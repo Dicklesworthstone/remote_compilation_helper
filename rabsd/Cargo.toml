@@ -41,7 +41,7 @@ asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/a
 [target.'cfg(unix)'.dependencies]
 # Selected registry cache files are opened relative to retained directory
 # descriptors; neither symlinked ancestors nor a substituted FIFO are inputs.
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "net", "event"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"
@@ -59,6 +59,10 @@ rabs-replay = { path = "../rabs-replay" }
 # production code cannot mint an all-caps context out of band. Dev-graph
 # only; the pin matches rabs-asupersync's exact-revision rule (bead A003).
 asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519", default-features = false, features = ["proc-macros", "test-internals"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Exercise real terminal refusal and inherited pipe input at the CLI boundary.
+rustix = { version = "1.1.4", features = ["pty", "pipe"] }
 
 [lints.rust]
 unsafe_code = "forbid"

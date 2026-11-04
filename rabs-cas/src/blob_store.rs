@@ -472,11 +472,22 @@ pub fn publish_staged_with_observation(
     durability: DurabilityPolicy,
     observation: &RawTargetObservation,
 ) -> Result<PutOutcome, PutError> {
-    observation.check_binding(&layout.published_path(declared, RAW_PROFILE_V1, declared), declared)?;
+    observation.check_binding(
+        &layout.published_path(declared, RAW_PROFILE_V1, declared),
+        declared,
+    )?;
     let logical_size = fs::metadata(staging).map_err(io_err("stat-staging"))?.len();
     publish_staged_observed_inner(
-        layout, store, declared, staging, logical_size, durability, None,
-        RAW_PROFILE_V1, declared, Some(observation),
+        layout,
+        store,
+        declared,
+        staging,
+        logical_size,
+        durability,
+        None,
+        RAW_PROFILE_V1,
+        declared,
+        Some(observation),
     )
 }
 
@@ -498,8 +509,16 @@ fn publish_staged_inner(
     file_digest: &TypedDigest,
 ) -> Result<PutOutcome, PutError> {
     publish_staged_observed_inner(
-        layout, store, declared, staging, logical_size, durability, fault,
-        profile, file_digest, None,
+        layout,
+        store,
+        declared,
+        staging,
+        logical_size,
+        durability,
+        fault,
+        profile,
+        file_digest,
+        None,
     )
 }
 

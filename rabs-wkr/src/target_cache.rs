@@ -32,7 +32,7 @@ mod source_edits;
 
 /// Independent count and byte limits bound retained seeds and in-flight staging.
 pub const MAX_TARGET_CACHE_ENTRIES: usize = 8;
-pub const MAX_TARGET_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_TARGET_CACHE_BYTES: u64 = rabs_sandbox::artifact_tree::MAX_PRIVATE_TREE_BYTES;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -151,7 +151,9 @@ pub(crate) fn target_key(
 /// Ordinary Cargo can reuse one private target across build, check and test,
 /// including different package and target selections. Clippy uses a separate
 /// family and retains every selection and lint control while sharing its own
-/// prior targets across source edits.
+/// prior targets across eligible source edits. A normalized key is only a
+/// candidate: acquisition permits changed-source reuse only when the complete
+/// prior target contains compiler metadata and no codegen or project executors.
 /// This secondary key never changes action identity or permits result replay:
 /// the current command executes with its original argv and artifact contract.
 /// Unknown argument forms retain exact-key reuse only.
@@ -170,19 +172,19 @@ pub(crate) fn target_compatibility_key(
     let mut value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
     let clippy = request.program == "/__rabs/toolchain/bin/cargo-clippy";
     value["version"] = serde_json::json!(if clippy {
-        "rabs.private-clippy-commands.v1"
+        "rabs.private-clippy-commands.v2"
     } else {
-        "rabs.private-cargo-selections.v1"
+        "rabs.private-cargo-selections.v2"
     });
     value["args"] = serde_json::json!(args);
     value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
-    if let Some(source) = source_edits::identity(inputs) {
+    if let Some(source) = source_edits::metadata_context_identity(inputs, spec) {
         // This is only a private Cargo seed family, never an action key.
         // Actual changed bytes remain in the exact key and current manifest.
         value["version"] = serde_json::json!(if clippy {
-            "rabs.private-clippy-source-edits.v1"
+            "rabs.private-clippy-source-edits.v2"
         } else {
-            "rabs.private-cargo-selection-source-edits.v1"
+            "rabs.private-cargo-selection-source-edits.v2"
         });
         value["source"] = serde_json::json!(source);
         value["workspace"] = serde_json::json!(source);
@@ -214,7 +216,7 @@ fn target_key_description(
     ro.sort();
     rw.sort();
     let mut value = serde_json::json!({
-        "version":"rabs.private-cargo-target.v1",
+        "version":"rabs.private-cargo-target.v2",
         "scope":scope.0,
         "source":inputs.full_source_digest,
         "workspace":inputs.manifest.digest(),
@@ -361,6 +363,8 @@ impl TargetCache {
                         state.entries.iter().rev().find(|seed| {
                             seed.compatible == Some(compatible)
                                 && !seed.invalidated.load(Ordering::Acquire)
+                                && (seed.source_manifest.digest() == inputs.manifest.digest()
+                                    || source_edits::metadata_seed(seed))
                         })
                     })
                 })
@@ -790,8 +794,15 @@ impl TargetAttempt {
         if SourceTimes::capture(&self.inputs, stopped)? != self.times {
             return Err(invalid("source changed while Cargo was executing"));
         }
-        let inventory =
-            TreeInventory::scan_complete(artifacts.backing(), MAX_ARTIFACT_BYTES, stopped)?;
+        let inventory = if artifacts.plan().private_incremental_roots().is_some() {
+            TreeInventory::scan_complete_private(
+                artifacts.backing(),
+                MAX_TARGET_CACHE_BYTES,
+                stopped,
+            )?
+        } else {
+            TreeInventory::scan_complete(artifacts.backing(), MAX_ARTIFACT_BYTES, stopped)?
+        };
         let Some(reservation) = self.cache.reserve(inventory.total_bytes()) else {
             return Ok(None);
         };
@@ -1067,7 +1078,11 @@ impl TreeSnapshot {
     ) -> io::Result<Option<(Reservation, Self)>> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = captured.file_names().map(str::to_owned).collect();
-        let tree = TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?;
+        let tree = if plan.private_incremental_roots().is_some() {
+            TreeInventory::scan_private(root, &required, MAX_TARGET_CACHE_BYTES, stopped)?
+        } else {
+            TreeInventory::scan(root, &required, MAX_ARTIFACT_BYTES, stopped)?
+        };
         // Every ordinary output still belongs to the validated offer. Only
         // the explicit Cargo private-state projection may retain extra files;
         // generic and older Cargo contracts continue to require exact equality.
@@ -1111,7 +1126,8 @@ impl TreeSnapshot {
     fn restore(&self, destination: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {
         use rabs_sandbox::artifact_tree::TreeInventory;
         let required = self.files.keys().cloned().collect();
-        let tree = TreeInventory::scan(self.directory.path(), &required, self.bytes, stopped)?;
+        let tree =
+            TreeInventory::scan_private(self.directory.path(), &required, self.bytes, stopped)?;
         let (files, directories) = copy_tree(&tree, destination, stopped)?;
         if files != self.files
             || directories != self.directories
@@ -1213,11 +1229,18 @@ fn copy_tree(
             digest
         } else {
             let mut output = OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(destination.join(name))?;
-            let digest = hash_copy(&mut input, &mut output, metadata.len(), stopped)?;
+            let digest = clone_or_copy_private(
+                &mut input,
+                &mut output,
+                destination,
+                metadata.len(),
+                stopped,
+            )?;
             output.set_permissions(fs::Permissions::from_mode(mode))?;
             output.set_times(FileTimes::new().set_modified(modified))?;
             aliases.insert(inode, name.to_owned());
@@ -1243,6 +1266,57 @@ fn copy_tree(
     }
     tree.verify(stopped)?;
     Ok((files, directories))
+}
+
+/// Retained target state and each restored attempt must own different writable
+/// inodes. Reuse the CAS materializer's verified CoW primitive to avoid writing
+/// the entire target twice per build. Hash the actual clone, not the source, and
+/// keep copy_tree's source inventory and expected seed-digest checks unchanged.
+/// Logical bytes remain fully charged to the pool even when extents are shared.
+#[cfg(target_os = "linux")]
+fn clone_or_copy_private(
+    input: &mut File,
+    output: &mut File,
+    parent: &Path,
+    length: u64,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<[u8; 32]> {
+    clone_or_copy_private_with_cloner(
+        input,
+        output,
+        parent,
+        length,
+        stopped,
+        rabs_cas::materialization::try_verified_reflink,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn clone_or_copy_private_with_cloner(
+    input: &mut File,
+    output: &mut File,
+    parent: &Path,
+    length: u64,
+    stopped: &impl Fn() -> bool,
+    cloner: impl FnOnce(&File, &File, &Path) -> bool,
+) -> io::Result<[u8; 32]> {
+    use std::io::Seek;
+
+    checkpoint(stopped)?;
+    // Fingerprint and dep-info files fit in a single copy buffer. Avoid the
+    // isolation probe's extra file creations and writes for those tiny inputs,
+    // including on filesystems without clone support.
+    if length > 64 * 1024 && cloner(input, output, parent) {
+        output.rewind()?;
+        hash_copy(output, &mut io::sink(), length, stopped)
+    } else {
+        // Unsupported or failed clones may have partially changed the fresh
+        // output. Never retain a suffix, including for an empty source file.
+        output.set_len(0)?;
+        output.rewind()?;
+        input.rewind()?;
+        hash_copy(input, output, length, stopped)
+    }
 }
 
 fn hash_copy(

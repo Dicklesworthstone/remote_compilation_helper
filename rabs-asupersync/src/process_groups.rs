@@ -21,9 +21,8 @@
 //!
 //! Safety posture: the workspace forbids `unsafe`. Group formation uses
 //! the stable `std::os::unix::process::CommandExt::process_group` (no
-//! `pre_exec`), and group signaling shells out to `kill(1)` with a
-//! negative pid — the standard dependency-free way to reach a whole
-//! group from safe Rust.
+//! `pre_exec`), and group signaling uses rustix's safe native API. Cleanup
+//! therefore does not depend on PATH or an external signal utility.
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -38,13 +37,7 @@ struct UnadmittedProcess(Option<Child>);
 
 fn kill_and_reap_spawned(leader: &mut Child) {
     let pgid = leader.id();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = signal_process_group(pgid, GroupSignal::Kill);
     // Always retain the direct-child fallback, even when group formation itself
     // was the failed check. A negative PGID signal alone may have no recipient.
     let _ = leader.kill();
@@ -60,7 +53,7 @@ impl Drop for UnadmittedProcess {
     }
 }
 
-/// Signal delivered to a whole process group via `kill(1)`.
+/// Signal delivered to a whole process group through the operating system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
     /// Graceful request (`TERM`).
@@ -71,14 +64,22 @@ pub enum GroupSignal {
     Hup,
 }
 
-impl GroupSignal {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Term => "TERM",
-            Self::Kill => "KILL",
-            Self::Hup => "HUP",
-        }
-    }
+fn signal_process_group(pgid: u32, signal: GroupSignal) -> io::Result<()> {
+    // Native kill(-1, sig) targets every permitted process, and zero targets
+    // the caller's own group. Neither can identify an owned action group.
+    let group = i32::try_from(pgid)
+        .ok()
+        .filter(|group| *group > 1)
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid owned process group")
+        })?;
+    let signal = match signal {
+        GroupSignal::Term => rustix::process::Signal::TERM,
+        GroupSignal::Kill => rustix::process::Signal::KILL,
+        GroupSignal::Hup => rustix::process::Signal::HUP,
+    };
+    rustix::process::kill_process_group(group, signal).map_err(Into::into)
 }
 
 /// One descendant observed in the action's process group.
@@ -190,6 +191,7 @@ impl ManagedProcessGroup {
                     Some(_) => {}
                     None => {
                         if !probe.iter().any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
+                            && leader_in_own_pgrp(pgid) != Some(true)
                             // Recheck exit: the first scan may have raced the
                             // leader becoming a zombie (filtered by the scan).
                             && leader.try_wait()?.is_none()
@@ -256,9 +258,8 @@ impl ManagedProcessGroup {
     }
 
     /// Force the directly owned child to exit without an external signal helper.
-    /// Group supervisors use this fallback before waiting when `kill(1)` is
-    /// unavailable or group signaling fails. Descendants still require the
-    /// normal group cleanup policy.
+    /// Group supervisors use this fallback before waiting when group signaling
+    /// fails. Descendants still require the normal group cleanup policy.
     ///
     /// # Errors
     /// The operating system refused to terminate the direct child.
@@ -274,26 +275,11 @@ impl ManagedProcessGroup {
 
     /// Deliver `sig` to the entire group (negative pid targets pgid).
     ///
-    /// Uses `kill(1)` because sending signals from safe std Rust is not
-    /// otherwise expressible under `forbid(unsafe_code)`. Failure means
-    /// the group outlived this call — callers decide escalation (G008).
+    /// Native signaling remains available with an empty or restricted PATH.
+    /// The operating system's error is preserved, including a missing group;
+    /// callers still verify group settlement and decide escalation (G008).
     pub fn signal_group(&self, sig: GroupSignal) -> io::Result<()> {
-        // `--` is required: without it kill(1) parses the negative pgid
-        // as another option-like token instead of an operand.
-        let status = Command::new("kill")
-            .arg(format!("-{}", sig.name()))
-            .arg("--")
-            .arg(format!("-{}", self.pgid))
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "kill -{} -- -{} failed: {status}",
-                sig.name(),
-                self.pgid
-            )))
-        }
+        signal_process_group(self.pgid, sig)
     }
 
     /// Spawn a caller-built `Command` as a process-group leader.
@@ -448,8 +434,8 @@ impl ManagedProcessGroup {
                 && stopping_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_millis(250))
             {
                 if self.signal_group(GroupSignal::Kill).is_err() {
-                    // A missing/failing kill utility must not leave the leader
-                    // running. Residual cleanup below still reports descendants.
+                    // Failed group signaling must not leave the leader running.
+                    // Residual cleanup below still reports descendants.
                     let _ = self.leader.kill();
                 }
                 killed = true;
@@ -498,15 +484,28 @@ pub fn reap_residuals(pgid: u32) -> u32 {
             // Half the grace spent: force. KILL needs no cooperation, so
             // one pass suffices; remaining polls VERIFY emptiness.
             escalated = true;
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg("--")
-                .arg(format!("-{pgid}"))
-                .status();
+            let _ = signal_process_group(pgid, GroupSignal::Kill);
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS));
     }
     members_from_proc(pgid).len() as u32
+}
+
+/// Check `/proc/<pgid>/stat` directly for the group leader's `pgrp`.
+///
+/// A multi-threaded leader (such as `rustc -vV`) that calls `exit_group` while
+/// `/proc` is being scanned may already be in state `Z` (`EXIT_ZOMBIE`, which
+/// [`members_from_proc`] filters out) while `waitpid(..., WNOHANG)` still
+/// returns `None` (`delay_group_leader` in `kernel/exit.c` while a subthread
+/// finishes `do_exit`). Reading `/proc/<pgid>/stat` directly verifies that the
+/// kernel placed the leader in `pgrp == pgid` regardless of zombie state.
+#[cfg(target_os = "linux")]
+fn leader_in_own_pgrp(pgid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
+    let (_, rest) = split_stat_fields(&stat)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let member_pgrp = fields.get(2)?.parse::<u32>().ok()?;
+    Some(member_pgrp == pgid)
 }
 
 /// Snapshot every process whose pgid equals `pgid`, from `/proc`.
@@ -951,6 +950,90 @@ mod tests {
     }
 
     #[test]
+    fn native_signaling_rejects_unowned_group_identifiers() {
+        for pgid in [0, 1, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(
+                signal_process_group(pgid, GroupSignal::Kill)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_group_cleanup_does_not_depend_on_path() {
+        const CHILD: &str = "RABS_TEST_NATIVE_GROUP_SIGNALING";
+        const EMPTY_PATH: &str = "/nonexistent/rabs-no-external-signal-helper";
+        if std::env::var_os(CHILD).is_none() {
+            // Give only this test subprocess a restricted PATH. Mutating the
+            // test runner's process-global environment would require unsafe.
+            let module = module_path!().split_once("::").unwrap().1;
+            let test = format!("{module}::native_group_cleanup_does_not_depend_on_path");
+            let output = Command::new("/proc/self/exe")
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("PATH", EMPTY_PATH)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+            return;
+        }
+        assert_eq!(std::env::var("PATH").unwrap(), EMPTY_PATH);
+        assert_eq!(
+            Command::new("kill").arg("-l").output().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // Both descendants retain both output pipes and ignore TERM. Their
+        // finite lifetime makes a broken implementation fail without leaking
+        // a permanent process. Cover cancellation and an already-exited leader.
+        for leader_waits in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = format!(
+                "trap '' TERM; printf stdout-ready; printf stderr-ready >&2; /bin/sleep 3 & {}",
+                if leader_waits { "wait" } else { "exit 0" }
+            );
+            let group = ManagedProcessGroup::spawn_with(&spec("/bin/sh", &script), |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            })
+            .unwrap();
+            let pgid = group.pgid();
+            let start = Instant::now();
+            let mut observed_descendant = false;
+            let output = group
+                .wait_with_bounded_drain_controlled(
+                    &crate::stream_drain::DrainLimits {
+                        resident_bound: 1024,
+                        spill_dir: dir.path().join("spill"),
+                    },
+                    || {
+                        observed_descendant |= members_from_proc(pgid).len() >= 2;
+                        leader_waits && observed_descendant
+                    },
+                )
+                .unwrap();
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert!(!leader_waits || observed_descendant);
+            assert_eq!(output.status.success(), !leader_waits);
+            assert_eq!(output.stdout.resident(), b"stdout-ready");
+            assert_eq!(output.stderr.resident(), b"stderr-ready");
+            assert_eq!(output.residual_group_members, 0);
+            assert!(members_from_proc(pgid).is_empty());
+            assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn controlled_wait_escalates_and_drains_both_streams() {
         let dir = tempfile::tempdir().unwrap();
@@ -1012,5 +1095,125 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout.resident(), b"ordinary-out");
         assert_eq!(output.stderr.resident(), b"ordinary-error");
+    }
+
+    #[test]
+    fn inherited_streams_deliver_binary_prefixes_before_exit_without_replay() {
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        // These endpoints stand in for the caller's inherited stdout/stderr.
+        // The process supervisor does not own their readers or capture bytes.
+        let (mut stdout, stdout_child) = UnixStream::pair().unwrap();
+        let (mut stderr, stderr_child) = UnixStream::pair().unwrap();
+        let (mut release, stdin_child) = UnixStream::pair().unwrap();
+        for stream in [&stdout, &stderr] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("must-not-be-created");
+        let group = ManagedProcessGroup::spawn_with(
+            &spec(
+                "sh",
+                r"printf 'out\000\377'; printf 'err\376' >&2; read -r release; printf tail; printf end >&2; exit 7",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::from(OwnedFd::from(stdin_child)))
+                    .stdout(Stdio::from(OwnedFd::from(stdout_child)))
+                    .stderr(Stdio::from(OwnedFd::from(stderr_child)));
+            },
+        )
+        .unwrap();
+        let outcome = std::thread::scope(|scope| {
+            let wait = scope.spawn(|| {
+                let started = Instant::now();
+                group.wait_with_bounded_drain_budget(
+                    &crate::stream_drain::DrainLimits {
+                        resident_bound: 0,
+                        spill_dir: spill.clone(),
+                    },
+                    0,
+                    || started.elapsed() > Duration::from_secs(5),
+                )
+            });
+            let mut out_prefix = [0; 5];
+            let mut err_prefix = [0; 4];
+            stdout.read_exact(&mut out_prefix).unwrap();
+            stderr.read_exact(&mut err_prefix).unwrap();
+            assert_eq!(&out_prefix, b"out\0\xff");
+            assert_eq!(&err_prefix, b"err\xfe");
+            assert!(!wait.is_finished(), "output waited for the process to exit");
+            // Only the consumer can release the child after observing both
+            // prefixes, so this is not a timing assumption about fast writes.
+            release.write_all(b"continue\n").unwrap();
+            let mut out_tail = Vec::new();
+            let mut err_tail = Vec::new();
+            stdout.read_to_end(&mut out_tail).unwrap();
+            stderr.read_to_end(&mut err_tail).unwrap();
+            assert_eq!(out_tail, b"tail");
+            assert_eq!(err_tail, b"end");
+            wait.join().unwrap().unwrap()
+        });
+        assert_eq!(outcome.status.code(), Some(7));
+        assert_eq!(outcome.residual_group_members, 0);
+        assert_eq!(outcome.stdout.total_bytes(), 0);
+        assert_eq!(outcome.stderr.total_bytes(), 0);
+        assert!(!spill.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_stream_backpressure_does_not_block_deadline_or_group_cleanup() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut consumer, output) = UnixStream::pair().unwrap();
+        consumer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec(
+                "sh",
+                "trap '' TERM; sleep 30 & printf ready; while :; do printf '%01000d' 0; done",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::from(OwnedFd::from(output)))
+                    .stderr(Stdio::null());
+            },
+        )
+        .unwrap();
+        let pgid = group.pgid();
+        let mut prefix = [0; 5];
+        consumer.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ready");
+        // Retain the open reader without consuming the unbounded child output.
+        // There is no forwarding/drain thread that can get stuck writing here.
+        let started = Instant::now();
+        let mut expired = false;
+        let output = group
+            .wait_with_bounded_drain_budget(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: std::path::PathBuf::new(),
+                },
+                0,
+                || {
+                    expired |= started.elapsed() >= Duration::from_millis(100);
+                    expired
+                },
+            )
+            .unwrap();
+        assert!(expired);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.residual_group_members, 0);
+        assert_eq!(output.stdout.total_bytes(), 0);
+        assert_eq!(output.stderr.total_bytes(), 0);
+        assert!(members_from_proc(pgid).is_empty());
     }
 }

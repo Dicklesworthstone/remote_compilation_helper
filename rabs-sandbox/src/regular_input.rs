@@ -60,7 +60,12 @@ mod tests {
         std::os::unix::fs::symlink(&input, &link).unwrap();
         let socket = directory.path().join("socket");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        for path in [link.as_path(), directory.path(), socket.as_path(), Path::new("/dev/null")] {
+        for path in [
+            link.as_path(),
+            directory.path(),
+            socket.as_path(),
+            Path::new("/dev/null"),
+        ] {
             assert!(open(path).is_err(), "{path:?}");
         }
         assert_eq!(std::fs::read(input).unwrap(), b"unchanged");
@@ -87,6 +92,10 @@ mod tests {
             drop(rescue);
         }
         thread.join().unwrap();
-        assert_eq!(first, Ok(true), "regular input acquisition waited on a FIFO");
+        assert_eq!(
+            first,
+            Ok(true),
+            "regular input acquisition waited on a FIFO"
+        );
     }
 }

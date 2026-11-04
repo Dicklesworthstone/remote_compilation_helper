@@ -140,6 +140,8 @@ fn running_connection_retries_after_saturation_without_starving_status() {
         live: Some(Arc::new(LiveEdge::new(LiveDependencyLane::new(
             Arc::clone(&coord),
         )))),
+        canonical_only: false,
+        canonical_activity: None,
     };
     let limits = EdgeLimits::new(0);
     let occupied: Vec<_> = (0..LIVE_DECISION_WORKERS)

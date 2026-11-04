@@ -196,6 +196,7 @@ impl Fixture {
             dependencies,
             toolchain: toolchain_guard,
             externs: Vec::new(),
+            canonical_paths: None,
         }
     }
 

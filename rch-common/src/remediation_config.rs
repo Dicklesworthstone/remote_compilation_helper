@@ -235,7 +235,8 @@ pub struct AutoRejoinConfig {
     pub probe_timeout_secs: u64,
     /// Minimum free disk (GB) a worker must report on every probed root.
     pub min_disk_free_gb: f64,
-    /// Minimum free inodes a worker must report on every probed root.
+    /// Minimum free inodes a worker must report on every probed root that has
+    /// a fixed inode pool. Filesystems without one (btrfs) are not checked.
     pub min_disk_inodes: u64,
     /// Disk roots whose capacity/inodes the probe reports.
     pub disk_roots: Vec<String>,

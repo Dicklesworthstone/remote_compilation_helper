@@ -438,9 +438,12 @@ fn allocation_unwind_releases_the_read_lease_without_poisoning_the_pool() {
     drop(capacity);
 }
 
-// Pause only after the real target copier has written a nonempty, incomplete
-// artifact. Initial source validation and destination allocation cannot satisfy
-// this observation. The callback uses the existing cooperative stop boundary.
+// Pause only after the production copier has established nonempty target bytes,
+// while the operation still owns its unverified output. A byte copy grows the
+// file gradually; a reflink establishes its full length before hashing the clone.
+// Initial source validation and destination allocation cannot satisfy this
+// observation. The callback uses the existing cooperative stop boundary, so the
+// same ownership/cancellation assertions exercise both preparation backends.
 fn paused_restore(
     cache: Arc<TargetCache>,
     key: TargetKey,
@@ -469,7 +472,7 @@ fn paused_restore(
                     && let Some(path) = destination.borrow().as_ref()
                 {
                     let written = fs::metadata(path).map_or(0, |metadata| metadata.len());
-                    if written > 0 && written < length {
+                    if written > 0 && written <= length {
                         paused.set(true);
                         entered.send(path.clone()).unwrap();
                         cancelled.set(release.recv_timeout(Duration::from_secs(10)).unwrap());
@@ -482,7 +485,7 @@ fn paused_restore(
 }
 
 #[test]
-fn pool_progress_and_quota_protection_continue_during_actual_target_copy() {
+fn pool_progress_and_quota_protection_continue_during_actual_target_preparation() {
     let bytes = vec![0xa5; 3 * 64 * 1024 + 7];
     let fixture = Fixture::new(&bytes);
     let length = bytes.len() as u64;
@@ -500,17 +503,21 @@ fn pool_progress_and_quota_protection_continue_during_actual_target_copy() {
         let reader = scope.spawn(move || {
             paused_restore(reader_cache, a, inputs, plan, length, (entered, resumed))
         });
-        let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
-        let written = fs::metadata(&partial).unwrap().len();
-        assert!(written > 0 && written < length);
-        // Even evicting B cannot make this request fit while A is being copied.
+        let pending = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let written = fs::metadata(&pending).unwrap().len();
+        assert!(written > 0 && written <= length);
+        assert!(
+            !reader.is_finished(),
+            "established bytes must still belong to the unfinished preparation"
+        );
+        // Even evicting B cannot make this request fit while A is being prepared.
         assert!(cache.reserve(length + 1).is_none());
         assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
         let other = fixture.restore(&cache, b);
         let other_path = other.backing().join("artifact");
         assert_eq!(fs::read(&other_path).unwrap(), bytes);
         assert_ne!(
-            fs::metadata(&partial).unwrap().ino(),
+            fs::metadata(&pending).unwrap().ino(),
             fs::metadata(&other_path).unwrap().ino()
         );
         accounted(&cache);
@@ -524,7 +531,7 @@ fn pool_progress_and_quota_protection_continue_during_actual_target_copy() {
 }
 
 #[test]
-fn cancellation_after_partial_copy_returns_no_output_and_keeps_verified_seed_reusable() {
+fn cancellation_during_target_preparation_returns_no_output_and_keeps_verified_seed_reusable() {
     let bytes = vec![0x7b; 3 * 64 * 1024 + 7];
     let fixture = Fixture::new(&bytes);
     let length = bytes.len() as u64;
@@ -541,8 +548,10 @@ fn cancellation_after_partial_copy_returns_no_output_and_keeps_verified_seed_reu
         let reader = scope.spawn(move || {
             paused_restore(reader_cache, key, inputs, plan, length, (entered, resumed))
         });
-        let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(fs::metadata(&partial).unwrap().len() < length);
+        let pending = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let written = fs::metadata(&pending).unwrap().len();
+        assert!(written > 0 && written <= length);
+        assert!(!reader.is_finished());
         release.send(true).unwrap();
         let error = reader.join().unwrap().unwrap_err();
         assert!(matches!(
@@ -550,7 +559,7 @@ fn cancellation_after_partial_copy_returns_no_output_and_keeps_verified_seed_reu
             io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
         ));
         assert!(
-            !partial.exists(),
+            !pending.exists(),
             "cancelled private output must not escape its owner"
         );
     });
@@ -564,7 +573,7 @@ fn cancellation_after_partial_copy_returns_no_output_and_keeps_verified_seed_reu
 }
 
 #[test]
-fn replacement_during_copy_survives_both_old_reader_success_and_corruption() {
+fn replacement_during_preparation_survives_both_old_reader_success_and_corruption() {
     for corrupt_old in [false, true] {
         let old_bytes = vec![0x31; 3 * 64 * 1024 + 7];
         let new_bytes = vec![0x92; old_bytes.len()];
@@ -585,7 +594,10 @@ fn replacement_during_copy_survives_both_old_reader_success_and_corruption() {
             let reader = scope.spawn(move || {
                 paused_restore(reader_cache, key, inputs, plan, length, (entered, resumed))
             });
-            let partial = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            let pending = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            let written = fs::metadata(&pending).unwrap().len();
+            assert!(written > 0 && written <= length);
+            assert!(!reader.is_finished());
             replacement.publish();
             assert!(original.exists());
             assert_eq!(cache.state.lock().unwrap().retained_bytes, length * 2);
@@ -602,9 +614,9 @@ fn replacement_during_copy_survives_both_old_reader_success_and_corruption() {
             if corrupt_old {
                 assert!(
                     restored.is_none(),
-                    "changed seed cannot return a partial target"
+                    "changed seed cannot return its unverified target"
                 );
-                assert!(!partial.exists());
+                assert!(!pending.exists());
             } else {
                 assert_eq!(
                     fs::read(restored.unwrap().backing().join("artifact")).unwrap(),

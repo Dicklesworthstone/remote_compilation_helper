@@ -30,6 +30,17 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
+    if stopped() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "source sealing cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// A regular input file. Directories are implicit; symlink semantics need a
 /// separate versioned contract and are deliberately not approximated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,18 +348,25 @@ fn each_child(
     Ok(())
 }
 
-fn verify_file(file: &mut File, expected: &SourceFile) -> io::Result<()> {
+fn verify_file(
+    file: &mut File,
+    expected: &SourceFile,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<()> {
+    checkpoint(stopped)?;
     let before = file.metadata()?;
     ordinary_file(&before, expected.len)?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
     let mut remaining = expected.len;
     while remaining != 0 {
+        checkpoint(stopped)?;
         let count = remaining.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..count])?;
         hash.update(&buffer[..count]);
         remaining -= count as u64;
     }
+    checkpoint(stopped)?;
     // Bounded even when a writer keeps appending. Read exactly the declaration
     // plus one byte rather than following an unbounded moving EOF.
     if file.read(&mut buffer[..1])? != 0
@@ -367,6 +385,7 @@ fn verify_file(file: &mut File, expected: &SourceFile) -> io::Result<()> {
             0o444
         }))?;
     }
+    checkpoint(stopped)?;
     Ok(())
 }
 
@@ -515,8 +534,19 @@ impl SourceReceiver {
     /// Transfer hashes prove what arrived, not what is still on disk: sealing
     /// rereads every file and rejects all undeclared files, directories and links.
     pub fn seal(&mut self) -> io::Result<&Path> {
+        self.seal_cancellable(|| false)
+    }
+
+    /// Seal with cooperative cancellation between members and bounded read
+    /// chunks. An interrupted verification poisons this staging operation;
+    /// clearing cancellation cannot turn a partial verification into authority.
+    pub fn seal_cancellable(&mut self, stopped: impl Fn() -> bool) -> io::Result<&Path> {
         if self.poisoned {
             return Err(invalid("source staging is poisoned"));
+        }
+        if let Err(error) = checkpoint(&stopped) {
+            self.poisoned = true;
+            return Err(error);
         }
         if self.sealed {
             return Ok(&self.root);
@@ -530,6 +560,7 @@ impl SourceReceiver {
         }
         let result = (|| {
             for file in self.files.values() {
+                checkpoint(&stopped)?;
                 if <[u8; 32]>::from(file.hash.clone().finalize()) != file.expected.sha256 {
                     return Err(invalid("source digest changed before seal"));
                 }
@@ -538,6 +569,7 @@ impl SourceReceiver {
             let mut directories = BTreeSet::new();
             let mut remaining: BTreeSet<String> = self.files.keys().cloned().collect();
             for name in self.files.keys() {
+                checkpoint(&stopped)?;
                 for (offset, _) in name.match_indices('/') {
                     directories.insert(&name[..offset]);
                     remaining.insert(name[..offset].to_owned());
@@ -549,11 +581,13 @@ impl SourceReceiver {
                 "",
                 &directories,
                 &mut remaining,
+                &stopped,
             )?;
             if !remaining.is_empty() {
                 return Err(invalid("source staging lost declared members"));
             }
             check_root(&self.root, &self.root_directory)?;
+            checkpoint(&stopped)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -571,9 +605,12 @@ impl SourceReceiver {
         prefix: &str,
         directories: &BTreeSet<&str>,
         remaining: &mut BTreeSet<String>,
+        stopped: &impl Fn() -> bool,
     ) -> io::Result<()> {
+        checkpoint(stopped)?;
         let before = directory.metadata()?;
         each_child(directory, path, |name| {
+            checkpoint(stopped)?;
             let text = name
                 .to_str()
                 .ok_or_else(|| invalid("non-UTF-8 source member"))?;
@@ -594,19 +631,21 @@ impl SourceReceiver {
                     &relative,
                     directories,
                     remaining,
+                    stopped,
                 )?;
             } else {
                 let pending = self
                     .files
                     .get(&relative)
                     .ok_or_else(|| invalid("undeclared source file"))?;
-                verify_file(&mut member, &pending.expected)?;
+                verify_file(&mut member, &pending.expected, stopped)?;
             }
             Ok(())
         })?;
         if !same_state(&before, &directory.metadata()?) {
             return Err(invalid("source directory changed during seal"));
         }
+        checkpoint(stopped)?;
         Ok(())
     }
 
@@ -828,6 +867,90 @@ mod tests {
             receiver.seal().is_err(),
             "a failed seal cannot be retried into authority"
         );
+    }
+
+    fn completed_multichunk_source(owner: &Path) -> (SourceReceiver, PathBuf) {
+        let root = owner.join("source");
+        let bytes = vec![0x5a; MAX_SOURCE_CHUNK * 3 + 17];
+        let mut receiver = SourceReceiver::create(
+            &root,
+            SourceManifest::new(vec![entry("src/lib.rs", &bytes)]).unwrap(),
+        )
+        .unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            receiver
+                .write_chunk(
+                    "src/lib.rs",
+                    (index * MAX_SOURCE_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+        (receiver, root)
+    }
+
+    #[test]
+    fn source_rehash_observes_cancellation_between_real_read_chunks() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private();
+        let (receiver, root) = completed_multichunk_source(owner.path());
+        let mut file = File::open(root.join("src/lib.rs")).unwrap();
+        // A cloned descriptor shares the actual cursor, so cancellation follows
+        // real read progress rather than a checkpoint counter or a timing race.
+        let observer = RefCell::new(file.try_clone().unwrap());
+        let error = verify_file(&mut file, &receiver.manifest().files()[0], &|| {
+            observer.borrow_mut().stream_position().unwrap() >= MAX_SOURCE_CHUNK as u64
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(file.stream_position().unwrap(), MAX_SOURCE_CHUNK as u64);
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(receiver.sealed_root().is_none());
+    }
+
+    #[test]
+    fn cancelled_partial_seal_never_exposes_or_retries_into_sealed_authority() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private();
+        let (mut receiver, root) = completed_multichunk_source(owner.path());
+        let verified = Cell::new(false);
+        let error = receiver
+            .seal_cancellable(|| {
+                // Sealing has actually rehashed the received disk bytes and
+                // changed this verified descriptor's mode before we cancel.
+                let read_only = fs::metadata(root.join("src/lib.rs"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o222
+                    == 0;
+                verified.set(read_only);
+                read_only
+            })
+            .unwrap_err();
+        assert!(
+            verified.get(),
+            "cancellation did not reach filesystem verification"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(receiver.seal_cancellable(|| false).is_err());
+        assert_poisoned(&mut receiver);
+    }
+
+    #[test]
+    fn cancelled_seal_refuses_even_an_already_sealed_receiver() {
+        let owner = private();
+        let (mut receiver, root) = completed_source(owner.path());
+        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.sealed_root(), Some(root.as_path()));
+        assert_eq!(
+            receiver.seal_cancellable(|| true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_poisoned(&mut receiver);
     }
 
     #[test]

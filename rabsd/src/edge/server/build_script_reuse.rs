@@ -5,10 +5,10 @@
 //! tracked-read veto, and binds a distinct policy identity. Neither profile
 //! admits execution, publishes results, nor grants cache-installation authority.
 
-#[path = "empty_out_dir_reuse.rs"]
-mod empty_out_dir;
 #[path = "cargo_placement_reuse.rs"]
 mod cargo_placement;
+#[path = "empty_out_dir_reuse.rs"]
+mod empty_out_dir;
 
 use crate::edge::live_facts::PackageFacts;
 use rabs_key::live_dependency::{

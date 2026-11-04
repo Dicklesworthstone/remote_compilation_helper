@@ -112,6 +112,106 @@ fn completed_target_survives_reopen_with_private_inodes_and_exact_timestamps() {
 }
 
 #[test]
+fn large_private_incremental_targets_survive_success_failure_and_restart() {
+    let private_files = rabs_sandbox::artifact_tree::MAX_TREE_FILES;
+    let report = concat!(
+        "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+        "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp.rmeta\"],\"executable\":null}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+    );
+    for failed in [false, true] {
+        let disk = private_directory("rabs-persistent-incremental-").unwrap();
+        let source = private_directory("rabs-persistent-incremental-source-").unwrap();
+        fs::write(source.path().join("lib.rs"), b"pub fn value() {}\n").unwrap();
+        let (_, plan) = incremental_request(&[]);
+        let target = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::create_dir_all(target.backing().join("debug/deps")).unwrap();
+        fs::create_dir_all(target.backing().join("debug/incremental/unit/session")).unwrap();
+        fs::write(
+            target.backing().join("debug/deps/libapp.rmeta"),
+            b"metadata",
+        )
+        .unwrap();
+        for index in 0..private_files {
+            fs::write(
+                target
+                    .backing()
+                    .join(format!("debug/incremental/unit/session/object{index}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let total = 8 + private_files as u64;
+        let key = TargetKey([44; 32]);
+        let cache = persistent(disk.path(), total, "host-v1");
+        let (attempt, restored) = cache
+            .acquire(
+                key,
+                None,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                1,
+                &|| false,
+            )
+            .unwrap();
+        assert!(restored.is_none());
+        let pending = if failed {
+            attempt.stage_failed(
+                &target,
+                std::process::ExitStatus::from_raw(101 << 8),
+                &|| false,
+            )
+        } else {
+            let captured = target
+                .capture_with_cargo_output(None, report.as_bytes(), || false)
+                .unwrap();
+            assert_eq!(captured.file_names().count(), 1);
+            attempt.stage(&target, &captured, &|| false)
+        }
+        .unwrap()
+        .unwrap();
+        assert_eq!(cache.state.lock().unwrap().reserved_bytes, total);
+        pending.publish();
+        drop(cache);
+
+        let cache = persistent(disk.path(), total, "host-v1");
+        {
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.retained_bytes, total);
+            assert_eq!(state.entries[0].tree.files.len(), private_files + 1);
+        }
+        let (attempt, restored) = cache
+            .acquire(
+                key,
+                None,
+                runtime_inputs(source.path(), &["lib.rs"]),
+                || PreparedArtifacts::new(plan.clone()),
+                2,
+                &|| false,
+            )
+            .unwrap();
+        let restored = restored.expect("all private state must survive restart and cloning");
+        assert_eq!(
+            fs::read(restored.backing().join(format!(
+                "debug/incremental/unit/session/object{}",
+                private_files - 1
+            )))
+            .unwrap(),
+            b"x"
+        );
+        drop(attempt);
+        drop(restored);
+        drop(cache);
+
+        // Reclamation must use the private inventory bound too, or these valid
+        // generations would strand charged disk space when a quota shrinks.
+        let cache = persistent(disk.path(), total - 1, "host-v1");
+        assert!(cache.state.lock().unwrap().entries.is_empty());
+        assert!(generations(disk.path()).is_empty());
+    }
+}
+
+#[test]
 fn cancelled_pending_and_crash_leftovers_never_become_restart_hits() {
     let disk = private_directory("rabs-persistent-pending-").unwrap();
     let cache = persistent(disk.path(), 32, "host-v1");

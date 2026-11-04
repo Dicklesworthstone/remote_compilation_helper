@@ -216,6 +216,24 @@ pub fn remote_worker_binary_paths(user: &str, declared_os: Option<&str>) -> Vec<
     ]
 }
 
+/// Awk statements that set `s`, how far a `df -P` data line's count columns
+/// sit to the right of where a one-word filesystem name puts them.
+///
+/// The counts start at the first field after the name that begins three count
+/// fields followed by a capacity field: three numbers (the available figure
+/// may be negative) and `N%` or `-`, or, where df has no figures at all, four
+/// `-`. Taking merely the first number misreads a name with a numeric word,
+/// such as a CIFS share `//nas/Backup 2024`, whose `2024` became the size. The
+/// counts are all numbers or all `-`, never a mix: otherwise Git Bash's
+/// figureless `df -Pi` line for a numbered name (`D:/Backup 2024 - - - - /d`)
+/// matched at the name's `2024`, which became the inode pool. A line without
+/// either shape falls back to the first number or `-`, and then to no shift.
+const DF_COUNT_SHIFT: &str = "s=-1; n=\"^-?[0-9]+$\"; \
+    for(c=2;c+3<=NF;c++) if(($c~n&&$(c+1)~n&&$(c+2)~n&&$(c+3)~/^([0-9]+%|-)$/) \
+    ||($c==\"-\"&&$(c+1)==\"-\"&&$(c+2)==\"-\"&&$(c+3)==\"-\")){s=c-2; break}; \
+    if(s<0) for(c=2;c<=NF;c++) if($c~/^([0-9]+|-)$/){s=c-2; break}; \
+    if(s<0) s=0;";
+
 /// Build the capability-probe shell script. It is intentionally fail-soft:
 /// every probe that errors simply omits its fact line, so a missing rustup or a
 /// broken binary shows up as *absent facts* (capability), never as a script
@@ -337,10 +355,29 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
              else printf '%stool_absent=%s\\n' \"$P\" {name}; fi; "
         ));
     }
-    // Disk roots: path;total_kb;avail_kb;avail_inodes (df -Pk and df -Pi).
+    // Disk roots: path;total_kb;avail_kb;avail_inodes;total_inodes (df -Pk
+    // and df -Pi). The inode total tells a filesystem without a fixed inode
+    // pool (btrfs reports 0, Git Bash reports `-`) apart from one whose pool
+    // is exhausted; both report zero free inodes. A failed `df -Pk` emits no
+    // line, and a failed `df -Pi` leaves both inode fields empty, so the field
+    // count never shifts.
+    // GNU and BusyBox `df -Pi` print only inode columns (`Filesystem Inodes
+    // IUsed IFree IUse% Mounted on`, headers possibly localized), so free
+    // inodes are column 4 and the pool size column 2. macOS/BSD `df -Pi`
+    // keeps the 512-byte block columns and appends `iused ifree %iused`, where
+    // columns 4 and 2 are free and total blocks; that layout is recognized by
+    // its `iused`/`ifree` headers without an `Inodes` header, and its pool size
+    // is `iused + ifree` (statvfs `f_files`).
+    // Column numbers count from the first count column, not from the line
+    // start: a filesystem name can contain spaces (macOS `map auto_home`, Git
+    // Bash `C:/Program Files/Git`, a Windows temp dir under a user name with
+    // a space), which shifts every column to the right. See `DF_COUNT_SHIFT`
+    // for how the first count column is found. A mount point with spaces is
+    // the last column and shifts nothing.
     // A configured future build directory may not exist yet. Measure its
     // closest existing ancestor, preserving the requested root in the fact,
     // so disk recovery can require evidence for every configured location.
+    let shift = DF_COUNT_SHIFT;
     for root in &spec.disk_roots {
         let q = shq(root);
         s.push_str(&format!(
@@ -350,9 +387,16 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
                [ \"$parent\" != \"$rp\" ] || break; rp=$parent; \
              done; \
              if [ -d \"$rp\" ]; then \
-               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{print $2\";\"$4}}'); \
-               i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==2{{print $4}}'); \
-               printf '%sdisk=%s;%s;%s\\n' \"$P\" {q} \"$b\" \"$i\"; \
+               b=$(df -Pk \"$rp\" 2>/dev/null | awk 'NR==2{{{shift} \
+                 print $(2+s)\";\"$(4+s)}}'); \
+               i=$(df -Pi \"$rp\" 2>/dev/null | awk 'NR==1{{for(c=1;c<=NF;c++){{h=tolower($c); \
+                 if(h==\"iused\")u=c; else if(h==\"ifree\")f=c; else if(h==\"inodes\")t=c}}}} \
+                 NR==2{{{shift} \
+                 if(u&&f&&!t)printf \"%s;%.0f\\n\",$(f+s),$(u+s)+$(f+s); \
+                 else print $(4+s)\";\"$(2+s)}}'); \
+               if [ -n \"$b\" ]; then \
+                 printf '%sdisk=%s;%s;%s\\n' \"$P\" {q} \"$b\" \"${{i:-;}}\"; \
+               fi; \
              fi; "
         ));
     }
@@ -429,6 +473,18 @@ pub fn normalize_probed_os(raw: &str) -> String {
     lower
 }
 
+/// Parse the `df -Pi` `Inodes` column into [`DiskRootFacts::total_inodes`].
+/// GNU `df` prints `-` when a filesystem reports no inode information, which
+/// like btrfs's literal `0` means there is no fixed pool to exhaust. An empty
+/// or otherwise unparseable field (a failed `df -Pi`) is unmeasured, so the
+/// free count keeps its historical meaning.
+fn parse_total_inodes(raw: &str) -> Option<u64> {
+    match raw.trim() {
+        "-" => Some(0),
+        number => number.parse().ok(),
+    }
+}
+
 /// Parse `RCH_FACT k=v` probe output into [`ProbedFacts`]. Lines without the
 /// prefix are ignored, so incidental stdout never corrupts the parse.
 #[must_use]
@@ -484,15 +540,17 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "zig_version" => f.runtimes.zig_version = Some(value.to_string()),
             "cargo_zigbuild_version" => f.runtimes.cargo_zigbuild_version = Some(value.to_string()),
             "disk" => {
-                // path;total_kb;avail_kb;avail_inodes
+                // path;total_kb;avail_kb;avail_inodes[;total_inodes]. The
+                // four-field form predates the inode total.
                 let parts: Vec<&str> = value.split(';').collect();
-                if parts.len() == 4 {
+                if parts.len() == 4 || parts.len() == 5 {
                     let kb = |s: &str| s.parse::<u64>().unwrap_or(0).saturating_mul(1024);
                     f.disk_roots.push(DiskRootFacts {
                         path: parts[0].to_string(),
                         total_bytes: kb(parts[1]),
                         available_bytes: kb(parts[2]),
                         available_inodes: parts[3].parse::<u64>().unwrap_or(0),
+                        total_inodes: parts.get(4).and_then(|raw| parse_total_inodes(raw)),
                     });
                 }
             }
@@ -1102,6 +1160,10 @@ mod tests {
         assert!(script.contains("bun --version"));
         assert!(script.contains("df -Pk"));
         assert!(script.contains("df -Pi"));
+        // Free inodes and the inode pool size, in that order, positionally
+        // for GNU/BusyBox `df -Pi` (column layouts are covered by
+        // `live_disk_probe_records_the_inode_pool_size_from_df`).
+        assert!(script.contains("print $(4+s)\";\"$(2+s)"));
         // Quoted disk root.
         assert!(script.contains("'/data/tmp'"));
     }
@@ -1140,11 +1202,218 @@ mod tests {
             facts.disk_roots[0].total_bytes,
             facts.disk_roots[1].total_bytes
         );
+        // A working `df -Pi` prints a numeric second column (0 on btrfs), so
+        // the live line carries the fifth field.
+        assert!(
+            facts.disk_roots[0].total_inodes.is_some(),
+            "{:?}",
+            facts.disk_roots
+        );
         assert!(
             !future.exists(),
             "a read-only disk probe must not create build directories"
         );
         assert_eq!(std::fs::read(&not_directory).unwrap(), b"not a build root");
+    }
+
+    /// Run the real probe script against a stand-in `df` that prints the
+    /// columns a given filesystem reports.
+    #[cfg(unix)]
+    #[test]
+    fn live_disk_probe_records_the_inode_pool_size_from_df() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let df = bin.path().join("df");
+        std::fs::write(
+            &df,
+            r#"#!/bin/sh
+case "$FAKE_DF:$1" in
+  nodf:*) exit 1 ;;
+  macos-autofs:-Pk) printf 'Filesystem    1024-blocks Used Available Capacity  Mounted on\nmap auto_home           0    0         0   100%%    /System/Volumes/Data/home\n' ;;
+  macos-autofs:-Pi) printf 'Filesystem    512-blocks Used Available Capacity iused ifree %%iused  Mounted on\nmap auto_home          0    0         0   100%%       0     0     -   /System/Volumes/Data/home\n' ;;
+  macos-spaced-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity  Mounted on\ndevices -- file:///Data/ 1073741824 0 1073741824 0%%    /Users/someone/DeviceFS\n' ;;
+  macos-spaced-name:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused  Mounted on\ndevices -- file:///Data/ 2147483648 0 2147483648 0%% 600000 1400000 30%%   /Users/someone/DeviceFS\n' ;;
+  gitbash-spaced-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nC:/Program Files/Git 498443260 290000000 208443260 59%% /\n' ;;
+  gitbash-spaced-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nC:/Program Files/Git - - - - /\n' ;;
+  numbered-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n//nas/Backup 2024 1000000 400000 600000 40%% /mnt/backup\n' ;;
+  numbered-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n//nas/Backup 2024 655360 100 655260 1%% /mnt/backup\n' ;;
+  gitbash-numbered-name:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nD:/Backup 2024 498443260 290000000 208443260 59%% /d\n' ;;
+  gitbash-numbered-name:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nD:/Backup 2024 - - - - /d\n' ;;
+  spaced-mount:-Pk) printf 'Filesystem     1024-blocks       Used Available Capacity  Mounted on\n/dev/disk9s1     17160192   16666636    449384    98%%   /Volumes/My Build Disk\n' ;;
+  spaced-mount:-Pi) printf 'Filesystem     512-blocks       Used Available Capacity iused      ifree %%iused  Mounted on\n/dev/disk9s1     34320384   33333272    898768    98%%  604947    4493840   12%%   /Volumes/My Build Disk\n' ;;
+  *:-Pk) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mapper/root 2000000 400000 1600000 20%% /data\n' ;;
+  btrfs:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/mapper/root 0 0 0 - /data\n' ;;
+  ext4:-Pi) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/sda1 6553600 6553588 12 100%% /data\n' ;;
+  localized:-Pi) printf 'Dateisystem Inodes IBenutzt IFrei IBenutzt%% Eingehaengt auf\n/dev/mapper/root 0 0 0 - /data\n' ;;
+  busybox:-Pi) printf 'Filesystem Inodes Used Available Use%% Mounted on\n/dev/root 6553600 6553588 12 100%% /data\n' ;;
+  macos:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/disk3s5 7805228320 7389863304 359512896 96%% 48157628 1797564480 3%% /data\n' ;;
+  macos-full:-Pi) printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted on\n/dev/disk4s1 2000000 1999000 1000 100%% 999990 10 100%% /data\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&df, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = ProbeSpec::new("probe", "/not-installed/rch-wkr");
+        spec.disk_roots = vec![root.path().to_str().unwrap().to_owned()];
+        let script = build_capability_probe_script(&spec);
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let probe = |mode: &str| {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", &path)
+                .env("FAKE_DF", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap()).disk_roots
+        };
+
+        let btrfs = probe("btrfs");
+        assert_eq!(btrfs.len(), 1, "{btrfs:?}");
+        assert_eq!(btrfs[0].available_bytes, 1_600_000 * 1024);
+        assert_eq!(
+            (btrfs[0].available_inodes, btrfs[0].total_inodes),
+            (0, Some(0))
+        );
+        assert!(btrfs[0].meets_inode_floor(10_000));
+
+        let ext4 = probe("ext4");
+        assert_eq!(
+            (ext4[0].available_inodes, ext4[0].total_inodes),
+            (12, Some(6_553_600))
+        );
+        assert!(!ext4[0].meets_inode_floor(10_000));
+
+        // GNU `df` translates its headers; the GNU layout is still read
+        // positionally.
+        let localized = probe("localized");
+        assert_eq!(
+            (localized[0].available_inodes, localized[0].total_inodes),
+            (0, Some(0))
+        );
+        let busybox = probe("busybox");
+        assert_eq!(
+            (busybox[0].available_inodes, busybox[0].total_inodes),
+            (12, Some(6_553_600))
+        );
+
+        // macOS/BSD `df -Pi` keeps the 512-byte block columns ahead of
+        // `iused ifree`: free blocks must not be read as free inodes, nor
+        // total blocks as the pool size.
+        let macos = probe("macos");
+        assert_eq!(macos[0].available_bytes, 1_600_000 * 1024);
+        assert_eq!(
+            (macos[0].available_inodes, macos[0].total_inodes),
+            (1_797_564_480, Some(48_157_628 + 1_797_564_480))
+        );
+        assert!(macos[0].meets_inode_floor(10_000));
+        let macos_full = probe("macos-full");
+        assert_eq!(
+            (macos_full[0].available_inodes, macos_full[0].total_inodes),
+            (10, Some(1_000_000))
+        );
+        assert!(!macos_full[0].meets_inode_floor(10_000));
+
+        // A filesystem name with spaces shifts every column right. Read from
+        // the first count column, the macOS autofs map reports no blocks and
+        // no inode pool instead of the word `auto_home` as its size and a
+        // made-up exhausted pool of 100 (its `100%` capacity) ...
+        let autofs = probe("macos-autofs");
+        assert_eq!(autofs.len(), 1, "{autofs:?}");
+        assert_eq!((autofs[0].total_bytes, autofs[0].available_bytes), (0, 0));
+        assert_eq!(
+            (autofs[0].available_inodes, autofs[0].total_inodes),
+            (0, Some(0))
+        );
+        // ... a three-word name still yields its real figures ...
+        let spaced = probe("macos-spaced-name");
+        assert_eq!(
+            (spaced[0].total_bytes, spaced[0].available_bytes),
+            (1_073_741_824 * 1024, 1_073_741_824 * 1024)
+        );
+        assert_eq!(
+            (spaced[0].available_inodes, spaced[0].total_inodes),
+            (1_400_000, Some(2_000_000))
+        );
+        // ... and Git Bash's `C:/Program Files/Git`, which has no inode
+        // figures, is a filesystem without a pool rather than an unmeasured
+        // one that fails the floor.
+        let gitbash = probe("gitbash-spaced-name");
+        assert_eq!(
+            (gitbash[0].total_bytes, gitbash[0].available_bytes),
+            (498_443_260 * 1024, 208_443_260 * 1024)
+        );
+        assert_eq!(gitbash[0].total_inodes, Some(0));
+        assert!(gitbash[0].meets_inode_floor(10_000));
+        // A numeric word in the name is not the first count: the counts are
+        // the three figures before the capacity column.
+        let numbered = probe("numbered-name");
+        assert_eq!(
+            (numbered[0].total_bytes, numbered[0].available_bytes),
+            (1_000_000 * 1024, 600_000 * 1024)
+        );
+        assert_eq!(
+            (numbered[0].available_inodes, numbered[0].total_inodes),
+            (655_260, Some(655_360))
+        );
+        // The same numeric word before Git Bash's figureless inode columns is
+        // not a count either: a number followed by `-` is not a count group,
+        // so the root still reads as having no inode pool rather than a
+        // 2024-inode pool with none free, which looks exhausted.
+        let gitbash_numbered = probe("gitbash-numbered-name");
+        assert_eq!(
+            (
+                gitbash_numbered[0].total_bytes,
+                gitbash_numbered[0].available_bytes
+            ),
+            (498_443_260 * 1024, 208_443_260 * 1024)
+        );
+        assert_eq!(
+            (
+                gitbash_numbered[0].available_inodes,
+                gitbash_numbered[0].total_inodes
+            ),
+            (0, Some(0))
+        );
+        assert_eq!(gitbash_numbered[0].free_inodes(), None);
+        // A mount point with spaces is the last column and shifts nothing.
+        let spaced_mount = probe("spaced-mount");
+        assert_eq!(
+            (spaced_mount[0].total_bytes, spaced_mount[0].available_bytes),
+            (17_160_192 * 1024, 449_384 * 1024)
+        );
+        assert_eq!(
+            (
+                spaced_mount[0].available_inodes,
+                spaced_mount[0].total_inodes
+            ),
+            (4_493_840, Some(604_947 + 4_493_840))
+        );
+
+        // A failed `df -Pi` leaves the inode fields empty without shifting the
+        // byte fields, and the unmeasured zero still fails the floor.
+        let no_inodes = probe("noinodes");
+        assert_eq!(no_inodes.len(), 1, "{no_inodes:?}");
+        assert_eq!(no_inodes[0].available_bytes, 1_600_000 * 1024);
+        assert_eq!(
+            (no_inodes[0].available_inodes, no_inodes[0].total_inodes),
+            (0, None)
+        );
+        assert!(!no_inodes[0].meets_inode_floor(10_000));
+
+        // Without byte figures the root is not reported at all.
+        assert!(probe("nodf").is_empty());
     }
 
     fn good_output() -> &'static str {
@@ -1197,10 +1466,46 @@ mod tests {
         assert_eq!(f.disk_roots[0].path, "/data/tmp");
         assert_eq!(f.disk_roots[0].available_bytes, 524288 * 1024);
         assert_eq!(f.disk_roots[0].available_inodes, 900000);
+        assert_eq!(f.disk_roots[0].total_inodes, None);
         assert_eq!(
             f.target_triple().as_deref(),
             Some("x86_64-unknown-linux-gnu")
         );
+    }
+
+    #[test]
+    fn parses_disk_inode_pool_size() {
+        let f = parse_capability_probe(
+            "RCH_FACT disk=/ext4;1048576;524288;5000;6553600\n\
+             RCH_FACT disk=/btrfs;1048576;524288;0;0\n\
+             RCH_FACT disk=/ntfs;1048576;524288;-;-\n\
+             RCH_FACT disk=/df-i-failed;1048576;524288;;\n\
+             RCH_FACT disk=/legacy;1048576;524288;900000\n\
+             RCH_FACT disk=/too-many;1048576;524288;1;2;3\n\
+             RCH_FACT disk=/too-few;1048576;524288\n",
+        );
+        let roots: Vec<(&str, u64, Option<u64>)> = f
+            .disk_roots
+            .iter()
+            .map(|r| (r.path.as_str(), r.available_inodes, r.total_inodes))
+            .collect();
+        assert_eq!(
+            roots,
+            vec![
+                ("/ext4", 5000, Some(6_553_600)),
+                ("/btrfs", 0, Some(0)),
+                ("/ntfs", 0, Some(0)),
+                ("/df-i-failed", 0, None),
+                ("/legacy", 900_000, None),
+            ]
+        );
+        // Only an exhausted fixed pool or an unmeasured zero fails the floor.
+        let floor: Vec<bool> = f
+            .disk_roots
+            .iter()
+            .map(|r| r.meets_inode_floor(10_000))
+            .collect();
+        assert_eq!(floor, vec![false, true, true, false, true]);
     }
 
     fn req_wasm() -> CapabilityRequirement {

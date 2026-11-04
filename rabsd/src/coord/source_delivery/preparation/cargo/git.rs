@@ -8,8 +8,8 @@
 use super::registry::{MAX_ARCHIVE_MEMBERS, open_home, open_selected};
 use super::vendor::GitSource;
 use super::{
-    MAX_PACKAGES, OUTPUT_LIMIT, bounded_command_with_input, contained_relative, invalid,
-    local_tool, require,
+    MAX_PACKAGES, OUTPUT_LIMIT, PreparationControl, bounded_command_with_input, contained_relative,
+    invalid, local_tool_controlled, require,
 };
 use rabs_sandbox::cargo_home::CAPTURED_GIT_CONFIG;
 use serde_json::Value;
@@ -241,11 +241,18 @@ fn git_command(tool: &GitTools, repository: &Path, scratch: &Path) -> Command {
     command
 }
 
-fn run(command: Command, scratch: &Path, limit: u64, input: Option<&[u8]>) -> io::Result<Vec<u8>> {
-    bounded_command_with_input(command, scratch, GIT_TIMEOUT, limit, input)
+fn run(
+    command: Command,
+    scratch: &Path,
+    limit: u64,
+    input: Option<&[u8]>,
+    control: &PreparationControl<'_>,
+) -> io::Result<Vec<u8>> {
+    bounded_command_with_input(command, scratch, GIT_TIMEOUT, limit, input, control)
 }
 
-fn checkpoint(deadline: Instant) -> io::Result<()> {
+fn checkpoint(deadline: Instant, control: &PreparationControl<'_>) -> io::Result<()> {
+    control.checkpoint()?;
     require(
         Instant::now() < deadline,
         "cached Git acquisition exceeded its runtime bound",
@@ -274,10 +281,11 @@ fn minimal_repository(root: &Path, revisions: &BTreeSet<String>) -> io::Result<(
 }
 
 #[cfg(unix)]
-fn database_names(root: &File) -> io::Result<Vec<String>> {
+fn database_names(root: &File, control: &PreparationControl<'_>) -> io::Result<Vec<String>> {
     let directory = open_selected(root, "git/db", true)?;
     let mut names = BTreeSet::new();
     for (index, entry) in rustix::fs::Dir::read_from(&directory)?.enumerate() {
+        control.checkpoint()?;
         require(
             index < 258,
             "Cargo Git database directory exceeds its scan bound",
@@ -297,7 +305,7 @@ fn database_names(root: &File) -> io::Result<Vec<String>> {
 }
 
 #[cfg(not(unix))]
-fn database_names(_root: &File) -> io::Result<Vec<String>> {
+fn database_names(_root: &File, _control: &PreparationControl<'_>) -> io::Result<Vec<String>> {
     Err(invalid(
         "cached Git capture requires Linux descriptor-backed object access",
     ))
@@ -308,8 +316,9 @@ struct ObjectView {
 }
 
 impl ObjectView {
-    fn verify_unchanged(&self) -> io::Result<()> {
+    fn verify_unchanged(&self, control: &PreparationControl<'_>) -> io::Result<()> {
         for (file, before) in &self.files {
+            control.checkpoint()?;
             let after = file.metadata()?;
             require(
                 before.len() == after.len(),
@@ -334,7 +343,12 @@ impl ObjectView {
 }
 
 #[cfg(target_os = "linux")]
-fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<ObjectView> {
+fn object_view(
+    root: &File,
+    name: &str,
+    destination: &Path,
+    control: &PreparationControl<'_>,
+) -> io::Result<ObjectView> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
     // /proc's visible PID can differ from getpid in a nested PID namespace.
@@ -361,6 +375,7 @@ fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<Object
     let mut view = ObjectView { files: Vec::new() };
     let mut total = 0_u64;
     let mut link = |path: &str| -> io::Result<()> {
+        control.checkpoint()?;
         require(
             view.files.len() < MAX_OBJECT_FILES,
             "cached Git object storage exceeds its descriptor bound",
@@ -392,6 +407,7 @@ fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<Object
         Ok(())
     };
     for (index, entry) in rustix::fs::Dir::read_from(&objects)?.enumerate() {
+        control.checkpoint()?;
         require(
             index < 260,
             "cached Git object directory exceeds its scan bound",
@@ -404,6 +420,7 @@ fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<Object
             let directory = open_selected(&objects, "pack", true)?;
             let mut packs = BTreeMap::<String, (bool, bool)>::new();
             for (index, entry) in rustix::fs::Dir::read_from(&directory)?.enumerate() {
+                control.checkpoint()?;
                 require(
                     index < 2048,
                     "cached Git pack directory exceeds its scan bound",
@@ -446,6 +463,7 @@ fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<Object
         {
             let directory = open_selected(&objects, name, true)?;
             for (index, entry) in rustix::fs::Dir::read_from(&directory)?.enumerate() {
+                control.checkpoint()?;
                 require(
                     index < MAX_OBJECT_FILES + 2,
                     "cached loose Git objects exceed their scan bound",
@@ -464,19 +482,35 @@ fn object_view(root: &File, name: &str, destination: &Path) -> io::Result<Object
 }
 
 #[cfg(not(target_os = "linux"))]
-fn object_view(_root: &File, _name: &str, _destination: &Path) -> io::Result<ObjectView> {
+fn object_view(
+    _root: &File,
+    _name: &str,
+    _destination: &Path,
+    _control: &PreparationControl<'_>,
+) -> io::Result<ObjectView> {
     Err(invalid(
         "cached Git capture requires Linux descriptor-backed object access",
     ))
 }
 
+#[cfg(test)]
 fn parse_tree(bytes: &[u8], remaining: &mut u64, count: &mut usize) -> io::Result<CapturedCommit> {
+    parse_tree_controlled(bytes, remaining, count, &PreparationControl::uncontrolled())
+}
+
+fn parse_tree_controlled(
+    bytes: &[u8],
+    remaining: &mut u64,
+    count: &mut usize,
+    control: &PreparationControl<'_>,
+) -> io::Result<CapturedCommit> {
     require(
         bytes.last() == Some(&0),
         "Git tree listing is empty or truncated",
     )?;
     let mut members = BTreeMap::new();
     for row in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        control.checkpoint()?;
         let tab = row
             .iter()
             .position(|byte| *byte == b'\t')
@@ -613,7 +647,9 @@ impl GitCache {
         mut remaining: u64,
         expanded_remaining: &mut u64,
         expanded_members: &mut usize,
+        control: &PreparationControl<'_>,
     ) -> io::Result<(Self, CapturedFiles)> {
+        control.checkpoint()?;
         let packages = locked_packages(lock)?;
         let revisions = packages
             .iter()
@@ -626,8 +662,8 @@ impl GitCache {
         let scratch = scratch.join("git-capture");
         fs::create_dir(&scratch)?;
         let tool = GitTools {
-            git: local_tool("git", &scratch)?,
-            prlimit: local_tool("prlimit", &scratch)?,
+            git: local_tool_controlled("git", &scratch, control)?,
+            prlimit: local_tool_controlled("prlimit", &scratch, control)?,
         };
         let mut captured = Self {
             packages,
@@ -639,14 +675,14 @@ impl GitCache {
         let mut found = BTreeSet::new();
         let mut databases = 0_usize;
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
-        for name in database_names(root)? {
-            checkpoint(deadline)?;
+        for name in database_names(root, control)? {
+            checkpoint(deadline, control)?;
             let temporary = tempfile::Builder::new()
                 .prefix("objects-")
                 .tempdir_in(&captured.scratch)?;
             let repository = temporary.path().join("view");
             minimal_repository(&repository, &revisions)?;
-            let view = object_view(root, &name, &repository)?;
+            let view = object_view(root, &name, &repository, control)?;
             let mut probe = git_command(&captured.tool, &repository, &captured.scratch);
             probe.args(["cat-file", "--batch-check"]);
             let input = revisions
@@ -658,6 +694,7 @@ impl GitCache {
                 &captured.scratch,
                 OUTPUT_LIMIT,
                 Some(input.as_bytes()),
+                control,
             )?;
             let text =
                 std::str::from_utf8(&output).map_err(|_| invalid("invalid Git commit probe"))?;
@@ -684,7 +721,7 @@ impl GitCache {
                 selected.insert(revision.clone());
             }
             if selected.is_empty() {
-                view.verify_unchanged()?;
+                view.verify_unchanged(control)?;
                 continue;
             }
             databases += 1;
@@ -693,17 +730,19 @@ impl GitCache {
                 "too many selected Cargo Git databases",
             )?;
             for revision in &selected {
-                checkpoint(deadline)?;
+                checkpoint(deadline, control)?;
                 let mut command = git_command(&captured.tool, &repository, &captured.scratch);
                 command.args(["ls-tree", "-r", "-l", "-z", revision]);
-                let output = run(command, &captured.scratch, OUTPUT_LIMIT, None)?;
-                let commit = parse_tree(&output, expanded_remaining, expanded_members)?;
+                let output = run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+                let commit =
+                    parse_tree_controlled(&output, expanded_remaining, expanded_members, control)?;
                 for (path, member) in &commit.members {
+                    control.checkpoint()?;
                     if Path::new(path)
                         .file_name()
                         .is_some_and(|name| name == "Cargo.toml")
                     {
-                        checkpoint(deadline)?;
+                        checkpoint(deadline, control)?;
                         require(
                             member.size <= OUTPUT_LIMIT,
                             "Git Cargo manifest exceeds its bound",
@@ -711,7 +750,7 @@ impl GitCache {
                         let mut command =
                             git_command(&captured.tool, &repository, &captured.scratch);
                         command.args(["cat-file", "blob", &member.object]);
-                        let bytes = run(command, &captured.scratch, OUTPUT_LIMIT, None)?;
+                        let bytes = run(command, &captured.scratch, OUTPUT_LIMIT, None, control)?;
                         if let Ok(text) = std::str::from_utf8(&bytes)
                             && let Ok(value) = toml::from_str::<toml::Value>(text)
                         {
@@ -727,7 +766,7 @@ impl GitCache {
                     .insert((name.clone(), revision.clone()), commit);
                 found.insert(revision.clone());
             }
-            checkpoint(deadline)?;
+            checkpoint(deadline, control)?;
             let mut enumerate = git_command(&captured.tool, &repository, &captured.scratch);
             enumerate
                 .args([
@@ -737,7 +776,7 @@ impl GitCache {
                     "--no-walk=unsorted",
                 ])
                 .args(&selected);
-            let output = run(enumerate, &captured.scratch, OUTPUT_LIMIT, None)?;
+            let output = run(enumerate, &captured.scratch, OUTPUT_LIMIT, None, control)?;
             let text = std::str::from_utf8(&output)
                 .map_err(|_| invalid("invalid selected Git object list"))?;
             let objects = text.lines().collect::<BTreeSet<_>>();
@@ -760,18 +799,24 @@ impl GitCache {
                 "--window=0",
                 "--threads=1",
             ]);
-            checkpoint(deadline)?;
-            let packed = run(pack, &captured.scratch, remaining, Some(input.as_bytes()))?;
+            checkpoint(deadline, control)?;
+            let packed = run(
+                pack,
+                &captured.scratch,
+                remaining,
+                Some(input.as_bytes()),
+                control,
+            )?;
             let generated = temporary.path().join("captured");
             minimal_repository(&generated, &selected)?;
             let incoming = temporary.path().join("selected.pack");
-            fs::write(&incoming, &packed)?;
+            control.write_all(File::create(&incoming)?, &packed)?;
             let mut index = git_command(&captured.tool, &generated, &captured.scratch);
             index
                 .args(["index-pack", "--strict", "--threads=1"])
                 .arg(&incoming);
-            checkpoint(deadline)?;
-            let output = run(index, &captured.scratch, OUTPUT_LIMIT, None)?;
+            checkpoint(deadline, control)?;
+            let output = run(index, &captured.scratch, OUTPUT_LIMIT, None, control)?;
             let digest = std::str::from_utf8(&output)
                 .map_err(|_| invalid("invalid generated Git pack identity"))?
                 .trim();
@@ -784,9 +829,9 @@ impl GitCache {
             )?;
             let mut verify = git_command(&captured.tool, &generated, &captured.scratch);
             verify.args(["fsck", "--full", "--strict", "--no-reflogs"]);
-            checkpoint(deadline)?;
-            run(verify, &captured.scratch, OUTPUT_LIMIT, None)?;
-            view.verify_unchanged()?;
+            checkpoint(deadline, control)?;
+            run(verify, &captured.scratch, OUTPUT_LIMIT, None, control)?;
+            view.verify_unchanged(control)?;
             let mut packed = Some(packed);
             for path in [
                 "config".to_owned(),
@@ -796,12 +841,16 @@ impl GitCache {
                 format!("{stem}.pack"),
                 format!("{stem}.idx"),
             ] {
+                control.checkpoint()?;
                 let bytes = if path.ends_with(".pack") {
                     packed
                         .take()
                         .ok_or_else(|| invalid("duplicate generated Git pack"))?
                 } else {
-                    fs::read(generated.join(&path))?
+                    control.read_bounded(
+                        File::open(generated.join(&path))?,
+                        remaining.saturating_add(1),
+                    )?
                 };
                 remaining = remaining.checked_sub(bytes.len() as u64).ok_or_else(|| {
                     invalid("captured Git pack exceeds the aggregate source byte budget")
@@ -814,7 +863,7 @@ impl GitCache {
                 )?;
             }
         }
-        checkpoint(deadline)?;
+        checkpoint(deadline, control)?;
         require(
             found == revisions,
             "approved Cargo home is missing a locked Git commit; fetch the complete locked graph before preparing",
@@ -912,13 +961,19 @@ impl GitCache {
         Ok(())
     }
 
-    pub(super) fn verify_checkouts(&self, home: &Path, packages: &[Value]) -> io::Result<()> {
+    pub(super) fn verify_checkouts(
+        &self,
+        home: &Path,
+        packages: &[Value],
+        control: &PreparationControl<'_>,
+    ) -> io::Result<()> {
         let mut checked = BTreeSet::new();
         for package in packages.iter().filter(|package| {
             package["source"]
                 .as_str()
                 .is_some_and(|source| source.starts_with("git+"))
         }) {
+            control.checkpoint()?;
             let (checkout, commit) = self.resolved_checkout(home, package)?;
             if !checked.insert(checkout.clone()) {
                 continue;
@@ -926,6 +981,7 @@ impl GitCache {
             let directory = open_home(&checkout)?;
             let mut paths = String::new();
             for (path, member) in &commit.members {
+                control.checkpoint()?;
                 let file = open_selected(&directory, path, false)?;
                 let metadata = file.metadata()?;
                 require(
@@ -957,7 +1013,13 @@ impl GitCache {
                 &self.scratch,
             );
             command.args(["hash-object", "--stdin-paths", "--no-filters"]);
-            let output = run(command, &self.scratch, OUTPUT_LIMIT, Some(paths.as_bytes()))?;
+            let output = run(
+                command,
+                &self.scratch,
+                OUTPUT_LIMIT,
+                Some(paths.as_bytes()),
+                control,
+            )?;
             let text = std::str::from_utf8(&output)
                 .map_err(|_| invalid("invalid Git checkout object verification"))?;
             require(

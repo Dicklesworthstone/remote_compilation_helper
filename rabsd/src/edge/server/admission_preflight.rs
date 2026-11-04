@@ -8,11 +8,16 @@
 //! or classify a directory source without its captured checksum witness.
 
 use rabs_key::invocation::{NormalizedRustcInvocation, SourceInput, parse};
-use rabs_key::live_dependency::remote::remote_dependency_output_class;
+use rabs_key::live_dependency::remote::{
+    canonical_generated_native_roots, remote_dependency_output_class,
+    validate_generated_native_inputs_with_roots,
+};
 use rabs_key::live_dependency::{
     LiveRefusal, LiveRustcRequest, check_dependency_cache_read_closure,
 };
-use rabs_key::output_derivation::check_dependency_output_options;
+use rabs_key::output_derivation::{
+    check_dependency_output_options, check_workspace_output_options,
+};
 
 #[path = "sysroot_preflight.rs"]
 mod sysroot_preflight;
@@ -21,7 +26,7 @@ mod sysroot_preflight;
 /// Keep this deliberately small; differential tests below require supported
 /// requests to continue to the full planner, not become false cache misses.
 pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, false)
+    rejection_for(request, PreflightMode::LocalDependency)
 }
 
 /// A configured remote worker can enforce the archive read-closure profile.
@@ -30,10 +35,34 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
 /// dispatch, publication or installation. An unavailable remote lane never
 /// turns this preliminary check into local codegen cache authority.
 pub(super) fn remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
-    rejection_for(request, true)
+    rejection_for(request, PreflightMode::RemoteDependency)
 }
 
-fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefusal> {
+/// Only the retained canonical Cargo unit capability can select this preflight.
+/// Primary-package environment, original lint settings and workspace cwd remain
+/// compiler inputs; the later pure planner and unit matcher grant execution.
+pub(super) fn workspace_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, PreflightMode::WorkspaceExecutionOnly)
+}
+
+/// Only a retained canonical Cargo operation may prepare generated static
+/// native inputs. Canonical-looking wrapper paths do not select this entry point;
+/// the driver owns the complete generated-tree capture and worker-only policy.
+pub(super) fn canonical_remote_rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
+    rejection_for(request, PreflightMode::CanonicalRemoteDependency)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreflightMode {
+    LocalDependency,
+    RemoteDependency,
+    CanonicalRemoteDependency,
+    WorkspaceExecutionOnly,
+}
+
+fn rejection_for(request: LiveRustcRequest<'_>, mode: PreflightMode) -> Option<LiveRefusal> {
+    let remote = mode != PreflightMode::LocalDependency;
+    let workspace = mode == PreflightMode::WorkspaceExecutionOnly;
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -45,7 +74,7 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
         "LD_AUDIT",
         "DYLD_INSERT_LIBRARIES",
     ] {
-        if names.contains(&name) {
+        if names.contains(&name) && !(workspace && name == "CARGO_PRIMARY_PACKAGE") {
             return Some(LiveRefusal::RefusedEnv(name.to_owned()));
         }
     }
@@ -64,14 +93,14 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
     if env_value("CARGO_HOME").is_none() && env_value("HOME").is_none() {
         return Some(LiveRefusal::MissingEnv("HOME"));
     }
-    if env_value("CARGO_MANIFEST_DIR") != Some(request.cwd) {
+    if !workspace && env_value("CARGO_MANIFEST_DIR") != Some(request.cwd) {
         return Some(LiveRefusal::WorkingDirectory(request.cwd.to_owned()));
     }
     let invocation = match parse(request.argv, None) {
         Ok(invocation) => invocation,
         Err(error) => return Some(LiveRefusal::Unparseable(format!("{error:?}"))),
     };
-    if invocation.cap_lints.as_deref() != Some("allow") {
+    if !workspace && invocation.cap_lints.as_deref() != Some("allow") {
         return Some(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",
         ));
@@ -80,14 +109,15 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
     // producers. They are prerequisites of otherwise cacheable work, but
     // this lane cannot serve their output classes. Do not make them wait
     // behind a cold sysroot merely to discover that after hashing it.
-    // These checks mirror only the HOST-INDEPENDENT shape restrictions in
-    // derive_dependency_output_declarations; the full planner still owns
-    // target naming, option semantics and the complete output declaration.
-    if invocation.crate_types.is_empty()
-        || invocation
-            .crate_types
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+    // Workspace metadata checks also include selected binaries and test
+    // harnesses. Their separate option adapter below validates this bounded
+    // shape without granting final-link or dependency-cache authority.
+    if !workspace
+        && (invocation.crate_types.is_empty()
+            || invocation
+                .crate_types
+                .iter()
+                .any(|kind| !matches!(kind.as_str(), "lib" | "rlib")))
     {
         return Some(LiveRefusal::NotDependencyCompile(
             "dependency outputs require --crate-type lib or rlib",
@@ -144,33 +174,60 @@ fn rejection_for(request: LiveRustcRequest<'_>, remote: bool) -> Option<LiveRefu
     {
         return Some(LiveRefusal::NativeCpu);
     }
-    dependency_inputs_rejection(&invocation)
-        .or_else(|| sysroot_preflight::rejection(&invocation))
-        // Use the SAME option model as final derivation, not a second flag
-        // list or a fabricated host triple. Supported threaded compiles keep
-        // going; incremental/save-temps/unknown modes never start cold hashing.
-        .or_else(|| {
+    dependency_inputs_rejection(
+        &invocation,
+        env_value("OUT_DIR"),
+        matches!(
+            mode,
+            PreflightMode::CanonicalRemoteDependency | PreflightMode::WorkspaceExecutionOnly
+        ),
+    )
+    .or_else(|| sysroot_preflight::rejection(&invocation))
+    // Use the SAME option model as final derivation, not a second flag
+    // list or a fabricated host triple. Supported threaded compiles keep
+    // going; incremental/save-temps/unknown modes never start cold hashing.
+    .or_else(|| {
+        let options = if workspace {
+            check_workspace_output_options(&invocation)
+        } else {
             check_dependency_output_options(&invocation)
-                .err()
-                .map(|error| LiveRefusal::Outputs(error.to_string()))
-        })
+        };
+        options
+            .err()
+            .map(|error| LiveRefusal::Outputs(error.to_string()))
+    })
 }
 
-fn dependency_inputs_rejection(invocation: &NormalizedRustcInvocation) -> Option<LiveRefusal> {
-    if let Some(library) = invocation.native_libs.first() {
-        return Some(LiveRefusal::NativeLibrary(library.clone()));
+fn dependency_inputs_rejection(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+    canonical_archive_execution: bool,
+) -> Option<LiveRefusal> {
+    let native_roots = if canonical_archive_execution {
+        match canonical_generated_native_roots(invocation, generated_root) {
+            Ok(roots) => roots,
+            Err(refusal) => return Some(refusal),
+        }
+    } else {
+        Vec::new()
+    };
+    if let Err(refusal) = validate_generated_native_inputs_with_roots(
+        invocation,
+        generated_root,
+        &native_roots,
+        canonical_archive_execution,
+    ) {
+        return Some(refusal);
     }
     // A proc-macro PRODUCER is rejected above, but the ordinary lib/rlib
-    // that CONSUMES it cannot enter this unsandboxed class either. Likewise,
-    // build scripts commonly add native search directories even without -l.
-    // Neither needs a host probe, source capture, or dependency enumeration
+    // that CONSUMES it cannot enter this class either.
+    // Unbound native search paths also refuse above, including those without
+    // -l. Only canonical worker executions may continue with native searches
+    // inside complete generated trees whose completed Cargo records and bytes
+    // must still be captured by the coordinator. These checks need neither
+    // a host probe, source capture, nor dependency enumeration
     // to establish this refusal. Let Cargo make progress immediately rather
     // than spend the wrapper's cold-readiness budget on an impossible hit.
-    for entry in &invocation.lib_search {
-        if !entry.starts_with("dependency=") {
-            return Some(LiveRefusal::SearchPath(entry.clone()));
-        }
-    }
     for (_, path) in &invocation.externs {
         let Some(path) = path else {
             // A bare --extern can name a toolchain crate. Only the full
@@ -248,6 +305,116 @@ mod tests {
                 assert_eq!(rejection(request), None);
                 assert!(plan_dependency_action(request, HOST).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn workspace_preflight_preserves_primary_lints_and_workspace_cwd_without_relaxing_dependency_admission()
+     {
+        let (mut argv, mut env) = fixture("/__rabs/workspace/member");
+        argv.retain(|arg| arg != "--cap-lints=allow");
+        env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+        let request = LiveRustcRequest {
+            argv: &argv,
+            cwd: "/__rabs/workspace",
+            env: &env,
+        };
+        assert!(rejection(request).is_some());
+        assert!(remote_rejection(request).is_some());
+        assert_eq!(workspace_rejection(request), None);
+        let mut generated = env.clone();
+        generated.push((
+            "OUT_DIR".into(),
+            "/__rabs/out/cargo/debug/build/member-hash/out".into(),
+        ));
+        for extra in [
+            vec!["-Lnative=/__rabs/out/cargo/debug/build/member-hash/out"],
+            vec![
+                "-Lnative=/__rabs/out/cargo/debug/build/member-hash/out",
+                "-lstatic=answer",
+            ],
+        ] {
+            let mut native = argv.clone();
+            native.retain(|arg| arg != "--emit=metadata,dep-info");
+            native.push("--emit=dep-info,metadata,link".into());
+            native.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let candidate = LiveRustcRequest {
+                argv: &native,
+                cwd: "/__rabs/workspace",
+                env: &generated,
+            };
+            assert_eq!(workspace_rejection(candidate), None);
+            assert!(rejection(candidate).is_some());
+            assert!(remote_rejection(candidate).is_some());
+        }
+        env.push(("LD_PRELOAD".into(), "/unretained.so".into()));
+        assert!(
+            workspace_rejection(LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            })
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn workspace_metadata_bins_and_harnesses_do_not_borrow_dependency_or_link_authority() {
+        use rabs_key::live_dependency::plan_canonical_workspace_execution;
+
+        for (crate_type, harness, test_cfg) in [
+            (Some("bin"), false, false),
+            (Some("bin"), true, false),
+            (Some("lib"), true, false),
+            (None, true, false),
+            (None, false, true),
+        ] {
+            let mut argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=app".into(),
+                "--emit=dep-info,metadata".into(),
+                "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+                "--error-format=json".into(),
+                "member/src/main.rs".into(),
+            ];
+            if let Some(kind) = crate_type {
+                argv.push(format!("--crate-type={kind}"));
+            }
+            if harness {
+                argv.push("--test".into());
+            }
+            if test_cfg {
+                argv.extend(["--cfg".into(), "test".into()]);
+            }
+            let env = vec![
+                ("HOME".into(), "/__rabs/home".into()),
+                ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+                (
+                    "CARGO_MANIFEST_DIR".into(),
+                    "/__rabs/workspace/member".into(),
+                ),
+                ("CARGO_PKG_NAME".into(), "app".into()),
+                ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ];
+            let candidate = LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            };
+            assert_eq!(workspace_rejection(candidate), None);
+            assert!(plan_canonical_workspace_execution(candidate, HOST).is_ok());
+            assert!(rejection(candidate).is_some());
+            assert!(remote_rejection(candidate).is_some());
+            assert!(canonical_remote_rejection(candidate).is_some());
+
+            argv[2] = "--emit=dep-info,metadata,link".into();
+            let linking = LiveRustcRequest {
+                argv: &argv,
+                cwd: "/__rabs/workspace",
+                env: &env,
+            };
+            assert!(workspace_rejection(linking).is_some());
+            assert!(plan_canonical_workspace_execution(linking, HOST).is_err());
         }
     }
 

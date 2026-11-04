@@ -16,7 +16,9 @@ const DISPOSITION_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_rabs_serving_dis
 /// No correctness judgment depends on either index. Failure rolls back this
 /// profile, reports the error, and leaves the mounted caller to close its store.
 /// Never rollback on BEGIN failure: a transaction we did not start is not ours.
-pub fn prepare_serving_indexes<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Result<(), StoreError> {
+pub fn prepare_serving_indexes<E: SqlEngine>(
+    store: &mut SqlMetadataStore<E>,
+) -> Result<(), StoreError> {
     install(store.engine_mut())
 }
 
@@ -72,9 +74,14 @@ mod tests {
             "SELECT passed FROM verification_samples WHERE passed < 1 OR passed > 1 ORDER BY passed",
             &[],
         ).unwrap();
-        assert_eq!(adverse, vec![
-            vec![SqlValue::Int(-1)], vec![SqlValue::Int(0)], vec![SqlValue::Int(2)],
-        ]);
+        assert_eq!(
+            adverse,
+            vec![
+                vec![SqlValue::Int(-1)],
+                vec![SqlValue::Int(0)],
+                vec![SqlValue::Int(2)],
+            ]
+        );
         before
     }
 
@@ -86,8 +93,11 @@ mod tests {
     #[test]
     fn both_metadata_engines_preserve_the_same_rows_and_predicates() {
         let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("rabs-read-indexes-{}-{nonce}", std::process::id()));
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rabs-read-indexes-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         assert_eq!(
             exercise(RusqliteEngine::open(&dir.join("reference.db")).unwrap()),
@@ -110,7 +120,11 @@ mod tests {
             self.engine.execute(sql, parameters)
         }
 
-        fn query(&mut self, sql: &str, parameters: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+        fn query(
+            &mut self,
+            sql: &str,
+            parameters: &[SqlValue],
+        ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
             self.engine.query(sql, parameters)
         }
     }
@@ -118,9 +132,14 @@ mod tests {
     #[test]
     fn every_failed_setup_boundary_rolls_back_without_data_or_partial_profile() {
         for statement in [OUTCOME_INDEX, DISPOSITION_INDEX, "COMMIT"] {
-            let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
             let before = store.differential_snapshot().unwrap();
-            let mut fault = FailOnce { engine: store.engine_mut(), statement, failed: false };
+            let mut fault = FailOnce {
+                engine: store.engine_mut(),
+                statement,
+                failed: false,
+            };
             assert!(install(&mut fault).is_err());
             assert!(fault.failed);
             assert!(fault.query(PROFILE, &[]).unwrap().is_empty());
@@ -141,7 +160,14 @@ mod tests {
         ).unwrap();
         assert!(install(engine).is_err());
         engine.execute("COMMIT", &[]).unwrap();
-        assert_eq!(engine.query("SELECT subject FROM decision_receipts WHERE kind = 'caller'", &[]).unwrap(),
-            vec![vec![SqlValue::Text("owned".into())]]);
+        assert_eq!(
+            engine
+                .query(
+                    "SELECT subject FROM decision_receipts WHERE kind = 'caller'",
+                    &[]
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Text("owned".into())]]
+        );
     }
 }

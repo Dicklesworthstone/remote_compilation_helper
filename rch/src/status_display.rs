@@ -1248,7 +1248,7 @@ pub fn circuit_state_explanation(
             (
                 "OPEN",
                 explanation,
-                "Wait for auto-recovery or run: rch workers probe <id> --force",
+                "Wait for auto-recovery or run: rch workers probe <id>",
             )
         }
         "half_open" => (

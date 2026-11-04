@@ -487,20 +487,43 @@ impl PreparedArtifacts {
         plan: &ArtifactPlan,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
-        use rabs_sandbox::artifact_tree::TreeInventory;
+        use rabs_sandbox::artifact_tree::{
+            MAX_PRIVATE_TREE_BYTES, TreeInventory, validate_tree_names,
+        };
         use std::os::unix::fs::PermissionsExt;
 
-        let inventory =
-            TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?;
+        let inventory = if plan.private_incremental_roots().is_some() {
+            TreeInventory::scan_private(
+                self.backing(),
+                &plan.files,
+                MAX_PRIVATE_TREE_BYTES,
+                &stopped,
+            )?
+        } else {
+            TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?
+        };
+        // The complete private tree has its own inventory budget. Only the
+        // independently derived compiler-state roots are omitted, and the
+        // exported namespace keeps its original file/directory limits.
+        let exported = validate_tree_names(
+            inventory
+                .names()
+                .filter(|name| !plan.is_private_incremental_file(name)),
+        )?;
+        let exported_entries = exported.len()
+            + inventory
+                .directory_names()
+                .filter(|name| !name.is_empty() && !plan.is_private_incremental_file(name))
+                .count();
+        if exported_entries > MAX_TREE_ENTRIES {
+            return Err(invalid("artifact tree directory entry limit exceeded"));
+        }
         let mut files = BTreeMap::new();
         let mut exported_bytes = 0_u64;
-        for name in inventory.names() {
+        for name in exported.iter().map(String::as_str) {
             // Scan the COMPLETE tree above, including private state, before
             // reading any payload. Symlinks, mounts, special files, external
             // hard links and mutation remain errors even in an omitted root.
-            if plan.is_private_incremental_file(name) {
-                continue;
-            }
             let file = inventory.open_file(name)?;
             let metadata = file.metadata()?;
             exported_bytes = exported_bytes
@@ -1608,6 +1631,73 @@ mod tests {
                         2 * b"private compiler state".len() as u64
                     }
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_incremental_inventory_has_a_separate_budget_from_delivery() {
+        use rabs_sandbox::cargo_artifacts::{
+            CARGO_ARTIFACTS_VERSION, CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        };
+        let report = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/debug/deps/libapp.rmeta\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        for private in [false, true] {
+            for case in [
+                "private-files",
+                "private-bytes",
+                "public-files",
+                "public-bytes",
+            ] {
+                let request = serde_json::json!({
+                    "program":"/__rabs/toolchain/bin/cargo",
+                    "args":["check", "--message-format=json", "--target-dir", "/__rabs/out/cargo"],
+                    "command_context":{"env":{"CARGO_INCREMENTAL":"1"}},
+                    "artifacts":{"unit":"cargo", "tree":TREE_FILES_VERSION, "files":[],
+                        "cargo":if private { CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION } else { CARGO_ARTIFACTS_VERSION }},
+                });
+                let prepared =
+                    PreparedArtifacts::new(parse_plan(&request).unwrap().unwrap()).unwrap();
+                fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+                fs::create_dir_all(prepared.backing().join("debug/incremental/unit")).unwrap();
+                fs::write(
+                    prepared.backing().join("debug/deps/libapp.rmeta"),
+                    b"metadata",
+                )
+                .unwrap();
+                let directory = if case.starts_with("private-") {
+                    prepared.backing().join("debug/incremental/unit")
+                } else {
+                    prepared.backing().join("debug/deps")
+                };
+                if case.ends_with("files") {
+                    for index in 0..MAX_TREE_FILES {
+                        fs::write(directory.join(format!("state{index}")), []).unwrap();
+                    }
+                } else {
+                    // Only metadata is inventoried; private payloads must not
+                    // be read, copied or charged as exported artifact bytes.
+                    File::create(directory.join("state"))
+                        .unwrap()
+                        .set_len(MAX_ARTIFACT_BYTES + 1)
+                        .unwrap();
+                }
+                let captured =
+                    prepared.capture_with_cargo_output(None, report.as_bytes(), || false);
+                if private && case.starts_with("private-") {
+                    let captured = captured.unwrap();
+                    assert_eq!(captured.total_bytes(), 8);
+                    assert_eq!(
+                        captured.file_names().collect::<Vec<_>>(),
+                        ["debug/deps/libapp.rmeta"]
+                    );
+                } else {
+                    assert!(captured.is_err(), "{case}, private={private}");
+                }
+            }
         }
     }
 

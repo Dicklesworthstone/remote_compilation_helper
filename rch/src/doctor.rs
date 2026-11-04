@@ -2690,7 +2690,7 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
 
     if severity != ReliabilitySeverity::Pass {
         diagnostic = diagnostic.with_remediation(
-            format!("rch workers probe {} --force", worker.id),
+            format!("rch workers probe {}", worker.id),
             "rch status --workers --json",
         );
     }

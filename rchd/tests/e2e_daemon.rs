@@ -455,8 +455,18 @@ fn test_daemon_shutdown() {
     // The graceful-shutdown CONTRACT (d3096217): /shutdown is refused while
     // admission is open — a wrapper could still be handed this daemon
     // mid-restart — and proceeds only once the restart-admission barrier is
-    // raised and no builds are active or queued. Pin both halves.
-    let premature = send_socket_request(&socket_path, "POST /shutdown").unwrap();
+    // raised and no builds are active or queued. Pin both halves. Every
+    // shutdown names a maintenance fence (#118; a bare request no longer
+    // parses), so the premature one carries a well-formed fence nobody holds.
+    let status = send_socket_request(&socket_path, "GET /restart-admission").unwrap();
+    let observed: rch_common::RestartAdmissionResponse =
+        serde_json::from_str(extract_json_body(&status).unwrap()).unwrap();
+    let unheld = format!(
+        "daemon_incarnation={}&token={}",
+        observed.daemon_incarnation,
+        uuid::Uuid::new_v4()
+    );
+    let premature = send_socket_request(&socket_path, &format!("POST /shutdown?{unheld}")).unwrap();
     let premature_body = extract_json_body(&premature).unwrap();
     assert!(
         !premature_body.contains("\"status\":\"shutting_down\""),

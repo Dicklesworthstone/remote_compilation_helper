@@ -26,14 +26,11 @@ impl Closure {
     pub(super) fn still_current(&self) -> bool {
         let directories_current = || {
             self.directories.iter().all(|(path, signature)| {
-                std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-                    metadata.is_dir() && FileSig::of(&metadata) == *signature
-                })
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir() && FileSig::of(&metadata) == *signature)
             })
         };
-        directories_current()
-            && self.links.iter().all(Link::still_current)
-            && directories_current()
+        directories_current() && self.links.iter().all(Link::still_current) && directories_current()
     }
 }
 

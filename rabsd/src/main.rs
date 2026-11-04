@@ -10,6 +10,8 @@
 //! - `--check-config` — parse + validate config, print resolved values
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
+//! - `--canonical-compile-local` — canonical local Cargo commands with dependency caching
+//! - `--canonical-compile-service` — one persistent coordinator for concurrent canonical builds
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
@@ -63,6 +65,20 @@ impl Default for RabsConfig {
 
 fn default_under_home(rel: &str) -> String {
     std::env::var("HOME").map_or_else(|_| format!("/tmp/{rel}"), |h| format!("{h}/{rel}"))
+}
+
+/// Direct daemon and doctor startup must create the same private state root as
+/// cargo-rabs. Existing permissions remain evidence for the cache admission
+/// checks; creating a directory must never silently repair someone else's root.
+fn prepare_state_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn parse_release_authorization_mode(
@@ -242,7 +258,7 @@ fn run_doctor() -> i32 {
         .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
     let state_dir_writable = {
         let dir = std::path::Path::new(&state_dir);
-        std::fs::create_dir_all(dir).is_ok()
+        prepare_state_directory(dir).is_ok()
             && std::fs::write(dir.join(".doctor-probe"), b"ok").is_ok()
             && std::fs::remove_file(dir.join(".doctor-probe")).is_ok()
     };
@@ -425,6 +441,28 @@ fn main() {
                 "rabsd {VERSION} — RABS edge+coordinator daemon\n\
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
+                 CANONICAL LOCAL: rabsd --canonical-compile-local <profile.json>\n\
+                 Captures source/toolchain, then runs selected cargo check/build/clippy/test/run/bench --offline --locked at canonical paths.\n\
+                 profile version canonical-compile-local-v1 requires source_root, toolchain_root, state_root,\n\
+                 operation_root and wrapper absolute paths; state/operation roots must already be private (0700).\n\
+                 Optional manifest (Cargo.toml), vendor or cargo_home_source, jobs (1), timeout_seconds (1800).\n\
+                 command is check (default), build, clippy, test, run or bench; selection chooses packages, features, targets and profiles.\n\
+                 A check without selection means --lib; build, test --no-run and bench --no-run retain their completed target directory.\n\
+                 Clippy requires captured cargo-clippy/clippy-driver, supports no_deps and lint_args, and never serves lint action-cache hits.\n\
+                 Test selection accepts doc, no_run, no_fail_fast, test_filter and literal test_args after --.\n\
+                 Tests/doctests execute on every request; doctests use captured rustdoc and failures retain Cargo's status.\n\
+                 Run selects one binary/example with literal run_args; Bench supports no_run, no_fail_fast, test_filter and test_args.\n\
+                 Run/Bench bodies execute every time and require nonterminal stdin: use a pipe, file or /dev/null.\n\
+                 Linux namespaces and nightly Cargo unit-graph planning are required.\n\
+                 Test, Clippy, Run, Bench and selected build-script/proc-macro graphs require isolated workers for dependency cache authority.\n\
+                 Without a worker those units compile normally; source/HOME are read-only and networking is isolated.\n\
+                 External metadata and isolated worker archives use the evidence-gated cache; workspace crates compile normally.\n\
+                 This mode honors the configured build identity and release authorization policy.\n\
+                 CANONICAL SERVICE: rabsd --canonical-compile-service <service.json>\n\
+                 service version canonical-compile-service-v1 requires state_root, socket, max_roots and jobs_per_root.\n\
+                 Set service_socket in a canonical local profile to attach to that running service.\n\
+                 Independent builds share one coordinator and worker pool, with private targets and scoped cancellation.\n\
+                 Busy or unavailable services fail without local fallback. Run and executing Bench require standalone profiles.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
@@ -469,6 +507,82 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
+        }
+        Some("--canonical-compile-service") => {
+            if args.len() != 2 {
+                eprintln!("usage: rabsd --canonical-compile-service <service.json>");
+                std::process::exit(2);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let config = match load_config() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("rabsd: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                let result = rabsd::coord::canonical_local::service::run_service_profile(
+                    std::path::Path::new(&args[1]),
+                    config.release_authorization,
+                    config.build_identity,
+                );
+                let code = match result {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("rabsd canonical service: {error}");
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("rabsd canonical service requires Linux namespace support");
+                std::process::exit(2);
+            }
+        }
+        Some("--canonical-compile-local") => {
+            if args.len() != 2 {
+                eprintln!("usage: rabsd --canonical-compile-local <profile.json>");
+                std::process::exit(2);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let config = match load_config() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("rabsd: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                let result = rabsd::coord::canonical_local::run_profile_with_release(
+                    std::path::Path::new(&args[1]),
+                    config.release_authorization,
+                    config.build_identity,
+                );
+                let code = match result {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("rabsd canonical compilation: {error}");
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("rabsd canonical check requires Linux namespace support");
+                std::process::exit(2);
+            }
         }
         Some("--worker-prepare") => {
             std::process::exit(run_prepare(&args[1..]));
@@ -634,8 +748,10 @@ fn main() {
     // that may commit (I8/I9/I10) — publishes through it. A failed mount
     // is carried into the janitor region so it still lands in the
     // shutdown receipt as that region's abandoned obligation.
-    let mounted =
-        rabsd::janitor::store::mount_and_reconcile(&state_dir.join("cas")).map(std::sync::Arc::new);
+    let mounted = prepare_state_directory(&state_dir)
+        .map_err(|error| format!("state root {}: {error}", state_dir.display()))
+        .and_then(|()| rabsd::janitor::store::mount_and_reconcile(&state_dir.join("cas")))
+        .map(std::sync::Arc::new);
     // The live coordinator (S6): shared edge<->coord in-process, with
     // the structural authority split intact — the coord region owns its
     // availability; the edge only consults it.

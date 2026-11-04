@@ -53,7 +53,10 @@ fn loaded_backend_bytes_join_the_existing_streaming_batch_and_fact_identity() {
     assert_eq!(changed.facts.verbose_version, version);
     assert_eq!(changed.facts.compiler_binary_digest, binary);
     assert_eq!(changed.facts.sysroot_root_digest, standard_library);
-    assert_ne!(changed.facts.runtime_libraries, first.facts.runtime_libraries);
+    assert_ne!(
+        changed.facts.runtime_libraries,
+        first.facts.runtime_libraries
+    );
 }
 
 #[test]
@@ -79,7 +82,11 @@ fn backend_names_and_nested_members_are_canonical_inputs() {
     let (dir, compiler) = toolchain_fixture();
     let backend = backend_file(&compiler);
     let first = probe_toolchain(&compiler, &[]).unwrap();
-    std::fs::rename(&backend, backend.with_file_name("librustc_codegen_other.so")).unwrap();
+    std::fs::rename(
+        &backend,
+        backend.with_file_name("librustc_codegen_other.so"),
+    )
+    .unwrap();
     let renamed = probe_toolchain(&compiler, &[]).unwrap();
     assert_ne!(
         first.facts, renamed.facts,

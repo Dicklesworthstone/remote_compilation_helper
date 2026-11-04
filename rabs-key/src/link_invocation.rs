@@ -190,6 +190,178 @@ impl NormalizedLinkInvocation {
     }
 }
 
+/// Digest domain for the linker implicit search closure (`L011`, risk `R123`).
+pub const DOMAIN_LINKER_IMPLICIT_CLOSURE: &str = "rabs.linker-implicit-closure.v1";
+
+/// One resolved `-l<name>` or framework search hit (`L011`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLinkerSearchItem {
+    /// Requested logical name (`"-lz"`, `"framework:CoreFoundation"`).
+    pub requested_name: String,
+    /// Selected canonical virtual path inside the closed view.
+    pub selected_virtual_path: String,
+    /// Content identity of the selected library/framework/object.
+    pub object: ObjectId,
+    /// Earlier `-L` / framework / sysroot search directories probed and found NOT
+    /// containing a matching candidate before `selected_virtual_path` won.
+    pub earlier_missed_paths: Vec<String>,
+}
+
+/// Discovered implicit linker search closure (`L011`, risk `R123`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkerImplicitSearchClosure {
+    /// Ordered `-l` / framework resolutions in link order.
+    pub resolved_libraries: Vec<ResolvedLinkerSearchItem>,
+    /// Ordered CRT / startup objects (`crt1.o`, `crti.o`, `crtbegin.o`, `crtend.o`, `crtn.o`).
+    pub crt_startup_objects: Vec<(String, ObjectId)>,
+    /// Default or implicit linker scripts read (e.g. GNU `libc.so` linker script + `GROUP` members).
+    pub implicit_linker_scripts: Vec<(String, TypedDigest)>,
+    /// Linker plugins loaded (`-plugin` / `liblto_plugin.so`).
+    pub linker_plugins: Vec<(String, ObjectId)>,
+    /// Included `@response` files by content digest.
+    pub response_files: Vec<(String, TypedDigest)>,
+    /// Search directories from `-L`, `LIBRARY_PATH`, `rustc-link-search`, or built-in linker defaults.
+    pub search_directories: Vec<String>,
+}
+
+/// Shareability and enforcement decision for a link action's implicit search closure (`L011`, `R123`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkerClosureShareability {
+    /// All search paths and observed linker reads lie strictly inside the closed
+    /// RABS view; returns the positive closure digest and negative-lookup digest.
+    ShareableClosedView {
+        /// Digest of all selected libraries, CRT objects, scripts, plugins, and response files.
+        closure_digest: TypedDigest,
+        /// Digest of the [`rabs_protocol::input_evidence::NegativeDependencySet`] for missed earlier search candidates.
+        negative_dependencies_digest: TypedDigest,
+    },
+    /// Linker search path includes an uncontrolled host system directory outside
+    /// the closed RABS view (`R122`/`R123`); link must stay local/nonshareable.
+    LocalOnlyUncontrolledSearchPath {
+        /// Offending search directories outside the closed view.
+        uncontrolled_paths: Vec<String>,
+    },
+    /// Linker read a file not declared in its closure during closed-view execution (`E021`/`L011`).
+    AbortUndeclaredLinkerRead {
+        /// The undeclared path read by the linker.
+        path: String,
+    },
+}
+
+impl LinkerImplicitSearchClosure {
+    /// Construct the [`rabs_protocol::input_evidence::NegativeDependencySet`]
+    /// recording all failed earlier candidate paths probed before each selected library (`L011`).
+    #[must_use]
+    pub fn to_negative_dependency_set(
+        &self,
+    ) -> rabs_protocol::input_evidence::NegativeDependencySet {
+        use rabs_protocol::input_evidence::{
+            INPUT_EVIDENCE_SCHEMA_VERSION, NegativeDependency, NegativeDependencySet,
+        };
+        use rabs_protocol::raw_bytes::RawBytes;
+
+        let mut entries = Vec::new();
+        for item in &self.resolved_libraries {
+            for missed in &item.earlier_missed_paths {
+                entries.push(NegativeDependency::FailedOpen {
+                    virtual_path: RawBytes::new(missed.as_bytes().to_vec()),
+                });
+            }
+        }
+        NegativeDependencySet {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            entries,
+        }
+    }
+
+    /// Canonical digest of the positive implicit linker closure (`L011`).
+    #[must_use]
+    pub fn closure_digest(&self) -> TypedDigest {
+        let mut enc = CanonicalEncoder::new();
+        enc.seq(&self.resolved_libraries, |enc, item| {
+            enc.str(&item.requested_name)
+                .str(&item.selected_virtual_path)
+                .str(item.object.0.domain)
+                .bytes(&item.object.0.bytes);
+        });
+        enc.seq(&self.crt_startup_objects, |enc, (path, obj)| {
+            enc.str(path).str(obj.0.domain).bytes(&obj.0.bytes);
+        });
+        enc.seq(&self.implicit_linker_scripts, |enc, (path, dig)| {
+            enc.str(path).str(dig.domain).bytes(&dig.bytes);
+        });
+        enc.seq(&self.linker_plugins, |enc, (path, obj)| {
+            enc.str(path).str(obj.0.domain).bytes(&obj.0.bytes);
+        });
+        enc.seq(&self.response_files, |enc, (path, dig)| {
+            enc.str(path).str(dig.domain).bytes(&dig.bytes);
+        });
+        compute(DOMAIN_LINKER_IMPLICIT_CLOSURE, &enc.finish())
+    }
+}
+
+fn path_within_allowed_prefixes(path: &str, allowed_prefixes: &[&str]) -> bool {
+    if path.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    allowed_prefixes
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+/// Evaluate and enforce a [`LinkerImplicitSearchClosure`] under the closed linker
+/// filesystem view (`L011`, risks `R122`/`R123`).
+#[must_use]
+pub fn evaluate_linker_implicit_closure(
+    closure: &LinkerImplicitSearchClosure,
+    closed_view_allowed_prefixes: &[&str],
+    observed_linker_reads: &[String],
+) -> LinkerClosureShareability {
+    let mut uncontrolled_paths = Vec::new();
+    for dir in &closure.search_directories {
+        if !path_within_allowed_prefixes(dir, closed_view_allowed_prefixes) {
+            uncontrolled_paths.push(dir.clone());
+        }
+    }
+    if !uncontrolled_paths.is_empty() {
+        return LinkerClosureShareability::LocalOnlyUncontrolledSearchPath { uncontrolled_paths };
+    }
+
+    let mut declared_reads: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for item in &closure.resolved_libraries {
+        declared_reads.insert(item.selected_virtual_path.as_str());
+    }
+    for (path, _) in &closure.crt_startup_objects {
+        declared_reads.insert(path.as_str());
+    }
+    for (path, _) in &closure.implicit_linker_scripts {
+        declared_reads.insert(path.as_str());
+    }
+    for (path, _) in &closure.linker_plugins {
+        declared_reads.insert(path.as_str());
+    }
+    for (path, _) in &closure.response_files {
+        declared_reads.insert(path.as_str());
+    }
+
+    for read in observed_linker_reads {
+        if !path_within_allowed_prefixes(read, closed_view_allowed_prefixes)
+            || !declared_reads.contains(read.as_str())
+        {
+            return LinkerClosureShareability::AbortUndeclaredLinkerRead { path: read.clone() };
+        }
+    }
+
+    let negdeps = closure.to_negative_dependency_set();
+    let negative_dependencies_digest =
+        crate::action_key::negative_dependency_set_digest(&negdeps).expect("valid schema version");
+
+    LinkerClosureShareability::ShareableClosedView {
+        closure_digest: closure.closure_digest(),
+        negative_dependencies_digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +526,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lld.invocation_digest(), spelled.invocation_digest());
+    }
+
+    #[test]
+    fn t045_directive_path_closure_and_linker_implicit_search_differential_scenarios() {
+        let allowed = &[
+            "/__rabs/workspace",
+            "/__rabs/out",
+            "/__rabs/toolchain",
+            "/__rabs/sysroot",
+        ];
+
+        let base_closure = LinkerImplicitSearchClosure {
+            resolved_libraries: vec![ResolvedLinkerSearchItem {
+                requested_name: "-lz".into(),
+                selected_virtual_path: "/__rabs/sysroot/usr/lib/libz.a".into(),
+                object: ObjectId(d("rabs.object.v1", 0x20)),
+                earlier_missed_paths: vec![
+                    "/__rabs/out/build-z/lib/libz.so".into(),
+                    "/__rabs/out/build-z/lib/libz.a".into(),
+                ],
+            }],
+            crt_startup_objects: vec![
+                (
+                    "/__rabs/sysroot/usr/lib/crt1.o".into(),
+                    ObjectId(d("rabs.object.v1", 0x21)),
+                ),
+                (
+                    "/__rabs/sysroot/usr/lib/crti.o".into(),
+                    ObjectId(d("rabs.object.v1", 0x22)),
+                ),
+            ],
+            implicit_linker_scripts: vec![(
+                "/__rabs/sysroot/usr/lib/libc.so".into(),
+                d("rabs.linker-script.v1", 0x23),
+            )],
+            linker_plugins: vec![(
+                "/__rabs/toolchain/lib/liblto_plugin.so".into(),
+                ObjectId(d("rabs.object.v1", 0x24)),
+            )],
+            response_files: vec![(
+                "/__rabs/out/link.rsp".into(),
+                d("rabs.response-file.v1", 0x25),
+            )],
+            search_directories: vec![
+                "/__rabs/out/build-z/lib".into(),
+                "/__rabs/sysroot/usr/lib".into(),
+            ],
+        };
+
+        let observed_reads = vec![
+            "/__rabs/sysroot/usr/lib/libz.a".to_string(),
+            "/__rabs/sysroot/usr/lib/crt1.o".to_string(),
+            "/__rabs/sysroot/usr/lib/crti.o".to_string(),
+            "/__rabs/sysroot/usr/lib/libc.so".to_string(),
+            "/__rabs/toolchain/lib/liblto_plugin.so".to_string(),
+            "/__rabs/out/link.rsp".to_string(),
+        ];
+
+        let LinkerClosureShareability::ShareableClosedView {
+            closure_digest: base_closure_digest,
+            negative_dependencies_digest: base_neg_digest,
+        } = evaluate_linker_implicit_closure(&base_closure, allowed, &observed_reads)
+        else {
+            panic!("expected ShareableClosedView");
+        };
+
+        // Differential 1 (R123): Mutating the selected system library content (`libz.a`) changes closure_digest.
+        let mut mutated_syslib = base_closure.clone();
+        mutated_syslib.resolved_libraries[0].object = ObjectId(d("rabs.object.v1", 0x99));
+        let LinkerClosureShareability::ShareableClosedView {
+            closure_digest: syslib_digest,
+            ..
+        } = evaluate_linker_implicit_closure(&mutated_syslib, allowed, &observed_reads)
+        else {
+            panic!("expected ShareableClosedView");
+        };
+        assert_ne!(syslib_digest, base_closure_digest);
+
+        // Differential 2 (R123): Earlier `-L` directory (`/__rabs/out/build-z/lib`) gains a shadowing `libz.a`:
+        // negative_dependencies_digest and closure_digest both change!
+        let mut shadowed = base_closure.clone();
+        shadowed.resolved_libraries[0].selected_virtual_path =
+            "/__rabs/out/build-z/lib/libz.a".into();
+        shadowed.resolved_libraries[0].object = ObjectId(d("rabs.object.v1", 0x77));
+        shadowed.resolved_libraries[0].earlier_missed_paths =
+            vec!["/__rabs/out/build-z/lib/libz.so".into()];
+        let shadowed_reads = vec![
+            "/__rabs/out/build-z/lib/libz.a".to_string(),
+            "/__rabs/sysroot/usr/lib/crt1.o".to_string(),
+            "/__rabs/sysroot/usr/lib/crti.o".to_string(),
+            "/__rabs/sysroot/usr/lib/libc.so".to_string(),
+            "/__rabs/toolchain/lib/liblto_plugin.so".to_string(),
+            "/__rabs/out/link.rsp".to_string(),
+        ];
+        let LinkerClosureShareability::ShareableClosedView {
+            closure_digest: shadowed_closure_digest,
+            negative_dependencies_digest: shadowed_neg_digest,
+        } = evaluate_linker_implicit_closure(&shadowed, allowed, &shadowed_reads)
+        else {
+            panic!("expected ShareableClosedView");
+        };
+        assert_ne!(shadowed_closure_digest, base_closure_digest);
+        assert_ne!(shadowed_neg_digest, base_neg_digest);
+
+        // Differential 3 (R122/N014/L011): `rustc-link-search` or linker default search path
+        // resolving outside the closed view (`/usr/local/lib`) forces LocalOnlyUncontrolledSearchPath!
+        let mut uncontrolled = base_closure.clone();
+        uncontrolled
+            .search_directories
+            .push("/usr/local/lib".into());
+        assert_eq!(
+            evaluate_linker_implicit_closure(&uncontrolled, allowed, &observed_reads),
+            LinkerClosureShareability::LocalOnlyUncontrolledSearchPath {
+                uncontrolled_paths: vec!["/usr/local/lib".into()],
+            }
+        );
+
+        // Differential 4 (E021/L011): Undeclared linker read during closed-view execution aborts!
+        let mut escaping_reads = observed_reads.clone();
+        escaping_reads.push("/__rabs/sysroot/usr/lib/libundeclared.a".into());
+        assert_eq!(
+            evaluate_linker_implicit_closure(&base_closure, allowed, &escaping_reads),
+            LinkerClosureShareability::AbortUndeclaredLinkerRead {
+                path: "/__rabs/sysroot/usr/lib/libundeclared.a".into(),
+            }
+        );
     }
 }

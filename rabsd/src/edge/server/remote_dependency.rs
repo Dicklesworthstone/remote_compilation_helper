@@ -1,10 +1,12 @@
 //! A long worker compile owns private output only. Installation has a second
 //! acknowledged frontier, so caller loss during compilation cannot leave a
 //! delayed writer targeting Cargo's directory.
-use super::liveness::{Limit, OwnedWork, Permit, WorkError};
+use super::liveness::{Limit, OwnedWork, Permit};
 use super::rustc_request::LiveEdge;
 use super::{EdgeStream, backpressure, read_frame, write_frame};
-use crate::coord::live_dependency::remote::{PendingRemote, PendingRemoteInstall, RemoteResult};
+use crate::coord::live_dependency::remote::{
+    PendingRemote, PendingRemoteInstall, PendingSharedRemote, RemoteResult,
+};
 use crate::coord::live_dependency::{InstallResult, MAX_TRANSCRIPT_BYTES};
 use crate::coord::secure_worker_delivery::OperationCancellation;
 use asupersync::io::AsyncBufRead;
@@ -46,8 +48,8 @@ impl Drop for RemoteWork {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum Waited {
-    Completed(Result<RemoteResult, WorkError>),
+enum Waited<T> {
+    Completed(T),
     CallerLost,
 }
 
@@ -58,10 +60,11 @@ async fn caller_activity(reader: &mut (impl AsyncBufRead + Unpin)) {
     poll_fn(|cx| Pin::new(&mut *reader).poll_fill_buf(cx).map(|_| ())).await;
 }
 
-async fn wait_owned(owner: &mut RemoteWork, stream: &mut EdgeStream) -> Waited {
-    let mut completed = pin!(owner.work.wait());
+async fn wait_result<T>(work: impl Future<Output = T>, stream: &mut EdgeStream) -> Waited<T> {
+    let mut completed = pin!(work);
     // There is no valid caller message during private execution. EOF, a
-    // premature ACK, malformed data or the bounded deadline all cancel it.
+    // premature ACK, malformed data or the bounded deadline detach this
+    // caller. Its owner decides whether any other interest keeps work alive.
     let mut caller = pin!(asupersync::time::timeout(
         asupersync::time::wall_now(),
         REMOTE_WAIT,
@@ -77,6 +80,17 @@ async fn wait_owned(owner: &mut RemoteWork, stream: &mut EdgeStream) -> Waited {
         }
     })
     .await
+}
+
+async fn accept_execution(stream: &mut EdgeStream, reply: &str, key: &str) -> bool {
+    write_frame(stream, reply).await
+        && read_frame(stream).await.is_some_and(|frame| {
+            serde_json::from_slice::<Value>(&frame).is_ok_and(|value| {
+                value["kind"] == "rustc-remote-accept"
+                    && value["remote_protocol"].as_u64() == Some(1)
+                    && value["action_key"].as_str() == Some(key)
+            })
+        })
 }
 
 enum InstallationCapacity {
@@ -123,15 +137,7 @@ pub(super) async fn complete_on_connection(
         return Some(backpressure::capacity_reply(may_wait, "remote-execution"));
     };
     let key = digest_key(pending.action_key());
-    let accepted = write_frame(stream, &reply).await
-        && read_frame(stream).await.is_some_and(|frame| {
-            serde_json::from_slice::<Value>(&frame).is_ok_and(|value| {
-                value["kind"] == "rustc-remote-accept"
-                    && value["remote_protocol"].as_u64() == Some(1)
-                    && value["action_key"].as_str() == Some(key.as_str())
-            })
-        });
-    if !accepted {
+    if !accept_execution(stream, &reply, &key).await {
         drop(pending);
         return None;
     }
@@ -142,7 +148,7 @@ pub(super) async fn complete_on_connection(
         Err(error) => return Some(failure(&key, error, true)),
     };
     let mut owned = RemoteWork { work, cancellation };
-    let result = match wait_owned(&mut owned, stream).await {
+    let result = match wait_result(owned.work.wait(), stream).await {
         Waited::Completed(Ok(result)) => result,
         Waited::Completed(Err(error)) => return Some(failure(&key, error, false)),
         Waited::CallerLost => {
@@ -153,6 +159,46 @@ pub(super) async fn complete_on_connection(
             return None;
         }
     };
+    complete_result(installations, live, &key, result, stream).await
+}
+
+/// The shared service owns and joins the producer. An edge owns only this
+/// subscription; disconnect or region cancellation never joins or cancels a
+/// compiler still needed by another accepted build. Worker reservations and
+/// the service supervisor bound producers, so followers consume no execution
+/// lane or additional blocking thread.
+pub(super) async fn complete_shared_on_connection(
+    installations: &Limit,
+    live: Arc<LiveEdge>,
+    pending: Box<PendingSharedRemote>,
+    reply: String,
+    stream: &mut EdgeStream,
+) -> Option<String> {
+    let key = digest_key(pending.action_key());
+    if !accept_execution(stream, &reply, &key).await {
+        return None;
+    }
+    let mut subscription = match (*pending).accept() {
+        Ok(subscription) => subscription,
+        Err(error) => return Some(failure(&key, error, true)),
+    };
+    let result = match wait_result(subscription.wait(), stream).await {
+        Waited::Completed(result) => result,
+        Waited::CallerLost => return None,
+    };
+    complete_result(installations, live, &key, result, stream).await
+}
+
+/// Both single-owner and shared execution cross the same independent writer
+/// frontier. A producer result is never permission to mutate a target until
+/// this connection accepts its exact manifest and owns installation capacity.
+async fn complete_result(
+    installations: &Limit,
+    live: Arc<LiveEdge>,
+    key: &str,
+    result: RemoteResult,
+    stream: &mut EdgeStream,
+) -> Option<String> {
     let pending = match result {
         RemoteResult::Ready(pending) => pending,
         RemoteResult::Failed {
@@ -161,9 +207,9 @@ pub(super) async fn complete_on_connection(
         } => {
             super::log_line(
                 "rabsd-remote-dependency-failed",
-                &[("key", &key), ("reason", &reason)],
+                &[("key", key), ("reason", &reason)],
             );
-            return Some(failure(&key, reason, execution_finished));
+            return Some(failure(key, reason, execution_finished));
         }
     };
     let installation = match wait_installation(installations, stream).await {
@@ -171,7 +217,7 @@ pub(super) async fn complete_on_connection(
         InstallationCapacity::CallerLost => return None,
         InstallationCapacity::TimedOut => {
             return Some(failure(
-                &key,
+                key,
                 "remote result is complete but installation capacity did not become available",
                 true,
             ));
@@ -201,9 +247,9 @@ pub(super) async fn complete_on_connection(
         Ok(mut work) => Some(
             work.wait()
                 .await
-                .unwrap_or_else(|error| failure(&key, error, true)),
+                .unwrap_or_else(|error| failure(key, error, true)),
         ),
-        Err(error) => Some(failure(&key, error, true)),
+        Err(error) => Some(failure(key, error, true)),
     }
 }
 
@@ -246,10 +292,12 @@ fn install(live: Arc<LiveEdge>, pending: PendingRemoteInstall) -> String {
 mod tests {
     use super::super::{FRAME_READ_BUFFER_BYTES, MATERIALIZATION_WORKERS};
     use super::*;
+    use crate::coord::live_dependency::shared_work::SharedWork;
     use asupersync::net::unix::UnixListener;
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::daemon_runtime::block_on_top_level;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     #[derive(Clone, Copy)]
@@ -383,6 +431,116 @@ mod tests {
     #[test]
     fn premature_partial_ack_cancels_a_queued_installer_without_consuming_input() {
         installation_wait_with_native_peer(InstallationPeerAction::PartialAck);
+    }
+
+    /// Exercise the actual socket reactor and shared native-work owner. The
+    /// channel result is a liveness fixture, not a compiler or cache result.
+    #[test]
+    fn shared_remote_disconnect_detaches_only_the_origin_socket() {
+        let root = crate::test_util::private_tempdir();
+        let path = root.path().join("shared.sock");
+        let owner = SharedWork::new(1, 2);
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (settle, settlement) = mpsc::channel();
+        let cancel_settle = settle.clone();
+        let mut origin = owner
+            .start(
+                1_u64,
+                move || {
+                    worker_cancelled.fetch_add(1, Ordering::SeqCst);
+                    let _ = cancel_settle.send(false);
+                },
+                move || {
+                    settlement
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap_or(false)
+                },
+            )
+            .unwrap();
+        let mut follower = owner.try_join(&1).expect("the live cohort is joinable");
+        let (queued, queue_observed) = mpsc::channel();
+        let (finished, finish_observed) = mpsc::channel();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let (peer, disconnected, retained, delivered) = block_on_top_level(&runtime, async {
+            let listener = UnixListener::bind(&path).await.unwrap();
+            let peer = std::thread::spawn(move || {
+                let origin = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                let _follower = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                queue_observed
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                origin.shutdown(std::net::Shutdown::Both).unwrap();
+                finish_observed
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            });
+            let (origin_socket, _) = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("the origin native peer did not connect")
+            .unwrap();
+            let (follower_socket, _) = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("the follower native peer did not connect")
+            .unwrap();
+            let mut origin_socket =
+                EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, origin_socket);
+            let mut follower_socket =
+                EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, follower_socket);
+            let disconnected = {
+                let mut waiting = pin!(wait_result(origin.wait(), &mut origin_socket));
+                let mut observed_pending = false;
+                let result = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    poll_fn(|cx| {
+                        let result = waiting.as_mut().poll(cx);
+                        if result.is_pending() && !observed_pending {
+                            observed_pending = true;
+                            queued.send(()).unwrap();
+                        }
+                        result
+                    }),
+                )
+                .await;
+                observed_pending && matches!(result, Ok(Waited::CallerLost))
+            };
+            // This is the production shared-connection cancellation path:
+            // discard only its subscription, without waiting for the worker.
+            drop(origin);
+            let retained = cancelled.load(Ordering::SeqCst) == 0;
+            let _ = settle.send(true);
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                wait_result(follower.wait(), &mut follower_socket),
+            )
+            .await;
+            let delivered = matches!(result, Ok(Waited::Completed(Ok(result))) if *result);
+            let _ = finished.send(());
+            (peer, disconnected, retained, delivered)
+        });
+        peer.join().unwrap();
+        drop(follower);
+        owner.shutdown().unwrap();
+        assert!(disconnected, "the original native socket did not detach");
+        assert!(
+            retained,
+            "origin loss cancelled the surviving subscriber's work"
+        );
+        assert!(
+            delivered,
+            "the surviving native socket lost its shared result"
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
     }
 
     #[test]

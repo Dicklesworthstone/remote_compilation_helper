@@ -21,7 +21,10 @@ impl Drop for EndpointOwner {
             Ok(true) => super::render_log_line("rabsd-edge-socket-retired", &[("socket", &path)]),
             Ok(false) => super::render_log_line(
                 "rabsd-edge-socket-retirement-skipped",
-                &[("socket", &path), ("reason", "absent or changed generation")],
+                &[
+                    ("socket", &path),
+                    ("reason", "absent or changed generation"),
+                ],
             ),
             Err(error) => super::render_log_line(
                 "rabsd-edge-socket-retirement-refused",

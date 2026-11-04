@@ -2,10 +2,10 @@
 //! state and Unix sockets. Only toolchain probes and compiled artifact bytes
 //! are fixtures; these are not executions of Cargo or rustc.
 
-use super::super::rustc_request::{Decided, LiveEdge, complete_on_lane, decide};
+use super::super::rustc_request::{Decided, LiveEdge, PublicationPause, complete_on_lane, decide};
 use super::super::{
-    EdgeLimits, EdgeServices, EdgeStream, FRAME_READ_BUFFER_BYTES, LIVE_DECISION_WORKERS,
-    MATERIALIZATION_WORKERS, handle_connection,
+    CanonicalActivity, EdgeLimits, EdgeServices, EdgeStream, FRAME_READ_BUFFER_BYTES,
+    LIVE_DECISION_WORKERS, MATERIALIZATION_WORKERS, accept_loop, endpoint, handle_connection,
 };
 use super::{Limit, OwnedWork};
 use crate::coord::live::CoordLive;
@@ -404,6 +404,8 @@ fn run_connection(
         coord: fixture.coord.edge_subscriber(),
         prepared_operations: None,
         live: Some(Arc::clone(&fixture.live)),
+        canonical_only: false,
+        canonical_activity: None,
     };
     let runtime = RuntimeBuilder::current_thread().build().unwrap();
     block_on_top_level(&runtime, async {
@@ -627,4 +629,187 @@ fn saturated_installation_retries_before_consent_then_serves_the_same_request() 
     assert_capacity_returned(&limits.live, LIVE_DECISION_WORKERS);
     assert_eq!(std::fs::read(&metadata).unwrap(), ARTIFACT);
     assert_eq!(std::fs::read(&dep_info).unwrap(), expected_dep_info);
+}
+
+#[test]
+fn canonical_drain_waits_for_acknowledged_publication_after_wrapper_exit() {
+    use asupersync::signal::ShutdownController;
+    use rabs_asupersync::daemon_runtime::{DaemonRunOptions, SubsystemWork, run_daemon_controlled};
+    use std::io::Read;
+
+    // The real acceptor, connection handler, capture and publication run here.
+    // Host-path facts deliberately reuse this protocol fixture: this is the
+    // canonical driver's lifetime barrier, not a native namespace/Cargo test.
+    let mut fixture = Fixture::new();
+    let (reached, paused) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    Arc::get_mut(&mut fixture.live).unwrap().publication_pause = Some(PublicationPause {
+        reached,
+        release: std::sync::Mutex::new(released),
+    });
+    let activity = CanonicalActivity::new();
+    let services = EdgeServices {
+        shadow: Arc::new(std::sync::Mutex::new(
+            crate::edge::shadow::ShadowPlane::open(&fixture.root.join("drain-shadow")).unwrap(),
+        )),
+        coord: fixture.coord.edge_subscriber(),
+        prepared_operations: None,
+        live: Some(Arc::clone(&fixture.live)),
+        canonical_only: false,
+        canonical_activity: Some(Arc::clone(&activity)),
+    };
+    let path = fixture.root.join("drain.sock");
+    let endpoint_path = path.clone();
+    let (ready, listening) = mpsc::channel();
+    let edge: SubsystemWork = Box::new(move |cx, mut shutdown| {
+        Box::pin(async move {
+            let listener = endpoint::bind(&endpoint_path, Duration::from_secs(5)).await?;
+            let owner_uid = listener.owner_uid();
+            let acceptor = cx
+                .spawn(move |cx| {
+                    accept_loop(
+                        cx,
+                        listener,
+                        AdmissionPolicy {
+                            expected_uid: owner_uid,
+                            require_token_on_unix: false,
+                            tcp_enabled: false,
+                        },
+                        SocketMetadata {
+                            owner_uid,
+                            mode: 0o600,
+                        },
+                        services,
+                        EdgeLimits::new(0),
+                    )
+                })
+                .map_err(|error| format!("fixture acceptor spawn: {error:?}"))?;
+            ready.send(()).map_err(|error| error.to_string())?;
+            shutdown.wait().await;
+            acceptor.abort();
+            Ok(())
+        })
+    });
+    let coord = Arc::clone(&fixture.coord);
+    let coordinator: SubsystemWork = Box::new(move |_, mut shutdown| {
+        Box::pin(async move {
+            shutdown.wait().await;
+            coord.mark_down();
+            Ok(())
+        })
+    });
+    let options = DaemonRunOptions {
+        edge_work: Some(edge),
+        coord_work: Some(coordinator),
+        ..DaemonRunOptions::default()
+    };
+    let controller = Arc::new(ShutdownController::new());
+    struct StopOnDrop(Arc<ShutdownController>, mpsc::Sender<()>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            let _ = self.1.send(());
+            self.0.shutdown();
+        }
+    }
+    std::thread::scope(|scope| {
+        // Release a blocked runtime even when a protocol assertion panics;
+        // the scoped join still proves that no publication worker survives.
+        let _shutdown = StopOnDrop(Arc::clone(&controller), release.clone());
+        let server_controller = Arc::clone(&controller);
+        let server = scope.spawn(move || run_daemon_controlled(options, server_controller));
+        listening.recv_timeout(Duration::from_secs(10)).unwrap();
+        let peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut peer = BufReader::new(peer);
+        let hello = json!({"kind":"hello",
+            "transport":{"minimum_compatible":1,"current":1},
+            "application":{"minimum_compatible":1,"current":1}});
+        writeln!(peer.get_mut(), "{hello}").unwrap();
+        assert_eq!(read_reply(&mut peer)["kind"], "hello-ok");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let decision = loop {
+            writeln!(peer.get_mut(), "{}", fixture.request).unwrap();
+            let decision = read_reply(&mut peer);
+            if decision["decision"] == "preparing" {
+                assert!(Instant::now() < deadline, "fixture facts did not warm");
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            assert_eq!(decision["decision"], "execute", "{decision}");
+            break decision;
+        };
+        fixture.outputs();
+        let report = json!({"kind":"rustc-complete", "capture_protocol":1,
+            "attempt":decision["attempt"], "exit_code":0, "signal":null,
+            "stdout_hex":"", "stderr_hex":""});
+        writeln!(peer.get_mut(), "{report}").unwrap();
+        let receipt = read_reply(&mut peer);
+        assert_eq!(receipt["kind"], "rustc-captured", "{receipt}");
+        let acknowledgment = json!({"kind":"rustc-capture-ack",
+            "attempt":receipt["attempt"], "capture":receipt["capture"]});
+        writeln!(peer.get_mut(), "{acknowledgment}").unwrap();
+        // This is exactly the wrapper boundary: it exits after the ACK,
+        // without waiting for the daemon's publication reply.
+        drop(peer);
+        paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(activity.active_sessions(), 1);
+        assert!(fixture.coord.available());
+        assert!(
+            fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .list_publications()
+                .unwrap()
+                .is_empty()
+        );
+
+        // A known pending publisher cannot be mistaken for an idle endpoint.
+        // A zero budget seals admission without a timing-dependent sleep.
+        assert!(activity.seal_and_wait(Duration::ZERO, || false).is_err());
+        let mut late = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        late.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        late.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        match writeln!(late, "{hello}") {
+            Ok(()) => match late.read(&mut byte) {
+                Ok(count) => assert_eq!(count, 0, "sealed endpoint admitted another hello"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+            },
+            Err(error) => assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            )),
+        }
+        drop(late);
+        assert_eq!(activity.active_sessions(), 1);
+        assert!(fixture.coord.available());
+
+        release.send(()).unwrap();
+        activity
+            .seal_and_wait(Duration::from_secs(10), || false)
+            .unwrap();
+        assert_eq!(activity.active_sessions(), 0);
+        let publications = fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .list_publications()
+            .unwrap();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].0, decision["action_key"].as_str().unwrap());
+        assert!(
+            fixture.coord.available(),
+            "authority stopped before publication drained"
+        );
+        controller.shutdown();
+        assert!(server.join().unwrap().unwrap().clean());
+        assert!(!fixture.coord.available());
+    });
 }

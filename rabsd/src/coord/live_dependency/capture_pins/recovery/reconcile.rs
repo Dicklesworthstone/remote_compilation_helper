@@ -148,8 +148,11 @@ pub(crate) fn reconcile_page(
     let (seq, mut after) = match cursor.as_slice() {
         [] => (1, String::new()),
         [row] => {
-            let [SqlValue::Int(seq), SqlValue::Text(state), SqlValue::Text(after)] =
-                row.as_slice()
+            let [
+                SqlValue::Int(seq),
+                SqlValue::Text(state),
+                SqlValue::Text(after),
+            ] = row.as_slice()
             else {
                 return Err(corrupt("cursor shape"));
             };
@@ -165,7 +168,9 @@ pub(crate) fn reconcile_page(
             if state != "pending" || after.is_empty() {
                 return Err(corrupt("cursor state"));
             }
-            let next = seq.checked_add(1).ok_or_else(|| corrupt("cursor exhausted"))?;
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| corrupt("cursor exhausted"))?;
             (next as u64, after.clone())
         }
         _ => return Err(corrupt("cursor row count")),
@@ -187,8 +192,13 @@ pub(crate) fn reconcile_page(
     };
     let releaser = Releaser::Coordinator(active.clone());
     for row in rows {
-        let [SqlValue::Text(id_hex), SqlValue::Text(owner), SqlValue::Text(root), encoded, raw_id] =
-            row.as_slice()
+        let [
+            SqlValue::Text(id_hex),
+            SqlValue::Text(owner),
+            SqlValue::Text(root),
+            encoded,
+            raw_id,
+        ] = row.as_slice()
         else {
             return Err(corrupt("pin shape"));
         };

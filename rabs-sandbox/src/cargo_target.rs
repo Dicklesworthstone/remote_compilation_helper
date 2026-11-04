@@ -17,6 +17,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// Verified private target copies and Cargo source timestamp restoration.
+#[cfg(target_os = "linux")]
+pub mod state;
+
 /// Which local source/data files Cargo may recheck after a private seed restore.
 /// Directory sources are immutable as a whole: Cargo does not track their
 /// ordinary source mtimes as it tracks local/path packages.
@@ -133,7 +137,9 @@ pub fn source_edit_identity(
 /// Normalize only the command/selection differences supported by Cargo's
 /// ordinary private target reuse. Callers must first validate the complete
 /// Cargo artifact contract. Unknown arguments retain exact-key reuse only.
-/// Clippy keeps every selection and lint control in a separate family.
+/// Cargo fingerprints feature-selected units and build-script environments;
+/// unchanged dependencies can therefore survive feature-selection changes.
+/// Clippy keeps every selection, feature and lint control in a separate family.
 #[must_use]
 pub fn compatible_arguments(
     program: &str,
@@ -142,7 +148,7 @@ pub fn compatible_arguments(
 ) -> Option<Vec<String>> {
     let command = args.first()?.as_str();
     let clippy = match (program, command, mode) {
-        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test", _) => false,
+        ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test" | "run" | "bench", _) => false,
         ("/__rabs/toolchain/bin/cargo-clippy", "clippy", CargoArtifactMode::Compilation) => true,
         _ => return None,
     };
@@ -150,23 +156,24 @@ pub fn compatible_arguments(
         if clippy {
             "cargo-clippy"
         } else {
-            "cargo-build-check-test"
+            "cargo-compilation"
         }
         .to_owned(),
     ];
     let mut no_run = false;
     let mut filter = false;
+    let mut profile = None;
     let mut at = 1;
     while at < args.len() {
         let argument = &args[at];
         if argument == "--" {
             if clippy {
                 // The admitted artifact contract validates a lint-only tail.
-                // Unlike test-process arguments, lints change compilation.
+                // Unlike runtime arguments, lints change compilation.
                 normalized.extend(args[at..].iter().cloned());
                 break;
             }
-            if command != "test" || no_run {
+            if !matches!(command, "test" | "run" | "bench") || no_run {
                 return None;
             }
             break;
@@ -177,14 +184,17 @@ pub fn compatible_arguments(
                 (option, Some(value))
             });
         match option {
-            "--no-run" if inline.is_none() && command == "test" && !no_run => {
+            "--no-run" if inline.is_none() && matches!(command, "test" | "bench") && !no_run => {
                 no_run = true;
             }
-            "--no-fail-fast" if inline.is_none() && command == "test" => {}
-            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--exclude" => {
+            "--no-fail-fast" if inline.is_none() && matches!(command, "test" | "bench") => {}
+            "--bin" | "--example" | "--test" | "--bench" | "--package" | "-p" | "--exclude"
+            | "--features" | "-F" => {
                 // Cargo rechecks each selected unit. Clippy must keep selection:
                 // a --no-deps dependency otherwise might stay fresh when made
-                // primary and escape the requested lints.
+                // primary and escape the requested lints. Features also stay
+                // exact for Clippy; ordinary Cargo keys them in each unit's
+                // own fingerprint, including feature-dependent build scripts.
                 if clippy {
                     normalized.push(argument.clone());
                 }
@@ -202,16 +212,24 @@ pub fn compatible_arguments(
                     return None;
                 }
             }
-            "--workspace" | "--all" | "--lib" | "--bins" | "--examples" | "--tests"
-            | "--benches" | "--all-targets"
+            "--workspace"
+            | "--all"
+            | "--lib"
+            | "--bins"
+            | "--examples"
+            | "--tests"
+            | "--benches"
+            | "--all-targets"
+            | "--all-features"
+            | "--no-default-features"
                 if inline.is_none() =>
             {
                 if clippy {
                     normalized.push(argument.clone());
                 }
             }
-            "--features" | "-F" | "--target" | "--color" | "--message-format"
-            | "--manifest-path" | "--target-dir" | "--profile" | "--jobs" | "-j" => {
+            "--target" | "--color" | "--message-format" | "--manifest-path" | "--target-dir"
+            | "--jobs" | "-j" => {
                 normalized.push(argument.clone());
                 let value = if let Some(value) = inline {
                     value
@@ -225,17 +243,23 @@ pub fn compatible_arguments(
                     return None;
                 }
             }
-            "--release"
-            | "-r"
-            | "--locked"
-            | "--offline"
-            | "--frozen"
-            | "--all-features"
-            | "--no-default-features"
-            | "--verbose"
-            | "-v"
-            | "-vv"
-            | "--quiet"
+            "--profile" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        at += 1;
+                        args.get(at)?.as_str()
+                    }
+                };
+                if profile.is_some() || value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+                profile = Some(value);
+            }
+            "--release" | "-r" if inline.is_none() && profile.is_none() && command != "bench" => {
+                profile = Some("release");
+            }
+            "--locked" | "--offline" | "--frozen" | "--verbose" | "-v" | "-vv" | "--quiet"
             | "-q"
                 if inline.is_none() =>
             {
@@ -247,7 +271,7 @@ pub fn compatible_arguments(
             "--no-deps" if inline.is_none() && clippy => {
                 normalized.push(argument.clone());
             }
-            _ if command == "test" && !argument.starts_with('-') && !filter => {
+            _ if matches!(command, "test" | "bench") && !argument.starts_with('-') && !filter => {
                 filter = true;
             }
             _ => return None,
@@ -257,9 +281,27 @@ pub fn compatible_arguments(
     if no_run && filter {
         return None;
     }
+    // This is private Cargo state only: Cargo still runs and checks every
+    // fingerprint. Keep debug/release/custom output families separate, while
+    // equivalent profile spellings can seed builds, runs, tests and benchmarks.
+    // Clippy retains its exact profile because lint freshness is distinct.
+    let profile = match profile {
+        Some("dev" | "test") if !clippy => "debug",
+        Some("release" | "bench") if !clippy => "release",
+        Some(profile) => profile,
+        None if command == "bench" => "release",
+        None => "debug",
+    };
+    normalized.push(format!("private-target-profile={profile}"));
     match mode {
-        CargoArtifactMode::Compilation if command != "test" || no_run => Some(normalized),
+        CargoArtifactMode::Compilation
+            if command != "run" && (!matches!(command, "test" | "bench") || no_run) =>
+        {
+            Some(normalized)
+        }
         CargoArtifactMode::TestExecution if command == "test" && !no_run => Some(normalized),
+        CargoArtifactMode::RunExecution if command == "run" && !no_run => Some(normalized),
+        CargoArtifactMode::BenchExecution if command == "bench" && !no_run => Some(normalized),
         _ => None,
     }
 }
@@ -593,6 +635,21 @@ mod tests {
                 CargoArtifactMode::Compilation,
             ),
             (
+                "build",
+                &["--features", "serde,parallel", "-F", "app/extra"][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "check",
+                &["--no-default-features", "--features=extra"][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "test",
+                &["--no-run", "--all-features"][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
                 "test",
                 &["--no-run", "--package=app"][..],
                 CargoArtifactMode::Compilation,
@@ -608,6 +665,22 @@ mod tests {
                 ][..],
                 CargoArtifactMode::TestExecution,
             ),
+            (
+                "run",
+                &[
+                    "--package=app",
+                    "--bin=app",
+                    "--",
+                    "--no-run",
+                    "--profile=release",
+                ][..],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "bench",
+                &["--profile=dev", "--bench=measured", "--", "--exact"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
         ] {
             assert_eq!(
                 compatible_arguments(cargo, &invocation(command, tail), mode),
@@ -615,8 +688,6 @@ mod tests {
             );
         }
         for tail in [
-            &["--features", "new-feature"][..],
-            &["--no-default-features"][..],
             &["--target=x86_64-unknown-linux-gnu"][..],
             &["--profile=release"][..],
             &["--jobs=2"][..],
@@ -637,6 +708,28 @@ mod tests {
                 &["--future-option"][..],
                 CargoArtifactMode::Compilation,
             ),
+            ("build", &["--features"][..], CargoArtifactMode::Compilation),
+            ("build", &["-F"][..], CargoArtifactMode::Compilation),
+            (
+                "build",
+                &["--features="][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "build",
+                &["--features", "--all-features"][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "build",
+                &["--all-features=yes"][..],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "build",
+                &["--no-default-features=1"][..],
+                CargoArtifactMode::Compilation,
+            ),
             ("check", &["--no-run"][..], CargoArtifactMode::Compilation),
             (
                 "test",
@@ -650,6 +743,25 @@ mod tests {
             ),
             ("build", &[][..], CargoArtifactMode::TestExecution),
             ("test", &[][..], CargoArtifactMode::Compilation),
+            ("run", &[][..], CargoArtifactMode::Compilation),
+            ("run", &["--no-run"][..], CargoArtifactMode::RunExecution),
+            ("bench", &[][..], CargoArtifactMode::Compilation),
+            (
+                "bench",
+                &["--no-run"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                &["--release"][..],
+                CargoArtifactMode::BenchExecution,
+            ),
+            ("bench", &["-r"][..], CargoArtifactMode::BenchExecution),
+            (
+                "bench",
+                &["--no-run", "--", "--exact"][..],
+                CargoArtifactMode::Compilation,
+            ),
         ] {
             assert_eq!(
                 compatible_arguments(cargo, &invocation(command, tail), mode),
@@ -664,6 +776,95 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn benchmark_default_profile_shares_only_the_release_compilation_family() {
+        let cargo = "/__rabs/toolchain/bin/cargo";
+        let release = compatible_arguments(
+            cargo,
+            &invocation("build", &["--release"]),
+            CargoArtifactMode::Compilation,
+        )
+        .unwrap();
+        for (command, tail, mode) in [
+            ("build", vec!["-r"], CargoArtifactMode::Compilation),
+            (
+                "build",
+                vec!["--profile", "release"],
+                CargoArtifactMode::Compilation,
+            ),
+            (
+                "run",
+                vec!["--release", "--example=demo", "--", "--profile=dev"],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "test",
+                vec!["--profile=bench", "filter", "--", "--nocapture"],
+                CargoArtifactMode::TestExecution,
+            ),
+            (
+                "bench",
+                vec!["--bench=measured", "filter", "--", "--no-run"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            ("bench", vec!["--no-run"], CargoArtifactMode::Compilation),
+            (
+                "bench",
+                vec!["--profile=release"],
+                CargoArtifactMode::BenchExecution,
+            ),
+        ] {
+            let args = invocation(command, &tail);
+            assert_eq!(
+                compatible_arguments(cargo, &args, mode),
+                Some(release.clone()),
+                "{args:?}"
+            );
+        }
+        for (command, tail, mode) in [
+            ("build", vec![], CargoArtifactMode::Compilation),
+            (
+                "run",
+                vec!["--", "--release"],
+                CargoArtifactMode::RunExecution,
+            ),
+            (
+                "bench",
+                vec!["--profile=dev"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                vec!["--profile=ci"],
+                CargoArtifactMode::BenchExecution,
+            ),
+            (
+                "bench",
+                vec!["--target=x86_64-unknown-linux-gnu"],
+                CargoArtifactMode::BenchExecution,
+            ),
+        ] {
+            let actual = compatible_arguments(cargo, &invocation(command, &tail), mode);
+            assert!(actual.is_some());
+            assert_ne!(actual, Some(release.clone()));
+        }
+        for tail in [
+            vec!["--profile=release", "--profile=dev"],
+            vec!["--release", "--profile=dev"],
+            vec!["--profile=dev", "-r"],
+            vec!["--profile"],
+        ] {
+            assert!(
+                compatible_arguments(
+                    cargo,
+                    &invocation("run", &tail),
+                    CargoArtifactMode::RunExecution
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -683,6 +884,10 @@ mod tests {
             &["--workspace"][..],
             &["--lib"][..],
             &["--package=app"][..],
+            &["--features=extra"][..],
+            &["-F", "extra"][..],
+            &["--all-features"][..],
+            &["--no-default-features"][..],
             &["--no-deps"][..],
             &["--", "-D", "warnings"][..],
         ] {

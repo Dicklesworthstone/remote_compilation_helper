@@ -863,10 +863,6 @@ impl LiveFixture {
         .unwrap();
     }
 
-    fn cargo_check(&self, wrapped: bool) -> CargoRun {
-        self.cargo_compile(wrapped, "check")
-    }
-
     fn cargo_compile(&self, wrapped: bool, subcommand: &str) -> CargoRun {
         assert!(matches!(subcommand, "check" | "build"));
         let number = self.sequence.get();
@@ -1074,7 +1070,7 @@ impl LiveFixture {
 /// Actual Cargo chooses argv, cwd, jobserver and loader environment. The graph
 /// is leaf -> middle -> top -> consumer; top has no direct leaf dependency but
 /// must resolve leaf's RemoteToken through middle's metadata. This fixture
-/// supports shared or disjoint input/output directories under dependency-exec-v7,
+/// supports shared or disjoint input/output directories under dependency-exec-v8,
 /// never treats local fallback as evidence of a working remote DAG, and performs
 /// no argv rewriting.
 #[test]

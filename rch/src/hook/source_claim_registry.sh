@@ -14,26 +14,57 @@ pending="$registry/$token.$digest.pending"
 released="$registry/released/$token.$digest.claim"
 cancelled="$registry/cancelled/$token.$digest.claim"
 cancelling="$registry/$token.$digest.cancelling"
+rch_claim_stage=validation
+rch_claim_diagnosed=0
+claim_exit() {
+    status=$?
+    if [ "$status" -ne 0 ] && [ "$rch_claim_diagnosed" -eq 0 ]; then
+        printf 'RCH_SOURCE_REGISTRY_INTERRUPTED operation=%s stage=%s status=%s identity=%s\n' \
+            "$operation" "$rch_claim_stage" "$status" "$token" >&2
+    fi
+}
+trap claim_exit 0
+legacy_registry=${RCH_LEGACY_SOURCE_CLAIM_REGISTRY-}
+if [ -z "$legacy_registry" ] && [ "$registry" = "/var/tmp/rch-source-authority-locks/claims-v1" ]; then
+    legacy_registry="/tmp/rch-source-authority-locks/claims-v1"
+fi
 
 # This transaction already names every record and containing-directory barrier.
-# GNU sync -f calls syncfs: under the worker-wide registry flock, that waits for
-# unrelated builds' dirty pages on the same filesystem. Use full file fsync
-# instead, preserving both data and metadata and every checked directory sync.
+# GNU sync -f calls syncfs, and uutils 0.10 sync FILE calls global sync(). Both
+# can wait for unrelated builds while holding the worker-wide registry flock.
+# Explicit fsync preserves data, metadata and every checked directory barrier.
 # The local adapter also covers the shared record helpers without changing
-# their GC callers outside this transaction. Topology's -d calls are unchanged.
-# No new utility dependency is introduced; native-Darwin performance remains
-# unqualified. Never retry a failed file sync with a broader/unchecked operation.
+# their GC callers outside this transaction. Topology's -d calls also need a
+# directory fsync, not an implementation-dependent utility invocation. Python
+# is already required by namespace custody. Missing Python fails closed.
 sync() {
     case "${1-}" in
-        -f)
-            [ "$#" -eq 2 ] && [ -n "$2" ] || return 1
-            command sync -- "$2"
+        -f|-d)
+            shift
+            if [ "${1-}" = -- ]; then shift; fi
+            [ "$#" -eq 1 ] && [ -n "$1" ] || return 1
+            python3 -I -S -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try: os.fsync(fd)
+finally: os.close(fd)' "$1"
             ;;
-        *) command sync "$@" ;;
+        *) return 1 ;;
     esac
 }
 
 refuse() {
+    rch_claim_diagnosed=1
+    case "$1" in
+        *cancelling*|*'intent cancelled'*|*'cancellation is unfinished'*)
+            printf 'RCH_SOURCE_CANCELLATION_FENCE identity=%s operation=%s\n' "$token" "$operation" >&2
+            ;;
+    esac
+    case "${rch_claim_stage-validation}" in
+        publication|confirmation)
+            printf 'RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED identity=%s operation=%s stage=%s\n' \
+                "$token" "$operation" "$rch_claim_stage" >&2
+            ;;
+    esac
     printf 'RCH: durable source ownership: %s\n' "$1" >&2
     exit 73
 }
@@ -43,6 +74,7 @@ refuse() {
 busy() {
     case "$operation" in
         try-acquire|topology)
+            rch_claim_diagnosed=1
             printf 'RCH: durable source ownership: %s\n' "$1" >&2
             exit 75
             ;;
@@ -65,11 +97,30 @@ matches_request() {
 # before emitting any authority/retirement verdict. Callers validate the record
 # and its state first; this helper never creates, moves or repairs a claim.
 confirm_durable_record() {
+    rch_claim_stage=confirmation
     sync -f "$1" && sync -f "${1%/*}" \
         || refuse 'cannot confirm durable source record'
     if [ "${1%/*}" != "$registry" ]; then
         sync -f "$registry" || refuse 'cannot confirm durable source transition'
     fi
+}
+
+# Call only after confirming the exact completed cancellation receipt. Older
+# unowned cancellations moved their only fence into cancelled/. A retry must
+# restore its permanent fence before acknowledging that terminal state again.
+# Quarantined intents retain their original hard-link evidence unchanged.
+confirm_cancellation_fence() {
+    if [ -e "$cancelling" ] || [ -L "$cancelling" ]; then
+        if ! rch_claim_quarantine_fence "$registry" "$cancelling"; then
+            matches_request "$cancelling"
+        fi
+    else
+        rch_claim_stage=publication
+        rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" \
+            || refuse 'cannot persist settled cancellation fence'
+        matches_request "$cancelling"
+    fi
+    confirm_durable_record "$cancelling"
 }
 
 # A mutator's exit status is not proof that the requested alias was established:
@@ -81,12 +132,13 @@ confirm_topology() {
     sh -c "$1" >/dev/null 2>&1 || refuse 'topology validation failed after initialization'
     while IFS= read -r topology_root; do
         [ -d "$topology_root" ] || refuse 'topology root is not a directory'
-        # fdatasync the root and its parent, not syncfs: the roots live on the
-        # worker's data filesystem, and this runs under the registry flock on
-        # every namespace setup. syncfs flushed every concurrent build's dirty
-        # pages first; on a saturated SSD a few setups queued past the 15 s
-        # budget and were killed (#111, hz3/hz4).
-        sync -d -- "$topology_root" && sync -d -- "$(dirname -- "$topology_root")" \
+        # The validated alias can itself be a symlink. Flush its resolved
+        # directory and its containing directory, then revalidate topology.
+        # The latter persists the alias entry; no-follow record opens remain
+        # mandatory everywhere else in the registry.
+        topology_resolved=$(rch_realpath_m "$topology_root") || refuse 'cannot resolve topology root'
+        topology_parent=$(rch_realpath_m "$(dirname -- "$topology_root")") || refuse 'cannot resolve topology parent'
+        sync -d -- "$topology_resolved" && sync -d -- "$topology_parent" \
             || refuse 'cannot confirm durable topology'
     done <<RCH_TOPOLOGY_ROOTS
 $requested
@@ -265,6 +317,7 @@ check_held_claims() {
         [ -e "$held" ] || [ -L "$held" ] || continue
         case "$held" in *.pending)
             if ! rch_claim_record_valid "$held"; then
+                [ "$operation" != cancel ] || refuse 'incomplete competing source publication'
                 rch_claim_quarantine_pending "$registry" "$held" || refuse 'cannot quarantine pending claim'
                 continue
             fi
@@ -272,7 +325,7 @@ check_held_claims() {
         esac
         validate_record "$held"
         case "${held##*/}" in "$token".*)
-            [ "$operation" = recover ] || refuse 'source identity already claimed'
+            case "$operation" in recover|cancel) ;; *) refuse 'source identity already claimed' ;; esac
             [ "$held" = "$active" ] || [ "$held" = "$pending" ] || refuse 'source identity roots changed'
             matches_request "$held"
             continue
@@ -289,6 +342,34 @@ ${held##*/}"
             check_held_claim_batch
         fi
     done
+    if [ -n "${legacy_registry-}" ] && [ "$legacy_registry" != "$registry" ] \
+        && [ ! -L "$legacy_registry" ] && [ -d "$legacy_registry" ]; then
+        for held in "$legacy_registry"/*.claim "$legacy_registry"/*.pending; do
+            [ -e "$held" ] || [ -L "$held" ] || continue
+            case "$held" in *.pending)
+                if ! rch_claim_record_valid "$held"; then
+                    [ "$operation" != cancel ] || refuse 'incomplete competing source publication'
+                    continue
+                fi
+                ;;
+            esac
+            validate_record "$held"
+            case "${held##*/}" in "$token".*)
+                refuse 'source identity exists in conflicting registry namespace'
+                ;;
+            esac
+            if [ -z "$held_claim_names" ]; then
+                held_claim_names=$held
+            else
+                held_claim_names="$held_claim_names
+$held"
+            fi
+            held_batch_count=$((held_batch_count + 1))
+            if [ "$held_batch_count" -eq "$held_batch_limit" ]; then
+                check_held_claim_batch
+            fi
+        done
+    fi
     if [ "$held_batch_count" -gt 0 ]; then
         check_held_claim_batch
     fi
@@ -296,9 +377,11 @@ ${held##*/}"
 
 check_held_claim_batch() {
     if closures_overlap "$requested" inventory lexical; then
+        describe_cancelling_overlap lexical
         busy 'unfinished overlapping source owner'
     fi
     if closures_overlap "$requested_physical" inventory physical; then
+        describe_cancelling_overlap physical
         busy 'unfinished overlapping physical source owner'
     fi
     held_claim_names=
@@ -308,21 +391,144 @@ check_held_claim_batch() {
     fi
 }
 
+describe_cancelling_overlap() {
+    # Only the rejected batch is examined again. Name an actual overlapping
+    # cancelling owner, not an unrelated marker elsewhere on the worker.
+    while IFS= read -r held_name; do
+        case "$held_name" in
+            /*) held_path=$held_name ;;
+            *) held_path="$registry/$held_name" ;;
+        esac
+        held_fence="${held_path%.*}.cancelling"
+        [ -e "$held_fence" ] || [ -L "$held_fence" ] || continue
+        if [ "$1" = lexical ]; then
+            closures_overlap "$requested" file "$held_path" || continue
+        else
+            held_physical=$(physical_roots < "$held_path") \
+                || refuse 'cannot describe cancelling physical owner'
+            closures_overlap "$requested_physical" roots "$held_physical" || continue
+        fi
+        held_identity=${held_path##*/}
+        printf 'RCH_SOURCE_CANCELLATION_FENCE identity=%s record=%s\n' \
+            "${held_identity%%.*}" "$held_fence" >&2
+        return 0
+    done <<RCH_HELD_CANCELLING_NAMES
+$held_claim_names
+RCH_HELD_CANCELLING_NAMES
+}
+
 emit_held_claim_roots() {
     while IFS= read -r held_name; do
         # Individual framing prevents an unterminated/empty record from being
         # hidden by concatenation with the next owner's roots. The outer end
         # marker is emitted ONLY if every read/resolution succeeds.
+        case "$held_name" in
+            /*) held_path=$held_name ;;
+            *) held_path="$registry/$held_name" ;;
+        esac
         printf 'RCH_HELD_RECORD_BEGIN\n' || return 1
         case "$1" in
-            lexical) LC_ALL=C tr '\000' '\r' < "$registry/$held_name" || return 1 ;;
-            physical) physical_roots < "$registry/$held_name" || return 1 ;;
+            lexical) LC_ALL=C tr '\000' '\r' < "$held_path" || return 1 ;;
+            physical) physical_roots < "$held_path" || return 1 ;;
             *) return 1 ;;
         esac
         printf 'RCH_HELD_RECORD_END\n' || return 1
     done <<RCH_HELD_CLAIM_NAMES
 $held_claim_names
 RCH_HELD_CLAIM_NAMES
+}
+
+prune_terminal_claims() {
+    retention_minutes=${RCH_SOURCE_CLAIM_RETENTION_MINUTES:-1440}
+    case "$retention_minutes" in
+        ''|*[!0-9]*) retention_minutes=1440 ;;
+    esac
+    # A released claim is the only durable proof when the dispatcher loses
+    # the release reply before checkpointing sources_released. Its age does
+    # not prove the dispatcher acknowledged it: deleting it strands restart
+    # recovery and allows a delayed initial acquire to revive the same token.
+    # Unlike cancelled receipts, no permanent release fence remains elsewhere.
+    # Retain released/ until a separate durable acknowledgement/retention
+    # protocol can preserve both recovery proof and delayed-request fencing.
+    terminal_dir="$registry/cancelled"
+    [ ! -L "$terminal_dir" ] && [ -d "$terminal_dir" ] \
+        && [ ! -L "$registry/released" ] && [ ! -L "$registry/quarantine" ] || return 0
+    # A cancelled receipt may be the last complete evidence after a dispatcher
+    # crash. Age never proves that its delayed acquire cannot still arrive.
+    # Bound the added validation work under this metadata mutex; unknown early
+    # candidates can defer later collection. This bounds candidate confirmations,
+    # not filesystem latency or the existing directory enumeration.
+    find "$terminal_dir" -maxdepth 1 -type f -name '*.claim' \
+        ! -name "$token.*" -mmin +"$retention_minutes" -print 2>/dev/null |
+    (
+        gc_checked=0
+        while IFS= read -r gc_receipt; do
+            [ "$gc_checked" -lt 16 ] || break
+            gc_checked=$((gc_checked + 1))
+            [ "${gc_receipt%/*}" = "$terminal_dir" ] || continue
+            rch_claim_record_valid "$gc_receipt" || continue
+            gc_token=$__rch_token
+            gc_fence="$registry/$__rch_token.$__rch_digest.cancelling"
+            rch_claim_record_valid "$gc_fence" || continue
+            cmp -s "$gc_receipt" "$gc_fence" || continue
+            gc_conflict=0
+            for gc_other in "$registry/$gc_token."* "$registry/released/$gc_token."* \
+                "$registry/cancelled/$gc_token."* "$registry/quarantine/$gc_token."*; do
+                [ -e "$gc_other" ] || [ -L "$gc_other" ] || continue
+                [ "$gc_other" = "$gc_receipt" ] || [ "$gc_other" = "$gc_fence" ] || {
+                    if [ "$gc_other" = "$registry/$gc_token.activity.lock" ] \
+                        && [ ! -L "$gc_other" ] && [ -f "$gc_other" ]; then
+                        continue
+                    fi
+                    gc_conflict=1
+                    break
+                }
+            done
+            [ "$gc_conflict" -eq 0 ] || continue
+            # Incomplete quarantine fences need the full receipt for recovery.
+            # Only a complete matching fence, durably retained in this registry,
+            # can replace it. A failed barrier preserves every existing record.
+            if ! sync -f "$gc_fence" || ! sync -f "$registry"; then
+                printf 'RCH_SOURCE_CLAIM_RETENTION_DEFERRED %s\n' "$gc_receipt" >&2
+                continue
+            fi
+            find "$gc_receipt" -maxdepth 0 -type f -mmin +"$retention_minutes" \
+                -delete 2>/dev/null || true
+        done
+    ) || true
+}
+
+df_available() {
+    {
+        IFS= read -r _ || return 1
+        read -r _ total _ avail _ || return 1
+    } <<RCH_DF_OUTPUT
+$1
+RCH_DF_OUTPUT
+    if [ "${2-}" = inodes ]; then
+        case "$total" in ''|0|*[!0-9]*) return 1 ;; esac
+    fi
+    case "$avail" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$avail"
+}
+
+check_registry_headroom() {
+    min_free_kb=${RCH_REGISTRY_MIN_FREE_KB:-4096}
+    case "$min_free_kb" in ''|*[!0-9]*) min_free_kb=4096 ;; esac
+    min_free_inodes=${RCH_REGISTRY_MIN_FREE_INODES:-256}
+    case "$min_free_inodes" in ''|*[!0-9]*) min_free_inodes=256 ;; esac
+    df_kb_out=$(df -Pk -- "$registry" 2>/dev/null) || df_kb_out=
+    free_kb=$(df_available "$df_kb_out" blocks) || free_kb=
+    if [ -n "$free_kb" ] && [ "$free_kb" -lt "$min_free_kb" ]; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s/.headroom-free-kb-%s\n' "$registry" "$free_kb" >&2
+        refuse 'source claim registry below reserved headroom'
+    fi
+    df_inodes_out=$(df -Pi -- "$registry" 2>/dev/null) || df_inodes_out=
+    free_inodes=$(df_available "$df_inodes_out" inodes) || free_inodes=
+    if [ -n "$free_inodes" ] && [ "$free_inodes" -lt "$min_free_inodes" ]; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s/.headroom-free-inodes-%s\n' "$registry" "$free_inodes" >&2
+        refuse 'source claim registry below reserved inode headroom'
+    fi
 }
 
 # rch <= 2.1.16 created .cancelling with a plain `set -C` redirect, so a full
@@ -364,6 +570,16 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
     "$registry/cancelled/$token."*.claim; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     case "$previous" in *.pending)
+        case "$operation" in
+            settle-cancel|cancellation-state) refuse 'unfinished claim transition during namespace reconciliation' ;;
+            locate)
+                # Discovery may bind a complete interrupted publication, but
+                # must not quarantine or repair an incomplete one as a side
+                # effect of locating an old dispatcher's namespace.
+                rch_claim_record_valid "$previous" \
+                    || refuse 'incomplete pending source namespace evidence'
+                ;;
+        esac
         if ! rch_claim_record_valid "$previous"; then
             rch_claim_quarantine_pending "$registry" "$previous" || refuse 'cannot quarantine pending claim'
             continue
@@ -387,7 +603,7 @@ for previous in "$registry/quarantine/$token."*.pending; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     [ ! -L "$previous" ] && [ -f "$previous" ] || refuse 'invalid quarantined claim'
     [ "$previous" = "$registry/quarantine/$token.$digest.pending" ] || refuse 'quarantined source identity roots changed'
-    case "$operation" in acquire|try-acquire|recover|topology) refuse 'source intent has an incomplete quarantined claim' ;; esac
+    case "$operation" in acquire|try-acquire|recover|topology|cancellation-state) refuse 'source intent has an incomplete quarantined claim' ;; esac
 done
 
 # Terminal replies retire the caller's recovery obligations. Validate the
@@ -410,6 +626,124 @@ if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
     done
 fi
 
+# Recovery must distinguish an already requested cancellation from a completed
+# one. A dispatcher can die after persisting its tree/pair retirement but before
+# finish-cancel, or the completed receipt can expire while its permanent fence
+# remains. Neither frontier may resume normal source activity. This observation
+# grants no cleanup authority: the caller still needs its owned durable journal
+# and exact retirement evidence before the normal cancel/finish-cancel protocol.
+# Do not repair, promote, quarantine or manufacture evidence during discovery.
+if [ "$operation" = cancellation-state ]; then
+    for record in "$registry/$token."* "$registry/released/$token."* \
+        "$registry/cancelled/$token."* "$registry/quarantine/$token."*; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        case "$record" in
+            "$active"|"$released"|"$cancelled"|"$cancelling") ;;
+            "$registry/$token.activity.lock")
+                [ ! -L "$record" ] && [ -f "$record" ] \
+                    || refuse 'invalid activity lock during cancellation discovery'
+                ;;
+            *) refuse 'unrecognized source identity evidence during cancellation discovery' ;;
+        esac
+    done
+    cancellation_found=0
+    for record in "$cancelling" "$cancelled"; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        matches_request "$record"
+        confirm_durable_record "$record"
+        cancellation_found=1
+    done
+    if [ "$cancellation_found" -eq 1 ]; then
+        printf cancellation
+    else
+        printf pending
+    fi
+    exit 0
+fi
+
+# Discovery binds an old dispatcher journal to existing worker evidence. It
+# never promotes a pending write, grants cleanup, or changes a source path.
+# The caller holds both namespace metadata locks and persists the result before
+# requesting any worker mutation. A later authorizing transaction must still
+# revalidate ownership and competing lexical/physical roots under those locks.
+if [ "$operation" = locate ]; then
+    if [ -e "$pending" ] || [ -L "$pending" ]; then
+        # A complete pending claim already excludes overlapping admission but
+        # has never granted activity. Legacy recovery must locate this exact
+        # namespace before it can use the normal recover/cancel transitions.
+        # Confirm only an isolated publication; no promotion, source access or
+        # retirement is authorized by this namespace observation.
+        matches_request "$pending"
+        for conflict in "$active" "$released" "$cancelled" "$cancelling" \
+            "$registry/quarantine/$token.$digest.pending"; do
+            [ ! -e "$conflict" ] && [ ! -L "$conflict" ] \
+                || refuse 'pending source namespace has conflicting ownership'
+        done
+        confirm_durable_record "$pending"
+        printf located
+        exit 0
+    fi
+    if [ -e "$registry/quarantine/$token.$digest.pending" ] \
+        || [ -L "$registry/quarantine/$token.$digest.pending" ]; then
+        [ -e "$cancelled" ] && rch_claim_quarantine_fence "$registry" "$cancelling" \
+            || refuse 'source namespace has incomplete quarantined ownership'
+    fi
+    located=0
+    for record in "$active" "$released" "$cancelled" "$cancelling"; do
+        [ -e "$record" ] || [ -L "$record" ] || continue
+        if [ "$record" != "$cancelling" ] \
+            || ! rch_claim_quarantine_fence "$registry" "$record"; then
+            matches_request "$record"
+        fi
+        confirm_durable_record "$record"
+        located=1
+    done
+    [ "$located" -eq 1 ] || refuse 'no exact source namespace evidence'
+    printf located
+    exit 0
+fi
+
+# The caller owns the exact retired dispatcher journal AND holds this token's
+# activity lock before this metadata lock. The cancellation fence blocks late
+# normal activity; draining activity excludes already admitted work/cleanup.
+# Moving the active record then also rejects queued cleanup. No source path is
+# inspected or changed here. Local acknowledgement alone is never sufficient.
+# Keep the marker: receipt GC can prune cancelled/*.claim, and the marker must
+# still reject delayed acquire/recover requests for this identity afterwards.
+if [ "$operation" = settle-cancel ]; then
+    [ ! -e "$released" ] && [ ! -L "$released" ] \
+        || refuse 'released source grant is not a cancellation'
+    [ ! -e "$pending" ] && [ ! -L "$pending" ] \
+        || refuse 'unfinished claim transition during terminal cancellation'
+    if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
+        matches_request "$cancelled"
+        confirm_durable_record "$cancelled"
+        confirm_cancellation_fence
+        printf settled
+        exit 0
+    fi
+    matches_request "$cancelling"
+    [ ! -e "$registry/quarantine/$token.$digest.pending" ] \
+        && [ ! -L "$registry/quarantine/$token.$digest.pending" ] \
+        || refuse 'terminal cancellation has quarantined ownership'
+    confirm_durable_record "$cancelling"
+    rch_claim_stage=publication
+    if [ -e "$active" ] || [ -L "$active" ]; then
+        matches_request "$active"
+        mv -- "$active" "$cancelled" || refuse 'cannot settle active cancellation'
+    else
+        # A valid marker without any grant denies both normal and cleanup
+        # activity. With activity drained and this caller's fully retired
+        # journal, it is safe to acknowledge that denial (including after
+        # receipt GC). This does not manufacture source or cleanup authority.
+        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" \
+            || refuse 'cannot settle fenced unowned cancellation'
+    fi
+    confirm_durable_record "$cancelled"
+    printf settled
+    exit 0
+fi
+
 if [ "$operation" = cancel ]; then
     if [ -e "$released" ] || [ -L "$released" ]; then
         refuse 'executed source grant was released, not cancelled'
@@ -417,6 +751,7 @@ if [ "$operation" = cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"
+        confirm_cancellation_fence
         printf unowned
         exit 0
     fi
@@ -434,6 +769,20 @@ if [ "$operation" = cancel ]; then
         [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'duplicate source grant'
     elif [ -e "$pending" ] || [ -L "$pending" ]; then
         matches_request "$pending"
+    fi
+    if [ -e "$active" ] || [ -e "$pending" ]; then
+        # Cancellation authorizes cleanup access. A legacy claim alone cannot
+        # override a current writer admitted after a namespace migration.
+        # Check both namespaces before any promotion or cancellation write;
+        # keep the valid active blocker until cleanup finishes.
+        requested_physical=$(
+            physical_roots <<RCH_CANCELLATION_ROOTS
+$requested
+RCH_CANCELLATION_ROOTS
+        ) || refuse 'cannot resolve cancellation source roots'
+        check_held_claims
+    fi
+    if [ -e "$pending" ] || [ -L "$pending" ]; then
         # Complete only an already persisted identical pending claim. It has
         # already excluded competing owners, even if readiness was not sent.
         sync -f "$pending"
@@ -442,10 +791,11 @@ if [ "$operation" = cancel ]; then
     if [ -e "$cancelling" ] || [ -L "$cancelling" ]; then
         matches_request "$cancelling"
     else
+        rch_claim_stage=publication
         rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" || refuse 'cannot persist source cancellation'
         matches_request "$cancelling"
     fi
-    sync -f "$cancelling"
+    confirm_durable_record "$cancelling"
     if [ -e "$active" ]; then
         # Keep the active record as a durable overlap blocker through cleanup.
         # Normal activity refuses this marker; cleanup gets its own checked
@@ -455,7 +805,12 @@ if [ "$operation" = cancel ]; then
     else
         # An absent intent never acquired source rights. Its tombstone fences
         # delayed acquisition but grants no authority to inspect/remove a tree.
-        mv -- "$cancelling" "$cancelled"
+        # Keep that fence before the reply: the dispatcher can disappear before
+        # settlement, and receipt retention must never revive its queued acquire.
+        rch_claim_stage=publication
+        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" \
+            || refuse 'cannot persist unowned source cancellation'
+        matches_request "$cancelled"
         confirm_durable_record "$cancelled"
         printf unowned
     fi
@@ -466,13 +821,16 @@ if [ "$operation" = finish-cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"
+        confirm_cancellation_fence
         exit 0
     fi
     matches_request "$cancelling"
     matches_request "$active"
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'unfinished claim transition'
+    rch_claim_stage=publication
     mv -- "$active" "$cancelled"
     confirm_durable_record "$cancelled"
+    prune_terminal_claims
     exit 0
 fi
 
@@ -518,8 +876,10 @@ if [ "$operation" = release ]; then
     [ ! -e "$cancelling" ] && [ ! -L "$cancelling" ] || refuse 'source grant is cancelling'
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'unfinished claim transition'
     [ ! -e "$released" ] && [ ! -L "$released" ] || refuse 'duplicate release receipt'
+    rch_claim_stage=publication
     mv -- "$active" "$released"
     confirm_durable_record "$released"
+    prune_terminal_claims
     exit 0
 fi
 
@@ -606,9 +966,13 @@ if [ "$operation" = recover ]; then
 else
     [ ! -e "$active" ] && [ ! -L "$active" ] || refuse 'source grant already exists'
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'pending source grant already exists'
+    prune_terminal_claims
+    check_registry_headroom
+    rch_claim_stage=publication
     rch_claim_write_atomic "$registry" "$pending" "$digest" "$requested" || refuse 'cannot persist source claim'
     matches_request "$pending"
 fi
 sync -f "$pending" || refuse 'cannot sync pending source claim'
+rch_claim_stage=publication
 mv -- "$pending" "$active" || refuse 'cannot activate source claim'
 confirm_durable_record "$active"

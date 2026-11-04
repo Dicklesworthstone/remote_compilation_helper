@@ -12,10 +12,12 @@ use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_protocol::capability_tokens::CapabilityToken;
 use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
     DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot, DependencyExecContext,
-    DependencyExecutionMode, DependencyIsolationSupport, MAX_DEPENDENCY_DIRS,
-    MAX_DEPENDENCY_ENV_ENTRIES,
+    DependencyExecutionMode, DependencyIsolationSupport, DependencyNativeRoot, MAX_DEPENDENCY_DIRS,
+    MAX_DEPENDENCY_ENV_ENTRIES, MAX_NATIVE_ROOTS,
 };
+use rabs_sandbox::generated_source::MAX_GENERATED_DIRECTORIES;
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -65,8 +67,9 @@ pub struct CanonicalExecRequest {
     /// Explicit, validated environment additions and canonical working directory.
     /// Absence on the wire uses the canonical workspace and pinned base only.
     pub command_context: CommandContext,
-    /// Separately negotiated original-path leaf rustc execution. This never
-    /// changes the semantics of an ordinary canonical command context.
+    /// Separately negotiated leaf rustc execution with an explicit original or
+    /// canonical Cargo path policy. This never changes the semantics of an
+    /// ordinary canonical command context.
     pub dependency_context: Option<DependencyExecContext>,
     /// Worker-local source of the toolchain dataset. Execution captures private
     /// bytes or leases an exactly pinned captured dataset, never this live path.
@@ -174,6 +177,9 @@ pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandConte
 /// explicit, including an empty array for a dependency leaf. V7 requires the
 /// execution mode so archive codegen cannot silently inherit metadata's procfs
 /// and device view. A generated tree binds the exact OUT_DIR environment value.
+/// Canonical Cargo has its own version and fixed compiler layout. Its explicit
+/// mode selects the measured metadata or closed archive namespace. Version 3
+/// also binds a complete sealed generated tree at its exact canonical OUT_DIR.
 pub fn parse_dependency_context(
     request: &serde_json::Value,
 ) -> Result<Option<DependencyExecContext>, String> {
@@ -186,6 +192,11 @@ pub fn parse_dependency_context(
     let object = value
         .as_object()
         .ok_or("dependency_context must be an object")?;
+    let workspace = object.get("version").and_then(serde_json::Value::as_str)
+        == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION);
+    let canonical = workspace
+        || object.get("version").and_then(serde_json::Value::as_str)
+            == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION);
     const REQUIRED: &[&str] = &[
         "version",
         "execution_mode",
@@ -195,18 +206,28 @@ pub fn parse_dependency_context(
         "compiler",
         "out_dir",
         "artifact_roots",
+        "generated_directories",
         "env",
         "runtime_cohort_sha256",
     ];
     if REQUIRED.iter().any(|field| !object.contains_key(*field))
+        || (workspace && !object.contains_key("source_directories"))
         || object.keys().any(|field| {
             !REQUIRED.contains(&field.as_str())
                 && field != "dependency_dirs"
                 && field != "loader_dirs"
                 && field != "generated_root"
+                && !(canonical && field == "native_roots")
+                && !(workspace && field == "source_directories")
         })
-        || object.get("version").and_then(serde_json::Value::as_str)
-            != Some(DEPENDENCY_CONTEXT_VERSION)
+        || !matches!(
+            object.get("version").and_then(serde_json::Value::as_str),
+            Some(
+                DEPENDENCY_CONTEXT_VERSION
+                    | CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                    | CANONICAL_WORKSPACE_CONTEXT_VERSION
+            )
+        )
     {
         return Err("dependency_context requires supported exact fields".to_owned());
     }
@@ -263,6 +284,18 @@ pub fn parse_dependency_context(
     };
     let dirs = directories("dependency_dirs")?;
     let loader_dirs = directories("loader_dirs")?;
+    let generated_directories = object
+        .get("generated_directories")
+        .and_then(serde_json::Value::as_array)
+        .filter(|paths| paths.len() <= MAX_GENERATED_DIRECTORIES)
+        .ok_or("generated_directories must be a bounded array")?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(str::to_owned)
+                .ok_or("generated_directories entries must be strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let generated_root = match object.get("generated_root") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
@@ -271,6 +304,49 @@ pub fn parse_dependency_context(
                 .ok_or("dependency generated_root must be a string or null")?
                 .to_owned(),
         ),
+    };
+    let native_roots = match object.get("native_roots") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .filter(|roots| roots.len() <= MAX_NATIVE_ROOTS)
+            .ok_or("native_roots must be a bounded array")?
+            .iter()
+            .map(|root| {
+                let root = root
+                    .as_object()
+                    .filter(|fields| {
+                        fields.len() == 3
+                            && ["path", "prefix", "directories"]
+                                .iter()
+                                .all(|name| fields.contains_key(*name))
+                    })
+                    .ok_or("native roots require exactly path, prefix and directories")?;
+                let directories = root["directories"]
+                    .as_array()
+                    .filter(|directories| directories.len() <= MAX_GENERATED_DIRECTORIES)
+                    .ok_or("native root directories must be a bounded array")?
+                    .iter()
+                    .map(|directory| {
+                        directory
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or("native root directories require strings")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(DependencyNativeRoot {
+                    path: root["path"]
+                        .as_str()
+                        .ok_or("native root path must be a string")?
+                        .to_owned(),
+                    prefix: root["prefix"]
+                        .as_str()
+                        .ok_or("native root prefix must be a string")?
+                        .to_owned(),
+                    directories,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
     };
     let artifact_roots = object
         .get("artifact_roots")
@@ -314,6 +390,65 @@ pub fn parse_dependency_context(
         *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
             .map_err(|_| "invalid dependency runtime cohort")?;
     }
+    if workspace || text("version")? == CANONICAL_DEPENDENCY_CONTEXT_VERSION {
+        if text("toolchain_root")? != rabs_sandbox::layout::TOOLCHAIN
+            || text("compiler")? != "/__rabs/toolchain/bin/rustc"
+        {
+            return Err(
+                "canonical dependency context requires retained package inputs and its fixed compiler"
+                    .to_owned(),
+            );
+        }
+        if workspace {
+            if text("source_root")? != rabs_sandbox::layout::WORKSPACE {
+                return Err("workspace execution requires the complete canonical workspace".into());
+            }
+            let source_directories = object
+                .get("source_directories")
+                .and_then(serde_json::Value::as_array)
+                .filter(|paths| paths.len() <= MAX_GENERATED_DIRECTORIES)
+                .ok_or("source_directories must be a bounded array")?
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(str::to_owned)
+                        .ok_or("source_directories entries must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return DependencyExecContext::new_canonical_workspace_execution(
+                execution_mode,
+                text("cwd")?,
+                text("out_dir")?,
+                dirs,
+                loader_dirs,
+                artifact_roots,
+                generated_root,
+                source_directories,
+                generated_directories,
+                env,
+                runtime_cohort,
+            )
+            .and_then(|context| context.with_native_roots(native_roots))
+            .map(Some)
+            .map_err(|error| error.to_string());
+        }
+        return DependencyExecContext::new_canonical_cargo_with_generated(
+            execution_mode,
+            text("source_root")?,
+            text("cwd")?,
+            text("out_dir")?,
+            dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort,
+        )
+        .and_then(|context| context.with_generated_directories(generated_directories))
+        .and_then(|context| context.with_native_roots(native_roots))
+        .map(Some)
+        .map_err(|error| error.to_string());
+    }
     DependencyExecContext::new_with_generated_artifacts(
         text("source_root")?,
         text("cwd")?,
@@ -327,6 +462,7 @@ pub fn parse_dependency_context(
         env,
         runtime_cohort,
     )
+    .and_then(|context| context.with_generated_directories(generated_directories))
     .map(|context| Some(context.with_execution_mode(execution_mode)))
     .map_err(|error| error.to_string())
 }
@@ -335,13 +471,17 @@ pub fn parse_dependency_context(
 /// or process launch. The coordinator's mode is intent, never proof that LLVM
 /// can safely run under that view. The stricter archive path must name only
 /// retained inputs and exactly the complete, derived library output set.
+/// Canonical Cargo uses the same closed-input/output validation for both modes,
+/// with an independent per-action context rather than the outer Cargo mounts.
 pub fn validate_dependency_execution(
     request: &CanonicalExecRequest,
     artifacts: Option<&ArtifactPlan>,
+    source_manifest: Option<&rabs_sandbox::source_transfer::SourceManifest>,
 ) -> Result<(), String> {
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
         RemoteDependencyOutputClass, remote_dependency_output_class,
+        validate_generated_native_inputs_with_roots,
     };
     use std::collections::BTreeSet;
     use std::path::{Component, Path};
@@ -354,8 +494,89 @@ pub fn validate_dependency_execution(
     let invocation = rabs_key::invocation::parse(&argv, None)
         .map_err(|error| format!("dependency invocation: {error:?}"))?;
     let class = remote_dependency_output_class(&invocation).map_err(|error| error.to_string())?;
+    // Canonical metadata checks and closed rlib execution can consume static
+    // native inputs from complete retained Cargo build-output trees. This grants neither
+    // host-native lookup nor local compiler-result authority.
+    // The source transfer retains the complete generated tree; the compiler
+    // can resolve only these declared directories and its other sealed inputs.
+    let native_roots = context
+        .native_roots()
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    let native_directories = validate_generated_native_inputs_with_roots(
+        &invocation,
+        context.generated_root(),
+        &native_roots,
+        context.canonical_cargo(),
+    )
+    .map_err(|error| format!("dependency generated native inputs: {error}"))?;
+    let native_tree = |directory: &str| {
+        context
+            .generated_root()
+            .map(|root| (root, context.generated_directories(), "generated"))
+            .into_iter()
+            .chain(context.native_roots().iter().map(|root| {
+                (
+                    root.path.as_str(),
+                    root.directories.as_slice(),
+                    root.prefix.as_str(),
+                )
+            }))
+            .find(|(root, _, _)| Path::new(directory).starts_with(root))
+    };
+    for directory in &native_directories {
+        let (root, directories, _) =
+            native_tree(directory).ok_or("native search has no retained input root")?;
+        let relative = Path::new(directory)
+            .strip_prefix(root)
+            .map_err(|_| "native input is outside the retained generated tree")?;
+        if !relative.as_os_str().is_empty()
+            && !directories
+                .iter()
+                .any(|declared| Path::new(declared) == relative)
+        {
+            return Err(
+                "native search directory is absent from the retained generated tree".into(),
+            );
+        }
+    }
+    if !native_directories.is_empty() {
+        let manifest = source_manifest.ok_or("native inputs lack a retained source manifest")?;
+        let files = manifest
+            .files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        for library in &invocation.native_libs {
+            let name = library
+                .strip_prefix("static=")
+                .ok_or("native inputs require default-bundle static archives")?;
+            let present = native_directories.iter().any(|directory| {
+                let Some((root, _, prefix)) = native_tree(directory) else {
+                    return false;
+                };
+                let Ok(relative) = Path::new(directory).strip_prefix(root) else {
+                    return false;
+                };
+                let path = Path::new(prefix)
+                    .join(relative)
+                    .join(format!("lib{name}.a"));
+                path.to_str().is_some_and(|path| files.contains(path))
+            });
+            if !present {
+                return Err(
+                    "static native archive is absent from the retained search directories".into(),
+                );
+            }
+        }
+    }
     match (context.execution_mode(), class) {
-        (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => return Ok(()),
+        (DependencyExecutionMode::Metadata, RemoteDependencyOutputClass::Metadata) => {
+            if !context.canonical_cargo() {
+                return Ok(());
+            }
+        }
         (DependencyExecutionMode::Rlib, RemoteDependencyOutputClass::Rlib) => {}
         _ => return Err("dependency execution mode differs from compiler outputs".into()),
     }
@@ -370,12 +591,14 @@ pub fn validate_dependency_execution(
         ("linux", "aarch64", true) => "aarch64-unknown-linux-musl",
         _ => return Err("remote archive execution requires a supported Linux worker".into()),
     };
-    let outputs =
+    let outputs = if context.workspace_execution_only() {
+        rabs_key::output_derivation::derive_workspace_output_declarations(&invocation, host)
+    } else {
         rabs_key::output_derivation::derive_dependency_output_declarations(&invocation, host)
-            .map_err(|error| format!("dependency archive outputs: {error}"))?;
+    }
+    .map_err(|error| format!("dependency execution outputs: {error}"))?;
     if request.program != context.compiler()
         || invocation.out_dir.as_deref() != Some(context.out_dir())
-        || !invocation.native_libs.is_empty()
         || invocation
             .codegen
             .iter()
@@ -402,11 +625,14 @@ pub fn validate_dependency_execution(
         return Err("dependency archive source is outside the retained package".into());
     }
     for search in &invocation.lib_search {
-        if search
+        let dependency = search
             .strip_prefix("dependency=")
-            .is_none_or(|path| !context.dependency_dirs().iter().any(|root| root == path))
-        {
-            return Err("dependency archive has an undeclared or native search directory".into());
+            .is_some_and(|path| context.dependency_dirs().iter().any(|root| root == path));
+        let native = search
+            .strip_prefix("native=")
+            .is_some_and(|path| native_directories.iter().any(|root| root == path));
+        if !dependency && !native {
+            return Err("dependency archive has an undeclared search directory".into());
         }
     }
     for (_, path) in &invocation.externs {
@@ -723,6 +949,20 @@ pub fn execute_uploaded_canonical_controlled(
     result
 }
 
+/// Create an attempt-owned root before any compiler or runtime input is written.
+/// Empty search trees must remain private even with a permissive host umask.
+/// The caller keeps the returned owner through process cleanup and output drains.
+fn attempt_private_directory(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
 /// Capture the selected host ELF runtime into independently owned storage.
 /// The caller retains this owner through process cleanup and diagnostic drains;
 /// dependency namespaces never expose the live host /usr tree.
@@ -871,7 +1111,11 @@ fn execute_canonical_inner(
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
     let artifact_plan = control.artifact_plan();
-    if let Err(error) = validate_dependency_execution(request, artifact_plan.as_ref()) {
+    if let Err(error) = validate_dependency_execution(
+        request,
+        artifact_plan.as_ref(),
+        source.map(SourceOwner::manifest),
+    ) {
         let _ = control.retain_outputs(Err(error));
         return exec_error(request.request_id);
     }
@@ -911,10 +1155,7 @@ fn execute_canonical_inner(
     // Hot Cargo state also uses an independent fresh HOME: a prior command's
     // runtime files must not become unkeyed inputs of a later target clone.
     let private_home = if request.dependency_context.is_some() || hot_inputs.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-private-home-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-private-home-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ =
@@ -929,10 +1170,7 @@ fn execute_canonical_inner(
         .as_ref()
         .map_or(home_backing, |directory| directory.path());
     let private_cargo_home = if hot_inputs.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-target-cargo-home-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-target-cargo-home-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ = control.retain_outputs(Err(format!("Cargo runtime preparation: {error}")));
@@ -950,10 +1188,7 @@ fn execute_canonical_inner(
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
-        match tempfile::Builder::new()
-            .prefix("rabs-dependency-empty-")
-            .tempdir()
-        {
+        match attempt_private_directory("rabs-dependency-empty-") {
             Ok(directory) => Some(directory),
             Err(error) => {
                 let _ =
@@ -969,6 +1204,9 @@ fn execute_canonical_inner(
     // excluding a file from a shared Cargo input/output directory.
     let mut dependency_inputs = None;
     let mut generated_inputs = None;
+    let mut native_inputs = Vec::new();
+    let mut workspace_inputs = None;
+    let mut retained_package = None;
     let prepared_spec = (|| -> Result<_, String> {
         if let Some(context) = &request.dependency_context {
             let source = source.ok_or("dependency execution lacks its source owner")?;
@@ -1012,9 +1250,16 @@ fn execute_canonical_inner(
                     execution_home,
                 )
                 .map_err(|error| error.to_string())?;
+            workspace_inputs = source
+                .prepare_dependency_source(request.request_id, context, &mut spec)
+                .map_err(|error| format!("workspace input preparation: {error}"))?;
+            retained_package = Some(source_root);
             generated_inputs = source
                 .prepare_dependency_generated(request.request_id, context, &mut spec)
                 .map_err(|error| format!("generated input preparation: {error}"))?;
+            native_inputs = source
+                .prepare_dependency_native(request.request_id, context, &mut spec)
+                .map_err(|error| format!("native input preparation: {error}"))?;
             let inputs = source
                 .prepare_dependency_output(request.request_id, context, &mut spec)
                 .map_err(|error| format!("dependency input mountpoints: {error}"))?;
@@ -1101,11 +1346,20 @@ fn execute_canonical_inner(
         hot_inputs.as_ref(),
         artifact_plan.as_ref(),
     ) {
+        // Hot target state is only constructed for canonical execution, which
+        // already probed host isolation above. The key must bind that proof;
+        // a missing probe refuses instead of hashing an unbound or empty profile.
+        let Some(support) = canonical_support.as_ref() else {
+            let _ = control.retain_outputs(Err(
+                "hot Cargo target state lacks canonical isolation proof".to_owned(),
+            ));
+            return exec_error(request.request_id);
+        };
         let prepared =
-            crate::target_cache::target_key(scope, request, inputs, &spec, &support, plan, grant)
+            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, grant)
                 .and_then(|key| {
                     let compatible = crate::target_cache::target_compatibility_key(
-                        scope, request, inputs, &spec, &support, plan, grant,
+                        scope, request, inputs, &spec, support, plan, grant,
                     )?;
                     cache.acquire(
                         key,
@@ -1163,18 +1417,34 @@ fn execute_canonical_inner(
         }
     };
     let launch = if let Some(context) = &request.dependency_context {
-        rabs_sandbox::dependency_context::build_dependency_argv(
-            context,
-            &spec,
-            dependency_runtime
-                .as_ref()
-                .expect("dependency execution has a retained runtime"),
-            dependency_support
-                .as_ref()
-                .expect("dependency execution has its own isolation proof"),
-            &request.program,
-            &request.args,
-        )
+        let runtime = dependency_runtime
+            .as_ref()
+            .expect("dependency execution has a retained runtime");
+        let support = dependency_support
+            .as_ref()
+            .expect("dependency execution has its own isolation proof");
+        if context.workspace_execution_only() {
+            rabs_sandbox::dependency_context::build_workspace_dependency_argv(
+                context,
+                &spec,
+                runtime,
+                support,
+                &request.program,
+                &request.args,
+                retained_package
+                    .as_deref()
+                    .expect("dependency execution retains its sealed package"),
+            )
+        } else {
+            rabs_sandbox::dependency_context::build_dependency_argv(
+                context,
+                &spec,
+                runtime,
+                support,
+                &request.program,
+                &request.args,
+            )
+        }
     } else {
         build_canonical_argv(
             &spec,
@@ -1236,13 +1506,26 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
-    if let Some(inputs) = &generated_inputs
-        && let Err(error) = inputs.verify()
-    {
-        let _ = control.retain_outputs(Err(format!(
-            "generated inputs changed before execution: {error}"
-        )));
-        return exec_error(request.request_id);
+    for (kind, inputs) in [
+        ("workspace", workspace_inputs.as_ref()),
+        ("generated", generated_inputs.as_ref()),
+    ] {
+        if let Some(inputs) = inputs
+            && let Err(error) = inputs.verify()
+        {
+            let _ = control.retain_outputs(Err(format!(
+                "{kind} inputs changed before execution: {error}"
+            )));
+            return exec_error(request.request_id);
+        }
+    }
+    for inputs in &native_inputs {
+        if let Err(error) = inputs.verify() {
+            let _ = control.retain_outputs(Err(format!(
+                "native inputs changed before execution: {error}"
+            )));
+            return exec_error(request.request_id);
+        }
     }
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
@@ -1414,7 +1697,13 @@ fn execute_canonical_inner(
                         )
                     })
                     .and_then(|captured| {
+                        if let Some(inputs) = &workspace_inputs {
+                            inputs.verify()?;
+                        }
                         if let Some(inputs) = &generated_inputs {
+                            inputs.verify()?;
+                        }
+                        for inputs in &native_inputs {
                             inputs.verify()?;
                         }
                         Ok(captured)
@@ -1532,6 +1821,70 @@ pub fn admit_worker(
 mod tests {
     use super::*;
     use rabs_protocol::capability_tokens::{CapabilityKind, mint};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attempt_private_directories_exclude_previous_home_and_search_inputs() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+
+        let prefixes = [
+            "rabs-private-home-",
+            "rabs-target-cargo-home-",
+            "rabs-dependency-empty-",
+        ];
+        let previous = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
+        let next = prefixes.map(|prefix| attempt_private_directory(prefix).unwrap());
+        for directory in previous.iter().chain(&next) {
+            let metadata = fs::symlink_metadata(directory.path()).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        let context = DependencyExecContext::new(
+            "/workspace/package".into(),
+            "/workspace/package".into(),
+            "/toolchains/fixture".into(),
+            "/toolchains/fixture/bin/rustc".into(),
+            "/target/output".into(),
+            vec!["/target/dependencies".into()],
+            Vec::new(),
+            [1; 32],
+        )
+        .unwrap();
+        context.prepare_empty_backings(previous[2].path()).unwrap();
+        context.prepare_empty_backings(next[2].path()).unwrap();
+        let search = |directory: &tempfile::TempDir| {
+            let children = fs::read_dir(directory.path())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(children.len(), 1);
+            children[0].path()
+        };
+        let previous_search = search(&previous[2]);
+        let next_search = search(&next[2]);
+        fs::write(previous[0].path().join("old-home-input"), b"old home").unwrap();
+        fs::write(
+            previous[1].path().join("old-cargo-input"),
+            b"old Cargo home",
+        )
+        .unwrap();
+        fs::write(previous_search.join("old-library.rlib"), b"old archive").unwrap();
+        assert_eq!(fs::read_dir(next[0].path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(next[1].path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&next_search).unwrap().count(), 0);
+
+        // Completing one attempt releases only its owners. Another attempt's
+        // home and declared empty search root must remain independently owned.
+        let next_home = next[0].path().join("active-home-input");
+        fs::write(&next_home, b"still active").unwrap();
+        drop(previous);
+        assert_eq!(fs::read(&next_home).unwrap(), b"still active");
+        assert!(next_search.is_dir());
+        assert_eq!(fs::read_dir(next_search).unwrap().count(), 0);
+    }
 
     fn token() -> CapabilityToken {
         mint(1, CapabilityKind::ExecuteAction, 7, 3, "worker/exec", 100).unwrap()

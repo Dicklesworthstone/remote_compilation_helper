@@ -19,7 +19,11 @@ use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
-use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
+use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
+    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use rabs_wkr::artifacts::{
@@ -39,7 +43,7 @@ use rabs_wkr::session::{
     probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
-use rabs_wkr::source_transfer::{self, SourceOwner};
+use rabs_wkr::source_transfer::{self, SourceCache, SourceOwner};
 use rabs_wkr::toolchain_transfer::{self, ToolchainOwner, ToolchainReply, ToolchainTransferTask};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -64,6 +68,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
 const OUTPUT_TRANSFER: &str = "ranges-v1";
 const INPUT_DEADLINE_EXCEEDED: &str = "input-upload-deadline-exceeded";
+
+/// A mode alone does not identify the namespace's path semantics. Preserve the
+/// exact version selected by authenticated admission until each request has
+/// been checked, before accepting input ownership or advancing the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DependencySelection {
+    version: &'static str,
+    mode: DependencyExecutionMode,
+}
 
 /// These are whole-phase limits, never idle timers refreshed by progress.
 /// Tests inject short budgets into the production session driver; wire peers
@@ -490,6 +503,47 @@ fn target_cache_limit(
     ))
 }
 
+fn source_cache_limit(
+    argument: Option<&str>,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<u64, String> {
+    let (name, value) = match argument {
+        Some(value) => ("--source-cache-bytes", value),
+        None => match environment {
+            Some(value) => (
+                "RABS_WORKER_SOURCE_CACHE_BYTES",
+                value
+                    .to_str()
+                    .ok_or("RABS_WORKER_SOURCE_CACHE_BYTES must be ASCII decimal digits")?,
+            ),
+            None => return Ok(source_transfer::DEFAULT_SOURCE_CACHE_BYTES),
+        },
+    };
+    if !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(bytes) = value.parse::<u64>()
+        && bytes <= source_transfer::MAX_SOURCE_CACHE_BYTES
+    {
+        return Ok(bytes);
+    }
+    Err(format!(
+        "{name} requires 1..10 decimal digits representing 0 to 8589934592 bytes"
+    ))
+}
+
+fn prepare_source_cache(
+    journal_root: &std::path::Path,
+    directory: Option<&std::ffi::OsStr>,
+    bytes: u64,
+) -> io::Result<Option<SourceCache>> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let root = directory.map_or(journal_root, std::path::Path::new);
+    SourceCache::open(root, bytes).map(Some)
+}
+
 fn target_cache_epoch(
     argument: Option<&str>,
     environment: Option<&std::ffi::OsStr>,
@@ -549,10 +603,13 @@ fn main() {
         Some("--help") => {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
-                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
+                 USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--source-cache-bytes N] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
+                 --source-cache-bytes or RABS_WORKER_SOURCE_CACHE_BYTES bounds verified input reuse (default 536870912; 0 disables).\n\
+                 Source bytes persist below the private worker state directory; RABS_SOURCE_CACHE_DIR selects another private directory.\n\
+                 Inputs are reverified and copied into a fresh receiver before every execution.\n\
                  --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
                  --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
                  Change the epoch before updating host tools, libraries or other runtime inputs.\n\
@@ -588,6 +645,7 @@ fn main() {
     let mut once = false;
     let mut target_cache_argument = None;
     let mut target_epoch_argument = None;
+    let mut source_cache_argument = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -598,15 +656,15 @@ fn main() {
                 }
             }
             "--once" => once = true,
-            "--target-cache-bytes" | "--target-cache-epoch" => {
+            "--target-cache-bytes" | "--target-cache-epoch" | "--source-cache-bytes" => {
                 let Some(value) = iter.next() else {
                     eprintln!("rabs-wkr: {arg} requires a value");
                     std::process::exit(2);
                 };
-                if arg == "--target-cache-bytes" {
-                    target_cache_argument = Some(value.as_str());
-                } else {
-                    target_epoch_argument = Some(value.as_str());
+                match arg.as_str() {
+                    "--target-cache-bytes" => target_cache_argument = Some(value.as_str()),
+                    "--target-cache-epoch" => target_epoch_argument = Some(value.as_str()),
+                    _ => source_cache_argument = Some(value.as_str()),
                 }
             }
             other => {
@@ -639,6 +697,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let source_cache_bytes = match source_cache_limit(
+        source_cache_argument,
+        std::env::var_os("RABS_WORKER_SOURCE_CACHE_BYTES").as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("rabs-wkr: {error}");
+            std::process::exit(2);
+        }
+    };
     let host_budget = match HostBudget::from_environment() {
         Ok(budget) => budget,
         Err(error) => {
@@ -655,6 +723,17 @@ fn main() {
         Err(error) => {
             eprintln!("rabs-wkr: durable ownership unavailable: {error}");
             std::process::exit(1);
+        }
+    };
+    let source_cache = match prepare_source_cache(
+        journal.storage_root(),
+        std::env::var_os("RABS_SOURCE_CACHE_DIR").as_deref(),
+        source_cache_bytes,
+    ) {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("rabs-wkr: source cache configuration: {error}");
+            std::process::exit(2);
         }
     };
     let target_cache = if target_cache_bytes == 0 {
@@ -698,21 +777,58 @@ fn main() {
         reconnect::RuntimeResources {
             host_budget,
             target_cache,
+            source_cache,
         },
     ));
 }
 
-/// Partial input belongs to the session, not to a disposable read future.
+/// Partial input and coalesced tails belong to the session, not to a disposable
+/// read future. Keep this owner across the admission-to-execution handoff.
 #[derive(Default)]
 struct FrameReader {
     pending: Vec<u8>,
+    scanned: usize,
 }
 
 impl FrameReader {
+    const READ_BYTES: usize = 4096;
+    const READS_PER_YIELD: usize = 32;
+
     async fn read<R: AsyncRead + Unpin>(&mut self, stream: &mut R) -> io::Result<Option<String>> {
-        let mut byte = [0_u8; 1];
+        let mut chunk = [0_u8; Self::READ_BYTES];
+        let mut reads = 0;
         loop {
-            if stream.read(&mut byte).await? == 0 {
+            if let Some(offset) = self.pending[self.scanned..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let end = self.scanned + offset;
+                if end > MAX_FRAME_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "frame too large",
+                    ));
+                }
+                let tail = self.pending.split_off(end + 1);
+                let mut frame = std::mem::replace(&mut self.pending, tail);
+                frame.truncate(end);
+                self.scanned = 0;
+                return String::from_utf8(frame)
+                    .map(Some)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 frame"));
+            }
+            if self.pending.len() > MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            self.scanned = self.pending.len();
+            // The extra byte permits a newline exactly at the frame limit.
+            // An oversized prefix never causes an unbounded read or allocation.
+            let capacity = chunk.len().min(MAX_FRAME_BYTES + 1 - self.pending.len());
+            let count = stream.read(&mut chunk[..capacity]).await?;
+            if count == 0 {
                 return if self.pending.is_empty() {
                     Ok(None)
                 } else {
@@ -722,18 +838,25 @@ impl FrameReader {
                     ))
                 };
             }
-            if byte[0] == b'\n' {
-                return String::from_utf8(std::mem::take(&mut self.pending))
-                    .map(Some)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 frame"));
+            self.pending.extend_from_slice(&chunk[..count]);
+            reads += 1;
+            if reads == Self::READS_PER_YIELD {
+                // A ready stream still yields to next_event's cancellation,
+                // absolute input deadlines and filesystem/process completions.
+                // All received bytes already belong to this persistent reader.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                reads = 0;
             }
-            if self.pending.len() == MAX_FRAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
-            self.pending.push(byte[0]);
         }
     }
 }
@@ -1194,9 +1317,8 @@ where
     .await
 }
 
-/// Production always supplies a durable journal. None is a test seam, never an
-/// IO-failure fallback. Input verification precedes durable admission and lease
-/// arming. Launch MUST retain both input owners through process and drain cleanup.
+/// Session fixtures begin after admission and own no buffered handshake bytes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_session_with_inputs<S, L, H>(
     stream: &mut S,
@@ -1209,7 +1331,7 @@ async fn drive_session_with_inputs<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_mode: Option<DependencyExecutionMode>,
+    dependency_mode: Option<DependencySelection>,
     launch: L,
     heartbeat: H,
 ) -> Result<(), String>
@@ -1244,9 +1366,65 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_session_with_input_budgets<S, L, H>(
     stream: &mut S,
+    report: &rabs_wkr::session::CapabilityReport,
+    once: bool,
+    journal: Option<&mut WorkerJournal>,
+    artifact_transfer_enabled: bool,
+    source_transfer_enabled: bool,
+    toolchain_transfer_enabled: bool,
+    output_preview_enabled: bool,
+    execution_lease: &ExecutionLeaseSelection,
+    toolchain_reuse_enabled: bool,
+    dependency_mode: Option<DependencySelection>,
+    input_budgets: InputBudgets,
+    launch: L,
+    heartbeat: H,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut(
+        CanonicalExecRequest,
+        Duration,
+        Option<ArtifactPlan>,
+        Option<SourceOwner>,
+        Option<ToolchainOwner>,
+        Option<(RequestExecutionLeaseIdentity, u64)>,
+    ) -> io::Result<ExecutionTask>,
+    H: FnMut() -> rabs_wkr::session::PressureSample,
+{
+    drive_session_with_reader(
+        stream,
+        FrameReader::default(),
+        report,
+        once,
+        journal,
+        artifact_transfer_enabled,
+        source_transfer_enabled,
+        toolchain_transfer_enabled,
+        output_preview_enabled,
+        execution_lease,
+        toolchain_reuse_enabled,
+        dependency_mode,
+        input_budgets,
+        None,
+        launch,
+        heartbeat,
+    )
+    .await
+}
+
+/// Production always supplies a durable journal and the admission reader.
+/// None is a test seam, never an IO-failure fallback. Input verification
+/// precedes durable admission and lease arming. Launch MUST retain both input
+/// owners through process and drain cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn drive_session_with_reader<S, L, H>(
+    stream: &mut S,
+    mut reader: FrameReader,
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
     mut journal: Option<&mut WorkerJournal>,
@@ -1256,8 +1434,9 @@ async fn drive_session_with_input_budgets<S, L, H>(
     output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     toolchain_reuse_enabled: bool,
-    dependency_mode: Option<DependencyExecutionMode>,
+    dependency_mode: Option<DependencySelection>,
     input_budgets: InputBudgets,
+    source_cache: Option<SourceCache>,
     mut launch: L,
     mut heartbeat: H,
 ) -> Result<(), String>
@@ -1284,22 +1463,19 @@ where
                 .to_owned(),
         );
     }
-    if dependency_mode.is_some_and(|mode| !report.dependency_modes.contains(&mode)) {
+    if dependency_mode.is_some_and(|selected| !report.dependency_modes.contains(&selected.mode)) {
         return Err("dependency execution mode unavailable".to_owned());
     }
-    let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
     let mut last_admitted: Option<u64> = None;
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
-    let mut source_transfer = if toolchain_transfer_enabled {
-        SourceTransferTask::with_input_budget(
-            rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET,
-        )
-    } else {
-        SourceTransferTask::default()
-    };
+    let mut source_transfer = SourceTransferTask::with_configuration(
+        toolchain_transfer_enabled
+            .then_some(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET),
+        source_cache,
+    );
     let mut toolchain_transfer = ToolchainTransferTask::with_reuse(toolchain_reuse_enabled);
     let mut input_deadline = InputDeadline::new(input_budgets);
     let mut deferred = DeferredFrames::default();
@@ -1671,7 +1847,8 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
-        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION],
+        "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION],
+        "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
@@ -1684,6 +1861,47 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "request_id_policy": "worker-endpoint-monotonic",
     })
     .to_string()
+}
+
+/// Preserve the worker's process-lifetime runtime roots across reconnects.
+/// Diagnostic retention may still own files beneath them after a session ends;
+/// creating a session-scoped TempDir here would discard those files too early.
+/// New Unix roots are private from creation, independent of a permissive umask.
+/// Existing roots are checked without changing permissions or adopting aliases.
+fn prepare_runtime_directory(path: &std::path::Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker runtime root must be a real directory, not a symlink or file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker runtime root must not be writable by group or other users",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker runtime root must be owned by the worker",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn session_loop(
@@ -1710,6 +1928,7 @@ async fn session_loop(
     };
     let target_scope =
         rabs_wkr::target_cache::TargetCacheScope::new(&report.worker_id, coordinator, &recipient);
+    let mut reader = FrameReader::default();
     let (
         capture_output,
         capture_artifacts,
@@ -1746,7 +1965,6 @@ async fn session_loop(
             write_frame(&mut stream, &hello.to_string())
                 .await
                 .map_err(|e| format!("hello write: {e}"))?;
-            let mut reader = FrameReader::default();
             let first = reader
                 .read(&mut stream)
                 .await
@@ -1854,7 +2072,7 @@ async fn session_loop(
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
     for path in [&cargo_home, &home, &spills] {
-        std::fs::create_dir_all(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
+        prepare_runtime_directory(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
     }
     let journal_root = journal.storage_root().to_path_buf();
     journal.clear_result_recipient();
@@ -1862,8 +2080,9 @@ async fn session_loop(
         journal.authorize_result_recipient(recipient.clone());
     }
     *admitted_at = Some(std::time::Instant::now());
-    let outcome = drive_session_with_inputs(
+    let outcome = drive_session_with_reader(
         &mut stream,
+        reader,
         report,
         once,
         Some(&mut *journal),
@@ -1874,6 +2093,8 @@ async fn session_loop(
         &execution_lease,
         reuse_toolchain,
         dependency_context,
+        InputBudgets::default(),
+        resources.source_cache.clone(),
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -1996,13 +2217,29 @@ fn dependency_context_selection(
     artifacts: bool,
     source: bool,
     toolchain: bool,
-) -> Result<Option<DependencyExecutionMode>, String> {
+) -> Result<Option<DependencySelection>, String> {
     let value: serde_json::Value =
         serde_json::from_str(frame).map_err(|error| error.to_string())?;
     match value.get("dependency_context") {
         None if value.get("dependency_execution_mode").is_none() => Ok(None),
         None => Err("dependency execution mode requires a versioned context".to_owned()),
-        Some(selected) if selected.as_str() == Some(DEPENDENCY_CONTEXT_VERSION) => {
+        Some(selected)
+            if matches!(
+                selected.as_str(),
+                Some(
+                    DEPENDENCY_CONTEXT_VERSION
+                        | CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                        | CANONICAL_WORKSPACE_CONTEXT_VERSION
+                )
+            ) =>
+        {
+            let version = if selected.as_str() == Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) {
+                CANONICAL_WORKSPACE_CONTEXT_VERSION
+            } else if selected.as_str() == Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) {
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION
+            } else {
+                DEPENDENCY_CONTEXT_VERSION
+            };
             let mode = match value
                 .get("dependency_execution_mode")
                 .and_then(serde_json::Value::as_str)
@@ -2020,7 +2257,7 @@ fn dependency_context_selection(
                         .to_owned(),
                 );
             }
-            Ok(Some(mode))
+            Ok(Some(DependencySelection { version, mode }))
         }
         Some(_) => Err("unsupported dependency_context selection".to_owned()),
     }
@@ -2032,11 +2269,15 @@ fn dependency_context_selection(
 fn validate_execution_selection(
     request: &CanonicalExecRequest,
     report: &rabs_wkr::session::CapabilityReport,
-    selected: Option<DependencyExecutionMode>,
+    selected: Option<DependencySelection>,
 ) -> Result<(), String> {
     match (request.dependency_context.as_ref(), selected) {
-        (Some(context), Some(mode))
-            if context.execution_mode() == mode && report.dependency_modes.contains(&mode) =>
+        (Some(context), Some(selected)) if context.version() != selected.version => {
+            Err("dependency context version does not match negotiation".to_owned())
+        }
+        (Some(context), Some(selected))
+            if context.execution_mode() == selected.mode
+                && report.dependency_modes.contains(&selected.mode) =>
         {
             Ok(())
         }
@@ -2151,6 +2392,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         rabs_wkr::session::validate_dependency_execution(
             &request,
             artifacts::parse_plan(value)?.as_ref(),
+            source_manifest.as_ref(),
         )?;
     }
     Ok(request)
@@ -2172,6 +2414,130 @@ mod tests {
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn source_cache_settings_enable_bounded_default_and_allow_explicit_disable() {
+        use std::ffi::OsStr;
+        assert_eq!(source_cache_limit(None, None).unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            source_cache_limit(None, Some(OsStr::new("1073741824"))).unwrap(),
+            1 << 30
+        );
+        assert_eq!(
+            source_cache_limit(Some("0"), Some(OsStr::new("invalid"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            source_cache_limit(Some("8589934592"), None).unwrap(),
+            source_transfer::MAX_SOURCE_CACHE_BYTES
+        );
+        for value in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1\n",
+            "1.5",
+            "8589934593",
+            "99999999999",
+        ] {
+            assert!(source_cache_limit(Some(value), None).is_err(), "{value:?}");
+            assert!(
+                source_cache_limit(None, Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let invalid = OsStr::from_bytes(b"\xff");
+            assert!(source_cache_limit(None, Some(invalid)).is_err());
+            assert_eq!(source_cache_limit(Some("0"), Some(invalid)).unwrap(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_cache_default_directory_reuses_across_sessions_and_disable_omits_it() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        fn exchange(task: &mut SourceTransferTask, frame: &serde_json::Value) -> serde_json::Value {
+            task.submit(frame, true, false).unwrap();
+            wait(poll_fn(|cx| task.poll_completion(cx)))
+                .unwrap()
+                .response
+                .unwrap()
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = b"real source bytes";
+        let digest = Sha256::digest(bytes).into();
+        let manifest = rabs_sandbox::source_transfer::SourceManifest::new(vec![
+            rabs_sandbox::source_transfer::SourceFile {
+                path: "lib.rs".into(),
+                len: bytes.len() as u64,
+                sha256: digest,
+                executable: false,
+            },
+        ])
+        .unwrap();
+        let manifest = serde_json::json!({"manifest_sha256":source_transfer::hex(&manifest.digest()), "files":[{
+            "path":"lib.rs", "bytes":bytes.len(), "sha256":source_transfer::hex(&digest), "executable":false,
+        }]});
+        let begin = serde_json::json!({"kind":"source-begin", "request_id":41, "manifest":manifest, "allow_cached_files":true});
+        let seal = serde_json::json!({"kind":"source-seal", "request_id":41, "manifest_sha256":manifest["manifest_sha256"]});
+        let capacity = source_cache_limit(None, None).unwrap();
+        let mut cold = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, capacity).unwrap(),
+        );
+        assert_eq!(
+            exchange(&mut cold, &begin)["missing_files"],
+            serde_json::json!(["lib.rs"])
+        );
+        exchange(
+            &mut cold,
+            &serde_json::json!({"kind":"source-chunk", "request_id":41,
+            "manifest_sha256":manifest["manifest_sha256"], "path":"lib.rs", "offset":0,
+            "data_hex":source_transfer::hex(bytes), "chunk_sha256":source_transfer::hex(&digest)}),
+        );
+        assert_eq!(exchange(&mut cold, &seal)["sealed"], true);
+        drop(cold);
+        assert!(root.path().join("source-files-v1").is_dir());
+
+        let mut warm = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, capacity).unwrap(),
+        );
+        let reply = exchange(&mut warm, &begin);
+        assert_eq!(reply["missing_files"], serde_json::json!([]));
+        assert_eq!(reply["source_reused_bytes"], bytes.len());
+        assert_eq!(reply["sealed"], false);
+        assert_eq!(exchange(&mut warm, &seal)["sealed"], true);
+        drop(warm);
+
+        let mut disabled = SourceTransferTask::with_configuration(
+            None,
+            prepare_source_cache(root.path(), None, 0).unwrap(),
+        );
+        let reply = exchange(&mut disabled, &begin);
+        assert_eq!(reply["missing_files"], serde_json::json!(["lib.rs"]));
+        assert_eq!(reply["source_reused_bytes"], 0);
+        assert!(
+            prepare_source_cache(
+                root.path(),
+                Some(std::ffi::OsStr::new("relative")),
+                capacity
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_source_cache(root.path(), Some(std::ffi::OsStr::new("relative")), 0)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn target_cache_settings_default_to_off_and_cli_overrides_environment() {
@@ -2643,6 +3009,272 @@ mod tests {
         }
     }
 
+    mod frame_reader_tests {
+        use super::*;
+
+        /// Controlled read fragmentation and counters exercise the real reader
+        /// without timing assertions or a throughput claim about this fixture.
+        struct BulkWire {
+            input: Vec<u8>,
+            offset: usize,
+            fragment: usize,
+            reads: usize,
+            largest_read: usize,
+            output: Vec<u8>,
+            flushes: Arc<AtomicUsize>,
+        }
+
+        impl BulkWire {
+            fn new(input: Vec<u8>, fragment: usize) -> Self {
+                assert!(fragment != 0);
+                Self {
+                    input,
+                    offset: 0,
+                    fragment,
+                    reads: 0,
+                    largest_read: 0,
+                    output: Vec::new(),
+                    flushes: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+
+        impl AsyncRead for BulkWire {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                this.reads += 1;
+                this.largest_read = this.largest_read.max(buffer.remaining());
+                let count = buffer
+                    .remaining()
+                    .min(this.fragment)
+                    .min(this.input.len() - this.offset);
+                buffer.put_slice(&this.input[this.offset..this.offset + count]);
+                this.offset += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for BulkWire {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut().output.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[test]
+        fn compiler_chunk_uses_bounded_reads_instead_of_one_poll_per_byte() {
+            let frame = serde_json::json!({
+                "kind": "toolchain-chunk", "data_hex": "ab".repeat(65_536),
+            })
+            .to_string();
+            let bytes = format!("{frame}\n").into_bytes();
+            let expected_reads = bytes.len().div_ceil(FrameReader::READ_BYTES);
+            let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+            let mut reader = FrameReader::default();
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.reads, expected_reads);
+            assert_eq!(wire.largest_read, FrameReader::READ_BYTES);
+            assert!(reader.pending.is_empty());
+        }
+
+        #[test]
+        fn native_atp_records_are_drained_without_one_tls_flush_per_payload_byte() {
+            use asupersync::bytes::BytesMut;
+            use asupersync::codec::Encoder;
+            use asupersync::net::atp::protocol::codec::AtpFrameCodec;
+            use asupersync::net::atp::protocol::frames::{Frame, FrameType, ProtocolVersion};
+            use rabs_asupersync::worker_transport::JsonAtpStream;
+
+            let frame = serde_json::json!({
+                "kind": "toolchain-chunk", "data_hex": "cd".repeat(65_536),
+            })
+            .to_string();
+            let mut encoded = BytesMut::new();
+            AtpFrameCodec::new()
+                .encode(
+                    Frame::new(
+                        ProtocolVersion::CURRENT,
+                        FrameType::Control,
+                        frame.as_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                    &mut encoded,
+                )
+                .unwrap();
+            let wire = BulkWire::new(encoded.to_vec(), FrameReader::READ_BYTES);
+            let flushes = Arc::clone(&wire.flushes);
+            let mut transport = JsonAtpStream::new(wire);
+            let mut reader = FrameReader::default();
+            let expected_reads = (frame.len() + 1).div_ceil(FrameReader::READ_BYTES);
+            assert_eq!(wait(reader.read(&mut transport)).unwrap(), Some(frame));
+            // The native adapter may yield while decoding the ATP payload.
+            // Its underlying flush count must still scale with chunks, not
+            // the 131,072 hex digits in this ordinary compiler upload record.
+            assert!(flushes.load(Ordering::Relaxed) <= expected_reads + 2);
+        }
+
+        #[test]
+        fn coalesced_frames_and_fragmented_utf8_preserve_exact_records() {
+            let frames = [
+                String::new(),
+                serde_json::json!({"kind":"ping", "label":"雪🦀\nquoted"}).to_string(),
+                "[1,2]".to_owned(),
+                "last".to_owned(),
+            ];
+            let bytes = frames
+                .iter()
+                .map(|frame| format!("{frame}\n"))
+                .collect::<String>()
+                .into_bytes();
+            for fragment in [1, 7, FrameReader::READ_BYTES] {
+                let mut wire = BulkWire::new(bytes.clone(), fragment);
+                let mut reader = FrameReader::default();
+                for frame in &frames {
+                    assert_eq!(wait(reader.read(&mut wire)).unwrap().as_ref(), Some(frame));
+                }
+                if fragment == FrameReader::READ_BYTES {
+                    assert_eq!(wire.reads, 1, "coalesced tails need no further stream read");
+                }
+                assert_eq!(wait(reader.read(&mut wire)).unwrap(), None);
+            }
+            for fragment in [1, FrameReader::READ_BYTES] {
+                let mut wire = BulkWire::new(vec![0xf0, 0x9f, 0xa6, b'\n'], fragment);
+                assert_eq!(
+                    wait(FrameReader::default().read(&mut wire))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+        }
+
+        #[test]
+        fn exact_frame_limit_accepts_terminator_and_preserves_the_next_frame() {
+            let frame = "x".repeat(MAX_FRAME_BYTES);
+            let mut wire = BulkWire::new(
+                format!("{frame}\nnext\n").into_bytes(),
+                FrameReader::READ_BYTES,
+            );
+            let mut reader = FrameReader::default();
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.offset, MAX_FRAME_BYTES + 1);
+            assert_eq!(
+                wait(reader.read(&mut wire)).unwrap().as_deref(),
+                Some("next")
+            );
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), None);
+
+            for terminator in [b"".as_slice(), b"\n".as_slice()] {
+                let mut bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
+                bytes.extend_from_slice(terminator);
+                let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+                let mut reader = FrameReader::default();
+                assert_eq!(
+                    wait(reader.read(&mut wire)).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+                assert_eq!(wire.offset, MAX_FRAME_BYTES + 1);
+                assert_eq!(reader.pending.len(), MAX_FRAME_BYTES + 1);
+            }
+            let mut wire = BulkWire::new(vec![b'x'; MAX_FRAME_BYTES], FrameReader::READ_BYTES);
+            assert_eq!(
+                wait(FrameReader::default().read(&mut wire))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof,
+            );
+        }
+
+        #[test]
+        fn dropping_a_yielded_bulk_read_preserves_its_partial_frame() {
+            let frame = "x".repeat(FrameReader::READ_BYTES * FrameReader::READS_PER_YIELD + 137);
+            let bytes = format!("{frame}\n").into_bytes();
+            let expected_reads = bytes.len().div_ceil(FrameReader::READ_BYTES);
+            let mut wire = BulkWire::new(bytes, FrameReader::READ_BYTES);
+            let mut reader = FrameReader::default();
+            let mut read = Box::pin(reader.read(&mut wire));
+            let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            assert!(
+                read.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            drop(read);
+            assert_eq!(wire.reads, FrameReader::READS_PER_YIELD);
+            assert!(!reader.pending.is_empty());
+            assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some(frame));
+            assert_eq!(wire.reads, expected_reads);
+        }
+
+        #[test]
+        fn admission_reader_hands_coalesced_commands_to_the_production_driver() {
+            let ack = serde_json::json!({"kind":"session-ok", "session_id":7}).to_string();
+            let mut wire = BulkWire::new(
+                format!(
+                    "{ack}\n{{\"kind\":\"ping\"}}\n{{\"kind\":\"unknown\",\"request_id\":9}}\n"
+                )
+                .into_bytes(),
+                FrameReader::READ_BYTES,
+            );
+            let mut reader = FrameReader::default();
+            assert_eq!(
+                wait(reader.read(&mut wire)).unwrap().as_deref(),
+                Some(ack.as_str())
+            );
+            assert!(session_ack_accepted(&ack));
+            assert_eq!(wire.reads, 1);
+            assert_eq!(wire.offset, wire.input.len());
+            assert!(!reader.pending.is_empty());
+            wait(drive_session_with_reader(
+                &mut wire,
+                reader,
+                &report(),
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                &ExecutionLeaseSelection::default(),
+                false,
+                None,
+                InputBudgets::default(),
+                None,
+                |_, _, _, _, _, _| panic!("control frames must not launch execution"),
+                pressure,
+            ))
+            .unwrap();
+            let replies: Vec<serde_json::Value> = wire
+                .output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["kind"], "heartbeat");
+            assert_eq!(replies[1]["kind"], "error");
+            assert_eq!(replies[1]["request_id"], 9);
+            assert_eq!(replies[1]["reason"], "unknown-frame");
+        }
+    }
+
     #[test]
     fn session_ack_requires_success_message_kind() {
         assert!(session_ack_accepted(
@@ -2740,6 +3372,156 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    mod runtime_directory_tests {
+        use super::{prepare_runtime_directory, private_root};
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        #[test]
+        fn runtime_directory_creation_is_private_and_reconnect_preserves_existing_bytes() {
+            let parent = private_root();
+            for name in ["cargo-home", "home", "spills"] {
+                let path = parent.path().join(name);
+                prepare_runtime_directory(&path).unwrap();
+                let created = fs::symlink_metadata(&path).unwrap();
+                assert_eq!(created.permissions().mode() & 0o777, 0o700);
+                assert_eq!(created.uid(), rustix::process::geteuid().as_raw());
+                let retained = path.join("retained-output");
+                fs::write(&retained, b"output still awaiting acknowledgement\0\xff").unwrap();
+                for mode in [0o700, 0o750, 0o755] {
+                    // Older workers created 0755 roots with a normal umask.
+                    // They remain usable without chmod or new inode ownership.
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                    prepare_runtime_directory(&path).unwrap();
+                    let after = fs::symlink_metadata(&path).unwrap();
+                    assert_eq!((after.dev(), after.ino()), (created.dev(), created.ino()));
+                    assert_eq!(after.permissions().mode() & 0o777, mode);
+                    assert_eq!(
+                        fs::read(&retained).unwrap(),
+                        b"output still awaiting acknowledgement\0\xff"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn runtime_directory_refuses_writable_or_redirected_roots_without_mutation() {
+            let parent = private_root();
+            for mode in [0o770, 0o707, 0o777] {
+                let path = parent.path().join(format!("writable-{mode:o}"));
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("retained"), b"existing output").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                let before = fs::symlink_metadata(&path).unwrap();
+                assert!(prepare_runtime_directory(&path).is_err());
+                let after = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+                assert_eq!(after.permissions().mode() & 0o777, mode);
+                assert_eq!(fs::read(path.join("retained")).unwrap(), b"existing output");
+            }
+            let real = parent.path().join("real");
+            prepare_runtime_directory(&real).unwrap();
+            fs::write(real.join("retained"), b"do not adopt this directory").unwrap();
+            let alias = parent.path().join("alias");
+            symlink(&real, &alias).unwrap();
+            assert!(prepare_runtime_directory(&alias).is_err());
+            assert!(
+                fs::symlink_metadata(&alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read(real.join("retained")).unwrap(),
+                b"do not adopt this directory"
+            );
+            let missing = parent.path().join("missing");
+            let dangling = parent.path().join("dangling");
+            symlink(&missing, &dangling).unwrap();
+            assert!(prepare_runtime_directory(&dangling).is_err());
+            assert!(!missing.exists());
+            assert!(
+                fs::symlink_metadata(&dangling)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let file = parent.path().join("file");
+            fs::write(&file, b"keep ordinary file bytes").unwrap();
+            assert!(prepare_runtime_directory(&file).is_err());
+            assert_eq!(fs::read(file).unwrap(), b"keep ordinary file bytes");
+        }
+
+        #[test]
+        fn runtime_directory_refuses_foreign_ownership_when_chown_is_available() {
+            let parent = private_root();
+            let path = parent.path().join("foreign");
+            prepare_runtime_directory(&path).unwrap();
+            fs::write(path.join("retained"), b"foreign owner output").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let held = fs::File::open(&path).unwrap();
+            let own = rustix::process::geteuid();
+            let foreign = rustix::process::Uid::from_raw(if own.is_root() { 1 } else { 0 });
+            match rustix::fs::fchown(&held, Some(foreign), None) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::PERM | rustix::io::Errno::INVAL) => {
+                    eprintln!(
+                        "foreign-owner runtime fixture needs chown permission and a mapped UID"
+                    );
+                    return;
+                }
+                Err(error) => panic!("create foreign-owned runtime fixture: {error}"),
+            }
+            let refused = prepare_runtime_directory(&path);
+            let observed = fs::symlink_metadata(&path).unwrap();
+            // Restore only our fixture's ownership after observing the result,
+            // so its test owner can reclaim it on hosts with limited UID maps.
+            rustix::fs::fchown(&held, Some(own), None).unwrap();
+            assert!(refused.is_err());
+            assert_eq!(observed.uid(), foreign.as_raw());
+            assert_eq!(observed.permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::read(path.join("retained")).unwrap(),
+                b"foreign owner output"
+            );
+        }
+
+        #[test]
+        fn runtime_directory_supports_real_runtime_capture_without_losing_retained_output() {
+            let parent = private_root();
+            let toolchain = parent.path().join("toolchain");
+            fs::create_dir_all(toolchain.join("bin")).unwrap();
+            // A real ELF no-op measures the actual host loader/runtime. It is
+            // not a compiler fixture or evidence of a remote compilation.
+            let executable = toolchain.join("bin/rustc");
+            fs::copy("/usr/bin/true", &executable).unwrap();
+            let output = parent.path().join("output");
+            let spills = parent.path().join("spills");
+            prepare_runtime_directory(&output).unwrap();
+            prepare_runtime_directory(&spills).unwrap();
+            let transcript = spills.join("completed-stdout");
+            fs::write(&transcript, b"completed stream awaiting its recipient").unwrap();
+            let retained = rabs_sandbox::runtime_cohort::retain_runtime_cohort(
+                &executable,
+                &toolchain,
+                &[],
+                &output,
+                &spills,
+                || false,
+            )
+            .unwrap();
+            retained.verify(|| false).unwrap();
+            drop(retained);
+            prepare_runtime_directory(&spills).unwrap();
+            assert_eq!(
+                fs::read(&transcript).unwrap(),
+                b"completed stream awaiting its recipient"
+            );
+            assert_eq!(fs::read_dir(&spills).unwrap().count(), 1);
+        }
     }
 
     #[cfg(unix)]

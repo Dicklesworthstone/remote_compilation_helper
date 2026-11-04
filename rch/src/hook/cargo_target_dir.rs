@@ -1315,17 +1315,28 @@ mod managed_build_dir_tests {
             }
         }
 
-        let root = tempfile::Builder::new()
-            .prefix("rch-managed-package-")
+        let container = tempfile::Builder::new()
+            .prefix("rch-managed-package-src-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        let root = container.join("pkg");
+        fs::create_dir(&root).unwrap();
+        let storage = tempfile::Builder::new()
+            .prefix("rch-managed-package-storage-")
             .tempdir()
             .unwrap()
             .keep();
         eprintln!(
-            "managed packaging fixture and logs retained at {}",
-            root.display()
+            "managed packaging fixture retained at {} (storage at {})",
+            root.display(),
+            storage.display()
         );
-        for directory in ["src", ".cargo", "bin", "cargo-home", "logs", "returned"] {
+        for directory in ["src", ".cargo", "bin"] {
             fs::create_dir(root.join(directory)).unwrap();
+        }
+        for directory in ["cargo-home", "logs", "returned"] {
+            fs::create_dir(storage.join(directory)).unwrap();
         }
         // Explicit inclusion keeps the toolchain symlink, logs and managed
         // caches out of the package, and makes the negative source meaningful.
@@ -1349,8 +1360,8 @@ mod managed_build_dir_tests {
 "#,
         )
         .unwrap();
-        let outside_file = root.join("outside-file-config");
-        let outside_env = root.join("outside-environment");
+        let outside_file = storage.join("outside-file-config");
+        let outside_env = storage.join("outside-environment");
         fs::write(
             root.join(".cargo/config.toml"),
             format!(
@@ -1400,22 +1411,23 @@ mod managed_build_dir_tests {
                 .env_clear()
                 .env("PATH", &path)
                 .env("HOME", &root)
-                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_HOME", storage.join("cargo-home"))
                 .env("CARGO_TARGET_DIR", pool)
                 .env("CARGO_BUILD_BUILD_DIR", &outside_env)
                 .env("RUSTC", cargo_bin.join("rustc"))
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env("LC_ALL", "C")
                 .output()
                 .expect("GNU timeout and the fixture's native Cargo must be available");
-            fs::write(root.join(format!("logs/{name}.stdout")), &output.stdout).unwrap();
-            fs::write(root.join(format!("logs/{name}.stderr")), &output.stderr).unwrap();
+            fs::write(storage.join(format!("logs/{name}.stdout")), &output.stdout).unwrap();
+            fs::write(storage.join(format!("logs/{name}.stderr")), &output.stderr).unwrap();
             output
         };
 
         let command = "cargo package --offline --allow-dirty --no-metadata -j1";
-        let pool = root.join("managed pool");
+        let pool = storage.join("managed pool");
         let packaged = run("package", command, &pool);
         assert!(packaged.status.success(), "{packaged:?}");
         let mut inventory = Vec::new();
@@ -1437,8 +1449,9 @@ mod managed_build_dir_tests {
             Some(rch_common::CompilationKind::CargoBuild),
             Some(plan.policy_command()),
         );
+        let returned_dir = storage.join("returned");
         let pipeline = crate::transfer::TransferPipeline::new(
-            root.join("returned"),
+            returned_dir.clone(),
             "native-package".into(),
             "fixture".into(),
             rch_common::TransferConfig::default(),
@@ -1476,7 +1489,7 @@ mod managed_build_dir_tests {
                 "--",
             ])
             .arg(format!("{}/", pool.display()))
-            .arg(format!("{}/", root.join("returned").display()))
+            .arg(format!("{}/", returned_dir.display()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1495,7 +1508,7 @@ mod managed_build_dir_tests {
         assert!(transferred.status.success(), "{transferred:?}");
         for relative in &selected {
             let original = fs::read(pool.join(relative)).unwrap();
-            let returned = fs::read(root.join("returned").join(relative)).unwrap();
+            let returned = fs::read(returned_dir.join(relative)).unwrap();
             assert_eq!(
                 blake3::hash(&returned),
                 blake3::hash(&original),
@@ -1503,7 +1516,7 @@ mod managed_build_dir_tests {
             );
         }
         let original = fs::read(pool.join(&archive)).unwrap();
-        let returned = fs::read(root.join("returned").join(&archive)).unwrap();
+        let returned = fs::read(returned_dir.join(&archive)).unwrap();
         assert_eq!(blake3::hash(&returned), blake3::hash(&original));
         let mut members = tar::Archive::new(flate2::read::GzDecoder::new(returned.as_slice()));
         let mut saw_source = false;
@@ -1529,10 +1542,10 @@ mod managed_build_dir_tests {
         let check = run(
             "worktree",
             "cargo check --offline -j1",
-            &root.join("check pool"),
+            &storage.join("check pool"),
         );
         assert!(check.status.success(), "{check:?}");
-        let failed_pool = root.join("failed package pool");
+        let failed_pool = storage.join("failed package pool");
         let failed = run("package-missing-input", command, &failed_pool);
         assert_eq!(failed.status.code(), Some(101), "{failed:?}");
         assert!(String::from_utf8_lossy(&failed.stderr).contains("worktree-only.txt"));
@@ -1591,6 +1604,22 @@ mod managed_build_dir_tests {
             b"excluded input\n"
         );
         assert!(!outside_file.exists() && !outside_env.exists());
+
+        // Planted unselected physical ancestor config is refused before Cargo starts.
+        fs::create_dir(container.join(".cargo")).unwrap();
+        fs::write(container.join(".cargo/config.toml"), "[build]\njobs=1\n").unwrap();
+        let ancestor_pool = storage.join("ancestor pool");
+        let refused = run(
+            "unselected-ancestor",
+            "cargo check --offline -j1",
+            &ancestor_pool,
+        );
+        assert_eq!(refused.status.code(), Some(113), "{refused:?}");
+        assert_eq!(
+            refused.stderr,
+            b"RCH-E413 clean-overlay unselected Cargo configuration\n"
+        );
+        assert!(!ancestor_pool.exists());
     }
 
     #[test]
@@ -2118,6 +2147,7 @@ mod managed_build_dir_tests {
                 .env("RUSTFLAGS", "")
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env_remove("RUSTUP_TOOLCHAIN")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .env_remove("CARGO_BUILD_RUSTC")
@@ -2390,6 +2420,7 @@ mod managed_build_dir_tests {
             .env("CARGO_TARGET_DIR", root.path().join("target"))
             .env("RCH_BUILD_SOURCE", "ambient")
             .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .output()
             .unwrap();
@@ -2603,6 +2634,7 @@ mod managed_build_dir_tests {
                 .env("RUSTFLAGS", "")
                 .env("RUSTUP_AUTO_INSTALL", "0")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env_remove("RUSTUP_TOOLCHAIN")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .env_remove("CARGO_BUILD_RUSTC")
@@ -2633,7 +2665,7 @@ mod managed_build_dir_tests {
         }
 
         let env_i_command = format!(
-            "env -i PATH={} HOME={} RUSTC={} CARGO_HOME={} CARGO_TARGET_DIR={} RUSTUP_AUTO_INSTALL=0 RCH_CARGO_WRAPPER_BYPASS=1 {} run --quiet --offline --jobs 1",
+            "env -i PATH={} HOME={} RUSTC={} CARGO_HOME={} CARGO_TARGET_DIR={} RUSTUP_AUTO_INSTALL=0 RCH_CARGO_WRAPPER_BYPASS=1 RCH_CARGO_WRAPPER_ORIGIN=rch {} run --quiet --offline --jobs 1",
             shell_words::quote(path.to_str().unwrap()),
             shell_words::quote(root.to_str().unwrap()),
             shell_words::quote(rustc.to_str().unwrap()),

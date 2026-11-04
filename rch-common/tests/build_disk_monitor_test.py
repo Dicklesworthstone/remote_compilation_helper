@@ -4,6 +4,7 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 rch-common/tests/build_disk_monitor_test.
 Fixtures are retained for inspection; these tests never fill a filesystem.
 """
 
+import gc
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -151,6 +153,27 @@ class DiskMonitorTests(unittest.TestCase):
         os.link(output, self.target / "same-inode")
         self.assertEqual(monitor.measure_outputs([str(self.target)]),
                          monitor.measure_outputs([str(self.target), str(nested)]))
+
+    def test_completed_scans_release_inode_tables_without_cyclic_collection(self):
+        for number in range(512):
+            (self.target / str(number)).touch()
+        expected = monitor.measure_outputs([str(self.target)])
+        # A long-running guardian must release each completed scan's metadata,
+        # even when the cyclic collector has not revisited its generation yet.
+        gc.collect()
+        enabled = gc.isenabled()
+        gc.disable()
+        tracemalloc.start()
+        try:
+            for _ in range(64):
+                self.assertEqual(monitor.measure_outputs([str(self.target)]), expected)
+            retained, _ = tracemalloc.get_traced_memory()
+            self.assertLess(retained, MIB, "completed scans retained inode tables")
+        finally:
+            tracemalloc.stop()
+            gc.collect()
+            if enabled:
+                gc.enable()
 
     def test_success_preserves_output_and_warm_total_highwater(self):
         (self.target / "warm-cache").write_bytes(b"w" * 3 * MIB)
@@ -532,9 +555,12 @@ else:
     def test_guardian_kills_writers_when_supervisor_is_killed(self):
         ready = self.target / "writer"
         process, receipt = self.spawn(f"from pathlib import Path; import os,signal,time; Path({str(ready)!r}).write_text(str(os.getpid())); os.kill(os.getppid(),signal.SIGKILL); time.sleep(20)")
-        status, _, _ = self.complete(process)
+        status, _, stderr = self.complete(process)
         self.assertNotEqual(status, 0)
         self.assertEqual(receipt.read_text(), "")
+        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+        self.assertEqual(diagnostic["reason"], "supervisor_exit_unconfirmed")
+        self.assertEqual(diagnostic["wait_status"], signal.SIGKILL)
         record = monitor.process_snapshot().get(int(ready.read_text()))
         self.assertTrue(record is None or record["state"] in ("Z", "X"))
 
@@ -578,7 +604,13 @@ else:
         ready = self.target / "writer"
         output = self.target / "large"
         process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); Path({str(output)!r}).write_bytes(b'x'*{4*MIB}); time.sleep(20)", budget=2 * MIB, inject=inject)
-        self.complete(process)
+        status, _, stderr = self.complete(process)
+        self.assertNotEqual(status, 0)
+        failures = [json.loads(line[len(MARKER):]) for line in stderr.splitlines()
+                    if line.startswith(MARKER)]
+        self.assertEqual(len(failures), 1, stderr)
+        self.assertEqual(failures[0]["reason"], "growth")
+        self.assertTrue(failures[0]["started"])
         self.assertEqual(receipt.read_text(), "")
         record = monitor.process_snapshot().get(int(ready.read_text()))
         self.assertTrue(record is None or record["state"] in ("Z", "X"))
@@ -610,6 +642,57 @@ m.receipts_for_failure=broken_receipt"""
         opened.assert_called_once_with(123)
         sent.assert_called_once_with(789, signal.SIGKILL)
         numeric_kill.assert_not_called()
+
+    def test_terminal_census_progress_keeps_guardian_live(self):
+        # Delay real procfs records only during finalization. The whole census
+        # takes longer than the heartbeat deadline, but each read progresses.
+        # Keep the real namespace, membership, writer cleanup and receipts.
+        inject = """original_finish=m.finish_descendants
+original_process=m.linux_process
+remaining=0
+def process(path):
+    global remaining
+    result=original_process(path)
+    if remaining:
+        remaining-=1
+        time.sleep(0.6)
+    return result
+def finish(value, heartbeat):
+    global remaining
+    remaining=7
+    return original_finish(value, heartbeat)
+m.linux_process=process
+m.finish_descendants=finish"""
+        if not sys.platform.startswith("linux"):
+            self.skipTest("procfs record scheduling probe")
+        process, receipt = self.spawn("print('foreground-finished')", inject=inject)
+        status, stdout, stderr = self.complete(process, timeout=15)
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+        self.assertTrue(usage["complete"])
+        self.assertEqual(usage["exit_code"], 0)
+
+    def test_terminal_census_stalled_read_still_stops_group(self):
+        inject = """original_finish=m.finish_descendants
+original_process=m.linux_process
+def finish(value, heartbeat):
+    def stalled(path):
+        time.sleep(20)
+        return original_process(path)
+    m.linux_process=stalled
+    return original_finish(value, heartbeat)
+m.finish_descendants=finish"""
+        if not sys.platform.startswith("linux"):
+            self.skipTest("procfs record scheduling probe")
+        process, receipt = self.spawn("print('foreground-finished')", inject=inject)
+        status, stdout, stderr = self.complete(process, timeout=8)
+        self.assertNotEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        self.assertEqual(receipt.read_text(), "")
+        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+        self.assertEqual(diagnostic["reason"], "heartbeat_timeout")
+        self.assertTrue(diagnostic["started"])
 
 
 if __name__ == "__main__":

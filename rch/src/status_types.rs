@@ -575,7 +575,7 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                     reason_code: "circuit_open".into(),
                     severity: "critical".into(),
                     message: msg,
-                    suggested_action: format!("rch workers probe {} --force", w.id),
+                    suggested_action: format!("rch workers probe {}", w.id),
                     worker_id: Some(w.id.clone()),
                 });
             }
@@ -1902,7 +1902,8 @@ mod tests {
         assert_eq!(circuit_hints.len(), 1);
         assert_eq!(circuit_hints[0].severity, "critical");
         assert!(circuit_hints[0].message.contains("5 consecutive failures"));
-        assert!(circuit_hints[0].suggested_action.contains("probe"));
+        // `workers probe` takes no `--force` flag (#126).
+        assert_eq!(circuit_hints[0].suggested_action, "rch workers probe w1");
         assert_eq!(circuit_hints[0].worker_id.as_deref(), Some("w1"));
     }
 

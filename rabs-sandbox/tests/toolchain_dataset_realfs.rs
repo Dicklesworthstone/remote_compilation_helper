@@ -2,10 +2,12 @@
 //! additionally compiles from retained bytes; it is not sandbox/ATP proof.
 #![cfg(target_os = "linux")]
 
-use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain, fingerprint_toolchain};
+use rabs_sandbox::toolchain_dataset::{
+    ToolchainLimits, capture_toolchain, capture_toolchain_with_cloner, fingerprint_toolchain,
+};
 use std::cell::Cell;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -118,6 +120,182 @@ fn copied_dataset_is_complete_and_independent_of_source_inodes() {
         fingerprint_toolchain(retained.root(), &ToolchainLimits::default(), || false).unwrap(),
         expected
     );
+}
+
+#[test]
+fn clone_strategy_preserves_identity_and_hashes_the_actual_retained_tree() {
+    let source = private();
+    let bytes = b"retained toolchain content\0\xff".repeat(4096);
+    write(source.path(), "compiler", &bytes, 0o755);
+    write(source.path(), "small", b"small toolchain file", 0o644);
+    let parent = private();
+    let expected =
+        fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false).unwrap();
+    let attempts = Cell::new(0);
+    let retained = capture_toolchain_with_cloner(
+        source.path(),
+        &parent.path().join("clone"),
+        Some(&expected),
+        &ToolchainLimits::default(),
+        || false,
+        |input, output, _| {
+            attempts.set(attempts.get() + 1);
+            // Exercise the success branch deterministically, including a
+            // primitive that advances both shared file offsets. This is not
+            // evidence that the test filesystem supports actual reflinks.
+            io::copy(
+                &mut input.try_clone().unwrap(),
+                &mut output.try_clone().unwrap(),
+            )
+            .unwrap();
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(attempts.get(), 1, "small files must avoid the clone probe");
+    assert_eq!(*retained.identity(), expected);
+    assert_eq!(fs::read(retained.root().join("compiler")).unwrap(), bytes);
+    assert_ne!(
+        fs::metadata(source.path().join("compiler")).unwrap().ino(),
+        fs::metadata(retained.root().join("compiler"))
+            .unwrap()
+            .ino()
+    );
+    assert_eq!(
+        fs::metadata(source.path().join("compiler")).unwrap().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(retained.root().join("compiler"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o555
+    );
+    fs::write(source.path().join("compiler"), b"changed original").unwrap();
+    assert_eq!(fs::read(retained.root().join("compiler")).unwrap(), bytes);
+    retained.verify(|| false).unwrap();
+    assert!(
+        retained
+            .verify_source_unchanged(source.path(), || false)
+            .is_err()
+    );
+}
+
+#[test]
+fn failed_clone_resets_both_cursors_and_discards_partial_output_suffixes() {
+    let bytes = b"source must be copied from its beginning\0\xff".repeat(4096);
+    for dirty_length in [17, bytes.len() * 2] {
+        let source = private();
+        write(source.path(), "compiler", &bytes, 0o755);
+        let parent = private();
+        let attempted = Cell::new(false);
+        let retained = capture_toolchain_with_cloner(
+            source.path(),
+            &parent.path().join("fallback"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+            |input, output, _| {
+                attempted.set(true);
+                input
+                    .try_clone()
+                    .unwrap()
+                    .seek(SeekFrom::Start(37))
+                    .unwrap();
+                output
+                    .try_clone()
+                    .unwrap()
+                    .write_all(&vec![0xee; dirty_length])
+                    .unwrap();
+                false
+            },
+        )
+        .unwrap();
+        assert!(attempted.get());
+        assert_eq!(fs::read(retained.root().join("compiler")).unwrap(), bytes);
+        retained.verify(|| false).unwrap();
+        retained
+            .verify_source_unchanged(source.path(), || false)
+            .unwrap();
+    }
+}
+
+#[test]
+fn successful_clone_cannot_supply_corrupt_truncated_or_oversized_bytes() {
+    let bytes = vec![0x73; 128 * 1024];
+    for length in [bytes.len(), bytes.len() - 1, bytes.len() + 1] {
+        let source = private();
+        write(source.path(), "compiler", &bytes, 0o755);
+        let parent = private();
+        let attempted = Cell::new(false);
+        let error = capture_toolchain_with_cloner(
+            source.path(),
+            &parent.path().join("invalid-clone"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+            |_, output, _| {
+                attempted.set(true);
+                output
+                    .try_clone()
+                    .unwrap()
+                    .write_all(&vec![0x42; length])
+                    .unwrap();
+                true
+            },
+        )
+        .unwrap_err();
+        assert!(attempted.get());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        if length == bytes.len() {
+            assert!(
+                error
+                    .to_string()
+                    .contains("retained toolchain bytes differ")
+            );
+        }
+    }
+}
+
+#[test]
+fn clone_success_does_not_bypass_source_mutation_or_cancellation() {
+    let bytes = vec![0x31; 128 * 1024];
+    for cancel in [false, true] {
+        let source = private();
+        write(source.path(), "compiler", &bytes, 0o755);
+        let parent = private();
+        let attempted = Cell::new(false);
+        let error = capture_toolchain_with_cloner(
+            source.path(),
+            &parent.path().join("interrupted-clone"),
+            None,
+            &ToolchainLimits::default(),
+            || cancel && attempted.get(),
+            |input, output, _| {
+                io::copy(
+                    &mut input.try_clone().unwrap(),
+                    &mut output.try_clone().unwrap(),
+                )
+                .unwrap();
+                attempted.set(true);
+                if !cancel {
+                    fs::write(source.path().join("compiler"), vec![0x32; bytes.len()]).unwrap();
+                }
+                true
+            },
+        )
+        .unwrap_err();
+        assert!(attempted.get());
+        assert_eq!(
+            error.kind(),
+            if cancel {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::InvalidData
+            }
+        );
+    }
 }
 
 #[test]

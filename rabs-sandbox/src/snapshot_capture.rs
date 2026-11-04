@@ -44,6 +44,12 @@ use std::sync::Arc;
 #[path = "snapshot_capture/agent_state_tests.rs"]
 mod agent_state_tests;
 
+#[cfg(test)]
+#[path = "snapshot_capture/cancellation_tests.rs"]
+mod cancellation_tests;
+
+const CAPTURE_IO_CHUNK_BYTES: usize = 64 * 1024;
+
 /// How the underlying filesystem lets us establish the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsSemanticClass {
@@ -205,9 +211,11 @@ impl std::fmt::Display for CaptureIoError {
 
 impl std::error::Error for CaptureIoError {}
 
-/// Capture failure: either a typed coherence refusal or hard I/O.
+/// Capture failure, including cancellation without publishing partial authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
+    /// The caller stopped capture or materialization; never eligible for retry.
+    Cancelled,
     /// Bounded retries exhausted without a coherent pair.
     Incoherent(CaptureRefusal),
     /// Hard I/O failure.
@@ -295,8 +303,19 @@ impl SnapshotManifest {
     }
 
     fn seal(root: &str, fs_class: FsSemanticClass, members: BTreeMap<String, MemberKind>) -> Self {
+        Self::seal_cancellable(root, fs_class, members, &|| false)
+            .expect("non-cancellable manifest sealing cannot be cancelled")
+    }
+
+    fn seal_cancellable(
+        root: &str,
+        fs_class: FsSemanticClass,
+        members: BTreeMap<String, MemberKind>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Self, CaptureError> {
+        check_stopped(stopped)?;
         let mut hasher = Sha256::new();
-        hasher.update(root.as_bytes());
+        hash_cancellable(&mut hasher, root.as_bytes(), stopped)?;
         hasher.update([0u8]);
         hasher.update(match fs_class {
             FsSemanticClass::AtomicSnapshot => b"atomic-snapshot".as_slice(),
@@ -304,8 +323,9 @@ impl SnapshotManifest {
             FsSemanticClass::GenerationScan => b"generation-scan".as_slice(),
         });
         for (path, kind) in &members {
+            check_stopped(stopped)?;
             hasher.update([0u8]);
-            hasher.update(path.as_bytes());
+            hash_cancellable(&mut hasher, path.as_bytes(), stopped)?;
             hasher.update([0u8]);
             match kind {
                 MemberKind::Regular {
@@ -322,40 +342,54 @@ impl SnapshotManifest {
                 }
                 MemberKind::Symlink { target } => {
                     hasher.update(b"l");
-                    hasher.update(target.as_bytes());
+                    hash_cancellable(&mut hasher, target.as_bytes(), stopped)?;
                 }
                 MemberKind::Directory => hasher.update(b"d"),
             }
         }
+        check_stopped(stopped)?;
         let manifest_sha256 = hasher.finalize().into();
-        Self {
+        Ok(Self {
             root: root.to_string(),
             fs_class,
             members,
             manifest_sha256,
-        }
+        })
     }
 }
 
 /// First divergence between the two scans of one attempt, if any.
 #[must_use]
 pub fn first_divergence(first: &ScanObservation, second: &ScanObservation) -> Option<Divergence> {
-    let added: Vec<String> = second
-        .members
-        .keys()
-        .filter(|k| !first.members.contains_key(*k))
-        .cloned()
-        .collect();
-    let removed: Vec<String> = first
-        .members
-        .keys()
-        .filter(|k| !second.members.contains_key(*k))
-        .cloned()
-        .collect();
+    first_divergence_cancellable(first, second, &|| false)
+        .expect("non-cancellable scan comparison cannot be cancelled")
+}
+
+fn first_divergence_cancellable(
+    first: &ScanObservation,
+    second: &ScanObservation,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Option<Divergence>, CaptureError> {
+    check_stopped(stopped)?;
+    let mut added = Vec::new();
+    for path in second.members.keys() {
+        check_stopped(stopped)?;
+        if !first.members.contains_key(path) {
+            added.push(path.clone());
+        }
+    }
+    let mut removed = Vec::new();
+    for path in first.members.keys() {
+        check_stopped(stopped)?;
+        if !second.members.contains_key(path) {
+            removed.push(path.clone());
+        }
+    }
     if !added.is_empty() || !removed.is_empty() {
-        return Some(Divergence::DirectorySetChanged { added, removed });
+        return Ok(Some(Divergence::DirectorySetChanged { added, removed }));
     }
     for (path, a) in &first.members {
+        check_stopped(stopped)?;
         let b = &second.members[path];
         match (a, b) {
             (
@@ -375,30 +409,36 @@ pub fn first_divergence(first: &ScanObservation, second: &ScanObservation) -> Op
                 },
             ) => {
                 if ia != ib {
-                    return Some(Divergence::InodeReplaced { path: path.clone() });
+                    return Ok(Some(Divergence::InodeReplaced { path: path.clone() }));
                 }
                 if ca != cb {
-                    return Some(Divergence::ContentChanged { path: path.clone() });
+                    return Ok(Some(Divergence::ContentChanged { path: path.clone() }));
                 }
                 if sa != sb || ma != mb || moda != modb {
-                    return Some(Divergence::MetadataInconsistent { path: path.clone() });
+                    return Ok(Some(Divergence::MetadataInconsistent {
+                        path: path.clone(),
+                    }));
                 }
             }
             (MemberKind::Symlink { target: ta }, MemberKind::Symlink { target: tb }) => {
                 if ta != tb {
-                    return Some(Divergence::SymlinkRetargeted { path: path.clone() });
+                    return Ok(Some(Divergence::SymlinkRetargeted { path: path.clone() }));
                 }
             }
             (MemberKind::Directory, MemberKind::Directory) => {}
-            _ => return Some(Divergence::KindChanged { path: path.clone() }),
+            _ => return Ok(Some(Divergence::KindChanged { path: path.clone() })),
         }
     }
     for path in first.identities.keys().chain(second.identities.keys()) {
+        check_stopped(stopped)?;
         if first.identities.get(path) != second.identities.get(path) {
-            return Some(Divergence::MetadataInconsistent { path: path.clone() });
+            return Ok(Some(Divergence::MetadataInconsistent {
+                path: path.clone(),
+            }));
         }
     }
-    None
+    check_stopped(stopped)?;
+    Ok(None)
 }
 
 /// Establish a coherent snapshot of one root, or refuse.
@@ -574,16 +614,30 @@ impl SealedSourceSnapshot {
     /// A failure leaves an unpublished partial directory for caller inspection;
     /// this operation never deletes files or returns a partial handle.
     pub fn materialize_into(&self, destination: &Path) -> Result<MaterializedSource, CaptureError> {
+        self.materialize_into_cancellable(destination, || false)
+    }
+
+    /// Materialize retained bytes while observing caller cancellation before
+    /// filesystem operations and between bounded write chunks. Cancellation
+    /// leaves only an unpublished partial directory, never a source handle.
+    pub fn materialize_into_cancellable(
+        &self,
+        destination: &Path,
+        stopped: impl Fn() -> bool,
+    ) -> Result<MaterializedSource, CaptureError> {
         use std::io::Write;
 
+        check_stopped(&stopped)?;
         std::fs::create_dir(destination).map_err(|error| capture_io(destination, error))?;
         let mut materialized = BTreeMap::new();
         for (id, root) in &self.roots {
+            check_stopped(&stopped)?;
             let backing = destination.join(id);
             std::fs::create_dir(&backing).map_err(|error| capture_io(&backing, error))?;
             // Parents sort before descendants. Symlinks are created only AFTER
             // all directory/file writes, so they cannot redirect those writes.
             for (path, kind) in &root.manifest.members {
+                check_stopped(&stopped)?;
                 let output = backing.join(path);
                 match kind {
                     MemberKind::Directory => {
@@ -595,21 +649,28 @@ impl SealedSourceSnapshot {
                             .create_new(true)
                             .open(&output)
                             .map_err(|error| capture_io(&output, error))?;
-                        file.write_all(&root.files[path])
-                            .map_err(|error| capture_io(&output, error))?;
+                        for chunk in root.files[path].chunks(CAPTURE_IO_CHUNK_BYTES) {
+                            check_stopped(&stopped)?;
+                            file.write_all(chunk)
+                                .map_err(|error| capture_io(&output, error))?;
+                        }
+                        check_stopped(&stopped)?;
                         set_file_mode(&file, *mode).map_err(|error| capture_io(&output, error))?;
                     }
                     MemberKind::Symlink { .. } => {}
                 }
             }
             for (path, kind) in &root.manifest.members {
+                check_stopped(&stopped)?;
                 if let MemberKind::Symlink { target } = kind {
                     let output = backing.join(path);
-                    materialize_symlink(target, &output, &root.manifest.members, path)?;
+                    materialize_symlink(target, &output, &root.manifest.members, path, &stopped)?;
                 }
             }
+            check_stopped(&stopped)?;
             materialized.insert(id.clone(), (backing, root.manifest.provenance()));
         }
+        check_stopped(&stopped)?;
         Ok(MaterializedSource {
             roots: materialized,
         })
@@ -634,8 +695,10 @@ fn materialize_symlink(
     output: &Path,
     members: &BTreeMap<String, MemberKind>,
     path: &str,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(), CaptureError> {
-    let resolved = resolve_captured_link(members, path, target)?;
+    let resolved = resolve_captured_link(members, path, target, stopped)?;
+    check_stopped(stopped)?;
     #[cfg(unix)]
     {
         let _ = resolved;
@@ -666,6 +729,26 @@ fn capture_io(path: &Path, error: std::io::Error) -> CaptureError {
     })
 }
 
+fn check_stopped(stopped: &dyn Fn() -> bool) -> Result<(), CaptureError> {
+    if stopped() {
+        Err(CaptureError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn hash_cancellable(
+    hasher: &mut Sha256,
+    bytes: &[u8],
+    stopped: &dyn Fn() -> bool,
+) -> Result<(), CaptureError> {
+    for chunk in bytes.chunks(CAPTURE_IO_CHUNK_BYTES) {
+        check_stopped(stopped)?;
+        hasher.update(chunk);
+    }
+    check_stopped(stopped)
+}
+
 fn reject(path: &str, reason: CaptureRejection) -> CaptureError {
     CaptureError::Rejected {
         path: path.to_string(),
@@ -694,24 +777,60 @@ pub fn capture_sealed_source(
     max_attempts: u32,
     max_bytes: u64,
 ) -> Result<SealedSourceSnapshot, CaptureError> {
-    capture_sealed_source_with(
+    capture_sealed_source_cancellable(roots, declared_git_state, max_attempts, max_bytes, || false)
+}
+
+/// Seal the complete closure with the same coherence and filesystem guards as
+/// [`capture_sealed_source`], observing cancellation throughout both scans,
+/// comparisons and digest construction. Cancellation never retries or returns
+/// a partially verified snapshot. Individual filesystem calls can still block.
+pub fn capture_sealed_source_cancellable(
+    roots: &[(String, PathBuf)],
+    declared_git_state: bool,
+    max_attempts: u32,
+    max_bytes: u64,
+    stopped: impl Fn() -> bool,
+) -> Result<SealedSourceSnapshot, CaptureError> {
+    capture_sealed_source_with_cancellation(
         roots,
         declared_git_state,
         max_attempts,
         max_bytes,
         |_, _| {},
+        &stopped,
     )
 }
 
+#[cfg(test)]
 fn capture_sealed_source_with(
     roots: &[(String, PathBuf)],
     declared_git_state: bool,
     max_attempts: u32,
     max_bytes: u64,
-    mut after_pass: impl FnMut(u32, u32),
+    after_pass: impl FnMut(u32, u32),
 ) -> Result<SealedSourceSnapshot, CaptureError> {
+    capture_sealed_source_with_cancellation(
+        roots,
+        declared_git_state,
+        max_attempts,
+        max_bytes,
+        after_pass,
+        &|| false,
+    )
+}
+
+fn capture_sealed_source_with_cancellation(
+    roots: &[(String, PathBuf)],
+    declared_git_state: bool,
+    max_attempts: u32,
+    max_bytes: u64,
+    mut after_pass: impl FnMut(u32, u32),
+    stopped: &dyn Fn() -> bool,
+) -> Result<SealedSourceSnapshot, CaptureError> {
+    check_stopped(stopped)?;
     let mut ordered = BTreeMap::new();
     for (id, path) in roots {
+        check_stopped(stopped)?;
         if !safe_component(id) || ordered.insert(id.clone(), path.clone()).is_some() {
             return Err(reject(id, CaptureRejection::InvalidRoot));
         }
@@ -722,56 +841,68 @@ fn capture_sealed_source_with(
     let attempts = max_attempts.max(1);
     let mut last = None;
     for attempt in 0..attempts {
+        check_stopped(stopped)?;
         let result = (|| {
-            let first = scan_retained_closure(&ordered, declared_git_state, max_bytes)?;
+            let first = scan_retained_closure(&ordered, declared_git_state, max_bytes, stopped)?;
             after_pass(attempt, 0);
-            let second = scan_retained_closure(&ordered, declared_git_state, max_bytes)?;
+            check_stopped(stopped)?;
+            let second = scan_retained_closure(&ordered, declared_git_state, max_bytes, stopped)?;
             after_pass(attempt, 1);
+            check_stopped(stopped)?;
             for (id, first_root) in &first {
-                if let Some(divergence) =
-                    first_divergence(&first_root.observation, &second[id].observation)
-                {
+                check_stopped(stopped)?;
+                if let Some(divergence) = first_divergence_cancellable(
+                    &first_root.observation,
+                    &second[id].observation,
+                    stopped,
+                )? {
                     return Err(CaptureError::Incoherent(CaptureRefusal {
                         attempts: attempt + 1,
                         last_divergence: divergence,
                     }));
                 }
             }
-            let roots: BTreeMap<_, _> = second
-                .into_iter()
-                .map(|(id, scan)| {
-                    let manifest = SnapshotManifest::seal(
-                        &id,
-                        FsSemanticClass::GenerationScan,
-                        scan.observation.members,
-                    );
-                    (
-                        id,
-                        SealedRoot {
-                            manifest,
-                            files: scan.files,
-                        },
-                    )
-                })
-                .collect();
+            let mut roots = BTreeMap::new();
+            for (id, scan) in second {
+                check_stopped(stopped)?;
+                let manifest = SnapshotManifest::seal_cancellable(
+                    &id,
+                    FsSemanticClass::GenerationScan,
+                    scan.observation.members,
+                    stopped,
+                )?;
+                roots.insert(
+                    id,
+                    SealedRoot {
+                        manifest,
+                        files: scan.files,
+                    },
+                );
+            }
             let mut digest = Sha256::new();
             digest.update(b"rabs.sealed-source-closure.v1\0");
             for (id, root) in &roots {
+                check_stopped(stopped)?;
                 digest.update((id.len() as u64).to_le_bytes());
-                digest.update(id.as_bytes());
+                hash_cancellable(&mut digest, id.as_bytes(), stopped)?;
                 digest.update(root.manifest.manifest_sha256);
             }
+            check_stopped(stopped)?;
             Ok(SealedSourceSnapshot {
                 roots,
                 digest: digest.finalize().into(),
             })
         })();
+        // Cancellation wins even if a concurrent mutation produced a retryable
+        // refusal, or the final bounded work completed while the caller stopped.
+        check_stopped(stopped)?;
         match result {
             Ok(snapshot) => return Ok(snapshot),
             Err(CaptureError::Incoherent(refusal)) => last = Some(refusal.last_divergence),
             Err(error) => return Err(error),
         }
     }
+    check_stopped(stopped)?;
     match last {
         Some(last_divergence) => Err(CaptureError::Incoherent(CaptureRefusal {
             attempts,
@@ -788,10 +919,13 @@ fn scan_retained_closure(
     roots: &BTreeMap<String, PathBuf>,
     declared_git_state: bool,
     max_bytes: u64,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<BTreeMap<String, RetainedScan>, CaptureError> {
+    check_stopped(stopped)?;
     let mut remaining = max_bytes;
     let mut scans = BTreeMap::new();
     for (id, root) in roots {
+        check_stopped(stopped)?;
         let metadata = std::fs::symlink_metadata(root).map_err(|error| capture_io(root, error))?;
         if !metadata.is_dir() {
             return Err(reject(id, CaptureRejection::UnsupportedKind));
@@ -807,16 +941,26 @@ fn scan_retained_closure(
             declared_git_state,
             &mut remaining,
             &mut scan,
+            stopped,
         )?;
         #[cfg(not(target_os = "linux"))]
-        scan_retained_directory(root, "", declared_git_state, &mut remaining, &mut scan)?;
+        scan_retained_directory(
+            root,
+            "",
+            declared_git_state,
+            &mut remaining,
+            &mut scan,
+            stopped,
+        )?;
         for (path, kind) in &scan.observation.members {
+            check_stopped(stopped)?;
             if let MemberKind::Symlink { target } = kind {
-                resolve_captured_link(&scan.observation.members, path, target)?;
+                resolve_captured_link(&scan.observation.members, path, target, stopped)?;
             }
         }
         scans.insert(id.clone(), scan);
     }
+    check_stopped(stopped)?;
     Ok(scans)
 }
 
@@ -847,8 +991,10 @@ fn open_sealed_entry(
     root: &std::fs::File,
     relative: &str,
     flags: rustix::fs::OFlags,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<std::fs::File, CaptureError> {
     use rustix::fs::{Mode, ResolveFlags, openat2};
+    check_stopped(stopped)?;
     openat2(
         root,
         relative,
@@ -867,9 +1013,11 @@ fn scan_retained_root(
     declared_git_state: bool,
     remaining: &mut u64,
     scan: &mut RetainedScan,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(), CaptureError> {
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 
+    check_stopped(stopped)?;
     // The explicit root is the trust boundary. Ordinary ancestor aliases (e.g.
     // /dp -> /data/projects) remain valid; a leaf symlink and proc magic links
     // do not. Descendants use stricter resolution from this anchored descriptor.
@@ -882,11 +1030,21 @@ fn scan_retained_root(
     )
     .map(std::fs::File::from)
     .map_err(|error| sealed_open_error(&path.to_string_lossy(), error))?;
+    check_stopped(stopped)?;
     let before = root.metadata().map_err(|error| capture_io(path, error))?;
     if identity_of(observed) != identity_of(&before) {
         return Err(sealed_unstable(""));
     }
-    scan_retained_directory_fd(&root, &root, "", declared_git_state, remaining, scan)?;
+    scan_retained_directory_fd(
+        &root,
+        &root,
+        "",
+        declared_git_state,
+        remaining,
+        scan,
+        stopped,
+    )?;
+    check_stopped(stopped)?;
     let after = root.metadata().map_err(|error| capture_io(path, error))?;
     if identity_of(&before) != identity_of(&after) {
         return Err(sealed_unstable(""));
@@ -907,15 +1065,22 @@ fn scan_retained_directory_fd(
     declared_git_state: bool,
     remaining: &mut u64,
     scan: &mut RetainedScan,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(), CaptureError> {
     use rustix::fs::{Dir, OFlags, readlinkat};
 
+    check_stopped(stopped)?;
     let before = directory
         .metadata()
         .map_err(|error| capture_io(Path::new(relative), error))?;
+    check_stopped(stopped)?;
     let mut entries =
         Dir::read_from(directory).map_err(|error| sealed_open_error(relative, error))?;
-    while let Some(entry) = entries.read() {
+    loop {
+        check_stopped(stopped)?;
+        let Some(entry) = entries.read() else {
+            break;
+        };
         let entry = entry.map_err(|error| sealed_open_error(relative, error))?;
         let name = entry.file_name();
         if matches!(name.to_bytes(), b"." | b"..") {
@@ -937,7 +1102,8 @@ fn scan_retained_directory_fd(
         // O_PATH inspects special files without opening them for I/O. With
         // NOFOLLOW, openat2 permits the terminal symlink itself as a descriptor.
         let entry_flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let observed = open_sealed_entry(root, &rel, entry_flags)?;
+        let observed = open_sealed_entry(root, &rel, entry_flags, stopped)?;
+        check_stopped(stopped)?;
         let metadata = observed
             .metadata()
             .map_err(|error| capture_io(Path::new(&rel), error))?;
@@ -945,6 +1111,7 @@ fn scan_retained_directory_fd(
             continue;
         }
         let member = if metadata.file_type().is_symlink() {
+            check_stopped(stopped)?;
             let target = readlinkat(&observed, "", Vec::new())
                 .map_err(|error| sealed_open_error(&rel, error))?;
             let target = target
@@ -958,14 +1125,24 @@ fn scan_retained_directory_fd(
                 root,
                 &rel,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                stopped,
             )?;
+            check_stopped(stopped)?;
             let child_metadata = child
                 .metadata()
                 .map_err(|error| capture_io(Path::new(&rel), error))?;
             if identity_of(&metadata) != identity_of(&child_metadata) {
                 return Err(sealed_unstable(&rel));
             }
-            scan_retained_directory_fd(root, &child, &rel, declared_git_state, remaining, scan)?;
+            scan_retained_directory_fd(
+                root,
+                &child,
+                &rel,
+                declared_git_state,
+                remaining,
+                scan,
+                stopped,
+            )?;
             MemberKind::Directory
         } else if metadata.is_file() {
             let file = open_sealed_entry(
@@ -976,6 +1153,7 @@ fn scan_retained_directory_fd(
                     | OFlags::NOCTTY
                     | OFlags::NOFOLLOW
                     | OFlags::CLOEXEC,
+                stopped,
             )?;
             let (member, bytes) = read_retained_descriptor(
                 file,
@@ -984,7 +1162,9 @@ fn scan_retained_directory_fd(
                 &metadata,
                 remaining,
                 |_| {},
+                stopped,
             )?;
+            check_stopped(stopped)?;
             scan.files.insert(rel.clone(), bytes.into());
             member
         } else {
@@ -992,7 +1172,8 @@ fn scan_retained_directory_fd(
         };
         // Re-resolve through the root even after descriptor reads: a rename or
         // mount substitution must not leave a retired inode in the sealed tree.
-        let current = open_sealed_entry(root, &rel, entry_flags)?;
+        let current = open_sealed_entry(root, &rel, entry_flags, stopped)?;
+        check_stopped(stopped)?;
         let after = current
             .metadata()
             .map_err(|error| capture_io(Path::new(&rel), error))?;
@@ -1004,6 +1185,7 @@ fn scan_retained_directory_fd(
             .insert(rel.clone(), identity_of(&after));
         scan.observation.members.insert(rel, member);
     }
+    check_stopped(stopped)?;
     let after = directory
         .metadata()
         .map_err(|error| capture_io(Path::new(relative), error))?;
@@ -1022,9 +1204,15 @@ fn scan_retained_directory(
     declared_git_state: bool,
     remaining: &mut u64,
     scan: &mut RetainedScan,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(), CaptureError> {
-    let entries = std::fs::read_dir(directory).map_err(|error| capture_io(directory, error))?;
-    for entry in entries {
+    check_stopped(stopped)?;
+    let mut entries = std::fs::read_dir(directory).map_err(|error| capture_io(directory, error))?;
+    loop {
+        check_stopped(stopped)?;
+        let Some(entry) = entries.next() else {
+            break;
+        };
         let entry = entry.map_err(|error| capture_io(directory, error))?;
         let name = entry.file_name();
         let name = name
@@ -1040,12 +1228,14 @@ fn scan_retained_directory(
         if member_disposition(&rel, declared_git_state) != MemberDisposition::Include {
             continue;
         }
+        check_stopped(stopped)?;
         let metadata =
             std::fs::symlink_metadata(&path).map_err(|error| capture_io(&path, error))?;
         if metadata.is_dir() && excluded_directory(&rel, declared_git_state) {
             continue;
         }
         let member = if metadata.file_type().is_symlink() {
+            check_stopped(stopped)?;
             let target = std::fs::read_link(&path).map_err(|error| capture_io(&path, error))?;
             let target = target
                 .to_str()
@@ -1054,15 +1244,24 @@ fn scan_retained_directory(
                 target: target.to_string(),
             }
         } else if metadata.is_dir() {
-            scan_retained_directory(&path, &rel, declared_git_state, remaining, scan)?;
+            scan_retained_directory(&path, &rel, declared_git_state, remaining, scan, stopped)?;
             MemberKind::Directory
         } else if metadata.is_file() {
-            let (member, bytes) = read_retained_file(&path, &rel, &metadata, remaining)?;
+            let (member, bytes) = read_retained_file_with_cancellation(
+                &path,
+                &rel,
+                &metadata,
+                remaining,
+                |_| {},
+                stopped,
+            )?;
+            check_stopped(stopped)?;
             scan.files.insert(rel.clone(), bytes.into());
             member
         } else {
             return Err(reject(&rel, CaptureRejection::UnsupportedKind));
         };
+        check_stopped(stopped)?;
         let after = std::fs::symlink_metadata(&path).map_err(|error| capture_io(&path, error))?;
         if identity_of(&metadata) != identity_of(&after) {
             return Err(CaptureError::Incoherent(CaptureRefusal {
@@ -1075,10 +1274,11 @@ fn scan_retained_directory(
             .insert(rel.clone(), identity_of(&after));
         scan.observation.members.insert(rel, member);
     }
+    check_stopped(stopped)?;
     Ok(())
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(test)]
 fn read_retained_file(
     path: &Path,
     relative: &str,
@@ -1088,7 +1288,7 @@ fn read_retained_file(
     read_retained_file_with(path, relative, observed, remaining, |_| {})
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(test)]
 fn read_retained_file_with(
     path: &Path,
     relative: &str,
@@ -1096,8 +1296,31 @@ fn read_retained_file_with(
     remaining: &mut u64,
     after_chunk: impl FnMut(usize),
 ) -> Result<(MemberKind, Vec<u8>), CaptureError> {
+    read_retained_file_with_cancellation(path, relative, observed, remaining, after_chunk, &|| {
+        false
+    })
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn read_retained_file_with_cancellation(
+    path: &Path,
+    relative: &str,
+    observed: &std::fs::Metadata,
+    remaining: &mut u64,
+    after_chunk: impl FnMut(usize),
+    stopped: &dyn Fn() -> bool,
+) -> Result<(MemberKind, Vec<u8>), CaptureError> {
+    check_stopped(stopped)?;
     let file = std::fs::File::open(path).map_err(|error| capture_io(path, error))?;
-    read_retained_descriptor(file, path, relative, observed, remaining, after_chunk)
+    read_retained_descriptor(
+        file,
+        path,
+        relative,
+        observed,
+        remaining,
+        after_chunk,
+        stopped,
+    )
 }
 
 fn read_retained_descriptor(
@@ -1107,8 +1330,10 @@ fn read_retained_descriptor(
     observed: &std::fs::Metadata,
     remaining: &mut u64,
     mut after_chunk: impl FnMut(usize),
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(MemberKind, Vec<u8>), CaptureError> {
     use std::io::Read;
+    check_stopped(stopped)?;
     let unstable = || {
         CaptureError::Incoherent(CaptureRefusal {
             attempts: 0,
@@ -1125,11 +1350,14 @@ fn read_retained_descriptor(
         return Err(unstable());
     }
     let mut bytes = Vec::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; CAPTURE_IO_CHUNK_BYTES];
     loop {
+        check_stopped(stopped)?;
         let count = file
             .read(&mut buffer)
             .map_err(|error| capture_io(path, error))?;
+        check_stopped(stopped)?;
         if count == 0 {
             break;
         }
@@ -1138,8 +1366,10 @@ fn read_retained_descriptor(
         }
         *remaining -= count as u64;
         bytes.extend_from_slice(&buffer[..count]);
+        hasher.update(&buffer[..count]);
         after_chunk(count);
     }
+    check_stopped(stopped)?;
     let after = file.metadata().map_err(|error| capture_io(path, error))?;
     if identity_of(&before) != identity_of(&after)
         || before.len() != after.len()
@@ -1148,11 +1378,12 @@ fn read_retained_descriptor(
     {
         return Err(unstable());
     }
+    check_stopped(stopped)?;
     let member = MemberKind::Regular {
         size: after.len(),
         inode: inode_of(&after),
         mtime_ns: mtime_ns_of(&after),
-        content_sha256: Sha256::digest(&bytes).into(),
+        content_sha256: hasher.finalize().into(),
         mode: mode_of(&after),
     };
     Ok((member, bytes))
@@ -1164,8 +1395,10 @@ fn resolve_captured_link(
     members: &BTreeMap<String, MemberKind>,
     path: &str,
     target: &str,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<String, CaptureError> {
     use std::collections::VecDeque;
+    check_stopped(stopped)?;
     let invalid = || reject(path, CaptureRejection::UnsafeSymlink);
     let mut resolved: Vec<String> = path.split('/').map(str::to_string).collect();
     resolved.pop();
@@ -1174,7 +1407,11 @@ fn resolve_captured_link(
     if Path::new(target).is_absolute() || target.contains(['\\', ':']) {
         return Err(invalid());
     }
-    while let Some(component) = pending.pop_front() {
+    loop {
+        check_stopped(stopped)?;
+        let Some(component) = pending.pop_front() else {
+            break;
+        };
         match component.as_str() {
             "" | "." => continue,
             ".." => {
@@ -1194,6 +1431,7 @@ fn resolve_captured_link(
                         }
                         resolved.pop();
                         for component in target.split('/').rev() {
+                            check_stopped(stopped)?;
                             pending.push_front(component.to_string());
                         }
                     }
@@ -1994,6 +2232,7 @@ mod tests {
             }
             CaptureError::Io(io) => panic!("wrong error class: {io}"),
             CaptureError::Rejected { .. } => panic!("unexpected policy refusal"),
+            CaptureError::Cancelled => panic!("non-cancellable capture was cancelled"),
         }
     }
 

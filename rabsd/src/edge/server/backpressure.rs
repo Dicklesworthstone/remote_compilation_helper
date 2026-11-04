@@ -32,13 +32,22 @@ pub(super) fn capacity_reply(may_wait: bool, phase: &str) -> String {
         &[
             (
                 "decision",
-                if may_wait { "capacity-wait" } else { "pass-through" },
+                if may_wait {
+                    "capacity-wait"
+                } else {
+                    "pass-through"
+                },
             ),
             ("reason", "edge-capacity"),
             ("phase", phase),
         ],
     );
-    if may_wait { CAPACITY_RETRY } else { CAPACITY_LEGACY }.to_owned()
+    if may_wait {
+        CAPACITY_RETRY
+    } else {
+        CAPACITY_LEGACY
+    }
+    .to_owned()
 }
 
 /// This entry point is for INITIAL decisions only, never accepted-hit
@@ -49,7 +58,10 @@ pub(super) async fn decide(
     request: Value,
 ) -> Result<Decided, WorkError> {
     let may_wait = request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true);
-    on_lane(lane, may_wait, move || rustc_request::decide(&live, &request)).await
+    on_lane(lane, may_wait, move || {
+        rustc_request::decide(&live, &request)
+    })
+    .await
 }
 
 async fn on_lane(
@@ -59,9 +71,7 @@ async fn on_lane(
 ) -> Result<Decided, WorkError> {
     match lane.spawn(work) {
         Ok(mut work) => work.wait().await,
-        Err(WorkError::Saturated) => {
-            Ok(Decided::Reply(capacity_reply(may_wait, "decision")))
-        }
+        Err(WorkError::Saturated) => Ok(Decided::Reply(capacity_reply(may_wait, "decision"))),
         // Do not broaden this to arbitrary errors. A panic in an admitted
         // decision may already have reserved an attempt; its owner must settle
         // through the existing error path, not a synthetic non-owning wait.

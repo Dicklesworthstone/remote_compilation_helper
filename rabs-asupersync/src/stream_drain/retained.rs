@@ -168,8 +168,8 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
         file.flush().unwrap();
-        let retained = RetainedSpill::new(file.as_file().try_clone().unwrap(), bytes.len() as u64)
-            .unwrap();
+        let retained =
+            RetainedSpill::new(file.as_file().try_clone().unwrap(), bytes.len() as u64).unwrap();
         (file, retained)
     }
 

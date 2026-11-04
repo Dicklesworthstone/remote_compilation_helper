@@ -326,3 +326,282 @@ fn cached_copy_still_refuses_source_replacement_between_chunks() {
         fixture.bytes[..BUFFER_BYTES]
     );
 }
+
+// This backend writes real bytes to exercise preparation's clone-result path.
+// It is deliberately not evidence that the filesystem supports native CoW.
+fn injected_clone(source: &File, destination: &File) -> io::Result<bool> {
+    let length = source.metadata()?.len();
+    let mut bytes = [0; BUFFER_BYTES];
+    let mut offset = 0;
+    while offset < length {
+        let count = (length - offset).min(bytes.len() as u64) as usize;
+        source.read_exact_at(&mut bytes[..count], offset)?;
+        destination.write_all_at(&bytes[..count], offset)?;
+        offset += count as u64;
+    }
+    Ok(true)
+}
+
+#[test]
+fn verified_clone_finishes_without_reserving_a_second_payload() {
+    for retained_empty in [false, true] {
+        let fixture = Fixture::new(65_539, 0o755);
+        if retained_empty {
+            fixture.retain(0);
+        }
+        let source_before = std::fs::metadata(&fixture.source).unwrap();
+        let mut clones = 0;
+        let mut modes_at_sync = Vec::new();
+        let prepared = prepare_with_backend(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            CopyBackend {
+                write: |_: &File, _: &[u8], _: u64| panic!("clone reached buffered copying"),
+                sync: |file: &File| {
+                    assert_eq!(file.metadata()?.len(), fixture.bytes.len() as u64);
+                    modes_at_sync.push(file.metadata()?.mode() & 0o7777);
+                    file.sync_all()
+                },
+                copy_range: |_: &File, _: &File, _: u64, _: usize| {
+                    panic!("clone reached suffix copying")
+                },
+                clone_file: |source: &File, destination: &File| {
+                    clones += 1;
+                    assert_eq!(destination.metadata()?.len(), 0);
+                    injected_clone(source, destination)
+                },
+                check_space: |_: &File, _: u64| anyhow::bail!("no room for a second full payload"),
+            },
+        )
+        .unwrap();
+        assert_eq!(clones, 1);
+        assert_eq!(modes_at_sync, [COPY_MODE, 0o755]);
+        assert_ne!(prepared.file.metadata().unwrap().ino(), source_before.ino());
+        fixture.caller_unchanged();
+        fixture.publish(prepared);
+        let source_after = std::fs::metadata(&fixture.source).unwrap();
+        assert!(same_version(&source_before, &source_after));
+        assert_eq!(
+            std::fs::metadata(&fixture.destination).unwrap().mode() & 0o7777,
+            0o755
+        );
+    }
+}
+
+#[test]
+fn unsupported_clone_and_retained_prefix_keep_copy_capacity_admission() {
+    for prefix in [0, 17, 65_539] {
+        let fixture = Fixture::new(65_539, 0o755);
+        fixture.retain(prefix);
+        let inode = std::fs::metadata(&fixture.temporary).unwrap().ino();
+        let mut clones = 0;
+        let mut reserved = Vec::new();
+        let prepared = prepare_with_backend(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            CopyBackend {
+                write: |file: &File, bytes: &[u8], offset: u64| {
+                    assert!(offset >= prefix as u64, "retained bytes were overwritten");
+                    file.write_at(bytes, offset)
+                },
+                sync: File::sync_all,
+                copy_range: |_: &File, _: &File, _: u64, _: usize| Ok(None),
+                clone_file: |_: &File, destination: &File| {
+                    clones += 1;
+                    assert_eq!(prefix, 0, "whole clone reached a retained prefix");
+                    assert_eq!(destination.metadata()?.len(), 0);
+                    Ok(false)
+                },
+                check_space: |directory: &File, bytes: u64| {
+                    if bytes > 0 {
+                        reserved.push(bytes);
+                    }
+                    check_copy_space(directory, bytes)
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(clones, usize::from(prefix == 0));
+        assert_eq!(
+            reserved,
+            if prefix == fixture.bytes.len() {
+                vec![]
+            } else {
+                vec![(fixture.bytes.len() - prefix) as u64]
+            }
+        );
+        assert_eq!(prepared.file.metadata().unwrap().ino(), inode);
+        fixture.caller_unchanged();
+        fixture.publish(prepared);
+    }
+
+    let fixture = Fixture::new(65_539, 0o755);
+    let result = prepare_with_backend(
+        &fixture.source,
+        &fixture.temporary,
+        &fixture.hash,
+        CopyBackend {
+            write: |_: &File, _: &[u8], _: u64| panic!("capacity refusal reached a write"),
+            sync: File::sync_all,
+            copy_range: |_: &File, _: &File, _: u64, _: usize| {
+                panic!("capacity refusal reached suffix copying")
+            },
+            clone_file: |_: &File, _: &File| Ok(false),
+            check_space: |_: &File, bytes: u64| {
+                assert_eq!(bytes, fixture.bytes.len() as u64);
+                anyhow::bail!("injected full-copy capacity refusal")
+            },
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::metadata(&fixture.temporary).unwrap().len(), 0);
+    fixture.caller_unchanged();
+}
+
+#[test]
+fn unsuccessful_clone_never_overwrites_its_changed_temporary() {
+    for reported_success in [false, true] {
+        let fixture = Fixture::new(65_539, 0o755);
+        let result = prepare_with_backend(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            CopyBackend {
+                write: |_: &File, _: &[u8], _: u64| panic!("changed clone was overwritten"),
+                sync: File::sync_all,
+                copy_range: |_: &File, _: &File, _: u64, _: usize| {
+                    panic!("changed clone reached suffix copying")
+                },
+                clone_file: |source: &File, destination: &File| {
+                    if reported_success {
+                        injected_clone(source, destination)?;
+                        destination.write_all_at(b"X", 0)?;
+                    } else {
+                        destination.write_all_at(&fixture.bytes[..17], 0)?;
+                    }
+                    Ok(reported_success)
+                },
+                check_space: |_: &File, _: u64| {
+                    panic!("changed clone was admitted as an ordinary copy")
+                },
+            },
+        );
+        assert!(result.is_err(), "unverified clone became a prepared output");
+        let retained = std::fs::read(&fixture.temporary).unwrap();
+        if reported_success {
+            assert_eq!(retained.len(), fixture.bytes.len());
+            assert_eq!(retained[0], b'X');
+            assert_eq!(&retained[1..], &fixture.bytes[1..]);
+        } else {
+            assert_eq!(retained, fixture.bytes[..17]);
+        }
+        fixture.caller_unchanged();
+    }
+}
+
+#[test]
+fn clone_io_failure_retains_progress_and_original_error_for_append_only_retry() {
+    for failure in [
+        rustix::io::Errno::NOSPC,
+        rustix::io::Errno::IO,
+        rustix::io::Errno::INTR,
+    ] {
+        let fixture = Fixture::new(65_539, 0o755);
+        let mut salvaged = Vec::new();
+        let error = prepare_with_backend(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            CopyBackend {
+                write: |_: &File, _: &[u8], _: u64| panic!("clone failure retried a write"),
+                sync: |file: &File| {
+                    salvaged.push(file.metadata()?.is_dir());
+                    Err(io::Error::from_raw_os_error(
+                        rustix::io::Errno::IO.raw_os_error(),
+                    ))
+                },
+                copy_range: |_: &File, _: &File, _: u64, _: usize| {
+                    panic!("clone failure retried a kernel operation")
+                },
+                clone_file: |_: &File, destination: &File| {
+                    destination.write_all_at(&fixture.bytes[..17], 0)?;
+                    Err(io::Error::from_raw_os_error(failure.raw_os_error()))
+                },
+                check_space: |_: &File, _: u64| panic!("clone error became a fallback"),
+            },
+        )
+        .err()
+        .expect("injected clone error must fail preparation");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(failure.raw_os_error())
+        );
+        assert_eq!(salvaged, [false, true]);
+        assert_eq!(
+            std::fs::read(&fixture.temporary).unwrap(),
+            fixture.bytes[..17]
+        );
+        let inode = std::fs::metadata(&fixture.temporary).unwrap().ino();
+        fixture.caller_unchanged();
+        let prepared = prepare_with_write(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            |file, bytes, offset| {
+                assert!(offset >= 17, "retry overwrote clone-failure evidence");
+                file.write_at(bytes, offset)
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.file.metadata().unwrap().ino(), inode);
+        fixture.publish(prepared);
+    }
+}
+
+#[test]
+fn clone_sync_failure_leaves_complete_bytes_reusable_without_copying() {
+    let fixture = Fixture::new(65_539, 0o755);
+    let result = prepare_with_backend(
+        &fixture.source,
+        &fixture.temporary,
+        &fixture.hash,
+        CopyBackend {
+            write: |_: &File, _: &[u8], _: u64| panic!("clone was redundantly copied"),
+            sync: |_: &File| {
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ))
+            },
+            copy_range: |_: &File, _: &File, _: u64, _: usize| panic!("unexpected suffix copy"),
+            clone_file: injected_clone,
+            check_space: |_: &File, _: u64| anyhow::bail!("no duplicate payload budget"),
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes);
+    let before = std::fs::metadata(&fixture.temporary).unwrap();
+    assert_eq!(before.mode() & 0o7777, COPY_MODE);
+    fixture.caller_unchanged();
+    let prepared = prepare_with_backend(
+        &fixture.source,
+        &fixture.temporary,
+        &fixture.hash,
+        CopyBackend {
+            write: |_: &File, _: &[u8], _: u64| panic!("complete clone was recopied"),
+            sync: File::sync_all,
+            copy_range: |_: &File, _: &File, _: u64, _: usize| {
+                panic!("complete clone was recopied")
+            },
+            clone_file: |_: &File, _: &File| panic!("complete clone was replaced"),
+            check_space: |_: &File, remaining: u64| {
+                anyhow::ensure!(remaining == 0, "complete clone requires no payload space");
+                Ok(())
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.file.metadata().unwrap().ino(), before.ino());
+    fixture.publish(prepared);
+}

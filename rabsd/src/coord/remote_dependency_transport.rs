@@ -10,8 +10,8 @@
 //! they never retry an execution or resolve its durable uncertainty.
 
 use super::secure_worker_delivery::{
-    DEPENDENCY_CONTEXT_VERSION, OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook,
-    parse_worker_pin, receive_authenticated_with_admission,
+    OperationCancellation, PinnedWorkerAdmission, WorkerAdmissionHook, parse_worker_pin,
+    receive_authenticated_with_admission,
 };
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
@@ -21,6 +21,10 @@ use super::worker_delivery::{
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_peer};
 use rabs_protocol::worker_fence::WorkerSessionOffer;
+use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION,
+};
 use serde_json::Value;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -390,7 +394,7 @@ impl RemoteDependencyReservation {
     /// Persist only this selected worker's exact recovery context. A pool can
     /// change membership or order while an uncertain result remains retained;
     /// its aggregate status cannot identify the owner of this request.
-    pub fn worker_configuration(&self) -> Value {
+    pub fn worker_configuration(&self, context_version: &str) -> Value {
         let pin: String = self
             .transport
             .pin
@@ -398,7 +402,7 @@ impl RemoteDependencyReservation {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         serde_json::json!({
-            "remote_protocol":1, "dependency_context":DEPENDENCY_CONTEXT_VERSION,
+            "remote_protocol":1, "dependency_context":context_version,
             "listen":self.transport.address.to_string(), "worker_id":self.transport.worker,
             "worker_spki_sha256":pin,
         })
@@ -506,8 +510,14 @@ fn preflight(request: &Value, upload: &SourceUpload, destination: &Path) -> io::
             "remote dependency destination must be absolute without traversal",
         ));
     }
-    if request["dependency_context"]["version"] != DEPENDENCY_CONTEXT_VERSION
-        || request.get("command_context").is_some()
+    if !matches!(
+        request["dependency_context"]["version"].as_str(),
+        Some(
+            DEPENDENCY_CONTEXT_VERSION
+                | CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                | CANONICAL_WORKSPACE_CONTEXT_VERSION
+        )
+    ) || request.get("command_context").is_some()
         || request.get("artifacts").is_none()
         || !toolchain_transfer(request)?
         || request["program"].as_str().is_none()
@@ -565,6 +575,76 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn workspace_preflight_accepts_exact_retained_upload_without_losing_existing_versions() {
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
+        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
+        use serde_json::json;
+
+        let state = crate::test_util::private_tempdir();
+        let source = state.path().join("source");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir(source.join("empty")).unwrap();
+        std::fs::write(source.join("src/lib.rs"), b"pub fn unit() {}\n").unwrap();
+        let snapshot = Arc::new(
+            capture_sealed_source(&[("workspace".into(), source)], false, 1, 4096).unwrap(),
+        );
+        let upload = SourceUpload::from_snapshot(snapshot, "workspace", &["src/lib.rs".into()])
+            .unwrap()
+            .with_dependency_artifacts(Vec::new())
+            .unwrap();
+        let compiler = state.path().join("compiler");
+        std::fs::create_dir_all(compiler.join("bin")).unwrap();
+        // Dataset bytes only: this regression does not execute rustc or TLS.
+        std::fs::write(compiler.join("bin/rustc"), b"fixture retained compiler").unwrap();
+        let prepared = capture_toolchain(
+            &compiler,
+            &state.path().join("retained-toolchain"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let mut request = json!({
+            "kind":"canonical-exec", "request_id":7,
+            "program":"/__rabs/toolchain/bin/rustc", "args":["src/lib.rs"],
+            "source_manifest":upload.wire_manifest(),
+            "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+            "toolchain_identity":crate::coord::worker_delivery::toolchain_identity_value(prepared.identity()),
+            "artifacts":{"unit":"workspace-unit", "files":["libunit.rmeta","unit.d"]},
+            "dependency_context":{
+                "version":CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                "execution_mode":"metadata", "source_root":"/__rabs/workspace",
+                "source_directories":["empty","src"],
+                "generated_root":null, "generated_directories":[],
+                "compiler":"/__rabs/toolchain/bin/rustc"
+            }
+        });
+        let upload = upload.with_toolchain(prepared, &request).unwrap();
+        let destination = state.path().join("delivery-not-created-by-preflight");
+        for version in [
+            DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            request["dependency_context"]["version"] = json!(version);
+            assert!(
+                preflight(&request, &upload, &destination).is_ok(),
+                "{version}"
+            );
+        }
+        request["dependency_context"]["version"] = json!("canonical-workspace-exec-future");
+        assert!(preflight(&request, &upload, &destination).is_err());
+        request["dependency_context"]["version"] = json!(CANONICAL_WORKSPACE_CONTEXT_VERSION);
+        request["dependency_context"]["source_directories"] = json!(["src"]);
+        assert!(preflight(&request, &upload, &destination).is_err());
+        request["dependency_context"]["source_directories"] = json!(["empty", "src"]);
+        request["program"] = json!("/__rabs/toolchain/bin/other");
+        assert!(preflight(&request, &upload, &destination).is_err());
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -860,23 +940,29 @@ mod tests {
         let transport = transport();
         let now = Instant::now();
         transport.observe_delivery(&disconnected(false), false, now);
-        let owner = transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).unwrap();
+        let owner = transport
+            .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+            .unwrap();
         let complete = delivered(true, false);
         transport.observe_delivery(&complete, false, now + FIRST_CONNECTION_COOLDOWN);
         assert!(transport.cooldown.lock().unwrap().failed_at.is_none());
-        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_err());
+        assert!(
+            transport
+                .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+                .is_err()
+        );
         drop(owner);
-        assert!(transport.try_reserve_at(now + FIRST_CONNECTION_COOLDOWN).is_ok());
+        assert!(
+            transport
+                .try_reserve_at(now + FIRST_CONNECTION_COOLDOWN)
+                .is_ok()
+        );
         assert_eq!(complete.as_ref().unwrap().receipt["exit_code"], 1);
         assert_eq!(
             complete.as_ref().unwrap().receipt["publication_authorized"],
             false,
         );
-        transport.observe_delivery(
-            &disconnected(false),
-            false,
-            now + FIRST_CONNECTION_COOLDOWN,
-        );
+        transport.observe_delivery(&disconnected(false), false, now + FIRST_CONNECTION_COOLDOWN);
         assert_eq!(
             transport.cooldown.lock().unwrap().delay,
             FIRST_CONNECTION_COOLDOWN,
@@ -907,7 +993,11 @@ mod tests {
         let outcome = disconnected(true);
         transport.observe_delivery(&outcome, false, now);
         assert!(transport.try_reserve_at(now).is_err());
-        drop(transport.try_reserve_at(now + MAX_CONNECTION_COOLDOWN).unwrap());
+        drop(
+            transport
+                .try_reserve_at(now + MAX_CONNECTION_COOLDOWN)
+                .unwrap(),
+        );
         // Availability is not drain proof, actor reconciliation or permission
         // to retry this same request. The original result is unchanged.
         let failure = outcome.unwrap_err();

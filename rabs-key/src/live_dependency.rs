@@ -63,11 +63,15 @@
 //!   [`CANONICAL_OUT_DIR`]; ordered dependency search directories and
 //!   `--extern` paths use distinct canonical roots before keying. rustc does not embed the out-dir
 //!   in `.rlib`/`.rmeta` bytes (pinned by a real-rustc test); dep-info and
-//!   the JSON artifact notifications do mention it, and are canonicalized
-//!   by [`canonicalize_out_dir`] / rendered back by [`render_out_dir`].
+//!   the JSON artifact notifications do mention it, and use separate bounded
+//!   [`canonicalize_placements`] / [`canonicalize_compiler_transcript`] adapters.
 //!   Dependency-root mentions in diagnostics are refused instead of rewritten.
 //!   Every other path (source, cwd, `--remap-path-prefix`, `--sysroot`)
 //!   is keyed as given — local-host serving only (`SubscriberPathPreserving`).
+//!   The separately prepared canonical Cargo profile already executes at its
+//!   stable visible paths. It keys those exact placements and replays bytes
+//!   unchanged, with its own isolation identity; ordinary wrapper requests
+//!   cannot select that profile through reserved path spelling alone.
 //! - **Dependencies:** the exact bytes of every `--extern` artifact
 //!   (plan §17.7's conservative default), bound to their crate names.
 //!   Every Rust artifact candidate in every dependency search directory is
@@ -100,7 +104,9 @@ use crate::extern_resolution::{
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::invocation::{NormalizedRustcInvocation, SourceInput, parse};
 use crate::output_declarations::OutputDeclarationSet;
-use crate::output_derivation::derive_dependency_output_declarations;
+use crate::output_derivation::{
+    derive_dependency_output_declarations, derive_workspace_output_declarations,
+};
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::path_policy::{BuildPathSemanticPolicy, policy_component_digest};
 use crate::toolchain::ToolchainContract;
@@ -108,11 +114,23 @@ use crate::typed_digest::compute;
 
 pub mod remote;
 
-/// Key epoch of the live dependency class. Epoch 4 refuses dynamic search-path
-/// candidates that may supply transitive procedural macros. Earlier entries
-/// could omit those macros and their untracked reads, so none may be reused.
-/// Complete environment keying and acknowledged immutable capture remain required.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 4;
+mod canonical_cargo;
+pub use canonical_cargo::{
+    canonical_cargo_dependency_key, plan_canonical_cargo_dependency_action,
+    plan_canonical_remote_dependency_action,
+};
+mod workspace_execution;
+pub use workspace_execution::{
+    plan_canonical_workspace_execution, remote_workspace_execution_isolation_policy,
+    remote_workspace_execution_key, remote_workspace_execution_shape, workspace_source_path,
+};
+
+/// Key epoch of the live dependency class. Epoch 6 requires the complete
+/// generated-directory topology, including empty directories, in input evidence.
+/// Earlier file-only keys must not serve generated-tree results. Exact artifact
+/// transcript rewriting, complete environment keying, dynamic-dependency refusal
+/// and acknowledged immutable capture remain required.
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 6;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -139,14 +157,15 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v7: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v8: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
      consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     regular-file OUT_DIR tree with every directory and immediate-child listing keyed, \
+     including empty directories, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
      dynamic candidates refused because regular dependencies can reexport procedural macros; \
@@ -154,7 +173,7 @@ pub const ISOLATION_PROFILE: &str = "live-dependency-v7: unsandboxed local edge 
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v7: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo Git checkout \
@@ -162,7 +181,8 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed loc
      real directory root revalidated on every observation; closure enforced after execution \
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
      proc-macro consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     regular-file OUT_DIR tree with every directory and immediate-child listing keyed, \
+     including empty directories, with exact OUT_DIR spelling keyed and generation revalidated; \
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
      dynamic candidates refused because regular dependencies can reexport procedural macros; \
@@ -171,7 +191,7 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v6: unsandboxed loc
 /// Directory sources retain their real paths and complete package contents.
 /// The checksum document identifies the source class, never the file closure:
 /// even files absent from its `files` map are captured, hashed and revalidated.
-pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: unsandboxed local edge process; \
+pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v4: unsandboxed local edge process; \
      environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
      wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
      unkeyed names, including absent reads, refuse publication); source = complete Cargo directory-source \
@@ -181,14 +201,16 @@ pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v3: uns
      symlinks and source-policy exclusions refuse capture; dep-info reads bounded to the \
      source and generated trees; proc-macro consumption and native link inputs refused; \
      dynamic dependency candidates refused because regular dependencies can reexport procedural macros; \
-     generated inputs captured as a complete disjoint regular-file OUT_DIR tree with exact \
+     generated inputs captured as a complete disjoint regular-file OUT_DIR tree with every \
+     directory and immediate-child listing keyed, including empty directories, with exact \
      OUT_DIR spelling keyed and generation revalidated; build-script execution is not cached; \
      exact dependency-directory crate candidates revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
-pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
-     exit, empty stdout, stderr = JSON diagnostics transcript canonicalized by out-dir \
-     substitution; every declared output present";
+pub const EXECUTION_SEMANTICS: &str = "live-dependency-v2: rustc exit status 0 by normal \
+     exit, empty stdout, stderr = byte-preserved JSON diagnostics with placement \
+     substitution only in declared rustc artifact paths; diagnostics containing \
+     output or dependency placement refuse replay; every declared output present";
 
 /// Shell location/process hints are preserved without fragmenting otherwise
 /// identical dependency actions. A compiler's tracked read of any of these
@@ -374,6 +396,9 @@ pub enum DependencySourceKind {
     GitCheckout,
     /// One Cargo directory-source package, witnessed before source capture.
     DirectoryPackage,
+    /// The complete retained canonical workspace for one fresh worker execution.
+    /// This source class never grants dependency-cache publication or serving.
+    WorkspaceExecutionOnly,
 }
 
 impl DependencySourceKind {
@@ -384,6 +409,7 @@ impl DependencySourceKind {
             Self::RegistryPackage => "registry-package",
             Self::GitCheckout => "git-checkout",
             Self::DirectoryPackage => "directory-package",
+            Self::WorkspaceExecutionOnly => "canonical-workspace-execution-only",
         }
     }
 }
@@ -396,9 +422,16 @@ pub struct DependencyActionPlan {
     pub invocation: NormalizedRustcInvocation,
     /// The real compiler argv\[0\].
     pub compiler: String,
-    /// rustc's working directory (= the package root).
+    /// The prepared canonical Cargo planner admitted these visible paths.
+    /// This selects exact placement keying and byte-preserving replay; it is
+    /// not proof of execution or publication authority. Ordinary wrapper input
+    /// cannot select this profile through an environment variable or wire flag.
+    pub canonical_cargo: bool,
+    /// rustc's working directory. Workspace execution may use the workspace
+    /// root while CARGO_MANIFEST_DIR names a selected member package.
     pub cwd: String,
-    /// Absolute out-dir (placement; virtualized in the key).
+    /// Absolute out-dir (virtualized for ordinary host plans; exact for
+    /// prepared canonical Cargo plans).
     pub out_dir: String,
     /// The compiled package root (`CARGO_MANIFEST_DIR`).
     pub package_root: String,
@@ -415,6 +448,11 @@ pub struct DependencyActionPlan {
     /// Cargo's build-script output tree consumed by this compile, if present.
     /// Its exact spelling is keyed; it is not a placement mapping.
     pub generated_root: Option<String>,
+    /// Complete foreign build-script OUT_DIR trees reached through Cargo's
+    /// propagated native searches, sorted by exact canonical visible path.
+    /// These require independently retained Cargo run records and closed
+    /// worker execution; ordinary/local dependency capture cannot use them.
+    pub native_roots: Vec<String>,
     /// Target triple the outputs are for.
     pub target_triple: String,
     /// Host triple from the toolchain probe.
@@ -438,6 +476,11 @@ impl DependencyActionPlan {
     /// disjoint, so replacing one can never hide another.
     #[must_use]
     pub fn placement_mappings(&self) -> Vec<(String, String)> {
+        if self.canonical_cargo {
+            // Cargo already planned under these exact visible paths. They are
+            // semantic key inputs, not subscriber-specific placement aliases.
+            return Vec::new();
+        }
         let mut mappings = vec![(self.out_dir.clone(), CANONICAL_OUT_DIR.to_owned())];
         for (index, root) in self.dependency_dirs.iter().enumerate() {
             if root != &self.out_dir {
@@ -485,6 +528,29 @@ impl DependencyActionPlan {
     #[must_use]
     pub fn generated_input_virtual_path(&self, relative: &str) -> String {
         format!("{}/{relative}", self.generated_virtual_root())
+    }
+
+    /// Distinct input-manifest root of one foreign native input tree. The
+    /// index is the position in the sorted `native_roots` contract, never the
+    /// order of native searches, which remains exact in the invocation.
+    #[must_use]
+    pub fn native_input_virtual_root(&self, index: usize) -> String {
+        format!("{}-native-{index:04}", self.source_virtual_root())
+    }
+
+    /// Virtual input path of a member of one complete foreign native tree.
+    #[must_use]
+    pub fn native_input_virtual_path(&self, index: usize, relative: &str) -> String {
+        format!("{}/{relative}", self.native_input_virtual_root(index))
+    }
+
+    /// Synthetic evidence path for the exact completed Cargo stdout record of
+    /// a foreign native producer. This object is keyed but never mounted into
+    /// the compiler's tree. Its `root-output` spelling is checked separately by
+    /// the coordinator against the retained logical/physical root mapping.
+    #[must_use]
+    pub fn native_record_virtual_path(&self, index: usize) -> String {
+        format!("{}-native-records/{index:04}", self.source_virtual_root())
     }
 
     /// Output file names relative to the out-dir, sorted.
@@ -574,6 +640,10 @@ pub struct LiveDependencyKey {
 /// refused rather than escaped: an exact transcript is worth more than
 /// coverage of exotic directory names.
 fn plain_path(path: &str) -> bool {
+    plain_path_in_profile(path, false)
+}
+
+fn plain_path_in_profile(path: &str, canonical_cargo: bool) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && !path.ends_with('/')
@@ -582,7 +652,11 @@ fn plain_path(path: &str) -> bool {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@')
         })
         && !path.split('/').any(|part| part == "." || part == "..")
-        && !path.contains("/__rabs")
+        && if canonical_cargo {
+            within(path, "/__rabs")
+        } else {
+            !path.contains("/__rabs")
+        }
 }
 
 fn safe_component(value: &str) -> bool {
@@ -604,8 +678,9 @@ fn git_metadata(relative: &str) -> bool {
 fn dependency_source(
     cargo_home: &str,
     package_root: &str,
+    canonical_cargo: bool,
 ) -> Result<(DependencySourceKind, String, String), LiveRefusal> {
-    if !plain_path(cargo_home) {
+    if !plain_path_in_profile(cargo_home, canonical_cargo) {
         return Err(LiveRefusal::UnrepresentablePath(cargo_home.to_owned()));
     }
     let registry_src = format!("{cargo_home}/registry/src/");
@@ -646,11 +721,12 @@ fn dependency_source(
 fn directory_source(
     cargo_home: &str,
     package_root: &str,
+    canonical_cargo: bool,
 ) -> Result<(DependencySourceKind, String, String), LiveRefusal> {
     // A witness must not reinterpret an invalid/incomplete Cargo cache path
     // as a standalone package and silently shrink a Git checkout's closure.
-    if !plain_path(cargo_home)
-        || !plain_path(package_root)
+    if !plain_path_in_profile(cargo_home, canonical_cargo)
+        || !plain_path_in_profile(package_root, canonical_cargo)
         || git_metadata(package_root)
         || package_root == cargo_home
         || within(package_root, cargo_home)
@@ -720,7 +796,7 @@ pub fn plan_dependency_action(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, None)
+    plan_with_directory_manifest(request, host_triple, None, DependencyPlanningMode::Ordinary)
 }
 
 /// Plan a Cargo directory-source dependency after the edge observed a valid
@@ -736,7 +812,20 @@ pub fn plan_directory_dependency_action(
     host_triple: &str,
     checksum_document: TypedDigest,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
-    plan_with_directory_manifest(request, host_triple, Some(checksum_document))
+    plan_with_directory_manifest(
+        request,
+        host_triple,
+        Some(checksum_document),
+        DependencyPlanningMode::Ordinary,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DependencyPlanningMode {
+    Ordinary,
+    CanonicalLocal,
+    CanonicalRemote,
+    WorkspaceExecutionOnly,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -744,14 +833,34 @@ fn plan_with_directory_manifest(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
     directory_source_manifest: Option<TypedDigest>,
+    mode: DependencyPlanningMode,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
+    plan_in_profile(request, host_triple, directory_source_manifest, mode)
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_in_profile(
+    request: LiveRustcRequest<'_>,
+    host_triple: &str,
+    directory_source_manifest: Option<TypedDigest>,
+    mode: DependencyPlanningMode,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    let canonical_cargo = mode != DependencyPlanningMode::Ordinary;
+    let workspace_execution_only = mode == DependencyPlanningMode::WorkspaceExecutionOnly;
+    let canonical_archive_execution = matches!(
+        mode,
+        DependencyPlanningMode::CanonicalRemote | DependencyPlanningMode::WorkspaceExecutionOnly
+    );
     // Environment first: it is the cheapest way out of the class.
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(LiveRefusal::DuplicateEnv(pair[0].to_owned()));
     }
-    if let Some(name) = names.iter().find(|name| REFUSED_NAMES.contains(name)) {
+    if let Some(name) = names.iter().find(|name| {
+        REFUSED_NAMES.contains(name)
+            && !(workspace_execution_only && **name == "CARGO_PRIMARY_PACKAGE")
+    }) {
         return Err(LiveRefusal::RefusedEnv((*name).to_owned()));
     }
     let package_root = env_value(request.env, "CARGO_MANIFEST_DIR")
@@ -767,24 +876,46 @@ fn plan_with_directory_manifest(
                 .trim_end_matches('/')
         ),
     };
-    if !plain_path(&package_root) {
+    if !plain_path_in_profile(&package_root, canonical_cargo) {
         return Err(LiveRefusal::UnrepresentablePath(package_root));
     }
-    let (source_kind, source_root, source_dir_name) = if directory_source_manifest.is_some() {
-        directory_source(&cargo_home, &package_root)?
+    let (source_kind, source_root, source_dir_name) = if workspace_execution_only {
+        if !canonical_cargo
+            || directory_source_manifest.is_some()
+            || !(package_root == workspace_execution::WORKSPACE
+                || within(&package_root, workspace_execution::WORKSPACE))
+        {
+            return Err(LiveRefusal::NotDependencySource(package_root));
+        }
+        (
+            DependencySourceKind::WorkspaceExecutionOnly,
+            workspace_execution::WORKSPACE.to_owned(),
+            "workspace".to_owned(),
+        )
+    } else if directory_source_manifest.is_some() {
+        directory_source(&cargo_home, &package_root, canonical_cargo)?
     } else {
-        dependency_source(&cargo_home, &package_root)?
+        dependency_source(&cargo_home, &package_root, canonical_cargo)?
     };
 
-    if request.cwd != package_root {
+    if if workspace_execution_only {
+        !plain_path_in_profile(request.cwd, true)
+            || !(request.cwd == source_root || within(request.cwd, &source_root))
+    } else {
+        request.cwd != package_root
+    } {
         return Err(LiveRefusal::WorkingDirectory(request.cwd.to_owned()));
     }
 
     let invocation = parse(request.argv, None)
         .map_err(|error| LiveRefusal::Unparseable(format!("{error:?}")))?;
-    let outputs = derive_dependency_output_declarations(&invocation, host_triple)
-        .map_err(|error| LiveRefusal::Outputs(format!("{error:?}")))?;
-    if invocation.cap_lints.as_deref() != Some("allow") {
+    let outputs = if workspace_execution_only {
+        derive_workspace_output_declarations(&invocation, host_triple)
+    } else {
+        derive_dependency_output_declarations(&invocation, host_triple)
+    }
+    .map_err(|error| LiveRefusal::Outputs(format!("{error:?}")))?;
+    if !workspace_execution_only && invocation.cap_lints.as_deref() != Some("allow") {
         return Err(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",
         ));
@@ -803,21 +934,27 @@ fn plan_with_directory_manifest(
     {
         return Err(LiveRefusal::NativeCpu);
     }
-    if let Some(library) = invocation.native_libs.first() {
+    if !canonical_archive_execution && let Some(library) = invocation.native_libs.first() {
         return Err(LiveRefusal::NativeLibrary(library.clone()));
     }
     let source = match &invocation.source {
         Some(SourceInput::Path(path)) => path.clone(),
         _ => return Err(LiveRefusal::SourceOutsidePackage("no source path".into())),
     };
-    if !plain_path(&source) || !within(&source, &package_root) {
+    let source_inside = if workspace_execution_only {
+        workspace_execution::resolved_workspace_source(request.cwd, &source)
+            .is_some_and(|source| within(&source, &source_root))
+    } else {
+        plain_path_in_profile(&source, canonical_cargo) && within(&source, &package_root)
+    };
+    if !source_inside {
         return Err(LiveRefusal::SourceOutsidePackage(source));
     }
     let out_dir = invocation
         .out_dir
         .clone()
         .ok_or_else(|| LiveRefusal::Outputs("missing --out-dir".into()))?;
-    if !plain_path(&out_dir)
+    if !plain_path_in_profile(&out_dir, canonical_cargo)
         || out_dir == source_root
         || within(&out_dir, &source_root)
         || within(&source_root, &out_dir)
@@ -826,7 +963,7 @@ fn plan_with_directory_manifest(
     }
     let generated_root = env_value(request.env, "OUT_DIR").map(str::to_owned);
     if let Some(root) = &generated_root
-        && (!plain_path(root)
+        && (!plain_path_in_profile(root, canonical_cargo)
             // Dep-info replay substitutes the compiler output placement.
             // It must never rewrite a retained exact generated-input path.
             || root.contains(&out_dir)
@@ -836,9 +973,20 @@ fn plan_with_directory_manifest(
     {
         return Err(LiveRefusal::UnrepresentablePath(root.clone()));
     }
+    let native_roots = if canonical_archive_execution {
+        remote::canonical_generated_native_roots(&invocation, generated_root.as_deref())?
+    } else {
+        Vec::new()
+    };
+    remote::validate_generated_native_inputs_with_roots(
+        &invocation,
+        generated_root.as_deref(),
+        &native_roots,
+        canonical_archive_execution,
+    )?;
     let mut dependency_dirs = Vec::new();
     let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
-        if !plain_path(path)
+        if !plain_path_in_profile(path, canonical_cargo)
             || path == source_root
             || within(path, &source_root)
             || within(&source_root, path)
@@ -846,6 +994,9 @@ fn plan_with_directory_manifest(
             || generated_root
                 .as_ref()
                 .is_some_and(|root| path == root || within(path, root) || within(root, path))
+            || native_roots
+                .iter()
+                .any(|root| path == root || within(path, root) || within(root, path))
             || dependency_dirs
                 .iter()
                 .any(|other: &String| other != path && (within(path, other) || within(other, path)))
@@ -863,6 +1014,13 @@ fn plan_with_directory_manifest(
         Ok(())
     };
     for entry in &invocation.lib_search {
+        // These inputs belong to the complete generated tree, not to Rust's
+        // crate-candidate inventory. The bounded remote validator above has
+        // already proved every native directory is within an exact retained
+        // OUT_DIR. Foreign producers have independent run-record evidence.
+        if canonical_archive_execution && entry.starts_with("native=") {
+            continue;
+        }
         let path = entry
             .strip_prefix("dependency=")
             .ok_or_else(|| LiveRefusal::SearchPath(entry.clone()))?;
@@ -909,7 +1067,7 @@ fn plan_with_directory_manifest(
     let execution_env = constructed_environment(request.env);
     let keyed_env: Vec<(String, String)> = execution_env
         .iter()
-        .filter(|(name, _)| matches!(env_role(name), EnvRole::Keyed))
+        .filter(|(name, _)| workspace_execution_only || matches!(env_role(name), EnvRole::Keyed))
         .cloned()
         .collect();
 
@@ -919,6 +1077,7 @@ fn plan_with_directory_manifest(
         .unwrap_or_else(|| host_triple.to_owned());
     Ok(DependencyActionPlan {
         compiler: invocation.compiler_argv0.clone(),
+        canonical_cargo,
         invocation,
         cwd: request.cwd.to_owned(),
         out_dir,
@@ -928,6 +1087,7 @@ fn plan_with_directory_manifest(
         source_root,
         source_dir_name,
         generated_root,
+        native_roots,
         target_triple,
         host_triple: host_triple.to_owned(),
         externs,
@@ -938,17 +1098,21 @@ fn plan_with_directory_manifest(
     })
 }
 
-/// The normalized-invocation component: out-dir placement virtualized,
-/// every other path kept, presentation flags bound (an exact transcript
+/// The normalized-invocation component: ordinary host output and dependency
+/// placement virtualized, prepared canonical Cargo placement exact. Every
+/// other path is kept and presentation flags are bound (an exact transcript
 /// is only replayable under the presentation that produced it).
 fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
     let mut virtual_invocation = plan.invocation.clone();
-    virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
+    if !plan.canonical_cargo {
+        virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
+    }
     for entry in &mut virtual_invocation.lib_search {
-        let root = entry
-            .strip_prefix("dependency=")
-            .expect("planned dependency search");
-        *entry = format!("dependency={}", plan.virtual_dependency_path(root));
+        if let Some(root) = entry.strip_prefix("dependency=") {
+            *entry = format!("dependency={}", plan.virtual_dependency_path(root));
+        }
+        // Generated native searches preserve their exact canonical spelling
+        // and ordering. They are never projected onto a dependency/output root.
     }
     for (_, path) in &mut virtual_invocation.externs {
         if let Some(path) = path {
@@ -1086,7 +1250,7 @@ fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, Liv
         .keyed_env
         .iter()
         .map(|(name, value)| {
-            let disposition = if name == "LD_LIBRARY_PATH" {
+            let disposition = if name == "LD_LIBRARY_PATH" && !plan.canonical_cargo {
                 EnvDisposition::SemanticNormalized {
                     normalizer: DYLIB_PATH_NORMALIZER.to_owned(),
                     normalized: value
@@ -1166,6 +1330,60 @@ pub fn live_dependency_key(
     build_script_output: Option<&[u8]>,
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
+    if plan.canonical_cargo || !plan.native_roots.is_empty() {
+        return Err(LiveRefusal::Facts(
+            "canonical Cargo plans require their distinct dependency-key policy".into(),
+        ));
+    }
+    remote::validate_generated_native_inputs(
+        &plan.invocation,
+        plan.generated_root.as_deref(),
+        false,
+    )?;
+    dependency_key(
+        plan,
+        toolchain,
+        externs,
+        directories,
+        build_script_output,
+        inputs,
+    )
+}
+
+fn dependency_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+    externs: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
+    build_script_output: Option<&[u8]>,
+    inputs: &ActionInputManifest,
+) -> Result<LiveDependencyKey, LiveRefusal> {
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "workspace execution-only plans have no dependency-cache authority".into(),
+        ));
+    }
+    captured_action_key(
+        plan,
+        toolchain,
+        externs,
+        directories,
+        build_script_output,
+        inputs,
+    )
+}
+
+/// Shared input validation and descriptor assembly. Only the separate workspace
+/// execution builder may use this for WorkspaceExecutionOnly, and that builder
+/// replaces the execution policy before returning an execution identity.
+fn captured_action_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+    externs: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
+    build_script_output: Option<&[u8]>,
+    inputs: &ActionInputManifest,
+) -> Result<LiveDependencyKey, LiveRefusal> {
     if toolchain.host_triple() != Some(plan.host_triple.as_str()) {
         return Err(LiveRefusal::Facts(
             "toolchain probe host differs from the planned host".into(),
@@ -1173,10 +1391,46 @@ pub fn live_dependency_key(
     }
     validate_build_script_output(plan, build_script_output)?;
     validate_directory_source_manifest(plan, inputs)?;
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        workspace_input_directories(plan, inputs)?;
+    }
+    generated_input_directories(plan, inputs)?;
+    if !plan.native_roots.is_empty() {
+        remote::validate_plan_native_roots(plan)?;
+        for index in 0..plan.native_roots.len() {
+            native_input_directories(plan, inputs, index)?;
+            let record = plan.native_record_virtual_path(index);
+            let mut records = inputs
+                .inputs
+                .iter()
+                .filter(|input| input.virtual_path.as_bytes() == record.as_bytes());
+            let Some(input) = records.next() else {
+                return Err(LiveRefusal::Facts(
+                    "foreign native input tree lacks its completed Cargo output record".into(),
+                ));
+            };
+            if records.next().is_some()
+                || input.file_type != InputFileType::Regular
+                || input.executable
+                || !input.symlink_resolution.is_empty()
+            {
+                return Err(LiveRefusal::Facts(
+                    "foreign native Cargo output record must be one exact regular input".into(),
+                ));
+            }
+        }
+    }
     let root = format!("{}/", plan.source_virtual_root());
     let generated = format!("{}/", plan.generated_virtual_root());
+    let native = (0..plan.native_roots.len())
+        .map(|index| {
+            (
+                format!("{}/", plan.native_input_virtual_root(index)),
+                plan.native_record_virtual_path(index),
+            )
+        })
+        .collect::<Vec<_>>();
     if inputs.inputs.is_empty()
-        || !inputs.directory_enumerations.is_empty()
         || !inputs.approved_generated_objects.is_empty()
         || inputs.inputs.iter().any(|input| {
             input.file_type != InputFileType::Regular
@@ -1186,11 +1440,17 @@ pub fn live_dependency_key(
                         && input
                             .virtual_path
                             .as_bytes()
-                            .starts_with(generated.as_bytes())))
+                            .starts_with(generated.as_bytes()))
+                    || native.iter().any(|(tree, record)| {
+                        input.virtual_path.as_bytes().starts_with(tree.as_bytes())
+                            || input.virtual_path.as_bytes() == record.as_bytes()
+                    }))
                 || (input.virtual_path.as_bytes().starts_with(root.as_bytes())
                     && matches!(
                         plan.source_kind,
-                        DependencySourceKind::GitCheckout | DependencySourceKind::DirectoryPackage
+                        DependencySourceKind::GitCheckout
+                            | DependencySourceKind::DirectoryPackage
+                            | DependencySourceKind::WorkspaceExecutionOnly
                     )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
@@ -1202,12 +1462,20 @@ pub fn live_dependency_key(
                 .into(),
         ));
     }
+    let workspace_source = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        Some(workspace_source_path(plan)?)
+    } else {
+        None
+    };
     let source_relative = plan
         .invocation
         .source
         .as_ref()
         .and_then(|source| match source {
-            SourceInput::Path(path) => path.strip_prefix(&format!("{}/", plan.source_root)),
+            SourceInput::Path(path) => workspace_source
+                .as_deref()
+                .unwrap_or(path)
+                .strip_prefix(&format!("{}/", plan.source_root)),
             SourceInput::Stdin(_) => None,
         })
         .map(|relative| plan.input_virtual_path(relative))
@@ -1243,11 +1511,25 @@ pub fn live_dependency_key(
                     .str(&plan.source_root)
                     .str(&plan.source_virtual_root());
             }
+            DependencySourceKind::WorkspaceExecutionOnly => {
+                enc.str("complete-canonical-workspace-execution-tree-v1")
+                    .str(plan.source_kind.as_str())
+                    .str(&plan.source_root)
+                    .str(&plan.source_virtual_root());
+            }
         }
         if let Some(generated_root) = &plan.generated_root {
-            enc.str("complete-generated-input-tree-enumeration-v1")
+            enc.str("complete-generated-input-tree-enumeration-v2")
                 .str(generated_root)
                 .str(&plan.generated_virtual_root());
+        }
+        if !plan.native_roots.is_empty() {
+            enc.str("complete-foreign-native-input-trees-v1");
+            for (index, root) in plan.native_roots.iter().enumerate() {
+                enc.str(root)
+                    .str(&plan.native_input_virtual_root(index))
+                    .str(&plan.native_record_virtual_path(index));
+            }
         }
         compute(DOMAIN_LIVE_NEGATIVE, &enc.finish())
     };
@@ -1281,7 +1563,11 @@ pub fn live_dependency_key(
     let descriptor = ActionDescriptor {
         key_epoch: LIVE_DEPENDENCY_KEY_EPOCH,
         projection_epoch: LIVE_DEPENDENCY_PROJECTION_EPOCH,
-        action_class: ActionClass::RustcDependencyCompile,
+        action_class: if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+            ActionClass::RustcWorkspaceCompile
+        } else {
+            ActionClass::RustcDependencyCompile
+        },
         normalized_invocation: invocation_component(plan),
         virtual_working_directory: compute(DOMAIN_LIVE_CWD, plan.cwd.as_bytes()),
         action_inputs,
@@ -1306,6 +1592,9 @@ pub fn live_dependency_key(
                 DependencySourceKind::RegistryPackage => ISOLATION_PROFILE,
                 DependencySourceKind::GitCheckout => GIT_ISOLATION_PROFILE,
                 DependencySourceKind::DirectoryPackage => DIRECTORY_ISOLATION_PROFILE,
+                DependencySourceKind::WorkspaceExecutionOnly => {
+                    workspace_execution::WORKSPACE_EXECUTION_PROFILE
+                }
             }
             .as_bytes(),
         ),
@@ -1322,6 +1611,241 @@ pub fn live_dependency_key(
         action_key,
         descriptor_digest,
     })
+}
+
+/// Validate the complete generated-tree directory closure bound into an action
+/// input manifest, returning sorted relative subdirectories excluding the root.
+/// Every directory, including an empty OUT_DIR itself, needs one exact listing
+/// of immediate file and directory names. Files and directories may not collide,
+/// every parent must be declared, and no listing outside OUT_DIR is accepted.
+///
+/// Callers supply observations from the same coherent capture as the positive
+/// file objects. This pure check proves their consistency, not that a caller
+/// observed a live filesystem or acquired authority to execute an action.
+///
+/// # Errors
+/// [`LiveRefusal::Facts`] for missing, unsafe, duplicate, unbounded or inconsistent
+/// generated input evidence, or directory evidence without a generated root.
+pub fn generated_input_directories(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+) -> Result<Vec<String>, LiveRefusal> {
+    let refuse = || {
+        LiveRefusal::Facts(
+            "generated inputs require complete normalized directory listings matching every captured file"
+                .into(),
+        )
+    };
+    let mut other_roots = (0..plan.native_roots.len())
+        .map(|index| plan.native_input_virtual_root(index))
+        .collect::<Vec<_>>();
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        other_roots.push(plan.source_virtual_root());
+    }
+    if plan.generated_root.is_none() {
+        return if inputs.directory_enumerations.iter().all(|enumeration| {
+            other_roots.iter().any(|root| {
+                enumeration.virtual_path.as_bytes() == root.as_bytes()
+                    || enumeration
+                        .virtual_path
+                        .as_bytes()
+                        .starts_with(format!("{root}/").as_bytes())
+            })
+        }) {
+            Ok(Vec::new())
+        } else {
+            Err(refuse())
+        };
+    }
+    complete_input_directories(inputs, &plan.generated_virtual_root(), &other_roots)
+}
+
+/// Validate the complete retained workspace directory closure for an
+/// execution-only plan, returning sorted relative subdirectories without the
+/// root. Generated-directory listings may accompany it only at their separate
+/// declared virtual root and are independently checked by the key builder.
+///
+/// # Errors
+/// Any other action class, missing or inconsistent source listings, unsafe
+/// paths, symlinks, file/directory collisions, or incomplete parent closure.
+pub fn workspace_input_directories(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+) -> Result<Vec<String>, LiveRefusal> {
+    if !plan.canonical_cargo
+        || plan.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+        || plan.source_root != workspace_execution::WORKSPACE
+    {
+        return Err(LiveRefusal::Facts(
+            "workspace directory evidence requires a canonical execution-only plan".into(),
+        ));
+    }
+    let mut other_roots = plan
+        .generated_root
+        .as_ref()
+        .map(|_| plan.generated_virtual_root())
+        .into_iter()
+        .collect::<Vec<_>>();
+    other_roots
+        .extend((0..plan.native_roots.len()).map(|index| plan.native_input_virtual_root(index)));
+    complete_input_directories(inputs, &plan.source_virtual_root(), &other_roots)
+}
+
+/// Validate one complete foreign native OUT_DIR's file and directory closure.
+/// Each root must retain every immediate listing, including empty directories;
+/// the synthetic Cargo stdout record is separate evidence, never tree content.
+///
+/// # Errors
+/// Noncanonical plans, missing/out-of-range roots, undeclared listings, duplicate
+/// paths, symlinks, absent parents or inconsistent file/directory membership.
+pub fn native_input_directories(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+    index: usize,
+) -> Result<Vec<String>, LiveRefusal> {
+    if !plan.canonical_cargo
+        || index >= plan.native_roots.len()
+        || plan.native_roots.len() > remote::MAX_CANONICAL_NATIVE_ROOTS
+    {
+        return Err(LiveRefusal::Facts(
+            "foreign native directory evidence requires an exact canonical root".into(),
+        ));
+    }
+    remote::validate_plan_native_roots(plan)?;
+    let mut other_roots = (0..plan.native_roots.len())
+        .filter(|other| *other != index)
+        .map(|other| plan.native_input_virtual_root(other))
+        .collect::<Vec<_>>();
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        other_roots.push(plan.source_virtual_root());
+    }
+    if plan.generated_root.is_some() {
+        other_roots.push(plan.generated_virtual_root());
+    }
+    complete_input_directories(inputs, &plan.native_input_virtual_root(index), &other_roots)
+}
+
+fn complete_input_directories(
+    inputs: &ActionInputManifest,
+    root: &str,
+    other_roots: &[String],
+) -> Result<Vec<String>, LiveRefusal> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let refuse = || {
+        LiveRefusal::Facts(
+            "retained inputs require complete normalized directory listings matching every captured file"
+                .into(),
+        )
+    };
+    // Match the independently bounded generated-directory execution contract.
+    // The generated root occupies one additional enumeration but no relative
+    // directory name in the worker context.
+    if inputs.directory_enumerations.is_empty()
+        || other_roots.len() > remote::MAX_CANONICAL_NATIVE_ROOTS + 1
+        || inputs.directory_enumerations.len() > 4097 * (other_roots.len() + 1)
+    {
+        return Err(refuse());
+    }
+    let prefix = format!("{root}/");
+    let mut declared = BTreeMap::new();
+    for enumeration in &inputs.directory_enumerations {
+        let path =
+            std::str::from_utf8(enumeration.virtual_path.as_bytes()).map_err(|_| refuse())?;
+        if other_roots
+            .iter()
+            .any(|other| path == other || within(path, other))
+        {
+            continue;
+        }
+        let relative = if path == root {
+            ""
+        } else {
+            let relative = path.strip_prefix(&prefix).ok_or_else(refuse)?;
+            if !normalized_generated_relative(relative) {
+                return Err(refuse());
+            }
+            relative
+        };
+        if declared.insert(relative, enumeration).is_some()
+            || enumeration
+                .entries
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || enumeration.entries.iter().any(|entry| {
+                std::str::from_utf8(entry.as_bytes()).map_or(true, |entry| {
+                    entry.contains('/') || !normalized_generated_relative(entry)
+                })
+            })
+        {
+            return Err(refuse());
+        }
+    }
+    if !declared.contains_key("") || declared.len() > 4097 {
+        return Err(refuse());
+    }
+    let mut expected: BTreeMap<&str, BTreeSet<&str>> = declared
+        .keys()
+        .map(|directory| (*directory, BTreeSet::new()))
+        .collect();
+    for relative in declared.keys().filter(|relative| !relative.is_empty()) {
+        let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+        let children = expected.get_mut(parent).ok_or_else(refuse)?;
+        if !children.insert(name) {
+            return Err(refuse());
+        }
+    }
+    for input in &inputs.inputs {
+        if input.virtual_path.as_bytes() == root.as_bytes() {
+            return Err(refuse());
+        }
+        let Some(relative) = input
+            .virtual_path
+            .as_bytes()
+            .strip_prefix(prefix.as_bytes())
+        else {
+            continue;
+        };
+        let relative = std::str::from_utf8(relative).map_err(|_| refuse())?;
+        if !normalized_generated_relative(relative)
+            || input.file_type != InputFileType::Regular
+            || !input.symlink_resolution.is_empty()
+            || declared.contains_key(relative)
+        {
+            return Err(refuse());
+        }
+        let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+        if !expected.get_mut(parent).ok_or_else(refuse)?.insert(name) {
+            return Err(refuse());
+        }
+    }
+    for (relative, enumeration) in &declared {
+        let children = &expected[relative];
+        if enumeration.entries.len() != children.len()
+            || enumeration
+                .entries
+                .iter()
+                .zip(children)
+                .any(|(actual, expected)| actual.as_bytes() != expected.as_bytes())
+        {
+            return Err(refuse());
+        }
+    }
+    Ok(declared
+        .keys()
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| (*relative).to_owned())
+        .collect())
+}
+
+fn normalized_generated_relative(path: &str) -> bool {
+    path.len() <= 1024
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').count() <= 32
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
 }
 
 fn validate_directory_source_manifest(
@@ -1417,9 +1941,11 @@ fn validate_build_script_output(
     Ok(())
 }
 
-/// Rewrite every occurrence of the real out-dir to [`CANONICAL_OUT_DIR`]
-/// (committed dep-info and transcripts). Refuses bytes that already
-/// contain the canonical marker: the rewrite would not be invertible.
+/// Low-level byte substitution for an already classified output payload.
+/// Live dep-info and compiler transcripts require their separate bounded
+/// adapters below; arbitrary diagnostic text is not safe to rewrite.
+/// Refuses bytes already containing the canonical marker because substitution
+/// would not be invertible.
 ///
 /// # Errors
 /// A static reason when the rewrite would be ambiguous.
@@ -1443,28 +1969,354 @@ pub fn render_out_dir(canonical: &[u8], out_dir: &str) -> Vec<u8> {
     replace_all(canonical, CANONICAL_OUT_DIR.as_bytes(), out_dir.as_bytes())
 }
 
-/// Canonicalize output placement in replayable dep-info or diagnostics.
-/// Dependency directory strings are refused: an arbitrary diagnostic may
-/// quote a source-authored literal, so replacing those strings is not sound.
+/// Canonicalize output placement in closure-checked dep-info. Only an absolute
+/// path token beneath the output directory is rewritten: a source path with a
+/// matching substring or sibling prefix is not output placement.
+/// Dependency directory strings remain outside this replay profile.
+/// Prepared canonical Cargo plans retain every byte because their actual
+/// visible placement is already exact and included in the key.
+/// Compiler transcripts must use [`canonicalize_compiler_transcript`] instead.
 ///
 /// # Errors
-/// Canonical markers and observable dependency placement are refused.
+/// Canonical markers and observable dependency placement are refused for
+/// ordinary host plans; prepared plans require the fixed canonical layout.
 pub fn canonicalize_placements(
     raw: &[u8],
     plan: &DependencyActionPlan,
 ) -> Result<Vec<u8>, &'static str> {
+    if plan.canonical_cargo {
+        if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+            workspace_execution::workspace_layout(plan)
+        } else {
+            canonical_cargo::canonical_layout(plan)
+        }
+        .map_err(|_| "invalid prepared canonical Cargo layout")?;
+        // These are the compiler's actual keyed paths, already identical for
+        // the producer and consumer. Replacing /__rabs/out would corrupt the
+        // nested real target path /__rabs/out/cargo as well as source literals.
+        return Ok(raw.to_vec());
+    }
     for root in &plan.dependency_dirs {
         if root != &plan.out_dir && contains(raw, root.as_bytes()) {
             return Err("observable dependency directory placement cannot be replayed");
         }
     }
-    canonicalize_out_dir(raw, &plan.out_dir)
+    if contains(raw, b"/__rabs") {
+        return Err("bytes already contain a canonical /__rabs path");
+    }
+    if !plain_path(&plan.out_dir) {
+        return Err("out-dir is not a plain path");
+    }
+    let prefix = format!("{}/", plan.out_dir);
+    let mut canonical = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        if (at == 0 || raw[at - 1].is_ascii_whitespace())
+            && raw[at..].starts_with(prefix.as_bytes())
+        {
+            canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
+            at += plan.out_dir.len();
+        } else {
+            canonical.push(raw[at]);
+            at += 1;
+        }
+    }
+    Ok(canonical)
 }
 
 /// Render the output placement admitted by [`canonicalize_placements`].
 #[must_use]
 pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
-    render_out_dir(canonical, &plan.out_dir)
+    if plan.canonical_cargo {
+        canonical.to_vec()
+    } else {
+        render_out_dir(canonical, &plan.out_dir)
+    }
+}
+
+/// Canonicalize only declared artifact paths in a compiler transcript, retaining
+/// every other byte (including whitespace, field order and line terminators).
+/// A diagnostic can quote a source-authored string that happens to equal the
+/// output directory. Rewriting that string for another subscriber changes what
+/// rustc said. Such ambiguous observations refuse publication instead.
+/// Prepared canonical Cargo plans key the exact output and dependency paths;
+/// they retain the original transcript, including source-authored path strings.
+/// Artifact events must still match the declared outputs in both profiles.
+///
+/// The artifact adapter deliberately recognizes only rustc's flat, three-string
+/// event schema. A future schema or escaped path must gain an explicit adapter;
+/// neither a nested `artifact` field nor an arbitrary JSON string grants a path
+/// rewrite. The rest of the pure key crate needs no JSON dependency.
+///
+/// # Errors
+/// Ambiguous placement, undeclared artifact paths, unsupported artifact events,
+/// pre-existing canonical markers in ordinary host plans, an invalid prepared
+/// canonical layout, or non-UTF-8 compiler output.
+pub fn canonicalize_compiler_transcript(
+    raw: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<Vec<u8>, &'static str> {
+    if plan.canonical_cargo {
+        if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+            workspace_execution::workspace_layout(plan)
+        } else {
+            canonical_cargo::canonical_layout(plan)
+        }
+        .map_err(|_| "invalid prepared canonical Cargo layout")?;
+    }
+    if !plan.canonical_cargo && contains(raw, b"/__rabs") {
+        return Err("bytes already contain a canonical /__rabs path");
+    }
+    if !plain_path_in_profile(&plan.out_dir, plan.canonical_cargo) {
+        return Err("out-dir is not a plain path");
+    }
+    for root in &plan.dependency_dirs {
+        if !plan.canonical_cargo && root != &plan.out_dir && contains(raw, root.as_bytes()) {
+            return Err("observable dependency directory placement cannot be replayed");
+        }
+    }
+    let mut canonical = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        std::str::from_utf8(line).map_err(|_| "compiler transcript is not UTF-8")?;
+        let (artifact, mentions_output) = transcript_observations(line, plan)?;
+        if !artifact {
+            if mentions_output && !plan.canonical_cargo {
+                return Err("diagnostic contains ambiguous output directory placement");
+            }
+            canonical.extend_from_slice(line);
+            continue;
+        }
+        let (path, emit) =
+            artifact_event_fields(line).ok_or("unsupported compiler artifact notification")?;
+        let relative = line[path.clone()]
+            .strip_prefix(plan.out_dir.as_bytes())
+            .and_then(|path| path.strip_prefix(b"/"))
+            .ok_or("compiler artifact is outside the output directory")?;
+        if !plan.outputs.declarations.iter().any(|output| {
+            use crate::output_declarations::OutputClass;
+            output.virtual_path.as_bytes() == relative
+                && matches!(
+                    (output.class, emit),
+                    (OutputClass::ProvisionalMetadata, b"metadata")
+                        | (OutputClass::DepInfo, b"dep-info")
+                        | (OutputClass::File, b"link")
+                )
+        }) {
+            return Err("compiler artifact does not match a declared output");
+        }
+        if plan.canonical_cargo {
+            canonical.extend_from_slice(line);
+        } else {
+            canonical.extend_from_slice(&line[..path.start]);
+            canonical.extend_from_slice(CANONICAL_OUT_DIR.as_bytes());
+            canonical.push(b'/');
+            canonical.extend_from_slice(relative);
+            canonical.extend_from_slice(&line[path.end..]);
+        }
+    }
+    Ok(canonical)
+}
+
+/// Render a transcript accepted by [`canonicalize_compiler_transcript`]. Only
+/// an ordinary host plan's validated artifact-path fields can contain its
+/// reserved replay marker. Prepared canonical Cargo transcripts remain exact.
+#[must_use]
+pub fn render_compiler_transcript(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
+    if plan.canonical_cargo {
+        canonical.to_vec()
+    } else {
+        render_out_dir(canonical, &plan.out_dir)
+    }
+}
+
+/// Decode JSON strings for REFUSAL/classification only. Raw substring checks
+/// alone miss `\/` and `\u002f`; an escaped discriminator must not disguise an
+/// artifact as ordinary diagnostic text. The accepted transcript keeps its
+/// original bytes. Actual artifact admission still requires the strict grammar
+/// below, so this observer cannot authorize a new event shape or a path rewrite.
+fn transcript_observations(
+    line: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<(bool, bool), &'static str> {
+    let mut at = 0;
+    let mut containers = Vec::new();
+    let mut artifact = false;
+    let mut mentions_output = contains(line, plan.out_dir.as_bytes());
+    while at < line.len() {
+        match line[at] {
+            b'"' => {
+                let value = transcript_string(line, &mut at)
+                    .ok_or("invalid JSON string in compiler transcript")?;
+                if !plan.canonical_cargo && contains(&value, b"/__rabs") {
+                    return Err("bytes already contain a canonical /__rabs path");
+                }
+                if !plan.canonical_cargo
+                    && plan
+                        .dependency_dirs
+                        .iter()
+                        .any(|root| root != &plan.out_dir && contains(&value, root.as_bytes()))
+                {
+                    return Err("observable dependency directory placement cannot be replayed");
+                }
+                mentions_output |= contains(&value, plan.out_dir.as_bytes());
+                if containers.as_slice() == b"{" && value == b"$message_type" {
+                    let mut next = at;
+                    while line.get(next).is_some_and(u8::is_ascii_whitespace) {
+                        next += 1;
+                    }
+                    if line.get(next) == Some(&b':') {
+                        next += 1;
+                        while line.get(next).is_some_and(u8::is_ascii_whitespace) {
+                            next += 1;
+                        }
+                        let kind = transcript_string(line, &mut next)
+                            .ok_or("invalid compiler message discriminator")?;
+                        // Keep any artifact discriminator, including an earlier
+                        // duplicate that a permissive map parser might replace.
+                        artifact |= kind == b"artifact";
+                    }
+                }
+            }
+            opening @ (b'{' | b'[') => {
+                if containers.len() >= 128 {
+                    return Err("compiler transcript nesting exceeds its bound");
+                }
+                containers.push(opening);
+                at += 1;
+            }
+            closing @ (b'}' | b']') => {
+                let expected = if closing == b'}' { b'{' } else { b'[' };
+                if containers.pop() != Some(expected) {
+                    return Err("unbalanced compiler transcript containers");
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    if !containers.is_empty() {
+        return Err("unbalanced compiler transcript containers");
+    }
+    Ok((artifact, mentions_output))
+}
+
+fn transcript_string(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    fn hex_quad(bytes: &[u8], at: &mut usize) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..4 {
+            value = value * 16 + char::from(*bytes.get(*at)?).to_digit(16)?;
+            *at += 1;
+        }
+        Some(value)
+    }
+    if bytes.get(*at) != Some(&b'"') {
+        return None;
+    }
+    *at += 1;
+    let mut decoded = Vec::new();
+    loop {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        match byte {
+            b'"' => return Some(decoded),
+            0..=31 => return None,
+            b'\\' => {
+                let escape = *bytes.get(*at)?;
+                *at += 1;
+                match escape {
+                    b'"' | b'\\' | b'/' => decoded.push(escape),
+                    b'b' => decoded.push(8),
+                    b'f' => decoded.push(12),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'u' => {
+                        let mut value = hex_quad(bytes, at)?;
+                        if (0xd800..=0xdbff).contains(&value) {
+                            if bytes.get(*at..*at + 2)? != b"\\u" {
+                                return None;
+                            }
+                            *at += 2;
+                            let low = hex_quad(bytes, at)?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return None;
+                            }
+                            value = 0x10000 + ((value - 0xd800) << 10) + (low - 0xdc00);
+                        }
+                        let character = char::from_u32(value)?;
+                        decoded.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+                    }
+                    _ => return None,
+                }
+            }
+            _ => decoded.push(byte),
+        }
+    }
+}
+
+/// A bounded grammar for the known rustc artifact event. Return the original
+/// path's byte span rather than reserializing JSON and changing rustc's bytes.
+fn artifact_event_fields(line: &[u8]) -> Option<(std::ops::Range<usize>, &[u8])> {
+    fn whitespace(bytes: &[u8], at: &mut usize) {
+        while bytes
+            .get(*at)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            *at += 1;
+        }
+    }
+    fn string(bytes: &[u8], at: &mut usize) -> Option<std::ops::Range<usize>> {
+        whitespace(bytes, at);
+        if bytes.get(*at) != Some(&b'"') {
+            return None;
+        }
+        *at += 1;
+        let start = *at;
+        loop {
+            match *bytes.get(*at)? {
+                b'"' => {
+                    let end = *at;
+                    *at += 1;
+                    return Some(start..end);
+                }
+                b'\\' | 0..=31 => return None,
+                _ => *at += 1,
+            }
+        }
+    }
+    let mut at = 0;
+    whitespace(line, &mut at);
+    if line.get(at) != Some(&b'{') {
+        return None;
+    }
+    at += 1;
+    let mut path = None;
+    let mut emit = None;
+    let mut message_type = false;
+    for field in 0..3 {
+        let name = string(line, &mut at)?;
+        whitespace(line, &mut at);
+        if line.get(at) != Some(&b':') {
+            return None;
+        }
+        at += 1;
+        let value = string(line, &mut at)?;
+        match &line[name] {
+            b"artifact" if path.is_none() => path = Some(value),
+            b"emit" if emit.is_none() => emit = Some(&line[value]),
+            b"$message_type" if !message_type && &line[value] == b"artifact" => {
+                message_type = true;
+            }
+            _ => return None,
+        }
+        whitespace(line, &mut at);
+        if line.get(at) != Some(&if field == 2 { b'}' } else { b',' }) {
+            return None;
+        }
+        at += 1;
+    }
+    whitespace(line, &mut at);
+    (at == line.len() && message_type).then_some((path?, emit?))
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1538,6 +2390,7 @@ pub fn dep_info_closure_violation(
                     return Some(format!("tracked read of unkeyed variable {name}"));
                 }
                 if name == "LD_LIBRARY_PATH"
+                    && !plan.canonical_cargo
                     && plan.keyed_env.iter().any(|(name, value)| {
                         name == "LD_LIBRARY_PATH"
                             && value.split(':').any(|entry| entry == plan.out_dir)
@@ -1545,13 +2398,13 @@ pub fn dep_info_closure_violation(
                 {
                     return Some("tracked read of placement-normalized LD_LIBRARY_PATH".into());
                 }
-                // Placement replay currently rewrites complete dep-info and
-                // diagnostic streams. A semantic environment name/value that
-                // contains this output root must not become a placement token:
-                // replay in another out-dir would change the compiler's read.
-                // Match every substring, just as canonicalize_out_dir does.
-                // Execution already preserved the value; only publishing fails.
-                if read.contains(&plan.out_dir) {
+                // Preserve the ordinary host class's refusal of observed
+                // output placement in environment names/values. The narrower
+                // transcript and dep-info adapters do not prove such a read
+                // cannot also affect native output. Execution preserved the
+                // value; only publication is refused. Prepared canonical
+                // Cargo plans preserve and key the exact paths and values.
+                if !plan.canonical_cargo && read.contains(&plan.out_dir) {
                     return Some(format!(
                         "tracked read of {name} contains compiler output placement"
                     ));
@@ -1632,15 +2485,26 @@ fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> O
         }
         return Some(plan.input_virtual_path(relative));
     }
-    let root = plan.generated_root.as_ref()?;
-    let normalized = normalized_within(absolute, root)?;
-    Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]))
+    if let Some(root) = &plan.generated_root
+        && let Some(normalized) = normalized_within(absolute, root)
+    {
+        return Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]));
+    }
+    plan.native_roots
+        .iter()
+        .enumerate()
+        .find_map(|(index, root)| {
+            let normalized = normalized_within(absolute, root)?;
+            Some(plan.native_input_virtual_path(index, &normalized[root.len() + 1..]))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput};
+    use rabs_protocol::input_evidence::{
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput,
+    };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
 
@@ -1831,6 +2695,15 @@ mod tests {
         ActionInputManifest {
             schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
             inputs: vec![input("Cargo.toml", 10), input("src/lib.rs", lib_tag)],
+            directory_enumerations: plan
+                .generated_root
+                .as_ref()
+                .map(|_| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
             ..ActionInputManifest::default()
         }
     }
@@ -2455,7 +3328,7 @@ mod tests {
             assert!(executed.stdout.is_empty());
             assert_eq!(
                 canonicalize_out_dir(&stock.stderr, stock_dir.to_str().unwrap()).unwrap(),
-                canonicalize_placements(&executed.stderr, &plan).unwrap()
+                canonicalize_compiler_transcript(&executed.stderr, &plan).unwrap()
             );
             for name in plan.output_names() {
                 let stock_bytes = std::fs::read(stock_dir.join(&name)).unwrap();
@@ -2514,6 +3387,7 @@ mod tests {
             executable: false,
             symlink_resolution: Vec::new(),
         });
+        manifest.directory_enumerations[0].entries = vec![RawBytes::from("value.rs")];
         let keyed = |plan: &DependencyActionPlan, manifest: &ActionInputManifest| {
             live_dependency_key(plan, &toolchain(), &externs(plan, 20), manifest)
                 .unwrap()
@@ -2568,6 +3442,164 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn generated_listing(
+        plan: &DependencyActionPlan,
+        relative: &str,
+        entries: &[&str],
+    ) -> DirectoryEnumeration {
+        DirectoryEnumeration {
+            virtual_path: RawBytes::new(
+                if relative.is_empty() {
+                    plan.generated_virtual_root()
+                } else {
+                    plan.generated_input_virtual_path(relative)
+                }
+                .into_bytes(),
+            ),
+            entries: entries.iter().map(|entry| RawBytes::from(*entry)).collect(),
+        }
+    }
+
+    #[test]
+    fn generated_empty_directory_topology_changes_action_identity() {
+        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", "/work/generated")]).unwrap();
+        let empty = inputs(&plan, 11);
+        assert!(
+            generated_input_directories(&plan, &empty)
+                .unwrap()
+                .is_empty()
+        );
+        let keyed = |manifest: &ActionInputManifest| {
+            live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), manifest)
+                .unwrap()
+                .action_key
+        };
+        let empty_key = keyed(&empty);
+        let mut directories = empty.clone();
+        directories.directory_enumerations = vec![
+            generated_listing(&plan, "", &["empty"]),
+            generated_listing(&plan, "empty", &[]),
+        ];
+        assert_eq!(
+            generated_input_directories(&plan, &directories).unwrap(),
+            ["empty"]
+        );
+        let directory_key = keyed(&directories);
+        assert_ne!(empty_key, directory_key);
+
+        let mut renamed = empty.clone();
+        renamed.directory_enumerations = vec![
+            generated_listing(&plan, "", &["renamed"]),
+            generated_listing(&plan, "renamed", &[]),
+        ];
+        assert_ne!(directory_key, keyed(&renamed));
+
+        let mut nested = directories.clone();
+        nested.directory_enumerations[1] = generated_listing(&plan, "empty", &["child"]);
+        nested
+            .directory_enumerations
+            .push(generated_listing(&plan, "empty/child", &[]));
+        assert_eq!(
+            generated_input_directories(&plan, &nested).unwrap(),
+            ["empty", "empty/child"]
+        );
+        assert_ne!(directory_key, keyed(&nested));
+        assert_ne!(empty_key, keyed(&nested));
+        nested.directory_enumerations.reverse();
+        let mut ordered = nested.clone();
+        ordered.directory_enumerations.reverse();
+        assert_eq!(keyed(&nested), keyed(&ordered));
+        assert_eq!(empty.inputs, directories.inputs);
+        assert_eq!(empty.inputs, nested.inputs);
+    }
+
+    #[test]
+    fn generated_directory_evidence_must_match_every_file_and_directory() {
+        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", "/work/generated")]).unwrap();
+        let mut good = inputs(&plan, 11);
+        good.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(
+                plan.generated_input_virtual_path("nested/value.rs")
+                    .into_bytes(),
+            ),
+            object: ObjectId(digest(42)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        good.directory_enumerations = vec![
+            generated_listing(&plan, "", &["empty", "nested"]),
+            generated_listing(&plan, "empty", &["child"]),
+            generated_listing(&plan, "empty/child", &[]),
+            generated_listing(&plan, "nested", &["value.rs"]),
+        ];
+        assert_eq!(
+            generated_input_directories(&plan, &good).unwrap(),
+            ["empty", "empty/child", "nested"]
+        );
+        assert!(live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &good).is_ok());
+        for fault in 0..15 {
+            let mut invalid = good.clone();
+            match fault {
+                0 => invalid.directory_enumerations.clear(),
+                1 => {
+                    invalid.directory_enumerations.remove(0);
+                }
+                2 => {
+                    invalid.directory_enumerations.remove(1);
+                }
+                3 => {
+                    invalid.directory_enumerations.remove(3);
+                }
+                4 => invalid
+                    .directory_enumerations
+                    .push(good.directory_enumerations[0].clone()),
+                5 => invalid.directory_enumerations[1].virtual_path = RawBytes::from("/outside"),
+                6 => invalid.directory_enumerations[0]
+                    .entries
+                    .push(RawBytes::from("unobserved")),
+                7 => {
+                    invalid.directory_enumerations[0].entries = vec![
+                        RawBytes::from("empty"),
+                        RawBytes::from("empty"),
+                        RawBytes::from("nested"),
+                    ]
+                }
+                8 => invalid.directory_enumerations[0].entries.reverse(),
+                9 => invalid.directory_enumerations[0].entries[0] = RawBytes::from("../escape"),
+                10 => invalid.directory_enumerations[3].entries.clear(),
+                11 => {
+                    invalid.inputs.last_mut().unwrap().virtual_path =
+                        RawBytes::new(plan.generated_input_virtual_path("nested").into_bytes())
+                }
+                12 => {
+                    invalid.inputs.last_mut().unwrap().virtual_path = RawBytes::new(
+                        plan.generated_input_virtual_path("nested/../value.rs")
+                            .into_bytes(),
+                    )
+                }
+                13 => invalid.inputs.last_mut().unwrap().file_type = InputFileType::Symlink,
+                14 => {
+                    invalid.directory_enumerations[2].virtual_path = RawBytes::new(
+                        plan.generated_input_virtual_path("empty/./child")
+                            .into_bytes(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                generated_input_directories(&plan, &invalid).is_err(),
+                "fault {fault}"
+            );
+            assert!(
+                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &invalid).is_err(),
+                "fault {fault}"
+            );
+        }
+        let no_generated = plan_for(OUT_A, &[], &[]).unwrap();
+        assert!(generated_input_directories(&no_generated, &good).is_err());
     }
 
     #[test]
@@ -2811,6 +3843,278 @@ mod tests {
     }
 
     #[test]
+    fn compiler_transcript_rewrites_only_declared_artifact_fields_byte_for_byte() {
+        let a = plan_for(OUT_A, &[], &[]).unwrap();
+        let b = plan_for(OUT_B, &[], &[]).unwrap();
+        let diagnostic = [
+            br#"{ "$message_type" : "diagnostic", "message":"retain \"quotes\" and \u2603", "spans":[] }"#.as_slice(),
+            b"\r\n",
+        ].concat();
+        for output in &a.outputs.declarations {
+            let emit = match output.class {
+                crate::output_declarations::OutputClass::ProvisionalMetadata => "metadata",
+                crate::output_declarations::OutputClass::DepInfo => "dep-info",
+                crate::output_declarations::OutputClass::File => "link",
+                _ => panic!("unexpected fixture output"),
+            };
+            // Nonstandard whitespace and ordering must survive without JSON
+            // reserialization; ordinary diagnostics remain an exact prefix.
+            let event = format!(
+                "  {{ \"emit\" : \"{emit}\", \"artifact\" : \"{OUT_A}/{}\", \"$message_type\" : \"artifact\" }}\r\n",
+                output.virtual_path
+            );
+            let raw = [diagnostic.as_slice(), event.as_bytes()].concat();
+            let canonical = canonicalize_compiler_transcript(&raw, &a).unwrap();
+            assert!(canonical.starts_with(&diagnostic));
+            assert_eq!(render_compiler_transcript(&canonical, &a), raw);
+            let expected = [
+                diagnostic.as_slice(),
+                event.replace(OUT_A, OUT_B).as_bytes(),
+            ]
+            .concat();
+            assert_eq!(render_compiler_transcript(&canonical, &b), expected);
+            let decoded: serde_json::Value =
+                serde_json::from_slice(&canonical[diagnostic.len()..]).unwrap();
+            assert_eq!(
+                decoded["artifact"],
+                format!("{CANONICAL_OUT_DIR}/{}", output.virtual_path)
+            );
+        }
+        assert!(
+            canonicalize_compiler_transcript(&[], &a)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compiler_transcript_refuses_source_authored_placement_and_ambiguous_events() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let path = format!("{OUT_A}/libitoa-c2b2f4e1a6d0b3c9.rmeta");
+        for raw in [
+            format!(
+                "{{\"$message_type\":\"diagnostic\",\"message\":\"deprecated note: {OUT_A}\"}}\n"
+            ),
+            format!("{{\"message\":\"literal {OUT_A}-backup\"}}\n"),
+            format!("{{\"message\":\"nested\",\"span\":{{\"artifact\":\"{path}\"}}}}\n"),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"link\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}-backup/file.rmeta\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{OUT_A}/undeclared.rmeta\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"metadata\",\"note\":\"extra field\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"artifact\":\"{path}\",\"emit\":\"metadata\"}}\n"
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{}\",\"emit\":\"metadata\"}}\n",
+                path.replace('/', "\\/")
+            ),
+            format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{path}\",\"emit\":\"metadata\"}} trailing"
+            ),
+            format!(
+                r#"{{"message":"escaped literal {}"}}"#,
+                OUT_A.replace('/', r"\/")
+            ),
+            format!(
+                r#"{{"message":"Unicode literal {}"}}"#,
+                OUT_A.replace('/', r"\u002f")
+            ),
+            format!(
+                r#"{{"\u0024message_type":"ar\u0074ifact","artifact":"{}","emit":"metadata"}}"#,
+                path.replace('/', r"\u002f")
+            ),
+            r#"{"$message_type":"ar\u0074ifact","artifact":"/unrelated/result.rmeta","emit":"metadata"}"#.into(),
+            format!(
+                r#"{{"$message_type":"artifact","$message_type":"diagnostic","artifact":"{}","emit":"metadata"}}"#,
+                path.replace('/', r"\u002f")
+            ),
+            r#"{"message":"literal \u002f__rabs\u002fout"}"#.into(),
+            r#"{"message":"invalid \q escape"}"#.into(),
+            r#"{"message":"invalid \ud800 surrogate"}"#.into(),
+            "{\"message\":\"literal /__rabs/out\"}\n".into(),
+        ] {
+            assert!(
+                canonicalize_compiler_transcript(raw.as_bytes(), &plan).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_string_observer_matches_json_decoding_without_changing_bytes() {
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        for encoded in [
+            r#""plain""#,
+            r#""quoted \"content\" and \\slashes\\""#,
+            r#""line\ncarriage\rtab\tbackspace\bformfeed\f""#,
+            r#""\u0061\u0062\u0063 \u2603 \ud83d\ude80""#,
+            r#""literal \\u002f and \\/""#,
+            "\"literal snowman ☃\"",
+        ] {
+            let mut at = 0;
+            let decoded = transcript_string(encoded.as_bytes(), &mut at).unwrap();
+            assert_eq!(at, encoded.len());
+            let expected: String = serde_json::from_str(encoded).unwrap();
+            assert_eq!(decoded, expected.as_bytes());
+            let line = format!("{{\"$message_type\":\"diagnostic\",\"message\":{encoded}}}\n");
+            assert_eq!(
+                canonicalize_compiler_transcript(line.as_bytes(), &plan).unwrap(),
+                line.as_bytes(),
+                "valid diagnostic escaping must remain byte-identical"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_rustc_diagnostic_literals_survive_replay_to_another_output_directory() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let sysroot = Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        assert!(
+            sysroot.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sysroot.stderr)
+        );
+        let compiler =
+            Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim()).join("bin/rustc");
+        let version = Command::new(&compiler).arg("-vV").output().unwrap();
+        assert!(
+            version.status.success(),
+            "{}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        let version = std::str::from_utf8(&version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let cargo_home = temporary.path().join("cargo-home");
+        let package =
+            cargo_home.join("registry/src/index.example-0123456789abcdef/diagnostic_fixture-1.0.0");
+        let first_out = temporary.path().join("first-out");
+        let second_out = temporary.path().join("second-out");
+        for directory in [&package, &first_out, &second_out] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let source = package.join("lib.rs");
+        std::fs::write(
+            &source,
+            format!(
+                "#[deprecated(note = {:?})]\npub fn old() {{}}\npub fn invoke() {{ old(); }}\n",
+                first_out.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let environment = vec![
+            ("CARGO_HOME".into(), cargo_home.display().to_string()),
+            ("CARGO_MANIFEST_DIR".into(), package.display().to_string()),
+            ("CARGO_PKG_NAME".into(), "diagnostic_fixture".into()),
+            ("CARGO_PKG_VERSION".into(), "1.0.0".into()),
+        ];
+        let compile = |out: &Path| {
+            let argv = vec![
+                compiler.display().to_string(),
+                "--crate-name=diagnostic_fixture".into(),
+                "--edition=2021".into(),
+                source.display().to_string(),
+                "--error-format=json".into(),
+                "--json=artifacts,diagnostic-rendered-ansi".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--cap-lints=allow".into(),
+                "--force-warn=deprecated".into(),
+                "--out-dir".into(),
+                out.display().to_string(),
+            ];
+            let plan = plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: package.to_str().unwrap(),
+                    env: &environment,
+                },
+                host,
+            )
+            .unwrap();
+            let output = Command::new(&compiler)
+                .args(&argv[1..])
+                .current_dir(&package)
+                .env_clear()
+                .envs(plan.execution_env.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty());
+            let diagnostics = std::str::from_utf8(&output.stderr).unwrap();
+            assert!(
+                diagnostics.lines().any(|line| {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    value["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(first_out.to_str().unwrap()))
+                }),
+                "real compiler must emit the source-authored path in its warning"
+            );
+            (plan, output.stderr)
+        };
+        let (first_plan, first_transcript) = compile(&first_out);
+        let (second_plan, second_transcript) = compile(&second_out);
+        // A first-output-root occurrence in diagnostic prose is ambiguous,
+        // even though artifact notifications themselves are safely rewritable.
+        assert!(canonicalize_compiler_transcript(&first_transcript, &first_plan).is_err());
+        // Capturing the same source in another output directory must retain
+        // that literal, then reproduce stock rustc's EXACT bytes at both roots.
+        let canonical = canonicalize_compiler_transcript(&second_transcript, &second_plan).unwrap();
+        assert_eq!(
+            render_compiler_transcript(&canonical, &second_plan),
+            second_transcript
+        );
+        assert_eq!(
+            render_compiler_transcript(&canonical, &first_plan),
+            first_transcript
+        );
+    }
+
+    #[test]
+    fn dep_info_does_not_relocate_source_paths_with_output_prefixes_or_substrings() {
+        let a = plan_for(OUT_A, &[], &[]).unwrap();
+        let b = plan_for(OUT_B, &[], &[]).unwrap();
+        let source_prefix = format!("{OUT_A}-source/src/lib.rs");
+        let source_substring = format!("/unrelated{OUT_A}/src/lib.rs");
+        let raw = format!(
+            "{OUT_A}/libitoa.rmeta: {source_prefix} {source_substring}\n\n{source_prefix}:\n{source_substring}:\n"
+        );
+        let canonical = canonicalize_placements(raw.as_bytes(), &a).unwrap();
+        assert_eq!(render_placements(&canonical, &a), raw.as_bytes());
+        assert_eq!(
+            render_placements(&canonical, &b),
+            raw.replacen(
+                &format!("{OUT_A}/libitoa.rmeta"),
+                &format!("{OUT_B}/libitoa.rmeta"),
+                1
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
     fn sibling_dependency_candidates_are_complete_ordered_and_content_bound() {
         let sibling_plan = |base: &str| {
             let mut args = argv(&format!("{base}/middle/out"), &[]);
@@ -2953,8 +4257,8 @@ mod tests {
             };
             let current =
                 live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &manifest).unwrap();
-            assert_eq!(current.descriptor.key_epoch, 4);
-            for previous_epoch in [1, 2, 3] {
+            assert_eq!(current.descriptor.key_epoch, 6);
+            for previous_epoch in [1, 2, 3, 4, 5] {
                 let mut previous = current.descriptor.clone();
                 previous.key_epoch = previous_epoch;
                 assert_ne!(current.action_key, compute_action_key(&previous).final_key);

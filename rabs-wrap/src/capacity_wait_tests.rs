@@ -52,8 +52,13 @@ fn exchange(replies: &[String], settings: WaitPolicy) -> (Result<Live, ()>, Vec<
         requests
     });
     let outcome = read_with_policy(
-        reader(stream), "unchanged request", Duration::from_secs(1),
-        true, settings, None, &|| true,
+        reader(stream),
+        "unchanged request",
+        Duration::from_secs(1),
+        true,
+        settings,
+        None,
+        &|| true,
     );
     (outcome, daemon.join().unwrap())
 }
@@ -61,7 +66,13 @@ fn exchange(replies: &[String], settings: WaitPolicy) -> (Result<Live, ()>, Vec<
 #[test]
 fn capacity_waits_cross_readiness_and_keyed_flights_without_starting_work() {
     let (result, requests) = exchange(
-        &[CAPACITY.into(), PREPARING.into(), WAIT.into(), CAPACITY.into(), EXECUTE.into()],
+        &[
+            CAPACITY.into(),
+            PREPARING.into(),
+            WAIT.into(),
+            CAPACITY.into(),
+            EXECUTE.into(),
+        ],
         policy(8),
     );
     assert!(matches!(result, Ok(Live::Execute { attempt, env, .. })
@@ -87,7 +98,13 @@ fn capacity_never_erases_a_key_or_authorizes_a_different_action() {
 #[test]
 fn all_wait_reasons_spend_one_retry_quota() {
     let (result, requests) = exchange(
-        &[CAPACITY.into(), PREPARING.into(), WAIT.into(), CAPACITY.into()], policy(3),
+        &[
+            CAPACITY.into(),
+            PREPARING.into(),
+            WAIT.into(),
+            CAPACITY.into(),
+        ],
+        policy(3),
     );
     assert!(matches!(result, Ok(Live::PassThrough)));
     assert_eq!(requests, vec!["unchanged request\n"; 3]);
@@ -116,8 +133,13 @@ fn disabled_waiting_keeps_legacy_passthrough_and_emits_no_request() {
             settings.preparation_budget = Duration::ZERO;
         }
         let result = read_with_policy(
-            reader(stream), "must not retry", Duration::from_secs(1),
-            may_wait, settings, None, &|| true,
+            reader(stream),
+            "must not retry",
+            Duration::from_secs(1),
+            may_wait,
+            settings,
+            None,
+            &|| true,
         );
         assert!(matches!(result, Ok(Live::PassThrough)));
         assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
@@ -126,20 +148,41 @@ fn disabled_waiting_keeps_legacy_passthrough_and_emits_no_request() {
 
 #[test]
 fn capacity_hints_require_unambiguous_version_and_nonownership() {
-    assert_eq!(wait_for(&reply_json::parse(CAPACITY).unwrap()), Some(WaitFor::Capacity));
+    assert_eq!(
+        wait_for(&reply_json::parse(CAPACITY).unwrap()),
+        Some(WaitFor::Capacity)
+    );
     for frame in [
         CAPACITY.replace("decision-capacity-v1", "decision-capacity-v2"),
         CAPACITY.replace("edge-capacity", "store-busy"),
-        CAPACITY.replace("\"compiler_skip_authorized\":false", "\"compiler_skip_authorized\":true"),
-        CAPACITY.replace("\"materialization_started\":false", "\"materialization_started\":true"),
-        CAPACITY.replace("\"materialization_started\":false", "\"materialization_started\":null"),
-        CAPACITY.replace("\"materialization_started\":false", "\"materialization_started\":false,\"materialization_started\":false"),
-        CAPACITY.replace("\"retry\":", "\"retry\":\"decision-capacity-v1\",\"retry\":"),
+        CAPACITY.replace(
+            "\"compiler_skip_authorized\":false",
+            "\"compiler_skip_authorized\":true",
+        ),
+        CAPACITY.replace(
+            "\"materialization_started\":false",
+            "\"materialization_started\":true",
+        ),
+        CAPACITY.replace(
+            "\"materialization_started\":false",
+            "\"materialization_started\":null",
+        ),
+        CAPACITY.replace(
+            "\"materialization_started\":false",
+            "\"materialization_started\":false,\"materialization_started\":false",
+        ),
+        CAPACITY.replace(
+            "\"retry\":",
+            "\"retry\":\"decision-capacity-v1\",\"retry\":",
+        ),
         CAPACITY.replace("\"retry\":", "\"action_key\":null,\"retry\":"),
         CAPACITY.replace("\"retry\":", "\"attempt\":null,\"attempt\":null,\"retry\":"),
         CAPACITY.replace("\"retry\":", "\"env\":[],\"retry\":"),
     ] {
-        assert!(wait_for(&reply_json::parse(&frame).unwrap()).is_none(), "{frame}");
+        assert!(
+            wait_for(&reply_json::parse(&frame).unwrap()).is_none(),
+            "{frame}"
+        );
         let (result, requests) = exchange(&[frame, EXECUTE.into()], policy(8));
         assert!(result.is_err());
         assert!(requests.is_empty());
@@ -170,8 +213,13 @@ fn capacity_does_not_renew_the_absolute_wait_deadline() {
     settings.budget = Duration::from_millis(150);
     settings.preparation_budget = Duration::from_secs(30);
     let result = read_with_policy(
-        reader(stream), "unchanged request", Duration::from_secs(30),
-        true, settings, None, &|| true,
+        reader(stream),
+        "unchanged request",
+        Duration::from_secs(30),
+        true,
+        settings,
+        None,
+        &|| true,
     );
     assert!(result.is_err());
     daemon.join().unwrap();
@@ -189,7 +237,10 @@ fn caller_loss_during_capacity_backoff_is_not_local_fallback_permission() {
         revoked.store(false, Ordering::Release);
         let mut bytes = Vec::new();
         let result = peer.read_to_end(&mut bytes);
-        assert!(result.is_ok() || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset));
+        assert!(
+            result.is_ok()
+                || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
         assert!(bytes.is_empty());
     });
     let mut settings = policy(8);
@@ -197,8 +248,13 @@ fn caller_loss_during_capacity_backoff_is_not_local_fallback_permission() {
     settings.initial_delay = Duration::from_secs(10);
     settings.preparation_maximum_delay = Duration::from_secs(10);
     let result = read_with_policy(
-        reader(stream), "must not retry", Duration::from_secs(30),
-        true, settings, None, &|| owned.load(Ordering::Acquire),
+        reader(stream),
+        "must not retry",
+        Duration::from_secs(30),
+        true,
+        settings,
+        None,
+        &|| owned.load(Ordering::Acquire),
     );
     assert!(result.is_err());
     daemon.join().unwrap();
@@ -223,8 +279,13 @@ fn capacity_after_hit_acceptance_is_uncertain_delivery_not_retry_or_fallback() {
         assert_eq!(peer.read_line(&mut line).unwrap(), 0);
     });
     let result = read_with_policy(
-        reader(stream), "unchanged request", Duration::from_secs(1),
-        true, policy(8), None, &|| true,
+        reader(stream),
+        "unchanged request",
+        Duration::from_secs(1),
+        true,
+        policy(8),
+        None,
+        &|| true,
     );
     assert!(matches!(result, Ok(Live::FailClosed(_))));
     daemon.join().unwrap();

@@ -38,24 +38,520 @@ use crate::transfer::WorkerPlatform;
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
-const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/tmp/rch-source-authority-locks";
+const SOURCE_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
+const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
 const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
+// Observe cancellation without publishing retirement or changing ownership.
+// The heartbeat supervisor remains responsible for transport liveness; this
+// waiter only relinquishes kernel locks for this exact cancelled invocation.
+const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"
+import fcntl
+import hashlib
+import os
+import re
+import select
+import stat
+import sys
+
+LIMIT = 32 * 1024 * 1024
+
+def canonical_root(root):
+    return (root.startswith(b"/") and not any(c in root for c in (0, 10, 13))
+            and (root == b"/" or not root.endswith(b"/"))
+            and all(part not in (b"", b".", b"..") for part in root.split(b"/")[1:]
+                    if root != b"/"))
+
+def record(directory, name, digest):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT:
+            raise ValueError("invalid cancellation record")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            content = source.read(LIMIT + 1)
+        after = os.fstat(fd)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (not os.path.samestat(before, after) or not os.path.samestat(after, named)
+                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or len(content) != before.st_size or not content.endswith(b"\n")
+                or hashlib.sha256(content).hexdigest() != digest):
+            raise ValueError("changed cancellation record")
+        roots = content[:-1].split(b"\n")
+        if not all(canonical_root(root) for root in roots):
+            raise ValueError("invalid cancellation roots")
+        content.decode("utf-8")
+        return content, roots
+    finally:
+        os.close(fd)
+
+def cancelled(registry, token, mode, selector):
+    descriptors = []
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory = os.open(registry, directory_flags)
+        descriptors.append(directory)
+        mutex = os.open("metadata.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=directory)
+        descriptors.append(mutex)
+        # Never wait under the source locks for an activity mutex. A coherent
+        # metadata snapshot needs only this nonblocking shared registry lock;
+        # cancellation publishes its fence after draining normal activity.
+        fcntl.flock(mutex, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        mutex_stat = os.fstat(mutex)
+        if (not stat.S_ISREG(mutex_stat.st_mode)
+                or not os.path.samestat(mutex_stat, os.stat(
+                    "metadata.lock", dir_fd=directory, follow_symlinks=False))):
+            return False
+        places = {"": directory}
+        fd = os.open("cancelled", directory_flags, dir_fd=directory)
+        descriptors.append(fd)
+        places["cancelled"] = fd
+        listings = {}
+        if mode == "source":
+            # Healthy source holders need only two name lookups, regardless
+            # of how many other jobs have retained terminal receipts.
+            found = False
+            for place, extension in (("", "cancelling"), ("cancelled", "claim")):
+                try:
+                    os.stat(token + "." + selector + "." + extension,
+                            dir_fd=places[place], follow_symlinks=False)
+                    found = True
+                except FileNotFoundError:
+                    pass
+            if not found:
+                return False
+        else:
+            # A pair can precede source admission and therefore does not yet
+            # know the digest. Discover only its cancellation candidate first.
+            listings = {place: os.listdir(fd) for place, fd in places.items()}
+            if not any(name.startswith(token + ".") and name.endswith(extension)
+                       for place, extension in (("", ".cancelling"), ("cancelled", ".claim"))
+                       for name in listings[place]):
+                return False
+        for place in ("released", "quarantine"):
+            fd = os.open(place, directory_flags, dir_fd=directory)
+            descriptors.append(fd)
+            places[place] = fd
+        records = {}
+        digests = set()
+        for place, fd in places.items():
+            for name in listings[place] if place in listings else os.listdir(fd):
+                if not name.startswith(token + ".") or not name.endswith(
+                        (".claim", ".pending", ".cancelling")):
+                    continue
+                match = re.fullmatch(re.escape(token) + r"\.([a-f0-9]{64})\.(claim|pending|cancelling)", name)
+                if match is None or (place, match[2]) in records:
+                    return False
+                digests.add(match[1])
+                records[place, match[2]] = (fd, name)
+        if len(digests) != 1:
+            return False
+        digest = next(iter(digests))
+        if mode == "source" and digest != selector:
+            return False
+        # Active ownership stays as the overlap fence through cleanup. An
+        # already terminal cancellation may retain its matching cancelling
+        # marker. Pending, released, quarantined or conflicting state is not
+        # permission to hand off even these transient locks.
+        keys = set(records)
+        if keys not in ({("", "claim"), ("", "cancelling")},
+                        {("cancelled", "claim")},
+                        {("cancelled", "claim"), ("", "cancelling")}):
+            return False
+        expected = None
+        for fd, name in records.values():
+            content, roots = record(fd, name, digest)
+            if expected is not None and content != expected:
+                return False
+            if mode == "pair" and os.fsencode(selector) not in roots:
+                return False
+            expected = content
+        return (os.path.samestat(os.fstat(directory), os.stat(registry, follow_symlinks=False))
+                and os.path.samestat(mutex_stat, os.stat(
+                    "metadata.lock", dir_fd=directory, follow_symlinks=False)))
+    except (OSError, ValueError):
+        # Ambiguity grants no handoff. Keep waiting for explicit retirement or
+        # a later valid fence; do not repair, delete or acknowledge any record.
+        return False
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+try:
+    mode, registry, token, selector, release = sys.argv[1:]
+    if (mode not in ("source", "pair", "cleanup-pair")
+            or re.fullmatch(r"[a-f0-9-]{1,128}", token) is None):
+        raise ValueError("invalid source release identity or mode")
+    if mode == "source":
+        if re.fullmatch(r"[a-f0-9]{64}", selector) is None:
+            raise ValueError("invalid source release digest")
+        prefix = "RCH_SOURCE_AUTHORITY_RELEASE:"
+    else:
+        if not canonical_root(os.fsencode(selector)):
+            raise ValueError("invalid source pair root")
+        prefix = "RCH_SOURCE_PAIR_RELEASE:"
+    if release != prefix + token:
+        raise ValueError("invalid source release request")
+    expected = (release + "\n").encode("ascii")
+    incoming = bytearray()
+    requester = select.poll()
+    requester.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        if mode != "cleanup-pair" and cancelled(registry, token, mode, selector):
+            print("RCH: source invocation cancelled; yielding kernel locks without retiring ownership",
+                  file=sys.stderr)
+            sys.exit(75)
+        if requester.poll(250):
+            chunk = os.read(0, 4096)
+            if not chunk:
+                raise ValueError("source release requester disconnected before retirement")
+            incoming.extend(chunk)
+            if not expected.startswith(incoming):
+                raise ValueError("unexpected source release input")
+            if incoming == expected:
+                sys.exit(0)
+except (OSError, ValueError) as error:
+    print("RCH: source release wait failed: {}".format(error), file=sys.stderr)
+    sys.exit(73)
+"#;
+// Every caller holds the pair flock; claim additionally holds the registry
+// metadata mutex after checking its cancellation fences. Private same-directory
+// writes prevent a failed write or killed initializer from truncating the last
+// complete owner. A receipt is immutable and always durable before owner release.
+// This helper never removes or repairs ambiguous records, nor grants source access.
+const SOURCE_PAIR_CUSTODY: &str = r#"
+import os
+import re
+import stat
+import sys
+
+stage = "validation"
+descriptors = []
+
+def refuse(reason):
+    raise ValueError(reason)
+
+def safe(info, directory=False):
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not kind(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022 or (not directory and info.st_nlink != 1)):
+        refuse("unsafe source pair record ownership, type or links")
+
+def stamp(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def verify_parent():
+    current = os.fstat(directory)
+    safe(current, directory=True)
+    named = os.stat(parent, follow_symlinks=False)
+    if not os.path.samestat(current, named):
+        refuse("source pair parent changed during publication")
+
+def verify(record):
+    name, fd, content, before = record
+    current = os.fstat(fd)
+    safe(current)
+    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if (stamp(current) != stamp(before) or stamp(named) != stamp(before)
+            or os.read(fd, 130) != content or stamp(os.fstat(fd)) != stamp(before)):
+        refuse("source pair record identity or exact bytes changed")
+    verify_parent()
+
+def read_record(name, receipt=False):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    descriptors.append(fd)
+    before = os.fstat(fd)
+    safe(before)
+    content = os.read(fd, 130)
+    if not (1 < len(content) <= 129 and content.endswith(b"\n")
+            and (re.fullmatch(rb"[a-f0-9-]{1,128}\n", content)
+                 or (not receipt and content == b"released\n"))):
+        refuse("source pair has an unfinished owner or malformed release receipt")
+    record = name, fd, content, before
+    verify(record)
+    if receipt and content != token_bytes:
+        refuse("source pair release receipt belongs to another identity")
+    return record
+
+def confirm(record):
+    global stage
+    stage = "confirmation"
+    verify(record)
+    os.fsync(record[1])
+    os.fsync(directory)
+    verify(record)
+
+def publish(name, content, previous):
+    global stage
+    stage = "publication"
+    verify_parent()
+    temporary = ".pair-write." + os.urandom(16).hex()
+    fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=directory)
+    descriptors.append(fd)
+    offset = 0
+    while offset < len(content):
+        written = os.write(fd, content[offset:])
+        if written <= 0:
+            refuse("incomplete private source pair publication")
+        offset += written
+    os.fsync(fd)
+    before = os.fstat(fd)
+    private = temporary, fd, content, before
+    verify(private)
+    if previous is None:
+        try:
+            os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            refuse("source pair publication destination appeared")
+    else:
+        verify(previous)
+    # All legitimate publishers retain the same pair flock. Check the exact
+    # expected destination immediately before this indivisible replacement;
+    # immutable receipts only take the absent-destination arm above. A failed
+    # barrier keeps the new complete name and any private failure evidence.
+    os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+    result = name, fd, content, os.fstat(fd)
+    confirm(result)
+    return result
+
+def receipt_or_publish():
+    if receipt_record is not None:
+        confirm(receipt_record)
+        return receipt_record
+    return publish(receipt_name, token_bytes, None)
+
+def require_root_absent():
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return
+    refuse("source pair has unretired source; refusing release or reuse")
+
+try:
+    operation, owner, receipt, token, root = sys.argv[1:]
+    if operation not in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
+        refuse("invalid source pair custody operation")
+    if re.fullmatch(r"[a-f0-9-]{1,128}", token) is None:
+        refuse("invalid source pair custody identity")
+    token_bytes = (token + "\n").encode("ascii")
+    parent, owner_name = os.path.split(owner)
+    receipt_parent, receipt_name = os.path.split(receipt)
+    if (not os.path.isabs(parent) or parent != receipt_parent or not owner_name
+            or not receipt_name or owner_name == receipt_name or not os.path.isabs(root)):
+        refuse("invalid source pair custody paths")
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    descriptors.append(directory)
+    verify_parent()
+    receipt_record = read_record(receipt_name, receipt=True)
+    if operation == "released" and receipt_record is None:
+        print("pending", end="", flush=True)
+    else:
+        owner_record = read_record(owner_name)
+        owner_bytes = owner_record[2] if owner_record is not None else None
+        if receipt_record is not None and owner_record is None:
+            refuse("source pair release receipt has no owner record")
+        if operation == "claim":
+            if receipt_record is not None:
+                refuse("source pair identity already released")
+            if owner_bytes not in (None, b"released\n"):
+                refuse("source pair has an unfinished owner; refusing reuse")
+            require_root_absent()
+            publish(owner_name, token_bytes, owner_record)
+        elif operation == "recover":
+            if owner_bytes != token_bytes or receipt_record is not None:
+                refuse("source pair has an unfinished owner or a completed release")
+            confirm(owner_record)
+        elif operation == "release":
+            if owner_bytes == b"released\n" and receipt_record is not None:
+                confirm(receipt_record)
+                confirm(owner_record)
+            else:
+                if owner_bytes != token_bytes:
+                    refuse("source pair owner changed before release")
+                require_root_absent()
+                receipt_or_publish()
+                publish(owner_name, b"released\n", owner_record)
+        elif operation == "released":
+            # A historical receipt never authorizes touching a successor's
+            # source tree or changing its complete owner. Missing/malformed
+            # owner evidence is not silently repaired from an old receipt.
+            confirm(receipt_record)
+            if owner_bytes == token_bytes:
+                require_root_absent()
+                publish(owner_name, b"released\n", owner_record)
+            else:
+                confirm(owner_record)
+            print("released", end="", flush=True)
+        elif operation == "cancel-owned":
+            if owner_bytes == token_bytes:
+                if receipt_record is not None:
+                    # Release can stop after the durable receipt and before
+                    # replacing its exact owner. Finish only that frontier;
+                    # neither a partial owner nor a successor is repaired.
+                    require_root_absent()
+                    confirm(receipt_record)
+                    publish(owner_name, b"released\n", owner_record)
+                    print("unowned", end="", flush=True)
+                else:
+                    confirm(owner_record)
+                    print("owned", end="", flush=True)
+            else:
+                if receipt_record is not None:
+                    confirm(receipt_record)
+                if owner_record is not None:
+                    confirm(owner_record)
+                print("unowned", end="", flush=True)
+        else:
+            # The caller has independently proved the source intent unowned.
+            # A pair acquired before that intent can be retired, but this
+            # operation never inspects or grants access to its source path.
+            if owner_bytes == token_bytes:
+                receipt_or_publish()
+                publish(owner_name, b"released\n", owner_record)
+            else:
+                if receipt_record is not None:
+                    confirm(receipt_record)
+                if owner_record is not None:
+                    confirm(owner_record)
+            print("unowned", end="", flush=True)
+except (OSError, ValueError) as error:
+    diagnostic = ("RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED" if stage != "validation"
+                  else "RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED")
+    print(diagnostic + " stage=" + stage + ": " + str(error), file=sys.stderr)
+    sys.exit(73)
+finally:
+    for fd in reversed(descriptors):
+        os.close(fd)
+"#;
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
-const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
+const LEGACY_SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+
+/// A source grant binds both durable records and kernel locks to one worker
+/// namespace. Old journals must discover this binding before changing either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceAuthorityNamespace {
+    Current,
+    Legacy,
+}
+
+impl SourceAuthorityNamespace {
+    fn registry(self) -> &'static str {
+        match self {
+            Self::Current => REMOTE_SOURCE_CLAIM_REGISTRY,
+            Self::Legacy => LEGACY_SOURCE_CLAIM_REGISTRY,
+        }
+    }
+
+    fn lock_dir(self) -> &'static str {
+        match self {
+            Self::Current => REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
+            Self::Legacy => "/tmp/rch-source-authority-locks",
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    pub(crate) fn activity_prefix(self, identity: &str, cleanup: bool) -> anyhow::Result<String> {
+        source_authority_activity_prefix_for_mode(self.registry(), identity, cleanup)
+    }
+}
 
 /// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
 ///
-/// The remote holder blocks on this SSH session's stdin after acquiring every
-/// lock. EOF/HUP releases kernel locks but retains a durable ownership claim.
-/// Only explicit, acknowledged release permits an overlapping future writer.
+/// The remote holder waits for release input after acquiring every lock and
+/// yields kernel locks when this exact grant is fenced for cancellation.
+/// EOF/HUP also releases kernel locks but retains the ownership claim. Only
+/// explicit, acknowledged retirement permits an overlapping future writer.
+/// POSIX sessions also expire without client heartbeats; expiry retains every
+/// durable claim and never terminates a separate compiler/rsync activity.
 pub(super) struct RemoteSourceAuthorityLock {
     worker_id: WorkerId,
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
     stdout_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    heartbeat: Option<SourceLockHeartbeat>,
     release_request: Option<String>,
     pair_root: Option<String>,
+    namespace: SourceAuthorityNamespace,
+}
+
+/// The single stdin writer serializes complete heartbeat/release frames. In
+/// particular release must not abort a half-written heartbeat and concatenate
+/// its suffix with a valid ownership-release request.
+struct SourceLockHeartbeat {
+    release: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl SourceLockHeartbeat {
+    fn start(mut stdin: tokio::process::ChildStdin, period: Duration) -> Self {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (release, mut requested) = tokio::sync::oneshot::channel::<Option<String>>();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    request = &mut requested => {
+                        let request = request.map_err(|_| std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "source-lock heartbeat owner was dropped",
+                        ))?;
+                        if let Some(request) = request {
+                            stdin.write_all(format!("{request}\n").as_bytes()).await?;
+                        }
+                        return stdin.shutdown().await;
+                    }
+                    _ = interval.tick() => {
+                        stdin.write_all(SOURCE_LOCK_HEARTBEAT_FRAME).await?;
+                        stdin.flush().await?;
+                    }
+                }
+            }
+        });
+        Self {
+            release: Some(release),
+            task,
+        }
+    }
+
+    async fn release(&mut self, request: Option<String>) -> anyhow::Result<()> {
+        let sender = self
+            .release
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("source-lock release was already requested"))?;
+        // If the receiver already failed, awaiting its task below preserves
+        // the actual write error rather than substituting a channel error.
+        let _ = sender.send(request);
+        (&mut self.task).await??;
+        Ok(())
+    }
+}
+
+impl Drop for SourceLockHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl RemoteSourceAuthorityLock {
@@ -79,6 +575,16 @@ impl RemoteSourceAuthorityLock {
 
     /// Fail closed if the lock-holder SSH process disappeared before Cargo starts.
     pub(super) fn ensure_held(&mut self) -> anyhow::Result<()> {
+        if self
+            .heartbeat
+            .as_ref()
+            .is_some_and(|heartbeat| heartbeat.task.is_finished())
+        {
+            anyhow::bail!(
+                "source-authority heartbeat on {} ended; durable ownership remains fenced",
+                self.worker_id,
+            );
+        }
         let child = self
             .child
             .as_mut()
@@ -103,7 +609,9 @@ impl RemoteSourceAuthorityLock {
 
         let deadline = tokio::time::Instant::now() + budget;
         let collect = async {
-            if let Some(request) = self.release_request.as_ref() {
+            if let Some(heartbeat) = self.heartbeat.as_mut() {
+                heartbeat.release(self.release_request.clone()).await?;
+            } else if let Some(request) = self.release_request.as_ref() {
                 let stdin = self
                     .stdin
                     .as_mut()
@@ -157,6 +665,9 @@ impl RemoteSourceAuthorityLock {
 
 impl Drop for RemoteSourceAuthorityLock {
     fn drop(&mut self) {
+        // Abort the writer before killing the transport. A cancelled caller
+        // must not detach a task that keeps renewing remote source locks.
+        drop(self.heartbeat.take());
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
@@ -179,11 +690,16 @@ async fn join_lock_drain(
 }
 
 fn source_authority_lock_path(root: &str) -> String {
+    source_authority_lock_path_in(root, SourceAuthorityNamespace::Current)
+}
+
+fn source_authority_lock_path_in(root: &str, namespace: SourceAuthorityNamespace) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rch.remote_source_authority_lock.v1\0");
     hasher.update(root.as_bytes());
     format!(
-        "{REMOTE_SOURCE_AUTHORITY_LOCK_DIR}/{}.lock",
+        "{}/{}.lock",
+        namespace.lock_dir(),
         hasher.finalize().to_hex()
     )
 }
@@ -365,15 +881,31 @@ pub(super) fn validate_source_authority_intent(
     Ok(())
 }
 
-fn source_registry_setup(registry: &str) -> String {
+pub(super) fn source_registry_setup(registry: &str) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    // mkdir -p can create more than the final directory. Persist each new
+    // directory entry bottom-up; replacing syncfs must not lose its implicit
+    // ancestor barriers. '/.' follows legitimate ancestor aliases such as
+    // Darwin's /tmp while the registry and record leaves remain no-follow.
+    let mut paths = ["released", "cancelled", "quarantine"]
+        .map(|name| format!("{registry}/{name}"))
+        .to_vec();
+    paths.push(registry.to_owned());
+    paths.extend(
+        Path::new(registry)
+            .ancestors()
+            .skip(1)
+            .map(|parent| parent.join(".").display().to_string()),
+    );
+    let borrowed: Vec<_> = paths.iter().map(String::as_str).collect();
     format!(
         "set -eu; umask 077; registry={registry}; \
          [ ! -L \"$registry\" ]; mkdir -p -- \"$registry\"; \
          for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do \
          [ ! -L \"$directory\" ]; mkdir -p -- \"$directory\"; done; \
-         [ ! -L \"$registry/metadata.lock\" ]; sync -f \"$registry\";\n",
+         [ ! -L \"$registry/metadata.lock\" ]; {sync_registry};\n",
         registry = quote(registry),
+        sync_registry = crate::transfer::file_fsync_command(&borrowed),
     )
 }
 
@@ -389,7 +921,7 @@ fn source_registry_invocation(
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
         SOURCE_CLAIM_REGISTRY,
     );
-    format!(
+    let command = format!(
         "flock -x -- {lock} sh -c {script} rch-source-registry {registry} {identity} {digest} {operation}",
         lock = quote(&format!("{registry}/metadata.lock")),
         script = quote(&script),
@@ -397,7 +929,29 @@ fn source_registry_invocation(
         identity = quote(identity),
         digest = quote(digest),
         operation = quote(operation),
-    )
+    );
+    if registry == LEGACY_SOURCE_CLAIM_REGISTRY {
+        // Current admission and GC publish/read under the current metadata
+        // mutex. Hold it before the legacy mutex throughout cleanup grants.
+        format!(
+            "env RCH_LEGACY_SOURCE_CLAIM_REGISTRY={peer} flock -x -- {lock} {command}",
+            peer = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+            lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
+        )
+    } else {
+        command
+    }
+}
+
+fn source_registry_recovery_setup(registry: &str) -> String {
+    let mut setup = String::new();
+    if registry == LEGACY_SOURCE_CLAIM_REGISTRY {
+        // Only initialize the shared mutex namespace; no current claim or
+        // cancellation receipt may be manufactured for a legacy identity.
+        setup.push_str(&source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY));
+    }
+    setup.push_str(&source_registry_setup(registry));
+    setup
 }
 
 fn source_authority_activity_prefix_at(registry: &str, identity: &str) -> anyhow::Result<String> {
@@ -451,18 +1005,35 @@ pub(crate) fn source_authority_activity_prefix(identity: &str) -> anyhow::Result
     source_authority_activity_prefix_at(REMOTE_SOURCE_CLAIM_REGISTRY, identity)
 }
 
-/// Cleanup-only authority for an already owned, durably cancelling grant. It
-/// cannot start a new normal operation or recover an absent source claim.
-pub(crate) fn source_authority_cleanup_prefix(identity: &str) -> anyhow::Result<String> {
-    source_authority_activity_prefix_for_mode(REMOTE_SOURCE_CLAIM_REGISTRY, identity, true)
-}
-
 pub(crate) fn wrap_remote_source_activity(command: &str, identity: &str) -> anyhow::Result<String> {
     Ok(format!(
         "{} sh -c {}",
         source_authority_activity_prefix(identity)?,
         shell_escape::escape(command.into()),
     ))
+}
+
+/// Wait in the holder's foreground process tree. Cancellation relinquishes
+/// kernel locks only; it never changes a claim or acknowledges source release.
+/// The selector is a source digest or one canonical pair root, never the full
+/// closure, so large grants do not become an exec argument.
+fn source_release_waiter_command(
+    mode: &str,
+    registry: &str,
+    identity: &str,
+    selector: &str,
+    release: &str,
+) -> String {
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    format!(
+        "python3 -I -S -c {waiter} {mode} {registry} {identity} {selector} {release}",
+        waiter = quote(SOURCE_AUTHORITY_RELEASE_WAITER),
+        mode = quote(mode),
+        registry = quote(registry),
+        identity = quote(identity),
+        selector = quote(selector),
+        release = quote(release),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,10 +1055,10 @@ fn build_durable_source_authority_lock_cmd(
     let terminal = format!(
         "set -eu; ready=$1; roots=$(cat <&4); exec 4<&-; \
          printf '%s\\n' \"$roots\" | {transaction}; \
-         printf '%s\\n' \"$ready\"; IFS= read -r request; \
-         [ \"$request\" = {release} ]; \
+         printf '%s\\n' \"$ready\"; {waiter}; \
          printf '%s\\n' \"$roots\" | flock -x -- {activity} {retirement}; \
          printf '%s\\n' {release}",
+        waiter = source_release_waiter_command("source", registry, identity, &digest, &release),
         release = quote(&release),
         activity = quote(&format!("{registry}/{identity}.activity.lock")),
     );
@@ -504,7 +1075,7 @@ fn build_durable_source_authority_lock_cmd(
     };
     Ok(format!(
         "{}exec 4<<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n{base} {terminal}",
-        source_registry_setup(registry),
+        source_registry_recovery_setup(registry),
         terminal = quote(&terminal),
     ))
 }
@@ -526,8 +1097,27 @@ fn source_intent_command(
     }
     Ok(format!(
         "{}{invocation} <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
-        source_registry_setup(registry),
+        source_registry_recovery_setup(registry),
     ))
+}
+
+/// Bound the worker process tree as well as the local SSH client. A client
+/// timeout alone can leave a queued flock transaction that wakes much later
+/// and publishes cancellation after its caller has gone. The controller
+/// validates the exact finite reply only after draining its private group.
+async fn run_source_metadata_rpc(
+    worker: &WorkerConfig,
+    command: &str,
+    contract: &str,
+    client_timeout: Duration,
+) -> anyhow::Result<Output> {
+    let controller = format!(
+        "set -- {}\n{}",
+        shell_escape::escape(contract.into()),
+        include_str!("source_namespace_control.sh"),
+    );
+    run_offload_ssh_command_with_stdin(worker, &controller, command.as_bytes(), client_timeout)
+        .await
 }
 
 /// Probe whether a started remote execution is gone for good. Every activity
@@ -562,8 +1152,9 @@ pub(super) async fn remote_execution_lost(
     worker: &WorkerConfig,
     identity: &str,
     receipt: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let script = remote_execution_probe_script(REMOTE_SOURCE_CLAIM_REGISTRY, identity, receipt)?;
+    let script = remote_execution_probe_script(namespace.registry(), identity, receipt)?;
     let output = run_offload_ssh_command_with_stdin(
         worker,
         "sh -s",
@@ -583,13 +1174,14 @@ pub(super) async fn remote_source_authority_was_released(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command = source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "released")?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "released")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_RELEASED",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
@@ -604,48 +1196,55 @@ pub(super) async fn remote_source_authority_was_released(
     }
 }
 
-/// Reconcile an exact cancellation receipt for a dead job (bd-ey7fr). Like
-/// the release probe, this grants no source read or mutation authority.
-pub(super) async fn remote_source_intent_was_cancelled(
+/// Locate an exact cancellation intent, including interruption before the
+/// completed receipt. This proves only that normal activity is fenced. It
+/// grants no source access and does not prove cleanup or source retirement;
+/// recovery must independently establish those obligations before finishing
+/// cancellation under the activity mutex.
+pub(super) async fn remote_source_intent_has_cancellation(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
     let command =
-        source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancelled")?;
-    let output = run_offload_ssh_command_with_stdin(
+        source_intent_command(namespace.registry(), roots, identity, "cancellation-state")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_CANCELLATION_STATE",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot reconcile durable source cancellation: {}",
+        "cannot locate durable source cancellation: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     match output.stdout.as_slice() {
-        b"cancelled" => Ok(true),
+        b"cancellation" => Ok(true),
         b"pending" => Ok(false),
-        _ => anyhow::bail!("invalid durable source cancellation response"),
+        _ => anyhow::bail!("invalid durable source cancellation state response"),
     }
 }
 
-/// Begin cancellation of a persisted pre-execution intent, draining normal
+/// Begin or resume cancellation of an owned persisted intent, draining normal
 /// activity and fencing delayed acquisition. True retains the existing claim
-/// for cleanup; false grants no source authority. Execution must never have
-/// started. Cleanup must finish before `finish_cancel_remote_source_authority_intent`.
+/// for cleanup; false grants no source authority. The caller must prove either
+/// pre-execution intent, exact execution completion/loss, or already completed
+/// tree/pair retirement. Cleanup must finish before
+/// `finish_cancel_remote_source_authority_intent`.
 pub(super) async fn cancel_remote_source_authority_intent(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let command = source_intent_command(REMOTE_SOURCE_CLAIM_REGISTRY, roots, identity, "cancel")?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "cancel")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
+        &command,
+        "RCH_SOURCE_INTENT_CANCEL",
         Duration::from_secs(30),
     )
     .await?;
@@ -666,17 +1265,13 @@ pub(super) async fn finish_cancel_remote_source_authority_intent(
     worker: &WorkerConfig,
     roots: &[String],
     identity: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<()> {
-    let command = source_intent_command(
-        REMOTE_SOURCE_CLAIM_REGISTRY,
-        roots,
-        identity,
-        "finish-cancel",
-    )?;
-    let output = run_offload_ssh_command_with_stdin(
+    let command = source_intent_command(namespace.registry(), roots, identity, "finish-cancel")?;
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
+        &command,
+        "RCH_SOURCE_INTENT_FINISHED",
         Duration::from_secs(30),
     )
     .await?;
@@ -684,6 +1279,149 @@ pub(super) async fn finish_cancel_remote_source_authority_intent(
         output.status.success(),
         "cannot finish durable source cancellation: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn source_cancellation_settlement_command(
+    registry: &str,
+    legacy_registry: &str,
+    roots: &[String],
+    identity: &str,
+    operation: &str,
+    expected_namespace: &str,
+) -> anyhow::Result<String> {
+    validate_source_identity(identity)?;
+    let (roots, digest) = source_claim_roots(roots)?;
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let transaction = format!(
+        "{}\n{}",
+        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+        SOURCE_CLAIM_REGISTRY,
+    );
+    Ok(format!(
+        "exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected} \
+         <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
+        coordinator = quote(include_str!("source_cancel_settlement.py")),
+        registry = quote(registry),
+        legacy = quote(legacy_registry),
+        identity = quote(identity),
+        digest = quote(&digest),
+        transaction = quote(&transaction),
+        operation = quote(operation),
+        expected = quote(expected_namespace),
+    ))
+}
+
+/// Discover exact legacy evidence without admitting activity or publishing
+/// cancellation. The caller must checkpoint this binding before any mutation.
+pub(super) async fn locate_remote_source_authority_namespace(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<SourceAuthorityNamespace> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        LEGACY_SOURCE_CLAIM_REGISTRY,
+        roots,
+        identity,
+        "locate",
+        "",
+    )?;
+    let output = run_source_metadata_rpc(
+        worker,
+        &command,
+        "RCH_SOURCE_AUTHORITY_NAMESPACE",
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot locate exact source ownership on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    match output.stdout.as_slice() {
+        b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n" => Ok(SourceAuthorityNamespace::Current),
+        b"RCH_SOURCE_AUTHORITY_NAMESPACE legacy\n" => Ok(SourceAuthorityNamespace::Legacy),
+        _ => anyhow::bail!("invalid source ownership namespace response"),
+    }
+}
+
+/// Observe an optional namespace for explicit recovery of an already retired
+/// legacy lease. Confirmed absence grants no authority and must leave its
+/// journal unchanged; malformed or ambiguous evidence remains an error.
+/// Normal ownership recovery still uses the mandatory locator above.
+pub(super) async fn discover_remote_source_authority_namespace(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+) -> anyhow::Result<Option<SourceAuthorityNamespace>> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        LEGACY_SOURCE_CLAIM_REGISTRY,
+        roots,
+        identity,
+        "discover",
+        "",
+    )?;
+    let output = run_source_metadata_rpc(
+        worker,
+        &command,
+        "RCH_SOURCE_AUTHORITY_DISCOVERY",
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot discover terminal source ownership on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+    match output.stdout.as_slice() {
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY current\n" => Ok(Some(SourceAuthorityNamespace::Current)),
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY legacy\n" => Ok(Some(SourceAuthorityNamespace::Legacy)),
+        b"RCH_SOURCE_AUTHORITY_DISCOVERY absent\n" => Ok(None),
+        _ => anyhow::bail!("invalid terminal source ownership discovery response"),
+    }
+}
+
+/// Settle cancellation metadata only after the caller has validated its exact
+/// durable failed-result and source/tree/pair retirement evidence. Detached
+/// recovery must retain its journal ownership across this call. Independent
+/// worker activity/metadata locks and matching records are also required;
+/// neither a terminal daemon lease nor a missing worker record grants authority.
+/// The legacy registry participates because pre-migration recipes did not store
+/// their registry location. Ambiguous cross-registry identity fails closed.
+pub(super) async fn settle_remote_source_cancellation(
+    worker: &WorkerConfig,
+    roots: &[String],
+    identity: &str,
+    namespace: SourceAuthorityNamespace,
+) -> anyhow::Result<()> {
+    let command = source_cancellation_settlement_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        LEGACY_SOURCE_CLAIM_REGISTRY,
+        roots,
+        identity,
+        "settle-cancel",
+        namespace.wire_name(),
+    )?;
+    let output = run_source_metadata_rpc(
+        worker,
+        &command,
+        "RCH_SOURCE_CANCELLATION_SETTLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.as_slice() == b"RCH_SOURCE_CANCELLATION_SETTLED\n",
+        "cannot settle terminal source cancellation on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
     );
     Ok(())
 }
@@ -706,6 +1444,18 @@ fn source_authority_lock_transport(
     (reader, Some(format!("{{\n{remote_cmd}\n}}\n")))
 }
 
+/// Supervise only this session, including waits for hierarchy and metadata
+/// locks. An expired session retains durable ownership; it cannot authorize
+/// source cleanup or terminate an independently launched activity.
+fn source_authority_live_session_command(remote_cmd: &str, idle: Duration) -> String {
+    let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    format!(
+        "set -eu\nexec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n{remote_cmd}\nRCH_SOURCE_LOCK_SESSION_PROGRAM\n\
+         exec sh -c {holder} {holder} --rch-session {seconds}",
+        seconds = idle.as_secs(),
+    )
+}
+
 /// Acquire sorted, worker-side locks for every mutable canonical source root.
 /// One persistent SSH session owns the whole set, so separate coordinator
 /// processes cannot overwrite any member of a Cargo closure while it compiles.
@@ -723,6 +1473,7 @@ pub(super) async fn acquire_remote_source_authority_lock(
         identity,
         "acquire",
         wait_timeout,
+        SourceAuthorityNamespace::Current,
     )
     .await
 }
@@ -735,6 +1486,7 @@ pub(super) async fn recover_remote_source_authority_lock(
     source_pair: Option<&mut RemoteSourceAuthorityLock>,
     identity: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     source_authority_lock(
         worker,
@@ -743,6 +1495,7 @@ pub(super) async fn recover_remote_source_authority_lock(
         identity,
         "recover",
         wait_timeout,
+        namespace,
     )
     .await
 }
@@ -754,6 +1507,7 @@ async fn source_authority_lock(
     identity: &str,
     operation: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     // A validated clean-overlay pair already holds its container exclusively.
     // Its private descendants retain their exact locks; re-locking their parent
@@ -763,8 +1517,8 @@ async fn source_authority_lock(
     let (include_ancestors, paired_root) = if let Some(pair) = source_pair {
         pair.ensure_held()?;
         anyhow::ensure!(
-            pair.pair_token().is_some(),
-            "source pair has no owner token"
+            pair.pair_token() == Some(identity) && pair.namespace == namespace,
+            "source pair identity or namespace does not match the source grant"
         );
         let root = pair
             .pair_root
@@ -779,11 +1533,22 @@ async fn source_authority_lock(
         .filter(|root| paired_root.as_ref() != Some(*root))
         .cloned()
         .collect::<Vec<_>>();
-    let locks = source_authority_lock_plan(&lock_roots, include_ancestors)?;
+    let mut locks = source_authority_lock_plan(&lock_roots, include_ancestors)?;
+    if namespace == SourceAuthorityNamespace::Legacy {
+        for lock in &mut locks {
+            let name = Path::new(&lock.path)
+                .file_name()
+                .context("source lock has no file name")?;
+            lock.path = Path::new(namespace.lock_dir())
+                .join(name)
+                .display()
+                .to_string();
+        }
+    }
     let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
     let remote_cmd = build_durable_source_authority_lock_cmd(
-        REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
-        REMOTE_SOURCE_CLAIM_REGISTRY,
+        namespace.lock_dir(),
+        namespace.registry(),
         &locks,
         authority_roots,
         identity,
@@ -793,6 +1558,7 @@ async fn source_authority_lock(
     let mut guard =
         spawn_source_authority_lock(worker, &remote_cmd, &ready_marker, wait_timeout).await?;
     guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
+    guard.namespace = namespace;
     Ok(guard)
 }
 
@@ -825,33 +1591,56 @@ pub(super) async fn recover_clean_overlay_source_pair(
     source_root: &str,
     token: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    recover_clean_overlay_source_pair_with_mode(
+        worker,
+        source_root,
+        token,
+        wait_timeout,
+        SourcePairRecoveryMode::Normal,
+        namespace,
+    )
+    .await
+}
+
+enum SourcePairRecoveryMode {
+    Normal,
+    CancellationCleanup,
+}
+
+async fn recover_clean_overlay_source_pair_with_mode(
+    worker: &WorkerConfig,
+    source_root: &str,
+    token: &str,
+    wait_timeout: Duration,
+    mode: SourcePairRecoveryMode,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     validate_source_identity(token)?;
-    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
-        .pop()
-        .expect("one source root");
+    let lock_path = source_authority_lock_path_in(source_root, namespace);
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let ready = format!("RCH_SOURCE_PAIR_READY:{token}");
     let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
     let script = format!(
-        "set -eu; owner={owner}; root={root}; token={token}; \
-         [ ! -L \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         printf '%s\\n' {ready}; IFS= read -r request; \
-         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
-        owner = quote(&owner),
-        root = quote(source_root),
-        token = quote(token),
+        "set -eu; {recover}; printf '%s\\n' {ready}; {waiter}; \
+         {retire}; printf '%s\\n' {release}",
+        recover = source_pair_custody_command("recover", &lock_path, source_root, token),
         ready = quote(&ready),
+        waiter = source_release_waiter_command(
+            match mode {
+                SourcePairRecoveryMode::Normal => "pair",
+                // This guard was acquired to complete the cancellation.
+                // Its existing fence must not discard the cleanup lock.
+                SourcePairRecoveryMode::CancellationCleanup => "cleanup-pair",
+            },
+            namespace.registry(),
+            token,
+            &canonical_source_authority_root(source_root),
+            &release,
+        ),
         release = quote(&release),
-        receipt = quote(&receipt),
+        retire = source_pair_custody_command("release", &lock_path, source_root, token),
     );
     let command = format!(
         "exec flock -x {} sh -c {}",
@@ -861,6 +1650,7 @@ pub(super) async fn recover_clean_overlay_source_pair(
     let mut guard = spawn_source_authority_lock(worker, &command, &ready, wait_timeout).await?;
     guard.release_request = Some(release);
     guard.pair_root = Some(source_root.to_owned());
+    guard.namespace = namespace;
     Ok(guard)
 }
 
@@ -872,10 +1662,11 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
     source_root: &str,
     token: &str,
     wait_timeout: Duration,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<Option<RemoteSourceAuthorityLock>> {
     validate_source_identity(token)?;
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let lock = source_authority_lock_path(source_root);
+    let lock = source_authority_lock_path_in(source_root, namespace);
     let script = format!(
         "set -eu; registry={registry}; token={token}; \
          set -- \"$registry/$token.\"*.claim; active=$1; owned=0; \
@@ -886,31 +1677,33 @@ pub(super) async fn cancel_clean_overlay_source_pair_intent(
          [ ! -e \"$active\" ] && [ ! -L \"$active\" ]; \
          set -- \"$registry/cancelled/$token.\"*.claim; \
          [ \"$#\" -eq 1 ] && [ ! -L \"$1\" ] && [ -f \"$1\" ]; fi; \
-         owner={owner}; [ ! -L \"$owner\" ]; \
-         if [ -f \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         then if [ \"$owned\" -eq 1 ]; then printf owned; else \
-         printf '%s\\n' \"$token\" > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf unowned; fi; \
-         else printf unowned; fi",
-        registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+         if [ \"$owned\" -eq 1 ]; then {owned}; else {unowned}; fi",
+        registry = quote(namespace.registry()),
         token = quote(token),
-        owner = quote(&format!("{lock}.owner")),
-        receipt = quote(&format!(
-            "{lock}.released-{}",
-            blake3::hash(token.as_bytes()).to_hex()
-        )),
+        owned = source_pair_custody_command("cancel-owned", &lock, source_root, token),
+        unowned = source_pair_custody_command("cancel-unowned", &lock, source_root, token),
     );
     let command = format!("flock -x -- {} sh -c {}", quote(&lock), quote(&script));
     let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", command.as_bytes(), wait_timeout)
-            .await?;
+        run_source_metadata_rpc(worker, &command, "RCH_SOURCE_INTENT_CANCEL", wait_timeout).await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot reconcile cancelled source pair"
+        "cannot reconcile cancelled source pair on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
     );
     match output.stdout.as_slice() {
         b"owned" => Ok(Some(
-            recover_clean_overlay_source_pair(worker, source_root, token, wait_timeout).await?,
+            recover_clean_overlay_source_pair_with_mode(
+                worker,
+                source_root,
+                token,
+                wait_timeout,
+                SourcePairRecoveryMode::CancellationCleanup,
+                namespace,
+            )
+            .await?,
         )),
         b"unowned" => Ok(None),
         _ => anyhow::bail!("invalid cancelled source-pair response"),
@@ -923,45 +1716,54 @@ pub(super) async fn clean_overlay_source_pair_was_released(
     worker: &WorkerConfig,
     source_root: &str,
     token: &str,
+    namespace: SourceAuthorityNamespace,
 ) -> anyhow::Result<bool> {
-    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
-        .pop()
-        .expect("one source root");
+    let lock_path = source_authority_lock_path_in(source_root, namespace);
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
-    let script = format!(
-        "set -eu; [ ! -L {receipt} ]; \
-         if [ ! -f {receipt} ]; then printf pending; exit 0; fi; \
-         [ \"$(cat {receipt})\" = {token} ]; [ ! -L {owner} ]; \
-         if [ \"$(cat {owner})\" = {token} ]; then \
-         [ ! -e {root} ] && [ ! -L {root} ]; \
-         printf 'released\\n' > {owner}; sync -f {owner}; fi; printf released",
-        receipt = quote(&receipt),
-        token = quote(token),
-        owner = quote(&owner),
-        root = quote(source_root),
-    );
+    let script = source_pair_custody_command("released", &lock_path, source_root, token);
     let command = format!("flock -x {} sh -c {}", quote(&lock_path), quote(&script));
-    let output = run_offload_ssh_command_with_stdin(
+    let output = run_source_metadata_rpc(
         worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(15),
+        &command,
+        "RCH_SOURCE_INTENT_RELEASED",
+        Duration::from_secs(30),
     )
     .await?;
     anyhow::ensure!(
         output.status.success(),
-        "cannot verify source-pair release receipt"
+        "cannot verify source-pair release receipt on {} (status {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
     );
     match output.stdout.as_slice() {
         b"released" => Ok(true),
         b"pending" => Ok(false),
         _ => anyhow::bail!("invalid source-pair release response"),
     }
+}
+
+fn source_pair_custody_command(
+    operation: &str,
+    lock_path: &str,
+    source_root: &str,
+    token: &str,
+) -> String {
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let owner = format!("{lock_path}.owner");
+    let receipt = format!(
+        "{lock_path}.released-{}",
+        blake3::hash(token.as_bytes()).to_hex()
+    );
+    format!(
+        "python3 -I -S -c {program} {operation} {owner} {receipt} {token} {root}",
+        program = quote(SOURCE_PAIR_CUSTODY),
+        operation = quote(operation),
+        owner = quote(&owner),
+        receipt = quote(&receipt),
+        token = quote(token),
+        root = quote(source_root),
+    )
 }
 
 fn clean_overlay_source_pair_lock_command(
@@ -972,45 +1774,32 @@ fn clean_overlay_source_pair_lock_command(
     release: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let owner = format!("{lock_path}.owner");
-    let receipt = format!(
-        "{lock_path}.released-{}",
-        blake3::hash(token.as_bytes()).to_hex()
-    );
     let creation = format!(
-        "set -eu; owner={owner}; root={root}; token={token}; \
-         registry={registry}; \
+        "set -eu; token={token}; registry={registry}; \
          for cancelled in \"$registry/cancelled/$token.\"*.claim \"$registry/$token.\"*.cancelling; do \
          if [ -e \"$cancelled\" ] || [ -L \"$cancelled\" ]; then \
          echo 'RCH: source pair intent was cancelled' >&2; exit 1; fi; done; \
-         if [ -L \"$owner\" ] || {{ [ -e \"$owner\" ] && [ \"$(cat \"$owner\")\" != released ]; }}; then \
-         echo 'RCH: source pair has an unfinished owner; inspect the prior job or use RCH_DISABLE_TARGET_REUSE=1' >&2; exit 1; fi; \
-         if [ -e \"$root\" ] || [ -L \"$root\" ]; then \
-         echo 'RCH: source pair has unretired source; refusing reuse' >&2; exit 1; fi; \
-         printf '%s\\n' \"$token\" > \"$owner\"; sync -f \"$owner\"; \
-         sync -f \"$(dirname \"$owner\")\"",
-        owner = quote(&owner),
-        root = quote(source_root),
+         {claim}",
         token = quote(token),
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
+        claim = source_pair_custody_command("claim", lock_path, source_root, token),
     );
     let script = format!(
         "{setup}flock -x -- {metadata_lock} sh -c {creation}; \
-         owner={owner}; root={root}; token={token}; \
-         printf '%s\\n' {ready}; IFS= read -r request; \
-         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
-         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
-         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
-        owner = quote(&owner),
-        root = quote(source_root),
-        token = quote(token),
+         printf '%s\\n' {ready}; {waiter}; {retire}; printf '%s\\n' {release}",
         ready = quote(ready),
+        waiter = source_release_waiter_command(
+            "pair",
+            REMOTE_SOURCE_CLAIM_REGISTRY,
+            token,
+            &canonical_source_authority_root(source_root),
+            release,
+        ),
         release = quote(release),
-        receipt = quote(&receipt),
         setup = source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY),
         metadata_lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
         creation = quote(&creation),
+        retire = source_pair_custody_command("release", lock_path, source_root, token),
     );
     format!(
         "mkdir -p {} && exec flock -x {} sh -c {}",
@@ -1033,13 +1822,22 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("ServerAliveInterval=10");
+    cmd.arg("-o").arg("ServerAliveCountMax=3");
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
         cmd.args(opts);
     }
     cmd.arg(&destination);
+    let platform = WorkerPlatform::from_worker(worker);
+    // Python process groups are available on Linux/Darwin, not native Windows.
+    // Windows retains its existing transport until a native liveness backend
+    // has been qualified; never silently claim that TCP keepalive is the same.
+    let heartbeat = !platform.is_windows();
+    let supervised = heartbeat
+        .then(|| source_authority_live_session_command(remote_cmd, SOURCE_LOCK_HEARTBEAT_TIMEOUT));
     let (remote_arg, stdin_bootstrap) =
-        source_authority_lock_transport(WorkerPlatform::from_worker(worker), remote_cmd);
+        source_authority_lock_transport(platform, supervised.as_deref().unwrap_or(remote_cmd));
     cmd.arg(remote_arg);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1055,6 +1853,7 @@ async fn spawn_source_authority_lock(
         ready_marker,
         stdin_bootstrap.as_deref(),
         wait_timeout,
+        heartbeat,
     )
     .await
 }
@@ -1065,13 +1864,15 @@ async fn finish_source_authority_lock_acquisition(
     ready_marker: &str,
     stdin_bootstrap: Option<&str>,
     wait_timeout: Duration,
+    heartbeat: bool,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("source-authority lock stdin was not piped"))?;
+    let mut stdin = Some(stdin);
     let stdout = child
         .stdout
         .take()
@@ -1093,16 +1894,27 @@ async fn finish_source_authority_lock_acquisition(
         stdin: None,
         stdout_drain: None,
         stderr_drain: Some(stderr_drain),
+        heartbeat: None,
         release_request: None,
         pair_root: None,
+        namespace: SourceAuthorityNamespace::Current,
     };
 
     let mut observed = String::new();
     let acquisition = async {
         let write_bootstrap = async {
             if let Some(bootstrap) = stdin_bootstrap {
-                stdin.write_all(bootstrap.as_bytes()).await?;
-                stdin.flush().await?;
+                let pipe = stdin
+                    .as_mut()
+                    .expect("stdin owned until bootstrap completes");
+                pipe.write_all(bootstrap.as_bytes()).await?;
+                pipe.flush().await?;
+            }
+            if heartbeat {
+                guard.heartbeat = Some(SourceLockHeartbeat::start(
+                    stdin.take().expect("bootstrap retains stdin"),
+                    SOURCE_LOCK_HEARTBEAT_INTERVAL,
+                ));
             }
             Ok::<(), std::io::Error>(())
         };
@@ -1155,6 +1967,7 @@ async fn finish_source_authority_lock_acquisition(
         }
     };
     if let Some(failure) = failure {
+        drop(guard.heartbeat.take());
         drop(stdin);
         if let Some(child) = guard.child.as_mut() {
             let _ = child.start_kill();
@@ -1183,7 +1996,7 @@ async fn finish_source_authority_lock_acquisition(
         });
     }
 
-    guard.stdin = Some(stdin);
+    guard.stdin = stdin;
     guard.stdout_drain = Some(tokio::spawn(crate::transfer::read_bounded_output_stream(
         stdout,
         MAX_SOURCE_LOCK_OUTPUT_BYTES,
@@ -1390,7 +2203,8 @@ pub(super) fn remote_preflight_topology_policy(
     remote_base: &str,
     dispatch_closure_roots: &[PathBuf],
 ) -> anyhow::Result<PathTopologyPolicy> {
-    if !clean_overlay && !source_content_receipt {
+    let off_root = !clean_overlay && !source_content_receipt && controller_policy.is_off_root();
+    if !clean_overlay && !source_content_receipt && !off_root {
         return Ok(controller_policy.clone());
     }
 
@@ -1399,7 +2213,14 @@ pub(super) fn remote_preflight_topology_policy(
     if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
         anyhow::bail!("isolated staging base contains an invalid path character");
     }
-    let staging_root = PathBuf::from(remote_base);
+    let staging_root = PathBuf::from(&remote_base);
+    let required_parent = if off_root {
+        controller_policy
+            .offroot_worker_canonical_root(&remote_base)
+            .map_err(|error| anyhow::anyhow!("invalid off-root staging base: {error}"))?
+    } else {
+        staging_root.clone()
+    };
     if dispatch_closure_roots.is_empty() {
         anyhow::bail!("isolated staging preflight requires a planned source root");
     }
@@ -1413,7 +2234,7 @@ pub(super) fn remote_preflight_topology_policy(
         {
             anyhow::bail!("invalid isolated source destination: {}", root.display());
         }
-        let relative = root.strip_prefix(&staging_root).ok().filter(|relative| {
+        let relative = root.strip_prefix(&required_parent).ok().filter(|relative| {
             !relative.as_os_str().is_empty()
                 && relative
                     .components()
@@ -1423,11 +2244,11 @@ pub(super) fn remote_preflight_topology_policy(
             anyhow::bail!(
                 "isolated source destination {} is not a strict descendant of staging base {}",
                 root.display(),
-                staging_root.display()
+                required_parent.display()
             );
         }
     }
-    // No worker-global alias is required for an invocation-owned source tree.
+    // No worker-global alias is required for an invocation-owned or off-root source tree.
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 
@@ -1697,13 +2518,16 @@ pub(super) async fn ensure_worker_projects_topology(
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
     let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
-    let remote_reader = match source_identity {
-        Some(identity) => format!("{} sh -s", source_authority_activity_prefix(identity)?),
-        None => "sh -s".to_owned(),
+    let topology_cmd = match source_identity {
+        Some(identity) => crate::transfer::source_activity_finite_script(
+            &source_authority_activity_prefix(identity)?,
+            &topology_cmd,
+        ),
+        None => topology_cmd,
     };
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        &remote_reader,
+        "sh -s",
         topology_cmd.as_bytes(),
         Duration::from_secs(20),
     )
@@ -1795,9 +2619,12 @@ async fn repair_worker_mirror_ownership(
         return Ok(0);
     }
     let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
-    let remote_reader = match source_identity {
-        Some(identity) => format!("{} sh -s", source_authority_activity_prefix(identity)?),
-        None => "sh -s".to_owned(),
+    let cmd = match source_identity {
+        Some(identity) => crate::transfer::source_activity_finite_script(
+            &source_authority_activity_prefix(identity)?,
+            &cmd,
+        ),
+        None => cmd,
     };
     // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
     // pathological trees without failing every dispatch the way the old fixed
@@ -1806,7 +2633,7 @@ async fn repair_worker_mirror_ownership(
     // executor retains the timeout, concurrent output drains and kill-on-drop.
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        &remote_reader,
+        "sh -s",
         cmd.as_bytes(),
         Duration::from_secs(600),
     )
@@ -2221,6 +3048,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             "CLOSURE_READY",
             bootstrap.as_deref(),
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap()
@@ -2250,6 +3078,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             "DURABLE_READY",
             bootstrap.as_deref(),
             Duration::from_secs(10),
+            false,
         )
         .await?;
         guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
@@ -2273,6 +3102,129 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .output()
             .await
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_cancellation_command_preserves_quoted_evidence_and_exact_control_result() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let registry = directory.path().join("registry ' ; $literal `literal`");
+        let legacy = directory.path().join("absent legacy ' registry");
+        let control = directory.path().join("control receipts");
+        std::fs::create_dir(&registry).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        for name in ["released", "cancelled", "quarantine"] {
+            std::fs::create_dir(registry.join(name)).unwrap();
+        }
+        let source = directory
+            .path()
+            .join("source ' ; $(touch expanded-dollar) `touch expanded-backtick`");
+        let roots = vec![source.display().to_string()];
+        let identity = "ac03";
+        let (body, digest) = source_claim_roots(&roots).unwrap();
+        let fence = registry.join(format!("{identity}.{digest}.cancelling"));
+        let receipt = registry
+            .join("cancelled")
+            .join(format!("{identity}.{digest}.claim"));
+        std::fs::write(&fence, &body).unwrap();
+        for attempt in 0..5 {
+            let discover = attempt == 0;
+            let locate = attempt == 1;
+            let command = source_cancellation_settlement_command(
+                registry.to_str().unwrap(),
+                legacy.to_str().unwrap(),
+                &roots,
+                identity,
+                if discover {
+                    "discover"
+                } else if locate {
+                    "locate"
+                } else {
+                    "settle-cancel"
+                },
+                if discover || locate { "" } else { "current" },
+            )
+            .unwrap();
+            let contract = if discover {
+                "RCH_SOURCE_AUTHORITY_DISCOVERY"
+            } else if locate {
+                "RCH_SOURCE_AUTHORITY_NAMESPACE"
+            } else {
+                "RCH_SOURCE_CANCELLATION_SETTLED"
+            };
+            let remote = build_remote_shell_command(
+                WorkerPlatform::Posix,
+                &format!(
+                    "set -- {contract}\n{}",
+                    include_str!("source_namespace_control.sh")
+                ),
+            );
+            if attempt == 4 {
+                std::fs::write(&fence, b"/incomplete\n").unwrap();
+            }
+            // Use the real generated upload, login-shell quoting and bounded
+            // controller. The standalone Python qualification uses shlex and
+            // cannot detect a regression in these Rust command boundaries.
+            let mut child = Command::new("sh")
+                .args(["-c", &remote])
+                .current_dir(directory.path())
+                .env("TMPDIR", &control)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(command.as_bytes()).await.unwrap();
+            drop(input);
+            let output = timeout(Duration::from_secs(30), child.wait_with_output())
+                .await
+                .expect("metadata controller did not terminate")
+                .unwrap();
+            if attempt < 4 {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.stdout,
+                    if discover {
+                        b"RCH_SOURCE_AUTHORITY_DISCOVERY current\n".as_slice()
+                    } else if locate {
+                        b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n".as_slice()
+                    } else {
+                        b"RCH_SOURCE_CANCELLATION_SETTLED\n".as_slice()
+                    }
+                );
+                assert_eq!(std::fs::read(&fence).unwrap(), body.as_bytes());
+            } else {
+                assert_eq!(output.status.code(), Some(73));
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SOURCE_CANCELLATION_UNSETTLED")
+                );
+                assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
+            }
+            if discover || locate {
+                assert!(
+                    !receipt.exists(),
+                    "namespace discovery published a cancellation receipt"
+                );
+            } else {
+                assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+            }
+            assert!(!source.exists(), "metadata recovery created a source root");
+            assert!(!directory.path().join("expanded-dollar").exists());
+            assert!(!directory.path().join("expanded-backtick").exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2746,6 +3698,73 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_flushes_only_named_objects_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let python = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for mode in ["ok", "registry", "pending"] {
+            let root = retained.join(mode);
+            let bin = root.join("bin");
+            let source = root.join("source with ' quotes");
+            let registry = root.join("registry");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            // Utility sync must never be invoked: uutils may flush the whole
+            // machine even with a file operand. The wrapper otherwise delegates
+            // to real Python and real fsync, injecting only the named failure.
+            std::fs::write(
+                bin.join("sync"),
+                "#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n",
+            )
+            .unwrap();
+            std::fs::write(bin.join("python3"), format!(
+                r#"#!{python}
+import os, sys
+args = sys.argv[1:]
+if len(args) >= 5 and args[:3] == ['-I', '-S', '-c'] and 'os.fsync(' in args[3]:
+ mode = os.environ['RCH_TEST_FLUSH_MODE']
+ if any((mode == 'registry' and path.endswith('/registry')) or (mode == 'pending' and os.path.basename(path).startswith('.record-write.')) for path in args[4:]):
+  sys.exit(86)
+os.execv({python:?}, [{python:?}] + args)
+"#
+            )).unwrap();
+            for name in ["sync", "python3"] {
+                std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            let roots = vec![source.display().to_string()];
+            let command =
+                source_intent_command(registry.to_str().unwrap(), &roots, "ba01", "acquire")
+                    .unwrap();
+            let output = timeout(
+                Duration::from_secs(10),
+                Command::new("sh")
+                    .args(["-c", &command])
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("RCH_TEST_FLUSH_MODE", mode)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output.status.success(), mode == "ok", "{mode}: {output:?}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("unexpected-global-sync"));
+            let (_, digest) = source_claim_roots(&roots).unwrap();
+            assert_eq!(
+                registry.join(format!("ba01.{digest}.claim")).exists(),
+                mode == "ok"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn durable_source_registry_lifecycle_runs_on_the_workers_userland() {
@@ -2958,7 +3977,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn durable_source_cancellation_blocks_overlapping_writers_through_cleanup() {
+    async fn durable_source_cancellation_yields_locks_but_preserves_cleanup() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let directory = source_lock_test_dir();
         let registry = directory.join("registry");
@@ -2970,12 +3989,37 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         let mut owner = claim_test_durable_source_closure(&registry, &roots, "ab11", "acquire")
             .await
             .unwrap();
-        drop(owner.stdin.take());
-        owner.child.as_mut().unwrap().wait().await.unwrap();
-        drop(owner);
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
         let cancellation = test_source_intent(&registry, &roots, "ab11", "cancel").await;
         assert!(cancellation.status.success());
         assert_eq!(cancellation.stdout, b"owned");
+        // Keep stdin open: an SSH connection may stay half-open after the
+        // dispatcher has already cancelled this exact grant on another one.
+        // The old holder must yield only its kernel locks, without requiring
+        // EOF or acknowledging a release it never performed.
+        assert!(owner.stdin.is_some());
+        let status = timeout(
+            Duration::from_secs(10),
+            owner.child.as_mut().unwrap().wait(),
+        )
+        .await
+        .expect("cancelled holder kept its kernel locks")
+        .unwrap();
+        assert_eq!(status.code(), Some(75));
+        assert!(
+            join_lock_drain(owner.stdout_drain.as_mut())
+                .await
+                .unwrap()
+                .is_empty(),
+            "kernel-only cancellation handoff must not acknowledge release"
+        );
+        for extension in ["claim", "cancelling"] {
+            assert_eq!(
+                std::fs::read(registry.join(format!("ab11.{digest}.{extension}"))).unwrap(),
+                contents.as_bytes(),
+                "cancellation must retain the exact ownership evidence"
+            );
+        }
         assert!(
             claim_test_durable_source_closure(&registry, &competing, "ab12", "acquire")
                 .await
@@ -3471,7 +4515,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     ) -> anyhow::Result<RemoteSourceAuthorityLock> {
         let token = uuid::Uuid::new_v4().to_string();
         let ready = format!("ready:{token}");
-        let release = format!("release:{token}");
+        let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
         let script = clean_overlay_source_pair_lock_command(
             lock.to_str().unwrap(),
             root.to_str().unwrap(),
@@ -3486,6 +4530,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             &ready,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await?;
         guard.release_request = Some(release);
@@ -3503,7 +4548,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         let lock = directory.join("pair.lock");
         let token = uuid::Uuid::new_v4().simple().to_string();
         let ready = format!("ready:{token}");
-        let release = format!("release:{token}");
+        let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
         let script = clean_overlay_source_pair_lock_command(
             lock.to_str().unwrap(),
             root.to_str().unwrap(),
@@ -3518,6 +4563,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             &ready,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -3878,6 +4924,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -3890,6 +4937,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         ));
         assert!(
             timeout(Duration::from_millis(100), &mut competing)
@@ -3911,6 +4959,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             marker,
             bootstrap.as_deref(),
             TEST_LOCK_ACQUIRE_BUDGET,
+            false,
         )
         .await
         .unwrap();
@@ -3940,6 +4989,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
                 "READY",
                 bootstrap.as_deref(),
                 Duration::from_secs(3),
+                false,
             )
             .await;
             let error = match result {
@@ -3986,6 +5036,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "READY",
             bootstrap.as_deref(),
             Duration::from_millis(250),
+            false,
         )
         .await;
         let error = match result {
@@ -4020,6 +5071,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "READY",
             Some(&bootstrap),
             Duration::from_millis(100),
+            false,
         )
         .await;
         let error = match result {
@@ -4044,6 +5096,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "READY",
             Some(&bootstrap),
             Duration::from_secs(60),
+            false,
         ));
         // Poll the real acquisition while its large write and readiness are
         // pending. Cancelling an unpolled future would miss the drain/guard
@@ -4980,8 +6033,10 @@ exec /bin/ln \"$@\"\n",
                 stdin: None,
                 stdout_drain,
                 stderr_drain,
+                heartbeat: None,
                 release_request: None,
                 pair_root: None,
+                namespace: SourceAuthorityNamespace::Current,
             },
             writers,
             notices,
@@ -5074,6 +6129,7 @@ exec /bin/ln \"$@\"\n",
                 "READY",
                 None,
                 Duration::from_secs(2),
+                false,
             )
             .await
             .unwrap();
@@ -5110,6 +6166,7 @@ exec /bin/ln \"$@\"\n",
                     "READY",
                     None,
                     Duration::from_secs(60),
+                    false,
                 ),
             )
             .await
@@ -5142,6 +6199,7 @@ exec /bin/ln \"$@\"\n",
             "READY",
             None,
             Duration::from_secs(2),
+            false,
         )
         .await
         .unwrap();
@@ -5151,6 +6209,159 @@ exec /bin/ln \"$@\"\n",
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_heartbeat_writer_serializes_release_and_eof() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "while IFS= read -r frame; do printf '%s\\n' \"$frame\"; done",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut writer =
+            SourceLockHeartbeat::start(child.stdin.take().unwrap(), Duration::from_millis(10));
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        for _ in 0..3 {
+            let mut frame = String::new();
+            timeout(Duration::from_secs(2), output.read_line(&mut frame))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.as_bytes(), SOURCE_LOCK_HEARTBEAT_FRAME);
+        }
+        writer
+            .release(Some("RCH_SOURCE_AUTHORITY_RELEASE:abc".to_owned()))
+            .await
+            .unwrap();
+        let mut remaining = String::new();
+        timeout(
+            Duration::from_secs(2),
+            output.read_to_string(&mut remaining),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let mut frames: Vec<_> = remaining.lines().collect();
+        assert_eq!(frames.pop(), Some("RCH_SOURCE_AUTHORITY_RELEASE:abc"));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| *frame == "RCH_SOURCE_LOCK_HEARTBEAT")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_supervised_claim_release_and_caller_loss() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        for release in [true, false] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let registry = directory.join("registry");
+            let root = directory.join("source");
+            std::fs::create_dir(&root).unwrap();
+            let roots = vec![root.to_string_lossy().into_owned()];
+            let identity = uuid::Uuid::new_v4().simple().to_string();
+            let lock = directory.join("root.lock").to_string_lossy().into_owned();
+            let script = build_durable_source_authority_lock_cmd(
+                directory.to_str().unwrap(),
+                registry.to_str().unwrap(),
+                &exclusive_source_locks(std::slice::from_ref(&lock)),
+                &roots,
+                &identity,
+                "acquire",
+                "SUPERVISED_READY",
+            )
+            .unwrap();
+            let script = source_authority_live_session_command(&script, Duration::from_secs(90));
+            let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+            let mut guard = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("supervised-source-session"),
+                "SUPERVISED_READY",
+                bootstrap.as_deref(),
+                Duration::from_secs(10),
+                true,
+            )
+            .await
+            .unwrap();
+            guard.release_request = Some(format!("RCH_SOURCE_AUTHORITY_RELEASE:{identity}"));
+            guard.ensure_held().unwrap();
+            let sender = guard.heartbeat.as_ref().unwrap().task.abort_handle();
+            let (body, digest) = source_claim_roots(&roots).unwrap();
+            let active = registry.join(format!("{identity}.{digest}.claim"));
+            assert_eq!(std::fs::read(&active).unwrap(), body.as_bytes());
+            assert!(source_lock_scaling_is_held(&lock).await);
+            if release {
+                guard.release().await.unwrap();
+                assert!(!active.exists());
+                assert_eq!(
+                    std::fs::read(registry.join(format!("released/{identity}.{digest}.claim")))
+                        .unwrap(),
+                    body.as_bytes(),
+                );
+            } else {
+                // A build/rsync runs in a separate session and owns the
+                // activity mutex. Expiring its control holder may release
+                // hierarchy descriptors, but must neither kill this live
+                // activity nor admit another token to the same source.
+                let prefix =
+                    source_authority_activity_prefix_at(registry.to_str().unwrap(), &identity)
+                        .unwrap();
+                let command = format!(
+                    "exec {prefix} sh -c {}",
+                    shell_escape::escape(
+                        "printf 'ACTIVITY_READY\\n'; IFS= read -r done; [ \"$done\" = done ]"
+                            .into(),
+                    ),
+                );
+                let mut activity = Command::new("sh")
+                    .args(["-c", &command])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut output = tokio::io::BufReader::new(activity.stdout.take().unwrap());
+                let mut ready = String::new();
+                timeout(Duration::from_secs(5), output.read_line(&mut ready))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ready, "ACTIVITY_READY\n");
+                drop(guard);
+                assert_eq!(std::fs::read(&active).unwrap(), body.as_bytes());
+                let fresh = uuid::Uuid::new_v4().simple().to_string();
+                let refused = test_source_intent(&registry, &roots, &fresh, "acquire").await;
+                assert_eq!(refused.status.code(), Some(73));
+                assert!(activity.try_wait().unwrap().is_none());
+                activity
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"done\n")
+                    .await
+                    .unwrap();
+                assert!(activity.wait().await.unwrap().success());
+            }
+            timeout(Duration::from_secs(5), async {
+                while !sender.is_finished() || source_lock_scaling_is_held(&lock).await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("caller loss detached a heartbeat sender or retained its kernel lock");
+        }
     }
 
     #[test]
@@ -5240,6 +6451,7 @@ exec /bin/ln \"$@\"\n",
                 marker,
                 bootstrap.as_deref(),
                 Duration::from_secs(20),
+                false,
             )
             .await
             .unwrap();
@@ -5279,6 +6491,7 @@ exec /bin/ln \"$@\"\n",
                 "SECOND",
                 bootstrap.as_deref(),
                 Duration::from_secs(20),
+                false,
             ));
             assert!(
                 timeout(Duration::from_millis(100), &mut second)
@@ -5317,6 +6530,7 @@ exec /bin/ln \"$@\"\n",
             "READY",
             bootstrap.as_deref(),
             Duration::from_secs(5),
+            false,
         )
         .await;
         assert!(
@@ -5347,6 +6561,7 @@ exec /bin/ln \"$@\"\n",
             "FIRST",
             bootstrap.as_deref(),
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();
@@ -5363,6 +6578,7 @@ exec /bin/ln \"$@\"\n",
             "SECOND",
             bootstrap.as_deref(),
             Duration::from_secs(20),
+            false,
         ));
         timeout(Duration::from_secs(5), async {
             loop {

@@ -120,7 +120,8 @@ pub struct BypassRecoveryConfig {
     /// Minimum free disk (GB) a worker must report on every probed root to pass
     /// the disk dimension.
     pub min_disk_free_gb: f64,
-    /// Minimum free inodes a worker must report on every probed root.
+    /// Minimum free inodes a worker must report on every probed root that has
+    /// a fixed inode pool. Filesystems without one (btrfs) are not checked.
     pub min_disk_inodes: u64,
     /// Disk roots whose capacity/inodes the probe reports (the roots real builds
     /// use). 11.1's mount-aware policy can supply precise roots; the default
@@ -326,7 +327,8 @@ impl SshRecoveryProber {
 ///
 /// `worker_binary_ok` requires the exact-path `rch-wkr` to have reported a
 /// version; `toolchain_ok` requires cargo plus every configured target/toolchain;
-/// `disk_ok` requires every probed root to clear both the byte and inode floor.
+/// `disk_ok` requires every probed root to clear the byte floor, and the inode
+/// floor when the root has a fixed inode pool.
 /// A reachable worker with a dimension we could not measure (no probed disk
 /// roots, no load fact) is not trapped on that dimension. A fully empty parse is
 /// unreachable — every dimension fails.
@@ -369,16 +371,18 @@ fn assess_probe_facts(
                 .any(|have| have.starts_with(t.as_str()))
         });
     let min_bytes = (config.min_disk_free_gb * BYTES_PER_GB) as u64;
-    // Git Bash reports `-` for NTFS inode availability; the capability parser
-    // represents that unavailable count as zero. Windows has no fixed Unix
-    // inode pool, so require free bytes there and retain both floors elsewhere.
+    // A filesystem without a fixed inode pool reports zero free inodes without
+    // being exhausted: btrfs reports 0 for every inode count, and Git Bash
+    // reports `-` on NTFS. Such a root only needs free bytes
+    // (`meets_inode_floor`); a fixed pool must also clear the inode floor.
+    // Windows keeps its OS-level exemption from the Unix inode floor.
     let requires_inodes = facts.os.as_deref() != Some("windows");
     let disk_ok = if facts.disk_roots.is_empty() {
         true
     } else {
         facts.disk_roots.iter().all(|r| {
             r.available_bytes >= min_bytes
-                && (!requires_inodes || r.available_inodes >= config.min_disk_inodes)
+                && (!requires_inodes || r.meets_inode_floor(config.min_disk_inodes))
         })
     };
     let load_ok = load_per_core.is_none_or(|lpc| lpc <= config.max_load_per_core);
@@ -2966,6 +2970,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn assess_disk_without_an_inode_pool_recovers_on_free_bytes() {
+        // btrfs reports 0 for every `df -Pi` column (#126). Free bytes decide
+        // its recovery, while a fixed pool with the same zero free inodes,
+        // or with too few, still refuses it.
+        let config = BypassRecoveryConfig::default();
+        for os in ["linux", "darwin", "unknown"] {
+            for (available_kb, inodes, expected) in [
+                ("1616000000", "0;0", true),
+                ("1048576", "0;0", false),
+                ("1616000000", "-;-", true),
+                ("1616000000", "0;6553600", false),
+                ("1616000000", "9999;6553600", false),
+                ("1616000000", "10000;6553600", true),
+                // `df -Pi` failed: an unmeasured zero is not evidence of a
+                // dynamic pool.
+                ("1616000000", ";", false),
+            ] {
+                let facts = parse_capability_probe(&format!(
+                    "RCH_FACT os={os}\n\
+                     RCH_FACT disk=/data/tmp;1953125000;{available_kb};{inodes}\n"
+                ));
+                assert_eq!(facts.disk_roots.len(), 1);
+                assert_eq!(
+                    assess_probe_facts(&facts, None, true, &config).disk_ok,
+                    expected,
+                    "os={os}, available_kb={available_kb}, inodes={inodes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disk_quarantine_without_an_inode_pool_recovers_once_bytes_are_free() {
+        let config = BypassRecoveryConfig::default();
+        let mut record = BypassRecord::new(
+            "btrfs-worker",
+            "h",
+            "u",
+            BypassFailureClass::DiskInodePressure,
+            T0,
+        );
+        record.disk_roots = vec!["/data/projects".to_string()];
+        let mut facts = facts_all_good();
+        facts.disk_roots = recovery_disk_config(&config, &record)
+            .disk_roots
+            .into_iter()
+            .map(|path| rch_common::DiskRootFacts {
+                path,
+                total_bytes: 1862 * GB,
+                available_bytes: 1541 * GB,
+                available_inodes: 0,
+                total_inodes: Some(0),
+            })
+            .collect();
+        assert!(
+            assess_recovery_probe_facts(&facts, Some(0.1), true, &config, &record).fully_healthy()
+        );
+
+        // The same zero free inodes in a fixed pool keep the quarantine.
+        for root in &mut facts.disk_roots {
+            root.total_inodes = Some(6_553_600);
+        }
+        let probe = assess_recovery_probe_facts(&facts, Some(0.1), true, &config, &record);
+        assert!(!probe.disk_ok);
+        assert!(!probe.fully_healthy());
     }
 
     #[test]

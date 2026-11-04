@@ -24,7 +24,11 @@ use rabs_sandbox::artifact_tree::{
     validate_tree_names,
 };
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
-use rabs_sandbox::dependency_context::{DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode};
+use rabs_sandbox::dependency_context::{
+    CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
+    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionMode,
+};
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -68,26 +72,33 @@ impl DeliveryMode {
 /// only from this exact request and an explicit worker advertisement, before
 /// disk creation, authentication grants or input upload. Recovery retrieves a
 /// sealed result and must not require the restarted worker to execute it again.
-pub(crate) fn negotiated_dependency_mode(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NegotiatedDependencyContext {
+    pub(crate) version: &'static str,
+    pub(crate) mode: DependencyExecutionMode,
+}
+
+pub(crate) fn negotiated_dependency_context(
     hello: &Value,
     request: &Value,
     mode: DeliveryMode,
-) -> io::Result<Option<DependencyExecutionMode>> {
+) -> io::Result<Option<NegotiatedDependencyContext>> {
     if mode == DeliveryMode::Resume {
         return Ok(None);
     }
     let Some(context) = request.get("dependency_context") else {
         return Ok(None);
     };
+    let version = match context.get("version").and_then(Value::as_str) {
+        Some(DEPENDENCY_CONTEXT_VERSION) => DEPENDENCY_CONTEXT_VERSION,
+        Some(CANONICAL_DEPENDENCY_CONTEXT_VERSION) => CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+        Some(CANONICAL_WORKSPACE_CONTEXT_VERSION) => CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        _ => return Err(invalid("unsupported dependency execution context")),
+    };
     require(
-        context["version"] == DEPENDENCY_CONTEXT_VERSION
-            && hello["dependency_contexts"]
-                .as_array()
-                .is_some_and(|versions| {
-                    versions
-                        .iter()
-                        .any(|version| version == DEPENDENCY_CONTEXT_VERSION)
-                }),
+        hello["dependency_contexts"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|offered| offered == version)),
         "worker lacks the required dependency execution context",
     )?;
     let selected = match context.get("execution_mode").and_then(Value::as_str) {
@@ -101,7 +112,75 @@ pub(crate) fn negotiated_dependency_mode(
             .is_some_and(|modes| modes.iter().any(|mode| mode == selected.as_str())),
         "worker lacks the required measured dependency execution mode",
     )?;
-    Ok(Some(selected))
+    if let Some(roots) = context.get("native_roots") {
+        let roots = roots
+            .as_array()
+            .ok_or_else(|| invalid("native roots must be an array"))?;
+        if !roots.is_empty() {
+            require(
+                version != DEPENDENCY_CONTEXT_VERSION,
+                "propagated native roots require canonical execution",
+            )?;
+            require(
+                hello["dependency_native_inputs"]
+                    .as_array()
+                    .is_some_and(|profiles| {
+                        profiles
+                            .iter()
+                            .any(|profile| profile == CANONICAL_NATIVE_ROOTS_CAPABILITY)
+                    }),
+                "worker lacks the required canonical propagated native roots capability",
+            )?;
+        }
+    }
+    if version != DEPENDENCY_CONTEXT_VERSION
+        && selected == DependencyExecutionMode::Metadata
+        && let Some(arguments) = request.get("args")
+    {
+        let mut argv = vec![
+            request["program"]
+                .as_str()
+                .ok_or_else(|| invalid("dependency execution program must be a string"))?
+                .to_owned(),
+        ];
+        for argument in arguments
+            .as_array()
+            .ok_or_else(|| invalid("dependency execution args must be an array"))?
+        {
+            argv.push(
+                argument
+                    .as_str()
+                    .ok_or_else(|| invalid("dependency execution args must be strings"))?
+                    .to_owned(),
+            );
+        }
+        let invocation = rabs_key::invocation::parse(&argv, None)
+            .map_err(|error| invalid(&format!("dependency execution invocation: {error:?}")))?;
+        if !invocation.native_libs.is_empty()
+            || invocation
+                .lib_search
+                .iter()
+                .any(|search| search.starts_with("native="))
+        {
+            // Use the same argv parser as planning and worker validation. An
+            // ordinary metadata capability does not imply this newer input
+            // class; fail before source/toolchain upload or execution ownership.
+            require(
+                hello["dependency_native_inputs"]
+                    .as_array()
+                    .is_some_and(|profiles| {
+                        profiles
+                            .iter()
+                            .any(|profile| profile == CANONICAL_NATIVE_METADATA_CAPABILITY)
+                    }),
+                "worker lacks the required canonical static native metadata capability",
+            )?;
+        }
+    }
+    Ok(Some(NegotiatedDependencyContext {
+        version,
+        mode: selected,
+    }))
 }
 
 const RESULT_RETENTION: &str = "durable-result-v1";
@@ -868,9 +947,10 @@ pub fn receive_operation(
                 .and_then(Value::as_array)
                 .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
         };
-        let dependency_mode = negotiated_dependency_mode(&hello, request, mode)?;
-        let require_canonical =
-            mode == DeliveryMode::Execute && dependency_mode != Some(DependencyExecutionMode::Rlib);
+        let dependency_context = negotiated_dependency_context(&hello, request, mode)?;
+        let require_canonical = mode == DeliveryMode::Execute
+            && dependency_context
+                .is_none_or(|selected| selected.mode != DependencyExecutionMode::Rlib);
         require(
             (!require_canonical || hello.get("canonical").and_then(Value::as_bool) == Some(true))
                 && number(&hello, "slots")? > 0
@@ -942,9 +1022,9 @@ pub fn receive_operation(
         create_directory(&destination.join("diagnostics"))?;
         create_directory(&destination.join("artifacts"))?;
         let mut ack = json!({"kind":"session-ok","output_transfer":"ranges-v1","recovery_protocol":"request-journal-v1"});
-        if let Some(mode) = dependency_mode {
-            ack["dependency_context"] = json!(DEPENDENCY_CONTEXT_VERSION);
-            ack["dependency_execution_mode"] = json!(mode.as_str());
+        if let Some(selected) = dependency_context {
+            ack["dependency_context"] = json!(selected.version);
+            ack["dependency_execution_mode"] = json!(selected.mode.as_str());
         }
         if expected.is_some() {
             ack["artifact_transfer"] = json!("files-v1");
@@ -2063,6 +2143,285 @@ mod tests {
         );
         assert_eq!(peer.sent[0]["dependency_execution_mode"], "rlib");
         assert_eq!(peer.sent[1], request);
+    }
+
+    #[test]
+    fn canonical_dependency_delivery_selects_the_exact_version_before_dispatch() {
+        for (version, offered, execution_mode, accepted) in [
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                "metadata",
+                true,
+            ),
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([CANONICAL_WORKSPACE_CONTEXT_VERSION]),
+                "rlib",
+                true,
+            ),
+            (
+                CANONICAL_WORKSPACE_CONTEXT_VERSION,
+                json!([
+                    DEPENDENCY_CONTEXT_VERSION,
+                    CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                ]),
+                "metadata",
+                false,
+            ),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                json!([CANONICAL_DEPENDENCY_CONTEXT_VERSION]),
+                "metadata",
+                true,
+            ),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                json!([DEPENDENCY_CONTEXT_VERSION]),
+                "metadata",
+                false,
+            ),
+            (
+                DEPENDENCY_CONTEXT_VERSION,
+                json!([CANONICAL_DEPENDENCY_CONTEXT_VERSION]),
+                "metadata",
+                false,
+            ),
+            (
+                CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                json!([
+                    DEPENDENCY_CONTEXT_VERSION,
+                    CANONICAL_DEPENDENCY_CONTEXT_VERSION
+                ]),
+                "rlib",
+                true,
+            ),
+            (
+                "canonical-dependency-exec-v1",
+                json!(["canonical-dependency-exec-v1"]),
+                "rlib",
+                false,
+            ),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut request = request();
+            request["dependency_context"] =
+                json!({"version":version,"execution_mode":execution_mode});
+            let mut peer = fixture(&destination);
+            peer.replies[0]["dependency_contexts"] = offered;
+            peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+            let result = receive_execution(&mut peer, &request, "worker", &destination);
+            if accepted {
+                let delivery = result.unwrap();
+                assert!(delivery.acknowledgments_confirmed);
+                assert_eq!(peer.sent[0]["dependency_context"], version);
+                assert_eq!(peer.sent[0]["dependency_execution_mode"], execution_mode);
+                assert_eq!(peer.sent[1], request);
+            } else {
+                assert!(!result.unwrap_err().execution_may_have_run);
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_dependency_recovery_does_not_reauthorize_execution() {
+        let no_execution = json!({"dependency_contexts":[],"dependency_execution_modes":[]});
+        for execution_mode in ["metadata", "rlib"] {
+            let request = json!({"dependency_context":{
+                "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,"execution_mode":execution_mode
+            }});
+            assert_eq!(
+                negotiated_dependency_context(&no_execution, &request, DeliveryMode::Resume)
+                    .unwrap(),
+                None
+            );
+            assert!(
+                negotiated_dependency_context(&no_execution, &request, DeliveryMode::Execute)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_metadata_negotiates_its_input_extension_without_changing_other_modes() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for arguments in [
+                json!(["-Lnative=/__rabs/out/cargo/debug/build/leaf/out", "lib.rs"]),
+                json!([
+                    "-L",
+                    "native=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-l",
+                    "static=leaf",
+                    "lib.rs"
+                ]),
+                json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-lstatic=leaf",
+                    "lib.rs"
+                ]),
+            ] {
+                let mut request = request();
+                request["args"] = arguments;
+                request["dependency_context"] =
+                    json!({"version":version,"execution_mode":"metadata"});
+                let mut hello = json!({
+                    "dependency_contexts":[version],
+                    "dependency_execution_modes":["metadata", "rlib"],
+                });
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_err()
+                );
+                assert_eq!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Resume).unwrap(),
+                    None
+                );
+                hello["dependency_native_inputs"] = json!([CANONICAL_NATIVE_METADATA_CAPABILITY]);
+                assert_eq!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).unwrap(),
+                    Some(NegotiatedDependencyContext {
+                        version,
+                        mode: DependencyExecutionMode::Metadata
+                    })
+                );
+                hello
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependency_native_inputs");
+                request["dependency_context"]["execution_mode"] = json!("rlib");
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+                request["dependency_context"]["execution_mode"] = json!("metadata");
+                request["args"] = json!(["-Ldependency=/__rabs/out/cargo/debug/deps", "lib.rs"]);
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn propagated_native_roots_require_explicit_capability_before_any_effect() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for mode in ["metadata", "rlib"] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("refused-native-roots");
+                let mut request = request();
+                request["dependency_context"] = json!({
+                    "version":version, "execution_mode":mode,
+                    "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out", "prefix":"native/0000", "directories":[]}]
+                });
+                request["args"] = json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/provider/out",
+                    "lib.rs"
+                ]);
+                let mut peer = fixture(&destination);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+                peer.replies[0]["dependency_native_inputs"] =
+                    json!([CANONICAL_NATIVE_METADATA_CAPABILITY]);
+                let mut hello = peer.replies[0].clone();
+                let failure =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+                assert!(!failure.execution_may_have_run);
+                assert!(
+                    failure
+                        .detail
+                        .contains("propagated native roots capability")
+                );
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+
+                hello["dependency_native_inputs"] = json!([
+                    CANONICAL_NATIVE_METADATA_CAPABILITY,
+                    CANONICAL_NATIVE_ROOTS_CAPABILITY
+                ]);
+                assert!(
+                    negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
+                );
+                assert_eq!(
+                    negotiated_dependency_context(&json!({}), &request, DeliveryMode::Resume)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_native_metadata_capability_refuses_before_disk_upload_or_dispatch() {
+        for version in [
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+            CANONICAL_WORKSPACE_CONTEXT_VERSION,
+        ] {
+            for offered in [
+                Value::Null,
+                json!(CANONICAL_NATIVE_METADATA_CAPABILITY),
+                json!([]),
+                json!(["canonical-generated-static-rlib-v1"]),
+                json!([{"profile":CANONICAL_NATIVE_METADATA_CAPABILITY}]),
+            ] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("refused-native-metadata");
+                let mut request = request();
+                request["dependency_context"] =
+                    json!({"version":version,"execution_mode":"metadata"});
+                request["args"] = json!([
+                    "-Lnative=/__rabs/out/cargo/debug/build/leaf/out",
+                    "-lstatic=leaf",
+                    "lib.rs"
+                ]);
+                let mut peer = fixture(&destination);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!(["metadata", "rlib"]);
+                peer.replies[0]["dependency_native_inputs"] = offered;
+                let failure =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+                assert!(!failure.execution_may_have_run);
+                assert!(failure.detail.contains("static native metadata capability"));
+                assert!(
+                    peer.sent.is_empty(),
+                    "no grant, input transfer or execution may precede negotiation"
+                );
+                assert!(!destination.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_archive_requires_both_the_version_and_measured_archive_capability() {
+        let request = json!({"dependency_context":{
+            "version":CANONICAL_DEPENDENCY_CONTEXT_VERSION,"execution_mode":"rlib"
+        }});
+        for hello in [
+            json!({"dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION],
+                "dependency_execution_modes":["metadata"]}),
+            json!({"dependency_contexts":["canonical-dependency-exec-v1"],
+                "dependency_execution_modes":["metadata","rlib"]}),
+        ] {
+            assert!(
+                negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_err()
+            );
+        }
+        let hello = json!({"canonical":false,
+            "dependency_contexts":[CANONICAL_DEPENDENCY_CONTEXT_VERSION],
+            "dependency_execution_modes":["rlib"]});
+        assert_eq!(
+            negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).unwrap(),
+            Some(NegotiatedDependencyContext {
+                version: CANONICAL_DEPENDENCY_CONTEXT_VERSION,
+                mode: DependencyExecutionMode::Rlib,
+            })
+        );
     }
 
     #[test]

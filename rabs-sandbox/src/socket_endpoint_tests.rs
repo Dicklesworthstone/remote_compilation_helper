@@ -70,7 +70,11 @@ fn uncertain_probe_results_never_retire_even_a_dead_socket() {
         io::ErrorKind::ConnectionReset,
         io::ErrorKind::Other,
     ] {
-        assert!(lease.retire_refused(observed, &io::Error::from(kind)).is_err());
+        assert!(
+            lease
+                .retire_refused(observed, &io::Error::from(kind))
+                .is_err()
+        );
         assert_eq!(lease.observe().unwrap(), Some(observed));
     }
 }
@@ -84,7 +88,11 @@ fn changed_probe_generation_is_not_retired() {
     let observed = lease.observe().unwrap().unwrap();
     fs::rename(&path, root.path().join("retained.sock")).unwrap();
     let replacement = private_socket(&path);
-    assert!(lease.retire_refused(observed, &connection_refused()).is_err());
+    assert!(
+        lease
+            .retire_refused(observed, &connection_refused())
+            .is_err()
+    );
     assert!(UnixStream::connect(&path).is_ok());
     drop(replacement);
 }
@@ -142,7 +150,12 @@ fn symlink_and_hardlinked_sockets_are_never_reclaimed_or_chmodded() {
     let mut lease = EndpointLease::acquire(&alias).unwrap();
     assert!(lease.observe().is_err());
     assert!(lease.claim_bound().is_err());
-    assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     let hardlink = root.path().join("hardlink.sock");
     fs::hard_link(&original, &hardlink).unwrap();
     let mut lease = EndpointLease::acquire(&hardlink).unwrap();
@@ -217,7 +230,12 @@ fn insecure_parent_or_lock_is_refused_without_repair() {
     symlink(&target, &lock).unwrap();
     assert!(EndpointLease::acquire(&root.path().join("edge.sock")).is_err());
     assert_eq!(fs::read(&target).unwrap(), b"preserve");
-    assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -240,7 +258,9 @@ fn explicit_unlock_releases_even_with_a_duplicate_file_description() {
 #[test]
 fn raw_names_sibling_churn_and_permanent_locks_do_not_invalidate_ownership() {
     let root = directory();
-    let path = root.path().join(OsString::from_vec(b"edge-\xff.sock".to_vec()));
+    let path = root
+        .path()
+        .join(OsString::from_vec(b"edge-\xff.sock".to_vec()));
     let mut lease = EndpointLease::acquire(&path).unwrap();
     let listener = UnixListener::bind(&path).unwrap();
     lease.claim_bound().unwrap();
@@ -272,7 +292,11 @@ fn traversal_and_repeated_binding_never_authorize_retirement() {
     lease.claim_bound().unwrap();
     assert!(lease.claim_bound().is_err());
     let observed = lease.observe().unwrap().unwrap();
-    assert!(lease.retire_refused(observed, &connection_refused()).is_err());
+    assert!(
+        lease
+            .retire_refused(observed, &connection_refused())
+            .is_err()
+    );
     assert!(UnixStream::connect(&path).is_ok());
     drop(listener);
 }

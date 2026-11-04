@@ -60,7 +60,10 @@ fn fixture() -> (PathBuf, Vec<(String, PathBuf)>, u64) {
             // A sparse file bigger than the WHOLE capture budget proves the
             // exclusion happens before retaining bytes, not after filtering
             // the manifest. The old classifier fails with ByteLimitExceeded.
-            fs::File::create(path).unwrap().set_len(STATE_BYTES).unwrap();
+            fs::File::create(path)
+                .unwrap()
+                .set_len(STATE_BYTES)
+                .unwrap();
         }
     }
     let budget = (INPUTS.len() * INPUT.len() * roots.len()) as u64;

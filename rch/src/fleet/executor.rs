@@ -3448,6 +3448,32 @@ RCH_FACT cargo_version=cargo 1.98.0-nightly\n";
         assert_eq!(level, PressureLevel::Critical);
     }
 
+    // A filesystem without a fixed inode pool (btrfs reports 0 for every
+    // `df -Pi` column) is admissible on its bytes; an exhausted fixed pool
+    // reporting the same zero free inodes is still critical.
+    #[tokio::test]
+    async fn smoke_disk_inode_ignores_filesystems_without_an_inode_pool() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        for (inodes, expected) in [
+            ("0;0", PressureLevel::Ok),
+            ("-;-", PressureLevel::Ok),
+            ("0;6553600", PressureLevel::Critical),
+        ] {
+            let probe_out = format!("RCH_FACT disk=/data/tmp;1048576;524288;{inodes}\n");
+            let mock =
+                MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+            let level = run_smoke_disk_inode_with_runner(
+                &smoke_worker(),
+                &["/data/tmp".to_string()],
+                &PressureThresholds::default(),
+                &mock,
+            )
+            .await
+            .unwrap();
+            assert_eq!(level, expected, "inodes={inodes}");
+        }
+    }
+
     // No probed roots (df returned nothing) => Unknown, never a silent pass.
     #[tokio::test]
     async fn smoke_disk_inode_unknown_when_no_roots() {

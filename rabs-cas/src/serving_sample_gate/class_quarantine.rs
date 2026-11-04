@@ -87,7 +87,11 @@ pub(super) fn refusal(
             [SqlValue::Text(_)] => return Ok(Some(PrivateExecutionReason::ElevatedClassRisk)),
             _ => return Err(StoreError::Corruption("invalid live class receipt".into())),
         },
-        _ => return Err(StoreError::Corruption("ambiguous live class receipt".into())),
+        _ => {
+            return Err(StoreError::Corruption(
+                "ambiguous live class receipt".into(),
+            ));
+        }
     }
     let parameters = [
         SqlValue::Text(CLASS_RECEIPT.to_owned()),
@@ -110,9 +114,17 @@ pub(super) fn refusal(
                         reason,
                     }));
                 }
-                _ => return Err(StoreError::Corruption("invalid class safety witness".into())),
+                _ => {
+                    return Err(StoreError::Corruption(
+                        "invalid class safety witness".into(),
+                    ));
+                }
             },
-            _ => return Err(StoreError::Corruption("unbounded class safety query".into())),
+            _ => {
+                return Err(StoreError::Corruption(
+                    "unbounded class safety query".into(),
+                ));
+            }
         }
     }
     Ok(None)
@@ -222,7 +234,10 @@ mod tests {
         // The requested key's own publication, serving state and evidence
         // stay unchanged. Demoting a class does not fabricate N divergences.
         assert_eq!(
-            store.serving_disposition_key(&requested).unwrap().as_deref(),
+            store
+                .serving_disposition_key(&requested)
+                .unwrap()
+                .as_deref(),
             Some("servable")
         );
         assert!(
@@ -275,7 +290,9 @@ mod tests {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         healthy(&mut store, 1, 10);
         let culprit = healthy(&mut store, 2, 11);
-        store.record_verification_sample(&action(2), 999_999, false, 99).unwrap();
+        store
+            .record_verification_sample(&action(2), 999_999, false, 99)
+            .unwrap();
         for flag in [-1, 0, 2, i64::MAX] {
             store.engine_mut().execute(
                 "UPDATE verification_samples SET passed = ?1 WHERE action_key = ?2 AND seq = 99",
@@ -350,10 +367,22 @@ mod tests {
         let legacy = published(&mut store, 3, 12);
         incident(&mut store, &legacy, DEPENDENCY_CLASS);
         store
-            .record_decision_receipt(CLASS_RECEIPT, &legacy, 1, DEPENDENCY_CLASS, "wrong sequence")
+            .record_decision_receipt(
+                CLASS_RECEIPT,
+                &legacy,
+                1,
+                DEPENDENCY_CLASS,
+                "wrong sequence",
+            )
             .unwrap();
         store
-            .record_decision_receipt("untrusted-class", &legacy, 0, DEPENDENCY_CLASS, "wrong kind")
+            .record_decision_receipt(
+                "untrusted-class",
+                &legacy,
+                0,
+                DEPENDENCY_CLASS,
+                "wrong kind",
+            )
             .unwrap();
         assert_eq!(decide(&mut store, 1), SampleGateDecision::ServeFromCache);
         // Once the real submission binding exists, legacy evidence is not lost.

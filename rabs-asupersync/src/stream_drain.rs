@@ -280,8 +280,7 @@ impl LaneDrain {
     /// # Errors
     /// Inconsistent receipts, poisoned custody, or a changed retained file.
     pub fn reader(&self) -> io::Result<impl Read + '_> {
-        if (self.resident.len() as u64).checked_add(self.spilled_bytes())
-            != Some(self.total_bytes)
+        if (self.resident.len() as u64).checked_add(self.spilled_bytes()) != Some(self.total_bytes)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -285,6 +285,94 @@ pub fn derive_dependency_output_declarations(
     invocation: &NormalizedRustcInvocation,
     host_target: &str,
 ) -> Result<OutputDeclarationSet, DerivationRefusal> {
+    derive_compilation_output_declarations(
+        invocation,
+        host_target,
+        CompilationOutputProfile::Dependency,
+    )
+}
+
+/// Derive exact outputs for a fresh canonical workspace compilation.
+///
+/// Ordinary libraries retain the dependency adapter's file-only codegen
+/// contract. Binary and test-harness compilations are additionally supported
+/// only when rustc emits exactly metadata and dep-info, as in `cargo check`.
+/// Cargo's custom `harness = false` tests and benches omit both `--test` and
+/// `--crate-type`; their explicit `--cfg test` is retained without rewriting
+/// the invocation. The coordinator separately requires a selected test/bench
+/// root for this form.
+/// Their `.rmeta` is a required, ordinarily empty file: it is neither omitted
+/// nor evidence that an executable or test result exists. The caller must bind
+/// the selected Cargo unit and retain request-owned execution and installation;
+/// this adapter grants no dependency or workspace cache authority.
+///
+/// # Errors
+/// An unmodeled compiler, source, output mode, option or target naming family.
+pub fn derive_workspace_output_declarations(
+    invocation: &NormalizedRustcInvocation,
+    host_target: &str,
+) -> Result<OutputDeclarationSet, DerivationRefusal> {
+    derive_compilation_output_declarations(
+        invocation,
+        host_target,
+        CompilationOutputProfile::WorkspaceExecutionOnly,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompilationOutputProfile {
+    Dependency,
+    WorkspaceExecutionOnly,
+}
+
+fn exact_metadata_outputs(invocation: &NormalizedRustcInvocation) -> bool {
+    invocation.emit.len() == 2
+        && invocation.emit.iter().any(|kind| kind == "dep-info")
+        && invocation.emit.iter().any(|kind| kind == "metadata")
+}
+
+fn check_compilation_output_kind(
+    invocation: &NormalizedRustcInvocation,
+    profile: CompilationOutputProfile,
+) -> Result<(), DerivationRefusal> {
+    let test_count = invocation
+        .passthrough
+        .iter()
+        .filter(|arg| *arg == "--test")
+        .count();
+    let library = !invocation.crate_types.is_empty()
+        && invocation
+            .crate_types
+            .iter()
+            .all(|kind| matches!(kind.as_str(), "lib" | "rlib"));
+    if library && (test_count == 0 || profile == CompilationOutputProfile::Dependency) {
+        return Ok(());
+    }
+    if profile == CompilationOutputProfile::WorkspaceExecutionOnly
+        && exact_metadata_outputs(invocation)
+        && test_count <= 1
+        && ((invocation.crate_types.len() == 1
+            && matches!(invocation.crate_types[0].as_str(), "lib" | "rlib" | "bin"))
+            || (invocation.crate_types.is_empty()
+                && (test_count == 1
+                    || (test_count == 0 && invocation.cfgs.iter().any(|cfg| cfg == "test")))))
+    {
+        return Ok(());
+    }
+    Err(DerivationRefusal::UnsupportedDependencyInvocation(
+        if profile == CompilationOutputProfile::Dependency {
+            "dependency outputs require --crate-type lib or rlib"
+        } else {
+            "workspace outputs require ordinary libraries or binary/test metadata without linking"
+        },
+    ))
+}
+
+fn derive_compilation_output_declarations(
+    invocation: &NormalizedRustcInvocation,
+    host_target: &str,
+    profile: CompilationOutputProfile,
+) -> Result<OutputDeclarationSet, DerivationRefusal> {
     let unsupported = DerivationRefusal::UnsupportedDependencyInvocation;
     let compiler = invocation.compiler_argv0.rsplit(['/', '\\']).next();
     if !matches!(compiler, Some("rustc" | "rustc.exe"))
@@ -303,16 +391,7 @@ pub fn derive_dependency_output_declarations(
     if invocation.out_dir.as_deref().is_none_or(str::is_empty) {
         return Err(unsupported("dependency outputs require --out-dir"));
     }
-    if invocation.crate_types.is_empty()
-        || invocation
-            .crate_types
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
-    {
-        return Err(unsupported(
-            "dependency outputs require --crate-type lib or rlib",
-        ));
-    }
+    check_compilation_output_kind(invocation, profile)?;
     let target = invocation.target.as_deref().unwrap_or(host_target);
     if !matches!(
         target,
@@ -334,7 +413,7 @@ pub fn derive_dependency_output_declarations(
     {
         return Err(DerivationRefusal::UnsafeOutputName(name.to_owned()));
     }
-    check_dependency_output_options(invocation)?;
+    check_compilation_output_options(invocation, profile)?;
     let declarations = derive_output_declarations(invocation, host_target)?;
     // Knowing the output names does not close the compiler's input reads.
     // The live capture path enforces source/include and tracked environment
@@ -376,6 +455,29 @@ pub fn derive_dependency_output_declarations(
 /// the explicitly modeled output contract. No option is removed or rewritten.
 pub fn check_dependency_output_options(
     invocation: &NormalizedRustcInvocation,
+) -> Result<(), DerivationRefusal> {
+    check_compilation_output_options(invocation, CompilationOutputProfile::Dependency)
+}
+
+/// Check the workspace execution adapter's host-independent output contract.
+///
+/// This adds binary/test metadata compilation to the ordinary library modes,
+/// without admitting linking, running a harness, or any result-cache access.
+/// The complete derivation still validates the compiler, source, output root
+/// and observed target family before worker execution.
+///
+/// # Errors
+/// An unmodeled crate/output shape, unstable/codegen control or passthrough flag.
+pub fn check_workspace_output_options(
+    invocation: &NormalizedRustcInvocation,
+) -> Result<(), DerivationRefusal> {
+    check_compilation_output_kind(invocation, CompilationOutputProfile::WorkspaceExecutionOnly)?;
+    check_compilation_output_options(invocation, CompilationOutputProfile::WorkspaceExecutionOnly)
+}
+
+fn check_compilation_output_options(
+    invocation: &NormalizedRustcInvocation,
+    profile: CompilationOutputProfile,
 ) -> Result<(), DerivationRefusal> {
     for kind in emit_kinds(invocation)? {
         if !matches!(kind.as_str(), "link" | "metadata" | "dep-info") {
@@ -444,6 +546,12 @@ pub fn check_dependency_output_options(
     }
     let mut passthrough = invocation.passthrough.iter();
     while let Some(arg) = passthrough.next() {
+        if profile == CompilationOutputProfile::WorkspaceExecutionOnly
+            && exact_metadata_outputs(invocation)
+            && arg == "--test"
+        {
+            continue;
+        }
         let (name, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
@@ -480,6 +588,106 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    #[test]
+    fn workspace_metadata_outputs_cover_binaries_and_test_harnesses_without_dependency_authority() {
+        for shape in [
+            vec!["--crate-type=bin"],
+            vec!["--test"],
+            vec!["--cfg", "test"],
+            vec!["--test", "--crate-type=lib"],
+            vec!["--test", "--crate-type=rlib"],
+            vec!["--test", "--crate-type=bin"],
+        ] {
+            let mut args = vec![
+                "--crate-name=app",
+                "--emit=dep-info,metadata",
+                "--out-dir=/work/deps",
+                "-Cextra-filename=-checked",
+                "src/main.rs",
+            ];
+            args.extend(shape);
+            let inv = invocation(&args);
+            assert!(check_workspace_output_options(&inv).is_ok(), "{args:?}");
+            let outputs =
+                derive_workspace_output_declarations(&inv, "x86_64-unknown-linux-gnu").unwrap();
+            assert_eq!(names(&outputs), ["app-checked.d", "libapp-checked.rmeta"]);
+            assert!(outputs.declarations.iter().all(|output| !output.optional));
+            assert!(
+                derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_metadata_adapter_refuses_linking_unknown_modes_and_redirected_outputs() {
+        for shape in [
+            vec!["--crate-type=bin"],
+            vec!["--test"],
+            vec!["--cfg", "test"],
+        ] {
+            let mut args = vec![
+                "--crate-name=app",
+                "--emit=dep-info,metadata",
+                "--out-dir=/work/deps",
+                "src/main.rs",
+            ];
+            args.extend(shape);
+            let inv = invocation(&args);
+            for emit in [
+                vec![],
+                vec!["dep-info"],
+                vec!["metadata"],
+                vec!["link", "dep-info"],
+                vec!["link", "metadata", "dep-info"],
+                vec!["dep-info", "metadata=/elsewhere/result"],
+                vec!["dep-info", "metadata", "metadata"],
+            ] {
+                let mut changed = inv.clone();
+                changed.emit = emit.iter().map(|kind| (*kind).to_owned()).collect();
+                assert!(
+                    check_workspace_output_options(&changed).is_err(),
+                    "{args:?} {emit:?}"
+                );
+                assert!(
+                    derive_workspace_output_declarations(&changed, "x86_64-unknown-linux-gnu")
+                        .is_err()
+                );
+            }
+            for extra in [
+                vec!["-o", "/elsewhere/result"],
+                vec!["--test=hidden"],
+                vec!["--print=file-names"],
+                vec!["-Zunpretty=expanded"],
+                vec!["-Cincremental=/mutable"],
+            ] {
+                let mut changed = args.clone();
+                changed.extend(extra);
+                assert!(check_workspace_output_options(&invocation(&changed)).is_err());
+            }
+        }
+        for shape in [
+            vec![],
+            vec!["--cfg=testing"],
+            vec!["--cfg=test=\"true\""],
+            vec!["--crate-type=cdylib"],
+            vec!["--crate-type=proc-macro"],
+            vec!["--crate-type=bin,lib"],
+            vec!["--test", "--test"],
+        ] {
+            let mut args = vec![
+                "--crate-name=app",
+                "--emit=dep-info,metadata",
+                "--out-dir=/work/deps",
+                "src/main.rs",
+            ];
+            args.extend(shape);
+            assert!(
+                check_workspace_output_options(&invocation(&args)).is_err(),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -735,7 +943,10 @@ mod tests {
                 let general = derive_output_declarations(&inv, host).unwrap();
                 assert!(!general.declarations.is_empty());
                 assert!(
-                    general.declarations.iter().all(|d| d.class != OutputClass::DepInfo)
+                    general
+                        .declarations
+                        .iter()
+                        .all(|d| d.class != OutputClass::DepInfo)
                 );
                 assert_eq!(
                     derive_dependency_output_declarations(&inv, host),
@@ -952,14 +1163,16 @@ mod tests {
                         let mut threaded = dependency(&args);
                         threaded.emit = baseline.emit.clone();
                         let original = threaded.clone();
-                        let expected = derive_dependency_output_declarations(&baseline, host)
-                            .unwrap();
-                        let actual = derive_dependency_output_declarations(&threaded, host)
-                            .unwrap();
+                        let expected =
+                            derive_dependency_output_declarations(&baseline, host).unwrap();
+                        let actual =
+                            derive_dependency_output_declarations(&threaded, host).unwrap();
                         assert_eq!(actual, expected, "{host}: {args:?} {emit}");
                         assert_eq!(threaded, original, "admission must not rewrite rustc argv");
                         assert_ne!(threaded.canonical_bytes(), baseline.canonical_bytes());
-                        threaded.unstable.push(("embed-metadata".into(), Some("no".into())));
+                        threaded
+                            .unstable
+                            .push(("embed-metadata".into(), Some("no".into())));
                         assert_eq!(
                             derive_dependency_output_declarations(&threaded, host).unwrap(),
                             expected,
@@ -988,7 +1201,8 @@ mod tests {
             Some("4294967296"),
         ] {
             let mut inv = dependency(&[]);
-            inv.unstable.push(("threads".into(), value.map(str::to_owned)));
+            inv.unstable
+                .push(("threads".into(), value.map(str::to_owned)));
             assert!(
                 matches!(
                     derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
@@ -1026,8 +1240,8 @@ mod tests {
     #[test]
     fn frontend_thread_count_is_bound_to_the_full_live_key_and_toolchain_profile() {
         use crate::live_dependency::{
-            LiveRustcRequest, ToolchainFacts, dep_info_closure_violation,
-            live_dependency_key, plan_dependency_action,
+            LiveRustcRequest, ToolchainFacts, dep_info_closure_violation, live_dependency_key,
+            plan_dependency_action,
         };
         use crate::typed_digest::compute;
         use rabs_protocol::input_evidence::{

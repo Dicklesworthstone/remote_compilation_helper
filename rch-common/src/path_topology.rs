@@ -19,6 +19,7 @@ pub const DEFAULT_ALIAS_PROJECT_ROOT: &str = "/dp";
 pub struct PathTopologyPolicy {
     canonical_root: PathBuf,
     alias_root: PathBuf,
+    off_root: bool,
 }
 
 impl PathTopologyPolicy {
@@ -27,7 +28,43 @@ impl PathTopologyPolicy {
         Self {
             canonical_root,
             alias_root,
+            off_root: false,
         }
+    }
+
+    /// Mark whether this topology policy comes from an ad-hoc off-root override
+    /// (for example `RCH_CANONICAL_PROJECT_ROOT` pointing at a scratch tree).
+    pub fn with_off_root(mut self, off_root: bool) -> Self {
+        self.off_root = off_root;
+        self
+    }
+
+    /// Whether this policy represents an off-root scratch topology that should
+    /// be mapped under `<remote_base>/offroot/<hash>/<rel>` on workers (bd-5edh1).
+    pub fn is_off_root(&self) -> bool {
+        self.off_root
+            || self.alias_root.to_string_lossy().ends_with(".rch-alias")
+            || self.canonical_root.starts_with("/private/tmp")
+            || self.canonical_root.starts_with("/var/folders")
+    }
+
+    /// Worker-managed base directory (`<remote_base>/offroot/<16-hex-hash>`)
+    /// for mirrors of this off-root canonical root (bd-5edh1).
+    pub fn offroot_worker_canonical_root(&self, remote_base: &str) -> Result<PathBuf, String> {
+        let remote_base = crate::types::validate_remote_base(remote_base)?;
+        if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
+            return Err("remote_base contains an invalid path character".to_string());
+        }
+        let canonical_trimmed = self
+            .canonical_root
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        let hash =
+            blake3::hash(format!("rch.offroot_canonical_root.v1\0{canonical_trimmed}").as_bytes())
+                .to_hex();
+        let short_hash = &hash.as_str()[..16];
+        Ok(PathBuf::from(remote_base).join("offroot").join(short_hash))
     }
 
     /// Canonical root path.
@@ -46,6 +83,7 @@ impl Default for PathTopologyPolicy {
         Self {
             canonical_root: PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT),
             alias_root: PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT),
+            off_root: false,
         }
     }
 }

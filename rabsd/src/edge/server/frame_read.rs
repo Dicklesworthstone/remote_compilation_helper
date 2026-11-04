@@ -21,24 +21,26 @@ pub(super) async fn read_frame(
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
     let mut frame = Vec::new();
-    poll_fn(|cx| loop {
-        let available = match Pin::new(&mut *reader).poll_fill_buf(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(_)) => return Poll::Ready(None),
-            Poll::Ready(Ok(available)) => available,
-        };
-        if available.is_empty() {
-            return Poll::Ready(None);
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let count = newline.unwrap_or(available.len());
-        if count > max_bytes.saturating_sub(frame.len()) {
-            return Poll::Ready(None);
-        }
-        frame.extend_from_slice(&available[..count]);
-        Pin::new(&mut *reader).consume(count + usize::from(newline.is_some()));
-        if newline.is_some() {
-            return Poll::Ready(Some(std::mem::take(&mut frame)));
+    poll_fn(|cx| {
+        loop {
+            let available = match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(None),
+                Poll::Ready(Ok(available)) => available,
+            };
+            if available.is_empty() {
+                return Poll::Ready(None);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.unwrap_or(available.len());
+            if count > max_bytes.saturating_sub(frame.len()) {
+                return Poll::Ready(None);
+            }
+            frame.extend_from_slice(&available[..count]);
+            Pin::new(&mut *reader).consume(count + usize::from(newline.is_some()));
+            if newline.is_some() {
+                return Poll::Ready(Some(std::mem::take(&mut frame)));
+            }
         }
     })
     .await

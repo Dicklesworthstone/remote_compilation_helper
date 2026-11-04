@@ -2748,6 +2748,13 @@ fn apply_env_overrides_inner(
         .to_policy()
         .canonical_root()
         .to_path_buf();
+    let derived_scratch_alias = derived_scratch_alias_root(
+        get_env("RCH_CANONICAL_PROJECT_ROOT").as_deref(),
+        &canonical_before_env,
+    );
+    if derived_scratch_alias.is_some() {
+        config.path_topology.off_root = true;
+    }
     if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT") {
         config.path_topology.canonical_root = Some(val);
         if let Some(ref mut sources) = sources {
@@ -2767,10 +2774,7 @@ fn apply_env_overrides_inner(
                 ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".to_string()),
             );
         }
-    } else if let Some(alias) = derived_scratch_alias_root(
-        get_env("RCH_CANONICAL_PROJECT_ROOT").as_deref(),
-        &canonical_before_env,
-    ) {
+    } else if let Some(alias) = derived_scratch_alias {
         // bd-xz7at: worker topology setup makes the alias point at the
         // canonical root. Keeping `/dp` (already -> /data/projects on workers)
         // for a scratch canonical root claimed `/dp`, i.e. all of

@@ -125,6 +125,63 @@ fn confirm_source_pair_execution(
     Ok(())
 }
 
+#[derive(Default)]
+pub(super) struct CompileUiState {
+    progress: Option<CompilationProgress>,
+    pub(super) output: String,
+    pub(super) output_truncated: bool,
+    crates_compiled: Option<u32>,
+    warnings: Option<u32>,
+}
+
+impl CompileUiState {
+    pub(super) fn new(progress: Option<CompilationProgress>) -> Self {
+        Self {
+            progress,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn capture_stderr(
+        &mut self,
+        line: &str,
+        capture: &mut String,
+        diagnostic: bool,
+        mut emit: impl FnMut(&str),
+    ) {
+        if diagnostic {
+            // Attempt-bound failure causes must survive both UI truncation
+            // and an unconfirmed execution return before result processing.
+            emit(line);
+        } else if let Some(progress) = self.progress.as_mut() {
+            progress.update_from_line(line);
+            if !self.output_truncated {
+                const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+                if self.output.len() + line.len() <= MAX_OUTPUT_BYTES {
+                    self.output.push_str(line);
+                } else {
+                    self.output_truncated = true;
+                }
+            }
+        } else {
+            emit(line);
+        }
+        capture.push_str(line);
+    }
+}
+
+pub(super) fn capture_disk_budget_diagnostic(
+    pipeline: &TransferPipeline,
+    line: &str,
+    state: &mut CompileUiState,
+    capture: &mut String,
+    emit: impl FnMut(&str),
+) -> Option<crate::transfer::RemoteBuildDiskBudgetExceeded> {
+    let failure = pipeline.parse_disk_budget_marker(line)?;
+    state.capture_stderr(line, capture, true, emit);
+    Some(failure)
+}
+
 /// A holder can disappear while durable completion is being read. Recheck the
 /// actual guard before turning a setup refusal into permission to fail over.
 pub(super) fn ensure_remote_process_setup_after_completion(
@@ -758,7 +815,7 @@ async fn execute_remote_compilation_inner(
     };
 
     let clean_overlay_cargo = clean_overlay.is_some()
-        && (kind.is_some_and(|kind| kind.command_base() == "cargo")
+        && (kind.is_some_and(|kind| kind.command_base() == "cargo") // ubs:ignore[rust.security.constant-time-compare] — compares public allowlisted compiler names, never secret values.
             || classify_command(command)
                 .kind
                 .is_some_and(|kind| kind.command_base() == "cargo"));
@@ -1107,6 +1164,16 @@ async fn execute_remote_compilation_inner(
     let project_lane = worker.project_lane;
     let ordinary_mirror =
         clean_overlay.is_none() && !owned_source_content_pair && source_content_build_id.is_none();
+    if ordinary_mirror && !worker_is_windows && topology_policy.is_off_root() {
+        for entry in &mut sync_plan {
+            entry.remote_root = super::dependency_closure::map_offroot_sync_root_to_remote_root(
+                &entry.local_root,
+                &entry.project_id,
+                topology_policy,
+                &transfer_config.remote_base,
+            )?;
+        }
+    }
     if project_lane > 0 && ordinary_mirror && !worker_is_windows {
         for entry in &mut sync_plan {
             entry.remote_root = project_lane_remote_root(&entry.remote_root, project_lane);
@@ -1373,11 +1440,20 @@ async fn execute_remote_compilation_inner(
     // Initialize under the registry mutex before any job intent or pair/source
     // lock exists. Its bounded wait must not block exact-owner recovery.
     if durable_sources {
-        durable_lease.context(
+        let writer = durable_lease.context(
             "remote source ownership requires an admitted durable job lease; use rch exec",
         )?;
         if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
-            .await?
+            .await
+            .map_err(|error| {
+                writer.source_namespace_preflight_failed(
+                    &worker_config.id,
+                    build_id,
+                    local_wrapper_id,
+                    SourceNamespacePreflightStage::TopologyProbe,
+                    error,
+                )
+            })?
         {
             reporter
                 .verbose("[RCH] initializing shared path translation without claiming its bases");
@@ -1389,7 +1465,16 @@ async fn execute_remote_compilation_inner(
             &remote_topology_policy,
             &recovery_identity,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            writer.source_namespace_preflight_failed(
+                &worker_config.id,
+                build_id,
+                local_wrapper_id,
+                SourceNamespacePreflightStage::NamespaceInitialization,
+                error,
+            )
+        })?;
     }
     let source_target_root = sync_plan
         .iter()
@@ -1498,7 +1583,11 @@ async fn execute_remote_compilation_inner(
     // job's source grant and cannot prepare any of its selected destinations.
     // A lane's roots are private mirrors, never the canonical checkouts the
     // repo updater converges (bd-sgvod).
-    if clean_overlay.is_none() && !source_content_receipt && project_lane == 0 {
+    if clean_overlay.is_none()
+        && !source_content_receipt
+        && project_lane == 0
+        && !topology_policy.is_off_root()
+    {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -2161,13 +2250,6 @@ async fn execute_remote_compilation_inner(
     let disk_usage_exit_code = Rc::new(Cell::new(None::<i32>));
     let disk_usage_conflict = Rc::new(Cell::new(false));
 
-    struct CompileUiState {
-        progress: Option<CompilationProgress>,
-        output: String,
-        output_truncated: bool,
-        crates_compiled: Option<u32>,
-        warnings: Option<u32>,
-    }
     let use_compile_progress = progress_enabled
         && matches!(
             kind,
@@ -2179,21 +2261,15 @@ async fn execute_remote_compilation_inner(
                     | CompilationKind::CargoBench
             )
         );
-    let ui_state = Rc::new(RefCell::new(CompileUiState {
-        progress: if use_compile_progress {
-            Some(CompilationProgress::new(
-                output_ctx,
-                worker_config.id.as_str().to_string(),
-                reporter.visibility == OutputVisibility::None,
-            ))
-        } else {
-            None
-        },
-        output: String::new(),
-        output_truncated: false,
-        crates_compiled: None,
-        warnings: None,
-    }));
+    let ui_state = Rc::new(RefCell::new(CompileUiState::new(if use_compile_progress {
+        Some(CompilationProgress::new(
+            output_ctx,
+            worker_config.id.as_str().to_string(),
+            reporter.visibility == OutputVisibility::None,
+        ))
+    } else {
+        None
+    })));
 
     // Add per-worker CARGO_HOME isolation to prevent cache lock contention
     let guarded_command = if owned_source_content_pair {
@@ -2237,6 +2313,7 @@ async fn execute_remote_compilation_inner(
     let defer_cargo_stdout = reporter.cargo_json_stdout;
 
     if let Some(session) = recovery_session.as_mut() {
+        session.verify_publication_suitability().await?;
         session.starting_execution()?;
     }
     // Heap-pinned: the streaming execution future is large (bd-uz82c).
@@ -2287,12 +2364,19 @@ async fn execute_remote_compilation_inner(
         move |line| {
             // Capture the attempt-bound control receipts before any bounded
             // output/UI buffer can discard a late disk failure.
-            if let Some(failure) = deadline_pipeline.parse_disk_budget_marker(line) {
+            if let Some(failure) = capture_disk_budget_diagnostic(
+                &deadline_pipeline,
+                line,
+                &mut ui_state_stderr.borrow_mut(),
+                &mut stderr_capture_stderr.borrow_mut(),
+                |line| eprint!("{line}"),
+            ) {
                 *disk_failure_stderr.borrow_mut() = Some(failure);
                 return;
             }
             if let Some(peak) = deadline_pipeline.parse_disk_usage_marker(line) {
                 let status = deadline_pipeline.parse_disk_usage_exit_code(line);
+                // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                 if disk_usage_exit_stderr.get().is_some() && disk_usage_exit_stderr.get() != status
                 {
                     disk_usage_conflict_stderr.set(true);
@@ -2307,29 +2391,19 @@ async fn execute_remote_compilation_inner(
                 return;
             }
             if line.trim_end_matches(['\r', '\n']) == process_setup_marker {
+                // ubs:ignore[rust.security.constant-time-compare] — attempt setup sentinel display filter; guarded completion receipts remain independently required.
                 return;
             }
             if let Some(state) = heartbeat_state_stderr.as_ref() {
                 mark_heartbeat_progress(state);
             }
             // Write stderr lines to stderr and capture for analysis
-            let mut state = ui_state_stderr.borrow_mut();
-            if let Some(progress) = state.progress.as_mut() {
-                progress.update_from_line(line);
-                if !state.output_truncated {
-                    const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-                    if state.output.len() + line.len() <= MAX_OUTPUT_BYTES {
-                        state.output.push_str(line);
-                    } else {
-                        state.output_truncated = true;
-                    }
-                }
-            } else {
-                eprint!("{}", line);
-            }
-            drop(state);
-
-            stderr_capture_stderr.borrow_mut().push_str(line);
+            ui_state_stderr.borrow_mut().capture_stderr(
+                line,
+                &mut stderr_capture_stderr.borrow_mut(),
+                false,
+                |line| eprint!("{line}"),
+            );
         },
     ))
     .await
@@ -2347,7 +2421,7 @@ async fn execute_remote_compilation_inner(
                     "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
                 )?;
             anyhow::ensure!(
-                completed == result.exit_code,
+                completed == result.exit_code, // ubs:ignore[rust.security.constant-time-compare] — public i32 completion and SSH exit statuses; mismatch retains unconfirmed ownership.
                 "SSH status disagrees with durable completion"
             );
             session.completed(completed)?;
@@ -2358,7 +2432,11 @@ async fn execute_remote_compilation_inner(
     }
 
     let mut captured_disk_failure = disk_failure.borrow_mut().take();
-    if captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none() {
+    // Mock transport never runs the remote disk supervisor, so it has neither
+    // a receipt to read nor usage to certify (as in `execute_remote`).
+    let disk_supervised = !crate::transfer::use_mock_transport(&worker_config);
+    if disk_supervised && captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none()
+    {
         // A full stderr pipe may drop control output. The immutable receipt
         // remains available after confirmed completion and is attempt-bound.
         if let Some(receipt) = pipeline
@@ -2375,6 +2453,7 @@ async fn execute_remote_compilation_inner(
                 }
                 if let Some(peak) = pipeline.parse_disk_usage_marker(line) {
                     let status = pipeline.parse_disk_usage_exit_code(line);
+                    // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                     if disk_usage_exit_code.get().is_some() && disk_usage_exit_code.get() != status
                     {
                         disk_usage_conflict.set(true);
@@ -2389,7 +2468,7 @@ async fn execute_remote_compilation_inner(
     anyhow::ensure!(
         !disk_usage_conflict.get()
             && (disk_peak_output_bytes.get().is_none()
-                || disk_usage_exit_code.get() == Some(result.exit_code)),
+                || disk_usage_exit_code.get() == Some(result.exit_code)), // ubs:ignore[rust.security.constant-time-compare] — compares public disk and SSH exit statuses; mismatch fails closed.
         crate::transfer::RemoteExecutionUnconfirmed
     );
     if let Some(mut failure) = captured_disk_failure {
@@ -2417,7 +2496,8 @@ async fn execute_remote_compilation_inner(
         }
         return Err(failure.into());
     }
-    if disk_peak_output_bytes.get().is_none()
+    if disk_supervised
+        && disk_peak_output_bytes.get().is_none()
         && !(result.exit_code == 137 && deadline_triggered.get())
     {
         pipeline.ensure_remote_disk_budget(&result)?;

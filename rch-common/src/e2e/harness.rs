@@ -1308,6 +1308,11 @@ impl TestHarness {
         // Drop (bd-b4hrx): rchd exits once this pid is gone.
         cmd.env("RCH_EXIT_WITH_PARENT_PID", std::process::id().to_string());
 
+        // Isolate client lease and XDG state from the host environment so
+        // concurrent host `rch exec` jobs do not block daemon shutdown tests.
+        cmd.env("RCH_STATE_HOME", self.test_dir.join("state"));
+        cmd.env("XDG_STATE_HOME", self.test_dir.join("xdg-state"));
+
         // Set default environment variables
         for (k, v) in &self.config.env_vars {
             cmd.env(k, v);
@@ -1479,6 +1484,11 @@ impl TestHarness {
             .current_dir(&self.test_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Isolate client lease and XDG state from the host environment unless
+        // overridden by the test's HarnessConfig.
+        cmd.env("RCH_STATE_HOME", self.test_dir.join("state"));
+        cmd.env("XDG_STATE_HOME", self.test_dir.join("xdg-state"));
 
         // Set default environment variables
         for (k, v) in &self.config.env_vars {

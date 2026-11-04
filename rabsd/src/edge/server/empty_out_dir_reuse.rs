@@ -250,6 +250,7 @@ mod tests {
                 .unwrap();
             let mut inputs = ActionInputManifest {
                 schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+                directory_enumerations: package.generated_directory_enumerations(&plan).unwrap(),
                 ..ActionInputManifest::default()
             };
             for (files, generated) in [(&package.files, false), (&package.generated_files, true)] {

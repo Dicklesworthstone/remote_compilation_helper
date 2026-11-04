@@ -243,11 +243,13 @@ import os, sys
 from pathlib import Path
 root = Path(os.environ["RCH_CENSUS_ROOT"])
 counter = root / "count"
-number = int(counter.read_text()) + 1
+number = int(counter.read_text()) + int("-e" in sys.argv)
 counter.write_text(str(number))
+# Count logical censuses, not their selected-thread second exchange.
 fault = os.environ.get("RCH_CENSUS_FAULT", "none")
 bad = (fault in ("failed", "malformed") and number == 1
        or fault == "persistent"
+       or fault == "thread-pass" and "-q" in sys.argv
        or fault == "after-term" and number == 2
        or fault == "persistent-after-term" and number >= 2)
 if bad:
@@ -388,6 +390,13 @@ exec "$@"
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         # Only a later genuine census establishes the release postcondition.
+        self.assertEqual(self.recover(group).returncode, 0)
+
+    def test_failed_selected_thread_pass_cannot_confirm_cleanup(self):
+        group = self.group()
+        result = self.recover(group, "thread-pass")
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)
 
     def test_census_failure_after_term_keeps_this_calls_live_escalation_witness(self):

@@ -48,8 +48,8 @@ impl Fixture {
                 "version":"toolchain-dataset-v1", "sha256":"ab".repeat(32),
                 "files":1, "bytes":4,
             },
-            "source_files":["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "lib.rs"],
-            "args":[command, "--workspace", "--frozen", "--offline",
+            "source_files":["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "lib.rs", "main.rs", "benchmark.rs"],
+            "args":[command, if command == "run" { "--bin=pool-fixture" } else { "--workspace" }, "--frozen", "--offline",
                 "--message-format=json", "--manifest-path=/__rabs/workspace/Cargo.toml",
                 "--target-dir=/__rabs/out/cargo"],
             "command_context":{
@@ -58,7 +58,12 @@ impl Fixture {
                     "RUSTC":"/__rabs/toolchain/bin/rustc", "RUSTFLAGS":"-C debuginfo=0"},
             },
             "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
-                "cargo":if command == "test" { "cargo-test-json-v1" } else { "cargo-json-v1" }},
+                "cargo":match command {
+                    "test" => "cargo-test-json-v1",
+                    "run" => "cargo-run-json-v1",
+                    "bench" => "cargo-bench-json-v1",
+                    _ => "cargo-json-v1",
+                }},
             "timeout_ms":10000,
         })
     }
@@ -71,8 +76,25 @@ impl Fixture {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
         if request["artifacts"].get("cargo").is_some() {
-            fs::write(source.join("Cargo.toml"),
-                b"[package]\nname=\"pool-fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[lib]\npath=\"lib.rs\"\n").unwrap();
+            fs::write(
+                source.join("Cargo.toml"),
+                concat!(
+                    "[package]\nname=\"pool-fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+                    "[lib]\npath=\"lib.rs\"\n[[bin]]\nname=\"pool-fixture\"\npath=\"main.rs\"\n",
+                    "[[bench]]\nname=\"measurement\"\npath=\"benchmark.rs\"\nharness=false\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                source.join("main.rs"),
+                b"fn main() { println!(\"{}\", pool_fixture::value()); }\n",
+            )
+            .unwrap();
+            fs::write(
+                source.join("benchmark.rs"),
+                b"fn main() { std::hint::black_box(pool_fixture::value()); }\n",
+            )
+            .unwrap();
             fs::write(
                 source.join("Cargo.lock"),
                 b"version = 4\n[[package]]\nname=\"pool-fixture\"\nversion=\"0.1.0\"\n",
@@ -189,7 +211,7 @@ fn completed(
 
 #[test]
 fn cargo_locality_follows_resolved_success_and_ordinary_failure_across_fresh_captures() {
-    for command in ["build", "check", "clippy", "test"] {
+    for command in ["build", "check", "clippy", "test", "run", "bench"] {
         for exit_code in [0, 101] {
             let fixture = Fixture::cargo(command);
             let store = fixture.open();
@@ -267,12 +289,15 @@ fn cargo_locality_preserves_load_priority_then_prefers_the_most_recent_match() {
 }
 
 #[test]
-fn cargo_locality_follows_source_edits_and_build_check_test_selections() {
+fn cargo_locality_follows_source_edits_and_compilation_or_execution_selections() {
     for (previous, current) in [
         ("build", "build"),
         ("build", "check"),
         ("check", "test"),
         ("test", "build"),
+        ("build", "run"),
+        ("run", "check"),
+        ("bench", "bench"),
         ("clippy", "clippy"),
     ] {
         for exit_code in [0, 101] {
@@ -289,7 +314,7 @@ fn cargo_locality_follows_source_edits_and_build_check_test_selections() {
             let source = fixture.root.join("source");
             fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
             let mut request = Fixture::cargo_template(current);
-            if current != "clippy" {
+            if !matches!(current, "clippy" | "run") {
                 request["args"].as_array_mut().unwrap().push(json!("--lib"));
             }
             let mut next = fixture.spec(2, 2);
@@ -315,6 +340,79 @@ fn cargo_locality_follows_source_edits_and_build_check_test_selections() {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             assert_eq!(source_file["sha256"], changed_digest);
+            no_dispatch(claim);
+        }
+    }
+}
+
+#[test]
+fn runtime_locality_survives_restart_but_never_reuses_an_execution_result() {
+    for (previous, current, prior_profile, next_profile, compatible) in [
+        ("build", "run", None, None, true),
+        ("run", "run", None, None, true),
+        ("build", "bench", Some("--release"), None, true),
+        ("bench", "run", None, Some("--release"), true),
+        ("build", "bench", None, None, false),
+        ("bench", "run", None, None, false),
+    ] {
+        for exit_code in [0, if previous == "run" { 23 } else { 101 }] {
+            let mut prior_request = Fixture::cargo_template(previous);
+            if let Some(profile) = prior_profile {
+                prior_request["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(profile));
+            }
+            if matches!(previous, "run" | "bench") {
+                prior_request["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([json!("--"), json!("previous runtime argument")]);
+            }
+            let fixture = Fixture::capture(prior_request);
+            let store = fixture.open();
+            let original = store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                exit_code,
+                Value::Null,
+                true,
+            );
+            drop(store);
+
+            fs::write(
+                fixture.root.join("source/lib.rs"),
+                b"pub fn value() -> u32 { 43 }\n",
+            )
+            .unwrap();
+            let mut request = Fixture::cargo_template(current);
+            if let Some(profile) = next_profile {
+                request["args"].as_array_mut().unwrap().push(json!(profile));
+            }
+            request["args"].as_array_mut().unwrap().extend([
+                json!("--"),
+                json!("new runtime argument"),
+                json!("--profile=opaque-runtime-value"),
+            ]);
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("current-runtime-capture");
+            prepare_source_template(&fixture.root.join("source"), &request, &next.bundle).unwrap();
+            let store = fixture.open();
+            let selected = store.submit_allocated_pool(next).unwrap();
+            assert_eq!(
+                selected.worker,
+                if compatible { "worker-2" } else { "worker-1" },
+                "{previous} {prior_profile:?} -> {current} {next_profile:?}, exit {exit_code}",
+            );
+            assert_ne!(selected.request_sha256, original.request_sha256);
+            assert_eq!(selected.mode, "execute");
+            assert_eq!(selected.request_id, None);
+            assert!(!selected.outputs_installed);
+            let claim = store.claim_next().unwrap().unwrap();
+            assert!(claim.needs_request_allocation());
+            assert_eq!(claim.request()["args"], request["args"]);
+            assert_eq!(claim.request()["artifacts"], request["artifacts"]);
             no_dispatch(claim);
         }
     }
@@ -532,58 +630,72 @@ fn source_edit_locality_binds_isolated_dependency_cache_and_refuses_legacy_proje
 }
 
 #[test]
-fn source_edit_locality_preserves_private_incremental_policy_across_test_mode() {
+fn source_edit_locality_preserves_private_incremental_policy_across_execution_modes() {
     use rabs_sandbox::cargo_artifacts::{
         CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+        CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION,
+        CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION,
         CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
     };
 
-    for (prior_incremental, next_incremental) in [(true, true), (false, true), (true, false)] {
-        let fixture = Fixture::cargo("build");
-        let source = fixture.root.join("source");
-        let request = |command: &str, incremental: bool| {
-            let mut request = Fixture::cargo_template(command);
-            request["command_context"]["env"]
-                .as_object_mut()
-                .unwrap()
-                .remove("RUSTFLAGS");
-            request["command_context"]["env"]["CARGO_INCREMENTAL"] =
-                json!(if incremental { "1" } else { "0" });
-            if incremental {
-                request["artifacts"]["cargo"] = json!(if command == "test" {
-                    CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION
+    for command in ["test", "run", "bench"] {
+        for (prior_incremental, next_incremental) in [(true, true), (false, true), (true, false)] {
+            let fixture = Fixture::cargo("build");
+            let source = fixture.root.join("source");
+            let request = |command: &str, incremental: bool| {
+                let mut request = Fixture::cargo_template(command);
+                request["command_context"]["env"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("RUSTFLAGS");
+                request["command_context"]["env"]["CARGO_INCREMENTAL"] =
+                    json!(if incremental { "1" } else { "0" });
+                if incremental {
+                    request["artifacts"]["cargo"] = json!(match command {
+                        "test" => CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION,
+                        "run" => CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION,
+                        "bench" => CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION,
+                        _ => CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION,
+                    });
+                }
+                if command == "bench" {
+                    // Compare the explicit development profile with the preceding
+                    // development build, not Cargo bench's default release family.
+                    request["args"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("--profile=dev"));
+                }
+                request
+            };
+            let mut first = fixture.singleton(1, 2);
+            first.bundle = fixture.root.join("first-incremental-capture");
+            prepare_source_template(&source, &request("build", prior_incremental), &first.bundle)
+                .unwrap();
+            let store = fixture.open();
+            store.submit_allocated(first).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                0,
+                Value::Null,
+                true,
+            );
+            fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("next-incremental-capture");
+            prepare_source_template(&source, &request(command, next_incremental), &next.bundle)
+                .unwrap();
+            assert_eq!(
+                store.submit_allocated_pool(next).unwrap().worker,
+                if prior_incremental == next_incremental {
+                    "worker-2"
                 } else {
-                    CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION
-                });
-            }
-            request
-        };
-        let mut first = fixture.singleton(1, 2);
-        first.bundle = fixture.root.join("first-incremental-capture");
-        prepare_source_template(&source, &request("build", prior_incremental), &first.bundle)
-            .unwrap();
-        let store = fixture.open();
-        store.submit_allocated(first).unwrap();
-        completed(
-            store.claim_next().unwrap().unwrap(),
-            9001,
-            0,
-            Value::Null,
-            true,
-        );
-        fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap();
-        let mut next = fixture.spec(2, 2);
-        next.bundle = fixture.root.join("next-incremental-capture");
-        prepare_source_template(&source, &request("test", next_incremental), &next.bundle).unwrap();
-        assert_eq!(
-            store.submit_allocated_pool(next).unwrap().worker,
-            if prior_incremental == next_incremental {
-                "worker-2"
-            } else {
-                "worker-1"
-            },
-            "incremental {prior_incremental} -> {next_incremental}",
-        );
+                    "worker-1"
+                },
+                "{command}: incremental {prior_incremental} -> {next_incremental}",
+            );
+        }
     }
 }
 

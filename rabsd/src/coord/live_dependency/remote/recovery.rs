@@ -77,10 +77,16 @@ impl ResultDirectory {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let parent = self.path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "remote recovery parent missing")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote recovery parent missing",
+            )
         })?;
         let state = parent.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "remote recovery state is not UTF-8")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote recovery state is not UTF-8",
+            )
         })?;
         let record = serde_json::to_vec_pretty(&json!({
             "schema": "rabs-live-remote-recovery-v1",
@@ -193,10 +199,9 @@ mod tests {
         let mut directory = recorded(parent.path());
         let bytes = std::fs::read(directory.path().join("request.json")).unwrap();
         assert_eq!(bytes, serde_json::to_vec(&request()).unwrap());
-        let record: Value = serde_json::from_slice(
-            &std::fs::read(directory.path().join("recovery.json")).unwrap(),
-        )
-        .unwrap();
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("recovery.json")).unwrap())
+                .unwrap();
         let digest: String = Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -207,7 +212,10 @@ mod tests {
         assert_eq!(record["remote_configuration"], configuration());
         assert_eq!(record["execution_state"], "unknown");
         assert_eq!(record["recovery_mode"], "resume-or-acknowledge-only");
-        assert_eq!(record["transport_state_dir"], parent.path().to_str().unwrap());
+        assert_eq!(
+            record["transport_state_dir"],
+            parent.path().to_str().unwrap()
+        );
         assert_eq!(record["publication_authorized"], false);
         assert_eq!(record["reexecute"], false);
         for path in [
@@ -215,7 +223,10 @@ mod tests {
             directory.path().join("request.json"),
             directory.path().join("recovery.json"),
         ] {
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
         directory.execution_finished();
     }
@@ -320,9 +331,17 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let mut oversized = request();
         oversized["args"] = json!(["x".repeat(MAX_JSON_RECORD)]);
-        for request in [json!({}), json!({"kind":"canonical-exec","request_id":0}), oversized] {
+        for request in [
+            json!({}),
+            json!({"kind":"canonical-exec","request_id":0}),
+            oversized,
+        ] {
             let mut directory = ResultDirectory::new(parent.path()).unwrap();
-            assert!(directory.record_request(&request, "action", &configuration()).is_err());
+            assert!(
+                directory
+                    .record_request(&request, "action", &configuration())
+                    .is_err()
+            );
             assert!(directory.retention.is_none());
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         }
@@ -335,7 +354,10 @@ mod tests {
         let path = directory.path().join("request.json");
         std::fs::write(&path, b"prior bytes").unwrap();
         assert_eq!(
-            directory.record_request(&request(), "action", &configuration()).unwrap_err().kind(),
+            directory
+                .record_request(&request(), "action", &configuration())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::AlreadyExists,
         );
         assert!(directory.retention.is_none());
@@ -458,16 +480,26 @@ mod receiver_tests {
                 "kind": "output-acknowledged", "request_id": 17, "already_released": false,
             }));
         }
-        (Peer { replies, sent: Vec::new(), lose_ack: false }, output)
+        (
+            Peer {
+                replies,
+                sent: Vec::new(),
+                lose_ack: false,
+            },
+            output,
+        )
     }
 
     fn recorded(parent: &Path) -> ResultDirectory {
         let mut directory = ResultDirectory::new(parent).unwrap();
-        directory.record_request(
-            &request(), "action-key",
-            &json!({"worker_id": "worker-a", "listen": "127.0.0.1:9123",
+        directory
+            .record_request(
+                &request(),
+                "action-key",
+                &json!({"worker_id": "worker-a", "listen": "127.0.0.1:9123",
                     "worker_spki_sha256": "ab".repeat(32)}),
-        ).unwrap();
+            )
+            .unwrap();
         directory
     }
 
@@ -476,11 +508,22 @@ mod receiver_tests {
         let root = directory.path().to_path_buf();
         let (mut peer, output) = peer(false, true);
         let failure = receive_operation(
-            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
-        ).unwrap_err();
+            &mut peer,
+            &request(),
+            "worker-a",
+            &root.join("delivery"),
+            DeliveryMode::Execute,
+        )
+        .unwrap_err();
         assert!(failure.execution_may_have_run);
         assert!(failure.transport_interrupted);
-        assert_eq!(peer.sent.iter().filter(|v| v["kind"] == "canonical-exec").count(), 1);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|v| v["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
         assert!(!peer.sent.iter().any(|v| v["kind"] == "output-ack"));
         // This is the original failure frontier: the outer owner is dropped.
         drop(directory);
@@ -496,33 +539,55 @@ mod receiver_tests {
     fn interrupted_receiver_resumes_from_retained_prefix_without_reexecution() {
         let parent = crate::test_util::private_tempdir();
         let (root, output) = retained_partial(parent.path());
-        let saved: Value = serde_json::from_slice(
-            &std::fs::read(root.join("request.json")).unwrap(),
-        ).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(root.join("request.json")).unwrap()).unwrap();
         assert_eq!(saved, request());
         let old = root.join("delivery");
-        assert!(recover_existing_delivery(&saved, "worker-a", &old, DeliveryTrust::Loopback).is_err());
+        assert!(
+            recover_existing_delivery(&saved, "worker-a", &old, DeliveryTrust::Loopback).is_err()
+        );
         let source = ResumeSource::open(&old).unwrap();
         let destination = parent.path().join("resumed");
         source.validate_destination(&destination).unwrap();
         let (mut peer, _) = peer(true, false);
         let delivery = receive_operation(
-            &mut ResumePeer::new(&mut peer, &source), &saved, "worker-a",
-            &destination, DeliveryMode::Resume,
-        ).unwrap();
+            &mut ResumePeer::new(&mut peer, &source),
+            &saved,
+            "worker-a",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap();
         assert!(delivery.acknowledgments_confirmed);
-        assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), output);
-        assert_eq!(std::fs::read(old.join("diagnostics/stdout")).unwrap(), output[..CHUNK_BYTES]);
+        assert_eq!(
+            std::fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            output
+        );
+        assert_eq!(
+            std::fs::read(old.join("diagnostics/stdout")).unwrap(),
+            output[..CHUNK_BYTES]
+        );
         assert!(root.join("request.json").is_file());
         assert_eq!(delivery.receipt["resumed"], true);
-        assert_eq!(delivery.receipt["worker_identity_scope"], "delivery-session");
+        assert_eq!(
+            delivery.receipt["worker_identity_scope"],
+            "delivery-session"
+        );
         assert_eq!(delivery.receipt["execution_boot_generation"], Value::Null);
         assert_eq!(delivery.receipt["publication_authorized"], false);
-        assert_eq!(peer.sent.iter().filter(|v| v["kind"] == "result-resume").count(), 1);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|v| v["kind"] == "result-resume")
+                .count(),
+            1
+        );
         assert!(!peer.sent.iter().any(|v| v["kind"] == "canonical-exec"));
-        let reads: Vec<_> = peer.sent.iter().filter(|v| {
-            v["kind"] == "output-read" && v["stream"] == "stdout"
-        }).collect();
+        let reads: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|v| v["kind"] == "output-read" && v["stream"] == "stdout")
+            .collect();
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0]["offset"], CHUNK_BYTES);
         assert!(peer.replies.is_empty());
@@ -536,27 +601,52 @@ mod receiver_tests {
         let (mut peer, output) = peer(false, false);
         peer.lose_ack = true;
         let delivery = receive_operation(
-            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
-        ).unwrap();
+            &mut peer,
+            &request(),
+            "worker-a",
+            &root.join("delivery"),
+            DeliveryMode::Execute,
+        )
+        .unwrap();
         assert!(!delivery.acknowledgments_confirmed);
         assert!(delivery.acknowledgment_interrupted);
         directory.delivery_finished(delivery.acknowledgments_confirmed);
         drop(directory);
         let recovered = recover_existing_delivery(
-            &request(), "worker-a", &root.join("delivery"), DeliveryTrust::Loopback,
-        ).unwrap().unwrap();
+            &request(),
+            "worker-a",
+            &root.join("delivery"),
+            DeliveryTrust::Loopback,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(recovered.receipt, delivery.receipt);
-        assert_eq!(std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(), output);
+        assert_eq!(
+            std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(),
+            output
+        );
         assert!(root.join("request.json").is_file());
         // Retention is not authority to upgrade this fixture's transport proof.
-        assert!(recover_existing_delivery(
-            &request(), "worker-a", &root.join("delivery"), DeliveryTrust::PinnedWorker([0xab; 32]),
-        ).is_err());
+        assert!(
+            recover_existing_delivery(
+                &request(),
+                "worker-a",
+                &root.join("delivery"),
+                DeliveryTrust::PinnedWorker([0xab; 32]),
+            )
+            .is_err()
+        );
         let mut wrong_request = request();
         wrong_request["args"] = json!(["other.rs"]);
-        assert!(recover_existing_delivery(
-            &wrong_request, "worker-a", &root.join("delivery"), DeliveryTrust::Loopback,
-        ).is_err());
+        assert!(
+            recover_existing_delivery(
+                &wrong_request,
+                "worker-a",
+                &root.join("delivery"),
+                DeliveryTrust::Loopback,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -572,15 +662,22 @@ mod receiver_tests {
         let destination = parent.path().join("refused-resume");
         let (mut peer, _) = peer(true, false);
         let failure = receive_operation(
-            &mut ResumePeer::new(&mut peer, &source), &request(), "worker-a",
-            &destination, DeliveryMode::Resume,
-        ).unwrap_err();
+            &mut ResumePeer::new(&mut peer, &source),
+            &request(),
+            "worker-a",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap_err();
         assert!(failure.execution_may_have_run);
         assert!(!failure.transport_interrupted);
         assert!(!destination.join("delivery.json").exists());
-        assert!(!peer.sent.iter().any(|v| {
-            v["kind"] == "canonical-exec" || v["kind"] == "output-ack"
-        }));
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|v| { v["kind"] == "canonical-exec" || v["kind"] == "output-ack" })
+        );
         assert_eq!(std::fs::read(path).unwrap(), corrupt);
         assert!(root.join("request.json").is_file());
     }
@@ -593,8 +690,13 @@ mod receiver_tests {
         let (mut peer, _) = peer(false, false);
         peer.replies.front_mut().unwrap()["worker_id"] = json!("wrong-worker");
         let failure = receive_operation(
-            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
-        ).unwrap_err();
+            &mut peer,
+            &request(),
+            "worker-a",
+            &root.join("delivery"),
+            DeliveryMode::Execute,
+        )
+        .unwrap_err();
         assert!(!failure.execution_may_have_run);
         assert!(peer.sent.is_empty());
         directory.execution_finished();
@@ -609,10 +711,18 @@ mod receiver_tests {
         let root = directory.path().to_path_buf();
         let (mut peer, output) = peer(false, false);
         let delivery = receive_operation(
-            &mut peer, &request(), "worker-a", &root.join("delivery"), DeliveryMode::Execute,
-        ).unwrap();
+            &mut peer,
+            &request(),
+            "worker-a",
+            &root.join("delivery"),
+            DeliveryMode::Execute,
+        )
+        .unwrap();
         assert!(delivery.acknowledgments_confirmed);
-        assert_eq!(std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(), output);
+        assert_eq!(
+            std::fs::read(root.join("delivery/diagnostics/stdout")).unwrap(),
+            output
+        );
         assert!(peer.replies.is_empty());
         directory.delivery_finished(delivery.acknowledgments_confirmed);
         drop(directory);

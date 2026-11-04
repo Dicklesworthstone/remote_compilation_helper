@@ -9,8 +9,9 @@ use rch_common::{CircuitState, CommandResult, WorkerStatus};
 
 // The wire/storage protocol path also used by the hook and worker GC. A test
 // checks all three literals together; do not move a probe to another filesystem.
-const REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
+const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const REFUSAL: &str = "RCH_SOURCE_REGISTRY_UNWRITABLE";
+const DEGRADED: &str = "RCH_SOURCE_REGISTRY_DEGRADED";
 
 pub(super) fn command() -> String {
     format!(
@@ -20,10 +21,19 @@ pub(super) fn command() -> String {
     )
 }
 
+pub(super) fn is_degraded(result: &HealthCheckResult) -> bool {
+    result
+        .error
+        .as_deref()
+        .is_some_and(|message| message.starts_with("RCH_SOURCE_REGISTRY_DEGRADED: "))
+}
+
 /// A confirmed storage failure is an immediate exclusion, not a slow response
 /// or a network blip. Once excluded, an inconclusive probe cannot promote the
 /// worker to Degraded (which accepts jobs), even if telemetry reset its circuit.
 /// A successful storage probe resumes the ordinary circuit-governed policy.
+/// A low-headroom warning (`RCH_SOURCE_REGISTRY_DEGRADED`) after a successful
+/// scratch write marks the worker `Degraded` without taking it offline.
 /// The caller applies this health result through the admin/quarantine lifecycle.
 pub(super) fn status_after_probe(
     previous: WorkerStatus,
@@ -35,8 +45,14 @@ pub(super) fn status_after_probe(
         .error
         .as_deref()
         .is_some_and(|message| message.starts_with("RCH_SOURCE_REGISTRY_UNWRITABLE: "));
-    if !result.healthy && (storage_refused || previous == WorkerStatus::Unreachable) {
+    let storage_degraded = is_degraded(result);
+    if !result.healthy
+        && !storage_degraded
+        && (storage_refused || previous == WorkerStatus::Unreachable)
+    {
         WorkerStatus::Unreachable
+    } else if storage_degraded && circuit != CircuitState::Open {
+        WorkerStatus::Degraded
     } else {
         derive_worker_status(circuit, result.healthy, result.response_time_ms, config)
     }
@@ -58,11 +74,21 @@ pub(super) fn classify_output(result: &CommandResult) -> Result<(), HealthProbeE
         line.strip_prefix(REFUSAL)
             .is_some_and(|suffix| suffix.starts_with(' '))
     });
-    if result.success() && result.stdout.trim() == "health_check" && !storage_refused {
+    let storage_degraded = result.stderr.lines().any(|line| {
+        line.strip_prefix(DEGRADED)
+            .is_some_and(|suffix| suffix.starts_with(' '))
+    });
+    if result.success()
+        && result.stdout.trim() == "health_check"
+        && !storage_refused
+        && !storage_degraded
+    {
         return Ok(());
     }
     let reason = if storage_refused {
         REFUSAL
+    } else if storage_degraded {
+        DEGRADED
     } else {
         "Unexpected response"
     };
@@ -108,10 +134,13 @@ mod tests {
         assert!(command().contains(invocation.as_str()));
         // These are protocol locations, not caller-selected scratch roots.
         let hook = include_str!("../../../rch/src/hook/ssh.rs");
+        let namespace = include_str!("../../../rch/src/hook/source_namespace.rs");
         let gc = include_str!("../../../rch-common/src/stale_target_reap.rs");
         let hook_path = format!("const REMOTE_SOURCE_CLAIM_REGISTRY: &str = \"{REGISTRY}\";");
+        let namespace_path = format!("const REGISTRY: &str = \"{REGISTRY}\";");
         let gc_path = format!("const SOURCE_CLAIM_REGISTRY: &str = \"{REGISTRY}\";");
         assert!(hook.contains(hook_path.as_str()));
+        assert!(namespace.contains(namespace_path.as_str()));
         assert!(gc.contains(gc_path.as_str()));
     }
 
@@ -304,5 +333,46 @@ mod tests {
             assert_eq!(lifecycle.eligibility, quarantined);
             assert!(!lifecycle.is_schedulable());
         }
+    }
+
+    #[test]
+    fn degraded_headroom_marks_worker_degraded_without_exclusion() {
+        let error = classify_output(&output(
+            75,
+            "",
+            "RCH_SOURCE_REGISTRY_DEGRADED /var/tmp/rch-source-authority-locks/claims-v1: free_bytes=1048576 free_kb=1024 free_inodes=512\n",
+        ))
+        .expect_err("low headroom must surface as degraded probe result");
+        assert!(error.message.starts_with("RCH_SOURCE_REGISTRY_DEGRADED: "));
+        assert!(error.message.contains("free_bytes=1048576"));
+        let result = HealthCheckResult::command_failure(error.message, error.retryable);
+        assert!(is_degraded(&result));
+        assert_eq!(
+            status_after_probe(
+                WorkerStatus::Healthy,
+                CircuitState::Closed,
+                &result,
+                &HealthConfig::default(),
+            ),
+            WorkerStatus::Degraded,
+        );
+        assert_eq!(
+            status_after_probe(
+                WorkerStatus::Unreachable,
+                CircuitState::Closed,
+                &result,
+                &HealthConfig::default(),
+            ),
+            WorkerStatus::Degraded,
+        );
+        assert_eq!(
+            status_after_probe(
+                WorkerStatus::Healthy,
+                CircuitState::Open,
+                &result,
+                &HealthConfig::default(),
+            ),
+            WorkerStatus::Unreachable,
+        );
     }
 }

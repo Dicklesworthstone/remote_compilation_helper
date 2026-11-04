@@ -115,9 +115,7 @@ fn observe_with(
     compiler: &Path,
     env: &[(String, String)],
     verify: impl FnOnce(&ProbedToolchain) -> bool,
-    probe: impl FnOnce(&Path, &[(String, String)]) -> Result<ProbedToolchain, String>
-        + Send
-        + 'static,
+    probe: impl FnOnce(&Path, &[(String, String)]) -> Result<ProbedToolchain, String> + Send + 'static,
 ) -> Result<ToolchainFacts, FactsMiss> {
     if !compiler.is_absolute() {
         return Err(FactsMiss::Refused("compiler path is not absolute".into()));
@@ -182,17 +180,21 @@ mod tests {
     fn until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + DEADLINE;
         while !condition() {
-            assert!(Instant::now() < deadline, "toolchain observation did not settle");
+            assert!(
+                Instant::now() < deadline,
+                "toolchain observation did not settle"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     fn ready(facts: &Arc<LiveFacts>, compiler: &Path) -> Arc<ProbedToolchain> {
         let probed = Arc::new(probe_toolchain(compiler, &[]).unwrap());
-        facts.toolchains.lock().unwrap().insert(
-            compiler.to_path_buf(),
-            Slot::Ready(Arc::clone(&probed)),
-        );
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.to_path_buf(), Slot::Ready(Arc::clone(&probed)));
         probed
     }
 
@@ -214,7 +216,8 @@ mod tests {
                 probed.still_current()
             },
             |_, _| panic!("ready observations do not probe"),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(actual, expected.facts);
         assert_eq!(*facts.warming.lock().unwrap(), 0);
     }
@@ -229,15 +232,19 @@ mod tests {
         let (entered, entering) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let slow_facts = Arc::clone(&facts);
-        let slow = std::thread::spawn(move || observe_with(
-            &slow_facts, &first, &[],
-            move |probed| {
-                entered.send(()).unwrap();
-                released.recv_timeout(DEADLINE).unwrap();
-                probed.still_current()
-            },
-            |_, _| panic!("ready observation unexpectedly reprobed"),
-        ));
+        let slow = std::thread::spawn(move || {
+            observe_with(
+                &slow_facts,
+                &first,
+                &[],
+                move |probed| {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(DEADLINE).unwrap();
+                    probed.still_current()
+                },
+                |_, _| panic!("ready observation unexpectedly reprobed"),
+            )
+        });
         entering.recv_timeout(DEADLINE).unwrap();
         let fast_facts = Arc::clone(&facts);
         let (finished, finishing) = mpsc::channel();
@@ -250,7 +257,12 @@ mod tests {
         release.send(()).unwrap();
         slow.join().unwrap().unwrap();
         fast.join().unwrap();
-        assert_eq!(answer.expect("unrelated lookup blocked behind validation").unwrap(), expected);
+        assert_eq!(
+            answer
+                .expect("unrelated lookup blocked behind validation")
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -260,11 +272,15 @@ mod tests {
         ready(&facts, &compiler);
         let successor = Arc::new(probe_toolchain(&compiler, &[]).unwrap());
         let answer = observe_with(
-            &facts, &compiler, &[],
+            &facts,
+            &compiler,
+            &[],
             |_| {
-                facts.toolchains.lock().unwrap().insert(
-                    compiler.clone(), Slot::Ready(Arc::clone(&successor)),
-                );
+                facts
+                    .toolchains
+                    .lock()
+                    .unwrap()
+                    .insert(compiler.clone(), Slot::Ready(Arc::clone(&successor)));
                 false
             },
             |_, _| panic!("obsolete validation started a new probe"),
@@ -289,20 +305,25 @@ mod tests {
             let calls = Arc::clone(&calls);
             let release = Arc::clone(&release);
             let entered = entered.clone();
-            callers.push(std::thread::spawn(move || observe_with(
-                &facts, &compiler, &[], ProbedToolchain::still_current,
-                move |compiler, env| {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    entered.send(()).unwrap();
-                    let (lock, changed) = &*release;
-                    let (allowed, _) = changed.wait_timeout_while(
-                        lock.lock().unwrap(), DEADLINE, |allowed| !*allowed,
-                    ).unwrap();
-                    assert!(*allowed, "probe release deadline expired");
-                    drop(allowed);
-                    probe_toolchain(compiler, env)
-                },
-            )));
+            callers.push(std::thread::spawn(move || {
+                observe_with(
+                    &facts,
+                    &compiler,
+                    &[],
+                    ProbedToolchain::still_current,
+                    move |compiler, env| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        entered.send(()).unwrap();
+                        let (lock, changed) = &*release;
+                        let (allowed, _) = changed
+                            .wait_timeout_while(lock.lock().unwrap(), DEADLINE, |allowed| !*allowed)
+                            .unwrap();
+                        assert!(*allowed, "probe release deadline expired");
+                        drop(allowed);
+                        probe_toolchain(compiler, env)
+                    },
+                )
+            }));
         }
         for caller in callers {
             assert_eq!(caller.join().unwrap(), Err(FactsMiss::Pending));
@@ -315,23 +336,37 @@ mod tests {
         assert_eq!(observed_calls, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let expected = facts.toolchain(&compiler, &[]).unwrap();
-        facts.toolchain_guard(&compiler, &expected).unwrap().verify_unchanged(&compiler).unwrap();
+        facts
+            .toolchain_guard(&compiler, &expected)
+            .unwrap()
+            .verify_unchanged(&compiler)
+            .unwrap();
     }
 
     #[test]
     fn a_panicking_probe_releases_memo_and_real_warm_capacity() {
         let (_dir, compiler) = toolchain_fixture();
         let facts = LiveFacts::new();
-        assert_eq!(observe_with(
-            &facts, &compiler, &[], ProbedToolchain::still_current,
-            |_, _| panic!("injected toolchain probe panic"),
-        ), Err(FactsMiss::Pending));
+        assert_eq!(
+            observe_with(
+                &facts,
+                &compiler,
+                &[],
+                ProbedToolchain::still_current,
+                |_, _| panic!("injected toolchain probe panic"),
+            ),
+            Err(FactsMiss::Pending)
+        );
         until(|| *facts.warming.lock().unwrap() == 0);
         assert!(!facts.toolchains.lock().unwrap().contains_key(&compiler));
         assert_eq!(facts.toolchain(&compiler, &[]), Err(FactsMiss::Pending));
         until(|| *facts.warming.lock().unwrap() == 0);
         let observed = facts.toolchain(&compiler, &[]).unwrap();
-        facts.toolchain_guard(&compiler, &observed).unwrap().verify_unchanged(&compiler).unwrap();
+        facts
+            .toolchain_guard(&compiler, &observed)
+            .unwrap()
+            .verify_unchanged(&compiler)
+            .unwrap();
     }
 
     #[test]
@@ -339,10 +374,16 @@ mod tests {
         let (_dir, compiler) = toolchain_fixture();
         let facts = LiveFacts::new();
         *facts.warming.lock().unwrap() = MAX_WARMING;
-        assert_eq!(observe_with(
-            &facts, &compiler, &[], ProbedToolchain::still_current,
-            |_, _| panic!("saturated pool ran an unadmitted probe"),
-        ), Err(FactsMiss::Pending));
+        assert_eq!(
+            observe_with(
+                &facts,
+                &compiler,
+                &[],
+                ProbedToolchain::still_current,
+                |_, _| panic!("saturated pool ran an unadmitted probe"),
+            ),
+            Err(FactsMiss::Pending)
+        );
         assert!(!facts.toolchains.lock().unwrap().contains_key(&compiler));
         assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
     }
@@ -373,15 +414,27 @@ mod tests {
     fn failures_keep_existing_backoff_without_poisoning_the_pool() {
         let (_dir, compiler) = toolchain_fixture();
         let facts = LiveFacts::new();
-        assert_eq!(observe_with(
-            &facts, &compiler, &[], ProbedToolchain::still_current,
-            |_, _| Err("fixture probe refused".into()),
-        ), Err(FactsMiss::Pending));
+        assert_eq!(
+            observe_with(
+                &facts,
+                &compiler,
+                &[],
+                ProbedToolchain::still_current,
+                |_, _| Err("fixture probe refused".into()),
+            ),
+            Err(FactsMiss::Pending)
+        );
         until(|| *facts.warming.lock().unwrap() == 0);
-        assert_eq!(observe_with(
-            &facts, &compiler, &[], ProbedToolchain::still_current,
-            |_, _| panic!("failed probe retried during its backoff"),
-        ), Err(FactsMiss::Refused("fixture probe refused".into())));
+        assert_eq!(
+            observe_with(
+                &facts,
+                &compiler,
+                &[],
+                ProbedToolchain::still_current,
+                |_, _| panic!("failed probe retried during its backoff"),
+            ),
+            Err(FactsMiss::Refused("fixture probe refused".into()))
+        );
         assert_eq!(*facts.warming.lock().unwrap(), 0);
     }
 
@@ -392,22 +445,28 @@ mod tests {
         {
             let mut memos = facts.toolchains.lock().unwrap();
             for index in 0..MAX_TOOLCHAIN_MEMOS {
-                owners.push(Reservation::insert(
-                    &facts, &mut memos, &PathBuf::from(format!("/fixture/{index}/bin/rustc")),
-                ).unwrap());
+                owners.push(
+                    Reservation::insert(
+                        &facts,
+                        &mut memos,
+                        &PathBuf::from(format!("/fixture/{index}/bin/rustc")),
+                    )
+                    .unwrap(),
+                );
             }
             assert_eq!(memos.len(), MAX_TOOLCHAIN_MEMOS);
-            assert!(matches!(Reservation::insert(
-                &facts, &mut memos, Path::new("/fixture/extra/bin/rustc"),
-            ), Err(FactsMiss::Pending)));
+            assert!(matches!(
+                Reservation::insert(&facts, &mut memos, Path::new("/fixture/extra/bin/rustc"),),
+                Err(FactsMiss::Pending)
+            ));
         }
         let completed = owners.pop().unwrap();
         assert!(completed.finish(Err("fixture failure".into())));
         {
             let mut memos = facts.toolchains.lock().unwrap();
-            let next = Reservation::insert(
-                &facts, &mut memos, Path::new("/fixture/extra/bin/rustc"),
-            ).unwrap();
+            let next =
+                Reservation::insert(&facts, &mut memos, Path::new("/fixture/extra/bin/rustc"))
+                    .unwrap();
             assert_eq!(memos.len(), MAX_TOOLCHAIN_MEMOS);
             assert!(owners.iter().all(|owner| owner.owns(&memos)));
             // Drop must acquire the mutex only after this critical section.

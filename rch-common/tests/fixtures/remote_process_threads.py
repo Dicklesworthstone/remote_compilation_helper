@@ -85,15 +85,29 @@ SNAPSHOT = r"""
 . "$1"
 rch_pgid=6000000
 RCH_TEST_SNAPSHOT=$2
+RCH_TEST_LEADERS=${5-$2}
 RCH_TEST_OBSERVER_LINE=$3
 RCH_TEST_OBSERVER=$$
 PATH="$4:$PATH"
-export RCH_TEST_SNAPSHOT RCH_TEST_OBSERVER_LINE RCH_TEST_OBSERVER PATH
+export RCH_TEST_SNAPSHOT RCH_TEST_LEADERS RCH_TEST_OBSERVER_LINE RCH_TEST_OBSERVER PATH
 rch_group_state
 """
 
 SNAPSHOT_PS = r"""#!/bin/sh
-[ "$*" = '-e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=' ] || exit 99
+case "$*" in
+    '-e -o pid= -o lwp= -o pgid= -o s= -o nlwp=')
+        if [ "$RCH_TEST_OBSERVER_LINE" = yes ]; then
+            printf '%s %s %s S 1\n' "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER"
+        fi
+        # The first exchange sees leaders; the second remains the exact LWP
+        # fixture, including malformed, duplicate and missing thread records.
+        if [ -n "$RCH_TEST_LEADERS" ]; then
+            printf '%s\n' "$RCH_TEST_LEADERS" | awk '!seen[$1]++ { $2=$1; print }'
+        fi
+        exit 0;;
+    '-L -q '* ) ;;
+    *) exit 99;;
+esac
 if [ "$RCH_TEST_OBSERVER_LINE" = yes ]; then
     printf '%s %s %s S 1\n' "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER"
 fi
@@ -224,7 +238,7 @@ def run(protocol):
             samples = [
                 ("absent", "", "yes", 0),
                 ("one-zombie", "6000001 6000001 6000000 Z 1", "yes", 0),
-                ("terminal-threads", "6000001 6000001 6000000 Z 2\n6000001 6000002 6000000 Z 2", "yes", 0),
+                ("terminal-threads", "6000001 6000001 6000000 Z 2\n6000001 6000002 6000000 Z 2", "yes", 2),
                 ("live-thread", "6000001 6000001 6000000 Z 2\n6000001 6000002 6000000 S 2", "yes", 1),
                 ("missing-thread", "6000001 6000001 6000000 Z 2", "yes", 2),
                 ("changing-terminal-count", "6000001 6000001 6000000 Z 2\n6000001 6000002 6000000 Z 1", "yes", 2),
@@ -242,6 +256,22 @@ def run(protocol):
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
                 )
                 assert result.returncode == expected, (shell, name, result.returncode, result.stderr)
+                count += 1
+            # A parent can fork an unselected child and exit between passes.
+            # Even terminal selected threads cannot then establish absence.
+            transitions = [
+                ("exited-parent", "6000001 6000001 6000000 S 1", ""),
+                ("exited-sibling", "6000001 6000001 6000000 Z 2", ""),
+                ("became-terminal", "6000001 6000001 6000000 S 1",
+                 "6000001 6000001 6000000 Z 1"),
+            ]
+            for name, leaders, snapshot in transitions:
+                result = subprocess.run(
+                    [shell, "-c", SNAPSHOT, "rch-snapshot-test", str(protocol), snapshot,
+                     "yes", str(fake_bin), leaders],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+                )
+                assert result.returncode == 2, (shell, name, result.returncode, result.stderr)
                 count += 1
             print(f"{shell}: {len(samples)} snapshot refusal/liveness cases passed", flush=True)
     print(f"PASS: {count} native process and snapshot cases", flush=True)

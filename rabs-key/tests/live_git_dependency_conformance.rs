@@ -10,9 +10,9 @@ use std::process::{Command, Output};
 
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
-    LiveRustcRequest, PlannedExtern, ToolchainFacts, canonicalize_out_dir, canonicalize_placements,
-    dep_info_closure_violation, live_dependency_key, plan_dependency_action, render_out_dir,
-    render_placements,
+    LiveRustcRequest, PlannedExtern, ToolchainFacts, canonicalize_compiler_transcript,
+    canonicalize_out_dir, canonicalize_placements, dep_info_closure_violation, live_dependency_key,
+    plan_dependency_action, render_out_dir, render_placements,
 };
 
 // A transparent recorder around the actual compiler Cargo selected. The
@@ -165,7 +165,8 @@ fn try_actual_key(
     toolchain: &ToolchainFacts,
 ) -> Result<rabs_key::live_dependency::LiveDependencyKey, rabs_key::live_dependency::LiveRefusal> {
     use rabs_protocol::input_evidence::{
-        ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        ActionInputManifest, DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+        PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -174,13 +175,18 @@ fn try_actual_key(
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
         ..ActionInputManifest::default()
     };
-    let mut roots = vec![(Path::new(&plan.source_root), plan.source_virtual_root())];
+    let mut roots = vec![(
+        Path::new(&plan.source_root),
+        plan.source_virtual_root(),
+        false,
+    )];
     if let Some(root) = &plan.generated_root {
-        roots.push((Path::new(root), plan.generated_virtual_root()));
+        roots.push((Path::new(root), plan.generated_virtual_root(), true));
     }
-    for (root, visible) in roots {
+    for (root, visible, generated) in roots {
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
+            let mut entries = Vec::new();
             for entry in std::fs::read_dir(&directory).unwrap() {
                 let entry = entry.unwrap();
                 if directory == root
@@ -188,6 +194,9 @@ fn try_actual_key(
                     && entry.file_name() == ".git"
                 {
                     continue;
+                }
+                if generated {
+                    entries.push(RawBytes::new(entry.file_name().as_encoded_bytes().to_vec()));
                 }
                 let path = entry.path();
                 let meta = std::fs::symlink_metadata(&path).unwrap();
@@ -209,6 +218,23 @@ fn try_actual_key(
                         symlink_resolution: Vec::new(),
                     });
                 }
+            }
+            if generated {
+                entries.sort();
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        if directory == root {
+                            visible.clone()
+                        } else {
+                            format!(
+                                "{visible}/{}",
+                                directory.strip_prefix(root).unwrap().to_str().unwrap()
+                            )
+                        }
+                        .into_bytes(),
+                    ),
+                    entries,
+                });
             }
         }
     }
@@ -298,7 +324,16 @@ fn actual_cargo_generated_inputs_bind_bytes_and_preserve_unkeyed_env_fallback() 
         r#"
 include!(concat!(env!("OUT_DIR"), "/value.rs"));
 pub fn generated_path() -> &'static str { env!("OUT_DIR") }
-pub fn custom() -> &'static str { option_env!("MY_VALUE").unwrap_or("unset") }
+pub fn custom() -> &'static str {
+    #[cfg(unkeyed_control)]
+    {
+        option_env!("RABS_TEST_COMPILER_CONTROL").unwrap_or("unset")
+    }
+    #[cfg(not(unkeyed_control))]
+    {
+        option_env!("MY_VALUE").unwrap_or("unset")
+    }
+}
 "#,
     )
     .unwrap();
@@ -311,8 +346,14 @@ fn main() {
     println!("cargo::rerun-if-env-changed=RABS_TEST_UNKEYED_ENV");
     println!("cargo::rustc-cfg=generated_input");
     println!("cargo::rustc-check-cfg=cfg(generated_input)");
-    if std::env::var_os("RABS_TEST_UNKEYED_ENV").is_some() {
-        println!("cargo::rustc-env=MY_VALUE=example");
+    println!("cargo::rustc-check-cfg=cfg(unkeyed_control)");
+    match std::env::var("RABS_TEST_UNKEYED_ENV").ok().as_deref() {
+        Some("1") => println!("cargo::rustc-env=MY_VALUE=example"),
+        Some("control") => {
+            println!("cargo::rustc-cfg=unkeyed_control");
+            println!("cargo::rustc-env=RABS_TEST_COMPILER_CONTROL=control");
+        }
+        _ => {}
     }
 }
 "#,
@@ -370,6 +411,7 @@ fn main() {
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_TARGET",
         "RABS_TEST_UNKEYED_ENV",
+        "RABS_TEST_COMPILER_CONTROL",
         "MY_VALUE",
     ] {
         cargo.env_remove(name);
@@ -408,8 +450,8 @@ fn main() {
     .unwrap();
     assert_eq!(baseline, actual_key(&repeat_plan, &toolchain));
     assert_eq!(
-        canonicalize_placements(&recorded.stderr, &plan).unwrap(),
-        canonicalize_placements(&repeat.stderr, &repeat_plan).unwrap()
+        canonicalize_compiler_transcript(&recorded.stderr, &plan).unwrap(),
+        canonicalize_compiler_transcript(&repeat.stderr, &repeat_plan).unwrap()
     );
     for name in plan.output_names() {
         let original = std::fs::read(Path::new(&plan.out_dir).join(&name)).unwrap();
@@ -459,32 +501,174 @@ fn main() {
     );
     std::fs::write(&generated_file, &original).unwrap();
     assert_eq!(baseline, actual_key(&plan, &toolchain));
-    // Cargo executes its build script again. An arbitrary rustc-env value
-    // stays on the ordinary compiler path, where the stock result proves
-    // it was preserved; the cache must refuse before private execution.
+
+    // Isolate environment digest changes for absent/example/changed/empty MY_VALUE
+    // while every other semantic descriptor component remains fixed.
+    let mut env_digests = Vec::new();
+    let mut action_keys = Vec::new();
+    for variant in [None, Some("example"), Some("changed"), Some("")] {
+        let mut variant_env: Vec<(String, String)> = recorded
+            .env
+            .iter()
+            .filter(|(name, _)| name != "MY_VALUE")
+            .cloned()
+            .collect();
+        if let Some(val) = variant {
+            variant_env.push(("MY_VALUE".into(), val.into()));
+        }
+        let variant_plan = plan_dependency_action(
+            LiveRustcRequest {
+                argv: &recorded.argv,
+                cwd: &plan.cwd,
+                env: &variant_env,
+            },
+            host,
+        )
+        .unwrap();
+        let variant_key = actual_key(&variant_plan, &toolchain);
+        let mut comparable_descriptor = variant_key.descriptor.clone();
+        comparable_descriptor.environment = baseline.descriptor.environment.clone();
+        assert_eq!(
+            comparable_descriptor, baseline.descriptor,
+            "non-environment semantic inputs must remain fixed across MY_VALUE={variant:?}"
+        );
+        assert!(
+            !env_digests.contains(&variant_key.descriptor.environment),
+            "environment digest must distinguish MY_VALUE={variant:?}"
+        );
+        assert!(
+            !action_keys.contains(&variant_key.action_key),
+            "action key must distinguish MY_VALUE={variant:?}"
+        );
+        env_digests.push(variant_key.descriptor.environment);
+        action_keys.push(variant_key.action_key);
+    }
+
+    // Cargo executes its build script again and emits `cargo::rustc-env=MY_VALUE=example`.
+    // Under dependency-env-v2, arbitrary compiler environment variables are preserved
+    // in execution_env and keyed_env, and private execution matches Cargo's output.
     cargo
         .args(["--locked", "--offline"])
         .env("RABS_TEST_UNKEYED_ENV", "1");
+    checked(&mut cargo);
+    let keyed_request = Recorded::load(&record.join("generated_fixture"));
+    let keyed_plan = keyed_request.plan(host);
+    assert!(
+        keyed_request
+            .env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    assert!(
+        keyed_plan
+            .execution_env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    assert!(
+        keyed_plan
+            .keyed_env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    let keyed_actual = actual_key(&keyed_plan, &toolchain);
+    assert_ne!(keyed_actual.action_key, baseline.action_key);
+    let keyed_repeat_out = root.join("keyed-repeat-out");
+    keyed_request.execute_at(&keyed_plan, &keyed_repeat_out);
+    for name in keyed_plan.output_names() {
+        let cargo_out = std::fs::read(Path::new(&keyed_plan.out_dir).join(&name)).unwrap();
+        let private_out = std::fs::read(keyed_repeat_out.join(&name)).unwrap();
+        if name.ends_with(".d") {
+            assert_eq!(
+                dep_info_closure_violation(&keyed_plan, &cargo_out, |path| {
+                    path.strip_prefix(&format!("{}/", keyed_plan.source_virtual_root()))
+                        .is_some_and(|relative| {
+                            Path::new(&keyed_plan.source_root).join(relative).is_file()
+                        })
+                        || path == keyed_plan.generated_input_virtual_path("value.rs")
+                }),
+                None
+            );
+            assert!(String::from_utf8_lossy(&cargo_out).contains("# env-dep:MY_VALUE=example"));
+        } else {
+            assert_eq!(
+                cargo_out, private_out,
+                "private execution with preserved MY_VALUE must match Cargo output {name}"
+            );
+        }
+    }
+    assert_eq!(
+        checked(&mut Command::new(target.join("debug/generated_consumer"))).stdout,
+        format!("17:example:{}\n", generated.display()).as_bytes()
+    );
+
+    // Captured build-script record value mismatch and missing-binding refusals:
+    let mut mismatch_plan = keyed_plan.clone();
+    for (name, value) in &mut mismatch_plan.keyed_env {
+        if name == "MY_VALUE" {
+            *value = "changed".into();
+        }
+    }
+    assert!(
+        matches!(
+            try_actual_key(&mismatch_plan, &toolchain),
+            Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name)) if name == "MY_VALUE"
+        ),
+        "captured rustc-env record mismatch must refuse with RefusedEnv(MY_VALUE)"
+    );
+    let mut missing_binding_plan = keyed_plan.clone();
+    missing_binding_plan
+        .keyed_env
+        .retain(|(name, _)| name != "MY_VALUE");
+    assert!(
+        matches!(
+            try_actual_key(&missing_binding_plan, &toolchain),
+            Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name)) if name == "MY_VALUE"
+        ),
+        "captured rustc-env record missing binding must refuse with RefusedEnv(MY_VALUE)"
+    );
+
+    // Genuinely unkeyed RABS_TEST_COMPILER_CONTROL stays on the ordinary compiler path,
+    // refuses build-script rustc-env publication, and refuses tracked dep-info reads.
+    cargo.env("RABS_TEST_UNKEYED_ENV", "control");
     checked(&mut cargo);
     let fallback_request = Recorded::load(&record.join("generated_fixture"));
     let fallback_plan = fallback_request.plan(host);
     assert!(
         fallback_request
             .env
-            .contains(&("MY_VALUE".into(), "example".into()))
+            .contains(&("RABS_TEST_COMPILER_CONTROL".into(), "control".into()))
+    );
+    assert!(
+        fallback_plan
+            .execution_env
+            .contains(&("RABS_TEST_COMPILER_CONTROL".into(), "control".into()))
     );
     assert!(
         !fallback_plan
-            .execution_env
+            .keyed_env
             .iter()
-            .any(|(name, _)| name == "MY_VALUE")
+            .any(|(name, _)| name == "RABS_TEST_COMPILER_CONTROL")
     );
+    assert!(matches!(
+        try_actual_key(&fallback_plan, &toolchain),
+        Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name))
+            if name == "RABS_TEST_COMPILER_CONTROL"
+    ));
+    let fallback_dep = fallback_plan
+        .output_names()
+        .into_iter()
+        .find(|name| name.ends_with(".d"))
+        .unwrap();
+    let fallback_dep_bytes =
+        std::fs::read(Path::new(&fallback_plan.out_dir).join(&fallback_dep)).unwrap();
     assert!(
-        matches!(try_actual_key(&fallback_plan, &toolchain), Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name)) if name == "MY_VALUE")
+        dep_info_closure_violation(&fallback_plan, &fallback_dep_bytes, |_| true).is_some_and(
+            |reason| {
+                reason.contains("tracked read of unkeyed variable RABS_TEST_COMPILER_CONTROL")
+            }
+        )
     );
     assert_eq!(
         checked(&mut Command::new(target.join("debug/generated_consumer"))).stdout,
-        format!("17:example:{}\n", generated.display()).as_bytes()
+        format!("17:control:{}\n", generated.display()).as_bytes()
     );
 }
 
@@ -606,8 +790,8 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
             "complete key differs for real Cargo request {index}"
         );
         assert_eq!(
-            canonicalize_placements(&request_a.stderr, a).unwrap(),
-            canonicalize_placements(&request_b.stderr, b).unwrap()
+            canonicalize_compiler_transcript(&request_a.stderr, a).unwrap(),
+            canonicalize_compiler_transcript(&request_b.stderr, b).unwrap()
         );
         for name in a.output_names() {
             let left = std::fs::read(Path::new(&a.out_dir).join(&name)).unwrap();

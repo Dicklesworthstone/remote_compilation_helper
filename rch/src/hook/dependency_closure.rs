@@ -894,6 +894,43 @@ fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> Str
     path.to_string_lossy().to_string()
 }
 
+/// Relocate an off-root (`RCH_CANONICAL_PROJECT_ROOT`) local closure root under
+/// `<remote_base>/offroot/<16-hex-hash>/<relative_or_project_id>` so worker
+/// mirrors never land in `/private/tmp/...` or unowned scratch roots (bd-5edh1).
+pub(super) fn map_offroot_sync_root_to_remote_root(
+    local_root: &Path,
+    project_id: &str,
+    policy: &PathTopologyPolicy,
+    remote_base: &str,
+) -> anyhow::Result<String> {
+    let offroot_base = policy
+        .offroot_worker_canonical_root(remote_base)
+        .map_err(|error| anyhow::anyhow!("invalid off-root staging base: {error}"))?;
+    for root in effective_sync_topology_roots(policy) {
+        if let Ok(relative) = local_root.strip_prefix(&root) {
+            if relative.as_os_str().is_empty() {
+                let leaf = if project_id.trim().is_empty() {
+                    local_root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("project")
+                } else {
+                    project_id
+                };
+                return Ok(offroot_base.join(leaf).to_string_lossy().to_string());
+            }
+            return Ok(offroot_base.join(relative).to_string_lossy().to_string());
+        }
+    }
+    let leaf = if project_id.trim().is_empty() {
+        "project"
+    } else {
+        project_id
+    };
+    Ok(offroot_base.join(leaf).to_string_lossy().to_string())
+}
+
 pub(super) fn build_sync_closure_plan(
     sync_roots: &[PathBuf],
     normalized_project_root: &Path,
@@ -1209,16 +1246,19 @@ pub(super) async fn verify_remote_dependency_manifests(
     let mut probe_failure: Option<String> = None;
 
     if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
-        let remote_command = source_identity
-            .map(|identity| super::ssh::wrap_remote_source_activity("sh -s", identity))
-            .transpose()?
-            .unwrap_or_else(|| "sh -s".to_owned());
+        let verify_cmd = match source_identity {
+            Some(identity) => crate::transfer::source_activity_finite_script(
+                &super::ssh::source_authority_activity_prefix(identity)?,
+                &verify_cmd,
+            ),
+            None => verify_cmd,
+        };
         // Stdin transport has no argv-size limit. Probe the entire closure in
         // one SSH session instead of paying a handshake and login-shell startup
         // for every 128 paths. Retain the former batches' total timeout budget.
         match run_offload_ssh_command_with_stdin(
             worker,
-            &remote_command,
+            "sh -s",
             verify_cmd.as_bytes(),
             dependency_preflight_timeout(synced_checks.len()),
         )
@@ -1797,6 +1837,78 @@ exec /bin/sh -c "$remote"
         assert!(
             dir.path().join("finished").is_file(),
             "child test did not run"
+        );
+    }
+
+    #[test]
+    fn offroot_topology_relocates_worker_mirror_under_remote_base_and_validates_preflight() {
+        let scratch = PathBuf::from(
+            "/private/tmp/claude-501/-Users-jemanuel-projects-0a/ef8812cb/scratchpad",
+        );
+        let policy = PathTopologyPolicy::new(
+            scratch.clone(),
+            PathBuf::from(format!("{}.rch-alias", scratch.display())),
+        )
+        .with_off_root(true);
+        assert!(policy.is_off_root());
+
+        let mapped = map_offroot_sync_root_to_remote_root(
+            &scratch.join("fmd-check-split"),
+            "fmd-check-split",
+            &policy,
+            "/data/tmp/rch",
+        )
+        .expect("offroot mapping");
+        let expected_base = policy
+            .offroot_worker_canonical_root("/data/tmp/rch")
+            .expect("offroot base");
+        assert!(mapped.starts_with("/data/tmp/rch/offroot/"), "{mapped}");
+        assert_eq!(
+            PathBuf::from(&mapped),
+            expected_base.join("fmd-check-split")
+        );
+
+        let root_itself = map_offroot_sync_root_to_remote_root(
+            &scratch,
+            "scratchpad-proj",
+            &policy,
+            "/data/tmp/rch",
+        )
+        .expect("root-level offroot mapping");
+        assert_eq!(
+            PathBuf::from(&root_itself),
+            expected_base.join("scratchpad-proj")
+        );
+
+        let remote_policy = super::super::ssh::remote_preflight_topology_policy(
+            &policy,
+            false,
+            false,
+            "/data/tmp/rch",
+            &[PathBuf::from(&mapped)],
+        )
+        .expect("remote preflight policy");
+        assert_eq!(
+            remote_policy,
+            PathTopologyPolicy::new(
+                PathBuf::from("/data/tmp/rch"),
+                PathBuf::from("/data/tmp/rch")
+            )
+        );
+
+        let refused = super::super::ssh::remote_preflight_topology_policy(
+            &policy,
+            false,
+            false,
+            "/data/tmp/rch",
+            &[scratch.join("fmd-check-split")],
+        )
+        .expect_err("unrelocated /private/tmp destination must be refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("is not a strict descendant of staging base"),
+            "{refused}"
         );
     }
 }

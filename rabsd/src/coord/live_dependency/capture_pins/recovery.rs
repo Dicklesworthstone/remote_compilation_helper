@@ -150,7 +150,10 @@ mod journal_tests {
         let decoded: CaptureEvidence = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.version, EVIDENCE_VERSION);
         assert_eq!(decoded.coordinator(), attempt.coordinator);
-        assert_eq!(decoded.generation, attempt.action_generation.generation_id.0);
+        assert_eq!(
+            decoded.generation,
+            attempt.action_generation.generation_id.0
+        );
         assert_eq!(decoded.attempt, attempt.attempt_id.0);
         assert_eq!(decoded.lease, attempt.execution_lease_id.0);
         assert_eq!(decoded.worker_incarnation, attempt.worker_incarnation_id.0);
@@ -176,7 +179,10 @@ mod journal_tests {
             let rows = store
                 .query(
                     "SELECT evidence FROM pins WHERE id_hex = ?1",
-                    &[SqlValue::Text(format!("{:032x}", pin_id(&pins.owner, &root)))],
+                    &[SqlValue::Text(format!(
+                        "{:032x}",
+                        pin_id(&pins.owner, &root)
+                    ))],
                 )
                 .unwrap();
             assert_eq!(
@@ -185,7 +191,10 @@ mod journal_tests {
             );
         }
         let mut invalid = attempt;
-        invalid.action_generation.created_under_authority_digest.bytes[0] ^= 1;
+        invalid
+            .action_generation
+            .created_under_authority_digest
+            .bytes[0] ^= 1;
         let other = compute("rabs.object.sha256.v1", b"must not be pinned");
         let mut rejected = CapturePins::new(Arc::clone(&cas), &invalid);
         let mut store = cas.store().lock().unwrap();

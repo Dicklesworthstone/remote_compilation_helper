@@ -417,6 +417,42 @@ if rch_remote_witness_matches; then exit 88; fi
         self.finish(run, 255)
         self.assert_empty()
 
+    def test_live_child_admission_does_not_require_unrelated_process_census(self):
+        self.env["RCH_TEST_PAYLOAD_READY"] = str(self.ready)
+        needle = "rch_group_state() {\n"
+        self.assertEqual(PROTOCOL.count(needle), 1)
+        # Only the all-process census is unavailable before execution. The
+        # child, boot/start identity and scope binding remain native. Cleanup
+        # must still execute the genuine census after the payload starts.
+        fault = PROTOCOL.replace(
+            needle, needle + '    [ -f "$RCH_TEST_PAYLOAD_READY" ] || return 2\n')
+        payload = f"printf ready > {shlex.quote(str(self.ready))}; exit 7"
+        self.finish(self.start(payload, protocol=fault), 7)
+        self.assertTrue(self.ready.exists())
+        self.assert_empty()
+
+    def test_post_kill_incomplete_census_requires_later_complete_observation(self):
+        killed = self.root / "owned-kill"
+        retried = self.root / "census-retried"
+        self.env["RCH_TEST_KILLED"] = str(killed)
+        self.env["RCH_TEST_RETRIED"] = str(retried)
+        needle = "rch_group_state() {\n"
+        signal_needle = '    kill -"$1" -"$rch_pgid" 2>/dev/null || :\n'
+        self.assertEqual(PROTOCOL.count(needle), 1)
+        self.assertEqual(PROTOCOL.count(signal_needle), 1)
+        # Inject one unavailable observation after the real authenticated KILL.
+        # No process result or identity is faked; the next census must prove
+        # absence using the kernel, as does the independent assertion below.
+        fault = PROTOCOL.replace(needle, needle + '''    if [ -f "$RCH_TEST_KILLED" ] && [ ! -f "$RCH_TEST_RETRIED" ]; then
+        printf retried > "$RCH_TEST_RETRIED"
+        return 2
+    fi
+''').replace(signal_needle, signal_needle + '    [ "$1" != KILL ] || printf killed > "$RCH_TEST_KILLED"\n')
+        self.finish(self.start("exit 7", protocol=fault), 7)
+        self.assertTrue(killed.exists())
+        self.assertTrue(retried.exists())
+        self.assert_empty()
+
     def test_post_admission_census_loss_retains_uncertainty(self):
         loss = self.root / "census-unavailable"
         self.env["RCH_TEST_CENSUS_LOSS"] = str(loss)

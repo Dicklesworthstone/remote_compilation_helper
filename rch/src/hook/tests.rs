@@ -144,6 +144,200 @@ fn init_clean_overlay_test_repo() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn clean_overlay_fixture_bytes_are_data_until_the_same_manifest_is_selected() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    let bad_build = b"[package]\nname='bad-build'\nversion='0.1.0'\nbuild='build.rs'\n";
+    let bad_path = b"[package]\nname='bad-path'\nversion='0.1.0'\n[dependencies]\nforeign={path='/absolute/unpublished'}\n";
+    for (name, bytes) in [
+        ("build", bad_build.as_slice()),
+        ("path", bad_path.as_slice()),
+        ("opaque", &[0xff, 0xfe]),
+    ] {
+        let directory = root.join("fixtures").join(name);
+        std::fs::create_dir_all(directory.join("src")).unwrap();
+        std::fs::write(directory.join("Cargo.toml"), bytes).unwrap();
+        std::fs::write(directory.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain negative fixture bytes",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+    let selected = selected_clean_overlay_cargo_tree(&root, &spec)
+        .await
+        .unwrap();
+    for (name, bytes, diagnostic) in [
+        ("build", bad_build.as_slice(), "build.rs"),
+        ("path", bad_path.as_slice(), "/absolute/unpublished"),
+        ("opaque", &[0xff, 0xfe], "Cargo metadata"),
+    ] {
+        let relative = format!("fixtures/{name}/Cargo.toml");
+        assert!(selected.contains_key(Path::new(&relative)));
+        let error = validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            &format!("cargo check --manifest-path {relative}"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        assert_eq!(std::fs::read(root.join(&relative)).unwrap(), bytes);
+        assert_eq!(
+            git_output_bytes(&root, &["cat-file", "blob", &format!("HEAD:{relative}")])
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+    validate_clean_overlay_cargo_sources(&root, &spec, "cargo check --all-targets")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn clean_overlay_actual_manifest_selector_precedes_workspace_semantics() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='bad-root'\nversion='0.1.0'\nbuild='missing.rs'",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("nested/src")).unwrap();
+    std::fs::write(
+        root.join("nested/Cargo.toml"),
+        "[package]\nname='standalone'\nversion='0.1.0'\n[workspace]",
+    )
+    .unwrap();
+    std::fs::write(root.join("nested/src/lib.rs"), "pub fn standalone() {}\n").unwrap();
+    git_output(&root, &["add", "Cargo.toml", "nested"])
+        .await
+        .unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "independent nested workspace",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        validate_clean_overlay_cargo_sources(&root, &spec, "cargo check")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("missing.rs")
+    );
+    for command in [
+        "cargo check --manifest-path nested/Cargo.toml",
+        "cargo check --manifest-path=nested/Cargo.toml --config 'build.jobs=1'",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    assert!(
+        validate_clean_overlay_cargo_sources(
+            &root,
+            &spec,
+            "cargo check --manifest-path nested/Cargo.toml --manifest-path Cargo.toml"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_manifest_file_alias_does_not_replace_the_selected_source_base() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir_all(root.join("fixtures/literal/src")).unwrap();
+    std::fs::create_dir_all(root.join("fixtures/alias/src")).unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/Cargo.toml"),
+        "[package]\nname='literal'\nversion='0.1.0'\nbuild='build.rs'",
+    )
+    .unwrap();
+    std::fs::write(root.join("fixtures/literal/build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        root.join("fixtures/literal/src/lib.rs"),
+        "pub fn literal() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixtures/alias/src/lib.rs"),
+        "pub fn alias() {}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../literal/Cargo.toml",
+        root.join("fixtures/alias/Cargo.toml"),
+    )
+    .unwrap();
+    git_output(&root, &["add", "fixtures"]).await.unwrap();
+    git_output(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "retain manifest alias fixture",
+        ],
+    )
+    .await
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    for command in [
+        "cargo check",
+        "cargo check --manifest-path fixtures/literal/Cargo.toml",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    let error = validate_clean_overlay_cargo_sources(
+        &root,
+        &spec,
+        "cargo check --manifest-path fixtures/alias/Cargo.toml",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manifest file symlinks"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn clean_overlay_cargo_preflight_reads_selected_base_not_ambient_manifest() {
     let _guard = test_guard!();
     let root = init_clean_overlay_test_repo().keep();
@@ -1008,7 +1202,7 @@ fn join_exec_command_keeps_leading_assignments_as_assignments() {
         "printf '%s|%s' \"$RCH_T_A\" \"$RCH_T_B\"".to_string(),
     ];
     let joined = join_exec_command(&parts);
-    let output = std::process::Command::new("sh")
+    let output = std::process::Command::new("sh") // ubs:ignore — executes only the fixed assignment/printf argv above to check real shell quoting.
         .arg("-c")
         .arg(&joined)
         .output()
@@ -1052,6 +1246,38 @@ fn clean_overlay_fmt_check_allowlist_is_exact_and_read_only() {
         "metadata".into(),
         "--check".into(),
     ]));
+}
+
+#[test]
+fn source_content_receipt_admits_read_only_cargo_fmt_check_with_isolated_selection_id() {
+    let _guard = test_guard!();
+    let fmt_check = vec![
+        "cargo".to_string(),
+        "fmt".to_string(),
+        "--all".to_string(),
+        "--check".to_string(),
+    ];
+    let fmt_mutate = vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()];
+
+    assert!(!is_isolated_source_cargo_fmt_check(
+        false, false, &fmt_check
+    ));
+    assert!(is_isolated_source_cargo_fmt_check(true, false, &fmt_check));
+    assert!(is_isolated_source_cargo_fmt_check(false, true, &fmt_check));
+    assert!(is_isolated_source_cargo_fmt_check(true, true, &fmt_check));
+    assert!(!is_isolated_source_cargo_fmt_check(
+        false,
+        true,
+        &fmt_mutate
+    ));
+
+    let first =
+        selection_project_for_source_content_fmt_check("frankentui", uuid::Uuid::from_u128(1));
+    let second =
+        selection_project_for_source_content_fmt_check("frankentui", uuid::Uuid::from_u128(2));
+    assert!(first.starts_with("frankentui::clean-overlay::"));
+    assert_eq!(first.len(), "frankentui::clean-overlay::".len() + 16);
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -1146,6 +1372,14 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
     assert!(
         has_bypass,
         "local fallback must bypass the PATH cargo wrapper to avoid recursive rch exec"
+    );
+    let has_origin = command.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_ENV)
+            && value == Some(std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_RCH))
+    });
+    assert!(
+        has_origin,
+        "local fallback must stamp RCH_CARGO_WRAPPER_ORIGIN=rch so the strict shim accepts it"
     );
 
     let args = command.get_args().collect::<Vec<_>>();
@@ -2869,6 +3103,247 @@ fn assert_retry_pending(writer: &DurableLeaseWriter, previous: &DurableJobLease)
     assert!(disk.recovery.is_none());
     assert!(disk.exit_code.is_none());
     assert!(!disk.terminal_acknowledged);
+}
+
+#[cfg(unix)]
+fn retry_custody_test_writer(directory: &Path, owned: bool) -> DurableLeaseWriter {
+    std::fs::create_dir_all(directory).unwrap();
+    let writer = if owned {
+        DurableLeaseWriter::create_in(directory, "cargo build", false, true).unwrap()
+    } else {
+        queued_selection_test_lease(directory.join("lease.json"))
+    };
+    writer.admit(41, &WorkerId::new("previous-worker")).unwrap();
+    let stage = directory.join("retained-stage");
+    std::fs::create_dir(&stage).unwrap();
+    std::fs::write(stage.join("collector-input"), b"retained original input").unwrap();
+    writer
+        .set_recovery(serde_json::json!({
+            "retired": true,
+            "returned": 137,
+            "wrapper_id": writer.wrapper_id(),
+            "build_id": 41,
+            "worker": {"id": "previous-worker"},
+            "retained_root": stage,
+            "phases": [{"complete": false, "pending": ["report", "original-hash"]}],
+        }))
+        .unwrap();
+    writer.record_exit(137).unwrap();
+    writer
+}
+
+#[cfg(unix)]
+fn retry_custody_snapshots(directory: &Path, wrapper: &str) -> Vec<(PathBuf, Vec<u8>)> {
+    let prefix = format!("{wrapper}.recovery-");
+    let mut snapshots: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".before"))
+        })
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshots
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_survives_uncertain_selection_and_writer_loss() {
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let wrapper = writer.wrapper_id();
+        let path = writer.path.clone();
+        let error = dispatch_retry_selection(&writer, true, async || {
+            assert_retry_pending(&writer, &previous);
+            let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+            assert_eq!(snapshots.len(), 1, "custody must precede query dispatch");
+            assert_eq!(snapshots[0].1, original);
+            anyhow::bail!(
+                anyhow::anyhow!("reply lost after selection dispatch")
+                    .context(daemon_ipc::SelectionOutcomeUnconfirmed)
+            );
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
+        drop(writer);
+        let reloaded = DurableLeaseWriter::read_journal(&path, &wrapper).unwrap();
+        assert_eq!(reloaded.phase, "selection_unconfirmed");
+        assert!(reloaded.identity.remote_build_id.is_none());
+        assert!(reloaded.worker_id.is_none() && reloaded.recovery.is_none());
+        assert!(reloaded.exit_code.is_none() && !reloaded.terminal_acknowledged);
+        let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].1, original);
+        let retained: DurableJobLease = serde_json::from_slice(&snapshots[0].1).unwrap();
+        assert_eq!(retained, previous);
+        assert_eq!(
+            std::fs::read(directory.path().join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_deduplicates_refusals_and_cannot_complete_a_new_attempt() {
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let wrapper = writer.wrapper_id();
+        for _ in 0..3 {
+            dispatch_retry_selection(&writer, true, async || {
+                assert_retry_pending(&writer, &previous);
+                Ok(retry_unassigned_response())
+            })
+            .await
+            .unwrap();
+            assert_eq!(writer.snapshot(), previous);
+            assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+            let snapshots = retry_custody_snapshots(directory.path(), &wrapper);
+            assert_eq!(snapshots.len(), 1, "identical evidence must be reused");
+            assert_eq!(snapshots[0].1, original);
+        }
+        writer.begin_retry_selection(true).unwrap();
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        assert!(writer.confirm_selection_cancelled().unwrap());
+        let cancelled = read_retry_lease(&writer);
+        assert_eq!(cancelled.exit_code, Some(130));
+        assert!(cancelled.terminal_acknowledged);
+        assert!(cancelled.identity.remote_build_id.is_none());
+        assert!(cancelled.recovery.is_none());
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        assert_eq!(read_retry_lease(&writer), cancelled);
+        assert_eq!(
+            retry_custody_snapshots(directory.path(), &wrapper)[0].1,
+            original
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retry_custody_preserves_direct_readmission_and_leaves_first_admission_unarchived() {
+    let directory = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let first =
+        DurableLeaseWriter::create_in(directory.path(), "cargo check", false, true).unwrap();
+    first.admit(40, &WorkerId::new("first-worker")).unwrap();
+    assert!(retry_custody_snapshots(directory.path(), &first.wrapper_id()).is_empty());
+
+    for owned in [false, true] {
+        let attempt_directory = directory.path().join(format!("owned-{owned}"));
+        let writer = retry_custody_test_writer(&attempt_directory, owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        writer.admit(42, &WorkerId::new("next-worker")).unwrap();
+        let next = read_retry_lease(&writer);
+        assert_eq!(next.identity.remote_build_id, Some(42));
+        assert_eq!(next.worker_id.as_deref(), Some("next-worker"));
+        assert!(next.recovery.is_none() && next.exit_code.is_none());
+        assert!(
+            writer
+                .acknowledge_observed_completion(&previous, 137)
+                .is_err()
+        );
+        writer.record_exit(0).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        let finished = read_retry_lease(&writer);
+        assert_eq!(finished.identity, next.identity);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished.terminal_acknowledged);
+        let snapshots = retry_custody_snapshots(&attempt_directory, &writer.wrapper_id());
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].1, original);
+        assert_eq!(
+            std::fs::read(attempt_directory.join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
+    // Real journal/dispatch transitions with supplied attempt receipts; this
+    // does not claim an actual worker compilation or daemon acknowledgment.
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_custody_preservation_failure_blocks_dispatch_and_readmission() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for owned in [false, true] {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer = retry_custody_test_writer(directory.path(), owned);
+        let previous = writer.snapshot();
+        let original = std::fs::read(&writer.path).unwrap();
+        let collision = directory.path().join(format!(
+            "{}.recovery-{}.before",
+            writer.wrapper_id(),
+            blake3::hash(&original).to_hex()
+        ));
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&collision)
+            .unwrap();
+        corrupt.write_all(b"incomplete retained evidence").unwrap();
+        corrupt.sync_all().unwrap();
+        let mut polled = false;
+        assert!(
+            dispatch_retry_selection(&writer, true, async || {
+                polled = true;
+                Ok(retry_unassigned_response())
+            })
+            .await
+            .is_err()
+        );
+        assert!(!polled, "failed custody preservation must precede dispatch");
+        assert!(writer.admit(42, &WorkerId::new("next-worker")).is_err());
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(collision).unwrap(),
+            b"incomplete retained evidence"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("retained-stage/collector-input")).unwrap(),
+            b"retained original input"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5055,7 +5530,7 @@ fn cargo_profile_forwarding_binds_settings_and_preserves_shell_precedence() {
         ),
     ] {
         let bound = bind_cargo_profile_command(command, &environment, &layer0, settings.clone());
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed printf cases and fixture-only profile settings exercise real shell environment precedence.
             .args(["-c", &bound])
             .env_clear()
             .output()
@@ -5145,6 +5620,683 @@ fn test_unacknowledged_release_is_a_typed_no_replay_error() {
     assert!(message.contains("build 42"));
     assert!(message.contains("worker-a"));
     assert!(message.contains("must not be replayed"));
+}
+
+fn namespace_preflight_completion_reply(
+    lease: &DurableJobLease,
+    cancelled: bool,
+) -> serde_json::Value {
+    let build = lease.identity.remote_build_id.unwrap();
+    let mut reply = serde_json::json!({
+        "status": "completed",
+        "local_wrapper_id": lease.identity.local_wrapper_id,
+        "record": {
+            "id": build,
+            "worker_id": lease.worker_id,
+            "exit_code": if cancelled { 130 } else { EXIT_BUILD_ERROR },
+        },
+    });
+    if cancelled {
+        reply["record"]["cancellation"] = serde_json::json!({
+            "operation_id": format!("cancel-{build}"),
+            "origin": "stuck_detector",
+            "reason_code": "stuck_detector",
+            "decision_path": ["abandoned_unlaunched", "completed"],
+            "escalation_stage": "none",
+            "escalation_count": 0,
+            "remote_kill_attempted": false,
+            "cleanup_ok": true,
+            "history_cancelled": true,
+            "final_state": "completed",
+        });
+    }
+    reply
+}
+
+async fn namespace_preflight_reply_fixture(
+    writer: &DurableLeaseWriter,
+    failure: &SourceNamespacePreflightFailure,
+    response: Vec<u8>,
+) -> anyhow::Result<SourceNamespacePreflightCompletion> {
+    let root = tempfile::tempdir().unwrap().keep();
+    let socket = root.join("receipt.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut request = String::new();
+        TokioBufReader::new(reader)
+            .read_line(&mut request)
+            .await
+            .unwrap();
+        assert_eq!(
+            request,
+            format!(
+                "GET /builds/{}?local_wrapper_id={}\n",
+                failure.build_id,
+                urlencoding_encode(&failure.local_wrapper_id)
+            )
+        );
+        // A bounded reader may reject an oversized response before it drains.
+        let _ = writer.write_all(&response).await;
+    };
+    let client =
+        confirm_source_namespace_preflight_release(writer, failure, true, socket.to_str().unwrap());
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .expect("bounded preflight receipt fixture must finish");
+    result
+}
+
+#[tokio::test]
+async fn namespace_preflight_failure_retries_only_after_confirmed_release() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for stage in [
+        SourceNamespacePreflightStage::TopologyProbe,
+        SourceNamespacePreflightStage::NamespaceInitialization,
+    ] {
+        for next_admitted in [false, true] {
+            let writer = queued_selection_test_lease(
+                retained.join(format!("{stage:?}-{next_admitted}.json")),
+            );
+            let worker = WorkerId::new("namespace-worker");
+            writer.admit(41, &worker).unwrap();
+            let wrapper = writer.wrapper_id();
+            let error = writer.source_namespace_preflight_failed(
+                &worker,
+                Some(41),
+                Some(&wrapper),
+                stage,
+                anyhow::anyhow!("SSH command timed out after 20s")
+                    .context("namespace transport failed"),
+            );
+            assert!(is_ssh_command_timeout_error(&error));
+            let failure = error
+                .downcast_ref::<SourceNamespacePreflightFailure>()
+                .unwrap()
+                .clone();
+            assert_eq!(failure.local_wrapper_id, wrapper);
+            assert_eq!(failure.worker_id, worker);
+            assert_eq!(failure.build_id, 41);
+            assert_eq!(failure.stage, stage);
+            assert_eq!(
+                classify_remote_pipeline_failure(&error),
+                RemotePipelineFailurePolicy::AllowLocalFallback
+            );
+            // Outer unconfirmed evidence always overrides retry eligibility.
+            let unconfirmed = error.context(crate::transfer::RemoteExecutionUnconfirmed);
+            assert_eq!(
+                classify_remote_pipeline_failure(&unconfirmed),
+                RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+            );
+            let previous = writer.snapshot();
+            assert_eq!(read_retry_lease(&writer), previous);
+            assert_eq!(previous.exit_code, None);
+            assert_eq!(previous.phase, "source_namespace_preflight_failed");
+            assert!(previous.recovery.is_none());
+            assert!(!previous.terminal_acknowledged);
+            let bytes = std::fs::read(&writer.path).unwrap();
+
+            assert!(
+                dispatch_retry_selection(&writer, false, async || {
+                    panic!("an unconfirmed daemon release must prevent reselection")
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(writer.snapshot(), previous);
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+
+            let error = confirm_source_namespace_preflight_release(
+                &writer,
+                &failure,
+                false,
+                "/not-contacted-preflight.sock",
+            )
+            .await
+            .unwrap_err();
+            assert!(is_remote_execution_unconfirmed(&error));
+            assert_eq!(writer.snapshot(), previous);
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+            let reply = namespace_preflight_completion_reply(&previous, false);
+            assert_eq!(
+                namespace_preflight_reply_fixture(
+                    &writer,
+                    &failure,
+                    format!("HTTP/1.1 200 OK\r\n\r\n{reply}").into_bytes(),
+                )
+                .await
+                .unwrap(),
+                SourceNamespacePreflightCompletion::Failed
+            );
+            let previous = writer.snapshot();
+            assert_eq!(previous.exit_code, Some(EXIT_BUILD_ERROR));
+            assert_eq!(read_retry_lease(&writer), previous);
+
+            let response = dispatch_retry_selection(&writer, true, async || {
+                assert_retry_pending(&writer, &previous);
+                if next_admitted {
+                    Ok(SelectionResponse {
+                        worker: Some(SelectedWorker {
+                            id: WorkerId::new("next-worker"),
+                            host: "not-contacted.invalid".into(),
+                            user: "test".into(),
+                            identity_file: "/unused/key".into(),
+                            slots_available: 4,
+                            speed_score: 90.0,
+                            declared_os: None,
+                            project_lane: 0,
+                            disk_budget: None,
+                        }),
+                        build_id: Some(42),
+                        reason: SelectionReason::Success,
+                        diagnostics: None,
+                    })
+                } else {
+                    Ok(retry_unassigned_response())
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if next_admitted {
+                assert_retry_pending(&writer, &previous);
+                writer
+                    .admit(response.build_id.unwrap(), &response.worker.unwrap().id)
+                    .unwrap();
+                let next = read_retry_lease(&writer);
+                assert_eq!(next.identity.remote_build_id, Some(42));
+                assert_eq!(next.worker_id.as_deref(), Some("next-worker"));
+                assert!(next.recovery.is_none() && next.exit_code.is_none());
+                assert!(!next.terminal_acknowledged);
+            } else {
+                assert_eq!(writer.snapshot(), previous);
+                writer.acknowledge_terminal().unwrap();
+                let terminal = read_retry_lease(&writer);
+                assert!(terminal.terminal_acknowledged);
+                assert_eq!(terminal.exit_code, Some(EXIT_BUILD_ERROR));
+                assert!(terminal.recovery.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn namespace_preflight_failure_cannot_replace_other_admission_or_source_evidence() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for case in [
+        "build",
+        "worker",
+        "wrapper",
+        "pending",
+        "source",
+        "malformed-source",
+        "observed",
+        "terminal",
+    ] {
+        let writer = queued_selection_test_lease(retained.join(format!("{case}.json")));
+        let worker = WorkerId::new("namespace-worker");
+        writer.admit(41, &worker).unwrap();
+        let wrapper = writer.wrapper_id();
+        match case {
+            "pending" => {
+                writer.begin_retry_selection(true).unwrap();
+            }
+            "source" => writer
+                .set_recovery(serde_json::json!({"retired": false}))
+                .unwrap(),
+            "malformed-source" => writer.set_recovery(serde_json::Value::Null).unwrap(),
+            "observed" => writer.record_exit(EXIT_BUILD_ERROR).unwrap(),
+            "terminal" => {
+                writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+                writer.acknowledge_terminal().unwrap();
+            }
+            _ => {}
+        }
+        let expected_worker = if case == "worker" {
+            WorkerId::new("another-worker")
+        } else {
+            worker
+        };
+        let before = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let error = writer.source_namespace_preflight_failed(
+            &expected_worker,
+            Some(if case == "build" { 42 } else { 41 }),
+            Some(if case == "wrapper" {
+                "another-wrapper"
+            } else {
+                &wrapper
+            }),
+            SourceNamespacePreflightStage::NamespaceInitialization,
+            anyhow::anyhow!("SSH command timed out after 20s"),
+        );
+        assert!(is_remote_execution_unconfirmed(&error), "{case}: {error:#}");
+        assert!(!error.is::<SourceNamespacePreflightFailure>(), "{case}");
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback,
+            "{case}"
+        );
+        assert_eq!(writer.snapshot(), before, "{case}");
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes, "{case}");
+    }
+}
+
+#[test]
+fn namespace_preflight_failure_keeps_unconfirmed_or_unpublished_evidence() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for publication_fails in [false, true] {
+        let writer =
+            queued_selection_test_lease(retained.join(format!("{publication_fails}.json")));
+        let worker = WorkerId::new("namespace-worker");
+        writer.admit(41, &worker).unwrap();
+        let wrapper = writer.wrapper_id();
+        let before = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let target = if publication_fails {
+            DurableLeaseWriter {
+                path: retained.clone(),
+                #[cfg(unix)]
+                recovery_ownership: None,
+                lease: writer.lease.clone(),
+            }
+        } else {
+            writer.clone()
+        };
+        let cause = anyhow::anyhow!("SSH command timed out after 20s");
+        let cause = if publication_fails {
+            cause
+        } else {
+            cause.context(crate::transfer::RemoteExecutionUnconfirmed)
+        };
+        let error = target.source_namespace_preflight_failed(
+            &worker,
+            Some(41),
+            Some(&wrapper),
+            SourceNamespacePreflightStage::NamespaceInitialization,
+            cause,
+        );
+        assert!(is_remote_execution_unconfirmed(&error));
+        assert!(!error.is::<SourceNamespacePreflightFailure>());
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn namespace_preflight_restart_before_release_accepts_exact_daemon_completion() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for cancelled in [false, true] {
+        let writer = queued_selection_test_lease(retained.join(format!("{cancelled}.json")));
+        let worker = WorkerId::new("namespace-worker");
+        writer.admit(41, &worker).unwrap();
+        let wrapper = writer.wrapper_id();
+        let error = writer.source_namespace_preflight_failed(
+            &worker,
+            Some(41),
+            Some(&wrapper),
+            SourceNamespacePreflightStage::NamespaceInitialization,
+            anyhow::anyhow!("worker source namespace initialization refused (status Some(73))"),
+        );
+        assert!(error.is::<SourceNamespacePreflightFailure>());
+        assert!(writer.snapshot().exit_code.is_none());
+        // The phase is diagnostic, not recovery authority. The live wrapper
+        // can publish either heartbeat before dying without a release receipt.
+        writer
+            .heartbeat(if cancelled {
+                "release_unconfirmed"
+            } else {
+                "finalize"
+            })
+            .unwrap();
+        let path = writer.path.clone();
+        drop(writer);
+        let writer = DurableLeaseWriter {
+            lease: Arc::new(std::sync::Mutex::new(
+                DurableLeaseWriter::read_journal(&path, &wrapper).unwrap(),
+            )),
+            path,
+            #[cfg(unix)]
+            recovery_ownership: None,
+        };
+        let observed = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(writer.acknowledge_terminal().is_err());
+        let completed = namespace_preflight_completion_reply(&observed, cancelled);
+        for invalid in ["running", "wrapper", "worker", "build"] {
+            let mut reply = completed.clone();
+            match invalid {
+                "running" => reply["status"] = "running".into(),
+                "wrapper" => reply["local_wrapper_id"] = "another-wrapper".into(),
+                "worker" => reply["record"]["worker_id"] = "another-worker".into(),
+                "build" => reply["record"]["id"] = 42.into(),
+                _ => unreachable!(),
+            }
+            assert!(crate::commands::jobs::validate_completion(&observed, &reply).is_err());
+            assert_eq!(writer.snapshot(), observed, "{invalid}");
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes, "{invalid}");
+        }
+        let code = crate::commands::jobs::validate_completion(&observed, &completed).unwrap();
+        writer
+            .acknowledge_observed_completion(&observed, code)
+            .unwrap();
+        let terminal = read_retry_lease(&writer);
+        assert!(terminal.terminal_acknowledged);
+        assert_eq!(
+            terminal.exit_code,
+            Some(if cancelled { 130 } else { EXIT_BUILD_ERROR })
+        );
+        assert!(terminal.recovery.is_none());
+    }
+    // An older journal that already recorded a conflicting result remains
+    // contradictory. No new phase or changed generic recovery rule excuses it.
+    let old = queued_selection_test_lease(retained.join("old-conflict.json"));
+    old.admit(41, &WorkerId::new("namespace-worker")).unwrap();
+    old.record_exit(EXIT_BUILD_ERROR).unwrap();
+    let observed = old.snapshot();
+    let bytes = std::fs::read(&old.path).unwrap();
+    let cancelled = namespace_preflight_completion_reply(&observed, true);
+    let code = crate::commands::jobs::validate_completion(&observed, &cancelled).unwrap();
+    assert!(
+        old.acknowledge_observed_completion(&observed, code)
+            .is_err()
+    );
+    assert_eq!(old.snapshot(), observed);
+    assert_eq!(std::fs::read(&old.path).unwrap(), bytes);
+}
+
+#[test]
+fn namespace_preflight_marker_preserves_source_busy_and_unconfirmed_precedence() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("lease.json"));
+    let worker = WorkerId::new("namespace-worker");
+    writer.admit(41, &worker).unwrap();
+    let wrapper = writer.wrapper_id();
+    let error = writer.source_namespace_preflight_failed(
+        &worker,
+        Some(41),
+        Some(&wrapper),
+        SourceNamespacePreflightStage::NamespaceInitialization,
+        anyhow::Error::new(crate::transfer::SourceAuthorityBusy(
+            "registry metadata lock remained busy".into(),
+        ))
+        .context("namespace transport failed"),
+    );
+    assert!(error.is::<SourceNamespacePreflightFailure>());
+    assert!(crate::transfer::source_authority_busy(&error));
+    let result = Err(error);
+    assert!(remote_release_faults(&result, &worker).source_busy);
+    let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+    assert!(!remote_release_faults(&result, &worker).source_busy);
+    assert_eq!(
+        classify_remote_pipeline_failure(result.as_ref().unwrap_err()),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert!(read_retry_lease(&writer).exit_code.is_none());
+}
+
+#[tokio::test]
+async fn namespace_preflight_release_ack_can_report_prior_terminal_cancellation() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("lease.json"));
+    let worker = WorkerId::new("namespace-worker");
+    writer.admit(41, &worker).unwrap();
+    let wrapper = writer.wrapper_id();
+    let error = writer.source_namespace_preflight_failed(
+        &worker,
+        Some(41),
+        Some(&wrapper),
+        SourceNamespacePreflightStage::NamespaceInitialization,
+        anyhow::anyhow!("SSH command timed out after 20s"),
+    );
+    let failure = error
+        .downcast_ref::<SourceNamespacePreflightFailure>()
+        .unwrap();
+    let reply = namespace_preflight_completion_reply(&writer.snapshot(), true);
+    let socket = retained.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = async {
+        for expected in ["POST /release-worker?", "GET /builds/41?"] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut peer) = stream.into_split();
+            let mut request = String::new();
+            TokioBufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert!(request.starts_with(expected), "{request}");
+            assert!(
+                request.contains(&format!("local_wrapper_id={wrapper}")),
+                "{request}"
+            );
+            if expected.starts_with("POST") {
+                assert!(request.contains("exit_code=1"), "{request}");
+                assert!(writer.snapshot().exit_code.is_none());
+                // The daemon already committed cancellation130. Its duplicate
+                // release ACK confirms retirement, not the newly supplied1.
+                peer.write_all(b"HTTP/1.1 200 OK\r\n\r\n{}").await.unwrap();
+            } else {
+                peer.write_all(format!("HTTP/1.1 200 OK\r\n\r\n{reply}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    let client = async {
+        release_worker_with_fault(
+            socket.to_str().unwrap(),
+            &worker,
+            1,
+            Some(41),
+            Some(EXIT_BUILD_ERROR),
+            None,
+            None,
+            None,
+            Some(&wrapper),
+            daemon_ipc::ReleaseFaults::default(),
+        )
+        .await
+        .unwrap();
+        confirm_source_namespace_preflight_release(&writer, failure, true, socket.to_str().unwrap())
+            .await
+    };
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result.unwrap(),
+        SourceNamespacePreflightCompletion::Cancelled
+    );
+    let terminal = read_retry_lease(&writer);
+    assert!(terminal.terminal_acknowledged && terminal.recovery.is_none());
+    assert_eq!(terminal.exit_code, Some(130));
+    assert_eq!(
+        terminal.state,
+        rch_common::job_identity::JobLifecycleState::Finished
+    );
+    assert!(
+        dispatch_retry_selection(&writer, true, async || {
+            panic!("confirmed cancellation must not select another worker")
+        })
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn namespace_preflight_receipts_fail_closed_without_recording_an_outcome() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("lease.json"));
+    let worker = WorkerId::new("namespace-worker");
+    writer.admit(41, &worker).unwrap();
+    let wrapper = writer.wrapper_id();
+    let error = writer.source_namespace_preflight_failed(
+        &worker,
+        Some(41),
+        Some(&wrapper),
+        SourceNamespacePreflightStage::TopologyProbe,
+        anyhow::anyhow!("SSH command timed out after 20s"),
+    );
+    let failure = error
+        .downcast_ref::<SourceNamespacePreflightFailure>()
+        .unwrap();
+    let before = writer.snapshot();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    for invalid in [
+        "active",
+        "wrapper",
+        "worker",
+        "build",
+        "success",
+        "no-cancellation",
+        "incomplete-cancellation",
+        "cleanup",
+        "history",
+        "operation",
+        "state",
+        "conflicting-failure",
+        "http-error",
+        "malformed",
+        "oversized",
+    ] {
+        let mut reply = namespace_preflight_completion_reply(&before, true);
+        match invalid {
+            "active" => reply["status"] = "active".into(),
+            "wrapper" => reply["local_wrapper_id"] = "another-wrapper".into(),
+            "worker" => reply["record"]["worker_id"] = "another-worker".into(),
+            "build" => reply["record"]["id"] = 42.into(),
+            "success" => reply["record"]["exit_code"] = 0.into(),
+            "no-cancellation" => reply["record"]["cancellation"] = serde_json::Value::Null,
+            "incomplete-cancellation" => {
+                reply["record"]["cancellation"] = serde_json::json!({"final_state":"completed"})
+            }
+            "cleanup" => reply["record"]["cancellation"]["cleanup_ok"] = false.into(),
+            "history" => reply["record"]["cancellation"]["history_cancelled"] = false.into(),
+            "operation" => reply["record"]["cancellation"]["operation_id"] = "cancel-42".into(),
+            "state" => reply["record"]["cancellation"]["final_state"] = "failed".into(),
+            "conflicting-failure" => reply["record"]["exit_code"] = EXIT_BUILD_ERROR.into(),
+            _ => {}
+        }
+        let response = match invalid {
+            "http-error" => format!("HTTP/1.1 503 Unavailable\r\n\r\n{reply}"),
+            "malformed" => "HTTP/1.1 200 OK\r\n\r\n{".to_string(),
+            "oversized" => format!("HTTP/1.1 200 OK\r\n\r\n{}", " ".repeat(70 * 1024)),
+            _ => format!("HTTP/1.1 200 OK\r\n\r\n{reply}"),
+        };
+        let error = namespace_preflight_reply_fixture(&writer, failure, response.into_bytes())
+            .await
+            .unwrap_err();
+        assert!(
+            is_remote_execution_unconfirmed(&error),
+            "{invalid}: {error:#}"
+        );
+        assert_eq!(writer.snapshot(), before, "{invalid}");
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes, "{invalid}");
+    }
+    let error = confirm_source_namespace_preflight_release(
+        &writer,
+        failure,
+        true,
+        retained.join("missing.sock").to_str().unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(is_remote_execution_unconfirmed(&error));
+    assert_eq!(writer.snapshot(), before);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+}
+
+#[test]
+fn namespace_preflight_checkpoint_and_concurrent_completion_preserve_terminal_truth() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for completion_first in [false, true] {
+        let writer = queued_selection_test_lease(retained.join(format!("{completion_first}.json")));
+        let worker = WorkerId::new("namespace-worker");
+        writer.admit(41, &worker).unwrap();
+        let wrapper = writer.wrapper_id();
+        // A completion observer starts its daemon query before the failure
+        // checkpoint, then returns on either side of that durable publication.
+        let observed = writer.snapshot();
+        let start = std::sync::Barrier::new(2);
+        let first_published = std::sync::Barrier::new(2);
+        let (error, completion) = std::thread::scope(|scope| {
+            let checkpoint = scope.spawn(|| {
+                start.wait();
+                if completion_first {
+                    first_published.wait();
+                }
+                let error = writer.source_namespace_preflight_failed(
+                    &worker,
+                    Some(41),
+                    Some(&wrapper),
+                    SourceNamespacePreflightStage::NamespaceInitialization,
+                    anyhow::anyhow!("SSH command timed out after 20s"),
+                );
+                if !completion_first {
+                    first_published.wait();
+                }
+                error
+            });
+            let completion = scope.spawn(|| {
+                start.wait();
+                if !completion_first {
+                    first_published.wait();
+                }
+                let result = writer.acknowledge_observed_completion(&observed, 130);
+                if completion_first {
+                    first_published.wait();
+                }
+                result
+            });
+            (checkpoint.join().unwrap(), completion.join().unwrap())
+        });
+        completion.unwrap();
+        let terminal = read_retry_lease(&writer);
+        assert_eq!(writer.snapshot(), terminal);
+        assert!(terminal.terminal_acknowledged && terminal.recovery.is_none());
+        assert_eq!(terminal.exit_code, Some(130));
+        if completion_first {
+            assert!(is_remote_execution_unconfirmed(&error));
+            assert!(!error.is::<SourceNamespacePreflightFailure>());
+        } else {
+            let failure = error
+                .downcast_ref::<SourceNamespacePreflightFailure>()
+                .unwrap();
+            let bytes = std::fs::read(&writer.path).unwrap();
+            assert!(
+                writer
+                    .record_source_namespace_preflight_completion(
+                        failure,
+                        SourceNamespacePreflightCompletion::Failed,
+                    )
+                    .is_err()
+            );
+            writer
+                .record_source_namespace_preflight_completion(
+                    failure,
+                    SourceNamespacePreflightCompletion::Cancelled,
+                )
+                .unwrap();
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        }
+    }
 }
 
 #[test]
@@ -5464,6 +6616,122 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         .live_checkout_refused
     );
     assert!(!remote_release_faults(&checked("Permission denied"), &worker).live_checkout_refused);
+}
+
+#[test]
+fn clean_overlay_disk_budget_diagnostic_survives_saturated_ui_and_unconfirmed_completion() {
+    use super::transfer_orchestration::{
+        CompileUiState, capture_disk_budget_diagnostic,
+        ensure_remote_process_setup_after_completion,
+    };
+
+    let budget = rch_common::BuildDiskBudget {
+        max_growth_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+        min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+    };
+    let pipeline = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let setup_marker = pipeline.remote_process_setup_marker();
+    let deadline = setup_marker.strip_suffix("_IDENTITY_UNAVAILABLE").unwrap();
+    let failure = serde_json::json!({
+        "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "started": true, "detail": "output scan deadline", "peak_output_bytes": 423_714_816,
+    });
+    let line = format!("{deadline}_DISK_BUDGET:{failure}\n");
+    let usage = serde_json::json!({
+        "max_growth_bytes": budget.max_growth_bytes, "min_free_bytes": budget.min_free_bytes,
+        "peak_output_bytes": 423_714_816, "peak_growth_bytes": 280_694_784,
+        "complete": false, "exit_code": null,
+    });
+    let usage_line = format!("{deadline}_DISK_USAGE:{usage}\n");
+
+    let mut state = CompileUiState::new(Some(CompilationProgress::new(
+        rch_common::ui::OutputContext::Machine,
+        "worker-diagnostic",
+        true,
+    )));
+    state.output = "x".repeat(256 * 1024);
+    let mut captured = String::new();
+    let mut emitted = String::new();
+    // Exercise the production cap first: ordinary output is retained for
+    // analysis but cannot grow the already full progress preview.
+    state.capture_stderr("ordinary overflow\n", &mut captured, false, |line| {
+        emitted.push_str(line);
+    });
+    assert!(state.output_truncated);
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(emitted.is_empty());
+
+    let observed =
+        capture_disk_budget_diagnostic(&pipeline, &line, &mut state, &mut captured, |line| {
+            emitted.push_str(line)
+        })
+        .expect("the exact attempt-bound failure must reach the uncapped diagnostic sink");
+    assert!(observed.started);
+    assert_eq!(observed.reason, "monitor_unavailable");
+    assert_eq!(observed.detail, "output scan deadline");
+    assert_eq!(observed.peak_output_bytes, Some(423_714_816));
+    assert_eq!(emitted, line);
+    assert_eq!(captured, format!("ordinary overflow\n{line}"));
+    assert_eq!(state.output.len(), 256 * 1024);
+    assert!(state.output_truncated);
+
+    assert!(pipeline.parse_disk_usage_marker(&usage_line).is_none());
+    assert!(pipeline.parse_disk_usage_exit_code(&usage_line).is_none());
+    for ordinary in [&usage_line[..], "RCH_SCOPED_COMPLETION_UNCONFIRMED\n"] {
+        state.capture_stderr(ordinary, &mut captured, false, |line| {
+            emitted.push_str(line);
+        });
+    }
+    let result = rch_common::CommandResult {
+        exit_code: 255,
+        stdout: String::new(),
+        stderr: captured.clone(),
+        duration_ms: 0,
+    };
+    let error = ensure_remote_process_setup_after_completion(&pipeline, &result, None).unwrap_err();
+    assert!(is_remote_execution_unconfirmed(&error));
+    assert!(format!("{error:#}").contains("SSH execution exit 255"));
+    assert!(
+        error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .is_none(),
+        "diagnostic retention must not turn unknown containment into a confirmed disk result"
+    );
+    assert_eq!(remote_failure_exit_code(&error), EXIT_BUILD_ERROR);
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert!(
+        remote_pipeline_failure_summary(&WorkerId::new("worker-diagnostic"), &error)
+            .contains("ownership retained for recovery")
+    );
+    assert!(captured.contains(&line));
+    assert_eq!(emitted, line);
+
+    let other = TransferPipeline::new(
+        PathBuf::from("/tmp/disk-diagnostic-capture"),
+        "disk-diagnostic-capture".into(),
+        "abc123".into(),
+        TransferConfig::default(),
+    )
+    .with_disk_budget(Some(budget));
+    let retained_before = captured.clone();
+    assert!(
+        capture_disk_budget_diagnostic(&other, &line, &mut state, &mut captured, |line| emitted
+            .push_str(line),)
+        .is_none(),
+        "another attempt's nonce cannot become trusted disk-failure evidence"
+    );
+    assert_eq!(captured, retained_before);
+    assert_eq!(emitted, line);
 }
 
 #[test]
@@ -8569,26 +9837,42 @@ fn test_layer0_pack_respects_profile_settings_the_project_declares() {
         "CARGO_PROFILE_DEV_DEBUG",
         "CARGO_PROFILE_TEST_DEBUG",
     ];
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("rch-layer0-profile-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let root = temp.path();
     let member = root.join("crates/member");
     std::fs::create_dir_all(member.join(".cargo")).unwrap();
     std::fs::write(
         member.join("Cargo.toml"),
-        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+        "[package]\nname = \"member\"\n[workspace]\n[profile.dev]\ndebug = 2\n",
     )
     .unwrap();
-    // No workspace: the member is its own root, and its dev debug also
+    // Explicit standalone root (`[workspace]`): the member is its own root even
+    // when scratch lies beneath an enclosing workspace, and its dev debug also
     // covers test, which inherits dev.
     assert_eq!(keys(&member), every[..2]);
 
-    // With a workspace root, only the root's profiles count.
+    // Without its own `[workspace]`, a member inherits its enclosing workspace
+    // root's profiles and ignores member-level `[profile.*]`.
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\"crates/member\"]\n[profile.test]\ndebug = 0\n",
     )
     .unwrap();
     assert_eq!(keys(&member), every[..3]);
+
+    // A nested directory without its own `[workspace]` boundary also inherits
+    // the enclosing workspace root's declared profiles.
+    let nested = root.join("crates/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(keys(&nested), every[..3]);
 
     // A `.cargo/config.toml` inside the tree counts too.
     std::fs::write(
@@ -8604,10 +9888,16 @@ fn test_layer0_pack_respects_profile_settings_the_project_declares() {
         ]
     );
 
-    // Nothing declared: every enabled knob applies.
-    let bare = tempfile::tempdir().unwrap();
-    assert_eq!(keys(bare.path()), every);
-    assert!(layer0_env_for_lane(&all, true, Some(bare.path())).is_empty());
+    // Nothing declared in an explicit standalone boundary: every enabled knob applies.
+    let bare = root.join("standalone-bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(
+        bare.join("Cargo.toml"),
+        "[package]\nname = \"bare\"\n[workspace]\n",
+    )
+    .unwrap();
+    assert_eq!(keys(&bare), every);
+    assert!(layer0_env_for_lane(&all, true, Some(&bare)).is_empty());
 }
 
 /// bd-hoxgn: the Layer 0 pack must reach the command that actually runs. It
@@ -8696,12 +9986,18 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         .find(|entry| entry.phase == mock::Phase::Execute)
         .and_then(|entry| entry.command.as_deref())
         .expect("execute command should be recorded");
+    // The disk-budget supervisor nests the build in one more shell-quoting
+    // layer, so compare the assignments with the quoting removed.
+    let unquoted: String = execute_command
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '\\'))
+        .collect();
     for assignment in [
-        "CARGO_PROFILE_DEV_DEBUG='line-tables-only'",
-        "CARGO_PROFILE_TEST_DEBUG='line-tables-only'",
+        "CARGO_PROFILE_DEV_DEBUG=line-tables-only",
+        "CARGO_PROFILE_TEST_DEBUG=line-tables-only",
     ] {
         assert!(
-            execute_command.contains(assignment),
+            unquoted.contains(assignment),
             "expected {assignment} on the executed command, got {execute_command}"
         );
     }

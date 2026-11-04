@@ -187,10 +187,7 @@ mod tests {
             // allowed, but successful capture must contain the ORIGINAL bytes.
             if let Ok(mut captured) = CapturedStream::from_lane(&lane) {
                 assert_eq!(captured.read_chunk(0, 10).unwrap(), b"A\0\xffB");
-                assert_eq!(
-                    captured.sha256(),
-                    crate::session::sha256_hex(b"A\0\xffB")
-                );
+                assert_eq!(captured.sha256(), crate::session::sha256_hex(b"A\0\xffB"));
             }
         }
     }
@@ -226,10 +223,7 @@ mod tests {
         for thread in threads {
             let mut captured = thread.join().unwrap();
             assert_eq!(captured.read_chunk(0, 10).unwrap(), b"A\0\xffB");
-            assert_eq!(
-                captured.sha256(),
-                crate::session::sha256_hex(b"A\0\xffB")
-            );
+            assert_eq!(captured.sha256(), crate::session::sha256_hex(b"A\0\xffB"));
         }
     }
 

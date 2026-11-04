@@ -19,15 +19,18 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
 use super::{
-    DependencyActionPlan, DependencyDirectoryFact, ExternFact, LiveDependencyKey, LiveRefusal,
-    PlannedExtern, ToolchainFacts, live_dependency_key, plain_path, within,
+    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
+    LiveDependencyKey, LiveRefusal, PlannedExtern, ToolchainFacts, live_dependency_key,
+    plain_path_in_profile, within,
 };
 use crate::action_key::compute_action_key;
 use crate::canonical::CanonicalEncoder;
 use crate::extern_resolution::DependencyArtifactKind;
 use crate::hit_verification::{descriptor_canonical_bytes, descriptor_digest};
 use crate::invocation::NormalizedRustcInvocation;
-use crate::output_derivation::derive_dependency_output_declarations;
+use crate::output_derivation::{
+    derive_dependency_output_declarations, derive_workspace_output_declarations,
+};
 use crate::output_platform::{CpuBaseline, OutputPlatformContract};
 use crate::typed_digest::compute;
 
@@ -35,15 +38,20 @@ use crate::typed_digest::compute;
 pub const RUNTIME_COHORT_DOMAIN: &str = "rabs.rustc-host-runtime.v2";
 /// Isolation policy domain for the remote metadata dependency class.
 pub const REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str = "rabs.remote-leaf.isolation.v1";
+/// Canonical Cargo planning and closed worker execution form a distinct lane.
+/// Neither ordinary worker receipts nor local canonical checks supply its
+/// evidence, even when source bytes and compiler options happen to match.
+pub const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN: &str =
+    "rabs.canonical-cargo-remote-dependency.isolation.v1";
 /// Complete retained toolchain bytes, joined with the observed compiler contract.
 pub const REMOTE_TOOLCHAIN_DOMAIN: &str = "rabs.remote-leaf.toolchain.v1";
 /// Versioned execution policy, deliberately separate from local-edge evidence.
-pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v6: \
+pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadata-v7: \
     Linux worker namespace; subscriber paths preserved; complete regular-file \
     dependency source, exact toolchain and complete crate-candidate inventories \
     mounted read-only; explicit rmeta and complete rlib extern bytes retained; \
     complete generated OUT_DIR tree retained read-only at its original path, \
-    including an empty tree, with exact captured Cargo stdout and rustc-env \
+    including every empty directory and exact keyed directory listing, with captured Cargo stdout and rustc-env \
     directives bound; build-script execution is not cached; no bare extern, \
     proc-macro or native inputs; metadata and dep-info \
     only; shared input/output roots use exact read-only file mounts above private \
@@ -52,7 +60,7 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
     receive private empty backings; outputs private until complete authenticated \
     delivery; network denied; compiler environment preserved by dependency-env-v2 \
     except process-local jobserver descriptors; all loader paths within the exact \
-    toolchain or independently observed dependency-exec-v6 directories without \
+    toolchain or independently observed dependency-exec-v8 directories without \
     dynamic libraries, including Cargo output parents; selected host ELF runtime \
     bytes, exact loader symlink topology and loader cache captured and mounted \
     read-only in a sparse /usr view without other host /usr or /etc/alternatives \
@@ -67,11 +75,12 @@ pub const REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "remote-dependency-metadat
 /// integrated assembler may read `.incbin` files without listing them in
 /// dep-info; it must not see procfs, randomness devices, or the host filesystem.
 /// This policy is never evidence for an unsandboxed local archive compilation.
-pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
-    dependency-exec-v7 rlib execution mode; original subscriber paths preserved; \
+pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v2: \
+    dependency-exec-v8 rlib execution mode; original subscriber paths preserved; \
     complete regular-file package, generated OUT_DIR, exact toolchain, Rust \
     dependency candidate inventories and observed selected ELF runtime retained \
-    read-only; exact compiler environment except process-local jobserver descriptors; \
+    read-only; generated trees include every empty directory and exact keyed directory listing; \
+    exact compiler environment except process-local jobserver descriptors; \
     network denied; no procfs or general device filesystem, only deterministic \
     /dev/null; fresh private empty home, temporary and output storage; LLVM \
     integrated archive codegen only with no proc macros, native link inputs, \
@@ -81,6 +90,69 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
     exact private output capture, runtime/input revalidation, authenticated delivery \
     and coordinator-only publication; full-result readiness";
 
+const CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE: &str = "canonical-cargo-remote-metadata-v4: canonical-dependency-exec-v4 negotiated \
+    separately from dependency-exec-v8; coordinator-owned canonical Cargo \
+    planning and retained logical-to-physical mappings; exact canonical rustc \
+    argv, cwd, environment and replay bytes; external registry, Git or checked \
+    directory-source metadata and dep-info only; closed worker package, complete \
+    toolchain and candidate inventories with independently matched retained ELF \
+    runtime; no outer Cargo workspace, complete Cargo home or coordinator control \
+    socket mounted; existing authenticated delivery, input revalidation, closure, \
+    sampling and release authorization remain required; complete generated OUT_DIR \
+    retained read-only at its exact canonical spelling, including every empty directory \
+    and exact keyed directory listing, \
+    with exact persisted Cargo stdout and matching rustc-env directives keyed; \
+    no workspace, archive, build-script execution or proc-macro authority";
+
+const CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE: &str = "canonical-cargo-remote-rlib-v3: \
+    canonical-dependency-exec-v4 rlib mode negotiated independently from metadata \
+    and ordinary dependency-exec-v8; coordinator-owned canonical Cargo planning \
+    and retained logical-to-physical mappings; exact canonical rustc argv, cwd, \
+    environment and replay bytes; complete immutable external registry, Git or \
+    checked directory-source package, toolchain, exact Rust candidate inventories \
+    and independently matched retained ELF runtime; existing closed archive \
+    namespace with no procfs, entropy devices, outer Cargo workspace/home or \
+    coordinator control socket; fresh private output, HOME and temporary storage; \
+    all assembler include/incbin inputs must resolve within retained keyed bytes \
+    or fail; existing exact output validation, authenticated delivery, input \
+    revalidation, sampling and release authorization required; no local codegen \
+    capture or workspace publication; complete generated OUT_DIR retained read-only \
+    at its exact canonical spelling, including every empty directory and exact keyed \
+    directory listing, with exact persisted \
+    Cargo stdout and matching rustc-env directives keyed; no build-script execution, \
+    proc macros or native linking";
+
+// Applied only to native archive actions. Existing pure-Rust descriptors retain
+// their exact policy identity. This extends the base archive policy's native-input
+// refusal without granting final-link, local-codegen or build-script authority.
+const CANONICAL_GENERATED_NATIVE_ISOLATION_EXTENSION: &str = "canonical-generated-static-rlib-v1: \
+    static native archive bundling is admitted only in the canonical closed rlib \
+    view; exact -l static=NAME arguments use default bundle semantics; every native \
+    search root is the current bound OUT_DIR or a captured descendant directory; \
+    each requested libNAME.a occurs in the complete retained generated file tree; \
+    search order, archive bytes, complete directory listings, exact Cargo stdout \
+    and all generated members remain keyed; source link attributes and archive \
+    member reads resolve only within the existing retained keyed view or fail; \
+    no dynamic/framework/system search, command-line link modifiers, external \
+    linker, metadata-only native execution or local capture authority";
+
+// Metadata receives a separate extension rather than rewriting the existing
+// archive profile. The entire generated tree was already a keyed, retained
+// input: admitting its static native searches adds no ambient filesystem access.
+// Workers negotiate this extension independently before receiving input bytes.
+pub(super) const CANONICAL_GENERATED_NATIVE_METADATA_ISOLATION_EXTENSION: &str = "canonical-generated-static-metadata-v1: \
+    exact metadata and dep-info outputs only; independently supervised canonical \
+    worker execution with the complete current package OUT_DIR retained read-only; \
+    every native search directory and requested libNAME.a must occur in that \
+    complete generated file and directory inventory; only default-bundle \
+    -l static=NAME arguments; original search/library ordering, all archive \
+    bytes, empty directories, exact Cargo stdout and rustc-env directives keyed; \
+    source link attributes resolve within retained inputs or fail; existing \
+    metadata runtime, environment, output, dep-info closure, authenticated delivery \
+    and publication checks remain required; no codegen, native linking, \
+    dynamic/framework/system searches, link modifiers, foreign generated roots, \
+    proc macros, build-script execution or local capture authority";
+
 /// Output and isolation class selected from a bounded compiler invocation.
 /// This is not execution or serving authority: the caller must enforce the
 /// matching worker context and retain every observed input through completion.
@@ -88,7 +160,7 @@ pub const REMOTE_RLIB_ISOLATION_PROFILE: &str = "remote-dependency-rlib-v1: \
 pub enum RemoteDependencyOutputClass {
     /// Existing metadata-only execution and cache policy.
     Metadata,
-    /// Pure Rust archive codegen in the stricter, closed filesystem profile.
+    /// Rust archive codegen in the stricter, closed filesystem profile.
     Rlib,
 }
 
@@ -114,12 +186,313 @@ pub fn remote_dependency_output_class(
     Err(RemoteDependencyRefusal::OutputClass)
 }
 
+/// Check the bounded generated-native extension before capture or execution.
+///
+/// Only a retained canonical remote dependency or selected fresh workspace
+/// execution context may pass `canonical_execution = true`. Path
+/// spelling is not authority. This helper permits static archive bundling
+/// in the closed Rlib view and static native inputs in metadata-only execution,
+/// never final native linking or local capture. All non-dependency search
+/// arguments are checked, including searches used by
+/// source `#[link]` attributes without a command-line `-l`.
+///
+/// Returned native roots are sorted and deduplicated for membership checks;
+/// the original invocation must retain the actual search and library ordering.
+/// The full key independently requires those directories and named archives
+/// in the complete captured generated tree. A worker must verify the same
+/// archive membership and directory topology before mounting those inputs.
+///
+/// # Errors
+/// A typed refusal for ordinary/local contexts, unsupported outputs, dynamic or
+/// modified library arguments, or searches outside the exact generated tree.
+pub fn validate_generated_native_inputs(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+    canonical_execution: bool,
+) -> Result<Vec<String>, LiveRefusal> {
+    validate_generated_native_inputs_with_roots(
+        invocation,
+        generated_root,
+        &[],
+        canonical_execution,
+    )
+}
+
+/// The independently bounded foreign-root contract shared with worker
+/// preparation. These are complete Cargo OUT_DIRs, never arbitrary host native
+/// search directories or a claim that a pathname itself proves capture.
+pub const MAX_CANONICAL_NATIVE_ROOTS: usize = 32;
+
+/// Derive foreign OUT_DIR capture intent from canonical Cargo native searches.
+///
+/// A search may name an OUT_DIR or one of its descendants. Cargo places the
+/// build directory below the profile, optionally preceded by a target triple.
+/// Both `build/<producer>/out` and `build/<crate>/<unit>/out` identify a producer
+/// root; completed
+/// `root-output`/`output` records must independently confirm that interpretation
+/// before any bytes are captured or sent. The current package's own OUT_DIR is
+/// already captured separately and is never duplicated here.
+///
+/// # Errors
+/// Unsafe/non-Cargo native paths, ambiguous overlapping roots, or excessive
+/// foreign root count. This pure helper grants no filesystem or cache authority.
+pub fn canonical_generated_native_roots(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+) -> Result<Vec<String>, LiveRefusal> {
+    const TARGET_PREFIX: &str = "/__rabs/out/cargo/";
+    let mut roots = std::collections::BTreeSet::new();
+    for search in &invocation.lib_search {
+        let Some(path) = search.strip_prefix("native=") else {
+            continue;
+        };
+        if !plain_path_in_profile(path, true) {
+            return Err(LiveRefusal::SearchPath(search.clone()));
+        }
+        if generated_root.is_some_and(|root| path == root || within(path, root)) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(TARGET_PREFIX)
+            .ok_or_else(|| LiveRefusal::SearchPath(search.clone()))?;
+        let components: Vec<_> = relative.split('/').collect();
+        let end = [2, 1]
+            .into_iter()
+            .find_map(|start| {
+                if components.get(start) != Some(&"build") {
+                    return None;
+                }
+                [start + 2, start + 3]
+                    .into_iter()
+                    .find(|end| components.get(*end) == Some(&"out"))
+            })
+            .ok_or_else(|| LiveRefusal::SearchPath(search.clone()))?;
+        roots.insert(format!("{TARGET_PREFIX}{}", components[..=end].join("/")));
+        if roots.len() > MAX_CANONICAL_NATIVE_ROOTS {
+            return Err(LiveRefusal::SearchPath(
+                "too many foreign native roots".into(),
+            ));
+        }
+    }
+    let roots: Vec<_> = roots.into_iter().collect();
+    validate_native_root_layout(invocation, generated_root, &roots, true)?;
+    Ok(roots)
+}
+
+fn validate_native_root_layout(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+    native_roots: &[String],
+    canonical_execution: bool,
+) -> Result<(), LiveRefusal> {
+    let overlaps =
+        |left: &str, right: &str| left == right || within(left, right) || within(right, left);
+    if native_roots.len() > MAX_CANONICAL_NATIVE_ROOTS
+        || native_roots.windows(2).any(|pair| pair[0] >= pair[1])
+        || (!canonical_execution && !native_roots.is_empty())
+    {
+        return Err(LiveRefusal::Facts(
+            "foreign native roots require a bounded sorted canonical execution contract".into(),
+        ));
+    }
+    for (index, root) in native_roots.iter().enumerate() {
+        if !plain_path_in_profile(root, true)
+            || !within(root, "/__rabs/out/cargo")
+            || !root.ends_with("/out")
+            || root == "/__rabs/out/cargo/out"
+            || generated_root.is_some_and(|own| overlaps(root, own))
+            || invocation
+                .out_dir
+                .as_deref()
+                .is_some_and(|output| overlaps(root, output))
+            || invocation.lib_search.iter().any(|search| {
+                search
+                    .strip_prefix("dependency=")
+                    .is_some_and(|dependency| overlaps(root, dependency))
+            })
+            || native_roots[index + 1..]
+                .iter()
+                .any(|other| overlaps(root, other))
+            || !invocation.lib_search.iter().any(|search| {
+                search
+                    .strip_prefix("native=")
+                    .is_some_and(|directory| directory == root || within(directory, root))
+            })
+        {
+            return Err(LiveRefusal::SearchPath(root.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Validate native searches against the own OUT_DIR and explicitly retained
+/// foreign OUT_DIRs. The complete directory/file inventories and each foreign
+/// Cargo run record are checked separately during keying; workers must check
+/// the corresponding transferred manifests and negotiate the native-roots
+/// capability before executing this extended class.
+///
+/// # Errors
+/// Invalid root membership/order, native modifiers or external searches, and
+/// any use of foreign roots outside isolated canonical compilation.
+pub fn validate_generated_native_inputs_with_roots(
+    invocation: &NormalizedRustcInvocation,
+    generated_root: Option<&str>,
+    native_roots: &[String],
+    canonical_execution: bool,
+) -> Result<Vec<String>, LiveRefusal> {
+    validate_native_root_layout(
+        invocation,
+        generated_root,
+        native_roots,
+        canonical_execution,
+    )?;
+    if canonical_execution
+        && canonical_generated_native_roots(invocation, generated_root)? != native_roots
+    {
+        return Err(LiveRefusal::Facts(
+            "foreign native roots do not exactly cover the canonical searches".into(),
+        ));
+    }
+    let mut native_dirs = Vec::new();
+    for search in &invocation.lib_search {
+        if search.starts_with("dependency=") {
+            continue;
+        }
+        let path = search
+            .strip_prefix("native=")
+            .ok_or_else(|| LiveRefusal::SearchPath(search.clone()))?;
+        if !canonical_execution || !plain_path_in_profile(path, true) {
+            return Err(LiveRefusal::SearchPath(search.clone()));
+        }
+        if !native_dirs.iter().any(|directory| directory == path) {
+            if native_dirs.len() >= 128 {
+                return Err(LiveRefusal::SearchPath(
+                    "too many native directories".into(),
+                ));
+            }
+            native_dirs.push(path.to_owned());
+        }
+    }
+    if native_dirs.is_empty() && invocation.native_libs.is_empty() {
+        return Ok(native_dirs);
+    }
+    if !canonical_execution || remote_dependency_output_class(invocation).is_err() {
+        return Err(LiveRefusal::Facts(
+            "generated native inputs require isolated canonical metadata or Rust archive execution"
+                .into(),
+        ));
+    }
+    let own = generated_root
+        .filter(|root| plain_path_in_profile(root, true) && within(root, "/__rabs/out/cargo"));
+    if generated_root.is_some() && own.is_none() {
+        return Err(LiveRefusal::Facts(
+            "generated native inputs require the exact canonical OUT_DIR".into(),
+        ));
+    }
+    for directory in &native_dirs {
+        if !own
+            .into_iter()
+            .chain(native_roots.iter().map(String::as_str))
+            .any(|root| directory == root || within(directory, root))
+        {
+            return Err(LiveRefusal::SearchPath(directory.clone()));
+        }
+    }
+    for library in &invocation.native_libs {
+        if native_dirs.is_empty()
+            || library.strip_prefix("static=").is_none_or(|name| {
+                // Linux filename limit leaves room for the lib prefix and .a.
+                !super::safe_component(name) || name.len() > 250
+            })
+        {
+            return Err(LiveRefusal::NativeLibrary(library.clone()));
+        }
+    }
+    native_dirs.sort();
+    Ok(native_dirs)
+}
+
+pub(super) fn validate_plan_native_roots(
+    plan: &DependencyActionPlan,
+) -> Result<Vec<String>, LiveRefusal> {
+    let directories = validate_generated_native_inputs_with_roots(
+        &plan.invocation,
+        plan.generated_root.as_deref(),
+        &plan.native_roots,
+        plan.canonical_cargo,
+    )?;
+    if !plan.native_roots.is_empty()
+        && (!plan.canonical_cargo
+            || canonical_generated_native_roots(&plan.invocation, plan.generated_root.as_deref())?
+                != plan.native_roots
+            || plan.native_roots.iter().any(|root| {
+                [&plan.source_root, &plan.out_dir]
+                    .into_iter()
+                    .chain(&plan.dependency_dirs)
+                    .any(|other| root == other || within(root, other) || within(other, root))
+            }))
+    {
+        return Err(LiveRefusal::Facts(
+            "foreign native roots differ from the complete canonical invocation".into(),
+        ));
+    }
+    Ok(directories)
+}
+
+/// This extension changes execution/input authority only for plans which
+/// actually retain foreign Cargo OUT_DIRs. Existing own-OUT_DIR and pure keys
+/// keep their policy identity and cannot supply evidence to this new class.
+pub(super) const CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION: &str = "canonical-generated-native-roots-v1: every foreign Cargo OUT_DIR selected \
+    by propagated native searches is independently bound to its completed \
+    root-output/stdout record and complete immutable file/directory tree; \
+    exact logical root and native search/library ordering retained; sorted \
+    roots transferred under disjoint native/index prefixes and mounted read-only; \
+    missing roots/directories/records refuse before dispatch; no arbitrary native \
+    host search, dynamic/framework library, modifier or linker authority; \
+    ordinary local capture and workspace publication remain forbidden";
+
 /// Exact isolation-policy component used by the remote key builder. Daemon
 /// publication and serving boundaries compare this against the descriptor,
 /// together with an opaque witness of the enforced worker execution mode.
 pub fn remote_dependency_isolation_policy(
     plan: &DependencyActionPlan,
 ) -> Result<TypedDigest, RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
+    let native_dirs = validate_plan_native_roots(plan)?;
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+        let (canonical_profile, execution_profile) =
+            match remote_dependency_output_class(&plan.invocation)? {
+                RemoteDependencyOutputClass::Metadata => (
+                    CANONICAL_REMOTE_DEPENDENCY_ISOLATION_PROFILE,
+                    REMOTE_DEPENDENCY_ISOLATION_PROFILE,
+                ),
+                RemoteDependencyOutputClass::Rlib => (
+                    CANONICAL_REMOTE_RLIB_ISOLATION_PROFILE,
+                    REMOTE_RLIB_ISOLATION_PROFILE,
+                ),
+            };
+        let mut policy = CanonicalEncoder::new();
+        policy
+            .str(canonical_profile)
+            .str(execution_profile)
+            .str(plan.source_kind.as_str());
+        if !native_dirs.is_empty() {
+            policy.str(match remote_dependency_output_class(&plan.invocation)? {
+                RemoteDependencyOutputClass::Metadata => {
+                    CANONICAL_GENERATED_NATIVE_METADATA_ISOLATION_EXTENSION
+                }
+                RemoteDependencyOutputClass::Rlib => CANONICAL_GENERATED_NATIVE_ISOLATION_EXTENSION,
+            });
+        }
+        if !plan.native_roots.is_empty() {
+            policy.str(CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION);
+        }
+        return Ok(compute(
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN,
+            &policy.finish(),
+        ));
+    }
     let profile = match remote_dependency_output_class(&plan.invocation)? {
         RemoteDependencyOutputClass::Metadata => REMOTE_DEPENDENCY_ISOLATION_PROFILE,
         RemoteDependencyOutputClass::Rlib => REMOTE_RLIB_ISOLATION_PROFILE,
@@ -224,7 +597,8 @@ fn loader_paths(
     plan: &DependencyActionPlan,
     toolchain_root: &str,
 ) -> Result<(Vec<String>, Vec<String>), RemoteDependencyRefusal> {
-    if !plain_path(toolchain_root)
+    if !plain_path_in_profile(toolchain_root, plan.canonical_cargo)
+        || (plan.canonical_cargo && toolchain_root != "/__rabs/toolchain")
         || plan.compiler != format!("{toolchain_root}/bin/rustc")
         || plan.invocation.compiler_argv0 != plan.compiler
     {
@@ -258,8 +632,15 @@ fn loader_paths(
         if name != "LD_LIBRARY_PATH" {
             continue;
         }
+        // A wholly empty value is the loader's empty search list, as emitted
+        // by Cargo for a cold workspace unit. It is not an empty component in
+        // a nonempty colon-separated list: those can search cwd and still
+        // refuse below. Keep the exact presented binding in the action key.
+        if value.is_empty() {
+            continue;
+        }
         for entry in value.split(':') {
-            if !plain_path(entry) {
+            if !plain_path_in_profile(entry, plan.canonical_cargo) {
                 return Err(RemoteDependencyRefusal::LoaderEnvironment(
                     "LD_LIBRARY_PATH contains an empty, relative or unrepresentable entry".into(),
                 ));
@@ -269,20 +650,29 @@ fn loader_paths(
             } else if within(entry, toolchain_root) {
                 search_paths.push(entry[toolchain_root.len() + 1..].to_owned());
             } else {
-                if overlaps(entry, toolchain_root)
-                    || overlaps(entry, &plan.source_root)
-                    || [
+                let reserved = if plan.canonical_cargo {
+                    entry != "/__rabs/out/cargo" && !within(entry, "/__rabs/out/cargo")
+                } else {
+                    [
                         "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc",
                         "/dev", "/sys", "/run",
                     ]
                     .iter()
                     .any(|reserved| overlaps(entry, reserved))
+                };
+                if overlaps(entry, toolchain_root)
+                    || overlaps(entry, &plan.source_root)
+                    || reserved
                     || within(entry, &plan.out_dir)
                     || plan.dependency_dirs.iter().any(|root| within(entry, root))
                     || plan
                         .generated_root
                         .as_deref()
                         .is_some_and(|root| entry == root || within(entry, root))
+                    || plan
+                        .native_roots
+                        .iter()
+                        .any(|root| entry == root || within(entry, root))
                 {
                     return Err(RemoteDependencyRefusal::LoaderEnvironment(
                         "private loader directory overlaps inputs, runtime or an output descendant"
@@ -312,6 +702,32 @@ pub fn remote_dependency_shape(
     directories: &[DependencyDirectoryFact],
     toolchain_root: &str,
 ) -> Result<(), RemoteDependencyRefusal> {
+    reject_workspace_cache_authority(plan)?;
+    if plan.canonical_cargo {
+        super::canonical_cargo::canonical_layout(plan)?;
+    }
+    remote_execution_shape(plan, directories, toolchain_root)
+}
+
+fn reject_workspace_cache_authority(
+    plan: &DependencyActionPlan,
+) -> Result<(), RemoteDependencyRefusal> {
+    if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "workspace execution-only plans have no remote dependency-cache authority".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Shared mechanical execution constraints. The public class-specific entry
+/// points validate their source/profile authority before reaching this helper.
+pub(super) fn remote_execution_shape(
+    plan: &DependencyActionPlan,
+    directories: &[DependencyDirectoryFact],
+    toolchain_root: &str,
+) -> Result<(), RemoteDependencyRefusal> {
     if directories.len() != plan.dependency_dirs.len()
         || plan
             .dependency_dirs
@@ -326,24 +742,99 @@ pub fn remote_dependency_shape(
     }
     validate_generated_root(plan, toolchain_root)?;
     remote_extern_facts(plan, directories)?;
-    if !plan.invocation.native_libs.is_empty()
-        || plan
-            .invocation
-            .codegen
-            .iter()
-            .any(|(name, value)| name == "target-cpu" && value.as_deref() == Some("native"))
+    validate_plan_native_roots(plan).map_err(|_| RemoteDependencyRefusal::NativeInputs)?;
+    if plan
+        .invocation
+        .codegen
+        .iter()
+        .any(|(name, value)| name == "target-cpu" && value.as_deref() == Some("native"))
     {
         return Err(RemoteDependencyRefusal::NativeInputs);
     }
     remote_dependency_output_class(&plan.invocation)?;
-    let derived = derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)
-        .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
+    let derived = if plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly {
+        derive_workspace_output_declarations(&plan.invocation, &plan.host_triple)
+    } else {
+        derive_dependency_output_declarations(&plan.invocation, &plan.host_triple)
+    }
+    .map_err(|error| LiveRefusal::Outputs(error.to_string()))?;
     if derived != plan.outputs {
         return Err(
             LiveRefusal::Facts("declared outputs differ from the invocation".into()).into(),
         );
     }
     remote_loader_search_paths(plan, toolchain_root)?;
+    Ok(())
+}
+
+/// The common key validator has already checked every generated file and
+/// directory listing. Bind native lookup to that complete tree instead of
+/// observing a host search directory or assuming it exists on the worker.
+pub(super) fn validate_generated_native_manifest(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+) -> Result<(), LiveRefusal> {
+    let directories = validate_plan_native_roots(plan)?;
+    if directories.is_empty() {
+        return Ok(());
+    }
+    let mut virtual_directories = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let virtual_directory = plan
+            .generated_root
+            .as_deref()
+            .filter(|root| directory == *root || within(&directory, root))
+            .map(|root| {
+                if directory == root {
+                    plan.generated_virtual_root()
+                } else {
+                    plan.generated_input_virtual_path(&directory[root.len() + 1..])
+                }
+            })
+            .or_else(|| {
+                plan.native_roots
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, root)| {
+                        if directory == *root {
+                            Some(plan.native_input_virtual_root(index))
+                        } else if within(&directory, root) {
+                            Some(
+                                plan.native_input_virtual_path(index, &directory[root.len() + 1..]),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .ok_or_else(|| LiveRefusal::SearchPath(directory.clone()))?;
+        if !inputs
+            .directory_enumerations
+            .iter()
+            .any(|enumeration| enumeration.virtual_path.as_bytes() == virtual_directory.as_bytes())
+        {
+            return Err(LiveRefusal::Facts(
+                "native search directory is absent from the retained generated tree".into(),
+            ));
+        }
+        virtual_directories.push(virtual_directory);
+    }
+    for library in &plan.invocation.native_libs {
+        let name = library
+            .strip_prefix("static=")
+            .ok_or_else(|| LiveRefusal::NativeLibrary(library.clone()))?;
+        if !virtual_directories.iter().any(|directory| {
+            let path = format!("{directory}/lib{name}.a");
+            inputs
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        }) {
+            return Err(LiveRefusal::Facts(
+                "static native archive is absent from the retained search directories".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -367,8 +858,9 @@ fn validate_generated_root(
         return Ok(());
     };
     let overlaps = |other: &str| root == other || within(root, other) || within(other, root);
-    if !plain_path(root)
+    if !plain_path_in_profile(root, plan.canonical_cargo)
         || root.contains(&plan.out_dir)
+        || (!plan.canonical_cargo && overlaps("/__rabs"))
         || [
             plan.source_root.as_str(),
             plan.out_dir.as_str(),
@@ -377,8 +869,7 @@ fn validate_generated_root(
         .into_iter()
         .chain(plan.dependency_dirs.iter().map(String::as_str))
         .chain([
-            "/__rabs", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys",
-            "/run",
+            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev", "/sys", "/run",
         ])
         .any(overlaps)
     {
@@ -390,7 +881,7 @@ fn validate_generated_root(
 /// Resolve every explicit extern to its exact keyed candidate. The ordinary
 /// local planner labels a bare extern as toolchain-provided but does not prove
 /// that resolution cannot execute a proc macro, so this remote class refuses it.
-fn remote_extern_facts(
+pub(super) fn remote_extern_facts(
     plan: &DependencyActionPlan,
     directories: &[DependencyDirectoryFact],
 ) -> Result<Vec<ExternFact>, RemoteDependencyRefusal> {
@@ -473,14 +964,50 @@ pub fn remote_dependency_key(
     }
     remote_dependency_shape(plan, directories, toolchain_root)?;
     let externs = remote_extern_facts(plan, directories)?;
-    let mut key = live_dependency_key(
+    let mut key = if plan.canonical_cargo {
+        super::canonical_cargo::canonical_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    } else {
+        live_dependency_key(
+            plan,
+            toolchain,
+            &externs,
+            directories,
+            build_script_output,
+            inputs,
+        )?
+    };
+    validate_generated_native_manifest(plan, inputs)?;
+    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
+    bind_remote_execution_inputs(
+        &mut key,
         plan,
-        toolchain,
-        &externs,
-        directories,
-        build_script_output,
-        inputs,
+        toolchain_root,
+        retained_toolchain_sha256,
+        runtime,
     )?;
+    Ok(key)
+}
+
+/// Bind the retained toolchain, exact archive placements and measured runtime
+/// without assigning source-class authority. Workspace callers replace the
+/// complete environment and execution policy with their separate contract.
+pub(super) fn bind_remote_execution_inputs(
+    key: &mut LiveDependencyKey,
+    plan: &DependencyActionPlan,
+    toolchain_root: &str,
+    retained_toolchain_sha256: &[u8; 32],
+    runtime: &TypedDigest,
+) -> Result<(), RemoteDependencyRefusal> {
+    if runtime.domain != RUNTIME_COHORT_DOMAIN {
+        return Err(RemoteDependencyRefusal::RuntimeIdentity);
+    }
     let output_class = remote_dependency_output_class(&plan.invocation)?;
     if output_class == RemoteDependencyOutputClass::Rlib {
         // An assembler `.incbin` can mention the original dependency/output
@@ -530,7 +1057,6 @@ pub fn remote_dependency_key(
         .str("toolchain-dataset-v1")
         .bytes(retained_toolchain_sha256);
     key.descriptor.toolchain = compute(REMOTE_TOOLCHAIN_DOMAIN, &retained_toolchain.finish());
-    key.descriptor.sandbox_semantic_policy = remote_dependency_isolation_policy(plan)?;
     let codegen = |name: &str| {
         plan.invocation
             .codegen
@@ -568,15 +1094,16 @@ pub fn remote_dependency_key(
     .contract_digest();
     key.action_key = compute_action_key(&key.descriptor).final_key;
     key.descriptor_digest = descriptor_digest(&descriptor_canonical_bytes(&key.descriptor));
-    Ok(key)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::canonical_cargo_dependency_key;
     use super::*;
     use crate::live_dependency::{LiveRustcRequest, plan_dependency_action};
     use rabs_protocol::input_evidence::{
-        INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
     };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -653,6 +1180,15 @@ mod tests {
                     symlink_resolution: Vec::new(),
                 })
                 .collect(),
+            directory_enumerations: plan
+                .generated_root
+                .as_ref()
+                .map(|_| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
             ..ActionInputManifest::default()
         }
     }
@@ -680,6 +1216,297 @@ mod tests {
         plan.outputs =
             derive_dependency_output_declarations(&plan.invocation, &plan.host_triple).unwrap();
         plan
+    }
+
+    fn canonical_plan(out_dir: &str) -> DependencyActionPlan {
+        canonical_plan_with_emit(out_dir, "dep-info,metadata")
+    }
+
+    fn canonical_plan_with_emit(out_dir: &str, emit: &str) -> DependencyActionPlan {
+        canonical_plan_with_generated(out_dir, emit, None)
+    }
+
+    fn canonical_plan_with_generated(
+        out_dir: &str,
+        emit: &str,
+        generated: Option<&str>,
+    ) -> DependencyActionPlan {
+        canonical_plan_with_generated_args(out_dir, emit, generated, &[])
+    }
+
+    fn canonical_plan_with_generated_args(
+        out_dir: &str,
+        emit: &str,
+        generated: Option<&str>,
+        extra_args: &[String],
+    ) -> DependencyActionPlan {
+        let package = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
+        let mut argv = vec![
+            "/__rabs/toolchain/bin/rustc".to_owned(),
+            "--crate-name=leaf".into(),
+            "--crate-type=lib".into(),
+            "--edition=2021".into(),
+            format!("{package}/src/lib.rs"),
+            "--error-format=json".into(),
+            "--json=artifacts".into(),
+            format!("--emit={emit}"),
+            "--cap-lints=allow".into(),
+            format!("--out-dir={out_dir}"),
+            "-L".into(),
+            format!("dependency={out_dir}"),
+        ];
+        argv.extend_from_slice(extra_args);
+        let mut env = vec![
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "leaf".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!("{out_dir}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+            ),
+        ];
+        if let Some(root) = generated {
+            env.push(("OUT_DIR".into(), root.into()));
+            env.push(("BUILD_LABEL".into(), "pinned".into()));
+        }
+        let request = LiveRustcRequest {
+            argv: &argv,
+            cwd: package,
+            env: &env,
+        };
+        if generated.is_some()
+            || extra_args
+                .iter()
+                .any(|argument| argument.starts_with("native="))
+        {
+            assert!(
+                super::super::plan_canonical_cargo_dependency_action(
+                    request,
+                    "x86_64-unknown-linux-gnu",
+                    None,
+                )
+                .is_err(),
+                "generated inputs cannot select local metadata capture"
+            );
+        } else if emit.contains("link") {
+            assert!(matches!(
+                super::super::plan_canonical_cargo_dependency_action(
+                    request,
+                    "x86_64-unknown-linux-gnu",
+                    None,
+                ),
+                Err(LiveRefusal::UnclosedCodegenInputs)
+            ));
+        }
+        super::super::plan_canonical_remote_dependency_action(
+            request,
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap()
+    }
+
+    fn canonical_key(
+        plan: &DependencyActionPlan,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_dependency_key(
+            plan,
+            &toolchain(),
+            &directories(plan),
+            &inputs(plan),
+            None,
+            "/__rabs/toolchain",
+            &[41; 32],
+            &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
+    }
+
+    #[test]
+    fn canonical_remote_metadata_has_separate_authority_and_exact_replay_identity() {
+        let plan = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let remote = canonical_key(&plan).unwrap();
+        let local = canonical_cargo_dependency_key(
+            &plan,
+            &toolchain(),
+            &[],
+            &directories(&plan),
+            None,
+            &inputs(&plan),
+        )
+        .unwrap();
+        let ordinary = key(&super::tests::plan(OUTPUT), b"runtime");
+        assert_eq!(
+            remote.descriptor.sandbox_semantic_policy.domain,
+            CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN
+        );
+        assert_ne!(remote.action_key, local.action_key);
+        assert_ne!(remote.action_key, ordinary.action_key);
+        assert_ne!(
+            remote.descriptor.sandbox_semantic_policy,
+            ordinary.descriptor.sandbox_semantic_policy
+        );
+        assert_eq!(
+            remote.action_key,
+            compute_action_key(&remote.descriptor).final_key
+        );
+        assert_eq!(
+            remote.descriptor_digest,
+            descriptor_digest(&descriptor_canonical_bytes(&remote.descriptor))
+        );
+        let moved = canonical_plan("/__rabs/out/cargo/debug/other-deps");
+        assert_ne!(remote.action_key, canonical_key(&moved).unwrap().action_key);
+        assert_eq!(
+            remote_loader_search_paths(&plan, "/__rabs/toolchain").unwrap(),
+            ["lib"]
+        );
+        assert_eq!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain").unwrap(),
+            ["/__rabs/out/cargo/debug", "/__rabs/out/cargo/debug/deps"]
+        );
+    }
+
+    #[test]
+    fn canonical_remote_context_cannot_borrow_unobserved_generated_or_host_path_authority() {
+        let original = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let mut generated = original.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
+        generated
+            .execution_env
+            .push(("OUT_DIR".into(), generated.generated_root.clone().unwrap()));
+        assert!(canonical_key(&generated).is_err());
+        let mut ordinary = original.clone();
+        ordinary.canonical_cargo = false;
+        assert!(canonical_key(&ordinary).is_err());
+        assert!(remote_dependency_shape(&original, &directories(&original), TOOLCHAIN).is_err());
+        for directory in [
+            "/__rabs/home/control",
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/out",
+            "/__rabs/out/cargo-other/debug",
+            "/usr/lib",
+            "/work/target/debug",
+        ] {
+            let mut plan = original.clone();
+            plan.execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = directory.to_owned();
+            assert!(canonical_key(&plan).is_err(), "loader alias {directory}");
+        }
+    }
+
+    #[test]
+    fn canonical_archives_require_remote_authority_and_key_assembler_payload_bytes() {
+        for emit in ["dep-info,link", "dep-info,metadata,link"] {
+            let plan = canonical_plan_with_emit("/__rabs/out/cargo/debug/deps", emit);
+            let archive = canonical_key(&plan).unwrap();
+            assert_eq!(
+                remote_dependency_output_class(&plan.invocation),
+                Ok(RemoteDependencyOutputClass::Rlib)
+            );
+            assert!(plan.output_names().contains(&"libleaf.rlib".to_owned()));
+            assert!(matches!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &inputs(&plan),
+                ),
+                Err(LiveRefusal::UnclosedCodegenInputs)
+            ));
+            assert!(
+                live_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &inputs(&plan),
+                )
+                .is_err()
+            );
+            let metadata = canonical_key(&canonical_plan(&plan.out_dir)).unwrap();
+            let ordinary = key(&archive_plan(OUTPUT, emit.contains("metadata")), b"runtime");
+            for other in [metadata, ordinary] {
+                assert_ne!(archive.action_key, other.action_key);
+                assert_ne!(
+                    archive.descriptor.sandbox_semantic_policy,
+                    other.descriptor.sandbox_semantic_policy
+                );
+            }
+            assert_eq!(
+                archive.descriptor.normalized_invocation.domain,
+                "rabs.remote-rlib.exact-invocation.v1"
+            );
+            let moved = canonical_plan_with_emit("/__rabs/out/cargo/release/deps", emit);
+            assert_ne!(
+                archive.action_key,
+                canonical_key(&moved).unwrap().action_key
+            );
+
+            // .incbin is absent from rustc dep-info. The complete retained
+            // package inventory, rather than a discovered Rust read set, must
+            // therefore invalidate an archive when those bytes change.
+            let mut retained = inputs(&plan);
+            retained.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(plan.input_virtual_path("payload.bin").into_bytes()),
+                object: ObjectId(compute("test.source.v1", b"assembler payload one")),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+            let with_inputs = |inputs: &ActionInputManifest| {
+                remote_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &directories(&plan),
+                    inputs,
+                    None,
+                    "/__rabs/toolchain",
+                    &[41; 32],
+                    &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .unwrap()
+            };
+            let first = with_inputs(&retained);
+            retained.inputs.last_mut().unwrap().object =
+                ObjectId(compute("test.source.v1", b"assembler payload two"));
+            assert_ne!(first.action_key, with_inputs(&retained).action_key);
+            assert_eq!(
+                archive.action_key,
+                compute_action_key(&archive.descriptor).final_key
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_remote_archive_policy_does_not_admit_other_codegen_or_native_linking() {
+        let original = canonical_plan_with_emit("/__rabs/out/cargo/debug/deps", "dep-info,link");
+        for emit in [
+            vec!["link"],
+            vec!["dep-info", "metadata", "link", "asm"],
+            vec!["dep-info", "obj"],
+            vec!["dep-info", "llvm-ir"],
+        ] {
+            let mut plan = original.clone();
+            plan.invocation.emit = emit.into_iter().map(str::to_owned).collect();
+            assert!(canonical_key(&plan).is_err());
+            assert!(remote_dependency_isolation_policy(&plan).is_err());
+        }
+        for crate_type in ["bin", "dylib", "cdylib", "staticlib", "proc-macro"] {
+            let mut plan = original.clone();
+            plan.invocation.crate_types = vec![crate_type.into()];
+            assert!(canonical_key(&plan).is_err());
+            assert!(remote_dependency_isolation_policy(&plan).is_err());
+        }
+        let mut generated = original.clone();
+        generated.generated_root = Some("/__rabs/out/cargo/debug/build/leaf/out".into());
+        assert!(canonical_key(&generated).is_err());
     }
 
     #[test]
@@ -1297,6 +2124,11 @@ mod tests {
 
     fn generated_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
         let mut inputs = inputs(plan);
+        inputs.directory_enumerations[0].entries = vec![RawBytes::from("nested")];
+        inputs.directory_enumerations.push(DirectoryEnumeration {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path("nested").into_bytes()),
+            entries: vec![RawBytes::from("generated.rs")],
+        });
         inputs.inputs.push(PositiveInput {
             virtual_path: RawBytes::new(
                 plan.generated_input_virtual_path("nested/generated.rs")
@@ -1321,10 +2153,922 @@ mod tests {
             &directories(plan),
             inputs,
             record,
-            TOOLCHAIN,
+            if plan.canonical_cargo {
+                "/__rabs/toolchain"
+            } else {
+                TOOLCHAIN
+            },
             &[41; 32],
             &compute(RUNTIME_COHORT_DOMAIN, b"same-runtime"),
         )
+    }
+
+    const NATIVE_ROOT: &str = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+
+    fn native_plan(emit: &str) -> DependencyActionPlan {
+        canonical_plan_with_generated_args(
+            "/__rabs/out/cargo/debug/deps",
+            emit,
+            Some(NATIVE_ROOT),
+            &[
+                "-L".into(),
+                format!("native={NATIVE_ROOT}"),
+                "-L".into(),
+                format!("native={NATIVE_ROOT}/native"),
+                "-l".into(),
+                "static=math".into(),
+                "-l".into(),
+                "static=extra".into(),
+            ],
+        )
+    }
+
+    fn native_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut retained = inputs(plan);
+        retained.directory_enumerations[0].entries =
+            vec![RawBytes::from("libmath.a"), RawBytes::from("native")];
+        retained.directory_enumerations.push(DirectoryEnumeration {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path("native").into_bytes()),
+            entries: vec![RawBytes::from("libextra.a"), RawBytes::from("libmath.a")],
+        });
+        for relative in ["libmath.a", "native/libextra.a", "native/libmath.a"] {
+            retained.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path(relative).into_bytes(),
+                ),
+                object: ObjectId(compute("rabs.test.v1", relative.as_bytes())),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        retained
+    }
+
+    const FOREIGN_NATIVE_A: &str = "/__rabs/out/cargo/debug/build/provider-a/a111111111111111/out";
+    const FOREIGN_NATIVE_B: &str = "/__rabs/out/cargo/debug/build/provider-b/out";
+
+    fn foreign_native_plan(emit: &str, own: Option<&str>) -> DependencyActionPlan {
+        canonical_plan_with_generated_args(
+            "/__rabs/out/cargo/debug/deps",
+            emit,
+            own,
+            &[
+                "-L".into(),
+                format!("native={FOREIGN_NATIVE_B}/nested"),
+                "-L".into(),
+                format!("native={FOREIGN_NATIVE_A}"),
+                "-L".into(),
+                format!("native={FOREIGN_NATIVE_A}/nested"),
+            ],
+        )
+    }
+
+    fn foreign_native_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut retained = inputs(plan);
+        for (index, root) in plan.native_roots.iter().enumerate() {
+            for (relative, entries) in [
+                ("", vec!["empty", "libmath.a", "nested"]),
+                ("empty", Vec::new()),
+                ("nested", vec!["libmath.a"]),
+            ] {
+                retained.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        if relative.is_empty() {
+                            plan.native_input_virtual_root(index)
+                        } else {
+                            plan.native_input_virtual_path(index, relative)
+                        }
+                        .into_bytes(),
+                    ),
+                    entries: entries.into_iter().map(RawBytes::from).collect(),
+                });
+            }
+            for relative in ["libmath.a", "nested/libmath.a"] {
+                retained.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(
+                        plan.native_input_virtual_path(index, relative).into_bytes(),
+                    ),
+                    object: ObjectId(compute("rabs.test.v1", relative.as_bytes())),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                });
+            }
+            retained.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(plan.native_record_virtual_path(index).into_bytes()),
+                object: ObjectId(compute(
+                    "rabs.test.v1",
+                    format!("cargo:rustc-link-search=native={root}\n").as_bytes(),
+                )),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        retained
+    }
+
+    #[test]
+    fn propagated_native_roots_work_without_own_out_dir_and_bind_every_producer() {
+        for emit in ["dep-info,metadata", "dep-info,metadata,link"] {
+            let plan = foreign_native_plan(emit, None);
+            assert!(plan.generated_root.is_none());
+            assert_eq!(plan.native_roots, [FOREIGN_NATIVE_A, FOREIGN_NATIVE_B]);
+            let retained = foreign_native_inputs(&plan);
+            let original = generated_key(&plan, &retained, None).unwrap();
+            assert_eq!(
+                super::super::native_input_directories(&plan, &retained, 0).unwrap(),
+                ["empty", "nested"]
+            );
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    None,
+                    &retained,
+                )
+                .is_err(),
+                "foreign inputs cannot fall through to local metadata authority"
+            );
+            let mut ordinary = plan.clone();
+            ordinary.canonical_cargo = false;
+            assert!(
+                live_dependency_key(
+                    &ordinary,
+                    &toolchain(),
+                    &[],
+                    &directories(&ordinary),
+                    None,
+                    &retained,
+                )
+                .is_err()
+            );
+            for index in 0..plan.native_roots.len() {
+                for path in [
+                    plan.native_input_virtual_path(index, "libmath.a"),
+                    plan.native_input_virtual_path(index, "nested/libmath.a"),
+                    plan.native_record_virtual_path(index),
+                ] {
+                    let mut changed = retained.clone();
+                    changed
+                        .inputs
+                        .iter_mut()
+                        .find(|input| input.virtual_path.as_bytes() == path.as_bytes())
+                        .unwrap()
+                        .object = ObjectId(compute("rabs.test.v1", b"changed retained input"));
+                    assert_ne!(
+                        original.action_key,
+                        generated_key(&plan, &changed, None).unwrap().action_key,
+                        "every foreign archive and Cargo run record must remain semantic: {path}"
+                    );
+                }
+            }
+            let mut reordered = plan.clone();
+            reordered.invocation.lib_search.swap(1, 2);
+            assert_ne!(
+                original.action_key,
+                generated_key(&reordered, &retained, None)
+                    .unwrap()
+                    .action_key,
+                "sorted capture roots must not reorder actual native search semantics"
+            );
+            let plain = canonical_plan_with_emit(&plan.out_dir, emit);
+            assert_ne!(
+                original.descriptor.sandbox_semantic_policy,
+                generated_key(&plain, &inputs(&plain), None)
+                    .unwrap()
+                    .descriptor
+                    .sandbox_semantic_policy
+            );
+        }
+    }
+
+    #[test]
+    fn propagated_native_evidence_requires_complete_trees_and_exact_run_records() {
+        let plan = foreign_native_plan("dep-info,metadata", Some(NATIVE_ROOT));
+        let retained = foreign_native_inputs(&plan);
+        let own_record = b"cargo:rustc-env=BUILD_LABEL=pinned\n";
+        let original = generated_key(&plan, &retained, Some(own_record)).unwrap();
+        assert!(generated_key(&plan, &retained, None).is_err());
+        for index in 0..plan.native_roots.len() {
+            let record = plan.native_record_virtual_path(index);
+            let position = retained
+                .inputs
+                .iter()
+                .position(|input| input.virtual_path.as_bytes() == record.as_bytes())
+                .unwrap();
+            let mut missing = retained.clone();
+            missing.inputs.remove(position);
+            assert!(generated_key(&plan, &missing, Some(own_record)).is_err());
+            let mut duplicate = retained.clone();
+            duplicate.inputs.push(duplicate.inputs[position].clone());
+            assert!(generated_key(&plan, &duplicate, Some(own_record)).is_err());
+            let mut executable = retained.clone();
+            executable.inputs[position].executable = true;
+            assert!(generated_key(&plan, &executable, Some(own_record)).is_err());
+            let mut symlink = retained.clone();
+            symlink.inputs[position].file_type = InputFileType::Symlink;
+            assert!(generated_key(&plan, &symlink, Some(own_record)).is_err());
+        }
+        let mut missing_directory = retained.clone();
+        missing_directory.directory_enumerations.remove(2);
+        assert!(generated_key(&plan, &missing_directory, Some(own_record)).is_err());
+        let mut unknown = retained.clone();
+        unknown.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(plan.native_record_virtual_path(2).into_bytes()),
+            object: ObjectId(compute("rabs.test.v1", b"unadmitted record")),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        assert!(generated_key(&plan, &unknown, Some(own_record)).is_err());
+        let mut topology = retained.clone();
+        let root = plan.native_input_virtual_root(0);
+        let empty = plan.native_input_virtual_path(0, "empty");
+        topology
+            .directory_enumerations
+            .iter_mut()
+            .find(|entry| entry.virtual_path.as_bytes() == root.as_bytes())
+            .unwrap()
+            .entries[0] = RawBytes::from("empty-renamed");
+        topology
+            .directory_enumerations
+            .iter_mut()
+            .find(|entry| entry.virtual_path.as_bytes() == empty.as_bytes())
+            .unwrap()
+            .virtual_path = RawBytes::new(
+            plan.native_input_virtual_path(0, "empty-renamed")
+                .into_bytes(),
+        );
+        assert_ne!(
+            original.action_key,
+            generated_key(&plan, &topology, Some(own_record))
+                .unwrap()
+                .action_key,
+            "empty native directories participate in exact input identity"
+        );
+    }
+
+    #[test]
+    fn propagated_native_root_shape_rejects_extra_alias_and_unbound_mounts() {
+        let plan = foreign_native_plan("dep-info,metadata,link", None);
+        let validate = |roots: &[String]| {
+            validate_generated_native_inputs_with_roots(&plan.invocation, None, roots, true)
+        };
+        assert!(validate(&plan.native_roots).is_ok());
+        assert!(validate(&[]).is_err());
+        let mut extra = plan.native_roots.clone();
+        extra.push("/__rabs/out/cargo/debug/build/provider-c/out".into());
+        assert!(validate(&extra).is_err());
+        let mut reordered = plan.native_roots.clone();
+        reordered.reverse();
+        assert!(validate(&reordered).is_err());
+        let mut duplicate = plan.native_roots.clone();
+        duplicate.insert(0, duplicate[0].clone());
+        assert!(validate(&duplicate).is_err());
+        assert!(
+            validate_generated_native_inputs_with_roots(
+                &plan.invocation,
+                None,
+                &plan.native_roots,
+                false
+            )
+            .is_err()
+        );
+        for loader in [
+            FOREIGN_NATIVE_A.to_owned(),
+            format!("{FOREIGN_NATIVE_A}/nested"),
+        ] {
+            let mut changed = plan.clone();
+            changed
+                .execution_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            changed
+                .execution_env
+                .push(("LD_LIBRARY_PATH".into(), loader));
+            assert!(remote_loader_search_paths(&changed, "/__rabs/toolchain").is_err());
+        }
+        for directory in [
+            "/usr/lib",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/out",
+            "/__rabs/out/cargo/debug/native/out",
+            "/__rabs/out/cargo/debug/build/provider/../other/out",
+            "/__rabs/out/cargo/debug/build/provider/out/../../other",
+        ] {
+            let mut invocation = plan.invocation.clone();
+            invocation.lib_search.push(format!("native={directory}"));
+            assert!(
+                canonical_generated_native_roots(&invocation, None).is_err(),
+                "{directory}"
+            );
+        }
+        for root in [
+            "/__rabs/out/cargo/out/build/provider/out",
+            "/__rabs/out/cargo/debug/build/canonical_leaf/b1792bad4aed14f1/out",
+            "/__rabs/out/cargo/out/build/canonical_leaf/b1792bad4aed14f1/out",
+            "/__rabs/out/cargo/x86_64-unknown-linux-gnu/debug/build/provider/out",
+            "/__rabs/out/cargo/x86_64-unknown-linux-gnu/debug/build/canonical_leaf/b1792bad4aed14f1/out",
+            "/__rabs/out/cargo/x86_64-unknown-linux-gnu/build/build/out/b1792bad4aed14f1/out",
+        ] {
+            let mut invocation = plan.invocation.clone();
+            invocation
+                .lib_search
+                .retain(|search| search.starts_with("dependency="));
+            invocation.lib_search.push(format!("native={root}/native"));
+            assert_eq!(
+                canonical_generated_native_roots(&invocation, None).unwrap(),
+                [root],
+                "classic and current Cargo layouts retain the complete producer root: {root}"
+            );
+        }
+        let mut unbounded = plan.invocation.clone();
+        unbounded
+            .lib_search
+            .retain(|search| search.starts_with("dependency="));
+        for index in 0..=MAX_CANONICAL_NATIVE_ROOTS {
+            unbounded.lib_search.push(format!(
+                "native=/__rabs/out/cargo/debug/build/provider-{index:04}/out"
+            ));
+        }
+        assert!(canonical_generated_native_roots(&unbounded, None).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_static_archives_bind_bytes_search_order_and_distinct_authority() {
+        let mut policies = Vec::new();
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let plan = native_plan(emit);
+            let retained = native_inputs(&plan);
+            let record = b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rustc-link-lib=static=math\ncargo::rustc-link-lib=static=extra\n";
+            let original = generated_key(&plan, &retained, Some(record)).unwrap();
+            policies.push(original.descriptor.sandbox_semantic_policy.clone());
+            assert_eq!(
+                plan.dependency_dirs,
+                ["/__rabs/out/cargo/debug/deps"],
+                "native directories remain in generated ownership, not Rust candidate mounts"
+            );
+            assert_eq!(
+                validate_generated_native_inputs(&plan.invocation, Some(NATIVE_ROOT), true)
+                    .unwrap(),
+                [NATIVE_ROOT.to_owned(), format!("{NATIVE_ROOT}/native")]
+            );
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    Some(record),
+                    &retained,
+                )
+                .is_err()
+            );
+            assert!(
+                live_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    Some(record),
+                    &retained,
+                )
+                .is_err()
+            );
+            let mut ordinary = plan.clone();
+            ordinary.canonical_cargo = false;
+            assert!(
+                live_dependency_key(
+                    &ordinary,
+                    &toolchain(),
+                    &[],
+                    &directories(&ordinary),
+                    Some(record),
+                    &retained,
+                )
+                .is_err(),
+                "a mutable plan cannot turn native inputs into ordinary local authority"
+            );
+
+            let mut changed = retained.clone();
+            changed.inputs.last_mut().unwrap().object =
+                ObjectId(compute("rabs.test.v1", b"changed archive bytes"));
+            assert_ne!(
+                original.action_key,
+                generated_key(&plan, &changed, Some(record))
+                    .unwrap()
+                    .action_key,
+                "all candidates remain semantic even if an earlier directory currently wins"
+            );
+            let mut searches = plan.clone();
+            searches.invocation.lib_search.swap(1, 2);
+            let reordered = generated_key(&searches, &retained, Some(record)).unwrap();
+            assert_ne!(original.action_key, reordered.action_key);
+            assert_ne!(
+                original.descriptor.normalized_invocation,
+                reordered.descriptor.normalized_invocation
+            );
+            let mut libraries = plan.clone();
+            libraries.invocation.native_libs.swap(0, 1);
+            assert_ne!(
+                original.action_key,
+                generated_key(&libraries, &retained, Some(record))
+                    .unwrap()
+                    .action_key
+            );
+
+            let mut source_attributes = plan.clone();
+            source_attributes.invocation.native_libs.clear();
+            let source_attributes =
+                generated_key(&source_attributes, &retained, Some(record)).unwrap();
+            assert_eq!(
+                original.descriptor.sandbox_semantic_policy,
+                source_attributes.descriptor.sandbox_semantic_policy
+            );
+            assert_ne!(original.action_key, source_attributes.action_key);
+            let pure = canonical_plan_with_generated(&plan.out_dir, emit, Some(NATIVE_ROOT));
+            let pure = generated_key(&pure, &retained, Some(record)).unwrap();
+            assert_ne!(
+                original.descriptor.sandbox_semantic_policy,
+                pure.descriptor.sandbox_semantic_policy
+            );
+            assert_eq!(
+                original.action_key,
+                compute_action_key(&original.descriptor).final_key
+            );
+        }
+        assert_ne!(
+            policies[0], policies[1],
+            "native metadata cannot borrow archive execution evidence"
+        );
+    }
+
+    #[test]
+    fn generated_native_inputs_require_captured_directories_and_named_archives() {
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let plan = native_plan(emit);
+            let retained = native_inputs(&plan);
+            let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+            generated_key(&plan, &retained, Some(record)).unwrap();
+            assert!(
+                generated_key(&plan, &inputs(&plan), Some(record)).is_err(),
+                "an empty tree cannot stand in for declared native directories"
+            );
+
+            let mut absent = retained.clone();
+            absent
+                .inputs
+                .retain(|input| !input.virtual_path.as_bytes().ends_with(b"/libextra.a"));
+            absent.directory_enumerations[1].entries.remove(0);
+            assert!(
+                generated_key(&plan, &absent, Some(record)).is_err(),
+                "complete but missing archive evidence cannot authorize native lookup"
+            );
+            let mut undeclared = plan.clone();
+            undeclared
+                .invocation
+                .lib_search
+                .push(format!("native={NATIVE_ROOT}/missing"));
+            assert!(
+                generated_key(&undeclared, &retained, Some(record)).is_err(),
+                "even an otherwise unused native directory must exist in the captured topology"
+            );
+
+            let mut misplaced = retained.clone();
+            misplaced
+                .inputs
+                .iter_mut()
+                .find(|input| input.virtual_path.as_bytes().ends_with(b"/libextra.a"))
+                .unwrap()
+                .virtual_path =
+                RawBytes::new(plan.generated_input_virtual_path("libextra.a").into_bytes());
+            misplaced.directory_enumerations[1].entries.remove(0);
+            misplaced.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("libextra.a"));
+            let mut nested_only = plan.clone();
+            nested_only.invocation.lib_search.remove(1);
+            assert!(
+                generated_key(&nested_only, &misplaced, Some(record)).is_err(),
+                "an archive elsewhere in OUT_DIR does not supply a declared native search"
+            );
+
+            let mut symlink = retained.clone();
+            symlink.inputs.last_mut().unwrap().file_type = InputFileType::Symlink;
+            symlink
+                .inputs
+                .last_mut()
+                .unwrap()
+                .symlink_resolution
+                .push(RawBytes::from("/usr/lib/libmath.a"));
+            assert!(generated_key(&plan, &symlink, Some(record)).is_err());
+            assert!(
+                generated_key(&plan, &retained, None).is_err(),
+                "native libraries retain the exact Cargo build-script record requirement"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_native_scope_refuses_dynamic_modifiers_host_searches_and_local_metadata() {
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let original = native_plan(emit);
+            for library in [
+                "math",
+                "dylib=math",
+                "framework=math",
+                "static=",
+                "static=../math",
+                "static=/usr/lib/math",
+                "static=math:renamed",
+                "static:+bundle=math",
+                "static:-bundle=math",
+                "static:+whole-archive=math",
+                "static=math,extra",
+            ] {
+                let mut plan = original.clone();
+                plan.invocation.native_libs = vec![library.into()];
+                assert!(
+                    remote_dependency_shape(&plan, &directories(&plan), "/__rabs/toolchain")
+                        .is_err(),
+                    "{library}"
+                );
+                assert!(
+                    remote_dependency_isolation_policy(&plan).is_err(),
+                    "{library}"
+                );
+            }
+            for search in [
+                "/usr/lib".to_owned(),
+                "all=/usr/lib".into(),
+                "framework=/usr/lib".into(),
+                "native=/__rabs/toolchain/lib".into(),
+                "native=/__rabs/out/cargo/debug/deps".into(),
+                "native=/__rabs/out/cargo/debug/build/other/out".into(),
+                format!("native={NATIVE_ROOT}-other"),
+                format!("native={NATIVE_ROOT}/../other"),
+                format!("native={NATIVE_ROOT}/"),
+                format!("native={NATIVE_ROOT}//native"),
+            ] {
+                let mut plan = original.clone();
+                plan.invocation.lib_search.push(search.clone());
+                assert!(
+                    remote_dependency_shape(&plan, &directories(&plan), "/__rabs/toolchain")
+                        .is_err(),
+                    "{search}"
+                );
+            }
+            let mut no_search = original.clone();
+            no_search
+                .invocation
+                .lib_search
+                .retain(|search| search.starts_with("dependency="));
+            assert!(remote_dependency_isolation_policy(&no_search).is_err());
+            let mut no_generated = original.clone();
+            no_generated.generated_root = None;
+            no_generated
+                .execution_env
+                .retain(|(name, _)| name != "OUT_DIR");
+            assert!(remote_dependency_isolation_policy(&no_generated).is_err());
+            let mut metadata = original.clone();
+            metadata.invocation.emit = vec!["dep-info".into(), "metadata".into()];
+            metadata.outputs =
+                derive_dependency_output_declarations(&metadata.invocation, &metadata.host_triple)
+                    .unwrap();
+            metadata.canonical_cargo = false;
+            assert!(
+                remote_dependency_shape(&metadata, &directories(&metadata), "/__rabs/toolchain")
+                    .is_err()
+            );
+            assert!(remote_dependency_isolation_policy(&metadata).is_err());
+            metadata.invocation.native_libs.clear();
+            assert!(
+                remote_dependency_isolation_policy(&metadata).is_err(),
+                "source-attribute native search still requires isolated canonical execution"
+            );
+            assert!(
+                validate_generated_native_inputs(&original.invocation, Some(NATIVE_ROOT), false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_generated_compiles_bind_complete_tree_and_cargo_record_in_both_output_modes() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        let mut keys = Vec::new();
+        for emit in [
+            "dep-info,metadata",
+            "dep-info,link",
+            "dep-info,metadata,link",
+        ] {
+            let plan =
+                canonical_plan_with_generated("/__rabs/out/cargo/debug/deps", emit, Some(root));
+            let retained = generated_inputs(&plan);
+            let original = generated_key(&plan, &retained, Some(record)).unwrap();
+            assert!(
+                canonical_cargo_dependency_key(
+                    &plan,
+                    &toolchain(),
+                    &[],
+                    &directories(&plan),
+                    Some(record),
+                    &retained,
+                )
+                .is_err(),
+                "a canonical local completion cannot acquire generated-input authority"
+            );
+            let mut changed = retained.clone();
+            changed.inputs.last_mut().unwrap().object =
+                ObjectId(compute("rabs.test.v1", b"pub const VALUE: u32 = 99;"));
+            assert_ne!(
+                generated_key(&plan, &changed, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "generated bytes, including assembler inputs, are semantic"
+            );
+            let mut added = retained.clone();
+            let mut file = added.inputs.last().unwrap().clone();
+            file.virtual_path =
+                RawBytes::new(plan.generated_input_virtual_path("extra.bin").into_bytes());
+            added.inputs.push(file);
+            added.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("extra.bin"));
+            assert_ne!(
+                generated_key(&plan, &added, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "complete generated membership is semantic"
+            );
+            let mut empty_directories = retained.clone();
+            empty_directories.directory_enumerations[0]
+                .entries
+                .insert(0, RawBytes::from("empty"));
+            empty_directories.directory_enumerations.extend([
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty").into_bytes(),
+                    ),
+                    entries: vec![RawBytes::from("child")],
+                },
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("empty/child")
+                            .into_bytes(),
+                    ),
+                    entries: Vec::new(),
+                },
+            ]);
+            assert_ne!(
+                generated_key(&plan, &empty_directories, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "empty generated directories remain semantic in every remote output mode"
+            );
+            assert_ne!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(
+                        b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rerun-if-changed=input.dat\n"
+                    )
+                )
+                .unwrap()
+                .action_key,
+                original.action_key,
+                "the exact Cargo record is semantic"
+            );
+            assert!(generated_key(&plan, &retained, None).is_err());
+            assert!(
+                generated_key(
+                    &plan,
+                    &retained,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=stale\n")
+                )
+                .is_err()
+            );
+            let moved = canonical_plan_with_generated(
+                "/__rabs/out/cargo/debug/deps",
+                emit,
+                Some("/__rabs/out/cargo/debug/build/other-unit/out"),
+            );
+            assert_ne!(
+                generated_key(&moved, &retained, Some(record))
+                    .unwrap()
+                    .action_key,
+                original.action_key,
+                "original canonical OUT_DIR spelling is retained"
+            );
+            assert_eq!(
+                original.action_key,
+                compute_action_key(&original.descriptor).final_key
+            );
+            keys.push(original.action_key);
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+    }
+
+    #[test]
+    fn canonical_empty_generated_tree_is_keyed_without_inventing_a_generated_file() {
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-unit/out"),
+        );
+        let source_only = inputs(&plan);
+        let empty = generated_key(&plan, &source_only, Some(b"")).unwrap();
+        let no_generated = canonical_plan("/__rabs/out/cargo/debug/deps");
+        let absent = generated_key(&no_generated, &inputs(&no_generated), None).unwrap();
+        assert_ne!(empty.action_key, absent.action_key);
+        assert_ne!(
+            empty.descriptor.negative_dependencies,
+            absent.descriptor.negative_dependencies
+        );
+        assert!(generated_key(&plan, &source_only, None).is_err());
+        assert!(generated_key(&no_generated, &inputs(&no_generated), Some(b"")).is_err());
+        assert_ne!(
+            empty.action_key,
+            generated_key(&plan, &generated_inputs(&plan), Some(b""))
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn canonical_generated_stdout_requires_matching_keyed_rustc_env() {
+        let mut plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some("/__rabs/out/cargo/debug/build/leaf-generated/out"),
+        );
+        let stdout = b"cargo::rustc-env=GENERATED_LABEL=one\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        plan.execution_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.keyed_env
+            .push(("GENERATED_LABEL".into(), "one".into()));
+        plan.execution_env.sort();
+        plan.keyed_env.sort();
+        let original = generated_key(&plan, &inputs(&plan), Some(stdout)).unwrap();
+        let changed_stdout = b"cargo::rustc-env=GENERATED_LABEL=two\n";
+        assert!(generated_key(&plan, &inputs(&plan), Some(changed_stdout)).is_err());
+        for environment in [&mut plan.execution_env, &mut plan.keyed_env] {
+            environment
+                .iter_mut()
+                .find(|(name, _)| name == "GENERATED_LABEL")
+                .unwrap()
+                .1 = "two".into();
+        }
+        assert_ne!(
+            original.action_key,
+            generated_key(&plan, &inputs(&plan), Some(changed_stdout))
+                .unwrap()
+                .action_key
+        );
+        assert!(generated_key(&plan, &inputs(&plan), Some(stdout)).is_err());
+        assert!(generated_key(&plan, &inputs(&plan), Some(b"cargo::rustc-env=broken\n")).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_paths_and_dep_info_cannot_escape_the_retained_tree() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        let retained = generated_inputs(&plan);
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        generated_key(&plan, &retained, Some(record)).unwrap();
+        let raw = format!(
+            "{}/leaf.d: {}/src/lib.rs {root}/nested/generated.rs\n# env-dep:OUT_DIR={root}\n",
+            plan.out_dir, plan.source_root
+        );
+        let captured = |path: &str| {
+            retained
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        assert!(
+            super::super::dep_info_closure_violation(&plan, raw.as_bytes(), captured).is_none()
+        );
+        assert_eq!(
+            super::super::canonicalize_placements(raw.as_bytes(), &plan).unwrap(),
+            raw.as_bytes()
+        );
+        let diagnostic = format!(
+            "{{\"$message_type\":\"diagnostic\",\"message\":\"generated input {root}/nested/generated.rs\"}}\n"
+        );
+        assert_eq!(
+            super::super::canonicalize_compiler_transcript(diagnostic.as_bytes(), &plan).unwrap(),
+            diagnostic.as_bytes(),
+        );
+        let uncaptured = raw.replace("nested/generated.rs", "nested/missing.rs");
+        assert!(
+            super::super::dep_info_closure_violation(&plan, uncaptured.as_bytes(), captured)
+                .is_some()
+        );
+        let escaped = raw.replace(
+            &format!("{root}/nested/generated.rs"),
+            "/__rabs/home/control/rustc.sock",
+        );
+        assert!(
+            super::super::dep_info_closure_violation(&plan, escaped.as_bytes(), |_| true).is_some(),
+            "a claimed capture cannot authorize a read outside the package and generated tree"
+        );
+
+        for bad in [
+            "/__rabs/home/control",
+            "/__rabs/cargo-home/registry/generated",
+            "/__rabs/workspace/generated",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug/deps",
+            "/__rabs/out/cargo/debug/deps/nested",
+            "/__rabs/out/cargo/debug",
+            "/__rabs/out/cargo/../escape",
+            "/__rabs/out/cargo-other/debug/build/leaf/out",
+            "/__rabs/toolchain/generated",
+            "/tmp/host-generated",
+            "/usr/generated",
+        ] {
+            let mut bad_plan = plan.clone();
+            bad_plan.generated_root = Some(bad.into());
+            for env in [&mut bad_plan.execution_env, &mut bad_plan.keyed_env] {
+                env.iter_mut()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1 = bad.into();
+            }
+            assert!(
+                generated_key(&bad_plan, &retained, Some(record)).is_err(),
+                "{bad}"
+            );
+        }
+        let mut missing = plan.clone();
+        missing.generated_root = None;
+        assert!(generated_key(&missing, &retained, Some(record)).is_err());
+        let mut duplicate = plan.clone();
+        duplicate
+            .execution_env
+            .push(("OUT_DIR".into(), root.into()));
+        assert!(generated_key(&duplicate, &retained, Some(record)).is_err());
+        let mut missing_environment = plan.clone();
+        missing_environment
+            .execution_env
+            .retain(|(name, _)| name != "OUT_DIR");
+        assert!(generated_key(&missing_environment, &retained, Some(record)).is_err());
+        let mut mismatched_environment = plan.clone();
+        mismatched_environment
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = "/__rabs/out/cargo/debug/build/other-unit/out".into();
+        assert!(generated_key(&mismatched_environment, &retained, Some(record)).is_err());
+        let mut candidate_alias = plan.clone();
+        candidate_alias.dependency_dirs.push(root.into());
+        assert!(generated_key(&candidate_alias, &retained, Some(record)).is_err());
+    }
+
+    #[test]
+    fn canonical_generated_loader_parent_stays_empty_and_cannot_load_generated_libraries() {
+        let root = "/__rabs/out/cargo/debug/build/leaf-unit/out";
+        let plan = canonical_plan_with_generated(
+            "/__rabs/out/cargo/debug/deps",
+            "dep-info,metadata",
+            Some(root),
+        );
+        // Cargo puts this ancestor on its loader path. It remains an empty
+        // skeleton above the separately bound read-only generated input tree.
+        assert!(
+            remote_empty_loader_directories(&plan, "/__rabs/toolchain")
+                .unwrap()
+                .contains(&"/__rabs/out/cargo/debug".to_owned())
+        );
+        remote_dependency_shape(&plan, &directories(&plan), "/__rabs/toolchain").unwrap();
+        for loader in [root.to_owned(), format!("{root}/lib")] {
+            let mut changed = plan.clone();
+            changed
+                .execution_env
+                .iter_mut()
+                .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                .unwrap()
+                .1 = loader;
+            assert!(matches!(
+                remote_dependency_shape(&changed, &directories(&changed), "/__rabs/toolchain"),
+                Err(RemoteDependencyRefusal::LoaderEnvironment(_))
+            ));
+        }
     }
 
     #[test]
@@ -1372,6 +3116,9 @@ mod tests {
         member.virtual_path =
             RawBytes::new(plan.generated_input_virtual_path("new.rs").into_bytes());
         added.inputs.push(member);
+        added.directory_enumerations[0]
+            .entries
+            .push(RawBytes::from("new.rs"));
         assert_ne!(
             remote.action_key,
             generated_key(&plan, &added, Some(record))
@@ -1650,9 +3397,10 @@ mod tests {
             ["/work/target/debug", "/work/target/debug/deps"]
         );
         for value in [
-            "",
+            ":",
             ":/toolchain/lib",
             "/toolchain/lib:",
+            "/toolchain/lib::/toolchain/lib/rustlib",
             "lib",
             "/toolchain/lib/../other",
             "/usr/lib",
@@ -1679,5 +3427,81 @@ mod tests {
             remote_loader_search_paths(&plan, TOOLCHAIN).unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn empty_loader_list_preserves_environment_identity_in_both_dependency_profiles() {
+        for (mut plan, root) in [
+            (plan(OUTPUT), TOOLCHAIN),
+            (
+                canonical_plan("/__rabs/out/cargo/debug/deps"),
+                "/__rabs/toolchain",
+            ),
+        ] {
+            for env in [&mut plan.execution_env, &mut plan.keyed_env] {
+                env.iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1
+                    .clear();
+            }
+            assert!(remote_loader_search_paths(&plan, root).unwrap().is_empty());
+            assert!(
+                remote_empty_loader_directories(&plan, root)
+                    .unwrap()
+                    .is_empty()
+            );
+            let identity = |plan: &DependencyActionPlan| {
+                remote_dependency_key(
+                    plan,
+                    &toolchain(),
+                    &directories(plan),
+                    &inputs(plan),
+                    None,
+                    root,
+                    &[41; 32],
+                    &compute(RUNTIME_COHORT_DOMAIN, b"runtime"),
+                )
+                .unwrap()
+            };
+            let empty = identity(&plan);
+            assert!(
+                plan.execution_env
+                    .contains(&("LD_LIBRARY_PATH".into(), String::new()))
+            );
+            let mut absent = plan.clone();
+            absent
+                .execution_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            absent
+                .keyed_env
+                .retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            assert_ne!(
+                empty.descriptor.environment,
+                identity(&absent).descriptor.environment
+            );
+            for value in [
+                ":".to_owned(),
+                format!(":{root}/lib"),
+                format!("{root}/lib:"),
+                format!("{root}/lib::{root}/lib/rustlib"),
+            ] {
+                let mut invalid = plan.clone();
+                invalid
+                    .execution_env
+                    .iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1 = value;
+                assert!(remote_loader_search_paths(&invalid, root).is_err());
+                assert!(remote_empty_loader_directories(&invalid, root).is_err());
+            }
+            plan.execution_env
+                .push(("LD_PRELOAD".into(), String::new()));
+            assert!(
+                remote_loader_search_paths(&plan, root).is_err(),
+                "the empty list must not bypass other loader-control validation"
+            );
+        }
     }
 }

@@ -288,11 +288,15 @@ mod tests {
         let mut second = CapturePins::new(Arc::clone(&cas), &authority(42));
         let captured = put_output(&cas, &first_source, 1 << 20, &mut first).unwrap();
         assert_eq!(
-            put_output(&cas, &first_source, 1 << 20, &mut first).unwrap().digest,
+            put_output(&cas, &first_source, 1 << 20, &mut first)
+                .unwrap()
+                .digest,
             captured.digest,
         );
         assert_eq!(
-            put_output(&cas, &second_source, 1 << 20, &mut second).unwrap().digest,
+            put_output(&cas, &second_source, 1 << 20, &mut second)
+                .unwrap()
+                .digest,
             captured.digest,
         );
         assert_eq!(first.held.len(), 1);
@@ -317,10 +321,12 @@ mod tests {
             b"original compiler artifact",
             rabs_cas::digest_set::DigestRequest::default(),
             None,
-        ).unwrap().atp_content_id;
-        let target = cas.layout().published_path(
-            &digest, rabs_cas::blob_store::RAW_PROFILE_V1, &digest,
-        );
+        )
+        .unwrap()
+        .atp_content_id;
+        let target =
+            cas.layout()
+                .published_path(&digest, rabs_cas::blob_store::RAW_PROFILE_V1, &digest);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&source, &target).unwrap();
         let held_store = cas.store().lock().unwrap();
@@ -329,14 +335,18 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let mut pins = CapturePins::new(Arc::clone(&worker_cas), &authority(43));
             let result = put_output(&worker_cas, &source, 1 << 20, &mut pins);
-            sender.send(result.map(|_| ()).map_err(|error| error.to_string())).unwrap();
+            sender
+                .send(result.map(|_| ()).map_err(|error| error.to_string()))
+                .unwrap();
         });
         let answer = receiver.recv_timeout(std::time::Duration::from_secs(5));
         // Release before joining even on test failure: the negative control
         // must fail, not strand a worker blocked behind the test's own lock.
         drop(held_store);
         worker.join().unwrap();
-        let error = answer.expect("duplicate observation waited behind the store lock").unwrap_err();
+        let error = answer
+            .expect("duplicate observation waited behind the store lock")
+            .unwrap_err();
         assert!(error.contains("observe output target"), "{error}");
         assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
     }

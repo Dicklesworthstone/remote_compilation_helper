@@ -158,12 +158,11 @@ fn tracked_value_and_presence_reads_refuse_publication() {
         "# env-dep:CARGO_TARGET_DIR\n",
         "# env-dep:CARGO_TARGET_DIR=\n",
     ] {
-        let reason = dep_info_closure_violation(
-            &candidate,
-            (ordinary.clone() + suffix).as_bytes(),
-            |_| true,
-        )
-        .unwrap();
+        let reason =
+            dep_info_closure_violation(&candidate, (ordinary.clone() + suffix).as_bytes(), |_| {
+                true
+            })
+            .unwrap();
         assert!(reason.contains("unkeyed variable CARGO_TARGET_DIR"));
     }
 }
@@ -225,7 +224,12 @@ fn captured_rustc_env_directive_keeps_exact_key_and_does_not_mutate_plan() {
     let original = candidate.clone();
     let expected = derive_with(&candidate, 7, Some(record)).unwrap();
     assert_eq!(
-        key(&mut candidate, true, |plan| derive_with(plan, 7, Some(record))).unwrap(),
+        key(&mut candidate, true, |plan| derive_with(
+            plan,
+            7,
+            Some(record)
+        ))
+        .unwrap(),
         expected
     );
     assert_eq!(candidate, original);
@@ -251,7 +255,9 @@ fn mismatched_or_duplicate_bindings_are_never_projected() {
     for variant in 0..3 {
         let mut candidate = plan(Some("/agents/one/target"));
         if variant == 1 {
-            candidate.execution_env.push((VARIABLE.into(), "/other".into()));
+            candidate
+                .execution_env
+                .push((VARIABLE.into(), "/other".into()));
         } else if variant == 2 {
             candidate.keyed_env.push((VARIABLE.into(), "/other".into()));
         } else {
@@ -287,7 +293,8 @@ fn failed_projection_preserves_another_profiles_read_veto() {
     let baseline = derive(&mut expected).unwrap();
     let result = key(&mut candidate, true, |plan| {
         // Model a narrower placement profile followed by a projection refusal.
-        plan.keyed_env.retain(|(name, _)| name != "CARGO_OTHER_PLACEMENT");
+        plan.keyed_env
+            .retain(|(name, _)| name != "CARGO_OTHER_PLACEMENT");
         if single_value(&plan.keyed_env).is_none() {
             return Err(LiveRefusal::Facts("requires exact target binding".into()));
         }
@@ -417,10 +424,7 @@ fn legacy_opt_in_keeps_its_exact_policy_and_does_not_expand_coverage() {
         descriptor_digest(&descriptor_canonical_bytes(&expected.descriptor));
     assert_eq!(key(&mut old, true, derive).unwrap(), expected);
     assert_eq!(old, expected_plan);
-    assert_eq!(
-        layout_key(&mut plan(Some("/agents/two/target"))),
-        expected
-    );
+    assert_eq!(layout_key(&mut plan(Some("/agents/two/target"))), expected);
     for variable in &LAYOUT_VARIABLES[1..] {
         let mut exact = plan(None);
         binding(&mut exact, variable, "/agents/one/build");
@@ -562,7 +566,11 @@ fn full_layout_opt_in_still_keys_other_environment_source_and_flags() {
         let mut changed = plan(None);
         binding(&mut changed, "CARGO_BUILD_BUILD_DIR", "/agents/two/build");
         if variant == 0 {
-            binding(&mut changed, "CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu");
+            binding(
+                &mut changed,
+                "CARGO_BUILD_TARGET",
+                "aarch64-unknown-linux-gnu",
+            );
         } else if variant == 1 {
             changed.invocation.cfgs.push("semantic_change".into());
         }

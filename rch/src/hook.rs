@@ -132,6 +132,8 @@ const EXIT_ARTIFACT_TRANSFER_FAILED: i32 = 102;
 const EXIT_REMOTE_REQUIRED_REFUSED: i32 = 103;
 
 const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
+const RCH_CARGO_WRAPPER_ORIGIN_ENV: &str = "RCH_CARGO_WRAPPER_ORIGIN";
+const RCH_CARGO_WRAPPER_ORIGIN_RCH: &str = "rch";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 
 /// Opt-out knob for remote target-dir REUSE. When set to a truthy value the hook
@@ -246,6 +248,23 @@ fn selection_project_for_execution(
     format!("{project}::clean-overlay::{}", &suffix[..16])
 }
 
+/// Return a per-job selection identity for a `--source-content-receipt`
+/// read-only `cargo fmt --check` run (bd-k90ud).
+///
+/// Like `--clean-overlay`, a receipt-backed `cargo fmt --check` materializes an
+/// isolated remote source container (`source-content-<build_id>-<hash>`) rather
+/// than mutating the shared mirror, and requires the worker's `rustfmt`
+/// component gate in `rchd`.
+fn selection_project_for_source_content_fmt_check(project: &str, job_nonce: uuid::Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-source-content-fmt-selection-project-v1\0");
+    hasher.update(project.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(job_nonce.as_bytes());
+    let suffix = hasher.finalize().to_hex();
+    format!("{project}::clean-overlay::{}", &suffix[..16])
+}
+
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -257,9 +276,75 @@ enum RemotePipelineFailurePolicy {
     FailClosedNoLocalFallback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceNamespacePreflightStage {
+    TopologyProbe,
+    NamespaceInitialization,
+}
+
+/// Issued only after the exact admitted journal durably records a failed
+/// namespace preflight phase with no source intent or observed outcome. The
+/// original transport error stays in the chain; it must not be confused with
+/// a timeout after admission. A daemon terminal receipt determines the outcome.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "RCH_SOURCE_NAMESPACE_PRE_ADMISSION_FAILED worker={worker_id} build={build_id} stage={stage:?}: no source or execution grant was issued"
+)]
+struct SourceNamespacePreflightFailure {
+    local_wrapper_id: String,
+    worker_id: WorkerId,
+    build_id: u64,
+    stage: SourceNamespacePreflightStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceNamespacePreflightCompletion {
+    Failed,
+    Cancelled,
+}
+
+impl SourceNamespacePreflightCompletion {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Failed => EXIT_BUILD_ERROR,
+            Self::Cancelled => 130,
+        }
+    }
+}
+
+/// A release ACK proves that the reservation is retired, but a cancellation
+/// may already have supplied its terminal result. Read the exact receipt
+/// before recording an outcome or retrying. A missing reply leaves exit=None
+/// so owner-verified restart recovery can reconcile that same daemon receipt.
+async fn confirm_source_namespace_preflight_release(
+    writer: &DurableLeaseWriter,
+    failure: &SourceNamespacePreflightFailure,
+    release_acknowledged: bool,
+    socket_path: &str,
+) -> anyhow::Result<SourceNamespacePreflightCompletion> {
+    let result = async {
+        anyhow::ensure!(
+            release_acknowledged,
+            "namespace preflight reservation release is unconfirmed"
+        );
+        let observed = writer.snapshot();
+        writer.validate_source_namespace_preflight_identity(&observed, failure)?;
+        let completion =
+            daemon_ipc::query_source_namespace_preflight_completion(socket_path, &observed).await?;
+        writer.record_source_namespace_preflight_completion(failure, completion)?;
+        Ok(completion)
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| {
+        error
+            .context("namespace preflight terminal receipt could not be reconciled")
+            .context(crate::transfer::RemoteExecutionUnconfirmed)
+    })
+}
+
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
     if is_remote_execution_unconfirmed(error)
-        || is_ssh_command_timeout_error(error)
+        || (is_ssh_command_timeout_error(error) && !error.is::<SourceNamespacePreflightFailure>())
         || error
             .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
             .is_some_and(|failure| failure.started)
@@ -990,6 +1075,7 @@ fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
         .env(RCH_CARGO_WRAPPER_BYPASS_ENV, "1")
+        .env(RCH_CARGO_WRAPPER_ORIGIN_ENV, RCH_CARGO_WRAPPER_ORIGIN_RCH)
         .arg("-c")
         .arg(command);
     child
@@ -2116,6 +2202,105 @@ impl DurableLeaseWriter {
         next.exit_code = Some(exit_code);
         self.publish_transition(&mut lease, next)
     }
+
+    /// The two namespace preflight RPCs run before RecoverySession::begin,
+    /// source/pair acquisition, transfer or execution. Record their failed
+    /// phase before daemon release, without inventing source cleanup or a
+    /// terminal result that could conflict with a concurrent daemon cancellation.
+    /// Only this durable, identity-checked transition permits the typed retry
+    /// classification; uncertain journal publication retains ownership instead.
+    fn source_namespace_preflight_failed(
+        &self,
+        worker_id: &WorkerId,
+        build_id: Option<u64>,
+        local_wrapper_id: Option<&str>,
+        stage: SourceNamespacePreflightStage,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if is_remote_execution_unconfirmed(&error) {
+            return error;
+        }
+        let checkpoint = (|| -> anyhow::Result<(u64, String)> {
+            let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+            let build_id =
+                build_id.context("namespace preflight failure has no admitted build identity")?;
+            let wrapper_id =
+                local_wrapper_id.context("namespace preflight failure has no wrapper identity")?;
+            self.admission_reference_from_lease(&lease, wrapper_id, build_id, worker_id)?;
+            anyhow::ensure!(
+                !lease.terminal_acknowledged
+                    && lease.exit_code.is_none()
+                    && lease.recovery.is_none(),
+                "namespace preflight failure cannot replace source ownership or an observed outcome"
+            );
+            let mut next = lease.clone();
+            next.heartbeat("source_namespace_preflight_failed", now_unix_ms());
+            self.publish_transition(&mut lease, next)?;
+            Ok((build_id, wrapper_id.to_owned()))
+        })();
+        match checkpoint {
+            Ok((build_id, local_wrapper_id)) => error.context(SourceNamespacePreflightFailure {
+                local_wrapper_id,
+                worker_id: worker_id.clone(),
+                build_id,
+                stage,
+            }),
+            Err(checkpoint) => error
+                .context(format!(
+                    "namespace preflight failure could not be durably recorded: {checkpoint:#}"
+                ))
+                .context(crate::transfer::RemoteExecutionUnconfirmed),
+        }
+    }
+
+    fn validate_source_namespace_preflight_identity(
+        &self,
+        lease: &DurableJobLease,
+        failure: &SourceNamespacePreflightFailure,
+    ) -> anyhow::Result<()> {
+        self.admission_reference_from_lease(
+            lease,
+            &failure.local_wrapper_id,
+            failure.build_id,
+            &failure.worker_id,
+        )?;
+        anyhow::ensure!(
+            lease.recovery.is_none(),
+            "namespace preflight completion cannot replace source ownership"
+        );
+        Ok(())
+    }
+
+    /// Publish only the exact admitted attempt's validated daemon outcome.
+    /// Heartbeats may change phase during the query; admission, source evidence
+    /// and observed outcomes must still agree under this same journal mutex.
+    fn record_source_namespace_preflight_completion(
+        &self,
+        failure: &SourceNamespacePreflightFailure,
+        completion: SourceNamespacePreflightCompletion,
+    ) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        self.validate_source_namespace_preflight_identity(&lease, failure)?;
+        let exit_code = completion.exit_code();
+        anyhow::ensure!(
+            lease.exit_code.is_none_or(|observed| observed == exit_code),
+            "namespace preflight daemon completion contradicts the observed outcome"
+        );
+        if lease.terminal_acknowledged {
+            anyhow::ensure!(
+                lease.exit_code == Some(exit_code),
+                "namespace preflight terminal journal has no matching outcome"
+            );
+            return Ok(());
+        }
+        let mut next = lease.clone();
+        next.exit_code = Some(exit_code);
+        if completion == SourceNamespacePreflightCompletion::Cancelled {
+            next.acknowledge_terminal(now_unix_ms());
+        }
+        self.publish_transition(&mut lease, next)
+    }
+
     fn create(
         command: &str,
         strict_remote: bool,
@@ -2201,7 +2386,8 @@ impl DurableLeaseWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "previous remote source ownership is unresolved; recover this wrapper before another admission"
             );
         }
@@ -2221,7 +2407,8 @@ impl DurableLeaseWriter {
         let lease = self.snapshot();
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "remote source ownership is unresolved; run rch jobs recover {} before retrying",
                 lease.identity.local_wrapper_id
             );
@@ -2250,7 +2437,8 @@ impl DurableLeaseWriter {
         );
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
-                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true)
+                    && Self::cancellation_allows_retirement(recovery),
                 "previous remote source ownership is unresolved; retry refused"
             );
         }
@@ -2344,6 +2532,32 @@ impl DurableLeaseWriter {
         let mut next = lease.clone();
         next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
         next.heartbeat("failed_before_admission", now_unix_ms());
+        next.terminal_acknowledged = true;
+        self.publish_transition(&mut lease, next)
+    }
+
+    /// Settle a pre-admission lease whose owner process is gone after the 24h
+    /// daemon-absence window (`bd-7e3bt`). Unlike `confirm_failed_before_admission`,
+    /// which requires an immediate daemon refusal on the live path, this requires
+    /// `daemon_absence_is_conclusive` and also settles abandoned `selection_pending`
+    /// or `selection_unconfirmed` journals.
+    pub(crate) fn settle_abandoned_pre_admission(&self, now_unix_ms: u64) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            lease.identity.remote_build_id.is_none()
+                && lease.worker_id.is_none()
+                && lease.recovery.is_none()
+                && lease.exit_code.is_none()
+                && !lease.terminal_acknowledged,
+            "pre-admission recovery cannot retire an admitted or completed lease"
+        );
+        anyhow::ensure!(
+            daemon_absence_is_conclusive(&lease, now_unix_ms),
+            "original wrapper is absent before daemon admission; acknowledgement waits until the lease is 24h old"
+        );
+        let mut next = lease.clone();
+        next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        next.heartbeat("failed_before_admission", now_unix_ms);
         next.terminal_acknowledged = true;
         self.publish_transition(&mut lease, next)
     }
@@ -2448,6 +2662,38 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
+    fn cancellation_allows_retirement(recovery: &serde_json::Value) -> bool {
+        match recovery.get("source_cancellation_settled") {
+            Some(serde_json::Value::Bool(true)) => {
+                // A settlement receipt is valid only after the failed result
+                // and every cancellation resource were durably retired.
+                // Raw readmission/acknowledgement paths must enforce the
+                // same invariant as the typed recovery loader.
+                recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|exit| i32::try_from(exit).ok())
+                    .is_some_and(|exit| exit != 0)
+                    && rch_common::job_identity::source_recovery_resources_retired(recovery)
+            }
+            None | Some(serde_json::Value::Null) => {
+                // Existing acknowledged journals remain readable, but a
+                // known legacy source cancellation cannot get a NEW ack or
+                // lose its current recovery authority through readmission.
+                recovery
+                    .get("preparation_cancelled")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                    || recovery
+                        .get("source_roots")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(Vec::is_empty)
+            }
+            // Explicitly pending and malformed evidence both fail closed.
+            _ => false,
+        }
+    }
+
     fn ensure_terminal_evidence(lease: &DurableJobLease, exit_code: i32) -> anyhow::Result<()> {
         anyhow::ensure!(
             !selection_is_pending(lease),
@@ -2470,6 +2716,10 @@ impl DurableLeaseWriter {
         }
         if let Some(recovery) = lease.recovery.as_ref() {
             anyhow::ensure!(
+                Self::cancellation_allows_retirement(recovery),
+                "worker source cancellation settlement is incomplete; terminal acknowledgement refused"
+            );
+            anyhow::ensure!(
                 recovery.get("returned").and_then(serde_json::Value::as_i64)
                     == Some(i64::from(exit_code)),
                 "terminal command result contradicts durable delivery; acknowledgement refused"
@@ -2487,12 +2737,34 @@ impl DurableLeaseWriter {
         next: DurableJobLease,
     ) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(&next)?;
+        let supersedes_recovery = lease.recovery.is_some() && next.recovery.is_none();
         #[cfg(unix)]
         if let Some(ownership) = &self.recovery_ownership {
+            if supersedes_recovery {
+                ownership.retain_snapshot(lease)?;
+            }
             ownership.publish(&bytes)?;
             *lease = next;
             return Ok(());
         }
+        #[cfg(unix)]
+        if supersedes_recovery {
+            // Loaded observations and older fixtures may not already own the
+            // gate. Preserve the same exact current epoch and publish its
+            // successor while holding one temporary exclusive owner, never
+            // skip custody preservation on this path.
+            let ownership =
+                transfer_orchestration::recovery::recovery_owner::acquire_gate(&self.path)?;
+            ownership.retain_snapshot(lease)?;
+            ownership.publish(&bytes)?;
+            *lease = next;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        anyhow::ensure!(
+            !supersedes_recovery,
+            "cannot supersede recovery custody without descriptor-bound journal snapshots on this platform"
+        );
         atomic_write(&self.path, &bytes)?;
         // Unix atomic_write already synchronizes and verifies its held parent;
         // reopening the pathname here adds no durability to that publication.
@@ -3338,9 +3610,10 @@ async fn selected_clean_overlay_cargo_tree(
         };
         entries.insert(
             target.clone(),
-            SelectedCargoEntry::File(Some(String::from_utf8(bytes).with_context(|| {
-                format!("selected Cargo metadata is not UTF-8: {}", target.display())
-            })?)),
+            // Unreferenced Cargo.toml files may be arbitrary fixture bytes.
+            // Reachable manifests and all selected configs still require text
+            // when the inventory-only semantic traversal admits them.
+            SelectedCargoEntry::File(String::from_utf8(bytes).ok()),
         );
     }
     spec.verify_overlay_unchanged(project_root)?;
@@ -3376,8 +3649,9 @@ async fn validate_clean_overlay_cargo_sources(
             );
         }
     }
-    let primary_manifest = primary_directory.join("Cargo.toml");
-    validate_selected_cargo_tree_at(&entries, &primary_manifest)?;
+    let mut primary_manifest = primary_directory.join("Cargo.toml");
+    let mut manifest_selected = false;
+    let mut inline_configs = Vec::new();
     let (tokens, cargo_index) = cargo_target_dir::managed_clean_overlay_cargo_tokens(command)?;
     // Changing cwd also changes Cargo's configuration search. Until that
     // search is represented in the selected-source plan, do not guess.
@@ -3425,6 +3699,15 @@ async fn validate_clean_overlay_cargo_sources(
                     "Cargo manifest argument is not selected Cargo metadata: {}",
                     path.display()
                 );
+                anyhow::ensure!(
+                    !manifest_selected,
+                    "multiple Cargo manifest selectors are not admitted"
+                );
+                manifest_selected = true;
+                // Retain the selected logical manifest location. The common
+                // validator refuses file aliases whose Cargo-relative source
+                // base would differ from the resolved metadata location.
+                primary_manifest = primary_directory.join(value);
             } else {
                 // Inline TOML is parsed by the same dependency-path validator.
                 // File-based --config needs an explicit selected-file mapping;
@@ -3432,15 +3715,14 @@ async fn validate_clean_overlay_cargo_sources(
                 let _: toml::Value = toml::from_str(value).context(
                     "clean-overlay supports inline TOML --config only; config files are not admitted",
                 )?;
-                validate_selected_cargo_config_at(
-                    &entries,
-                    &primary_manifest,
-                    primary_directory,
-                    value,
-                )?;
+                inline_configs.push(value);
             }
         }
         index += 1;
+    }
+    validate_selected_cargo_tree_at(&entries, &primary_manifest)?;
+    for value in inline_configs {
+        validate_selected_cargo_config_at(&entries, &primary_manifest, primary_directory, value)?;
     }
     spec.verify_overlay_unchanged(project_root)?;
     Ok(())
@@ -3691,6 +3973,14 @@ fn is_clean_overlay_cargo_fmt_check(command_parts: &[String]) -> bool {
     subcommand == "fmt" && parts.any(|part| part == "--check")
 }
 
+fn is_isolated_source_cargo_fmt_check(
+    clean_overlay: bool,
+    source_content_receipt: bool,
+    command_parts: &[String],
+) -> bool {
+    (clean_overlay || source_content_receipt) && is_clean_overlay_cargo_fmt_check(command_parts)
+}
+
 #[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params
 pub async fn run_exec(
     base: Option<String>,
@@ -3807,7 +4097,8 @@ pub async fn run_exec(
     } else {
         classify_command(&command)
     };
-    let clean_overlay_fmt_check = clean_overlay && is_clean_overlay_cargo_fmt_check(&command_parts);
+    let clean_overlay_fmt_check =
+        is_isolated_source_cargo_fmt_check(clean_overlay, source_content_receipt, &command_parts);
     if !classification.is_compilation && !clean_overlay_fmt_check {
         // This should not normally happen because the hook only rewrites
         // compilations. Preserve the ordinary local behavior, but honor
@@ -3998,11 +4289,11 @@ pub async fn run_exec(
         )
         .await?;
     }
-    let selection_project = selection_project_for_execution(
-        &project,
-        clean_overlay_spec.as_ref(),
-        uuid::Uuid::new_v4(),
-    );
+    let selection_project = if clean_overlay_spec.is_none() && clean_overlay_fmt_check {
+        selection_project_for_source_content_fmt_check(&project, uuid::Uuid::new_v4())
+    } else {
+        selection_project_for_execution(&project, clean_overlay_spec.as_ref(), uuid::Uuid::new_v4())
+    };
     // Issue #63: `--job` bypasses classification (kind = Job), so the request
     // used to carry NO toolchain even for a delegated `cargo clippy` — and the
     // daemon's clippy component gate then fail-closed EVERY worker as
@@ -4569,6 +4860,41 @@ pub async fn run_exec(
                 ));
             }
             return Err(release_unconfirmed_error(&worker.id, remote_build_id));
+        }
+
+        if !retain_unconfirmed_ownership
+            && let Err(error) = result.as_ref()
+            && let Some(failure) = error.downcast_ref::<SourceNamespacePreflightFailure>()
+        {
+            let completion = confirm_source_namespace_preflight_release(
+                &durable_lease,
+                failure,
+                release_acknowledged,
+                &config.general.socket_path,
+            )
+            .await?;
+            if completion == SourceNamespacePreflightCompletion::Cancelled {
+                reporter.summary("[RCH] cancelled during source namespace initialization");
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "completed",
+                    location: "remote",
+                    fallback_reason: None,
+                    worker_id: Some(worker.id.as_str()),
+                    remote_exit_code: Some(130),
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id,
+                        remote_build_id,
+                        &worker.id,
+                    )?,
+                });
+                std::process::exit(130);
+            }
         }
 
         // Classify the outcome. Terminal cases (success, real build/test failure,
@@ -5341,7 +5667,7 @@ mod repo_updater;
 // consumes the same items via `crate::hook::ssh`, so the module stays
 // crate-internal (`pub(crate)`) rather than fully private.
 pub(crate) mod ssh;
-pub(crate) use ssh::{source_authority_activity_prefix, source_authority_cleanup_prefix};
+pub(crate) use ssh::SourceAuthorityNamespace;
 
 /// Worker setup can change a shared ancestor of many source trees. Give each
 /// explicit mutation the same durable exclusion and activity draining as a
@@ -5379,9 +5705,21 @@ pub(crate) async fn run_owned_worker_topology_command(
             // its kernel locks. Fence that exact intent before reporting that
             // setup failed; a missing acknowledgment is not absent ownership.
             let cancellation = async {
-                if ssh::cancel_remote_source_authority_intent(worker, &roots, &identity).await? {
-                    ssh::finish_cancel_remote_source_authority_intent(worker, &roots, &identity)
-                        .await?;
+                if ssh::cancel_remote_source_authority_intent(
+                    worker,
+                    &roots,
+                    &identity,
+                    SourceAuthorityNamespace::Current,
+                )
+                .await?
+                {
+                    ssh::finish_cancel_remote_source_authority_intent(
+                        worker,
+                        &roots,
+                        &identity,
+                        SourceAuthorityNamespace::Current,
+                    )
+                    .await?;
                 }
                 Ok::<(), anyhow::Error>(())
             }
@@ -5517,8 +5855,8 @@ use rabs_recorder::record_invocation;
 mod daemon_ipc;
 pub(crate) use daemon_ipc::{
     RestartAdmissionWait, query_admission_preview, query_daemon, query_daemon_dry_run,
-    release_worker,
-    restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
+    release_worker, restart_admission_is_closed, restart_admission_wait_bound,
+    wait_for_restart_admission,
 };
 use daemon_ipc::{
     disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,
@@ -6623,6 +6961,136 @@ pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String
         "sh -c {} rch-cargo-cache \"${{{base_var}:-}}\"",
         shell_escape::escape(script.into())
     )
+}
+
+#[cfg(test)]
+mod source_cancellation_retirement_tests {
+    use super::*;
+
+    fn settled_recipe() -> serde_json::Value {
+        serde_json::json!({
+            "returned": 137, "retired": true,
+            "source_roots": ["/source"], "sources_released": true,
+            "source_cancellation_settled": true,
+            "future_custody": {"keep": "original"},
+        })
+    }
+
+    fn lease(recipe: serde_json::Value) -> DurableJobLease {
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            11,
+            None,
+            None,
+            1,
+            false,
+            true,
+            "test".into(),
+        );
+        lease.admit(7, "worker1".into(), 1);
+        lease.exit_code = Some(137);
+        lease.recovery = Some(recipe);
+        lease
+    }
+
+    #[test]
+    fn settled_cancellation_preserves_absent_resource_defaults() {
+        for explicit_defaults in [false, true] {
+            let mut recipe = settled_recipe();
+            if explicit_defaults {
+                recipe["pair"] = serde_json::Value::Null;
+                recipe["retire_root"] = serde_json::Value::Null;
+                recipe["pair_released"] = serde_json::json!(false);
+                recipe["tree_retired"] = serde_json::json!(false);
+            }
+            let before = recipe.clone();
+            assert!(DurableLeaseWriter::cancellation_allows_retirement(&recipe));
+            let lease = lease(recipe);
+            DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).unwrap();
+            assert_eq!(lease.recovery.as_ref(), Some(&before));
+
+            let mut no_source = before;
+            no_source["source_roots"] = serde_json::json!([]);
+            no_source
+                .as_object_mut()
+                .unwrap()
+                .remove("sources_released");
+            assert!(DurableLeaseWriter::cancellation_allows_retirement(
+                &no_source
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_retirement_refuses_live_or_malformed_resource_evidence() {
+        for (key, value) in [
+            ("sources_released", serde_json::json!(false)),
+            ("sources_released", serde_json::Value::Null),
+            ("source_roots", serde_json::Value::Null),
+            ("source_roots", serde_json::json!("/source")),
+            ("source_roots", serde_json::json!([null])),
+            ("source_roots", serde_json::json!([""])),
+            ("source_roots", serde_json::json!(["/source\nother"])),
+            ("pair", serde_json::json!(["/source", "aa"])),
+            ("pair", serde_json::json!(["/source"])),
+            ("pair", serde_json::json!(["/source", 1])),
+            ("pair_released", serde_json::Value::Null),
+            ("pair_released", serde_json::json!("true")),
+            ("retire_root", serde_json::json!("/source")),
+            ("retire_root", serde_json::json!(false)),
+            ("tree_retired", serde_json::Value::Null),
+            ("returned", serde_json::json!(0)),
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_cancellation_settled", serde_json::json!("true")),
+        ] {
+            let mut recipe = settled_recipe();
+            recipe[key] = value;
+            let before = recipe.clone();
+            assert!(
+                !DurableLeaseWriter::cancellation_allows_retirement(&recipe),
+                "{key}"
+            );
+            let lease = lease(recipe);
+            assert!(
+                DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).is_err(),
+                "{key}"
+            );
+            assert_eq!(lease.recovery.as_ref(), Some(&before));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_pending_cancellation_blocks_acknowledgement_and_readmission() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let mut recipe = settled_recipe();
+        recipe["source_cancellation_settled"] = serde_json::json!(false);
+        let writer = DurableLeaseWriter {
+            path: directory.path().join("lease.json"),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(lease(recipe))),
+        };
+        writer.persist().unwrap();
+        let before = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(writer.acknowledge_terminal().is_err());
+        assert!(writer.ensure_released_for_retry().is_err());
+        assert!(writer.begin_retry_selection(true).is_err());
+        assert!(writer.admit(8, &WorkerId::new("worker2")).is_err());
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+
+        let mut settled = before.recovery.unwrap();
+        settled["source_cancellation_settled"] = serde_json::json!(true);
+        writer.set_recovery(settled.clone()).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        writer.ensure_released_for_retry().unwrap();
+        assert!(writer.snapshot().terminal_acknowledged);
+        assert_eq!(writer.snapshot().recovery.as_ref(), Some(&settled));
+    }
 }
 
 #[cfg(test)]

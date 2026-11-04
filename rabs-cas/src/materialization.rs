@@ -509,13 +509,23 @@ fn copy_verified_with_cloner(
     Ok((written, reflinked))
 }
 
-/// Only Linux's safe FICLONE binding is enabled. Other platforms retain the
-/// verified-copy backend until their clone API has equivalent isolation tests.
+/// Try to make a private copy-on-write clone into an already-created file.
+///
+/// Both files must be ordinary, distinct inodes on the same filesystem. The
+/// destination filesystem's content and metadata isolation are independently
+/// probed before cloning. Only Linux's safe FICLONE binding is enabled; other
+/// platforms return false until they have equivalent isolation tests.
+///
+/// This is a copy optimization, not content verification. Callers must hash the
+/// actual destination clone, revalidate their retained source, and apply the
+/// destination's private metadata before publishing it. A false return requires
+/// truncating and rewinding the destination before a normal copy: an unsuccessful
+/// clone attempt is not a promise that the destination stayed empty.
 #[cfg(all(
     target_os = "linux",
     not(any(target_arch = "sparc", target_arch = "sparc64"))
 ))]
-fn try_verified_reflink(input: &std::fs::File, output: &std::fs::File, parent: &Path) -> bool {
+pub fn try_verified_reflink(input: &std::fs::File, output: &std::fs::File, parent: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     let (Ok(source), Ok(target)) = (input.metadata(), output.metadata()) else {
@@ -539,7 +549,11 @@ fn try_verified_reflink(input: &std::fs::File, output: &std::fs::File, parent: &
     target_os = "linux",
     not(any(target_arch = "sparc", target_arch = "sparc64"))
 )))]
-fn try_verified_reflink(_input: &std::fs::File, _output: &std::fs::File, _parent: &Path) -> bool {
+pub fn try_verified_reflink(
+    _input: &std::fs::File,
+    _output: &std::fs::File,
+    _parent: &Path,
+) -> bool {
     false
 }
 

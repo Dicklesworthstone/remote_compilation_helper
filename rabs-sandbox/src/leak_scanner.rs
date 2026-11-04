@@ -136,7 +136,12 @@ fn matching_patterns(bytes: &[u8], patterns: &[&str], state_limit: usize) -> Vec
     }
     // Retain the existing vectorized substring search for the one-pattern
     // case. Empty patterns have never been evidence of a leak.
-    if patterns.iter().filter(|pattern| !pattern.is_empty()).count() <= 1 {
+    if patterns
+        .iter()
+        .filter(|pattern| !pattern.is_empty())
+        .count()
+        <= 1
+    {
         return literal_matches(bytes, patterns);
     }
     let mut states = vec![MatchState::default()];
@@ -248,7 +253,10 @@ pub fn scan_surface(
     let mut findings = Vec::new();
     let mut check = |patterns: &[String], class_for: &dyn Fn(Surface) -> LeakClass| {
         for pattern in patterns {
-            if matched.next().expect("one presence result per hidden pattern") {
+            if matched
+                .next()
+                .expect("one presence result per hidden pattern")
+            {
                 findings.push(LeakFinding {
                     surface,
                     class: class_for(surface),
@@ -344,13 +352,7 @@ mod tests {
 
     #[test]
     fn empty_and_single_pattern_inventories_preserve_literal_behavior() {
-        for patterns in [
-            vec![],
-            vec![""],
-            vec!["", ""],
-            vec!["a"],
-            vec!["", "a", ""],
-        ] {
+        for patterns in [vec![], vec![""], vec!["", ""], vec!["a"], vec!["", "a", ""]] {
             for bytes in [&b""[..], &b"ab"[..], &b"clean"[..], &b"\xff\0"[..]] {
                 assert_eq!(
                     matching_patterns(bytes, &patterns, MAX_MATCH_STATES),

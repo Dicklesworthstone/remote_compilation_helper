@@ -507,6 +507,11 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         #[arg(long)]
         apply: bool,
 
+        /// Include read-only census of retained `source-content-pair-*.retained-*`
+        /// trees (bd-psywj). Never deletes source directories even with `--apply`.
+        #[arg(long)]
+        retained: bool,
+
         /// Worker IDs to sweep (repeatable). Default: every configured worker.
         #[arg(long, value_name = "WORKER_ID")]
         workers: Vec<String>,
@@ -2469,10 +2474,22 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             Commands::Gc {
                 dry_run,
                 apply,
+                retained,
                 workers,
                 roots,
                 worker_timeout,
-            } => handle_gc(dry_run, apply, workers, roots, worker_timeout, &ctx).await,
+            } => {
+                handle_gc(
+                    dry_run,
+                    apply,
+                    retained,
+                    workers,
+                    roots,
+                    worker_timeout,
+                    &ctx,
+                )
+                .await
+            }
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
@@ -4860,6 +4877,7 @@ struct GcDecision {
 async fn handle_gc(
     dry_run: bool,
     apply: bool,
+    retained: bool,
     worker_filter: Vec<String>,
     cli_roots: Vec<String>,
     worker_timeout: u64,
@@ -5169,6 +5187,84 @@ async fn handle_gc(
             }),
         };
 
+        // Read-only retained `source-content-pair-*.retained-*` census (bd-psywj).
+        // Never deletes source directories even with `--apply`.
+        let retained_sources = if retained {
+            let mut retained_entries = Vec::new();
+            let mut retained_seen = std::collections::HashSet::new();
+            let mut retained_error: Option<String> = None;
+            for base in bases {
+                match run_gc_surface_command(
+                    worker,
+                    &reap::retained_source_trees_census_command(base),
+                    deadline,
+                    &mut output_budget,
+                )
+                .await
+                {
+                    Ok(result) if result.success() => {
+                        let (_status, reports) =
+                            reap::parse_retained_source_reports(&result.stdout);
+                        for r in reports {
+                            if retained_seen.insert(r.path.clone()) {
+                                retained_entries.push(r);
+                            }
+                        }
+                    }
+                    Ok(result) => {
+                        retained_error = Some(format!(
+                            "retained source census of {base} exited {}: {}",
+                            result.exit_code,
+                            result.stderr.trim()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        retained_error = Some(format!("retained source census of {base}: {e}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = retained_error {
+                serde_json::json!({
+                    "status": "error",
+                    "error": error,
+                    "trees": [],
+                    "total_kb": 0,
+                    "unclaimed_kb": 0,
+                })
+            } else {
+                let total_kb: u64 = retained_entries.iter().map(|r| r.kb).sum();
+                let unclaimed_kb: u64 = retained_entries
+                    .iter()
+                    .filter(|r| r.verdict == "unclaimed-preview")
+                    .map(|r| r.kb)
+                    .sum();
+                serde_json::json!({
+                    "status": "ok",
+                    "trees": retained_entries
+                        .iter()
+                        .map(|r| serde_json::json!({
+                            "path": r.path,
+                            "kb": r.kb,
+                            "age_minutes": r.age_minutes,
+                            "verdict": r.verdict,
+                            "reason": r.reason,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "total_kb": total_kb,
+                    "unclaimed_kb": unclaimed_kb,
+                })
+            }
+        } else {
+            serde_json::json!({
+                "status": "not-requested",
+                "trees": [],
+                "total_kb": 0,
+                "unclaimed_kb": 0,
+            })
+        };
+
         let dirs: Vec<serde_json::Value> = decisions
             .iter()
             .map(|d| {
@@ -5215,6 +5311,7 @@ async fn handle_gc(
             "rm_errors": rm_errors,
             "skipped": skipped,
             "gc_claims": gc_claims,
+            "retained_sources": retained_sources,
         })
     });
     let worker_reports =
@@ -5409,6 +5506,7 @@ async fn handle_gc(
                 );
             }
             print_gc_claims(&report["gc_claims"], style);
+            print_retained_sources(&report["retained_sources"], style);
         }
     }
 
@@ -5460,6 +5558,53 @@ fn print_gc_claims(report: &serde_json::Value, style: &ui::Theme) {
             claim["reason"].as_str().unwrap_or("?"),
             claim["age_minutes"].as_u64().unwrap_or(0) / 60,
             claim["path"].as_str().unwrap_or("?"),
+        );
+    }
+}
+
+/// Text view of one worker's `retained_sources` report (`rch gc --retained`,
+/// bd-psywj). Silent when `--retained` was not requested.
+fn print_retained_sources(report: &serde_json::Value, style: &ui::Theme) {
+    let trees = report["trees"].as_array().map_or(&[][..], Vec::as_slice);
+    match report["status"].as_str() {
+        Some("not-requested") | None => return,
+        Some("ok") if trees.is_empty() => {
+            println!("    retained source trees: 0 dir(s)");
+            return;
+        }
+        Some("ok") => {}
+        Some("error") => {
+            println!(
+                "    {} retained source trees not checked: {}",
+                style.muted("!"),
+                report["error"].as_str().unwrap_or("?")
+            );
+            return;
+        }
+        Some(other) => {
+            println!(
+                "    {} retained source trees not checked: {other}",
+                style.muted("!"),
+            );
+            return;
+        }
+    }
+    let total_mb = report["total_kb"].as_u64().unwrap_or(0) / 1024;
+    let unclaimed_mb = report["unclaimed_kb"].as_u64().unwrap_or(0) / 1024;
+    println!(
+        "    retained source trees ({} dir(s), {} MB total, {} MB unclaimed; preview-only — never deleted by --apply):",
+        trees.len(),
+        total_mb,
+        unclaimed_mb,
+    );
+    for tree in trees {
+        println!(
+            "      {:>8} MB  {:<18} {:<15} {:>5}h  {}",
+            tree["kb"].as_u64().unwrap_or(0) / 1024,
+            tree["verdict"].as_str().unwrap_or("?"),
+            tree["reason"].as_str().unwrap_or("?"),
+            tree["age_minutes"].as_u64().unwrap_or(0) / 60,
+            tree["path"].as_str().unwrap_or("?"),
         );
     }
 }
@@ -7060,6 +7205,23 @@ mod tests {
         );
         assert!(workers.is_empty());
         assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn gc_retained_flag_defaults_false_and_parses_opt_in() {
+        let default_cli = Cli::try_parse_from(["rch", "gc"]).unwrap();
+        assert!(matches!(
+            default_cli.command,
+            Some(Commands::Gc {
+                retained: false,
+                ..
+            })
+        ));
+        let retained_cli = Cli::try_parse_from(["rch", "gc", "--retained"]).unwrap();
+        assert!(matches!(
+            retained_cli.command,
+            Some(Commands::Gc { retained: true, .. })
+        ));
     }
 
     #[test]

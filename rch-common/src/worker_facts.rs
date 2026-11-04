@@ -123,6 +123,40 @@ pub struct DiskRootFacts {
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub available_inodes: u64,
+    /// Size of the filesystem's inode pool (statvfs `f_files`, the `df -Pi`
+    /// `Inodes` column). `Some(0)` means the filesystem reports no fixed pool:
+    /// btrfs allocates inodes dynamically and reports zero for every inode
+    /// count, and GNU `df` prints `-` (also recorded as zero) when there is no
+    /// inode information at all. `None` means the total was not measured, so
+    /// the free count is still treated as a fixed pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_inodes: Option<u64>,
+}
+
+impl DiskRootFacts {
+    /// Whether the filesystem has a fixed inode pool that can run out. Without
+    /// one, its zero free-inode count does not mean exhaustion, and free bytes
+    /// are the only capacity limit.
+    #[must_use]
+    pub fn has_inode_pool(&self) -> bool {
+        self.total_inodes != Some(0)
+    }
+
+    /// Free inodes as a capacity measurement, or `None` when the filesystem has
+    /// no fixed inode pool (see [`DiskRootFacts::has_inode_pool`]).
+    #[must_use]
+    pub fn free_inodes(&self) -> Option<u64> {
+        self.has_inode_pool().then_some(self.available_inodes)
+    }
+
+    /// Whether this root clears a free-inode floor. A filesystem without a
+    /// fixed inode pool always does; one with a pool must have at least
+    /// `floor` free inodes, so real exhaustion (an ext4 root with
+    /// `f_files > 0` and `f_ffree` below the floor) still fails.
+    #[must_use]
+    pub fn meets_inode_floor(&self, floor: u64) -> bool {
+        self.free_inodes().is_none_or(|free| free >= floor)
+    }
 }
 
 /// All exact disk roots a worker reports (temp root, build roots, cargo home).
@@ -296,6 +330,83 @@ mod tests {
     fn new_stamps_current_schema_version() {
         assert_eq!(sample().schema_version, "1.0.0");
         assert_eq!(worker_facts_schema_version(), "1.0.0");
+    }
+
+    /// A root built from synthetic statvfs values: `f_files` (pool size, if
+    /// measured) and `f_ffree` (free inodes).
+    fn statvfs_root(f_files: Option<u64>, f_ffree: u64) -> DiskRootFacts {
+        DiskRootFacts {
+            path: "/data/tmp".to_string(),
+            total_bytes: 2_000_000_000_000,
+            available_bytes: 1_600_000_000_000,
+            available_inodes: f_ffree,
+            total_inodes: f_files,
+        }
+    }
+
+    #[test]
+    fn inode_floor_ignores_filesystems_without_an_inode_pool() {
+        // btrfs: f_files == f_ffree == 0. Nothing to exhaust, whatever the floor.
+        let btrfs = statvfs_root(Some(0), 0);
+        assert!(!btrfs.has_inode_pool());
+        assert_eq!(btrfs.free_inodes(), None);
+        for floor in [0, 1, 10_000, u64::MAX] {
+            assert!(btrfs.meets_inode_floor(floor), "floor={floor}");
+        }
+        // A zero pool with a nonsensical free count is still no pool.
+        assert!(statvfs_root(Some(0), 7).meets_inode_floor(10_000));
+    }
+
+    #[test]
+    fn inode_floor_detects_exhaustion_of_a_fixed_pool() {
+        // ext4-style pools: the floor applies to the free count.
+        let cases = [
+            (6_553_600, 5_000_000, true),
+            (6_553_600, 10_000, true),
+            (6_553_600, 9_999, false),
+            (6_553_600, 12, false),
+            (6_553_600, 0, false),
+            (1, 0, false),
+        ];
+        for (f_files, f_ffree, expected) in cases {
+            let root = statvfs_root(Some(f_files), f_ffree);
+            assert!(root.has_inode_pool());
+            assert_eq!(root.free_inodes(), Some(f_ffree));
+            assert_eq!(
+                root.meets_inode_floor(10_000),
+                expected,
+                "f_files={f_files}, f_ffree={f_ffree}"
+            );
+        }
+        // A zero floor disables the check even for an exhausted pool.
+        assert!(statvfs_root(Some(6_553_600), 0).meets_inode_floor(0));
+    }
+
+    #[test]
+    fn inode_floor_without_a_measured_total_keeps_the_free_count_binding() {
+        // Facts that never measured f_files keep the historical behavior: the
+        // free count is trusted, so a reported zero is exhaustion.
+        let unmeasured = statvfs_root(None, 0);
+        assert!(unmeasured.has_inode_pool());
+        assert!(!unmeasured.meets_inode_floor(10_000));
+        assert!(statvfs_root(None, 900_000).meets_inode_floor(10_000));
+    }
+
+    #[test]
+    fn disk_root_total_inodes_is_optional_on_the_wire() {
+        let legacy = r#"{"path":"/tmp","total_bytes":1,"available_bytes":1,"available_inodes":5}"#;
+        let parsed: DiskRootFacts = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.total_inodes, None);
+        let value = serde_json::to_value(&parsed).unwrap();
+        assert!(value.get("total_inodes").is_none());
+
+        let btrfs = statvfs_root(Some(0), 0);
+        let value = serde_json::to_value(&btrfs).unwrap();
+        assert_eq!(value["total_inodes"], 0);
+        assert_eq!(
+            serde_json::from_value::<DiskRootFacts>(value).unwrap(),
+            btrfs
+        );
     }
 
     #[test]

@@ -80,11 +80,15 @@ def linux_process(path):
     }
 
 
-def process_snapshot():
+def process_snapshot(heartbeat=lambda: None):
     result = {}
     if sys.platform.startswith("linux"):
         with os.scandir("/proc") as entries:
             for entry in entries:
+                # A large, progressing census is not a wedged kernel read.
+                # Keep the guardian armed between records; any individual
+                # scandir/read stall still receives no heartbeat and is fenced.
+                heartbeat()
                 if not entry.name.isdecimal():
                     continue
                 try:
@@ -95,6 +99,7 @@ def process_snapshot():
                     if record["state"] in ("Z", "X"):
                         with os.scandir(entry.path + "/task") as tasks:
                             for task in tasks:
+                                heartbeat()
                                 try:
                                     thread = linux_process(task.path + "/stat")
                                     result[thread["pid"]] = thread
@@ -107,6 +112,7 @@ def process_snapshot():
             ["ps", "-axo", "pid=,ppid=,pgid=,stat="], timeout=1, text=True
         )
         for line in output.splitlines():
+            heartbeat()
             pid, parent, group, state = line.split()
             result[int(pid)] = {
                 "pid": int(pid), "parent": int(parent), "group": int(group),
@@ -209,9 +215,15 @@ def measure_outputs(paths):
             # disappearing managed root is separately rejected by its binding.
             if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
                 raise
-    for path in paths:
-        visit(path)
-    return total
+    try:
+        for path in paths:
+            visit(path)
+        return total
+    finally:
+        # Recursion captures this function's own cell. Break that cycle on
+        # success AND failure so every scan releases its inode table promptly,
+        # instead of accumulating entire trees until cyclic GC runs.
+        visit = None
 
 
 def private_regular(descriptor):
@@ -460,7 +472,7 @@ def finish_descendants(monitor, heartbeat):
     while True:
         heartbeat()
         monitor.check_owner()
-        snapshot = process_snapshot()
+        snapshot = process_snapshot(heartbeat)
         descendants = [record for record in snapshot.values()
                        if record["group"] == monitor.group and record["pid"] not in monitor.controls
                        and record["state"] not in ("Z", "X")]
@@ -579,11 +591,15 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                     receipts.append(usage_receipt(marker, monitor, False))
             else:
                 receipts = receipts_for_failure(marker, failure, budget, floor, started, monitor)
+            # A failing filesystem can also wedge receipt fsync. Publish the
+            # bounded, nonblocking failure diagnostic first so the guardian's
+            # subsequent kill does not erase the reason. This is never a
+            # completion acknowledgement; durable success still comes first.
+            with contextlib.suppress(OSError):
+                emit_receipts(receipts)
             if receipt_owned:
                 with contextlib.suppress(OSError):
                     persist_receipts(receipt_path, receipts)
-            with contextlib.suppress(OSError):
-                emit_receipts(receipts)
         finally:
             # A broken serializer, receipt writer, or diagnostic must never
             # bypass the only cleanup boundary for a possibly started child.
@@ -626,6 +642,16 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
         nonlocal cancelled
         cancelled = True
 
+    def stop(reason, **detail):
+        # Diagnostics must not delay the existing kill fence. This separate
+        # marker never attests disk usage or successful command completion.
+        try:
+            emit_receipts([(marker[:-len(DISK_MARKER_SUFFIX)] + "_DISK_GUARDIAN:", {
+                "reason": reason, "started": started, **detail,
+            })])
+        finally:
+            kill_owned_group(group)
+
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     last_heartbeat = time.monotonic()
@@ -646,12 +672,15 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
                 completed = completed or b"C" in os.read(read_fd, 4096)
             if os.WIFEXITED(status) and completed:
                 return os.WEXITSTATUS(status)
-            kill_owned_group(group)
+            stop("supervisor_exit_unconfirmed", wait_status=status)
         deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + 10
-        if cancelled or os.getppid() != parent or time.monotonic() - last_heartbeat > deadline:
+        age = time.monotonic() - last_heartbeat
+        if cancelled or os.getppid() != parent or age > deadline:
             # Also fences a wedged fsync/receipt or process-identity probe. A
             # missing receipt is unconfirmed execution, never safe local replay.
-            kill_owned_group(group)
+            reason = "cancelled" if cancelled else (
+                "parent_lost" if os.getppid() != parent else "heartbeat_timeout")
+            stop(reason, heartbeat_age_seconds=age)
         time.sleep(0.1)
 
 

@@ -142,10 +142,18 @@ fn tally(decisions: &[serde_json::Value]) -> std::collections::BTreeMap<String, 
     let mut counts = std::collections::BTreeMap::new();
     for decision in decisions {
         let label = match decision["decision"].as_str().unwrap_or("?") {
-            "shadow" => format!(
-                "shadow:{}",
-                decision["reason"].as_str().unwrap_or("unspecified")
-            ),
+            "shadow" => match decision["detail"].as_str() {
+                Some(detail) if decision["reason"].as_str() == Some("toolchain-refused") => {
+                    format!(
+                        "shadow:{}:{detail}",
+                        decision["reason"].as_str().unwrap_or("unspecified")
+                    )
+                }
+                _ => format!(
+                    "shadow:{}",
+                    decision["reason"].as_str().unwrap_or("unspecified")
+                ),
+            },
             other => other.to_owned(),
         };
         *counts.entry(label).or_insert(0) += 1;

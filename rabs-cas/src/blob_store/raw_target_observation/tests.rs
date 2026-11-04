@@ -13,7 +13,9 @@ fn store() -> SqlMetadataStore<RusqliteEngine> {
 }
 
 fn id(bytes: &[u8]) -> TypedDigest {
-    digest_set(bytes, DigestRequest::default(), None).unwrap().atp_content_id
+    digest_set(bytes, DigestRequest::default(), None)
+        .unwrap()
+        .atp_content_id
 }
 
 fn stage(layout: &BlobStoreLayout, bytes: &[u8]) -> PathBuf {
@@ -26,9 +28,14 @@ fn seed(layout: &BlobStoreLayout, bytes: &[u8]) -> TypedDigest {
     let key = id(bytes);
     let mut reader = bytes;
     put_if_absent(
-        layout, &mut store(), &key, &mut reader,
-        PutLimits::default(), DurabilityPolicy::FULL,
-    ).unwrap();
+        layout,
+        &mut store(),
+        &key,
+        &mut reader,
+        PutLimits::default(),
+        DurabilityPolicy::FULL,
+    )
+    .unwrap();
     key
 }
 
@@ -43,16 +50,37 @@ fn raw_observation_preserves_empty_binary_and_multibuffer_publication() {
         assert!(missing.file.is_none());
         assert!(!db.object_located(&key).unwrap());
         let incoming = stage(&layout, &bytes);
-        assert!(matches!(publish_staged_with_observation(
-            &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &missing,
-        ).unwrap(), PutOutcome::Stored { .. }));
+        assert!(matches!(
+            publish_staged_with_observation(
+                &layout,
+                &mut db,
+                &key,
+                &incoming,
+                DurabilityPolicy::FULL,
+                &missing,
+            )
+            .unwrap(),
+            PutOutcome::Stored { .. }
+        ));
         let observation = RawTargetObservation::observe(&layout, &key, u64::MAX).unwrap();
         let incoming = stage(&layout, &bytes);
-        assert!(matches!(publish_staged_with_observation(
-            &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &observation,
-        ).unwrap(), PutOutcome::IdempotentDuplicate { .. }));
+        assert!(matches!(
+            publish_staged_with_observation(
+                &layout,
+                &mut db,
+                &key,
+                &incoming,
+                DurabilityPolicy::FULL,
+                &observation,
+            )
+            .unwrap(),
+            PutOutcome::IdempotentDuplicate { .. }
+        ));
         assert!(!incoming.exists());
-        assert_eq!(fs::read(layout.published_path(&key, RAW_PROFILE_V1, &key)).unwrap(), bytes);
+        assert_eq!(
+            fs::read(layout.published_path(&key, RAW_PROFILE_V1, &key)).unwrap(),
+            bytes
+        );
         assert!(db.object_located(&key).unwrap());
     }
 }
@@ -68,15 +96,30 @@ fn create_race_refuses_without_metadata_or_stage_loss_then_reobserves() {
     let incoming = stage(&layout, bytes);
     let mut db = store();
     let error = publish_staged_with_observation(
-        &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &missing,
-    ).unwrap_err();
+        &layout,
+        &mut db,
+        &key,
+        &incoming,
+        DurabilityPolicy::FULL,
+        &missing,
+    )
+    .unwrap_err();
     assert!(RawTargetObservation::changed(&error));
     assert_eq!(fs::read(&incoming).unwrap(), bytes);
     assert!(!db.object_located(&key).unwrap());
     let current = RawTargetObservation::observe(&layout, &key, 100).unwrap();
-    assert!(matches!(publish_staged_with_observation(
-        &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &current,
-    ).unwrap(), PutOutcome::IdempotentDuplicate { .. }));
+    assert!(matches!(
+        publish_staged_with_observation(
+            &layout,
+            &mut db,
+            &key,
+            &incoming,
+            DurabilityPolicy::FULL,
+            &current,
+        )
+        .unwrap(),
+        PutOutcome::IdempotentDuplicate { .. }
+    ));
 }
 
 #[test]
@@ -92,14 +135,23 @@ fn equal_byte_replacement_cannot_reuse_an_old_descriptor_witness() {
     let incoming = stage(&layout, bytes);
     let mut db = store();
     let error = publish_staged_with_observation(
-        &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &old,
-    ).unwrap_err();
+        &layout,
+        &mut db,
+        &key,
+        &incoming,
+        DurabilityPolicy::FULL,
+        &old,
+    )
+    .unwrap_err();
     assert!(RawTargetObservation::changed(&error));
     assert!(!db.object_located(&key).unwrap());
     assert_eq!(fs::read(incoming).unwrap(), bytes);
     let current = RawTargetObservation::observe(&layout, &key, 100).unwrap();
     assert_eq!(current.digest(&target, &key).unwrap(), key);
-    assert!(old.digest(&target, &key).is_err(), "refresh cannot revive the old witness");
+    assert!(
+        old.digest(&target, &key).is_err(),
+        "refresh cannot revive the old witness"
+    );
 }
 
 #[test]
@@ -116,7 +168,8 @@ fn restored_mtime_cannot_hide_a_same_length_rewrite() {
         &target,
         filetime::FileTime::from_last_access_time(&before),
         filetime::FileTime::from_last_modification_time(&before),
-    ).unwrap();
+    )
+    .unwrap();
     let error = observation.digest(&target, &key).unwrap_err();
     assert!(RawTargetObservation::changed(&error));
 }
@@ -136,7 +189,9 @@ fn growth_truncation_permission_change_and_hardlink_change_invalidate() {
             2 => fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap(),
             _ => fs::hard_link(&target, temp.path().join("another-link")).unwrap(),
         }
-        assert!(RawTargetObservation::changed(&observation.digest(&target, &key).unwrap_err()));
+        assert!(RawTargetObservation::changed(
+            &observation.digest(&target, &key).unwrap_err()
+        ));
     }
 }
 
@@ -152,9 +207,21 @@ fn observation_cannot_cross_store_path_digest_or_digest_domain() {
     let incoming = stage(&other, bytes);
     let mut db = store();
     let error = publish_staged_with_observation(
-        &other, &mut db, &key, &incoming, DurabilityPolicy::FULL, &observation,
-    ).unwrap_err();
-    assert!(matches!(error, PutError::Io { step: "raw-target-observation-binding", .. }));
+        &other,
+        &mut db,
+        &key,
+        &incoming,
+        DurabilityPolicy::FULL,
+        &observation,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PutError::Io {
+            step: "raw-target-observation-binding",
+            ..
+        }
+    ));
     assert!(incoming.exists());
     assert!(!db.object_located(&key).unwrap());
     let target = layout.published_path(&key, RAW_PROFILE_V1, &key);
@@ -173,18 +240,34 @@ fn mismatch_uses_the_original_collision_quarantine_not_a_fast_duplicate() {
     let mut db = store();
     let mut reader = good.as_slice();
     put_if_absent(
-        &layout, &mut db, &key, &mut reader,
-        PutLimits::default(), DurabilityPolicy::FULL,
-    ).unwrap();
+        &layout,
+        &mut db,
+        &key,
+        &mut reader,
+        PutLimits::default(),
+        DurabilityPolicy::FULL,
+    )
+    .unwrap();
     let target = layout.published_path(&key, RAW_PROFILE_V1, &key);
     fs::write(&target, b"different corrupt bytes").unwrap();
     let observation = RawTargetObservation::observe(&layout, &key, 100).unwrap();
     assert_ne!(observation.digest(&target, &key).unwrap(), key);
     let incoming = stage(&layout, good);
     let error = publish_staged_with_observation(
-        &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &observation,
-    ).unwrap_err();
-    let PutError::CollisionIncident { existing_path, preserved_incoming_path, .. } = error else {
+        &layout,
+        &mut db,
+        &key,
+        &incoming,
+        DurabilityPolicy::FULL,
+        &observation,
+    )
+    .unwrap_err();
+    let PutError::CollisionIncident {
+        existing_path,
+        preserved_incoming_path,
+        ..
+    } = error
+    else {
         panic!("collision must not become a duplicate: {error:?}");
     };
     assert_eq!(fs::read(existing_path).unwrap(), b"different corrupt bytes");
@@ -197,8 +280,10 @@ fn oversized_and_special_targets_are_never_treated_as_absent() {
     let temp = tempfile::tempdir().unwrap();
     let layout = BlobStoreLayout::open(temp.path()).unwrap();
     let key = seed(&layout, b"12345678");
-    assert!(matches!(RawTargetObservation::observe(&layout, &key, 7),
-        Err(PutError::LogicalLimitExceeded { limit: 7 })));
+    assert!(matches!(
+        RawTargetObservation::observe(&layout, &key, 7),
+        Err(PutError::LogicalLimitExceeded { limit: 7 })
+    ));
     let target = layout.published_path(&key, RAW_PROFILE_V1, &key);
     let original = temp.path().join("held-original");
     fs::rename(&target, &original).unwrap();
@@ -216,18 +301,43 @@ fn observed_descriptor_cursor_is_not_used_for_duplicate_replay() {
     let bytes = b"cursor remains private";
     let key = seed(&layout, bytes);
     let mut observation = RawTargetObservation::observe(&layout, &key, 100).unwrap();
-    observation.file.as_mut().unwrap().file.seek(SeekFrom::Start(3)).unwrap();
+    observation
+        .file
+        .as_mut()
+        .unwrap()
+        .file
+        .seek(SeekFrom::Start(3))
+        .unwrap();
     let incoming = stage(&layout, bytes);
     publish_staged_with_observation(
-        &layout, &mut store(), &key, &incoming, DurabilityPolicy::FULL, &observation,
-    ).unwrap();
-    assert_eq!(observation.file.as_mut().unwrap().file.stream_position().unwrap(), 3);
+        &layout,
+        &mut store(),
+        &key,
+        &incoming,
+        DurabilityPolicy::FULL,
+        &observation,
+    )
+    .unwrap();
+    assert_eq!(
+        observation
+            .file
+            .as_mut()
+            .unwrap()
+            .file
+            .stream_position()
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
 fn prepared_new_put_retains_every_existing_publish_fault_boundary() {
-    for fault in [FaultPoint::StagingSynced, FaultPoint::Linked,
-        FaultPoint::DirectorySynced, FaultPoint::MetadataRecorded] {
+    for fault in [
+        FaultPoint::StagingSynced,
+        FaultPoint::Linked,
+        FaultPoint::DirectorySynced,
+        FaultPoint::MetadataRecorded,
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let layout = BlobStoreLayout::open(temp.path()).unwrap();
         let bytes = b"crash boundary object";
@@ -236,16 +346,32 @@ fn prepared_new_put_retains_every_existing_publish_fault_boundary() {
         let incoming = stage(&layout, bytes);
         let mut db = store();
         let result = publish_staged_observed_inner(
-            &layout, &mut db, &key, &incoming, bytes.len() as u64,
-            DurabilityPolicy::FULL, Some(fault), RAW_PROFILE_V1, &key, Some(&observation),
+            &layout,
+            &mut db,
+            &key,
+            &incoming,
+            bytes.len() as u64,
+            DurabilityPolicy::FULL,
+            Some(fault),
+            RAW_PROFILE_V1,
+            &key,
+            Some(&observation),
         );
         assert_eq!(result, Err(PutError::CrashInjected(fault)));
         let target = layout.published_path(&key, RAW_PROFILE_V1, &key);
-        if target.exists() { assert_eq!(fs::read(&target).unwrap(), bytes); }
+        if target.exists() {
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+        }
         let retry = RawTargetObservation::observe(&layout, &key, 100).unwrap();
         publish_staged_with_observation(
-            &layout, &mut db, &key, &incoming, DurabilityPolicy::FULL, &retry,
-        ).unwrap();
+            &layout,
+            &mut db,
+            &key,
+            &incoming,
+            DurabilityPolicy::FULL,
+            &retry,
+        )
+        .unwrap();
         assert_eq!(fs::read(target).unwrap(), bytes);
         assert!(db.object_located(&key).unwrap());
         assert!(!incoming.exists());

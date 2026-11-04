@@ -388,3 +388,43 @@ fn t010_concurrent_gc_snapshot_during_active_pin_mutation_never_observes_torn_vi
     assert_eq!(final_snap.pinned_roots.len(), 1);
     assert!(final_snap.pinned_roots.contains(&anchor_key));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn t010_rss_memory_slope_across_sampled_lifecycle_epochs_is_bounded() {
+    fn rss_pages() -> u64 {
+        let statm = std::fs::read_to_string("/proc/self/statm").expect("/proc/self/statm");
+        statm
+            .split_whitespace()
+            .nth(1)
+            .expect("resident pages field")
+            .parse::<u64>()
+            .expect("parse resident pages")
+    }
+
+    let mut store = fresh();
+    // Warm up SQLite page cache and allocator arenas over 500 lifecycles.
+    for cycle in 0..500 {
+        lifecycle(&mut store, cycle);
+    }
+    let rss_after_warmup = rss_pages();
+
+    // Run 3 subsequent epochs of 500 lifecycles each and sample RSS at each boundary.
+    let mut epoch_rss = [0_u64; 3];
+    for (idx, epoch) in (1_u128..=3).enumerate() {
+        let start = epoch * 500;
+        for cycle in start..(start + 500) {
+            lifecycle(&mut store, cycle);
+        }
+        epoch_rss[idx] = rss_pages();
+    }
+
+    // Second-half slope (epoch 1 -> epoch 3, across 1,000 lifecycles) must stay bounded
+    // (< 512 pages = 2 MiB across 1,000 lifecycles), ruling out unbounded linear RSS leaks.
+    let late_growth_pages = epoch_rss[2].saturating_sub(epoch_rss[0]);
+    let total_growth_pages = epoch_rss[2].saturating_sub(rss_after_warmup);
+    assert!(
+        late_growth_pages <= 512 && total_growth_pages <= 1024,
+        "RSS slope exceeded bound across 1,500 post-warmup lifecycles (warmup={rss_after_warmup}, epochs={epoch_rss:?})"
+    );
+}

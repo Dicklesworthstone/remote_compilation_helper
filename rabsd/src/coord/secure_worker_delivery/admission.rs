@@ -105,14 +105,19 @@ impl PinnedWorkerAdmission {
     /// # Errors
     /// Invalid/exhausted allocation history or unavailable durable storage.
     pub fn allocate_request_id(&self) -> io::Result<u64> {
-        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let floor = u64::try_from(elapsed.as_nanos())
             .map_err(|_| invalid("worker request clock seed exceeds u64"))?;
         self.allocate_request_id_at(floor)
     }
 
     fn allocate_request_id_at(&self, floor: u64) -> io::Result<u64> {
-        let mut store = self.cas.store().lock()
+        let mut store = self
+            .cas
+            .store()
+            .lock()
             .map_err(|_| invalid("worker request allocation lock poisoned"))?;
         require_request_durability(&mut *store)?;
         let rows = store.query(
@@ -122,38 +127,52 @@ impl PinnedWorkerAdmission {
         let (sequence, previous) = match rows.as_slice() {
             [] => (0, 0),
             [row] => {
-                let [SqlValue::Int(sequence), SqlValue::Text(value), SqlValue::Text(reason)] = row.as_slice() else {
+                let [
+                    SqlValue::Int(sequence),
+                    SqlValue::Text(value),
+                    SqlValue::Text(reason),
+                ] = row.as_slice()
+                else {
                     return Err(invalid("invalid worker request allocation receipt"));
                 };
                 require(
                     *sequence >= 0
                         && value.len() == 16
-                        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                         && reason == REQUEST_ALLOCATION_REASON,
                     "invalid worker request allocation receipt",
                 )?;
                 let previous = u64::from_str_radix(value, 16)
                     .map_err(|_| invalid("invalid worker request allocation value"))?;
                 require(previous > 0, "zero worker request allocation")?;
-                let sequence = sequence.checked_add(1)
+                let sequence = sequence
+                    .checked_add(1)
                     .ok_or_else(|| invalid("worker request allocation sequence exhausted"))?;
-                (u64::try_from(sequence)
-                    .map_err(|_| invalid("invalid worker request allocation sequence"))?, previous)
+                (
+                    u64::try_from(sequence)
+                        .map_err(|_| invalid("invalid worker request allocation sequence"))?,
+                    previous,
+                )
             }
             _ => return Err(invalid("ambiguous worker request allocation history")),
         };
-        let observed = request_high_water(&mut *store, &self.worker)?
-            .map_or(0, |(_, value)| value);
-        let next = previous.max(observed).checked_add(1)
+        let observed = request_high_water(&mut *store, &self.worker)?.map_or(0, |(_, value)| value);
+        let next = previous
+            .max(observed)
+            .checked_add(1)
             .ok_or_else(|| invalid("worker request ID exhausted"))?
             .max(floor);
-        store.record_decision_receipt(
-            REQUEST_ALLOCATION,
-            &self.worker,
-            sequence,
-            &format!("{next:016x}"),
-            REQUEST_ALLOCATION_REASON,
-        ).map_err(|error| invalid(format!("persist worker request allocation: {error:?}")))?;
+        store
+            .record_decision_receipt(
+                REQUEST_ALLOCATION,
+                &self.worker,
+                sequence,
+                &format!("{next:016x}"),
+                REQUEST_ALLOCATION_REASON,
+            )
+            .map_err(|error| invalid(format!("persist worker request allocation: {error:?}")))?;
         // Hold the metadata guard and exclusive mount ownership through fsync.
         // Burn an ID on any later error; never hand out an unsynced reservation.
         self.sync_request_history()?;
@@ -192,7 +211,9 @@ impl PinnedWorkerAdmission {
                     &format!("{value:016x}"),
                     REQUEST_OBSERVATION_REASON,
                 )
-                .map_err(|error| invalid(format!("persist worker request high-water: {error:?}")))?;
+                .map_err(|error| {
+                    invalid(format!("persist worker request high-water: {error:?}"))
+                })?;
         }
         // Also sync a repeated observation: a previous attempt may have written
         // the receipt but failed its final fsync. Never repair by lowering it.
@@ -379,13 +400,20 @@ fn request_high_water(
     match rows.as_slice() {
         [] => Ok(None),
         [row] => {
-            let [SqlValue::Int(sequence), SqlValue::Text(value), SqlValue::Text(reason)] = row.as_slice() else {
+            let [
+                SqlValue::Int(sequence),
+                SqlValue::Text(value),
+                SqlValue::Text(reason),
+            ] = row.as_slice()
+            else {
                 return Err(invalid("invalid worker request high-water receipt"));
             };
             require(
                 *sequence >= 0
                     && value.len() == 16
-                    && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     && reason == REQUEST_OBSERVATION_REASON,
                 "invalid worker request high-water receipt",
             )?;
@@ -456,30 +484,63 @@ mod tests {
             "SELECT seq, decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
             &[SqlValue::Text(REQUEST_ALLOCATION.to_owned()), SqlValue::Text("worker".into())],
         ).unwrap();
-        assert_eq!(rows, vec![
-            vec![SqlValue::Int(0), SqlValue::Text("00000000000001f4".into())],
-            vec![SqlValue::Int(1), SqlValue::Text("00000000000001f5".into())],
-            vec![SqlValue::Int(2), SqlValue::Text("0000000000000384".into())],
-            vec![SqlValue::Int(3), SqlValue::Text("0000000000000385".into())],
-        ]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqlValue::Int(0), SqlValue::Text("00000000000001f4".into())],
+                vec![SqlValue::Int(1), SqlValue::Text("00000000000001f5".into())],
+                vec![SqlValue::Int(2), SqlValue::Text("0000000000000384".into())],
+                vec![SqlValue::Int(3), SqlValue::Text("0000000000000385".into())],
+            ]
+        );
     }
 
     #[test]
     fn request_allocator_exhaustion_cannot_wrap_or_reset_on_reopen() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        assert_eq!(admission.allocate_request_id_at(u64::MAX).unwrap(), u64::MAX);
-        assert!(admission.allocate_request_id_at(0).unwrap_err().to_string().contains("ID exhausted"));
+        assert_eq!(
+            admission.allocate_request_id_at(u64::MAX).unwrap(),
+            u64::MAX
+        );
+        assert!(
+            admission
+                .allocate_request_id_at(0)
+                .unwrap_err()
+                .to_string()
+                .contains("ID exhausted")
+        );
         drop(admission);
         let reopened = open(root.path(), "worker", [1; 32]).unwrap();
-        assert!(reopened.allocate_request_id_at(0).unwrap_err().to_string().contains("ID exhausted"));
+        assert!(
+            reopened
+                .allocate_request_id_at(0)
+                .unwrap_err()
+                .to_string()
+                .contains("ID exhausted")
+        );
 
         let other = open(root.path(), "sequence-exhausted", [2; 32]).unwrap();
-        other.cas.store().lock().unwrap().record_decision_receipt(
-            REQUEST_ALLOCATION, "sequence-exhausted", i64::MAX as u64,
-            "0000000000000001", REQUEST_ALLOCATION_REASON,
-        ).unwrap();
-        assert!(other.allocate_request_id_at(0).unwrap_err().to_string().contains("sequence exhausted"));
+        other
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .record_decision_receipt(
+                REQUEST_ALLOCATION,
+                "sequence-exhausted",
+                i64::MAX as u64,
+                "0000000000000001",
+                REQUEST_ALLOCATION_REASON,
+            )
+            .unwrap();
+        assert!(
+            other
+                .allocate_request_id_at(0)
+                .unwrap_err()
+                .to_string()
+                .contains("sequence exhausted")
+        );
     }
 
     #[test]
@@ -494,13 +555,23 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let admission = open(root.path(), "worker", [1; 32]).unwrap();
-            admission.cas.store().lock().unwrap().record_decision_receipt(
-                REQUEST_ALLOCATION, "worker", 0, value, reason,
-            ).unwrap();
-            assert!(admission.allocate_request_id_at(10_000).is_err(), "{value:?}");
+            admission
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .record_decision_receipt(REQUEST_ALLOCATION, "worker", 0, value, reason)
+                .unwrap();
+            assert!(
+                admission.allocate_request_id_at(10_000).is_err(),
+                "{value:?}"
+            );
             drop(admission);
             let reopened = open(root.path(), "worker", [1; 32]).unwrap();
-            assert!(reopened.allocate_request_id_at(20_000).is_err(), "{value:?}");
+            assert!(
+                reopened.allocate_request_id_at(20_000).is_err(),
+                "{value:?}"
+            );
         }
     }
 
@@ -634,7 +705,11 @@ mod tests {
     }
 
     fn observed(admission: &PinnedWorkerAdmission) -> Option<(u64, u64)> {
-        request_high_water(&mut *admission.cas.store().lock().unwrap(), &admission.worker).unwrap()
+        request_high_water(
+            &mut *admission.cas.store().lock().unwrap(),
+            &admission.worker,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -662,14 +737,21 @@ mod tests {
         let reopened = open(root.path(), "worker", [1; 32]).unwrap();
         assert_eq!(reopened.allocate_request_id_at(1).unwrap(), remote + 1);
         assert_eq!(reopened.allocate_request_id_at(0).unwrap(), remote + 2);
-        assert_eq!(saved["request_id"], 100, "saved work keeps its original identity");
+        assert_eq!(
+            saved["request_id"], 100,
+            "saved work keeps its original identity"
+        );
     }
 
     #[test]
     fn duplicate_lower_and_absent_observations_neither_lower_the_floor_nor_append_receipts() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, 500)).unwrap());
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, 500))
+                .unwrap(),
+        );
         for value in [json!(500), json!(3), json!(0), Value::Null] {
             let mut offered = hello(5, 1);
             offered["request_high_water"] = value;
@@ -679,7 +761,11 @@ mod tests {
         drop(admission.admit(&identity(), &hello(5, 1)).unwrap());
         assert_eq!(observed(&admission), Some((0, 500)));
         assert_eq!(admission.allocate_request_id_at(1000).unwrap(), 1000);
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, 700)).unwrap());
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, 700))
+                .unwrap(),
+        );
         assert_eq!(observed(&admission), Some((1, 700)));
         assert_eq!(admission.allocate_request_id_at(0).unwrap(), 1001);
     }
@@ -688,38 +774,81 @@ mod tests {
     fn request_floor_is_not_learned_from_wrong_identity_name_stale_boot_or_clone() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, 100)).unwrap());
-        let wrong = TransportIdentity { peer_id: [2; 32], fingerprint: [2; 32] };
-        assert!(admission.admit(&wrong, &hello_with_request(6, 2, 900)).is_err());
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, 100))
+                .unwrap(),
+        );
+        let wrong = TransportIdentity {
+            peer_id: [2; 32],
+            fingerprint: [2; 32],
+        };
+        assert!(
+            admission
+                .admit(&wrong, &hello_with_request(6, 2, 900))
+                .is_err()
+        );
         let mut named = hello_with_request(6, 2, 900);
         named["worker_id"] = json!("another-worker");
         assert!(admission.admit(&identity(), &named).is_err());
-        assert!(admission.admit(&identity(), &hello_with_request(4, 3, 900)).is_err());
+        assert!(
+            admission
+                .admit(&identity(), &hello_with_request(4, 3, 900))
+                .is_err()
+        );
         let mut reset = hello_with_request(6, 2, 900);
         reset["reenrollment_proof"] = json!(123);
         assert!(admission.admit(&identity(), &reset).is_err());
         assert_eq!(observed(&admission), Some((0, 100)));
 
-        let live = admission.admit(&identity(), &hello_with_request(5, 1, 100)).unwrap();
-        assert!(admission.admit(&identity(), &hello_with_request(5, 2, 900)).is_err());
+        let live = admission
+            .admit(&identity(), &hello_with_request(5, 1, 100))
+            .unwrap();
+        assert!(
+            admission
+                .admit(&identity(), &hello_with_request(5, 2, 900))
+                .is_err()
+        );
         assert_eq!(observed(&admission), Some((0, 100)));
         drop(live);
-        assert!(admission.admit(&identity(), &hello_with_request(6, 3, 900)).is_err());
+        assert!(
+            admission
+                .admit(&identity(), &hello_with_request(6, 3, 900))
+                .is_err()
+        );
         assert_eq!(observed(&admission), Some((0, 100)));
     }
 
     #[test]
     fn malformed_request_high_water_cannot_enroll_or_advance_a_worker() {
-        for value in [json!(-1), json!(1.5), json!(true), json!("100"), json!([]), json!({})] {
+        for value in [
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("100"),
+            json!([]),
+            json!({}),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let admission = open(root.path(), "worker", [1; 32]).unwrap();
             let mut offered = hello(50, 1);
             offered["request_high_water"] = value.clone();
             assert!(admission.admit(&identity(), &offered).is_err(), "{value}");
             assert_eq!(observed(&admission), None);
-            assert!(!check_pin(&mut *admission.cas.store().lock().unwrap(), "worker", [1; 32]).unwrap());
+            assert!(
+                !check_pin(
+                    &mut *admission.cas.store().lock().unwrap(),
+                    "worker",
+                    [1; 32]
+                )
+                .unwrap()
+            );
             // The rejected claim did not raise the boot fence either.
-            drop(admission.admit(&identity(), &hello_with_request(1, 2, 10)).unwrap());
+            drop(
+                admission
+                    .admit(&identity(), &hello_with_request(1, 2, 10))
+                    .unwrap(),
+            );
             assert_eq!(admission.allocate_request_id_at(0).unwrap(), 11);
         }
     }
@@ -728,14 +857,38 @@ mod tests {
     fn exhausted_observed_request_space_never_wraps_and_does_not_block_authentication() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, u64::MAX)).unwrap());
-        assert!(admission.allocate_request_id_at(0).unwrap_err().to_string().contains("ID exhausted"));
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, u64::MAX))
+                .unwrap(),
+        );
+        assert!(
+            admission
+                .allocate_request_id_at(0)
+                .unwrap_err()
+                .to_string()
+                .contains("ID exhausted")
+        );
         // Result recovery must still be able to authenticate the last identity.
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, u64::MAX)).unwrap());
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, u64::MAX))
+                .unwrap(),
+        );
         drop(admission);
         let reopened = open(root.path(), "worker", [1; 32]).unwrap();
-        assert!(reopened.allocate_request_id_at(1).unwrap_err().to_string().contains("ID exhausted"));
-        drop(reopened.admit(&identity(), &hello_with_request(6, 2, 1)).unwrap());
+        assert!(
+            reopened
+                .allocate_request_id_at(1)
+                .unwrap_err()
+                .to_string()
+                .contains("ID exhausted")
+        );
+        drop(
+            reopened
+                .admit(&identity(), &hello_with_request(6, 2, 1))
+                .unwrap(),
+        );
         assert_eq!(observed(&reopened), Some((0, u64::MAX)));
     }
 
@@ -750,15 +903,31 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let admission = open(root.path(), "worker", [1; 32]).unwrap();
-            admission.cas.store().lock().unwrap().record_decision_receipt(
-                REQUEST_OBSERVATION, "worker", 0, value, reason,
-            ).unwrap();
+            admission
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .record_decision_receipt(REQUEST_OBSERVATION, "worker", 0, value, reason)
+                .unwrap();
             assert!(admission.allocate_request_id_at(1000).is_err(), "{value:?}");
-            assert!(admission.admit(&identity(), &hello_with_request(5, 1, 10)).is_err());
-            let fence = admission.cas.store().lock().unwrap()
+            assert!(
+                admission
+                    .admit(&identity(), &hello_with_request(5, 1, 10))
+                    .is_err()
+            );
+            let fence = admission
+                .cas
+                .store()
+                .lock()
+                .unwrap()
                 .worker_incarnation_fence(&PeerId(hex(&[1; 32])))
-                .unwrap().unwrap();
-            assert!(fence.active_incarnation.is_none(), "failed observation stranded a session");
+                .unwrap()
+                .unwrap();
+            assert!(
+                fence.active_incarnation.is_none(),
+                "failed observation stranded a session"
+            );
             drop(admission);
             let reopened = open(root.path(), "worker", [1; 32]).unwrap();
             assert!(reopened.allocate_request_id_at(2000).is_err());
@@ -769,16 +938,25 @@ mod tests {
     fn observed_floor_is_worker_scoped_and_new_allocations_remain_serialized() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, 500)).unwrap());
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, 500))
+                .unwrap(),
+        );
         let other = open(root.path(), "other-worker", [2; 32]).unwrap();
         assert_eq!(other.allocate_request_id_at(1).unwrap(), 1);
         assert_eq!(observed(&other), None);
         let mut ids = std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..8).map(|_| {
-                let admission = Arc::clone(&admission);
-                scope.spawn(move || admission.allocate_request_id_at(0).unwrap())
-            }).collect();
-            threads.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let admission = Arc::clone(&admission);
+                    scope.spawn(move || admission.allocate_request_id_at(0).unwrap())
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
         });
         ids.sort_unstable();
         assert_eq!(ids, (501..509).collect::<Vec<u64>>());
@@ -789,13 +967,29 @@ mod tests {
     fn exhausted_observation_sequence_allows_repeated_evidence_but_never_resets() {
         let root = tempfile::tempdir().unwrap();
         let admission = open(root.path(), "worker", [1; 32]).unwrap();
-        admission.cas.store().lock().unwrap().record_decision_receipt(
-            REQUEST_OBSERVATION, "worker", i64::MAX as u64,
-            "0000000000000064", REQUEST_OBSERVATION_REASON,
-        ).unwrap();
-        drop(admission.admit(&identity(), &hello_with_request(5, 1, 100)).unwrap());
+        admission
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .record_decision_receipt(
+                REQUEST_OBSERVATION,
+                "worker",
+                i64::MAX as u64,
+                "0000000000000064",
+                REQUEST_OBSERVATION_REASON,
+            )
+            .unwrap();
+        drop(
+            admission
+                .admit(&identity(), &hello_with_request(5, 1, 100))
+                .unwrap(),
+        );
         assert_eq!(admission.allocate_request_id_at(0).unwrap(), 101);
-        let error = admission.admit(&identity(), &hello_with_request(5, 1, 102)).err().unwrap();
+        let error = admission
+            .admit(&identity(), &hello_with_request(5, 1, 102))
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("sequence exhausted"));
         assert_eq!(observed(&admission), Some((i64::MAX as u64, 100)));
     }

@@ -149,9 +149,11 @@ impl SimulatedDiskStats {
         self.available_bytes == 0
     }
 
+    /// Only a fixed inode pool can run out. A filesystem that allocates
+    /// inodes dynamically (btrfs) reports zero total and zero free.
     #[must_use]
     pub fn is_inodes_exhausted(&self) -> bool {
-        self.available_inodes == 0
+        self.total_inodes > 0 && self.available_inodes == 0
     }
 }
 
@@ -472,6 +474,13 @@ mod tests {
         assert!(s.is_inodes_exhausted() && !s.is_bytes_exhausted());
 
         assert!(!SimulatedDiskStats::healthy().is_bytes_exhausted());
+
+        let dynamic_pool = SimulatedDiskStats {
+            total_inodes: 0,
+            available_inodes: 0,
+            ..SimulatedDiskStats::healthy()
+        };
+        assert!(!dynamic_pool.is_inodes_exhausted());
     }
 
     #[test]

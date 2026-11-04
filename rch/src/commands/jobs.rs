@@ -148,6 +148,56 @@ fn validate_admitted_cancellation(
     lease: &DurableJobLease,
     reply: &Value,
 ) -> Result<AdmittedCancellation> {
+    validate_admitted_cancellation_receipt(lease, reply)
+        .map_err(|error| cancellation_unconfirmed_error(lease, error))
+}
+
+fn cancellation_unconfirmed_error(
+    lease: &DurableJobLease,
+    error: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    // A failed response leaves this exact job's custody unresolved. Include
+    // recovery in details too: plaintext output does not render remediation.
+    let error = error.into();
+    let recovery = format!(
+        "After the original wrapper stops, run `rch jobs recover {}` to reconcile the same job without replay",
+        lease.identity.local_wrapper_id
+    );
+    let mut api = rch_common::ApiError::from_code(rch_common::ErrorCode::CancelCleanupFailed)
+        .with_details(format!("{error:#}\n{recovery}"));
+    api.message = "Cancellation outcome is unconfirmed".to_string();
+    api.remediation = vec![
+        format!(
+            "Observe the original job with `rch jobs attach {}`; its outcome is still uncertain",
+            lease.identity.local_wrapper_id
+        ),
+        recovery,
+        "Keep its journal and reservations until terminal acknowledgement".to_string(),
+    ];
+    anyhow::Error::new(api)
+}
+
+fn parse_cancellation_response(lease: &DurableJobLease, response: &str) -> Result<Value> {
+    let parsed = (|| {
+        let (header, body) = response
+            .split_once("\r\n\r\n")
+            .or_else(|| response.split_once("\n\n"))
+            .with_context(|| format!("missing cancellation response body: {response:?}"))?;
+        let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+        anyhow::ensure!(
+            matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+            "daemon refused cancellation; response: {response:?}"
+        );
+        serde_json::from_str(body)
+            .with_context(|| format!("invalid cancellation response JSON: {response:?}"))
+    })();
+    parsed.map_err(|error| cancellation_unconfirmed_error(lease, error))
+}
+
+fn validate_admitted_cancellation_receipt(
+    lease: &DurableJobLease,
+    reply: &Value,
+) -> Result<AdmittedCancellation> {
     if reply["status"] == "completed" {
         return validate_completion(lease, reply).map(AdmittedCancellation::AlreadyCompleted);
     }
@@ -347,10 +397,12 @@ fn job_journal_error(path: &std::path::Path, error: String) -> Value {
 
 #[cfg(unix)]
 fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
+    use rch_common::job_identity::journal::{read_retained_snapshot_at, retained_snapshot_kind};
     use rustix::fs::{Dir, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
 
     let mut jobs = Vec::new();
+    let mut retained_evidence = Vec::new();
     let mut journal_errors = Vec::new();
     let descriptor = match rustix::fs::open(
         directory,
@@ -375,6 +427,30 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
             };
             let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
             let path = directory.join(name);
+            if retained_snapshot_kind(entry.file_name()).is_some() {
+                let observed = (|| read_retained_snapshot_at(entries.fd()?, entry.file_name()))();
+                match observed {
+                    Ok(snapshot) => {
+                        // A predecessor is inspection evidence, never the
+                        // wrapper's current attempt or replay authority. Its
+                        // old state/PID must not become a live job observation.
+                        let mut report = json!({
+                            "path": path.to_string_lossy(),
+                            "kind": snapshot.kind.as_str(),
+                            "digest": snapshot.digest,
+                            "lease": snapshot.lease,
+                        });
+                        if path.to_str().is_none() {
+                            report["path_bytes"] = json!(path.as_os_str().as_bytes());
+                        }
+                        retained_evidence.push(report);
+                    }
+                    Err(error) => {
+                        journal_errors.push(job_journal_error(&path, format!("{error:#}")));
+                    }
+                }
+                continue;
+            }
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
@@ -403,6 +479,7 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
     }
     Ok(json!({
         "jobs": jobs,
+        "retained_evidence": retained_evidence,
         "complete": journal_errors.is_empty(),
         "journal_errors": journal_errors,
     }))
@@ -482,6 +559,23 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
+            if recover && lease.recovery.is_some() {
+                // A local terminal acknowledgement does not prove that the
+                // worker published the matching cancellation settlement.
+                // Re-enter identity-bound recovery under its journal gate;
+                // ordinary completed deliveries remain local and read-only.
+                let (code, recovered_writer) = within_job_deadline(
+                    deadline,
+                    "terminal source cancellation reconciliation (retry the same journal)",
+                    crate::hook::recover_job(&writer),
+                )
+                .await?;
+                emit(
+                    ctx,
+                    &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
+                )?;
+                return Ok(());
+            }
             // The daemon refused before admission: no remote command ran, so
             // there is no remote exit to report or recover.
             let report = if lease.state
@@ -500,6 +594,40 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(ctx, &report)?;
             return Ok(());
         }
+        if !cancel
+            && recover
+            && lease.identity.remote_build_id.is_none()
+            && lease.worker_id.is_none()
+            && lease.recovery.is_none()
+            && owner_presence(&lease) == OwnerPresence::Absent
+        {
+            anyhow::ensure!(
+                crate::hook::daemon_absence_is_conclusive(&lease, crate::hook::unix_ms_now()),
+                "original wrapper is absent before daemon admission; acknowledgement waits until the lease is 24h old"
+            );
+            let latest_writer = within_job_deadline(
+                deadline,
+                "terminal journal ownership",
+                writer.claim_recovery(),
+            )
+            .await?;
+            if !settle_absent_pre_admission(&lease, &latest_writer, crate::hook::unix_ms_now())? {
+                wait_for_job_poll(deadline).await?;
+                continue;
+            }
+            let settled = latest_writer.snapshot();
+            emit(
+                ctx,
+                &json!({
+                    "status": "failed_before_admission",
+                    "identity": settled.identity,
+                    "exit_code": null,
+                    "terminal_acknowledged": true,
+                    "admission": null,
+                }),
+            )?;
+            return Ok(());
+        }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {
             wait_for_job_poll(deadline).await?;
             continue;
@@ -507,25 +635,25 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         if cancel && lease.identity.remote_build_id.is_none() {
             // Admission may win after this snapshot. The daemon serializes the
             // decision with registration and cancels that exact active build.
-            let response = within_job_deadline(
-                deadline,
-                "queued cancellation",
-                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n")),
-            )
+            let response = within_job_deadline(deadline, "queued cancellation", async {
+                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n"))
+                    .await
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))
+            })
             .await?;
-            let body = response
-                .split_once("\r\n\r\n")
-                .or_else(|| response.split_once("\n\n"))
-                .map(|(_, body)| body)
-                .context("missing queued cancellation response")?;
-            let mut reply: Value = serde_json::from_str(body)?;
-            validate_queued_cancellation(&wrapper_id, &reply)?;
+            let mut reply = parse_cancellation_response(&lease, &response)?;
+            validate_queued_cancellation(&wrapper_id, &reply)
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             if reply["status"] == "cancelled_before_start" {
                 // Daemon cancellation already succeeded. A live wrapper owns
                 // its journal and acknowledges the selection response itself.
                 // Report deferred acknowledgment without overwriting that
                 // owner or misreporting its cancellation as a daemon failure.
-                reply["journal_acknowledged"] = json!(writer.confirm_selection_cancelled()?);
+                reply["journal_acknowledged"] = json!(
+                    writer
+                        .confirm_selection_cancelled()
+                        .map_err(|error| cancellation_unconfirmed_error(&lease, error))?
+                );
             } else if reply["status"] == "cancelled" {
                 let mut identity = lease.identity.clone();
                 identity.admit(
@@ -534,42 +662,53 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                         .context("missing cancelled build id")?,
                 );
                 let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
-                crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)?;
+                crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             }
             emit(ctx, &reply)?;
             return Ok(());
         }
-        let status = within_job_deadline(deadline, "job status", query(&lease)).await?;
+        let status = within_job_deadline(deadline, "job status", async {
+            query(&lease).await.map_err(|error| {
+                if cancel {
+                    cancellation_unconfirmed_error(&lease, error)
+                } else {
+                    error
+                }
+            })
+        })
+        .await?;
         if cancel {
             if status["status"] == "completed" {
-                let code = validate_completion(&lease, &status)?;
+                let code = validate_completion(&lease, &status)
+                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
                 emit(ctx, &completed_cancellation_report(&lease, code))?;
                 return Ok(());
             }
             let id = lease
                 .identity
                 .remote_build_id
-                .context("job has no admitted build")?;
-            anyhow::ensure!(
-                status["status"] == "active",
-                "daemon has no identity evidence for cancellation (status: {}); no process was signalled",
-                status["status"]
-            );
-            let response = within_job_deadline(
-                deadline,
-                "admitted cancellation",
+                .context("job has no admitted build")
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
+            if status["status"] != "active" {
+                return Err(cancellation_unconfirmed_error(
+                    &lease,
+                    anyhow::anyhow!(
+                        "daemon has no identity evidence for cancellation (status: {}); no process was signalled",
+                        status["status"]
+                    ),
+                ));
+            }
+            let response = within_job_deadline(deadline, "admitted cancellation", async {
                 super::send_daemon_command(&format!(
                     "POST /builds/{id}/cancel?local_wrapper_id={}\n",
                     wrapper_id
-                )),
-            )
+                ))
+                .await
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))
+            })
             .await?;
-            let body = response
-                .split_once("\r\n\r\n")
-                .or_else(|| response.split_once("\n\n"))
-                .map(|(_, b)| b)
-                .context("missing cancellation response")?;
-            let reply: Value = serde_json::from_str(body)?;
+            let reply = parse_cancellation_response(&lease, &response)?;
             if let AdmittedCancellation::AlreadyCompleted(code) =
                 validate_admitted_cancellation(&lease, &reply)?
             {
@@ -579,7 +718,8 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             // The original wrapper consumes this exact-identity receipt itself.
             // Never signal a PID obtained from a persisted lease.
             let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
-            crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&lease.identity)?)?;
+            crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&lease.identity)?)
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))?;
             emit(
                 ctx,
                 &json!({"status":"cancelled", "identity":lease.identity, "wrapper_stop_requested":true}),
@@ -727,6 +867,24 @@ fn settle_absent_not_found_without_recovery(
     Ok(Some(code))
 }
 
+#[cfg(unix)]
+fn settle_absent_pre_admission(
+    observed: &DurableJobLease,
+    writer: &crate::hook::DurableLeaseWriter,
+    now_unix_ms: u64,
+) -> Result<bool> {
+    let latest = writer.snapshot();
+    if !same_unfinished_owner_without_recovery(observed, &latest) {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        latest.identity.remote_build_id.is_none() && latest.worker_id.is_none(),
+        "pre-admission recovery cannot retire an admitted lease"
+    );
+    writer.settle_abandoned_pre_admission(now_unix_ms)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +977,239 @@ mod tests {
         assert_eq!(std::fs::read(valid).unwrap(), valid_bytes);
         assert_eq!(std::fs::read(corrupt).unwrap(), corrupt_bytes);
         assert_eq!(std::fs::read(pending).unwrap(), b"pending evidence");
+    }
+
+    #[cfg(unix)]
+    fn write_private_job_evidence(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn retained_job_evidence_name(lease: &DurableJobLease, bytes: &[u8]) -> String {
+        format!(
+            "{}.recovery-{}.before",
+            lease.identity.local_wrapper_id,
+            blake3::hash(bytes).to_hex()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_discovers_retained_attempts_without_promoting_them_to_current_jobs() {
+        for current_present in [true, false] {
+            let retained = tempfile::tempdir().unwrap().keep();
+            let mut previous = queued_lease();
+            previous.admit(41, "previous-worker".into(), 1);
+            previous.exit_code = Some(137);
+            previous.recovery = Some(json!({
+                "retired": true,
+                "returned": 137,
+                "identity": "previous-retrieval-stage",
+                "retained_root": "/retained/previous-attempt",
+                "phases": [{"complete": false, "pending": ["report", "retained-hash"]}],
+            }));
+            let mut original = serde_json::to_value(&previous).unwrap();
+            original["producer_extension"] = json!({"future_receipt": "preserved in exact bytes"});
+            let previous_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            let previous_path =
+                retained.join(retained_job_evidence_name(&previous, &previous_bytes));
+            write_private_job_evidence(&previous_path, &previous_bytes);
+
+            let mut legacy = previous.clone();
+            legacy.recovery = Some(json!({
+                "retired": false,
+                "identity": "older-artifact-policy-stage",
+                "transfer": {"retrieval_staging_dir": "/retained/original-stage"},
+            }));
+            let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+            let legacy_path = retained.join(format!(
+                "artifact-policy-{}.before",
+                uuid::Uuid::new_v4().simple()
+            ));
+            write_private_job_evidence(&legacy_path, &legacy_bytes);
+
+            let mut current = previous.clone();
+            current.admit(42, "current-worker".into(), 2);
+            current.recovery = None;
+            current.exit_code = Some(0);
+            current.acknowledge_terminal(3);
+            let current_path = retained.join(format!("{}.json", current.identity.local_wrapper_id));
+            let current_bytes = serde_json::to_vec(&current).unwrap();
+            if current_present {
+                write_private_job_evidence(&current_path, &current_bytes);
+            }
+            let unrelated = retained.join("operator-note.before");
+            write_private_job_evidence(&unrelated, b"unrelated non-JSON operator evidence");
+
+            let listing = read_job_listing(&retained).unwrap();
+            assert_eq!(listing["complete"], true);
+            assert_eq!(listing["journal_errors"], json!([]));
+            let jobs = listing["jobs"].as_array().unwrap();
+            if current_present {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(jobs[0]["lease"], serde_json::to_value(&current).unwrap());
+                assert_eq!(std::fs::read(&current_path).unwrap(), current_bytes);
+            } else {
+                assert!(
+                    jobs.is_empty(),
+                    "historical evidence cannot recreate a current job"
+                );
+                assert!(!current_path.exists());
+            }
+            let evidence = listing["retained_evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 2);
+            for (path, kind, lease, bytes) in [
+                (&previous_path, "recovery", &previous, &previous_bytes),
+                (
+                    &legacy_path,
+                    "legacy_artifact_policy",
+                    &legacy,
+                    &legacy_bytes,
+                ),
+            ] {
+                let report = evidence
+                    .iter()
+                    .find(|item| item["path"] == json!(path))
+                    .unwrap();
+                assert_eq!(report["kind"], kind);
+                assert_eq!(report["digest"], blake3::hash(bytes).to_hex().to_string());
+                assert_eq!(report["lease"], serde_json::to_value(lease).unwrap());
+                assert!(report.get("owner_presence").is_none());
+                assert!(report.get("wrapper_alive").is_none());
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            assert_eq!(
+                std::fs::read(unrelated).unwrap(),
+                b"unrelated non-JSON operator evidence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_reports_invalid_retained_evidence_without_losing_current_jobs() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        for change in [
+            "corrupt",
+            "digest",
+            "identity",
+            "schema",
+            "malformed-name",
+            "malformed-legacy-name",
+            "writable",
+            "hardlink",
+            "symlink",
+            "fifo",
+            "directory",
+        ] {
+            let retained = tempfile::tempdir().unwrap().keep();
+            let current = admitted_lease();
+            let current_path = retained.join(format!("{}.json", current.identity.local_wrapper_id));
+            let current_bytes = serde_json::to_vec(&current).unwrap();
+            write_private_job_evidence(&current_path, &current_bytes);
+            let mut previous = queued_lease();
+            previous.admit(41, "previous-worker".into(), 1);
+            previous.recovery = Some(json!({"retired": true, "returned": 137}));
+            if change == "schema" {
+                previous.schema_version = 2;
+            }
+            let bytes = if change == "corrupt" {
+                b"{\"identity\":".to_vec()
+            } else {
+                serde_json::to_vec(&previous).unwrap()
+            };
+            let name = match change {
+                "digest" => format!(
+                    "{}.recovery-{}.before",
+                    previous.identity.local_wrapper_id,
+                    "0".repeat(64)
+                ),
+                "identity" => retained_job_evidence_name(&queued_lease(), &bytes),
+                "malformed-name" => format!(
+                    "{}.recovery-not-a-digest.before",
+                    previous.identity.local_wrapper_id
+                ),
+                "malformed-legacy-name" => "artifact-policy-not-a-uuid.before".to_owned(),
+                _ => retained_job_evidence_name(&previous, &bytes),
+            };
+            let path = retained.join(name);
+            let other_name = retained.join("preserved-evidence");
+            match change {
+                "symlink" => {
+                    write_private_job_evidence(&other_name, &bytes);
+                    std::os::unix::fs::symlink(&other_name, &path).unwrap();
+                }
+                "fifo" => {
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .args(["-m", "600"])
+                            .arg(&path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => {
+                    write_private_job_evidence(&path, &bytes);
+                    if change == "writable" {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                            .unwrap();
+                    } else if change == "hardlink" {
+                        std::fs::hard_link(&path, &other_name).unwrap();
+                    }
+                }
+            }
+
+            let listing = if change == "fifo" {
+                let directory = retained.clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    sender.send(read_job_listing(&directory)).unwrap();
+                });
+                let listing = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("retained evidence listing waited on a FIFO without a writer")
+                    .unwrap();
+                reader.join().unwrap();
+                listing
+            } else {
+                read_job_listing(&retained).unwrap()
+            };
+            assert_eq!(listing["complete"], false, "{change}");
+            assert!(listing["retained_evidence"].as_array().unwrap().is_empty());
+            assert_eq!(listing["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                listing["jobs"][0]["lease"],
+                serde_json::to_value(current).unwrap()
+            );
+            let errors = listing["journal_errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{change}: {errors:?}");
+            assert_eq!(errors[0]["path"], json!(path));
+            assert!(!errors[0]["error"].as_str().unwrap().is_empty());
+            assert_eq!(std::fs::read(current_path).unwrap(), current_bytes);
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            match change {
+                "symlink" => assert!(metadata.file_type().is_symlink()),
+                "fifo" => assert!(metadata.file_type().is_fifo()),
+                "directory" => assert!(metadata.is_dir()),
+                _ => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+            }
+            if matches!(change, "symlink" | "hardlink") {
+                assert_eq!(std::fs::read(other_name).unwrap(), bytes);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1196,7 +1587,7 @@ mod tests {
         let listing = read_job_listing(&absent).unwrap();
         assert_eq!(
             listing,
-            json!({"jobs": [], "complete": true, "journal_errors": []})
+            json!({"jobs": [], "retained_evidence": [], "complete": true, "journal_errors": []})
         );
         assert!(!absent.exists());
     }
@@ -1410,6 +1801,125 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_cancellation_retains_custody_and_same_job_recovery_guidance() {
+        let mut lease = admitted_lease();
+        lease.recovery = Some(json!({"retired": false, "sources_released": false}));
+        let before = lease.clone();
+        let reply = json!({
+            "status": "failed", "build_id": 42, "worker_id": "worker-a",
+            "message": "Cancellation unconfirmed; active build and reservations retained for retry",
+            "slots_released": 0,
+        });
+        let error = validate_admitted_cancellation(&lease, &reply).unwrap_err();
+        let api = crate::top_level_api_error(&error);
+        assert_eq!(api.code, "RCH-E323");
+        assert_eq!(api.message, "Cancellation outcome is unconfirmed");
+        let details = api.details.as_deref().unwrap();
+        assert!(details.contains("cancellation was not acknowledged"));
+        assert!(details.contains("reservations retained for retry"));
+        assert!(details.contains("worker-a"));
+        let guidance = api.remediation.join("\n");
+        assert!(guidance.contains(&format!(
+            "rch jobs recover {}",
+            lease.identity.local_wrapper_id
+        )));
+        assert!(guidance.contains("without replay"));
+        assert!(guidance.contains("terminal acknowledgement"));
+        let plaintext = error.to_string();
+        assert!(plaintext.contains(&format!(
+            "rch jobs recover {}",
+            lease.identity.local_wrapper_id
+        )));
+        assert!(plaintext.contains("without replay"));
+        assert!(!guidance.to_ascii_lowercase().contains("restart"));
+        assert!(!guidance.to_ascii_lowercase().contains("clear"));
+        assert!(!guidance.to_ascii_lowercase().contains("force"));
+        assert_eq!(lease, before);
+    }
+
+    #[test]
+    fn cancellation_responses_require_successful_http_and_valid_json() {
+        for lease in [queued_lease(), admitted_lease()] {
+            let before = lease.clone();
+            let expected = if lease.identity.remote_build_id.is_some() {
+                json!({"status": "cancelled", "build_id": 42, "worker_id": "worker-a"})
+            } else {
+                json!({
+                    "status": "cancelled_before_start",
+                    "local_wrapper_id": lease.identity.local_wrapper_id,
+                    "exit_code": 130, "build_id": null,
+                })
+            };
+            let body = expected.to_string();
+            for header in ["HTTP/1.1 200 OK\r\n\r\n", "HTTP/1.0 200 OK\n\n"] {
+                assert_eq!(
+                    parse_cancellation_response(&lease, &format!("{header}{body}")).unwrap(),
+                    expected
+                );
+            }
+            for response in [
+                format!("HTTP/1.1 500 Internal Server Error\r\n\r\n{body}"),
+                format!("HTTP/1.1 401 Unauthorized\n\n{body}"),
+                format!("HTTP/9.9 200 OK\r\n\r\n{body}"),
+                body.clone(),
+                "HTTP/1.1 200 OK\r\n\r\n{invalid-json".to_string(),
+                "HTTP/1.1 200 OK".to_string(),
+                "HTTP/1.1 500 Failure\r\n\r\n\u{1b}[31m".to_string(),
+            ] {
+                let error = parse_cancellation_response(&lease, &response).unwrap_err();
+                let api = crate::top_level_api_error(&error);
+                assert_eq!(api.code, "RCH-E323");
+                assert!(
+                    api.details
+                        .as_deref()
+                        .unwrap()
+                        .contains(&format!("{response:?}"))
+                );
+                assert!(error.to_string().contains(&format!(
+                    "rch jobs recover {}",
+                    lease.identity.local_wrapper_id
+                )));
+                assert!(!error.to_string().contains('\u{1b}'));
+                assert_eq!(lease, before);
+            }
+        }
+    }
+
+    #[test]
+    fn unconfirmed_cancellation_guidance_uses_own_identity_and_keeps_valid_twins() {
+        let lease = admitted_lease();
+        let valid = json!({
+            "status": "cancelled", "build_id": 42, "worker_id": "worker-a",
+            "local_wrapper_id": lease.identity.local_wrapper_id,
+        });
+        assert_eq!(
+            validate_admitted_cancellation(&lease, &valid).unwrap(),
+            AdmittedCancellation::StopWrapper
+        );
+        for (field, value) in [
+            ("build_id", json!(43)),
+            ("worker_id", json!("foreign-worker")),
+            ("local_wrapper_id", json!("foreign-wrapper")),
+        ] {
+            let mut reply = valid.clone();
+            reply[field] = value;
+            let error = validate_admitted_cancellation(&lease, &reply).unwrap_err();
+            let api = crate::top_level_api_error(&error);
+            assert_eq!(api.code, "RCH-E323");
+            let guidance = api.remediation.join("\n");
+            assert!(guidance.contains(&format!(
+                "rch jobs recover {}",
+                lease.identity.local_wrapper_id
+            )));
+            assert!(!guidance.contains("foreign-"));
+        }
+        assert_eq!(
+            validate_admitted_cancellation(&lease, &completion(&lease, 0)).unwrap(),
+            AdmittedCancellation::AlreadyCompleted(0)
+        );
+    }
+
+    #[test]
     fn cancellation_completion_does_not_claim_artifacts_or_retire_the_journal() {
         let mut lease = admitted_lease();
         lease.recovery = Some(json!({"retired": false}));
@@ -1600,5 +2110,58 @@ mod tests {
         let settled = writer.snapshot();
         assert!(settled.terminal_acknowledged);
         assert_eq!(settled.exit_code, Some(101));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_admission_dead_lease_waits_24h_then_settles_failed_before_admission() {
+        for phase in [
+            "queued",
+            "selection_pending",
+            "selection_unconfirmed",
+            "restart_admission_wait",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let writer = crate::hook::DurableLeaseWriter::create_in(
+                directory.path(),
+                "cargo test",
+                true,
+                false,
+            )
+            .unwrap();
+            writer.heartbeat(phase).unwrap();
+            let observed = writer.snapshot();
+            let heartbeat = observed.heartbeat_unix_ms;
+            let twenty_four_hours_ms = 24 * 60 * 60 * 1000;
+
+            let premature = settle_absent_pre_admission(
+                &observed,
+                &writer,
+                heartbeat + twenty_four_hours_ms - 1,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{premature:#}").contains("waits until the lease is 24h old"),
+                "{phase}: {premature:#}"
+            );
+            assert!(!writer.snapshot().terminal_acknowledged);
+            assert_eq!(
+                writer.snapshot().state,
+                rch_common::job_identity::JobLifecycleState::Queued
+            );
+
+            let settled_ok =
+                settle_absent_pre_admission(&observed, &writer, heartbeat + twenty_four_hours_ms)
+                    .unwrap();
+            assert!(settled_ok, "{phase}");
+            let settled = writer.snapshot();
+            assert!(settled.terminal_acknowledged);
+            assert_eq!(settled.exit_code, None);
+            assert_eq!(settled.phase, "failed_before_admission");
+            assert_eq!(
+                settled.state,
+                rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+            );
+        }
     }
 }

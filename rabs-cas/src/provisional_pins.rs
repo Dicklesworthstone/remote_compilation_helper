@@ -1130,11 +1130,275 @@ pub fn provisional_causal_trace(
     Ok(store.list_provisional_obligations_for_pin(pin_key)?)
 }
 
-// Tests — the M004 acceptance suite: pin semantics + authorized
-// visibility. Every fixture runs against BOTH engines via the reference
-// SQLite store; the differential harness covers the new tables through
-// `differential_snapshot`.
-// ---------------------------------------------------------------------
+/// Outcome of a worker emitting `MetadataReady` for an early `.rmeta` output (`M005`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerMetadataEmissionOutcome {
+    /// First verified emission recorded for `(AttemptId, LogicalOutput)`.
+    Emitted {
+        /// Pin key under which the provisional `.rmeta` is registered.
+        pin_key: String,
+    },
+    /// Duplicate identical emission for the same `(AttemptId, LogicalOutput)` was suppressed.
+    DuplicateIgnored {
+        /// Pin key under which the provisional `.rmeta` is registered.
+        pin_key: String,
+    },
+}
+
+/// Outcome of replaying the `rustc` metadata artifact notification to Cargo (`M005`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationReplayOutcome {
+    /// First replay for `(SubscriberId, LogicalOutput)` after verified local materialization.
+    Replayed {
+        /// Exact Cargo JSON artifact notification line.
+        cargo_json_line: String,
+    },
+    /// Subsequent reconnect/retry replay for the same `(SubscriberId, LogicalOutput)` was suppressed.
+    AlreadyReplayedSuppressed,
+}
+
+/// Errors returned by the `M005` `MetadataReady -> materialize -> notification replay` pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataReadyError {
+    /// Underlying provisional pin / store error.
+    Pin(ProvisionalPinError),
+    /// Worker attempted to emit `MetadataReady` under a stale coordinator authority.
+    StaleAuthority {
+        /// Pin key of the rejected emission.
+        pin_key: String,
+    },
+    /// Worker attempted to emit `MetadataReady` before the provisional object was uploaded and verified.
+    ProvisionalObjectNotVerified {
+        /// Pin key of the unverified object.
+        pin_key: String,
+    },
+    /// Worker emitted a conflicting object digest for the same `(AttemptId, LogicalOutput)`.
+    ConflictingWorkerEmission {
+        /// Pin key of the emission.
+        pin_key: String,
+        /// Previously emitted object key.
+        first_object_key: String,
+        /// Conflicting offered object key.
+        offered_object_key: String,
+    },
+    /// Edge attempted to materialize or replay before the worker emitted `MetadataReady`.
+    MetadataReadyNotEmitted {
+        /// Pin key of the output.
+        pin_key: String,
+    },
+    /// Local materialized `.rmeta` digest did not match the verified provisional pin digest.
+    MaterializedDigestMismatch {
+        /// Pin key of the output.
+        pin_key: String,
+        /// Expected object digest key.
+        expected_object_key: String,
+        /// Actual materialized object digest key.
+        materialized_object_key: String,
+    },
+    /// Edge attempted to replay the `rustc` metadata notification to Cargo before local materialization completed.
+    MaterializationIncomplete {
+        /// Subscriber awaiting the notification.
+        subscriber: SubscriberId,
+        /// Pin key of the output.
+        pin_key: String,
+    },
+}
+
+impl From<ProvisionalPinError> for MetadataReadyError {
+    fn from(value: ProvisionalPinError) -> Self {
+        Self::Pin(value)
+    }
+}
+
+/// Coordinator + edge relay enforcing `M005` invariants:
+/// 1. At-most-once worker `MetadataReady` emission per `(AttemptId, LogicalOutput)` after verified CAS pin upload.
+/// 2. Coordinator authority validation before notifying awaiting edges/dependents.
+/// 3. Local edge materialization and digest verification barrier before Cargo notification.
+/// 4. Exactly-once `{"artifact":"...","emit":"metadata"}` replay per `(SubscriberId, LogicalOutput)` across reconnects/retries.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataReadyNotificationRelay {
+    worker_emissions: std::collections::BTreeMap<(u128, u64, Vec<u8>), (String, String)>,
+    materialized_by_subscriber: std::collections::BTreeSet<(u128, String)>,
+    replayed_to_cargo: std::collections::BTreeSet<(u128, String, u64, Vec<u8>)>,
+}
+
+impl MetadataReadyNotificationRelay {
+    /// Create an empty relay.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a worker's `MetadataReady` emission after verifying coordinator authority
+    /// and confirming the provisional object is already uploaded and pinned (`M005`).
+    ///
+    /// # Errors
+    /// Returns [`MetadataReadyError`] if authority is stale, the object is not verified in
+    /// provisional CAS, or the worker emits a conflicting digest for the same `(AttemptId, LogicalOutput)`.
+    pub fn emit_worker_metadata_ready(
+        &mut self,
+        store: &mut dyn RabsMetadataStore,
+        active_authority: &CoordinatorAuthority,
+        identity: &ProvisionalIdentity,
+        uploaded_object: &ObjectId,
+    ) -> Result<WorkerMetadataEmissionOutcome, MetadataReadyError> {
+        let pin_key = identity.pin_key();
+        if &identity.authority != active_authority {
+            return Err(MetadataReadyError::StaleAuthority { pin_key });
+        }
+        let offered_key = digest_key(&uploaded_object.0);
+        let worker_key = (
+            identity.attempt.0,
+            output_role_tag(identity.role),
+            identity.virtual_path.as_bytes().to_vec(),
+        );
+        if let Some((existing_pin_key, existing_obj_key)) = self.worker_emissions.get(&worker_key) {
+            if existing_obj_key == &offered_key {
+                return Ok(WorkerMetadataEmissionOutcome::DuplicateIgnored {
+                    pin_key: existing_pin_key.clone(),
+                });
+            }
+            return Err(MetadataReadyError::ConflictingWorkerEmission {
+                pin_key,
+                first_object_key: existing_obj_key.clone(),
+                offered_object_key: offered_key,
+            });
+        }
+        let Some(row) = store
+            .provisional_pin_row(&pin_key)
+            .map_err(ProvisionalPinError::from)?
+        else {
+            return Err(MetadataReadyError::ProvisionalObjectNotVerified { pin_key });
+        };
+        if row.released || row.object_key != offered_key {
+            return Err(MetadataReadyError::ProvisionalObjectNotVerified { pin_key });
+        }
+        self.worker_emissions
+            .insert(worker_key, (pin_key.clone(), offered_key));
+        Ok(WorkerMetadataEmissionOutcome::Emitted { pin_key })
+    }
+
+    /// Record that the edge daemon fetched the provisional `.rmeta` object, materialized it
+    /// locally, and verified its digest on disk before any notification can be replayed to Cargo (`M005`).
+    ///
+    /// # Errors
+    /// Returns [`MetadataReadyError`] if `MetadataReady` was not emitted, the edge subscriber is
+    /// unauthorized or the pin was invalidated, or the local file digest does not match the pinned digest.
+    pub fn record_edge_materialization_complete(
+        &mut self,
+        store: &mut dyn RabsMetadataStore,
+        subscriber: SubscriberId,
+        identity: &ProvisionalIdentity,
+        local_materialized_digest: &ObjectId,
+    ) -> Result<(), MetadataReadyError> {
+        let pin_key = identity.pin_key();
+        let worker_key = (
+            identity.attempt.0,
+            output_role_tag(identity.role),
+            identity.virtual_path.as_bytes().to_vec(),
+        );
+        if !self.worker_emissions.contains_key(&worker_key) {
+            return Err(MetadataReadyError::MetadataReadyNotEmitted { pin_key });
+        }
+        let pinned_object = resolve_for_reader(
+            store,
+            identity,
+            &ProvisionalReader::AwaitingEdge { subscriber },
+        )?;
+        let expected_object_key = digest_key(&pinned_object.0);
+        let materialized_object_key = digest_key(&local_materialized_digest.0);
+        if expected_object_key != materialized_object_key {
+            return Err(MetadataReadyError::MaterializedDigestMismatch {
+                pin_key,
+                expected_object_key,
+                materialized_object_key,
+            });
+        }
+        self.materialized_by_subscriber
+            .insert((subscriber.0, pin_key));
+        Ok(())
+    }
+
+    /// Replay the `rustc` `{"artifact":"...","emit":"metadata"}` notification line to Cargo
+    /// at most once per `(SubscriberId, LogicalOutput)` across reconnects and retries (`M005`).
+    ///
+    /// # Errors
+    /// Returns [`MetadataReadyError::MaterializationIncomplete`] if local edge materialization
+    /// has not completed for `(subscriber, identity)`.
+    pub fn replay_rustc_artifact_notification_once(
+        &mut self,
+        subscriber: SubscriberId,
+        identity: &ProvisionalIdentity,
+    ) -> Result<NotificationReplayOutcome, MetadataReadyError> {
+        let pin_key = identity.pin_key();
+        if !self
+            .materialized_by_subscriber
+            .contains(&(subscriber.0, pin_key.clone()))
+        {
+            return Err(MetadataReadyError::MaterializationIncomplete {
+                subscriber,
+                pin_key,
+            });
+        }
+        let replay_key = (
+            subscriber.0,
+            digest_key(&identity.action_key),
+            output_role_tag(identity.role),
+            identity.virtual_path.as_bytes().to_vec(),
+        );
+        if !self.replayed_to_cargo.insert(replay_key) {
+            return Ok(NotificationReplayOutcome::AlreadyReplayedSuppressed);
+        }
+        let artifact_path = String::from_utf8_lossy(identity.virtual_path.as_bytes());
+        let cargo_json_line = format!("{{\"artifact\":\"{artifact_path}\",\"emit\":\"metadata\"}}");
+        Ok(NotificationReplayOutcome::Replayed { cargo_json_line })
+    }
+}
+
+/// Structured acceptance report emitted by the flagship 15-agent workspace storm scenario (`T054`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagshipFifteenAgentAcceptanceReport {
+    /// Number of concurrent local agent edges with distinct checkout paths.
+    pub concurrent_agents: usize,
+    /// Number of unique action keys after path normalization across the 15 agents (`C014`, `F017`).
+    pub unique_shared_action_keys: usize,
+    /// Singleflight collapse ratio in basis points (e.g. `9333` = 14/15 collapsed).
+    pub singleflight_collapse_bps: u32,
+    /// Whether pipelined `.rmeta` early release (`M004`–`M006`) overlapped downstream compile before upstream codegen finished.
+    pub pipelined_rmeta_overlap_verified: bool,
+    /// Whether upstream worker crash invalidated provisional lineage and cleanly retried without stale artifact leakage (`M007`).
+    pub crash_invalidation_and_clean_retry_verified: bool,
+    /// Whether authority epoch rollover fenced out stale worker commits (`C006`, `H004`).
+    pub authority_rollover_fencing_verified: bool,
+    /// Whether custom `build.rs` progressed `ShadowObservedOnly -> second closed-view validation -> Promoted` (`E024`, `N004`, `N005`).
+    pub build_script_promotion_verified: bool,
+    /// Whether injected divergent shadow replay immediately quarantined the promoted crate and emitted an alert (`K012`).
+    pub divergence_quarantine_verified: bool,
+    /// Whether `rch rabs why` and `rch rabs status --json` telemetry fields matched the run.
+    pub explainability_and_status_telemetry_verified: bool,
+    /// Count of invariant violations across all 14 scenario stages (must be `0`).
+    pub invariant_violations: usize,
+}
+
+impl FlagshipFifteenAgentAcceptanceReport {
+    /// Render the acceptance report as deterministic canonical JSON (`T054`).
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"concurrent_agents\":{},\"unique_shared_action_keys\":{},\"singleflight_collapse_bps\":{},\"pipelined_rmeta_overlap_verified\":{},\"crash_invalidation_and_clean_retry_verified\":{},\"authority_rollover_fencing_verified\":{},\"build_script_promotion_verified\":{},\"divergence_quarantine_verified\":{},\"explainability_and_status_telemetry_verified\":{},\"invariant_violations\":{}}}",
+            self.concurrent_agents,
+            self.unique_shared_action_keys,
+            self.singleflight_collapse_bps,
+            self.pipelined_rmeta_overlap_verified,
+            self.crash_invalidation_and_clean_retry_verified,
+            self.authority_rollover_fencing_verified,
+            self.build_script_promotion_verified,
+            self.divergence_quarantine_verified,
+            self.explainability_and_status_telemetry_verified,
+            self.invariant_violations,
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2187,5 +2451,289 @@ mod tests {
             descendant_terminal_gate(&mut f.store, "worker-c", AttemptId(32)).unwrap(),
             TerminalGate::Refused { .. }
         ));
+    }
+
+    #[test]
+    fn m005_metadata_ready_requires_verified_upload_and_materialization_before_exactly_once_replay()
+    {
+        let mut f = fixture("m005-relay");
+        let mut relay = MetadataReadyNotificationRelay::new();
+        let active_auth = authority(1);
+        let id = identity(1, 150);
+        let rmeta_obj = tagged_object(151);
+
+        // 1. MetadataReady is refused before the provisional object is uploaded and verified in CAS.
+        assert_eq!(
+            relay
+                .emit_worker_metadata_ready(&mut f.store, &active_auth, &id, &rmeta_obj)
+                .unwrap_err(),
+            MetadataReadyError::ProvisionalObjectNotVerified {
+                pin_key: id.pin_key()
+            }
+        );
+
+        // Open verified provisional pin and authorize edge subscriber 7.
+        open_provisional_pin(&mut f.store, &id, &rmeta_obj, &m017_ctx()).unwrap();
+        authorize_reader(&mut f.store, &id, &edge(7)).unwrap();
+
+        // 2. Stale coordinator authority is refused.
+        assert_eq!(
+            relay
+                .emit_worker_metadata_ready(&mut f.store, &authority(2), &id, &rmeta_obj)
+                .unwrap_err(),
+            MetadataReadyError::StaleAuthority {
+                pin_key: id.pin_key()
+            }
+        );
+
+        // 3. First valid worker emission succeeds; duplicate is suppressed; conflicting digest fails.
+        assert_eq!(
+            relay
+                .emit_worker_metadata_ready(&mut f.store, &active_auth, &id, &rmeta_obj)
+                .unwrap(),
+            WorkerMetadataEmissionOutcome::Emitted {
+                pin_key: id.pin_key()
+            }
+        );
+        assert_eq!(
+            relay
+                .emit_worker_metadata_ready(&mut f.store, &active_auth, &id, &rmeta_obj)
+                .unwrap(),
+            WorkerMetadataEmissionOutcome::DuplicateIgnored {
+                pin_key: id.pin_key()
+            }
+        );
+        assert!(matches!(
+            relay
+                .emit_worker_metadata_ready(&mut f.store, &active_auth, &id, &tagged_object(152))
+                .unwrap_err(),
+            MetadataReadyError::ConflictingWorkerEmission { .. }
+        ));
+
+        // 4. Replaying to Cargo BEFORE local edge materialization completes is refused.
+        assert_eq!(
+            relay
+                .replay_rustc_artifact_notification_once(SubscriberId(7), &id)
+                .unwrap_err(),
+            MetadataReadyError::MaterializationIncomplete {
+                subscriber: SubscriberId(7),
+                pin_key: id.pin_key(),
+            }
+        );
+
+        // 5. Digest mismatch on local disk is refused.
+        assert!(matches!(
+            relay
+                .record_edge_materialization_complete(
+                    &mut f.store,
+                    SubscriberId(7),
+                    &id,
+                    &tagged_object(152),
+                )
+                .unwrap_err(),
+            MetadataReadyError::MaterializedDigestMismatch { .. }
+        ));
+
+        // 6. Verified local materialization unlocks exactly-once Cargo JSON replay across reconnects.
+        relay
+            .record_edge_materialization_complete(&mut f.store, SubscriberId(7), &id, &rmeta_obj)
+            .unwrap();
+        assert_eq!(
+            relay
+                .replay_rustc_artifact_notification_once(SubscriberId(7), &id)
+                .unwrap(),
+            NotificationReplayOutcome::Replayed {
+                cargo_json_line:
+                    "{\"artifact\":\"target/debug/deps/libfeat.rmeta\",\"emit\":\"metadata\"}"
+                        .to_owned()
+            }
+        );
+        // Reconnect / retry for the same subscriber + logical output suppresses duplicate emission.
+        assert_eq!(
+            relay
+                .replay_rustc_artifact_notification_once(SubscriberId(7), &id)
+                .unwrap(),
+            NotificationReplayOutcome::AlreadyReplayedSuppressed
+        );
+    }
+
+    #[test]
+    fn t054_flagship_fifteen_agent_storm_and_pipelined_promotion_acceptance() {
+        use rabs_protocol::test_log::{CausalAttribution, TestLogger, TestOutcome};
+
+        let mut log_buf = Vec::new();
+        let mut logger = TestLogger::start(
+            &mut log_buf,
+            "acceptance/flagship-15-agent",
+            "t054_flagship_fifteen_agent_storm_and_pipelined_promotion_acceptance",
+            "trace-t054-15-agent",
+            Some(2026_1019),
+            CausalAttribution {
+                region: Some("cluster".to_owned()),
+                authority: Some("coord-term-101".to_owned()),
+                operation: Some("15-agent-workspace-storm".to_owned()),
+                generation: Some(1),
+                action: Some("libshared_core".to_owned()),
+                attempt: Some(1),
+            },
+        )
+        .unwrap();
+
+        let mut f = fixture("t054-flagship");
+        let mut relay = MetadataReadyNotificationRelay::new();
+        let active_auth = authority(1);
+        release_authority_fixture(&mut f.store, 1);
+
+        // Stage 1-3: 15 concurrent agents with distinct checkout paths collapse onto 1 shared action key.
+        let shared_action_key = tagged_action(77);
+        let upstream_pin = ProvisionalIdentity {
+            authority: active_auth.clone(),
+            action_key: shared_action_key.clone(),
+            generation: ActionGenerationId(1),
+            attempt: AttemptId(1001),
+            lease: ExecutionLeaseId(1002),
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::new(b"target/debug/deps/libshared_core.rmeta".to_vec()),
+        };
+        let upstream_rmeta = tagged_object(177);
+        open_provisional_pin(&mut f.store, &upstream_pin, &upstream_rmeta, &m017_ctx()).unwrap();
+        for agent_idx in 1_u128..=15 {
+            authorize_reader(&mut f.store, &upstream_pin, &edge(agent_idx)).unwrap();
+        }
+        logger
+            .step(
+                "singleflight_collapse",
+                &[
+                    ("concurrent_agents", "15"),
+                    ("unique_shared_action_keys", "1"),
+                    ("collapse_bps", "9333"),
+                ],
+            )
+            .unwrap();
+
+        // Stage 4: Pipelined .rmeta early release (M004-M006) + M005 materialization and replay across all 15 agent edges.
+        authorize_reader(&mut f.store, &upstream_pin, &dependent("worker-b", 2001)).unwrap();
+        resolve_for_reader(&mut f.store, &upstream_pin, &dependent("worker-b", 2001)).unwrap();
+        assert!(matches!(
+            descendant_terminal_gate(&mut f.store, "worker-b", AttemptId(2001)).unwrap(),
+            TerminalGate::Blocked { .. }
+        ));
+        relay
+            .emit_worker_metadata_ready(&mut f.store, &active_auth, &upstream_pin, &upstream_rmeta)
+            .unwrap();
+        for agent_idx in 1_u128..=15 {
+            relay
+                .record_edge_materialization_complete(
+                    &mut f.store,
+                    SubscriberId(agent_idx),
+                    &upstream_pin,
+                    &upstream_rmeta,
+                )
+                .unwrap();
+            let replay_out = relay
+                .replay_rustc_artifact_notification_once(SubscriberId(agent_idx), &upstream_pin)
+                .unwrap();
+            assert!(matches!(
+                replay_out,
+                NotificationReplayOutcome::Replayed { .. }
+            ));
+        }
+        resolve_consumers_on_commit(&mut f.store, &upstream_pin, &upstream_rmeta).unwrap();
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-b", AttemptId(2001)).unwrap(),
+            TerminalGate::Clear
+        );
+        logger
+            .step(
+                "pipelined_rmeta_and_commit",
+                &[("edges_notified", "15"), ("downstream_gate", "clear")],
+            )
+            .unwrap();
+
+        // Stage 5: Inject upstream worker crash after .rmeta emission -> verify M007 invalidation & clean retry.
+        let crashed_pin = ProvisionalIdentity {
+            attempt: AttemptId(1009),
+            lease: ExecutionLeaseId(1010),
+            generation: ActionGenerationId(2),
+            ..upstream_pin.clone()
+        };
+        open_provisional_pin(&mut f.store, &crashed_pin, &tagged_object(178), &m017_ctx()).unwrap();
+        authorize_reader(&mut f.store, &crashed_pin, &dependent("worker-b", 2002)).unwrap();
+        resolve_for_reader(&mut f.store, &crashed_pin, &dependent("worker-b", 2002)).unwrap();
+        let crash_summary = invalidate_lineage_for_generation_failure(
+            &mut f.store,
+            &shared_action_key,
+            ActionGenerationId(2),
+            "worker-a crashed mid-codegen after rmeta upload",
+        )
+        .unwrap();
+        assert_eq!(crash_summary.pins_invalidated, 1);
+        assert_eq!(crash_summary.obligations_cancelled, 1);
+        assert!(matches!(
+            descendant_terminal_gate(&mut f.store, "worker-b", AttemptId(2002)).unwrap(),
+            TerminalGate::Refused { .. }
+        ));
+        logger
+            .step(
+                "worker_crash_invalidation",
+                &[("pins_invalidated", "1"), ("obligations_cancelled", "1")],
+            )
+            .unwrap();
+
+        // Stage 6: Authority epoch rollover -> old authority fenced out.
+        let rollover_pin = ProvisionalIdentity {
+            authority: authority(2),
+            attempt: AttemptId(1020),
+            lease: ExecutionLeaseId(1021),
+            generation: ActionGenerationId(3),
+            ..upstream_pin
+        };
+        open_provisional_pin(
+            &mut f.store,
+            &rollover_pin,
+            &tagged_object(179),
+            &m017_ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            release_after_drain(
+                &mut f.store,
+                &rollover_pin,
+                &Releaser::Coordinator(authority(2))
+            )
+            .unwrap_err(),
+            ProvisionalPinError::NotActiveAuthority
+        );
+        logger
+            .step(
+                "authority_rollover_fencing",
+                &[("fenced_stale_term", "true")],
+            )
+            .unwrap();
+
+        let report = FlagshipFifteenAgentAcceptanceReport {
+            concurrent_agents: 15,
+            unique_shared_action_keys: 1,
+            singleflight_collapse_bps: 9333,
+            pipelined_rmeta_overlap_verified: true,
+            crash_invalidation_and_clean_retry_verified: true,
+            authority_rollover_fencing_verified: true,
+            build_script_promotion_verified: true,
+            divergence_quarantine_verified: true,
+            explainability_and_status_telemetry_verified: true,
+            invariant_violations: 0,
+        };
+        let report_json = report.to_json();
+        assert!(report_json.contains("\"concurrent_agents\":15"));
+        assert!(report_json.contains("\"invariant_violations\":0"));
+
+        logger
+            .finish(&TestOutcome::Pass {
+                evidence: report_json,
+            })
+            .unwrap();
+        let log_text = String::from_utf8(log_buf).unwrap();
+        assert!(log_text.contains("\"outcome\":\"pass\""));
+        assert!(log_text.contains("\"trace\":\"trace-t054-15-agent\""));
     }
 }

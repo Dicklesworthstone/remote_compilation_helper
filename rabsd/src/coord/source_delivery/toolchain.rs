@@ -8,6 +8,7 @@ use super::{digest, hex, invalid, require};
 use crate::coord::worker_delivery::{
     WorkerPeer, toolchain_identity, toolchain_identity_value, toolchain_transfer,
 };
+use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use rabs_sandbox::toolchain_transfer::{
     MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry,
@@ -26,8 +27,25 @@ mod pipeline;
 const CHUNK_WINDOW: usize = 4;
 
 #[derive(Debug, Clone)]
+enum ToolchainOwner {
+    Independent(Arc<PreparedToolchain>),
+    Retained(Arc<RetainedToolchain>),
+}
+
+impl std::ops::Deref for ToolchainOwner {
+    type Target = PreparedToolchain;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Independent(image) => image,
+            Self::Retained(owner) => owner.image(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ToolchainUpload {
-    prepared: Arc<PreparedToolchain>,
+    prepared: ToolchainOwner,
     entries: Arc<Vec<ToolchainEntry>>,
 }
 
@@ -41,7 +59,24 @@ impl ToolchainUpload {
         request: &Value,
     ) -> io::Result<Self> {
         let entries = Arc::new(prepared.entries()?);
-        let upload = Self { prepared, entries };
+        let upload = Self {
+            prepared: ToolchainOwner::Independent(prepared),
+            entries,
+        };
+        upload.validate_request(request)?;
+        Ok(upload)
+    }
+
+    pub(super) fn from_retained(
+        retained: Arc<RetainedToolchain>,
+        request: &Value,
+    ) -> io::Result<Self> {
+        retained.image().verify_retained_generation(|| false)?;
+        let entries = Arc::new(retained.image().entries()?);
+        let upload = Self {
+            prepared: ToolchainOwner::Retained(retained),
+            entries,
+        };
         upload.validate_request(request)?;
         Ok(upload)
     }
@@ -415,6 +450,85 @@ mod tests {
                 .iter()
                 .all(|frame| frame["kind"] != "canonical-exec")
         );
+    }
+
+    #[test]
+    fn retained_upload_owns_the_selected_generation_after_pool_and_caller_release() {
+        use rabs_sandbox::toolchain_cache::ToolchainPool;
+        use std::time::Duration;
+
+        let root = crate::test_util::private_tempdir();
+        let source = root.path().join("source");
+        let pool_root = root.path().join("pool");
+        // Separate private siblings satisfy the pool's source/retention
+        // boundary. These are real transfer bytes, never an executed compiler.
+        for directory in [&source, &pool_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir(source.join("bin")).unwrap();
+        let bytes: Vec<_> = (0..MAX_TOOLCHAIN_CHUNK + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let original = source.join("bin/compiler");
+        fs::write(&original, &bytes).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("bin/compiler", source.join("rustc")).unwrap();
+        let pool = ToolchainPool::new(&pool_root, 1, |_, _, _| false).unwrap();
+        let lease = pool
+            .acquire(&source, Duration::from_secs(5), || false)
+            .unwrap();
+        let identity = *lease.image().identity();
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+            "toolchain_identity":toolchain_identity_value(&identity)});
+
+        let mut mismatched_identity = identity;
+        mismatched_identity.sha256[0] ^= 1;
+        let mut mismatched_request = request.clone();
+        mismatched_request["toolchain_identity"] = toolchain_identity_value(&mismatched_identity);
+        let error =
+            ToolchainUpload::from_retained(Arc::clone(&lease), &mismatched_request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the saved request identity")
+        );
+
+        let backing = lease.owner_path().to_path_buf();
+        let weak = Arc::downgrade(&lease);
+        let upload = ToolchainUpload::from_retained(Arc::clone(&lease), &request).unwrap();
+        drop(lease);
+        pool.shutdown().unwrap();
+        drop(pool);
+        assert!(weak.upgrade().is_some());
+        assert!(backing.is_dir());
+
+        // The only strong owner is the upload. A later original-source write
+        // must neither change its identity nor be substituted into the stream.
+        let changed = vec![0xa5; bytes.len()];
+        fs::write(&original, &changed).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), changed);
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request, false).unwrap();
+        let received = peer.sealed.as_ref().unwrap();
+        received.verify(|| false).unwrap();
+        assert_eq!(received.identity(), &identity);
+        assert_eq!(fs::read(received.root().join("rustc")).unwrap(), bytes);
+        assert!(
+            peer.sent
+                .iter()
+                .any(|frame| frame["kind"] == "toolchain-chunk")
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "toolchain-seal");
+        assert!(peer.replies.is_empty());
+
+        drop(upload);
+        assert!(weak.upgrade().is_none());
+        assert!(!backing.exists());
+        // Receiver ownership is independent of the released sender generation.
+        received.verify(|| false).unwrap();
+        assert_eq!(fs::read(received.root().join("rustc")).unwrap(), bytes);
     }
 
     #[test]

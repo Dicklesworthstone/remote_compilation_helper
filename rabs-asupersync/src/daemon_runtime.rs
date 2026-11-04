@@ -300,6 +300,22 @@ pub fn block_on_top_level<F: std::future::Future>(
 /// Boot the runtime island, run the subsystem regions, shut down
 /// cleanly, and return the receipt generated from the accounting.
 pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonError> {
+    let controller = Arc::new(ShutdownController::new());
+    if options.run_for.is_none() {
+        controller.listen_for_signals();
+    }
+    run_daemon_controlled(options, controller)
+}
+
+/// Run an embedded daemon whose lifetime is owned by its caller. The caller
+/// retains the controller, requests shutdown after its operation ends, and
+/// joins this call before releasing any operation inputs or output directories.
+/// Signal handling is explicit: unlike [`run_daemon`], this entry point does
+/// not install a process-wide signal listener.
+pub fn run_daemon_controlled(
+    options: DaemonRunOptions,
+    controller: Arc<ShutdownController>,
+) -> Result<ShutdownReceipt, DaemonError> {
     let boot_start = options.boot_started_at;
 
     // Crash-evidence marker: found-at-boot means the prior incarnation
@@ -320,10 +336,6 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
         .build()
         .map_err(|e| DaemonError::RuntimeBuild(format!("{e:?}")))?;
 
-    let controller = Arc::new(ShutdownController::new());
-    if options.run_for.is_none() {
-        controller.listen_for_signals();
-    }
     if let Some(run_for) = options.run_for {
         let timed = Arc::clone(&controller);
         std::thread::spawn(move || {

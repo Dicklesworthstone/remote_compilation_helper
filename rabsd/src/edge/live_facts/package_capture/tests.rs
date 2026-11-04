@@ -91,8 +91,17 @@ fn concurrent_foreground_requests_share_one_real_sealed_capture() {
     let captured = producer.join().unwrap().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(*facts.warming.lock().unwrap(), 0);
-    assert!(Arc::ptr_eq(&captured, &facts.package(&root, KIND, None).unwrap()));
-    assert_eq!(captured.snapshot.file_bytes(super::super::PACKAGE_ROOT, "lib.rs").unwrap(), &[0; 17]);
+    assert!(Arc::ptr_eq(
+        &captured,
+        &facts.package(&root, KIND, None).unwrap()
+    ));
+    assert_eq!(
+        captured
+            .snapshot
+            .file_bytes(super::super::PACKAGE_ROOT, "lib.rs")
+            .unwrap(),
+        &[0; 17]
+    );
     captured.verify_unchanged(&root).unwrap();
 }
 
@@ -115,7 +124,10 @@ fn concurrent_large_requests_use_one_existing_warm_slot() {
     ));
     start.recv_timeout(Duration::from_secs(5)).unwrap();
     for _ in 0..32 {
-        assert!(matches!(facts.package(&root, KIND, None), Err(FactsMiss::Pending)));
+        assert!(matches!(
+            facts.package(&root, KIND, None),
+            Err(FactsMiss::Pending)
+        ));
     }
     assert_eq!(*facts.warming.lock().unwrap(), 1);
     release.send(()).unwrap();
@@ -135,8 +147,14 @@ fn changed_generation_does_not_wait_for_or_inherit_an_old_capture() {
     let old_bytes = original.capture().unwrap();
     fs::write(root.join("lib.rs"), b"changed source generation").unwrap();
     let newer = facts.package(&root, KIND, None).unwrap();
-    assert!(matches!(owner.finish(Ok(old_bytes), true), Err(FactsMiss::Refused(_))));
-    assert!(Arc::ptr_eq(&newer, &facts.package(&root, KIND, None).unwrap()));
+    assert!(matches!(
+        owner.finish(Ok(old_bytes), true),
+        Err(FactsMiss::Refused(_))
+    ));
+    assert!(Arc::ptr_eq(
+        &newer,
+        &facts.package(&root, KIND, None).unwrap()
+    ));
     newer.verify_unchanged(&root).unwrap();
 }
 
@@ -153,7 +171,11 @@ fn a_capture_that_started_after_mutation_cannot_fill_an_earlier_observation() {
         Err(FactsMiss::Refused(reason)) if reason.contains("admitted observation")
     ));
     assert!(facts.packages.lock().unwrap().is_empty());
-    facts.package(&root, KIND, None).unwrap().verify_unchanged(&root).unwrap();
+    facts
+        .package(&root, KIND, None)
+        .unwrap()
+        .verify_unchanged(&root)
+        .unwrap();
 }
 
 #[test]
@@ -163,13 +185,17 @@ fn failure_backoff_is_scoped_to_exact_source_and_generated_inputs() {
     let generated = Path::new(plan.generated_root.as_ref().unwrap());
     let facts = LiveFacts::new();
     let original = Arc::new(Observation::read(root, plan.source_kind, Some(generated)).unwrap());
-    reserve(&facts, &original).finish(Err("old capture failed".into()), true).unwrap_err();
+    reserve(&facts, &original)
+        .finish(Err("old capture failed".into()), true)
+        .unwrap_err();
     assert!(matches!(
         facts.package(root, plan.source_kind, Some(generated)),
         Err(FactsMiss::Refused(reason)) if reason == "old capture failed"
     ));
     fs::write(generated.join("value.rs"), b"pub const VALUE:u32=42;").unwrap();
-    let changed = facts.package(root, plan.source_kind, Some(generated)).unwrap();
+    let changed = facts
+        .package(root, plan.source_kind, Some(generated))
+        .unwrap();
     changed.verify_unchanged(root).unwrap();
     assert_ne!(changed.generated, original.generated);
     // Omitting generated inputs is a different observation, not the failed one.
@@ -186,7 +212,10 @@ fn failed_warm_admission_releases_only_its_exact_token() {
     fs::write(root.join("extra.rs"), b"another source").unwrap();
     let changed = observation(&root);
     *facts.warming.lock().unwrap() = super::super::MAX_WARMING;
-    assert!(matches!(facts.package(&root, KIND, None), Err(FactsMiss::Pending)));
+    assert!(matches!(
+        facts.package(&root, KIND, None),
+        Err(FactsMiss::Pending)
+    ));
     let memos = facts.packages.lock().unwrap();
     assert!(original_owner.owns(&memos));
     assert!(!memos.contains_key(&changed));
@@ -206,10 +235,16 @@ fn stale_same_observation_token_cannot_overwrite_or_remove_its_successor() {
     // Inject eviction/retry of exactly the same generation, not changed bytes.
     facts.packages.lock().unwrap().remove(&observed);
     let successor = reserve(&facts, &observed);
-    assert!(matches!(stale.finish(observed.capture(), true), Err(FactsMiss::Pending)));
+    assert!(matches!(
+        stale.finish(observed.capture(), true),
+        Err(FactsMiss::Pending)
+    ));
     assert!(successor.owns(&facts.packages.lock().unwrap()));
     let captured = successor.finish(observed.capture(), true).unwrap();
-    assert!(Arc::ptr_eq(&captured, &facts.package(&root, KIND, None).unwrap()));
+    assert!(Arc::ptr_eq(
+        &captured,
+        &facts.package(&root, KIND, None).unwrap()
+    ));
 }
 
 #[test]
@@ -255,14 +290,20 @@ fn pending_observations_are_bounded_and_never_evicted_to_admit_more_work() {
         owners.push(reserve(&facts, &observation(&other)));
     }
     assert!(matches!(
-        observe_with(&facts, &root, KIND, None, |_| panic!("saturated capture ran")),
+        observe_with(&facts, &root, KIND, None, |_| panic!(
+            "saturated capture ran"
+        )),
         Err(FactsMiss::Pending)
     ));
     assert_eq!(facts.packages.lock().unwrap().len(), MAX_PACKAGE_MEMOS);
     drop(owners.pop());
     facts.package(&root, KIND, None).unwrap();
     assert_eq!(facts.packages.lock().unwrap().len(), MAX_PACKAGE_MEMOS);
-    assert!(owners.iter().all(|owner| owner.owns(&facts.packages.lock().unwrap())));
+    assert!(
+        owners
+            .iter()
+            .all(|owner| owner.owns(&facts.packages.lock().unwrap()))
+    );
 }
 
 #[test]
@@ -280,7 +321,13 @@ fn prospective_byte_limit_evicts_memo_references_not_subscribers_or_captures() {
     assert!(pending.owns(&memos));
     drop(memos);
     subscriber.verify_unchanged(&root).unwrap();
-    assert_eq!(subscriber.snapshot.file_bytes(super::super::PACKAGE_ROOT, "lib.rs").unwrap(), &[0; 17]);
+    assert_eq!(
+        subscriber
+            .snapshot
+            .file_bytes(super::super::PACKAGE_ROOT, "lib.rs")
+            .unwrap(),
+        &[0; 17]
+    );
 }
 
 #[test]
@@ -313,17 +360,21 @@ fn stamp_ready(facts: &Arc<LiveFacts>, root: &Path, stamp: Instant) {
 }
 
 fn retained_bytes(memos: &PackageMemos) -> u64 {
-    memos.values().map(|slot| match slot {
-        PackageSlot::Ready { captured, .. } => captured.bytes,
-        _ => 0,
-    }).sum()
+    memos
+        .values()
+        .map(|slot| match slot {
+            PackageSlot::Ready { captured, .. } => captured.bytes,
+            _ => 0,
+        })
+        .sum()
 }
 
 #[test]
 fn byte_pressure_preserves_hot_snapshots_and_only_recaptures_the_evicted_package() {
     let fixtures = [fixture(17), fixture(9), fixture(4), fixture(8)];
     let facts = LiveFacts::new();
-    let captured: Vec<_> = fixtures[..3].iter()
+    let captured: Vec<_> = fixtures[..3]
+        .iter()
         .map(|(_, root)| facts.package(root, KIND, None).unwrap())
         .collect();
     let base = Instant::now();
@@ -334,8 +385,12 @@ fn byte_pressure_preserves_hot_snapshots_and_only_recaptures_the_evicted_package
     let pending = reserve(&facts, &keys[3]);
     {
         let mut memos = facts.packages.lock().unwrap();
-        let reused = memos.get_mut(&keys[0]).unwrap()
-            .reuse(base + Duration::from_secs(1)).unwrap().unwrap();
+        let reused = memos
+            .get_mut(&keys[0])
+            .unwrap()
+            .reuse(base + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert!(Arc::ptr_eq(&reused, &captured[0]));
         assert!(make_byte_room(&mut memos, 6, 30));
         assert_eq!(retained_bytes(&memos), 21);
@@ -347,7 +402,8 @@ fn byte_pressure_preserves_hot_snapshots_and_only_recaptures_the_evicted_package
     for index in [0, 2] {
         let reused = observe_with(&facts, &fixtures[index].1, KIND, None, |_| {
             panic!("pressure discarded a retained hot snapshot")
-        }).unwrap();
+        })
+        .unwrap();
         assert!(Arc::ptr_eq(&reused, &captured[index]));
     }
     // Eviction dropped only the memo reference. An existing subscriber keeps
@@ -358,7 +414,8 @@ fn byte_pressure_preserves_hot_snapshots_and_only_recaptures_the_evicted_package
     let replacement = observe_with(&facts, &fixtures[1].1, KIND, None, move |observed| {
         count.fetch_add(1, Ordering::SeqCst);
         observed.capture()
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(!Arc::ptr_eq(&replacement, &captured[1]));
     assert_eq!(replacement.files, captured[1].files);
@@ -379,13 +436,26 @@ fn unequal_byte_victims_stop_at_the_budget_and_keep_zero_byte_snapshots() {
     assert!(make_byte_room(&mut memos, 20, 30));
     assert_eq!(retained_bytes(&memos), 9);
     assert_eq!(memos.len(), 2);
-    assert!(memos.contains_key(&keys[0]), "zero bytes cannot relieve byte pressure");
-    assert!(memos.contains_key(&keys[3]), "do not flush the last ready snapshot");
-    assert!(make_byte_room(&mut memos, 21, 30), "exact bound must retain both");
+    assert!(
+        memos.contains_key(&keys[0]),
+        "zero bytes cannot relieve byte pressure"
+    );
+    assert!(
+        memos.contains_key(&keys[3]),
+        "do not flush the last ready snapshot"
+    );
+    assert!(
+        make_byte_room(&mut memos, 21, 30),
+        "exact bound must retain both"
+    );
     assert_eq!(memos.len(), 2);
     assert!(!make_byte_room(&mut memos, 31, 30));
     assert!(!make_byte_room(&mut memos, u64::MAX, 30));
-    assert_eq!(memos.len(), 2, "unretainable incoming data must not flush the cache");
+    assert_eq!(
+        memos.len(),
+        2,
+        "unretainable incoming data must not flush the cache"
+    );
 }
 
 fn pressure_fixture() -> (tempfile::TempDir, Arc<LiveFacts>, Vec<PathBuf>) {
@@ -412,23 +482,35 @@ fn actual_entry_pressure_keeps_127_ready_snapshots_instead_of_flushing_them() {
     let keys: Vec<_> = roots.iter().map(|root| observation(root)).collect();
     let hot = {
         let mut memos = facts.packages.lock().unwrap();
-        memos.get_mut(&keys[0]).unwrap()
-            .reuse(Instant::now() + Duration::from_secs(1)).unwrap().unwrap()
+        memos
+            .get_mut(&keys[0])
+            .unwrap()
+            .reuse(Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
     };
-    facts.package(&roots[MAX_PACKAGE_MEMOS], KIND, None).unwrap();
+    facts
+        .package(&roots[MAX_PACKAGE_MEMOS], KIND, None)
+        .unwrap();
     {
         let memos = facts.packages.lock().unwrap();
         assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
-        assert!(!memos.contains_key(&keys[1]), "oldest unused snapshot is the sole victim");
+        assert!(
+            !memos.contains_key(&keys[1]),
+            "oldest unused snapshot is the sole victim"
+        );
         assert!(memos.contains_key(&keys[0]));
         assert_eq!(retained_bytes(&memos), MAX_PACKAGE_MEMOS as u64);
     }
     for index in (0..MAX_PACKAGE_MEMOS).filter(|index| *index != 1) {
         let reused = observe_with(&facts, &roots[index], KIND, None, |_| {
             panic!("entry pressure recaptured a surviving snapshot")
-        }).unwrap();
+        })
+        .unwrap();
         reused.verify_unchanged(&roots[index]).unwrap();
-        if index == 0 { assert!(Arc::ptr_eq(&reused, &hot)); }
+        if index == 0 {
+            assert!(Arc::ptr_eq(&reused, &hot));
+        }
     }
 }
 
@@ -439,21 +521,42 @@ fn retrying_an_expired_failure_at_capacity_does_not_evict_another_package() {
     let base = Instant::now();
     {
         let mut memos = facts.packages.lock().unwrap();
-        memos.insert(Arc::clone(&keys[0]), PackageSlot::Failed {
-            reason: "expired fixture failure".into(), at: base,
-        });
-        assert!(memos.get_mut(&keys[0]).unwrap().reuse(base + PROBE_RETRY).is_none());
+        memos.insert(
+            Arc::clone(&keys[0]),
+            PackageSlot::Failed {
+                reason: "expired fixture failure".into(),
+                at: base,
+            },
+        );
+        assert!(
+            memos
+                .get_mut(&keys[0])
+                .unwrap()
+                .reuse(base + PROBE_RETRY)
+                .is_none()
+        );
         assert!(make_entry_room(&mut memos, &keys[0], base + PROBE_RETRY));
         assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
-        assert!(keys[..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+        assert!(
+            keys[..MAX_PACKAGE_MEMOS]
+                .iter()
+                .all(|key| memos.contains_key(key))
+        );
     }
     // Drive the same reservation/finish path used after that expired lookup.
     let owner = reserve(&facts, &keys[0]);
     let captured = owner.finish(keys[0].capture(), false).unwrap();
-    assert!(Arc::ptr_eq(&captured, &facts.package(&roots[0], KIND, None).unwrap()));
+    assert!(Arc::ptr_eq(
+        &captured,
+        &facts.package(&roots[0], KIND, None).unwrap()
+    ));
     let memos = facts.packages.lock().unwrap();
     assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
-    assert!(keys[..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+    assert!(
+        keys[..MAX_PACKAGE_MEMOS]
+            .iter()
+            .all(|key| memos.contains_key(key))
+    );
 }
 
 #[test]
@@ -594,7 +697,11 @@ fn entry_pressure_prefers_expired_failures_and_preserves_live_backoff() {
     assert!(make_entry_room(&mut memos, &keys[MAX_PACKAGE_MEMOS], now));
     assert_eq!(memos.len(), MAX_PACKAGE_MEMOS - 1);
     assert!(!memos.contains_key(&keys[0]));
-    assert!(keys[1..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+    assert!(
+        keys[1..MAX_PACKAGE_MEMOS]
+            .iter()
+            .all(|key| memos.contains_key(key))
+    );
     assert!(matches!(memos.get_mut(&keys[1]).unwrap().reuse(now),
         Some(Err(FactsMiss::Refused(reason))) if reason == "live backoff"));
     memos.insert(
@@ -603,8 +710,14 @@ fn entry_pressure_prefers_expired_failures_and_preserves_live_backoff() {
     );
     assert!(make_entry_room(&mut memos, &keys[0], now));
     assert!(!memos.contains_key(&keys[2]), "oldest ready entry is next");
-    assert!(memos.contains_key(&keys[1]), "do not silently clear live backoff");
-    assert!(matches!(memos.get(&keys[MAX_PACKAGE_MEMOS]), Some(PackageSlot::Warming(_))));
+    assert!(
+        memos.contains_key(&keys[1]),
+        "do not silently clear live backoff"
+    );
+    assert!(matches!(
+        memos.get(&keys[MAX_PACKAGE_MEMOS]),
+        Some(PackageSlot::Warming(_))
+    ));
 }
 
 #[test]

@@ -10,12 +10,16 @@
 //! gone, a few per cycle, backing off per lease after a failure.
 //! Source retirement can precede the daemon handoff: those unacknowledged
 //! journals still need recovery, even though no worker filesystem work remains.
+//! Older acknowledged cancellations also remain candidates until their exact
+//! worker-side cancellation state has been reconciled (#111).
 
 #[cfg(test)]
 use crate::api::is_process_alive;
 use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
-use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
+use rch_common::job_identity::{
+    DurableJobLease, default_job_lease_directory, source_recovery_resources_retired,
+};
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -29,6 +33,9 @@ use tracing::{info, warn};
 
 /// How often the lease directory is checked for recoverable leases.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Do not contend with a just-finished wrapper's journal. This is a scheduling
+/// grace only; activity-lock and durable worker receipts authorize settlement.
+const TERMINAL_CANCELLATION_GRACE_MS: u64 = 15 * 60 * 1000;
 /// Bound both starts per scan interval and total in-flight recovery clients.
 /// A worker gets at most one client, so a stalled worker cannot consume every
 /// lane or serialize independent workers behind its timeout.
@@ -51,21 +58,42 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
     let recipe = lease.recovery.as_ref()?;
     let build_id = lease.identity.remote_build_id.filter(|id| *id > 0)?;
     let worker = lease.worker_id.as_deref().filter(|id| !id.is_empty())?;
-    let roots = recipe["source_roots"].as_array()?;
     if recipe["version"].as_u64() != Some(2)
         || recipe["wrapper_id"].as_str() != Some(lease.identity.local_wrapper_id.as_str())
         || recipe["build_id"].as_u64() != Some(build_id)
         || recipe["worker"]["id"].as_str() != Some(worker)
         || recipe["retired"].as_bool() != Some(true)
-        || (!roots.is_empty() && recipe["sources_released"].as_bool() != Some(true))
-        || (!recipe["pair"].is_null() && recipe["pair_released"].as_bool() != Some(true))
-        || (!recipe["retire_root"].is_null() && recipe["tree_retired"].as_bool() != Some(true))
+        || !source_recovery_resources_retired(recipe)
     {
         return None;
     }
     recipe["returned"]
         .as_i64()
         .and_then(|code| i32::try_from(code).ok())
+}
+
+fn source_cancellation_pending(recipe: &serde_json::Value) -> Option<bool> {
+    let preparation_cancelled = match recipe.get("preparation_cancelled") {
+        None => false,
+        Some(serde_json::Value::Bool(cancelled)) => *cancelled,
+        _ => return None,
+    };
+    match recipe.get("source_cancellation_settled") {
+        None | Some(serde_json::Value::Null) => Some(preparation_cancelled),
+        Some(serde_json::Value::Bool(settled)) => Some(!settled),
+        _ => None,
+    }
+}
+
+fn terminal_cancellation_unsettled(lease: &DurableJobLease) -> bool {
+    lease
+        .recovery
+        .as_ref()
+        .and_then(source_cancellation_pending)
+        == Some(true)
+        && lease.terminal_acknowledged
+        && lease.state == rch_common::job_identity::JobLifecycleState::Finished
+        && retired_delivery(lease).is_some_and(|exit| exit != 0 && lease.exit_code == Some(exit))
 }
 
 /// Matches rchd's stuck-build hard cap (`should_remediate`) and the client's
@@ -95,6 +123,92 @@ fn verify_recovery_completion(
         || before.command_fingerprint != after.command_fingerprint
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
+    }
+    let before_namespace =
+        before.recovery.as_ref().map_or(
+            &serde_json::Value::Null,
+            |recipe| &recipe["source_authority_namespace"],
+        );
+    let after_namespace =
+        after.recovery.as_ref().map_or(
+            &serde_json::Value::Null,
+            |recipe| &recipe["source_authority_namespace"],
+        );
+    let valid_namespace = |value: &serde_json::Value| {
+        value.is_null() || matches!(value.as_str(), Some("current" | "legacy"))
+    };
+    if !valid_namespace(before_namespace)
+        || !valid_namespace(after_namespace)
+        || (!before_namespace.is_null() && before_namespace != after_namespace)
+    {
+        return Err("source ownership namespace changed or is malformed".into());
+    }
+    if let Some(recipe) = after.recovery.as_ref() {
+        // Discovery can add an obligation after this daemon selected an
+        // ordinary unacknowledged handoff. Re-read that obligation too: an
+        // acknowledged CLI result cannot conceal a pending cancellation.
+        match source_cancellation_pending(recipe) {
+            Some(false) => {}
+            Some(true) => {
+                return Err("recovery command left worker cancellation unsettled".into());
+            }
+            None => return Err("recovery command left malformed cancellation evidence".into()),
+        }
+        if recipe["source_cancellation_settled"].as_bool() == Some(true) {
+            if !retired_delivery(after).is_some_and(|exit| exit != 0) {
+                return Err(
+                    "worker cancellation settlement contradicts retired failed delivery".into(),
+                );
+            }
+            if recipe["source_roots"]
+                .as_array()
+                .is_some_and(|roots| !roots.is_empty())
+                && !matches!(after_namespace.as_str(), Some("current" | "legacy"))
+            {
+                return Err("worker cancellation settlement has no exact source namespace".into());
+            }
+        }
+    }
+    if terminal_cancellation_unsettled(before) {
+        // This lease already completed daemon accounting. The only remaining
+        // obligation is worker cancellation; a zero CLI exit with the old
+        // terminal flags is exactly the false success reported in #111.
+        let before_recipe = before.recovery.as_ref().expect("validated cancellation");
+        let Some(after_recipe) = after.recovery.as_ref() else {
+            return Err("terminal cancellation lost its recovery recipe".into());
+        };
+        if after_recipe["source_cancellation_settled"].as_bool() != Some(true)
+            || (after_recipe["source_roots"]
+                .as_array()
+                .is_some_and(|roots| !roots.is_empty())
+                && !matches!(after_namespace.as_str(), Some("current" | "legacy")))
+            || !after.terminal_acknowledged
+            || after.state != before.state
+            || after.exit_code != before.exit_code
+            || retired_delivery(after) != before.exit_code
+            || [
+                "identity",
+                "worker",
+                "source_roots",
+                "completion",
+                "pair",
+                "retire_root",
+                "retained_root",
+                "retained_materialized",
+                "sources_released",
+                "tree_retired",
+                "pair_released",
+                "execution_started",
+                "preparation_cancelled",
+            ]
+            .iter()
+            .any(|key| before_recipe[*key] != after_recipe[*key])
+        {
+            return Err(
+                "terminal cancellation exited without exact worker settlement evidence".into(),
+            );
+        }
+        return Ok(());
     }
     if before.recovery.is_none() && after.recovery.is_none() {
         if before.heartbeat_unix_ms == 0
@@ -168,9 +282,10 @@ struct RecoveryCandidate {
     heartbeat_unix_ms: u64,
 }
 
-/// Only dead, stale, unacknowledged source owners or pending daemon handoffs
-/// enter the queue. Unreadable/noncanonical journals are not execution authority;
-/// the separate restart scan retains its fail-closed treatment of bad evidence.
+/// Only dead, stale source owners, pending daemon handoffs, or acknowledged
+/// cancellations lacking worker settlement enter the queue. Unreadable or
+/// noncanonical journals are not execution authority; the separate restart
+/// scan retains its fail-closed treatment of bad evidence.
 fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
@@ -191,6 +306,15 @@ fn recoverable_candidates(
         })
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
+            if terminal_cancellation_unsettled(lease) {
+                // lease_blocks_restart deliberately ignores terminal leases.
+                // Recovery must still exclude live or unverified wrappers.
+                return presence(lease) == OwnerPresence::Absent
+                    && lease.heartbeat_unix_ms > 0
+                    && (lease.heartbeat_unix_ms > now_unix_ms
+                        || now_unix_ms.saturating_sub(lease.heartbeat_unix_ms)
+                            >= TERMINAL_CANCELLATION_GRACE_MS);
+            }
             !lease.terminal_acknowledged
                 && (lease_owns_unretired_source(lease)
                     || retired_delivery(lease).is_some()
@@ -895,6 +1019,289 @@ mod tests {
         after.exit_code = Some(exit);
         after.acknowledge_terminal(before.heartbeat_unix_ms + 1);
         after
+    }
+
+    fn terminal_cancellation_lease(stale: u64, pid: u32) -> DurableJobLease {
+        let mut before = handoff_lease(stale, pid, 1);
+        let recipe = before.recovery.as_mut().unwrap();
+        recipe["identity"] = serde_json::json!("0123456789abcdef0123456789abcdef");
+        recipe["preparation_cancelled"] = serde_json::json!(true);
+        recipe["tree_retired"] = serde_json::json!(true);
+        recipe["pair_released"] = serde_json::json!(true);
+        // Live wrappers historically acknowledged without a detached daemon
+        // receipt in the recipe. Their worker settlement is independent.
+        before.exit_code = Some(1);
+        before.acknowledge_terminal(stale);
+        before
+    }
+
+    #[test]
+    fn acknowledged_cancellations_are_recovered_after_restart_until_worker_settlement() {
+        let dir = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let stale = now - 60 * 60 * 1000;
+        let legacy = terminal_cancellation_lease(stale, 11);
+        let mut interrupted = terminal_cancellation_lease(stale, 12);
+        interrupted.recovery.as_mut().unwrap()["preparation_cancelled"] = serde_json::json!(false);
+        interrupted.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(false);
+        let live = terminal_cancellation_lease(stale, 22);
+        let unknown = terminal_cancellation_lease(stale, 33);
+        let fresh = terminal_cancellation_lease(now, 11);
+        let mut settled = terminal_cancellation_lease(stale, 11);
+        settled.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        let ordinary = completed_lease(&handoff_lease(stale, 11, 102), 102, 102);
+        let mut incomplete = terminal_cancellation_lease(stale, 11);
+        incomplete.recovery.as_mut().unwrap()["retire_root"] = serde_json::json!("/unretired-tree");
+        incomplete.recovery.as_mut().unwrap()["tree_retired"] = serde_json::json!(false);
+        for candidate in [
+            &legacy,
+            &interrupted,
+            &live,
+            &unknown,
+            &fresh,
+            &settled,
+            &ordinary,
+            &incomplete,
+        ] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", candidate.identity.local_wrapper_id)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
+        }
+        let presence = |lease: &DurableJobLease| match lease.wrapper_pid {
+            22 => OwnerPresence::Live,
+            33 => OwnerPresence::Unknown,
+            _ => OwnerPresence::Absent,
+        };
+        let mut expected = vec![
+            legacy.identity.local_wrapper_id.clone(),
+            interrupted.identity.local_wrapper_id.clone(),
+        ];
+        expected.sort();
+        for _restart in 0..2 {
+            let candidates = recoverable_candidates(dir.path(), now, presence);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.wrapper_id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cancellation_recovery_preserves_absent_resource_defaults_after_restart() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let stale = now - 60 * 60 * 1000;
+        let mut expected = Vec::new();
+        let mut journals = Vec::new();
+        for explicit_defaults in [false, true] {
+            for explicit_pending in [false, true] {
+                let mut before = terminal_cancellation_lease(stale, 11);
+                let recipe = before.recovery.as_mut().unwrap();
+                if explicit_defaults {
+                    recipe["pair"] = serde_json::Value::Null;
+                    recipe["retire_root"] = serde_json::Value::Null;
+                    recipe["pair_released"] = serde_json::json!(false);
+                    recipe["tree_retired"] = serde_json::json!(false);
+                } else {
+                    recipe.as_object_mut().unwrap().remove("pair_released");
+                    recipe.as_object_mut().unwrap().remove("tree_retired");
+                }
+                if explicit_pending {
+                    recipe["preparation_cancelled"] = serde_json::json!(false);
+                    recipe["source_cancellation_settled"] = serde_json::json!(false);
+                }
+                recipe["future_custody"] = serde_json::json!({"keep": "original"});
+                assert_eq!(retired_delivery(&before), Some(1));
+                assert!(terminal_cancellation_unsettled(&before));
+                assert!(verify_recovery_completion(&before, &before).is_err());
+
+                let mut after = before.clone();
+                after.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+                    serde_json::json!(true);
+                after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                    serde_json::json!("current");
+                verify_recovery_completion(&before, &after).unwrap();
+                assert!(!terminal_cancellation_unsettled(&after));
+
+                let path = directory
+                    .path()
+                    .join(format!("{}.json", before.identity.local_wrapper_id));
+                let bytes = serde_json::to_vec(&before).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                expected.push(before.identity.local_wrapper_id);
+                journals.push((path, bytes));
+            }
+        }
+        expected.sort();
+        for _restart in 0..2 {
+            assert_eq!(
+                recoverable_candidates(directory.path(), now, |_| OwnerPresence::Absent)
+                    .into_iter()
+                    .map(|candidate| candidate.wrapper_id)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            for (path, bytes) in &journals {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn retired_delivery_refuses_live_and_malformed_resource_evidence() {
+        let before = handoff_lease(1, 11, 137);
+        let complete = completed_lease(&before, 137, 137);
+        verify_recovery_completion(&before, &complete).unwrap();
+        for (key, value) in [
+            ("source_roots", serde_json::Value::Null),
+            ("source_roots", serde_json::json!("/p")),
+            ("source_roots", serde_json::json!([null])),
+            ("source_roots", serde_json::json!([""])),
+            ("source_roots", serde_json::json!(["/p\nother"])),
+            ("sources_released", serde_json::json!(false)),
+            ("sources_released", serde_json::Value::Null),
+            ("pair", serde_json::json!(["/p", "aa"])),
+            ("pair", serde_json::json!(["/p"])),
+            ("pair", serde_json::json!(["/p", false])),
+            ("pair_released", serde_json::Value::Null),
+            ("pair_released", serde_json::json!("true")),
+            ("retire_root", serde_json::json!("/p")),
+            ("retire_root", serde_json::json!([])),
+            ("tree_retired", serde_json::Value::Null),
+        ] {
+            let mut after = complete.clone();
+            after.recovery.as_mut().unwrap()[key] = value;
+            let unchanged = after.clone();
+            assert!(retired_delivery(&after).is_none(), "{key}");
+            assert!(
+                verify_recovery_completion(&before, &after).is_err(),
+                "{key}"
+            );
+            assert_eq!(after, unchanged);
+        }
+    }
+
+    #[test]
+    fn handoff_completion_refuses_new_pending_or_malformed_cancellation() {
+        let before = handoff_lease(1, 11, 137);
+        let mut complete = completed_lease(&before, 137, 130);
+        complete.recovery.as_mut().unwrap()["preparation_cancelled"] = serde_json::json!(false);
+        complete.recovery.as_mut().unwrap()["source_authority_namespace"] =
+            serde_json::json!("current");
+        verify_recovery_completion(&before, &complete).unwrap();
+        for (key, value) in [
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_cancellation_settled", serde_json::json!("true")),
+            ("source_cancellation_settled", serde_json::json!(0)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("preparation_cancelled", serde_json::Value::Null),
+            ("preparation_cancelled", serde_json::json!("false")),
+        ] {
+            let mut after = complete.clone();
+            after.recovery.as_mut().unwrap()[key] = value;
+            let unchanged = after.clone();
+            assert!(after.terminal_acknowledged);
+            assert!(
+                verify_recovery_completion(&before, &after).is_err(),
+                "{key}"
+            );
+            assert_eq!(after, unchanged);
+        }
+        complete.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(true);
+        verify_recovery_completion(&before, &complete).unwrap();
+        let mut unbound = complete.clone();
+        unbound.recovery.as_mut().unwrap()["source_authority_namespace"] = serde_json::Value::Null;
+        assert!(verify_recovery_completion(&before, &unbound).is_err());
+        let mut no_source_before = before.clone();
+        no_source_before.recovery.as_mut().unwrap()["source_roots"] = serde_json::json!([]);
+        let mut local_settlement = completed_lease(&no_source_before, 137, 130);
+        local_settlement.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(true);
+        verify_recovery_completion(&no_source_before, &local_settlement).unwrap();
+        let mut false_success = complete;
+        false_success.recovery.as_mut().unwrap()["returned"] = serde_json::json!(0);
+        false_success.exit_code = Some(0);
+        assert!(verify_recovery_completion(&before, &false_success).is_err());
+    }
+
+    #[test]
+    fn terminal_cancellation_recovery_requires_new_exact_worker_evidence() {
+        let before = terminal_cancellation_lease(1, 11);
+        assert!(verify_recovery_completion(&before, &before).is_err());
+        let mut after = before.clone();
+        after.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+            serde_json::json!("current");
+        verify_recovery_completion(&before, &after).unwrap();
+        for (key, value) in [
+            ("source_cancellation_settled", serde_json::json!("true")),
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("source_authority_namespace", serde_json::json!(null)),
+            ("source_authority_namespace", serde_json::json!("elsewhere")),
+            ("source_authority_namespace", serde_json::json!(false)),
+            ("identity", serde_json::json!("another-attempt")),
+            ("source_roots", serde_json::json!(["/another-project"])),
+            (
+                "worker",
+                serde_json::json!({"id":"worker1", "host":"other"}),
+            ),
+            ("tree_retired", serde_json::json!(false)),
+            ("returned", serde_json::json!(0)),
+        ] {
+            let mut changed = after.clone();
+            changed.recovery.as_mut().unwrap()[key] = value;
+            assert!(
+                verify_recovery_completion(&before, &changed).is_err(),
+                "{key}"
+            );
+        }
+        let mut changed = after;
+        changed.exit_code = Some(0);
+        assert!(verify_recovery_completion(&before, &changed).is_err());
+    }
+
+    #[test]
+    fn terminal_recovery_can_bind_legacy_namespace_but_never_change_it() {
+        for namespace in ["current", "legacy"] {
+            let before = terminal_cancellation_lease(1, 11);
+            let mut after = before.clone();
+            after.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+                serde_json::json!(true);
+            after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(namespace);
+            verify_recovery_completion(&before, &after).unwrap();
+            let mut bound = before;
+            bound.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(namespace);
+            verify_recovery_completion(&bound, &after).unwrap();
+            after.recovery.as_mut().unwrap()["source_authority_namespace"] =
+                serde_json::json!(if namespace == "current" {
+                    "legacy"
+                } else {
+                    "current"
+                });
+            assert!(verify_recovery_completion(&bound, &after).is_err());
+        }
+        let mut empty = terminal_cancellation_lease(1, 11);
+        empty.recovery.as_mut().unwrap()["source_roots"] = serde_json::json!([]);
+        let mut settled = empty.clone();
+        settled.recovery.as_mut().unwrap()["source_cancellation_settled"] = serde_json::json!(true);
+        verify_recovery_completion(&empty, &settled).unwrap();
+        assert!(settled.recovery.as_ref().unwrap()["source_authority_namespace"].is_null());
     }
 
     #[test]

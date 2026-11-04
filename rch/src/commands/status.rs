@@ -1293,8 +1293,12 @@ fn no_admissible_rejection_summary(
             _ => return None,
         };
         rejected = rejected.checked_add(count)?;
-        *by_category.entry(category.as_str().to_string()).or_insert(0) += count;
-        *by_class.entry(category.class().as_str().to_string()).or_insert(0) += count;
+        *by_category
+            .entry(category.as_str().to_string())
+            .or_insert(0) += count;
+        *by_class
+            .entry(category.class().as_str().to_string())
+            .or_insert(0) += count;
     }
     if rejected == 0 {
         return None;
@@ -1477,7 +1481,11 @@ pub async fn admit(
                 Ok(preview) => {
                     recommendation =
                         refine_admit_from_selection(pf.base_recommendation, &preview.selection);
-                    observation = if recommendation.is_some() { "observed" } else { "unknown" };
+                    observation = if recommendation.is_some() {
+                        "observed"
+                    } else {
+                        "unknown"
+                    };
                     live_selection = Some(preview.selection);
                 }
                 Err(error) => {
@@ -1511,8 +1519,12 @@ pub async fn admit(
             Some(value) => {
                 let r = value.as_str();
                 match value {
-                    rch_common::admit_preflight::AdmitRecommendation::Offload => style.format_success(r),
-                    rch_common::admit_preflight::AdmitRecommendation::Local => style.format_warning(r),
+                    rch_common::admit_preflight::AdmitRecommendation::Offload => {
+                        style.format_success(r)
+                    }
+                    rch_common::admit_preflight::AdmitRecommendation::Local => {
+                        style.format_warning(r)
+                    }
                     _ => style.value(r).to_string(),
                 }
             }
@@ -1558,11 +1570,19 @@ pub async fn admit(
             style.value(&selection.reason.to_string())
         );
         if let Some(worker) = selection.worker.as_ref() {
-            println!("{} {}", style.key("Worker:"), style.value(worker.id.as_str()));
+            println!(
+                "{} {}",
+                style.key("Worker:"),
+                style.value(worker.id.as_str())
+            );
         }
     }
     if let Some(error) = observation_error.as_deref() {
-        println!("{} {}", style.key("Observation error:"), style.warning(error));
+        println!(
+            "{} {}",
+            style.key("Observation error:"),
+            style.warning(error)
+        );
     }
     println!();
     println!("{}", style.muted(&pf.detail));

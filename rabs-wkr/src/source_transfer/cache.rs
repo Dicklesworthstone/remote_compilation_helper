@@ -5,17 +5,22 @@
 //! eviction, corruption, and a busy writer only cost another source upload.
 //! The directory is scoped to one trusted worker administrative domain.
 
-use rabs_sandbox::source_transfer::{SourceFile, SourceReceiver};
+use rabs_sandbox::source_transfer::{
+    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SourceFile, SourceReceiver,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-const MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Retain one maximum-size source/dependency projection by default.
+pub const DEFAULT_SOURCE_CACHE_BYTES: u64 = MAX_SOURCE_BYTES;
+/// Explicit disk bound, independent of the maximum size of one input object.
+pub const MAX_SOURCE_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_FILES: usize = 4096;
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = MAX_SOURCE_BYTES;
 const INCOMING: &str = "incoming";
 
 fn invalid(message: &str) -> io::Error {
@@ -66,6 +71,36 @@ fn same_inode(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
+fn same_state(a: &Metadata, b: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same_inode(a, b)
+            && a.len() == b.len()
+            && a.mode() == b.mode()
+            && a.nlink() == b.nlink()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+fn within_budget(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "source upload deadline exceeded during cache I/O",
+        ));
+    }
+    Ok(())
+}
+
 fn object_name(digest: &[u8; 32]) -> String {
     format!("{}.src", super::hex(digest))
 }
@@ -78,34 +113,114 @@ fn owned_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
-/// The bound is checked before allocating, and the descriptor is checked against
-/// the named inode. No mtime, filename, or former successful upload is a hit.
-fn read_verified(path: &Path, expected: &SourceFile) -> io::Result<(File, Vec<u8>)> {
+/// Stream exactly the declared bytes plus one bounded EOF check. The destination
+/// is private scratch, never an execution receiver. Source and storage failures
+/// remain distinct so optional cache writes cannot hide a changed sealed input.
+fn copy_verified(
+    path: &Path,
+    expected: &SourceFile,
+    deadline: Option<Instant>,
+    output: &mut impl Write,
+) -> Result<File, RememberError> {
+    within_budget(deadline)?;
     if expected.len > MAX_FILE_BYTES {
-        return Err(invalid("source object exceeds the per-file reuse bound"));
+        return Err(RememberError::Source(invalid(
+            "source object exceeds the per-file reuse bound",
+        )));
     }
-    let named = fs::symlink_metadata(path)?;
+    let named = fs::symlink_metadata(path).map_err(RememberError::Source)?;
     if !ordinary(&named) || named.len() != expected.len {
-        return Err(invalid("source object has an unexpected type or length"));
+        return Err(RememberError::Source(invalid(
+            "source object has an unexpected type or length",
+        )));
     }
-    let mut input = File::open(path)?;
-    let before = input.metadata()?;
-    if !ordinary(&before) || !same_inode(&named, &before) || before.len() != expected.len {
-        return Err(invalid("source object changed while opening"));
+    #[cfg(target_os = "linux")]
+    let mut input = File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| RememberError::Source(error.into()))?,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let mut input = File::open(path).map_err(RememberError::Source)?;
+    let before = input.metadata().map_err(RememberError::Source)?;
+    if !ordinary(&before) || !same_state(&named, &before) {
+        return Err(RememberError::Source(invalid(
+            "source object changed while opening",
+        )));
     }
-    let mut bytes = Vec::new();
-    (&mut input)
-        .take(expected.len + 1)
-        .read_to_end(&mut bytes)?;
-    let after = input.metadata()?;
-    if !ordinary(&after)
-        || after.len() != expected.len
-        || bytes.len() as u64 != expected.len
-        || <[u8; 32]>::from(Sha256::digest(&bytes)) != expected.sha256
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+    let mut remaining = expected.len;
+    while remaining != 0 {
+        within_budget(deadline)?;
+        let count = remaining.min(buffer.len() as u64) as usize;
+        input
+            .read_exact(&mut buffer[..count])
+            .map_err(RememberError::Source)?;
+        hash.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    within_budget(deadline)?;
+    if input
+        .read(&mut buffer[..1])
+        .map_err(RememberError::Source)?
+        != 0
+        || !same_state(&before, &input.metadata().map_err(RememberError::Source)?)
+        || !same_state(
+            &before,
+            &fs::symlink_metadata(path).map_err(RememberError::Source)?,
+        )
+        || <[u8; 32]>::from(hash.finalize()) != expected.sha256
     {
-        return Err(invalid("source object content verification failed"));
+        return Err(RememberError::Source(invalid(
+            "source object content verification failed",
+        )));
     }
-    Ok((input, bytes))
+    Ok(input)
+}
+
+/// An anonymous, independently owned snapshot of a completely verified object.
+/// Cache replacement after lookup cannot change these bytes. Only this type can
+/// begin populating the receiver, and it never allocates an object-sized buffer.
+#[derive(Debug)]
+pub(super) struct VerifiedSource {
+    file: File,
+    expected: SourceFile,
+    deadline: Option<Instant>,
+}
+
+impl VerifiedSource {
+    pub(super) fn install(mut self, receiver: &mut SourceReceiver) -> io::Result<()> {
+        let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+        let mut offset = 0_u64;
+        while offset < self.expected.len {
+            within_budget(self.deadline)?;
+            let count = (self.expected.len - offset).min(buffer.len() as u64) as usize;
+            self.file.read_exact(&mut buffer[..count])?;
+            receiver.write_chunk(
+                &self.expected.path,
+                offset,
+                &buffer[..count],
+                Sha256::digest(&buffer[..count]).into(),
+            )?;
+            offset += count as u64;
+        }
+        within_budget(self.deadline)
+    }
+
+    #[cfg(test)]
+    fn bytes(mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
 }
 
 struct Entry {
@@ -117,10 +232,11 @@ struct Entry {
 /// A path is only configuration, never an input capability. The cache owns a
 /// dedicated namespace below an explicitly configured private directory.
 #[derive(Debug, Clone)]
-pub(super) struct SourceCache {
+pub struct SourceCache {
     root: PathBuf,
     max_bytes: u64,
     max_files: usize,
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -137,15 +253,16 @@ impl From<io::Error> for RememberError {
 }
 
 impl SourceCache {
-    pub(super) fn configured() -> io::Result<Option<Self>> {
-        std::env::var_os("RABS_SOURCE_CACHE_DIR")
-            .map(|root| Self::open(Path::new(&root)))
-            .transpose()
-    }
-
-    pub(super) fn open(parent: &Path) -> io::Result<Self> {
+    /// Open a private, disposable input cache below an existing worker-owned
+    /// directory. A zero capacity is configured by omitting this cache entirely.
+    pub fn open(parent: &Path, max_bytes: u64) -> io::Result<Self> {
         if !parent.is_absolute() {
-            return Err(invalid("RABS_SOURCE_CACHE_DIR must be absolute"));
+            return Err(invalid("source cache directory must be absolute"));
+        }
+        if max_bytes == 0 || max_bytes > MAX_SOURCE_CACHE_BYTES {
+            return Err(invalid(
+                "source cache capacity must be between 1 and 8589934592 bytes",
+            ));
         }
         private_directory(parent)?;
         let root = fs::canonicalize(parent)?.join("source-files-v1");
@@ -163,22 +280,58 @@ impl SourceCache {
         private_directory(&root)?;
         Ok(Self {
             root,
-            max_bytes: MAX_BYTES,
+            max_bytes,
             max_files: MAX_FILES,
+            deadline: None,
         })
+    }
+
+    pub(super) fn before(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// An unavailable or corrupt object is a MISS before any staging write.
     /// Recency is eviction policy only; it never establishes content identity.
-    pub(super) fn load(&self, expected: &SourceFile) -> Option<Vec<u8>> {
+    pub(super) fn load(&self, expected: &SourceFile) -> Option<VerifiedSource> {
+        if expected.len > self.max_bytes || expected.len > MAX_FILE_BYTES {
+            return None;
+        }
+        within_budget(self.deadline).ok()?;
         private_directory(&self.root).ok()?;
-        let (file, bytes) =
-            read_verified(&self.root.join(object_name(&expected.sha256)), expected).ok()?;
+        let mut snapshot = tempfile::tempfile_in(&self.root).ok()?;
+        let file = copy_verified(
+            &self.root.join(object_name(&expected.sha256)),
+            expected,
+            self.deadline,
+            &mut snapshot,
+        )
+        .ok()?;
+        snapshot.rewind().ok()?;
+        within_budget(self.deadline).ok()?;
         let _ = file.set_modified(SystemTime::now());
-        Some(bytes)
+        Some(VerifiedSource {
+            file: snapshot,
+            expected: expected.clone(),
+            deadline: self.deadline,
+        })
+    }
+
+    fn contains_verified(&self, expected: &SourceFile) -> bool {
+        let Ok(file) = copy_verified(
+            &self.root.join(object_name(&expected.sha256)),
+            expected,
+            self.deadline,
+            &mut io::sink(),
+        ) else {
+            return false;
+        };
+        let _ = file.set_modified(SystemTime::now());
+        true
     }
 
     fn writer(&self) -> io::Result<Option<File>> {
+        within_budget(self.deadline)?;
         private_directory(&self.root)?;
         let path = self.root.join("lock");
         match fs::symlink_metadata(&path) {
@@ -220,12 +373,13 @@ impl SourceCache {
         }
         let mut entries = Vec::new();
         for item in fs::read_dir(&self.root)? {
+            within_budget(self.deadline)?;
             let item = item?;
             let name = item.file_name();
             if name == "lock" {
                 continue;
             }
-            if entries.len() >= self.max_files
+            if entries.len() >= MAX_FILES
                 || !name.to_str().is_some_and(owned_name)
                 || !ordinary(&fs::symlink_metadata(item.path())?)
             {
@@ -267,6 +421,17 @@ impl SourceCache {
             sum.checked_add(entry.bytes)
                 .ok_or_else(|| invalid("source cache size overflow"))
         })?;
+        // A restarted worker may deliberately lower its disk allowance. Apply
+        // that limit before protecting this projection's hits, including when
+        // every requested object was already present in the older cache.
+        while total > self.max_bytes || entries.len() > self.max_files {
+            within_budget(self.deadline)?;
+            let entry = entries
+                .pop_front()
+                .ok_or_else(|| invalid("source cache capacity accounting is inconsistent"))?;
+            fs::remove_file(&entry.path)?;
+            total -= entry.bytes;
+        }
         let mut protected = BTreeMap::new();
         let mut missing = Vec::new();
         // Decide the whole projection's existing-hit set before any eviction.
@@ -274,10 +439,11 @@ impl SourceCache {
         // paths sort that way. A filename alone is never protection evidence:
         // corrupt objects must remain evictable/repairable, not occupy credit.
         for expected in receiver.manifest().files() {
+            within_budget(self.deadline)?;
             if expected.len == 0 || expected.len > MAX_FILE_BYTES || expected.len > self.max_bytes {
                 continue;
             }
-            if self.load(expected).is_some() {
+            if self.contains_verified(expected) {
                 protected.insert(self.root.join(object_name(&expected.sha256)), expected.len);
             } else {
                 missing.push(expected);
@@ -289,6 +455,7 @@ impl SourceCache {
         })?;
         let mut stored = 0;
         for expected in missing {
+            within_budget(self.deadline)?;
             let destination = self.root.join(object_name(&expected.sha256));
             if let Some(bytes) = protected.get(&destination) {
                 if *bytes != expected.len {
@@ -300,17 +467,42 @@ impl SourceCache {
                 // object admitted earlier in this call consumes only one slot.
                 continue;
             }
-            let (_, bytes) = read_verified(&root.join(&expected.path), expected)
-                .map_err(RememberError::Source)?;
-            let Some(next_protected_bytes) = protected_bytes
+            let next_protected_bytes = protected_bytes
                 .checked_add(expected.len)
-                .filter(|sum| *sum <= self.max_bytes)
-            else {
+                .filter(|sum| *sum <= self.max_bytes && protected.len() < self.max_files);
+            let Some(next_protected_bytes) = next_protected_bytes else {
+                // Capacity pressure must not hide mutation of a sealed source.
+                // Verify without allocating or writing an unnecessary spool.
+                copy_verified(
+                    &root.join(&expected.path),
+                    expected,
+                    self.deadline,
+                    &mut io::sink(),
+                )?;
                 continue;
             };
-            if protected.len() >= self.max_files {
-                continue;
+            // One fixed scratch name plus the held process-shared lock bounds
+            // crash debris and serializes capacity accounting across workers.
+            // Verify the complete source before evicting useful cache objects.
+            let scratch = self.root.join(INCOMING);
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
+            let mut file = options.open(&scratch)?;
+            copy_verified(
+                &root.join(&expected.path),
+                expected,
+                self.deadline,
+                &mut file,
+            )?;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_readonly(true);
+            file.set_permissions(permissions)?;
+            drop(file);
             // Establish that this object can fit WITHOUT sacrificing this
             // projection's useful bytes before removing any cache entry. If
             // it cannot, even unrelated LRU entries should remain untouched.
@@ -328,6 +520,7 @@ impl SourceCache {
                     .checked_add(expected.len)
                     .is_none_or(|sum| sum > self.max_bytes)
             {
+                within_budget(self.deadline)?;
                 let index = entries
                     .iter()
                     .position(|entry| !protected.contains_key(&entry.path))
@@ -338,22 +531,7 @@ impl SourceCache {
                 fs::remove_file(&entry.path)?;
                 total -= entry.bytes;
             }
-            // One fixed scratch name plus the held process-shared lock bounds
-            // crash debris and serializes capacity accounting across workers.
-            let scratch = self.root.join(INCOMING);
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&scratch)?;
-            file.write_all(&bytes)?;
-            let mut permissions = file.metadata()?.permissions();
-            permissions.set_readonly(true);
-            file.set_permissions(permissions)?;
-            drop(file);
+            within_budget(self.deadline)?;
             fs::rename(&scratch, &destination)?;
             total += expected.len;
             protected_bytes = next_protected_bytes;
@@ -394,9 +572,14 @@ mod tests {
         .unwrap();
         let mut receiver = SourceReceiver::create(&parent.join("workspace"), manifest).unwrap();
         for (path, bytes) in files {
-            if !bytes.is_empty() {
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
                 receiver
-                    .write_chunk(path, 0, bytes, Sha256::digest(bytes).into())
+                    .write_chunk(
+                        path,
+                        (index * MAX_SOURCE_CHUNK) as u64,
+                        chunk,
+                        Sha256::digest(chunk).into(),
+                    )
                     .unwrap();
             }
         }
@@ -416,13 +599,13 @@ mod tests {
         let input = private();
         let source = staged(input.path(), &[("lib.rs", b"A\0\xffB")]);
         let expected = source.manifest().files()[0].clone();
-        let cache = SourceCache::open(parent.path()).unwrap();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         assert_eq!(cache.remember(&source).unwrap(), 1);
-        let cache = SourceCache::open(parent.path()).unwrap();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         let mut projected = expected.clone();
         projected.path = "different/name.rs".into();
         projected.executable = true;
-        let bytes = cache.load(&projected).unwrap();
+        let bytes = cache.load(&projected).unwrap().bytes();
         assert_eq!(bytes, b"A\0\xffB");
         let next = private();
         let mut receiver = SourceReceiver::create(
@@ -442,7 +625,7 @@ mod tests {
         );
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&installed, b"changed").unwrap();
-        assert_eq!(cache.load(&expected).unwrap(), b"A\0\xffB");
+        assert_eq!(cache.load(&expected).unwrap().bytes(), b"A\0\xffB");
     }
 
     #[test]
@@ -451,14 +634,14 @@ mod tests {
         let input = private();
         let source = staged(input.path(), &[("lib.rs", b"good")]);
         let expected = &source.manifest().files()[0];
-        let cache = SourceCache::open(parent.path()).unwrap();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         cache.remember(&source).unwrap();
         let path = cache.root.join(object_name(&expected.sha256));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"evil").unwrap();
         assert!(cache.load(expected).is_none());
         assert_eq!(cache.remember(&source).unwrap(), 1);
-        assert_eq!(cache.load(expected).unwrap(), b"good");
+        assert_eq!(cache.load(expected).unwrap().bytes(), b"good");
         let mut wrong = expected.clone();
         wrong.len += 1;
         assert!(cache.load(&wrong).is_none());
@@ -473,7 +656,7 @@ mod tests {
             let input = private();
             let source = staged(input.path(), &[("lib.rs", b"good")]);
             let expected = &source.manifest().files()[0];
-            let cache = SourceCache::open(parent.path()).unwrap();
+            let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
             let path = cache.root.join(object_name(&expected.sha256));
             let original = source.sealed_root().unwrap().join("lib.rs");
             if hardlink {
@@ -494,7 +677,7 @@ mod tests {
             input.path(),
             &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
         );
-        let mut cache = SourceCache::open(parent.path()).unwrap();
+        let mut cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         cache.max_bytes = 8;
         cache.max_files = 2;
         let prior = private();
@@ -504,8 +687,14 @@ mod tests {
         let entries = cache.inventory().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.iter().map(|entry| entry.bytes).sum::<u64>(), 8);
-        assert_eq!(cache.load(&source.manifest().files()[0]).unwrap(), b"aaaa");
-        assert_eq!(cache.load(&source.manifest().files()[1]).unwrap(), b"bbbb");
+        assert_eq!(
+            cache.load(&source.manifest().files()[0]).unwrap().bytes(),
+            b"aaaa"
+        );
+        assert_eq!(
+            cache.load(&source.manifest().files()[1]).unwrap().bytes(),
+            b"bbbb"
+        );
         assert!(cache.load(&source.manifest().files()[2]).is_none());
         assert!(cache.load(&old.manifest().files()[0]).is_none());
         assert_eq!(
@@ -520,7 +709,7 @@ mod tests {
         let input = private();
         let source = staged(input.path(), &[("lib.rs", b"good")]);
         let expected = &source.manifest().files()[0];
-        let cache = SourceCache::open(parent.path()).unwrap();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         let lock = cache.writer().unwrap().unwrap();
         assert_eq!(cache.remember(&source).unwrap(), 0);
         fs::write(cache.root.join(INCOMING), b"torn").unwrap();
@@ -528,27 +717,27 @@ mod tests {
         drop(lock);
         assert_eq!(cache.remember(&source).unwrap(), 1);
         assert!(!cache.root.join(INCOMING).exists());
-        assert_eq!(cache.load(expected).unwrap(), b"good");
+        assert_eq!(cache.load(expected).unwrap().bytes(), b"good");
     }
 
     #[test]
     fn unsealed_source_and_nonprivate_configuration_refuse() {
         let parent = private();
         let input = private();
-        let cache = SourceCache::open(parent.path()).unwrap();
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         let source = SourceReceiver::create(
             &input.path().join("workspace"),
             SourceManifest::new(vec![entry("lib.rs", b"good")]).unwrap(),
         )
         .unwrap();
         assert!(cache.remember(&source).is_err());
-        assert!(SourceCache::open(Path::new("relative")).is_err());
+        assert!(SourceCache::open(Path::new("relative"), DEFAULT_SOURCE_CACHE_BYTES).is_err());
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(SourceCache::open(parent.path()).is_err());
+        assert!(SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).is_err());
     }
 
     fn bounded_cache(parent: &Path, bytes: u64, files: usize) -> SourceCache {
-        let mut cache = SourceCache::open(parent).unwrap();
+        let mut cache = SourceCache::open(parent, DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         cache.max_bytes = bytes;
         cache.max_files = files;
         cache
@@ -572,7 +761,12 @@ mod tests {
         let input = private();
         let source = staged(
             input.path(),
-            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc"), ("d", b"dddd")],
+            &[
+                ("a", b"aaaa"),
+                ("b", b"bbbb"),
+                ("c", b"cccc"),
+                ("d", b"dddd"),
+            ],
         );
         // Exercise the byte and object ceilings independently, then together.
         for (bytes, files) in [(8, 4), (16, 2), (8, 2)] {
@@ -584,8 +778,14 @@ mod tests {
                 let reopened = bounded_cache(directory.path(), bytes, files);
                 assert_eq!(reopened.remember(&source).unwrap(), 0);
                 assert_eq!(cache_inodes(&reopened), original);
-                assert_eq!(reopened.load(&entry("any", b"aaaa")).unwrap(), b"aaaa");
-                assert_eq!(reopened.load(&entry("any", b"bbbb")).unwrap(), b"bbbb");
+                assert_eq!(
+                    reopened.load(&entry("any", b"aaaa")).unwrap().bytes(),
+                    b"aaaa"
+                );
+                assert_eq!(
+                    reopened.load(&entry("any", b"bbbb")).unwrap().bytes(),
+                    b"bbbb"
+                );
                 assert!(reopened.load(&entry("any", b"cccc")).is_none());
                 assert!(reopened.load(&entry("any", b"dddd")).is_none());
                 assert!(!reopened.root.join(INCOMING).exists());
@@ -609,7 +809,10 @@ mod tests {
         let source = staged(input.path(), &[("a-cold", b"cold"), ("z-hot", b"warm")]);
         assert_eq!(cache.remember(&source).unwrap(), 0);
         assert_eq!(cache_inodes(&cache), original);
-        assert_eq!(cache.load(&entry("z-hot", b"warm")).unwrap(), b"warm");
+        assert_eq!(
+            cache.load(&entry("z-hot", b"warm")).unwrap().bytes(),
+            b"warm"
+        );
         assert!(cache.load(&entry("a-cold", b"cold")).is_none());
     }
 
@@ -625,8 +828,11 @@ mod tests {
         let source = staged(input.path(), &[("a-new", b"12345"), ("z-hot", b"abcdef")]);
         assert_eq!(cache.remember(&source).unwrap(), 0);
         assert_eq!(cache_inodes(&cache), original);
-        assert_eq!(cache.load(&entry("other", b"xy")).unwrap(), b"xy");
-        assert_eq!(cache.load(&entry("z-hot", b"abcdef")).unwrap(), b"abcdef");
+        assert_eq!(cache.load(&entry("other", b"xy")).unwrap().bytes(), b"xy");
+        assert_eq!(
+            cache.load(&entry("z-hot", b"abcdef")).unwrap().bytes(),
+            b"abcdef"
+        );
         assert!(cache.load(&entry("a-new", b"12345")).is_none());
     }
 
@@ -634,7 +840,10 @@ mod tests {
     fn lru_eviction_still_reclaims_objects_outside_the_current_projection() {
         let parent = private();
         let seed = private();
-        let cached = staged(seed.path(), &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")]);
+        let cached = staged(
+            seed.path(),
+            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
+        );
         let cache = bounded_cache(parent.path(), 12, 3);
         assert_eq!(cache.remember(&cached).unwrap(), 3);
         // Deliberate timestamps, not sleeps or filesystem timestamp resolution.
@@ -649,12 +858,15 @@ mod tests {
         assert_eq!(cache.remember(&source).unwrap(), 1);
         assert!(cache.load(&entry("b", b"bbbb")).is_none());
         for bytes in [b"aaaa", b"cccc", b"NEW!"] {
-            assert_eq!(cache.load(&entry("any", bytes)).unwrap(), bytes);
+            assert_eq!(cache.load(&entry("any", bytes)).unwrap().bytes(), bytes);
         }
         let entries = cache.inventory().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries.iter().map(|entry| entry.bytes).sum::<u64>(), 12);
-        assert_eq!(fs::read(cached.sealed_root().unwrap().join("b")).unwrap(), b"bbbb");
+        assert_eq!(
+            fs::read(cached.sealed_root().unwrap().join("b")).unwrap(),
+            b"bbbb"
+        );
     }
 
     #[test]
@@ -663,7 +875,12 @@ mod tests {
         let input = private();
         let source = staged(
             input.path(),
-            &[("a", b"same"), ("b", b"diff"), ("c", b"same"), ("d", b"tail")],
+            &[
+                ("a", b"same"),
+                ("b", b"diff"),
+                ("c", b"same"),
+                ("d", b"tail"),
+            ],
         );
         let cache = bounded_cache(parent.path(), 8, 2);
         assert_eq!(cache.remember(&source).unwrap(), 2);
@@ -671,7 +888,7 @@ mod tests {
         let entries = cache.inventory().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.iter().map(|entry| entry.bytes).sum::<u64>(), 8);
-        assert_eq!(cache.load(&entry("c", b"same")).unwrap(), b"same");
+        assert_eq!(cache.load(&entry("c", b"same")).unwrap().bytes(), b"same");
         assert!(cache.load(&entry("d", b"tail")).is_none());
     }
 
@@ -692,11 +909,19 @@ mod tests {
         assert_eq!(cache.remember(&source).unwrap(), 2);
         for file in source.manifest().files() {
             assert_eq!(
-                cache.load(file).unwrap(),
+                cache.load(file).unwrap().bytes(),
                 fs::read(source.sealed_root().unwrap().join(&file.path)).unwrap()
             );
         }
-        assert_eq!(cache.inventory().unwrap().iter().map(|entry| entry.bytes).sum::<u64>(), 8);
+        assert_eq!(
+            cache
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<u64>(),
+            8
+        );
         assert_eq!(cache.remember(&source).unwrap(), 0);
     }
 
@@ -712,8 +937,11 @@ mod tests {
         let path = source.sealed_root().unwrap().join("a-cold");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"evil").unwrap();
-        assert!(matches!(cache.remember(&source), Err(RememberError::Source(_))));
-        assert_eq!(cache.load(&entry("hot", b"warm")).unwrap(), b"warm");
+        assert!(matches!(
+            cache.remember(&source),
+            Err(RememberError::Source(_))
+        ));
+        assert_eq!(cache.load(&entry("hot", b"warm")).unwrap().bytes(), b"warm");
         assert!(cache.load(&entry("a-cold", b"cold")).is_none());
         assert!(!cache.root.join(INCOMING).exists());
     }
@@ -729,9 +957,204 @@ mod tests {
         assert_eq!(cache.remember(&old).unwrap(), 1);
         assert_eq!(cache.remember(&new).unwrap(), 1);
         assert!(cache.load(&entry("old", b"aaaa")).is_none());
-        assert_eq!(cache.load(&entry("new", b"bbbb")).unwrap(), b"bbbb");
+        assert_eq!(cache.load(&entry("new", b"bbbb")).unwrap().bytes(), b"bbbb");
         assert_eq!(cache.remember(&old).unwrap(), 1);
         assert!(cache.load(&entry("new", b"bbbb")).is_none());
-        assert_eq!(cache.load(&entry("old", b"aaaa")).unwrap(), b"aaaa");
+        assert_eq!(cache.load(&entry("old", b"aaaa")).unwrap().bytes(), b"aaaa");
+    }
+
+    #[test]
+    fn large_verified_spool_is_independent_of_later_cache_mutation() {
+        let parent = private();
+        let input = private();
+        let bytes = vec![b'A'; 5 * 1024 * 1024 + 13];
+        let source = staged(input.path(), &[("liblarge.rlib", &bytes)]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        assert_eq!(cache.remember(&source).unwrap(), 1);
+        let snapshot = cache.load(expected).unwrap();
+        let cached = cache.root.join(object_name(&expected.sha256));
+        assert_ne!(
+            snapshot.file.metadata().unwrap().ino(),
+            fs::metadata(&cached).unwrap().ino()
+        );
+        fs::set_permissions(&cached, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&cached)
+            .unwrap()
+            .write_all(b"B")
+            .unwrap();
+        assert!(cache.load(expected).is_none());
+
+        let next = private();
+        let mut receiver =
+            SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
+                .unwrap();
+        snapshot.install(&mut receiver).unwrap();
+        let installed = receiver.seal().unwrap().join(&expected.path);
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_ne!(
+            fs::metadata(installed).unwrap().ino(),
+            fs::metadata(cached).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn retained_readers_have_independent_positions_and_survive_eviction() {
+        let parent = private();
+        let input = private();
+        let source = staged(input.path(), &[("lib.rmeta", b"ABCD")]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), 4).unwrap();
+        cache.remember(&source).unwrap();
+        let mut first = cache.load(expected).unwrap();
+        let mut second = cache.load(expected).unwrap();
+        let mut prefix = [0_u8; 2];
+        first.file.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"AB");
+        assert_eq!(second.file.stream_position().unwrap(), 0);
+        second.file.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"AB");
+        assert_eq!(first.file.stream_position().unwrap(), 2);
+        first.file.rewind().unwrap();
+        second.file.rewind().unwrap();
+        let replacement = private();
+        let next = staged(replacement.path(), &[("next.rmeta", b"WXYZ")]);
+        cache.remember(&next).unwrap();
+        assert!(cache.load(expected).is_none());
+        for snapshot in [first, second] {
+            let destination = private();
+            let mut receiver = SourceReceiver::create(
+                &destination.path().join("workspace"),
+                source.manifest().clone(),
+            )
+            .unwrap();
+            snapshot.install(&mut receiver).unwrap();
+            assert_eq!(
+                fs::read(receiver.seal().unwrap().join("lib.rmeta")).unwrap(),
+                b"ABCD"
+            );
+        }
+    }
+
+    #[test]
+    fn large_objects_obey_capacity_and_a_lowered_budget_after_reopen() {
+        let parent = private();
+        let input = private();
+        let first = vec![b'A'; 5 * 1024 * 1024 + 17];
+        let second = vec![b'B'; first.len()];
+        let source = staged(input.path(), &[("a.rlib", &first), ("b.rlib", &second)]);
+        let capacity = 6 * 1024 * 1024;
+        let cache = SourceCache::open(parent.path(), capacity).unwrap();
+        assert_eq!(cache.remember(&source).unwrap(), 1);
+        let inodes = cache_inodes(&cache);
+        assert_eq!(
+            cache
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<u64>(),
+            first.len() as u64
+        );
+        let reopened = SourceCache::open(parent.path(), capacity).unwrap();
+        assert_eq!(reopened.remember(&source).unwrap(), 0);
+        assert_eq!(cache_inodes(&reopened), inodes);
+        assert_eq!(
+            reopened
+                .load(&source.manifest().files()[0])
+                .unwrap()
+                .bytes(),
+            first
+        );
+        assert!(reopened.load(&source.manifest().files()[1]).is_none());
+
+        let smaller = SourceCache::open(parent.path(), 4 * 1024 * 1024).unwrap();
+        assert!(smaller.load(&source.manifest().files()[0]).is_none());
+        assert_eq!(smaller.remember(&source).unwrap(), 0);
+        assert!(smaller.inventory().unwrap().is_empty());
+        assert_eq!(
+            fs::metadata(source.sealed_root().unwrap().join("a.rlib"))
+                .unwrap()
+                .len(),
+            first.len() as u64
+        );
+    }
+
+    #[test]
+    fn streaming_verification_detects_mutation_after_the_modified_bytes_were_read() {
+        struct MutatingSink<'a> {
+            path: &'a Path,
+            changed: bool,
+        }
+        impl Write for MutatingSink<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.changed {
+                    self.changed = true;
+                    fs::set_permissions(self.path, fs::Permissions::from_mode(0o600))?;
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(self.path)?
+                        .write_all(b"B")?;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = private();
+        let bytes = vec![b'A'; MAX_SOURCE_CHUNK * 3 + 7];
+        let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+        let path = source.sealed_root().unwrap().join("lib.rlib");
+        let mut sink = MutatingSink {
+            path: &path,
+            changed: false,
+        };
+        assert!(matches!(
+            copy_verified(&path, &source.manifest().files()[0], None, &mut sink),
+            Err(RememberError::Source(_))
+        ));
+        assert!(sink.changed);
+    }
+
+    #[test]
+    fn expired_cache_work_neither_modifies_receiver_nor_publishes_cache_bytes() {
+        let parent = private();
+        let input = private();
+        let source = staged(input.path(), &[("lib.rs", b"good")]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        let original = cache_inodes(&cache);
+        let expired = cache.clone().before(Instant::now());
+        assert!(expired.load(expected).is_none());
+        assert!(
+            matches!(expired.remember(&source), Err(RememberError::Cache(error)) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(cache_inodes(&cache), original);
+        assert!(!cache.root.join(INCOMING).exists());
+
+        let mut snapshot = cache.load(expected).unwrap();
+        snapshot.deadline = Some(Instant::now());
+        let next = private();
+        let mut receiver =
+            SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
+                .unwrap();
+        assert_eq!(
+            snapshot.install(&mut receiver).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            fs::metadata(next.path().join("workspace/lib.rs"))
+                .unwrap()
+                .len(),
+            0
+        );
+        receiver
+            .write_chunk("lib.rs", 0, b"good", Sha256::digest(b"good").into())
+            .unwrap();
+        assert!(receiver.seal().is_ok());
     }
 }

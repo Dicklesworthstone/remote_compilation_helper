@@ -19,13 +19,18 @@
 //!    is answered [`FactsMiss::Pending`]; the compiler then runs exactly as
 //!    it would without RABS.
 
+use crate::coord::live_dependency::canonical::CanonicalGeneratedRoot;
 use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
 use rabs_key::canonical::CanonicalEncoder;
 use rabs_key::live_dependency::{
     DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact, ToolchainFacts,
 };
 use rabs_key::typed_digest::compute;
-use rabs_protocol::result_identity::TypedDigest;
+use rabs_protocol::input_evidence::{
+    ActionInputManifest, DirectoryEnumeration, InputFileType, PositiveInput,
+};
+use rabs_protocol::raw_bytes::RawBytes;
+use rabs_protocol::result_identity::{ObjectId, TypedDigest};
 use rabs_sandbox::snapshot_capture::{
     MemberDisposition, MemberKind, SealedSourceSnapshot, capture_sealed_source, member_disposition,
 };
@@ -49,6 +54,11 @@ pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
 pub const PACKAGE_ROOT: &str = "package";
 /// Separate sealed root for compiler inputs produced by a Cargo build script.
 pub const GENERATED_ROOT: &str = "generated";
+
+/// A separate root in the same coherent snapshot for each propagated OUT_DIR.
+pub fn native_snapshot_root(index: usize) -> String {
+    format!("native-{index:04}")
+}
 
 /// Largest package tree the lane captures at all.
 const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -373,10 +383,19 @@ pub struct PackageFacts {
     pub generated_files: Vec<(String, TypedDigest, bool)>,
     /// Exact Cargo build-script stdout record, bound into the action key.
     pub build_script_output: Option<Vec<u8>>,
+    /// Complete propagated native trees, in the planner's sorted root order.
+    pub native: Vec<NativePackageFacts>,
     source_kind: DependencySourceKind,
     members: Vec<(String, MemberSig)>,
     generated: Option<GeneratedObservation>,
+    native_observations: Vec<GeneratedObservation>,
     bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct NativePackageFacts {
+    pub files: Vec<(String, TypedDigest, bool)>,
+    pub build_script_output: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -388,6 +407,9 @@ enum MemberSig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GeneratedObservation {
     root: PathBuf,
+    // Cargo writes the compiler-visible spelling. Ordinary execution uses
+    // `root`; canonical execution retains a driver-owned logical name here.
+    record_root: PathBuf,
     members: Vec<(String, MemberSig)>,
     // Unlike compiler output directories this is a read-only input tree.
     // Retain every directory generation to detect transient added inputs.
@@ -397,6 +419,152 @@ struct GeneratedObservation {
 }
 
 impl PackageFacts {
+    /// Exact directory topology from the same sealed image as the generated
+    /// file bytes. Root and empty directory listings are semantic inputs too:
+    /// `empty/../value.rs` cannot be opened unless `empty` actually exists.
+    pub fn generated_directory_enumerations(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        match (
+            self.snapshot.manifest(GENERATED_ROOT),
+            plan.generated_root.as_ref(),
+        ) {
+            (None, None) => return Ok(Vec::new()),
+            (Some(_), Some(_)) => {}
+            _ => return Err("generated directory capture differs from the action plan".into()),
+        }
+        self.directory_enumerations(GENERATED_ROOT, &plan.generated_virtual_root())
+    }
+
+    /// Complete workspace membership from the exact sealed bytes used for this
+    /// fresh execution. Sibling packages and empty directories remain inputs.
+    pub fn source_directory_enumerations(
+        &self,
+        plan: &DependencyActionPlan,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        if self.source_kind != DependencySourceKind::WorkspaceExecutionOnly
+            || plan.source_kind != self.source_kind
+            || !plan.canonical_cargo
+            || plan.source_root != rabs_sandbox::layout::WORKSPACE
+        {
+            return Err(
+                "workspace directory capture requires its retained execution profile".into(),
+            );
+        }
+        self.directory_enumerations(PACKAGE_ROOT, &plan.source_virtual_root())
+    }
+
+    /// Bind every propagated tree and its completed Cargo stdout record to the
+    /// action's input evidence. The record is evidence, not a compiler mount.
+    pub fn append_native_inputs(
+        &self,
+        plan: &DependencyActionPlan,
+        inputs: &mut ActionInputManifest,
+    ) -> Result<(), String> {
+        if self.native.len() != plan.native_roots.len()
+            || self.native_observations.len() != plan.native_roots.len()
+        {
+            return Err("native input capture differs from the action plan".into());
+        }
+        for (index, (native, observed)) in self
+            .native
+            .iter()
+            .zip(&self.native_observations)
+            .enumerate()
+        {
+            if observed.record_root != Path::new(&plan.native_roots[index]) {
+                return Err("native input record differs from the canonical root".into());
+            }
+            inputs
+                .directory_enumerations
+                .extend(self.directory_enumerations(
+                    &native_snapshot_root(index),
+                    &plan.native_input_virtual_root(index),
+                )?);
+            inputs
+                .inputs
+                .extend(
+                    native
+                        .files
+                        .iter()
+                        .map(|(relative, object, executable)| PositiveInput {
+                            virtual_path: RawBytes::new(
+                                plan.native_input_virtual_path(index, relative).into_bytes(),
+                            ),
+                            object: ObjectId(object.clone()),
+                            file_type: InputFileType::Regular,
+                            executable: *executable,
+                            symlink_resolution: Vec::new(),
+                        }),
+                );
+            let record = rabs_cas::digest_set::digest_set(
+                &native.build_script_output,
+                DigestRequest::default(),
+                None,
+            )
+            .map_err(|error| format!("native Cargo record digest: {error:?}"))?;
+            inputs.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(plan.native_record_virtual_path(index).into_bytes()),
+                object: ObjectId(record.atp_content_id),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn directory_enumerations(
+        &self,
+        root: &str,
+        virtual_root: &str,
+    ) -> Result<Vec<DirectoryEnumeration>, String> {
+        let captured = self
+            .snapshot
+            .manifest(root)
+            .ok_or("input root was not captured")?;
+        let mut directories = BTreeMap::<String, Vec<RawBytes>>::new();
+        directories.insert(String::new(), Vec::new());
+        for (path, member) in &captured.members {
+            match member {
+                MemberKind::Directory => {
+                    directories.insert(path.clone(), Vec::new());
+                }
+                MemberKind::Regular { .. } => {}
+                MemberKind::Symlink { .. } => {
+                    return Err("input directory capture contains a symlink".into());
+                }
+            }
+        }
+        rabs_sandbox::generated_source::validate_generated_directories(
+            &directories
+                .keys()
+                .filter(|path| !path.is_empty())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| format!("input directory capture: {error}"))?;
+        for path in captured.members.keys() {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            directories
+                .get_mut(parent)
+                .ok_or("input directory capture is missing a parent")?
+                .push(RawBytes::new(name.as_bytes().to_vec()));
+        }
+        Ok(directories
+            .into_iter()
+            .map(|(relative, entries)| DirectoryEnumeration {
+                virtual_path: RawBytes::new(if relative.is_empty() {
+                    virtual_root.as_bytes().to_vec()
+                } else {
+                    format!("{virtual_root}/{relative}").into_bytes()
+                }),
+                entries,
+            })
+            .collect())
+    }
+
     /// Re-walk `root` and require exactly the captured members with the
     /// captured identities. Used after the compiler ran against the live
     /// tree: a result is only publishable if its inputs never moved.
@@ -405,10 +573,10 @@ impl PackageFacts {
     /// A description of the first difference.
     pub fn verify_unchanged(&self, root: &Path) -> Result<(), String> {
         let (members, _) = walk_package(root, self.source_kind)?;
-        if let Some(generated) = &self.generated
-            && observe_generated(&generated.root)?.0 != *generated
-        {
-            return Err("generated inputs changed during execution".into());
+        for generated in self.generated.iter().chain(&self.native_observations) {
+            if observe_generated(&generated.root, &generated.record_root)?.0 != *generated {
+                return Err("generated inputs changed during execution".into());
+            }
         }
         if members == self.members {
             Ok(())
@@ -420,9 +588,23 @@ impl PackageFacts {
     /// Generated inputs must never alias directories or files the compiler
     /// or a cache installation can write. Rechecked at both delivery gates.
     pub fn verify_generated_disjoint(&self, plan: &DependencyActionPlan) -> Result<(), String> {
-        let Some(generated) = &self.generated else {
+        match (&self.generated, &plan.generated_root) {
+            (None, None) => {}
+            (Some(generated), Some(root)) if generated.root == Path::new(root) => {}
+            _ => return Err("generated inputs differ from the observed compiler plan".into()),
+        }
+        if self.native_observations.len() != plan.native_roots.len()
+            || self
+                .native_observations
+                .iter()
+                .zip(&plan.native_roots)
+                .any(|(observed, root)| observed.root != Path::new(root))
+        {
+            return Err("native inputs differ from the observed compiler plan".into());
+        }
+        if self.generated.is_none() && self.native_observations.is_empty() {
             return Ok(());
-        };
+        }
         let output = std::fs::symlink_metadata(&plan.out_dir)
             .map_err(|error| format!("output directory: {error}"))?;
         let source = std::fs::symlink_metadata(&plan.source_root)
@@ -430,31 +612,36 @@ impl PackageFacts {
         if !output.is_dir() || !source.is_dir() {
             return Err("source/output root is not a real directory".into());
         }
-        for other in [&plan.out_dir, &plan.source_root] {
-            let canonical = std::fs::canonicalize(other)
-                .map_err(|error| format!("source/output topology: {error}"))?;
-            if generated.root.starts_with(&canonical) || canonical.starts_with(&generated.root) {
-                return Err("generated input tree overlaps source or compiler output".into());
+        for generated in self.generated.iter().chain(&self.native_observations) {
+            for other in [&plan.out_dir, &plan.source_root] {
+                let canonical = std::fs::canonicalize(other)
+                    .map_err(|error| format!("source/output topology: {error}"))?;
+                if generated.root.starts_with(&canonical) || canonical.starts_with(&generated.root)
+                {
+                    return Err("generated input tree overlaps source or compiler output".into());
+                }
             }
-        }
-        for (_, sig) in &generated.directories {
-            if [(output.dev(), output.ino()), (source.dev(), source.ino())]
-                .contains(&(sig.dev, sig.ino))
-            {
-                return Err("generated input directory aliases source or compiler output".into());
+            for (_, sig) in &generated.directories {
+                if [(output.dev(), output.ino()), (source.dev(), source.ino())]
+                    .contains(&(sig.dev, sig.ino))
+                {
+                    return Err(
+                        "generated input directory aliases source or compiler output".into(),
+                    );
+                }
             }
-        }
-        for name in plan.output_names() {
-            let path = Path::new(&plan.out_dir).join(name);
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("output identity: {error}")),
-            };
-            if [(generated.script_output.1.dev, generated.script_output.1.ino), (generated.root_output.1.dev, generated.root_output.1.ino)].contains(&(meta.dev(), meta.ino())) || generated.members.iter().any(|(_, member)| {
+            for name in plan.output_names() {
+                let path = Path::new(&plan.out_dir).join(name);
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(format!("output identity: {error}")),
+                };
+                if [(generated.script_output.1.dev, generated.script_output.1.ino), (generated.root_output.1.dev, generated.root_output.1.ino)].contains(&(meta.dev(), meta.ino())) || generated.members.iter().any(|(_, member)| {
                 matches!(member, MemberSig::File(sig) if sig.dev == meta.dev() && sig.ino == meta.ino())
             }) {
                 return Err("generated input aliases a declared compiler output".into());
+            }
             }
         }
         Ok(())
@@ -880,7 +1067,10 @@ fn walk_package(
     Ok((members, total))
 }
 
-fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String> {
+fn observe_generated(
+    root: &Path,
+    record_root: &Path,
+) -> Result<(GeneratedObservation, u64), String> {
     // A lexical root reached through an ancestor symlink may overlap the
     // compiler's writable tree despite the planner's disjoint-path check.
     for ancestor in root.ancestors() {
@@ -942,7 +1132,12 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     let root_output = run.join("root-output");
     let (root_sig, root_bytes) = read_stable(&root_output, 64 * 1024)
         .map_err(|error| format!("build-script root-output: {error}"))?;
-    if root_bytes != root.to_str().ok_or("non-UTF-8 generated root")?.as_bytes() {
+    if root_bytes
+        != record_root
+            .to_str()
+            .ok_or("non-UTF-8 generated record root")?
+            .as_bytes()
+    {
         return Err("Cargo build-script record names a different OUT_DIR".into());
     }
     let script_output = run.join(script_record);
@@ -954,6 +1149,7 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     Ok((
         GeneratedObservation {
             root: root.to_path_buf(),
+            record_root: record_root.to_path_buf(),
             members,
             directories,
             script_output: (script_output, script_sig),
@@ -973,24 +1169,21 @@ fn captured_files(
     let manifest = snapshot
         .manifest(logical_root)
         .ok_or("capture lost its root")?;
-    let captured_count = manifest
-        .members
-        .values()
-        .filter(|member| matches!(member, MemberKind::Regular { .. }))
-        .count();
-    let observed_count = observed
-        .iter()
-        .filter(|(_, sig)| matches!(sig, MemberSig::File(_)))
-        .count();
-    if captured_count != observed_count
-        || manifest
-            .members
-            .values()
-            .any(|member| matches!(member, MemberKind::Symlink { .. }))
+    if manifest.members.len() != observed.len()
+        || manifest.members.iter().zip(observed).any(
+            |((captured_path, captured), (observed_path, observed))| {
+                captured_path != observed_path
+                    || !matches!(
+                        (captured, observed),
+                        (MemberKind::Directory, MemberSig::Directory)
+                            | (MemberKind::Regular { .. }, MemberSig::File(_))
+                    )
+            },
+        )
     {
         return Err("capture does not cover the complete input tree".into());
     }
-    let mut files = Vec::with_capacity(captured_count);
+    let mut files = Vec::new();
     for (relative, member) in &manifest.members {
         if let MemberKind::Regular { mode, .. } = member {
             let bytes = snapshot
@@ -1009,18 +1202,35 @@ fn capture_package(
     root: &Path,
     source_kind: DependencySourceKind,
     generated_root: Option<&Path>,
+    generated_record_root: Option<&Path>,
+    native_roots: &[(PathBuf, PathBuf)],
 ) -> Result<PackageFacts, String> {
+    if native_roots.len() > rabs_key::live_dependency::remote::MAX_CANONICAL_NATIVE_ROOTS {
+        return Err("too many propagated native input trees".into());
+    }
     let (before, bytes) = walk_package(root, source_kind)?;
-    let (generated, generated_bytes) = match generated_root {
-        Some(root) => {
-            let (observation, size) = observe_generated(root)?;
+    let (generated, generated_bytes) = match (generated_root, generated_record_root) {
+        (Some(root), Some(record_root)) => {
+            let (observation, size) = observe_generated(root, record_root)?;
             (Some(observation), size)
         }
-        None => (None, 0),
+        (None, None) => (None, 0),
+        _ => return Err("generated tree lacks its Cargo record binding".into()),
     };
-    let bytes = bytes.saturating_add(generated_bytes);
+    let mut bytes = bytes.saturating_add(generated_bytes);
+    let mut native_observations = Vec::with_capacity(native_roots.len());
+    for (root, record_root) in native_roots {
+        let (observed, size) = observe_generated(root, record_root)?;
+        bytes = bytes.saturating_add(size);
+        native_observations.push(observed);
+    }
     if bytes > MAX_PACKAGE_BYTES
-        || before.len() + generated.as_ref().map_or(0, |tree| tree.members.len())
+        || before.len()
+            + generated.as_ref().map_or(0, |tree| tree.members.len())
+            + native_observations
+                .iter()
+                .map(|tree| tree.members.len())
+                .sum::<usize>()
             > MAX_PACKAGE_FILES
     {
         return Err("combined source and generated inputs exceed capture bounds".into());
@@ -1038,6 +1248,9 @@ fn capture_package(
     if let Some(root) = generated_root {
         roots.push((GENERATED_ROOT.to_owned(), root.to_path_buf()));
     }
+    for (index, (root, _)) in native_roots.iter().enumerate() {
+        roots.push((native_snapshot_root(index), root.clone()));
+    }
     let snapshot = capture_sealed_source(&roots, false, 3, MAX_PACKAGE_BYTES)
         .map_err(|error| format!("capture: {error:?}"))?;
     let (after, _) = walk_package(root, source_kind)?;
@@ -1051,7 +1264,7 @@ fn capture_package(
             if sig != tree.script_output.1 {
                 return Err("build-script output record changed during capture".into());
             }
-            if observe_generated(&tree.root)?.0 != *tree {
+            if observe_generated(&tree.root, &tree.record_root)?.0 != *tree {
                 return Err("generated inputs changed during capture".into());
             }
             (
@@ -1061,15 +1274,38 @@ fn capture_package(
         }
         None => (Vec::new(), None),
     };
+    let mut native = Vec::with_capacity(native_observations.len());
+    for (index, tree) in native_observations.iter().enumerate() {
+        let (sig, output) = read_stable(&tree.script_output.0, 1024 * 1024)
+            .map_err(|error| format!("native build-script stdout capture: {error}"))?;
+        if sig != tree.script_output.1
+            || observe_generated(&tree.root, &tree.record_root)?.0 != *tree
+        {
+            return Err("native inputs changed during capture".into());
+        }
+        native.push(NativePackageFacts {
+            files: captured_files(&snapshot, &native_snapshot_root(index), &tree.members)?,
+            build_script_output: output,
+        });
+    }
+    // Revalidate the complete set together after all record reads. No tree may
+    // borrow an earlier observation while another root is being sealed.
+    for tree in generated.iter().chain(&native_observations) {
+        if observe_generated(&tree.root, &tree.record_root)?.0 != *tree {
+            return Err("generated input set changed during capture".into());
+        }
+    }
     let files = captured_files(&snapshot, PACKAGE_ROOT, &before)?;
     Ok(PackageFacts {
         snapshot: Arc::new(snapshot),
         files,
         generated_files,
         build_script_output,
+        native,
         source_kind,
         members: before,
         generated,
+        native_observations,
         bytes,
     })
 }
@@ -1146,7 +1382,14 @@ pub struct LiveFacts {
     warming: Mutex<usize>,
 }
 
-type PackageKey = (PathBuf, DependencySourceKind, Option<PathBuf>);
+// Both generated spellings identify an observation. Equal physical bytes
+// cannot lend a memo to another expected Cargo `root-output` record.
+type PackageKey = (
+    PathBuf,
+    DependencySourceKind,
+    Option<PathBuf>,
+    Option<PathBuf>,
+);
 
 /// Host-local memo identity, NOT an action key or serving authority. A
 /// reservation/backoff for one observed inventory must not mask a newer
@@ -1518,6 +1761,45 @@ impl LiveFacts {
         generated_root: Option<&Path>,
     ) -> Result<Arc<PackageFacts>, FactsMiss> {
         package_capture::observe(self, root, source_kind, generated_root)
+    }
+
+    /// Observe canonical generated inputs through an opaque driver binding.
+    /// The physical plan is for I/O only; its environment and the captured
+    /// Cargo stdout/root-output records keep their exact logical bytes.
+    pub(crate) fn package_canonical(
+        self: &Arc<Self>,
+        physical: &DependencyActionPlan,
+        generated: Option<&CanonicalGeneratedRoot>,
+        native: &[CanonicalGeneratedRoot],
+    ) -> Result<Arc<PackageFacts>, FactsMiss> {
+        let mut recorded = physical
+            .execution_env
+            .iter()
+            .filter(|(name, _)| name == "OUT_DIR")
+            .map(|(_, value)| value.as_str());
+        if !physical.canonical_cargo
+            || physical.generated_root.as_deref().map(Path::new)
+                != generated.map(CanonicalGeneratedRoot::physical)
+            || recorded.next() != generated.and_then(|root| root.logical().to_str())
+            || recorded.next().is_some()
+            || physical.native_roots.len() != native.len()
+            || physical
+                .native_roots
+                .iter()
+                .zip(native)
+                .any(|(root, binding)| Path::new(root) != binding.physical())
+        {
+            return Err(FactsMiss::Refused(
+                "canonical package capture lacks its generated-root binding".into(),
+            ));
+        }
+        package_capture::observe_canonical(
+            self,
+            Path::new(&physical.source_root),
+            physical.source_kind,
+            generated,
+            native,
+        )
     }
 }
 
@@ -1970,6 +2252,70 @@ mod tests {
     }
 
     #[test]
+    fn generated_directory_listings_are_sealed_with_files_and_include_empty_subtrees() {
+        let (_dir, plan) = generated_fixture();
+        let source = Path::new(&plan.source_root);
+        let generated = Path::new(plan.generated_root.as_ref().unwrap());
+        std::fs::create_dir_all(generated.join("empty/child")).unwrap();
+        std::fs::create_dir(generated.join("nested")).unwrap();
+        std::fs::write(generated.join("nested/value.rs"), b"captured").unwrap();
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(source, plan.source_kind, Some(generated))
+            .unwrap();
+        let listings = captured.generated_directory_enumerations(&plan).unwrap();
+        let readable = listings
+            .iter()
+            .map(|listing| {
+                (
+                    String::from_utf8(listing.virtual_path.as_bytes().to_vec()).unwrap(),
+                    listing
+                        .entries
+                        .iter()
+                        .map(|name| String::from_utf8(name.as_bytes().to_vec()).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readable,
+            vec![
+                (
+                    plan.generated_virtual_root(),
+                    vec!["empty".into(), "nested".into(), "value.rs".into()]
+                ),
+                (
+                    plan.generated_input_virtual_path("empty"),
+                    vec!["child".into()]
+                ),
+                (plan.generated_input_virtual_path("empty/child"), vec![]),
+                (
+                    plan.generated_input_virtual_path("nested"),
+                    vec!["value.rs".into()]
+                ),
+            ]
+        );
+        std::fs::rename(
+            generated.join("empty/child"),
+            generated.join("empty/renamed"),
+        )
+        .unwrap();
+        assert!(captured.verify_unchanged(source).is_err());
+        assert_eq!(
+            captured.generated_directory_enumerations(&plan).unwrap(),
+            listings,
+            "retained listings must not reopen a mutable OUT_DIR"
+        );
+        let next = facts
+            .package(source, plan.source_kind, Some(generated))
+            .unwrap();
+        assert_ne!(
+            next.generated_directory_enumerations(&plan).unwrap(),
+            listings
+        );
+    }
+
+    #[test]
     fn generated_inputs_capture_revalidate_bytes_members_and_script_record() {
         let (_dir, plan) = generated_fixture();
         let source = Path::new(&plan.source_root);
@@ -2021,6 +2367,128 @@ mod tests {
         .unwrap();
         assert!(current.verify_unchanged(source).is_err());
         assert_ne!(current.build_script_output, capture().build_script_output);
+    }
+
+    #[test]
+    fn warmed_generated_capture_retains_canonical_recorded_root_and_rejects_rebinding() {
+        use crate::coord::live_dependency::canonical::CanonicalPaths;
+        use rabs_key::live_dependency::{
+            LiveRustcRequest, plan_canonical_remote_dependency_action,
+        };
+
+        let (directory, _) = generated_fixture();
+        let owner = Arc::new(directory);
+        let mappings = [
+            ("/__rabs/workspace", "workspace"),
+            ("/__rabs/cargo-home", "cargo-home"),
+            ("/__rabs/toolchain", "toolchain"),
+            ("/__rabs/out/cargo", "canonical-target"),
+            ("/__rabs/home", "home"),
+        ]
+        .into_iter()
+        .map(|(visible, relative)| {
+            let backing = owner.path().join(relative);
+            std::fs::create_dir_all(&backing).unwrap();
+            (PathBuf::from(visible), backing)
+        })
+        .collect();
+        let target = owner.path().join("canonical-target");
+        std::fs::create_dir_all(target.join("debug/build")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::rename(
+            owner.path().join("build-script"),
+            target.join("debug/build/generated-123"),
+        )
+        .unwrap();
+        let paths = CanonicalPaths::new(Arc::clone(&owner), mappings).unwrap();
+        let package = "/__rabs/cargo-home/registry/src/index/generated-1.0";
+        let visible = "/__rabs/out/cargo/debug/build/generated-123/out";
+        let argv = vec![
+            "/__rabs/toolchain/bin/rustc".into(),
+            "--crate-name=generated".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            "--cap-lints=allow".into(),
+            "--error-format=json".into(),
+            "--out-dir=/__rabs/out/cargo/debug/deps".into(),
+            format!("{package}/lib.rs"),
+        ];
+        let env = vec![
+            ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
+            ("HOME".into(), "/__rabs/home".into()),
+            ("CARGO_MANIFEST_DIR".into(), package.into()),
+            ("CARGO_PKG_NAME".into(), "generated".into()),
+            ("OUT_DIR".into(), visible.into()),
+        ];
+        let logical = plan_canonical_remote_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+            None,
+        )
+        .unwrap();
+        let physical = paths.project_plan(&logical).unwrap();
+        let binding = paths.generated_root(&logical, &physical).unwrap().unwrap();
+        let source = Path::new(&physical.source_root);
+        let record = binding.physical().parent().unwrap().join("run/root-output");
+        std::fs::write(&record, visible).unwrap();
+        // Force the actual background capture path: the borrowed logical name
+        // must survive in its owned observation, not fall back to the backing.
+        std::fs::File::create(source.join("large-input.bin"))
+            .unwrap()
+            .set_len(SYNCHRONOUS_PACKAGE_BYTES + 1)
+            .unwrap();
+        let facts = LiveFacts::new();
+        assert!(matches!(
+            facts.package_canonical(&physical, Some(&binding), &[]),
+            Err(FactsMiss::Pending)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let captured = loop {
+            match facts.package_canonical(&physical, Some(&binding), &[]) {
+                Ok(captured) => break captured,
+                Err(FactsMiss::Pending) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "generated capture did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("canonical generated capture refused: {error}"),
+            }
+        };
+        assert_eq!(
+            captured.generated.as_ref().unwrap().record_root,
+            Path::new(visible)
+        );
+        assert!(Arc::ptr_eq(
+            &captured,
+            &facts
+                .package_canonical(&physical, Some(&binding), &[])
+                .unwrap()
+        ));
+        captured.verify_unchanged(source).unwrap();
+        captured.verify_generated_disjoint(&physical).unwrap();
+        let mut rebound = physical.clone();
+        rebound
+            .execution_env
+            .iter_mut()
+            .find(|(name, _)| name == "OUT_DIR")
+            .unwrap()
+            .1 = "/__rabs/out/cargo/debug/build/different/out".into();
+        assert!(matches!(
+            facts.package_canonical(&rebound, Some(&binding), &[]),
+            Err(FactsMiss::Refused(_))
+        ));
+        std::fs::write(&record, binding.physical().to_str().unwrap()).unwrap();
+        assert!(captured.verify_unchanged(source).is_err());
+        assert!(matches!(
+            facts.package_canonical(&physical, Some(&binding), &[]),
+            Err(FactsMiss::Refused(_))
+        ));
     }
 
     #[test]
@@ -2084,28 +2552,36 @@ mod tests {
         std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
         std::fs::write(unit.join("stderr"), b"").unwrap();
         std::fs::write(unit.join("invoked.timestamp"), b"This file has an mtime").unwrap();
-        let (observed, _) = observe_generated(&out).unwrap();
+        let (observed, _) = observe_generated(&out, &out).unwrap();
         assert_eq!(observed.script_output.0, unit.join("output"));
         assert_eq!(observed.root_output.0, unit.join("root-output"));
-        assert_eq!(observe_generated(&out).unwrap().0, observed);
+        assert_eq!(observe_generated(&out, &out).unwrap().0, observed);
         // A rerun of the build script rewrites the record: never the same.
         std::fs::write(unit.join("output"), b"cargo:rustc-cfg=other\n").unwrap();
-        assert_ne!(observe_generated(&out).unwrap().0, observed);
+        assert_ne!(observe_generated(&out, &out).unwrap().0, observed);
         // The record must name THIS OUT_DIR.
         std::fs::write(unit.join("root-output"), b"/elsewhere/out").unwrap();
         assert!(
-            observe_generated(&out)
+            observe_generated(&out, &out)
                 .unwrap_err()
                 .contains("different OUT_DIR")
         );
         // A `run` entry that is not a directory is neither layout: refuse.
         std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
         std::fs::write(unit.join("run"), b"not a directory").unwrap();
-        assert!(observe_generated(&out).unwrap_err().contains("not real"));
+        assert!(
+            observe_generated(&out, &out)
+                .unwrap_err()
+                .contains("not real")
+        );
         // Without any record there is nothing to bind: refuse.
         std::fs::remove_file(unit.join("run")).unwrap();
         std::fs::remove_file(unit.join("output")).unwrap();
-        assert!(observe_generated(&out).unwrap_err().contains("stdout"));
+        assert!(
+            observe_generated(&out, &out)
+                .unwrap_err()
+                .contains("stdout")
+        );
     }
 
     #[test]

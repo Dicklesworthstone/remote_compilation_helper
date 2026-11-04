@@ -1,6 +1,8 @@
-use super::*;
+use super::super::super::{
+    CapturePins, capture_owner, pin_id, tests::authority as fixture_attempt,
+};
 use super::super::evidence;
-use super::super::super::{CapturePins, capture_owner, pin_id, tests::authority as fixture_attempt};
+use super::*;
 use rabs_cas::metadata_store::{AuthorityRow, RusqliteEngine, SqlMetadataStore};
 use rabs_key::typed_digest::compute;
 use rabs_protocol::generation::AttemptAuthority;
@@ -100,7 +102,12 @@ fn released(store: &mut dyn RabsMetadataStore, id: u128) -> bool {
 fn only_a_different_released_authority_and_closed_generation_allow_recovery() {
     let (mut store, attempt) = fixture();
     let id = capture(&mut store, &attempt, &root(1));
-    assert_eq!(reconcile_page(&mut store, &attempt.coordinator).unwrap().released, 0);
+    assert_eq!(
+        reconcile_page(&mut store, &attempt.coordinator)
+            .unwrap()
+            .released,
+        0
+    );
     assert!(!released(&mut store, id));
     let next = next_boot(&mut store, &attempt.coordinator, false);
     assert_eq!(reconcile_page(&mut store, &next).unwrap().released, 0);
@@ -141,7 +148,11 @@ fn each_page_is_bounded_and_releasing_rows_never_skips_the_next_page() {
     assert!(ids.into_iter().all(|id| released(&mut store, id)));
     let before = store.differential_snapshot().unwrap();
     assert_eq!(reconcile_page(&mut store, &next).unwrap().scanned, 0);
-    assert_eq!(store.differential_snapshot().unwrap(), before, "idle means no writes");
+    assert_eq!(
+        store.differential_snapshot().unwrap(),
+        before,
+        "idle means no writes"
+    );
 }
 
 #[test]
@@ -149,18 +160,39 @@ fn malformed_legacy_and_other_pin_classes_remain_protected() {
     let (mut store, attempt) = fixture();
     let owner = capture_owner(&attempt);
     let mut ids = Vec::new();
-    for (index, encoded) in [None, Some("{"), Some("{}"), Some("null")].into_iter().enumerate() {
+    for (index, encoded) in [None, Some("{"), Some("{}"), Some("null")]
+        .into_iter()
+        .enumerate()
+    {
         let object = root(index as u64);
         let id = pin_id(&owner, &object);
         store
-            .create_pin(id, &object, &owner, CAPTURE_PIN_CLASS, None, encoded, true, "legacy")
+            .create_pin(
+                id,
+                &object,
+                &owner,
+                CAPTURE_PIN_CLASS,
+                None,
+                encoded,
+                true,
+                "legacy",
+            )
             .unwrap();
         ids.push(id);
     }
     let object = root(20);
     let pin = capture(&mut store, &attempt, &object);
     store
-        .create_pin(1, &object, "coordinator", "action-publication", None, None, true, "independent")
+        .create_pin(
+            1,
+            &object,
+            "coordinator",
+            "action-publication",
+            None,
+            None,
+            true,
+            "independent",
+        )
         .unwrap();
     let next = next_boot(&mut store, &attempt.coordinator, true);
     let page = reconcile_page(&mut store, &next).unwrap();
@@ -176,9 +208,18 @@ fn malformed_checkpoint_retains_every_remaining_pin() {
     let id = capture(&mut store, &attempt, &root(1));
     let next = next_boot(&mut store, &attempt.coordinator, true);
     store
-        .record_decision_receipt(CURSOR_KIND, &digest_key(&authority_digest(&next)), 1, "pending", "not-hex")
+        .record_decision_receipt(
+            CURSOR_KIND,
+            &digest_key(&authority_digest(&next)),
+            1,
+            "pending",
+            "not-hex",
+        )
         .unwrap();
-    assert!(matches!(reconcile_page(&mut store, &next), Err(StoreError::Corruption(_))));
+    assert!(matches!(
+        reconcile_page(&mut store, &next),
+        Err(StoreError::Corruption(_))
+    ));
     assert!(!released(&mut store, id));
 }
 
@@ -219,13 +260,25 @@ fn production_capture_drop_recovers_old_custody_after_actual_cas_reopen() {
         let coord = CoordLive::with_cas(Arc::clone(&cas));
         let mut attempt = fixture_attempt(7);
         attempt.coordinator = coord.acquire_boot_authority("capture-tests").unwrap();
-        attempt.action_generation.created_under_authority_digest = authority_digest(&attempt.coordinator);
+        attempt.action_generation.created_under_authority_digest =
+            authority_digest(&attempt.coordinator);
         seed(&mut *cas.store().lock().unwrap(), &attempt);
         let mut pins = CapturePins::new(Arc::clone(&cas), &attempt);
         object = put_bytes(&cas, b"captured bytes survive recovery", &mut pins).unwrap();
         old_id = pin_id(&pins.owner, &object.0);
-        cas.store().lock().unwrap()
-            .create_pin(1, &object.0, "coordinator", "action-publication", None, None, true, "independent publication")
+        cas.store()
+            .lock()
+            .unwrap()
+            .create_pin(
+                1,
+                &object.0,
+                "coordinator",
+                "action-publication",
+                None,
+                None,
+                true,
+                "independent publication",
+            )
             .unwrap();
         // Discard only the in-memory cleanup inventory to model process loss.
         pins.held.clear();
@@ -235,8 +288,12 @@ fn production_capture_drop_recovers_old_custody_after_actual_cas_reopen() {
     let mut current = fixture_attempt(17);
     current.coordinator = coord.acquire_boot_authority("capture-tests").unwrap();
     assert_eq!(coord.closed_prior_generations(), 1);
-    current.action_generation = cas.store().lock().unwrap()
-        .allocate_bound_generation(&authority_digest(&current.coordinator), &current.action_key).unwrap();
+    current.action_generation = cas
+        .store()
+        .lock()
+        .unwrap()
+        .allocate_bound_generation(&authority_digest(&current.coordinator), &current.action_key)
+        .unwrap();
     let mut pins = CapturePins::new(Arc::clone(&cas), &current);
     put_bytes(&cas, b"current captured bytes", &mut pins).unwrap();
     assert!(!released(&mut *cas.store().lock().unwrap(), old_id));
@@ -246,9 +303,16 @@ fn production_capture_drop_recovers_old_custody_after_actual_cas_reopen() {
     assert!(!released(&mut *store, 1));
     let locations = store.object_locations(&object.0).unwrap();
     assert_eq!(locations.len(), 1);
-    assert_eq!(std::fs::read(&locations[0].0).unwrap(), b"captured bytes survive recovery");
+    assert_eq!(
+        std::fs::read(&locations[0].0).unwrap(),
+        b"captured bytes survive recovery"
+    );
     let snapshot = store.gc_snapshot(900).unwrap();
-    assert!(snapshot.reachable_from_pins.contains(&digest_key(&object.0)));
+    assert!(
+        snapshot
+            .reachable_from_pins
+            .contains(&digest_key(&object.0))
+    );
 }
 
 #[test]
@@ -284,8 +348,14 @@ fn every_forged_witness_field_retains_its_original_pin() {
         let encoded = serde_json::to_string(&witness).unwrap();
         store
             .create_pin(
-                id, &object, &owner, CAPTURE_PIN_CLASS, None,
-                Some(&encoded), true, "forged witness control",
+                id,
+                &object,
+                &owner,
+                CAPTURE_PIN_CLASS,
+                None,
+                Some(&encoded),
+                true,
+                "forged witness control",
             )
             .unwrap();
         let valid = capture(&mut store, &attempt, &root(2));
@@ -305,9 +375,10 @@ fn full_width_witnesses_recover_through_both_metadata_backends() {
     let dir = crate::test_util::private_tempdir();
     let stores: [Box<dyn RabsMetadataStore>; 2] = [
         Box::new(SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap()),
-        Box::new(SqlMetadataStore::open(
-            FsqliteEngine::open(&dir.path().join("metadata.db")).unwrap(),
-        ).unwrap()),
+        Box::new(
+            SqlMetadataStore::open(FsqliteEngine::open(&dir.path().join("metadata.db")).unwrap())
+                .unwrap(),
+        ),
     ];
     for mut store in stores {
         let mut attempt = fixture_attempt(u128::MAX - 2);

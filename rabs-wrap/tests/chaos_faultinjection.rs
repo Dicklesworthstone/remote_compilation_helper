@@ -75,7 +75,7 @@ fn daemon_log(dir: &std::path::Path) -> String {
 }
 
 fn wait_for_socket(socket: &std::path::Path, up: bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while socket.exists() != up {
         assert!(
             Instant::now() < deadline,

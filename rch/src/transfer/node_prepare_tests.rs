@@ -24,7 +24,9 @@ fn dependency_preparation_is_inside_the_tracked_workload() {
     ] {
         let pipeline = pipeline(kind, true, WorkerPlatform::Posix);
         let command = pipeline.build_remote_command(workload, None);
-        let session = command.find("setsid sh -c").expect("tracked process group");
+        // Linux selects setsid(1) as the session launcher, then runs `"$@" sh -c`.
+        assert!(command.contains("*) set -- setsid;;"));
+        let session = command.find("\"$@\" sh -c").expect("tracked process group");
         let preparation = command.find("rch-wkr prepare").expect("worker preparation");
         assert!(preparation > session);
         assert_eq!(command.matches("rch-wkr prepare").count(), 1);

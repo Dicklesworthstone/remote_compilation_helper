@@ -25,6 +25,8 @@
 //! abandoned so nothing hides.
 
 mod output_install;
+mod request_owned_install;
+pub(super) use request_owned_install::RequestOwnedInstallError;
 #[cfg(test)]
 mod produced_result_tests;
 
@@ -83,6 +85,8 @@ use rabs_protocol::serving::{
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
+use rabs_scheduler::acquisition_order::{GrantRefusal, RootGrant, TransferableToken};
+use rabs_scheduler::fairness::{FairQueue, TenantKey};
 use rabs_scheduler::speculation_brownout::{
     BrownoutDecision, PressureBand, SpeculationProvenance, WorkCategory, band, decide,
 };
@@ -327,6 +331,18 @@ pub enum ExpectedOutputs {
         paths: std::collections::BTreeSet<String>,
         /// Directory mappings; component boundaries and longest-prefix order
         /// are validated before deriving any subscriber output.
+        mappings: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Canonical Cargo consumes the exact namespace-visible .d bytes. These
+    /// mappings translate validation and freshness I/O only; they never rewrite
+    /// the compiler's paths or the installed dep-info. The retained driver
+    /// capability constructs and revalidates the backing mappings.
+    CanonicalCargo {
+        /// Complete output names relative to the retained target directory.
+        paths: std::collections::BTreeSet<String>,
+        /// The compiler's absolute namespace-visible working directory.
+        working_directory: Vec<u8>,
+        /// Namespace roots and their private filesystem backings.
         mappings: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// The caller is not skipping any work and accepts whatever the
@@ -739,9 +755,17 @@ struct ProjectedFile {
     executable: bool,
 }
 
+#[derive(Debug)]
+struct ProjectedDirectory {
+    root: String,
+    relative: String,
+}
+
 /// A descriptor bound to actual retained source bytes BEFORE submission.
-/// This initial source lane supports projected regular files. Other positive
-/// input kinds need their own verified materializers and are refused explicitly.
+/// This source lane supports projected regular files and complete captured
+/// directory inventories. Other positive input kinds need their own verified
+/// materializers and are refused explicitly. Separately retained key-only
+/// evidence never becomes a compiler-visible filesystem input.
 /// Invocation, environment and negative-dependency validation remain the edge's
 /// responsibility; this constructor is not a parser for untrusted wire requests.
 #[derive(Debug)]
@@ -749,6 +773,8 @@ pub struct ActionSubmission {
     descriptor: ActionDescriptor,
     source: Arc<SealedSourceSnapshot>,
     files: Vec<ProjectedFile>,
+    directories: Vec<ProjectedDirectory>,
+    evidence: Vec<Arc<[u8]>>,
 }
 
 impl ActionSubmission {
@@ -762,18 +788,33 @@ impl ActionSubmission {
         source: Arc<SealedSourceSnapshot>,
         mappings: &[(String, String)],
     ) -> Result<Self, SubmissionRefusal> {
+        Self::from_snapshot_with_evidence(descriptor, manifest, source, mappings, &[])
+    }
+
+    /// Validate captured compiler inputs plus retained non-executable evidence,
+    /// such as a completed Cargo build-script stdout record. Every evidence
+    /// object must exactly match one positive manifest input outside all mapped
+    /// source roots. Its bytes are retained for the submission's lifetime but
+    /// never materialized or mounted. This cannot replace a captured source
+    /// file or fill a missing member of an enumerated source tree.
+    pub fn from_snapshot_with_evidence(
+        descriptor: ActionDescriptor,
+        manifest: &ActionInputManifest,
+        source: Arc<SealedSourceSnapshot>,
+        mappings: &[(String, String)],
+        evidence: &[(String, Vec<u8>)],
+    ) -> Result<Self, SubmissionRefusal> {
         let invalid = |why: &str| SubmissionRefusal::InvalidSource(why.to_owned());
         let digest = action_input_manifest_digest(manifest)
             .map_err(|error| invalid(&format!("invalid input manifest: {error:?}")))?;
         if digest != descriptor.action_inputs {
             return Err(invalid("descriptor input digest does not match projection"));
         }
-        if manifest.inputs.is_empty()
-            || !manifest.directory_enumerations.is_empty()
+        if (manifest.inputs.is_empty() && manifest.directory_enumerations.is_empty())
             || !manifest.approved_generated_objects.is_empty()
         {
             return Err(invalid(
-                "this source lane requires a nonempty regular-file projection",
+                "this source lane requires captured files or complete directories",
             ));
         }
         let mut roots = BTreeSet::new();
@@ -782,23 +823,68 @@ impl ActionSubmission {
                 || visible
                     .strip_prefix(&format!("{}/", rabs_sandbox::layout::REPOS))
                     .is_some_and(source_component);
-            if !canonical_root || !roots.insert(root) || source.manifest(root).is_none() {
+            if !canonical_root
+                || !source_component(root)
+                || !roots.insert(root)
+                || source.manifest(root).is_none()
+            {
                 return Err(invalid("invalid or duplicate snapshot root mapping"));
             }
         }
         for (index, (_, visible)) in mappings.iter().enumerate() {
-            if mappings[..index].iter().any(|(_, prior)| prior == visible) {
+            if mappings[..index].iter().any(|(_, prior)| {
+                Path::new(prior).starts_with(visible) || Path::new(visible).starts_with(prior)
+            }) {
                 return Err(invalid("ambiguous canonical root mapping"));
+            }
+        }
+        let mut retained_evidence = BTreeMap::new();
+        for (path, bytes) in evidence {
+            let canonical = path
+                .strip_prefix(&format!("{}/", rabs_sandbox::layout::WORKSPACE))
+                .is_some_and(|relative| relative.split('/').all(source_component))
+                || path
+                    .strip_prefix(&format!("{}/", rabs_sandbox::layout::REPOS))
+                    .and_then(|relative| relative.split_once('/'))
+                    .is_some_and(|(root, relative)| {
+                        source_component(root) && relative.split('/').all(source_component)
+                    });
+            if !canonical
+                || mappings.iter().any(|(_, visible)| {
+                    Path::new(path).starts_with(visible) || Path::new(visible).starts_with(path)
+                })
+                || retained_evidence
+                    .insert(path.as_str(), Arc::<[u8]>::from(bytes.as_slice()))
+                    .is_some()
+            {
+                return Err(invalid(
+                    "invalid, overlapping or duplicate key-only evidence",
+                ));
             }
         }
         let mut files = Vec::new();
         let mut paths = BTreeSet::new();
+        let mut projected_members = BTreeSet::new();
+        let mut matched_evidence = BTreeSet::new();
         for input in &manifest.inputs {
             if input.file_type != InputFileType::Regular || !input.symlink_resolution.is_empty() {
                 return Err(invalid("unsupported non-regular source projection"));
             }
             let path = std::str::from_utf8(input.virtual_path.as_bytes())
                 .map_err(|_| invalid("source path is not lossless UTF-8"))?;
+            if !paths.insert(path.to_owned()) {
+                return Err(invalid("duplicate source path"));
+            }
+            if let Some(bytes) = retained_evidence.get(path) {
+                let object = digest_set(bytes, DigestRequest::default(), None)
+                    .map_err(|_| invalid("evidence object digest failed"))?
+                    .atp_content_id;
+                if input.executable || input.object.0 != object {
+                    return Err(invalid("key-only evidence differs from its retained bytes"));
+                }
+                matched_evidence.insert(path);
+                continue;
+            }
             let (root, relative) = mappings
                 .iter()
                 .find_map(|(root, visible)| {
@@ -809,9 +895,6 @@ impl ActionSubmission {
                 .ok_or_else(|| invalid("source path is outside mapped roots"))?;
             if !relative.split('/').all(source_component) {
                 return Err(invalid("source path contains unsafe components"));
-            }
-            if !paths.insert(path.to_owned()) {
-                return Err(invalid("duplicate source path"));
             }
             let member = source
                 .manifest(root)
@@ -835,16 +918,127 @@ impl ActionSubmission {
             if input.object.0 != object {
                 return Err(invalid("projected object differs from captured bytes"));
             }
+            projected_members.insert((root.clone(), relative.to_owned()));
             files.push(ProjectedFile {
                 root: root.clone(),
                 relative: relative.to_owned(),
                 executable: input.executable,
             });
         }
+        if matched_evidence.len() != retained_evidence.len() {
+            return Err(invalid(
+                "key-only evidence is absent from the input manifest",
+            ));
+        }
+
+        // A directory listing promises an exact namespace, including empty
+        // directories. Require the complete captured tree for each root with
+        // listings, rather than accepting a listing whose unprojected children
+        // would disappear when materialized. Roots with files only retain the
+        // existing sparse-projection semantics.
+        let mut declared: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for enumeration in &manifest.directory_enumerations {
+            let path = std::str::from_utf8(enumeration.virtual_path.as_bytes())
+                .map_err(|_| invalid("directory path is not lossless UTF-8"))?;
+            let (root, relative) = mappings
+                .iter()
+                .find_map(|(root, visible)| {
+                    if path == visible {
+                        Some((root, ""))
+                    } else {
+                        path.strip_prefix(visible.as_str())
+                            .and_then(|suffix| suffix.strip_prefix('/'))
+                            .map(|relative| (root, relative))
+                    }
+                })
+                .ok_or_else(|| invalid("directory listing is outside mapped roots"))?;
+            if (!relative.is_empty() && !relative.split('/').all(source_component))
+                || enumeration
+                    .entries
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(invalid("directory listing has unsafe or duplicate entries"));
+            }
+            let entries = enumeration
+                .entries
+                .iter()
+                .map(|entry| {
+                    let name = std::str::from_utf8(entry.as_bytes())
+                        .map_err(|_| invalid("directory entry is not lossless UTF-8"))?;
+                    if !source_component(name) {
+                        return Err(invalid("directory entry contains unsafe components"));
+                    }
+                    Ok(name.to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if declared
+                .entry(root.clone())
+                .or_default()
+                .insert(relative.to_owned(), entries)
+                .is_some()
+            {
+                return Err(invalid("duplicate directory listing"));
+            }
+        }
+        let mut directories = Vec::new();
+        for (root, listings) in declared {
+            let captured = source
+                .manifest(&root)
+                .ok_or_else(|| invalid("listed root was not captured"))?;
+            let mut expected = BTreeMap::from([(String::new(), BTreeSet::new())]);
+            for (relative, member) in &captured.members {
+                if !relative.split('/').all(source_component) {
+                    return Err(invalid("captured directory has unsafe members"));
+                }
+                match member {
+                    MemberKind::Directory => {
+                        expected.insert(relative.clone(), BTreeSet::new());
+                    }
+                    MemberKind::Regular { .. } => {
+                        if !projected_members.contains(&(root.clone(), relative.clone())) {
+                            return Err(invalid("listed tree contains an unprojected file"));
+                        }
+                    }
+                    MemberKind::Symlink { .. } => {
+                        return Err(invalid("listed tree contains an unsupported symlink"));
+                    }
+                }
+            }
+            for relative in captured.members.keys() {
+                let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+                expected
+                    .get_mut(parent)
+                    .ok_or_else(|| invalid("captured tree omits a parent directory"))?
+                    .insert(name.to_owned());
+            }
+            if expected.len() != listings.len()
+                || expected.iter().any(|(relative, entries)| {
+                    listings
+                        .get(relative)
+                        .is_none_or(|listing| !listing.iter().eq(entries.iter()))
+                })
+            {
+                return Err(invalid(
+                    "directory listings differ from the complete captured tree",
+                ));
+            }
+            directories.extend(expected.into_keys().map(|relative| ProjectedDirectory {
+                root: root.clone(),
+                relative,
+            }));
+        }
+        if files.is_empty() && directories.is_empty() {
+            return Err(invalid(
+                "source projection has no captured files or directories",
+            ));
+        }
         Ok(Self {
             descriptor,
             source,
             files,
+            directories,
+            evidence: retained_evidence.into_values().collect(),
         })
     }
 
@@ -854,9 +1048,10 @@ impl ActionSubmission {
         compute_action_key(&self.descriptor).final_key
     }
 
-    /// Materialize ONLY projected files into fresh caller-owned backing. Hidden
-    /// parents are created; all file modes are normalized to the keyed executable
-    /// bit (0644/0755 on Unix). Execution must mount this backing read-only.
+    /// Materialize ONLY projected files and validated complete directory trees
+    /// into fresh caller-owned backing. Key-only evidence stays unmounted.
+    /// Hidden parents are created; all file modes are normalized to the keyed
+    /// executable bit (0644/0755 on Unix). Execution mounts this backing read-only.
     /// Partial failure leaves inspection state and never returns a usable handle.
     pub fn materialize_into(
         &self,
@@ -865,6 +1060,11 @@ impl ActionSubmission {
         use std::io::Write;
         std::fs::create_dir(destination)?;
         let mut backing = BTreeMap::new();
+        for directory in &self.directories {
+            let root = destination.join(&directory.root);
+            std::fs::create_dir_all(root.join(&directory.relative))?;
+            backing.insert(directory.root.clone(), root);
+        }
         for file in &self.files {
             let root = destination.join(&file.root);
             let output = root.join(&file.relative);
@@ -895,13 +1095,19 @@ impl ActionSubmission {
         Ok(backing)
     }
 
-    /// Total projected source bytes across validated inputs (for Q009 transfer/storage cost accounting).
+    /// Total retained input bytes, including key-only evidence (for Q009
+    /// transfer/storage cost accounting).
     #[must_use]
     pub fn source_bytes(&self) -> u64 {
         self.files
             .iter()
             .filter_map(|file| self.source.file_bytes(&file.root, &file.relative))
             .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .chain(
+                self.evidence
+                    .iter()
+                    .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+            )
             .fold(0_u64, u64::saturating_add)
     }
 }
@@ -1142,6 +1348,120 @@ pub const GIT_PREWARM_RECEIPT_KIND: &str = "q007_git_prewarm_event";
 /// prewarm publication is promoted (`rabsd::coord::live`).
 pub const CI_CANONICAL_PREWARM_RECEIPT_KIND: &str = "q008_ci_canonical_prewarm";
 
+/// Durable `decision_receipts` kind written whenever the live Cargo root-permit
+/// broker admits, refuses, or completes a Cargo root (`bd-d4uqa` / `T016`).
+pub const CARGO_ROOT_BROKER_RECEIPT_KIND: &str = "cargo_root_permit_broker";
+
+/// Receipt emitted when a Cargo build request is enqueued in the live root-permit broker (`bd-d4uqa`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootEnqueueReceipt {
+    /// Owning tenant across fairness dimensions.
+    pub tenant: TenantKey,
+    /// Unique Cargo root invocation identifier.
+    pub root_id: String,
+    /// Enqueue tick.
+    pub enqueued_at: u64,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Receipt emitted when the live Cargo root-permit broker grants a root permit (`bd-d4uqa` / `T016`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootGrantReceipt {
+    /// Owning tenant.
+    pub tenant: TenantKey,
+    /// Granted Cargo root invocation identifier.
+    pub root_id: String,
+    /// Granted root capacity `C` (`1` implicit + `C - 1` transferable jobserver tokens).
+    pub capacity: u32,
+    /// Enqueue-to-grant wait time in ticks.
+    pub wait_ticks: u64,
+    /// Active Cargo roots after this grant (`<= max_concurrent_cargo_roots`).
+    pub active_cargo_roots: u32,
+    /// Configured ceiling on concurrent Cargo roots (`T016`).
+    pub max_concurrent_cargo_roots: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Receipt emitted when an active Cargo root completes and releases its root grant (`bd-d4uqa`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootCompletionReceipt {
+    /// Completed Cargo root invocation identifier.
+    pub root_id: String,
+    /// Active Cargo roots remaining after completion.
+    pub active_cargo_roots: u32,
+    /// Durable receipt sequence in `decision_receipts`.
+    pub receipt_seq: u64,
+}
+
+/// Live telemetry snapshot for the coordinator's Cargo root-permit broker (`bd-d4uqa` / `T016`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoRootBrokerTelemetry {
+    /// Maximum concurrent Cargo roots allowed by policy (`T016`).
+    pub max_concurrent_cargo_roots: u32,
+    /// Per-root capacity `C` (`1` implicit + `C - 1` transferable tokens).
+    pub per_root_capacity: u32,
+    /// Currently active Cargo roots holding an open `RootGrant`.
+    pub active_cargo_roots: u32,
+    /// High-water mark of active Cargo roots observed (`must be <= max_concurrent_cargo_roots`).
+    pub peak_active_cargo_roots: u32,
+    /// Requests currently waiting in the weighted fair queue.
+    pub queued_requests: u64,
+    /// Total requests enqueued.
+    pub total_enqueued: u64,
+    /// Total root permits granted.
+    pub total_granted: u64,
+    /// Total root permits completed and released.
+    pub total_completed: u64,
+    /// Total admission attempts deferred/refused because `active_cargo_roots == max_concurrent_cargo_roots`.
+    pub total_root_cap_refusals: u64,
+    /// Hard starvation bound in ticks configured on the `FairQueue`.
+    pub starvation_bound: u64,
+    /// Worst observed enqueue-to-grant lag per agent (`agent -> max_wait_ticks`).
+    pub worst_lag_by_agent: BTreeMap<String, u64>,
+    /// Count of granted items whose wait exceeded `starvation_bound`.
+    pub starvation_violations: u64,
+    /// Service order of granted `root_id`s for deterministic replay auditing.
+    pub granted_order: Vec<String>,
+}
+
+struct CargoRootBrokerState {
+    max_concurrent_cargo_roots: u32,
+    per_root_capacity: u32,
+    queue: FairQueue,
+    queued_count: u64,
+    active_grants: BTreeMap<String, RootGrant>,
+    peak_active_cargo_roots: u32,
+    total_enqueued: u64,
+    total_granted: u64,
+    total_completed: u64,
+    total_root_cap_refusals: u64,
+    worst_lag_by_agent: BTreeMap<String, u64>,
+    starvation_violations: u64,
+    granted_order: Vec<String>,
+}
+
+impl Default for CargoRootBrokerState {
+    fn default() -> Self {
+        Self {
+            max_concurrent_cargo_roots: 4,
+            per_root_capacity: 4,
+            queue: FairQueue::new(64, 16),
+            queued_count: 0,
+            active_grants: BTreeMap::new(),
+            peak_active_cargo_roots: 0,
+            total_enqueued: 0,
+            total_granted: 0,
+            total_completed: 0,
+            total_root_cap_refusals: 0,
+            worst_lag_by_agent: BTreeMap::new(),
+            starvation_violations: 0,
+            granted_order: Vec::new(),
+        }
+    }
+}
+
 /// Git / workspace lifecycle event triggering prewarm (bead Q007; plan §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitPrewarmEventKind {
@@ -1331,6 +1651,7 @@ pub struct CoordLive {
     speculation_runs: Mutex<Vec<SpeculationRunRecord>>,
     speculation_gate: Mutex<SpeculationGateState>,
     prewarm_state: Mutex<PrewarmCoordinatorState>,
+    cargo_root_broker: Mutex<CargoRootBrokerState>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -2270,6 +2591,322 @@ impl CoordLive {
                 required_tier,
             })
         }
+    }
+
+    /// Configure the live Cargo root-permit broker and weighted fair queue (`bd-d4uqa` / `T016`).
+    pub fn configure_cargo_root_broker(
+        &self,
+        max_concurrent_cargo_roots: u32,
+        per_root_capacity: u32,
+        starvation_bound: u64,
+        deadline_window: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        if max_concurrent_cargo_roots == 0 || per_root_capacity == 0 {
+            return Err(SubmissionRefusal::Admission(
+                "cargo root broker capacities must be non-zero".to_owned(),
+            ));
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker.max_concurrent_cargo_roots = max_concurrent_cargo_roots;
+        broker.per_root_capacity = per_root_capacity;
+        broker.queue = FairQueue::new(starvation_bound, deadline_window);
+        broker.queued_count = 0;
+        broker.active_grants.clear();
+        broker.peak_active_cargo_roots = 0;
+        broker.total_enqueued = 0;
+        broker.total_granted = 0;
+        broker.total_completed = 0;
+        broker.total_root_cap_refusals = 0;
+        broker.worst_lag_by_agent.clear();
+        broker.starvation_violations = 0;
+        broker.granted_order.clear();
+        Ok(())
+    }
+
+    /// Set a tenant's scheduling weight in the live Cargo root-permit broker (`bd-d4uqa`).
+    pub fn set_cargo_root_tenant_weight(
+        &self,
+        tenant: TenantKey,
+        weight: u64,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker.queue.set_weight(tenant, weight);
+        Ok(())
+    }
+
+    /// Enqueue a Cargo root request into the live coordinator's weighted fair queue (`bd-d4uqa`).
+    pub fn enqueue_cargo_root_request(
+        &self,
+        tenant: TenantKey,
+        root_id: &str,
+        cost: u64,
+        now_tick: u64,
+        deadline: Option<u64>,
+    ) -> Result<CargoRootEnqueueReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        if root_id.is_empty() {
+            return Err(SubmissionRefusal::Admission(
+                "root_id must not be empty".to_owned(),
+            ));
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        broker
+            .queue
+            .enqueue(tenant.clone(), root_id, cost, now_tick, deadline);
+        broker.queued_count = broker.queued_count.saturating_add(1);
+        broker.total_enqueued = broker.total_enqueued.saturating_add(1);
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    root_id,
+                    receipt_seq,
+                    "enqueued",
+                    &format!(
+                        "agent={} project={} ci={} cost={} tick={}",
+                        tenant.agent, tenant.project, tenant.ci, cost, now_tick
+                    ),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker enqueue receipt: {error:?}"))
+                })?;
+        }
+        Ok(CargoRootEnqueueReceipt {
+            tenant,
+            root_id: root_id.to_owned(),
+            enqueued_at: now_tick,
+            receipt_seq,
+        })
+    }
+
+    /// Admit the next Cargo root from the weighted fair queue if active root capacity permits (`bd-d4uqa` / `T016`).
+    ///
+    /// Enforces `active_cargo_roots <= max_concurrent_cargo_roots`: when at capacity, records a
+    /// durable `"root_cap_reached"` receipt and returns `Ok(None)` without opening a grant.
+    pub fn admit_next_cargo_root(
+        &self,
+        now_tick: u64,
+    ) -> Result<Option<CargoRootGrantReceipt>, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let active_count = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        if active_count >= broker.max_concurrent_cargo_roots {
+            broker.total_root_cap_refusals = broker.total_root_cap_refusals.saturating_add(1);
+            let max_roots = broker.max_concurrent_cargo_roots;
+            drop(broker);
+
+            let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(cas) = self.cas.as_ref() {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| SubmissionRefusal::Unavailable)?;
+                store
+                    .record_decision_receipt(
+                        CARGO_ROOT_BROKER_RECEIPT_KIND,
+                        "broker_capacity_gate",
+                        receipt_seq,
+                        "root_cap_reached",
+                        &format!(
+                            "active_cargo_roots={active_count} max_concurrent_cargo_roots={max_roots} tick={now_tick}"
+                        ),
+                    )
+                    .map_err(|error| {
+                        SubmissionRefusal::Admission(format!(
+                            "broker cap refusal receipt: {error:?}"
+                        ))
+                    })?;
+            }
+            return Ok(None);
+        }
+
+        let Some(item) = broker.queue.dequeue(now_tick) else {
+            return Ok(None);
+        };
+        broker.queued_count = broker.queued_count.saturating_sub(1);
+        let capacity = broker.per_root_capacity;
+        let grant = RootGrant::open(capacity).map_err(|error| {
+            SubmissionRefusal::Admission(format!("root grant open failed: {error:?}"))
+        })?;
+        let root_id = item.label.clone();
+        broker.active_grants.insert(root_id.clone(), grant);
+        let new_active = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        if new_active > broker.peak_active_cargo_roots {
+            broker.peak_active_cargo_roots = new_active;
+        }
+        let wait_ticks = now_tick.saturating_sub(item.enqueued_at);
+        if wait_ticks > broker.queue.starvation_bound {
+            broker.starvation_violations = broker.starvation_violations.saturating_add(1);
+        }
+        broker
+            .worst_lag_by_agent
+            .entry(item.tenant.agent.clone())
+            .and_modify(|worst| *worst = (*worst).max(wait_ticks))
+            .or_insert(wait_ticks);
+        broker.total_granted = broker.total_granted.saturating_add(1);
+        broker.granted_order.push(root_id.clone());
+        let max_roots = broker.max_concurrent_cargo_roots;
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    &root_id,
+                    receipt_seq,
+                    "root_granted",
+                    &format!(
+                        "agent={} capacity={} wait_ticks={} active={}/{}",
+                        item.tenant.agent, capacity, wait_ticks, new_active, max_roots
+                    ),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker grant receipt: {error:?}"))
+                })?;
+        }
+
+        Ok(Some(CargoRootGrantReceipt {
+            tenant: item.tenant,
+            root_id,
+            capacity,
+            wait_ticks,
+            active_cargo_roots: new_active,
+            max_concurrent_cargo_roots: max_roots,
+            receipt_seq,
+        }))
+    }
+
+    /// Issue one transferable jobserver token from an active Cargo root's `C - 1` budget (`bd-d4uqa`).
+    pub fn issue_cargo_jobserver_token(
+        &self,
+        root_id: &str,
+    ) -> Result<Result<TransferableToken, GrantRefusal>, SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(grant) = broker.active_grants.get_mut(root_id) else {
+            return Ok(Err(GrantRefusal::GrantClosed));
+        };
+        Ok(grant.issue_transferable())
+    }
+
+    /// Release one transferable jobserver token back to an active Cargo root (`bd-d4uqa`).
+    pub fn release_cargo_jobserver_token(
+        &self,
+        root_id: &str,
+        token: &TransferableToken,
+    ) -> Result<Result<(), GrantRefusal>, SubmissionRefusal> {
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(grant) = broker.active_grants.get_mut(root_id) else {
+            return Ok(Err(GrantRefusal::GrantClosed));
+        };
+        Ok(grant.release(token))
+    }
+
+    /// Complete an active Cargo root, closing its `RootGrant` and freeing one root slot (`bd-d4uqa`).
+    pub fn complete_cargo_root(
+        &self,
+        root_id: &str,
+        now_tick: u64,
+    ) -> Result<CargoRootCompletionReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() || self.authority().is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let Some(mut grant) = broker.active_grants.remove(root_id) else {
+            return Err(SubmissionRefusal::Admission(format!(
+                "unknown or already completed cargo root: {root_id}"
+            )));
+        };
+        grant.close();
+        broker.total_completed = broker.total_completed.saturating_add(1);
+        let remaining = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
+        drop(broker);
+
+        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(cas) = self.cas.as_ref() {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            store
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    root_id,
+                    receipt_seq,
+                    "root_completed",
+                    &format!("remaining_active={remaining} tick={now_tick}"),
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker completion receipt: {error:?}"))
+                })?;
+        }
+
+        Ok(CargoRootCompletionReceipt {
+            root_id: root_id.to_owned(),
+            active_cargo_roots: remaining,
+            receipt_seq,
+        })
+    }
+
+    /// Snapshot live telemetry for the Cargo root-permit broker (`bd-d4uqa` / `T016`).
+    pub fn cargo_root_broker_telemetry(
+        &self,
+    ) -> Result<CargoRootBrokerTelemetry, SubmissionRefusal> {
+        let broker = self
+            .cargo_root_broker
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(CargoRootBrokerTelemetry {
+            max_concurrent_cargo_roots: broker.max_concurrent_cargo_roots,
+            per_root_capacity: broker.per_root_capacity,
+            active_cargo_roots: u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX),
+            peak_active_cargo_roots: broker.peak_active_cargo_roots,
+            queued_requests: broker.queued_count,
+            total_enqueued: broker.total_enqueued,
+            total_granted: broker.total_granted,
+            total_completed: broker.total_completed,
+            total_root_cap_refusals: broker.total_root_cap_refusals,
+            starvation_bound: broker.queue.starvation_bound,
+            worst_lag_by_agent: broker.worst_lag_by_agent.clone(),
+            starvation_violations: broker.starvation_violations,
+            granted_order: broker.granted_order.clone(),
+        })
     }
 
     fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
@@ -3880,7 +4517,9 @@ mod tests {
     use rabs_protocol::generation::{
         AttemptId, ExecutionLeaseId, LeaseRenewalSeq, WorkerBootGeneration,
     };
-    use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput};
+    use rabs_protocol::input_evidence::{
+        DirectoryEnumeration, INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput,
+    };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
     use rabs_protocol::worker_fence::WorkerLeaseBindingRejection;
@@ -3954,6 +4593,93 @@ mod tests {
             &[("workspace".into(), rabs_sandbox::layout::WORKSPACE.into())],
         )
         .unwrap()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn complete_projection_fixture() -> (
+        tempfile::TempDir,
+        Arc<SealedSourceSnapshot>,
+        ActionInputManifest,
+        ActionDescriptor,
+        Vec<(String, String)>,
+    ) {
+        let root = crate::test_util::private_tempdir();
+        let package = root.path().join("package");
+        let generated = root.path().join("generated");
+        let native = root.path().join("native");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::create_dir_all(generated.join("nested/also-empty")).unwrap();
+        std::fs::create_dir(generated.join("empty")).unwrap();
+        std::fs::create_dir(&native).unwrap();
+        std::fs::write(package.join("input.txt"), b"projected bytes\n").unwrap();
+        std::fs::write(package.join("unrelated.txt"), b"unprojected package file").unwrap();
+        std::fs::write(generated.join("nested/libnative.a"), b"retained archive").unwrap();
+        let source = Arc::new(
+            capture_sealed_source(
+                &[
+                    ("package".into(), package),
+                    ("generated".into(), generated),
+                    ("native".into(), native),
+                ],
+                false,
+                2,
+                4096,
+            )
+            .unwrap(),
+        );
+        let inputs = [
+            (
+                "/__rabs/repos/package/input.txt",
+                b"projected bytes\n".as_slice(),
+            ),
+            (
+                "/__rabs/repos/package-generated/nested/libnative.a",
+                b"retained archive".as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| PositiveInput {
+            virtual_path: RawBytes::from(path),
+            object: ObjectId(
+                digest_set(bytes, DigestRequest::default(), None)
+                    .unwrap()
+                    .atp_content_id,
+            ),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        })
+        .collect();
+        let directory_enumerations = [
+            ("/__rabs/repos/package-generated", vec!["empty", "nested"]),
+            ("/__rabs/repos/package-generated/empty", vec![]),
+            (
+                "/__rabs/repos/package-generated/nested",
+                vec!["also-empty", "libnative.a"],
+            ),
+            ("/__rabs/repos/package-generated/nested/also-empty", vec![]),
+            ("/__rabs/repos/package-native-0000", vec![]),
+        ]
+        .into_iter()
+        .map(|(path, entries)| DirectoryEnumeration {
+            virtual_path: RawBytes::from(path),
+            entries: entries.into_iter().map(RawBytes::from).collect(),
+        })
+        .collect();
+        let manifest = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs,
+            directory_enumerations,
+            approved_generated_objects: Vec::new(),
+        };
+        let (_base, _image, _inputs, mut descriptor) = source_fixture();
+        descriptor.action_inputs = action_input_manifest_digest(&manifest).unwrap();
+        let mappings = vec![
+            ("package".into(), "/__rabs/repos/package".into()),
+            ("generated".into(), "/__rabs/repos/package-generated".into()),
+            ("native".into(), "/__rabs/repos/package-native-0000".into()),
+        ];
+        (root, source, manifest, descriptor, mappings)
     }
 
     fn request(operation: u128, kind: SubscriberKind, priority: u8) -> JoinRequest {
@@ -4249,6 +4975,194 @@ mod tests {
     }
 
     #[test]
+    fn complete_projection_retains_empty_directories_and_original_captured_bytes() {
+        let (live, source, manifest, descriptor, mappings) = complete_projection_fixture();
+        let input =
+            ActionSubmission::from_snapshot(descriptor, &manifest, Arc::clone(&source), &mappings)
+                .unwrap();
+        std::fs::write(
+            live.path().join("generated/nested/libnative.a"),
+            b"changed archive",
+        )
+        .unwrap();
+        std::fs::write(live.path().join("generated/empty/late-file"), b"later").unwrap();
+        let target = live.path().join("projection");
+        let paths = input.materialize_into(&target).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(
+            std::fs::read(paths["generated"].join("nested/libnative.a")).unwrap(),
+            b"retained archive"
+        );
+        for empty in [
+            paths["generated"].join("empty"),
+            paths["generated"].join("nested/also-empty"),
+            paths["native"].clone(),
+        ] {
+            assert!(empty.is_dir());
+            assert_eq!(std::fs::read_dir(empty).unwrap().count(), 0);
+        }
+        assert!(!paths["package"].join("unrelated.txt").exists());
+
+        // A directory-only retained tree is a real input, including an empty
+        // root, and needs no fabricated file to survive materialization.
+        let mut empty_only = manifest;
+        empty_only.inputs.clear();
+        empty_only.directory_enumerations.retain(|enumeration| {
+            enumeration.virtual_path.as_bytes() == b"/__rabs/repos/package-native-0000"
+        });
+        let mut descriptor = input.descriptor.clone();
+        descriptor.action_inputs = action_input_manifest_digest(&empty_only).unwrap();
+        let empty = ActionSubmission::from_snapshot(descriptor, &empty_only, source, &mappings)
+            .unwrap()
+            .materialize_into(&live.path().join("empty-projection"))
+            .unwrap();
+        assert_eq!(empty.len(), 1);
+        assert!(empty["native"].is_dir());
+    }
+
+    #[test]
+    fn complete_projection_refuses_missing_extra_unsafe_or_unprojected_directory_members() {
+        let (_live, source, manifest, descriptor, mappings) = complete_projection_fixture();
+        for case in 0..11 {
+            let mut changed = manifest.clone();
+            match case {
+                0 => {
+                    changed.directory_enumerations.remove(0);
+                }
+                1 => {
+                    changed.directory_enumerations.remove(3);
+                }
+                2 => {
+                    changed.directory_enumerations[0].entries.remove(0);
+                }
+                3 => changed.directory_enumerations[1]
+                    .entries
+                    .push(RawBytes::from("invented")),
+                4 => changed.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::from(
+                        "/__rabs/repos/package-generated/nested/libnative.a",
+                    ),
+                    entries: Vec::new(),
+                }),
+                5 => {
+                    changed.directory_enumerations[1].virtual_path =
+                        RawBytes::from("/__rabs/repos/unmapped/empty");
+                }
+                6 => changed.directory_enumerations[0].entries.reverse(),
+                7 => {
+                    changed.directory_enumerations[1].entries =
+                        vec![RawBytes::from("duplicate"), RawBytes::from("duplicate")]
+                }
+                8 => changed.directory_enumerations[1].entries = vec![RawBytes::from("../escape")],
+                9 => {
+                    changed.directory_enumerations[1].virtual_path =
+                        RawBytes::from("/__rabs/repos/package-generated/../escape");
+                }
+                _ => {
+                    changed.inputs.remove(1);
+                }
+            }
+            let mut described = descriptor.clone();
+            described.action_inputs = action_input_manifest_digest(&changed).unwrap();
+            assert!(
+                matches!(
+                    ActionSubmission::from_snapshot(
+                        described,
+                        &changed,
+                        Arc::clone(&source),
+                        &mappings,
+                    ),
+                    Err(SubmissionRefusal::InvalidSource(_))
+                ),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_only_evidence_retains_exact_bytes_without_becoming_a_source_mount() {
+        let (live, source, mut manifest, mut descriptor, mappings) = complete_projection_fixture();
+        let path = "/__rabs/repos/package-native-records/0000";
+        let record = b"cargo::rustc-link-search=native=/__rabs/out/cargo/debug/build/a/out\n";
+        manifest.inputs.push(PositiveInput {
+            virtual_path: RawBytes::from(path),
+            object: ObjectId(
+                digest_set(record, DigestRequest::default(), None)
+                    .unwrap()
+                    .atp_content_id,
+            ),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        descriptor.action_inputs = action_input_manifest_digest(&manifest).unwrap();
+        assert!(
+            ActionSubmission::from_snapshot(
+                descriptor.clone(),
+                &manifest,
+                Arc::clone(&source),
+                &mappings,
+            )
+            .is_err()
+        );
+        let mut evidence = vec![(path.to_owned(), record.to_vec())];
+        let input = ActionSubmission::from_snapshot_with_evidence(
+            descriptor.clone(),
+            &manifest,
+            Arc::clone(&source),
+            &mappings,
+            &evidence,
+        )
+        .unwrap();
+        evidence[0].1 = b"changed caller storage".to_vec();
+        assert_eq!(input.evidence[0].as_ref(), record);
+        assert_eq!(input.source_bytes(), 16 + 16 + record.len() as u64);
+        let target = live.path().join("with-record");
+        let paths = input.materialize_into(&target).unwrap();
+        assert_eq!(
+            paths.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["generated", "native", "package"]
+        );
+        assert!(!target.join("package-native-records").exists());
+        assert!(!paths["native"].join("0000").exists());
+
+        for case in 0..9 {
+            let mut changed = manifest.clone();
+            let mut evidence = vec![(path.to_owned(), record.to_vec())];
+            match case {
+                0 => evidence[0].1.push(b'!'),
+                1 => changed.inputs.last_mut().unwrap().executable = true,
+                2 => changed.inputs.last_mut().unwrap().file_type = InputFileType::Symlink,
+                3 => evidence.push((format!("{path}-unused"), record.to_vec())),
+                4 => evidence.push(evidence[0].clone()),
+                5 => evidence.push((
+                    "/__rabs/repos/package/input.txt".into(),
+                    b"projected bytes\n".to_vec(),
+                )),
+                6 => evidence[0].0 = "/host/records/0000".into(),
+                7 => evidence[0].0 = "/__rabs/repos/package-native-records/../0000".into(),
+                _ => changed.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::from("/__rabs/repos/package-native-records"),
+                    entries: vec![RawBytes::from("0000")],
+                }),
+            }
+            let mut described = descriptor.clone();
+            described.action_inputs = action_input_manifest_digest(&changed).unwrap();
+            assert!(
+                ActionSubmission::from_snapshot_with_evidence(
+                    described,
+                    &changed,
+                    Arc::clone(&source),
+                    &mappings,
+                    &evidence,
+                )
+                .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
     fn shared_queue_prioritizes_foreground_and_restores_unstarted_claims() {
         let (_state, coord) = submission_coordinator();
         let (_live, source, manifest, descriptor) = source_fixture();
@@ -4436,6 +5350,58 @@ mod tests {
             incarnation: WorkerIncarnationId(incarnation),
             reenrollment_proof: None,
         }
+    }
+
+    #[test]
+    fn workspace_execution_retirement_allows_fresh_attempt_without_publishing() {
+        use crate::coord::live_dependency::settle_completed_dispatch;
+        use rabs_action::state_machines::AttemptState;
+
+        let (_state, coord) = submission_coordinator();
+        let (_source_root, source, manifest, mut descriptor) = source_fixture();
+        descriptor.action_class = ActionClass::RustcWorkspaceCompile;
+        let worker = worker_offer(1, 17);
+        coord.admit_worker_session(&worker).unwrap();
+        let mut attempts = Vec::new();
+        for operation in 1..=2 {
+            let submitted = coord
+                .submit_action(
+                    submission(&source, &manifest, &descriptor),
+                    request(operation, SubscriberKind::ForegroundAgent, 200),
+                    i64::try_from(operation).unwrap(),
+                    0,
+                )
+                .unwrap();
+            let key = submitted.action_key;
+            let serial = coord.claim_submitted_dispatch(&key).unwrap().unwrap();
+            let authority = coord
+                .begin_claimed_dispatch(&key, serial, &worker, 60_000)
+                .unwrap();
+            assert!(!attempts.contains(&authority.attempt_id));
+            attempts.push(authority.attempt_id);
+            // Explicit lifecycle fixture, not a claim that a compiler ran.
+            for state in [
+                AttemptState::LeaseAccepted,
+                AttemptState::AwaitingInputs,
+                AttemptState::Materializing,
+                AttemptState::Running,
+                AttemptState::ProcessExited,
+                AttemptState::HarvestingOutputs,
+                AttemptState::UploadingOutputs,
+                AttemptState::VerifyingOutputs,
+                AttemptState::PreparedResultOffered,
+            ] {
+                coord
+                    .advance_started_dispatch(&key, serial, &authority, state)
+                    .unwrap();
+            }
+            settle_completed_dispatch(&coord, &key, serial, &authority).unwrap();
+            assert!(coord.submitted_actor(&key).unwrap().is_none());
+            let mut store = coord.live_cas().unwrap().store().lock().unwrap();
+            assert!(store.published_manifest_key(&key).unwrap().is_none());
+            assert!(store.list_verification_samples(&key).unwrap().is_empty());
+        }
+        assert_eq!(attempts.len(), 2);
     }
 
     #[test]
@@ -5420,5 +6386,159 @@ mod tests {
             actor_after.slot(),
             rabs_action::state_machines::PublicationSlotState::Absent
         );
+    }
+
+    #[test]
+    fn bd_d4uqa_live_cargo_root_broker_fifteen_agent_storm_bounds_roots_and_starvation_with_receipts()
+     {
+        let (_state, coord) = submission_coordinator();
+        let starvation_bound = 64_u64;
+        let max_roots = 4_u32;
+        let per_root_capacity = 4_u32;
+        coord
+            .configure_cargo_root_broker(max_roots, per_root_capacity, starvation_bound, 16)
+            .unwrap();
+
+        let tenants: Vec<TenantKey> = (0..15)
+            .map(|i| TenantKey {
+                agent: format!("agent-{i:02}"),
+                project: format!("repo-{i:02}"),
+                ci: i % 5 == 0,
+            })
+            .collect();
+        // Give agent-00 a higher weight (4) to verify weighted fairness in live coordinator service order.
+        coord
+            .set_cargo_root_tenant_weight(tenants[0].clone(), 4)
+            .unwrap();
+
+        // Schedule 15 agents x 6 Cargo roots = 90 roots across staggered ticks.
+        let mut arrivals: BTreeMap<u64, Vec<(usize, String)>> = BTreeMap::new();
+        for (j, tenant) in tenants.iter().enumerate() {
+            for round in 0..6_u64 {
+                let tick = round * 30 + (j as u64) * 2;
+                arrivals
+                    .entry(tick)
+                    .or_default()
+                    .push((j, format!("{}/cargo-root-{round}", tenant.agent)));
+            }
+        }
+
+        let total_expected = 90_usize;
+        let mut active_queue: std::collections::VecDeque<(String, u64)> =
+            std::collections::VecDeque::new();
+        let mut completed = 0_usize;
+        let mut tick = 0_u64;
+
+        while completed < total_expected {
+            // Complete any active root whose 3-tick compile window finished.
+            while let Some((front_id, finish_tick)) = active_queue.front().cloned() {
+                if tick >= finish_tick {
+                    active_queue.pop_front();
+                    let comp = coord.complete_cargo_root(&front_id, tick).unwrap();
+                    assert!(comp.active_cargo_roots < max_roots);
+                    completed += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(batch) = arrivals.remove(&tick) {
+                for (j, root_id) in batch {
+                    coord
+                        .enqueue_cargo_root_request(tenants[j].clone(), &root_id, 100, tick, None)
+                        .unwrap();
+                }
+            }
+
+            // Attempt to admit up to max_roots + 1 times to exercise both normal grants and the T016 cap refusal.
+            for _ in 0..=max_roots {
+                if let Some(grant_receipt) = coord.admit_next_cargo_root(tick).unwrap() {
+                    assert!(
+                        grant_receipt.active_cargo_roots <= max_roots,
+                        "T016: active Cargo roots must never exceed granted ceiling"
+                    );
+                    assert_eq!(grant_receipt.capacity, per_root_capacity);
+
+                    // Exercise C-1 transferable jobserver tokens on the live root.
+                    let tok1 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    let tok2 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    let tok3 = coord
+                        .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                        .unwrap()
+                        .unwrap();
+                    // 4th transferable token on capacity=4 must be refused as TransferablesExhausted.
+                    assert_eq!(
+                        coord
+                            .issue_cargo_jobserver_token(&grant_receipt.root_id)
+                            .unwrap(),
+                        Err(GrantRefusal::TransferablesExhausted {
+                            outstanding: 3,
+                            capacity: 4
+                        })
+                    );
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok1)
+                        .unwrap()
+                        .unwrap();
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok2)
+                        .unwrap()
+                        .unwrap();
+                    coord
+                        .release_cargo_jobserver_token(&grant_receipt.root_id, &tok3)
+                        .unwrap()
+                        .unwrap();
+
+                    active_queue.push_back((grant_receipt.root_id, tick + 3));
+                } else {
+                    break;
+                }
+            }
+
+            tick += 1;
+        }
+
+        let telemetry = coord.cargo_root_broker_telemetry().unwrap();
+        assert_eq!(telemetry.total_enqueued, 90);
+        assert_eq!(telemetry.total_granted, 90);
+        assert_eq!(telemetry.total_completed, 90);
+        assert_eq!(telemetry.active_cargo_roots, 0);
+        assert!(telemetry.peak_active_cargo_roots <= max_roots);
+        assert!(telemetry.peak_active_cargo_roots > 1);
+        assert_eq!(
+            telemetry.starvation_violations, 0,
+            "no starvation beyond policy bound ({starvation_bound} ticks): {:?}",
+            telemetry.worst_lag_by_agent
+        );
+
+        // Verify durable telemetry receipts in SQLite `decision_receipts`.
+        let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+        let rows = store
+            .query(
+                "SELECT decision FROM decision_receipts WHERE kind = ?1",
+                &[SqlValue::Text(CARGO_ROOT_BROKER_RECEIPT_KIND.to_owned())],
+            )
+            .unwrap();
+        let enqueued_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "enqueued"))
+            .count();
+        let granted_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "root_granted"))
+            .count();
+        let completed_receipts = rows
+            .iter()
+            .filter(|r| matches!(r.as_slice(), [SqlValue::Text(d)] if d == "root_completed"))
+            .count();
+        assert_eq!(enqueued_receipts, 90);
+        assert_eq!(granted_receipts, 90);
+        assert_eq!(completed_receipts, 90);
     }
 }

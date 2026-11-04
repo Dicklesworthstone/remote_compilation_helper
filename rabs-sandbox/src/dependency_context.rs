@@ -14,6 +14,7 @@ use crate::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, IsolationError, NamespaceBoundary,
     NamespaceLaunch, push_binds, push_common_prelude, push_env, push_host_usr,
 };
+use crate::generated_source::validate_generated_directories;
 use crate::layout;
 use crate::runtime_cohort::RetainedRuntime;
 use std::collections::BTreeSet;
@@ -21,11 +22,36 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Both peers must explicitly select this capability before dependency execution.
-pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v7";
+pub const DEPENDENCY_CONTEXT_VERSION: &str = "dependency-exec-v8";
+/// Separately negotiated canonical Cargo dependency execution. This is not a
+/// pathname-based extension of the original-path context: both peers must
+/// select this version and its output mode before canonical aliases can enter
+/// a compiler view. Version 4 binds every generated subdirectory, including
+/// empty directories, alongside the sealed files at canonical Cargo OUT_DIR.
+pub const CANONICAL_DEPENDENCY_CONTEXT_VERSION: &str = "canonical-dependency-exec-v4";
+/// Fresh execution of a Cargo-selected workspace compilation. This separately
+/// negotiated context carries the complete retained workspace directory tree;
+/// it grants no dependency-cache or workspace-result publication authority.
+/// Version 3 also admits static archive bundling into a workspace rlib from
+/// that unit's complete, independently retained OUT_DIR. Metadata checks retain
+/// their existing binary, example and standard/custom harness contract.
+pub const CANONICAL_WORKSPACE_CONTEXT_VERSION: &str = "canonical-workspace-exec-v3";
+/// Separately advertised extension for metadata checks with static native inputs
+/// from the current canonical Cargo OUT_DIR. The existing context versions and
+/// measured metadata namespace remain unchanged; a coordinator must observe this
+/// capability before dispatching native metadata to an older worker. Archive
+/// execution does not require it and keeps its existing policy identity.
+pub const CANONICAL_NATIVE_METADATA_CAPABILITY: &str = "canonical-generated-static-metadata-v1";
+/// Additional complete Cargo build-output trees consumed through propagated
+/// native search paths. Peers must negotiate this before transferring inputs;
+/// it does not widen ordinary dependency execution or cache authority.
+pub const CANONICAL_NATIVE_ROOTS_CAPABILITY: &str = "canonical-generated-native-roots-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
 pub const MAX_DEPENDENCY_DIRS: usize = 64;
+/// Maximum independently retained native build-output roots per compilation.
+pub const MAX_NATIVE_ROOTS: usize = 32;
 
 /// The output class selects the filesystem contract independently of argv.
 /// The worker must also check that the actual invocation belongs to this class.
@@ -241,13 +267,27 @@ pub struct DependencyArtifactRoot {
     pub prefix: String,
 }
 
+/// A complete foreign Cargo build-script output tree. The prefix selects only
+/// its sealed bundle bytes; visible paths never authorize host filesystem reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyNativeRoot {
+    pub path: String,
+    pub prefix: String,
+    pub directories: Vec<String>,
+}
+
 /// Validated original paths and complete environment for one rustc action.
 /// Physical source, toolchain, output and jobserver backings never appear here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyExecContext {
+    canonical_cargo: bool,
+    workspace_execution_only: bool,
     execution_mode: DependencyExecutionMode,
     source_root: String,
+    source_directories: Vec<String>,
     generated_root: Option<String>,
+    generated_directories: Vec<String>,
+    native_roots: Vec<DependencyNativeRoot>,
     cwd: String,
     toolchain_root: String,
     compiler: String,
@@ -296,6 +336,18 @@ fn valid_alias(value: &str) -> bool {
         ]
         .iter()
         .any(|reserved| overlaps(Path::new(value), Path::new(reserved)))
+}
+
+fn canonical_descendant(value: &str, root: &str) -> bool {
+    normalized_absolute(value) && value != root && Path::new(value).starts_with(root)
+}
+
+fn canonical_alias(value: &str) -> bool {
+    value == layout::TOOLCHAIN
+        || value == "/__rabs/out/cargo"
+        || [layout::WORKSPACE, layout::CARGO_HOME, "/__rabs/out/cargo"]
+            .iter()
+            .any(|root| canonical_descendant(value, root))
 }
 
 impl DependencyExecContext {
@@ -402,12 +454,236 @@ impl DependencyExecContext {
         compiler: String,
         out_dir: String,
         dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_in_profile(
+            false,
+            false,
+            source_root,
+            cwd,
+            toolchain_root,
+            compiler,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Retain a canonical Cargo dependency's exact visible names while giving
+    /// its compiler only the selected package, toolchain and candidate bytes.
+    /// The complete outer Cargo workspace, Cargo home and control socket are
+    /// never mounted. The driver owns path admission; this constructor grants
+    /// neither caller-filesystem access nor cache/publication authority.
+    ///
+    /// Archive emission selects the existing Rlib namespace, which excludes
+    /// procfs and entropy devices so assembler inputs must come from retained
+    /// keyed bytes. Arbitrary canonical mount aliases remain unsupported.
+    /// Neither mode authorizes local codegen capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_cargo(
+        mode: DependencyExecutionMode,
+        source_root: String,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_canonical_cargo_with_generated(
+            mode,
+            source_root,
+            cwd,
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            None,
+            env,
+            runtime_cohort_sha256,
+        )
+    }
+
+    /// Add one complete retained build-script input tree at the exact OUT_DIR
+    /// beneath the canonical Cargo target. The tree is disjoint from writable
+    /// compiler outputs and may be empty; its bytes are supplied by the sealed
+    /// source owner. The worker neither executes nor caches the build script.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_cargo_with_generated(
+        mode: DependencyExecutionMode,
+        source_root: String,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        Self::new_in_profile(
+            true,
+            false,
+            source_root,
+            cwd,
+            layout::TOOLCHAIN.to_owned(),
+            format!("{}/bin/rustc", layout::TOOLCHAIN),
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort_sha256,
+        )
+        .map(|context| context.with_execution_mode(mode))
+    }
+
+    /// Execute one selected canonical workspace compilation against the complete
+    /// retained workspace, exact dependency candidates and optional generated
+    /// input tree. The caller must hold the driver's selected-unit capability;
+    /// neither this path validator nor a peer's request establishes membership.
+    /// CARGO_PRIMARY_PACKAGE and lint settings remain the compiler's own inputs.
+    ///
+    /// Source and generated inventories contain every relative subdirectory,
+    /// including empty ones, in sorted order with the roots excluded. Workers
+    /// independently pair them with the transferred files before constructing
+    /// private read-only backings. No source mount exposes the outer Cargo
+    /// target, Cargo home, control socket or uncaptured host workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_canonical_workspace_execution(
+        mode: DependencyExecutionMode,
+        cwd: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
+        loader_dirs: Vec<String>,
+        artifact_roots: Vec<DependencyArtifactRoot>,
+        generated_root: Option<String>,
+        source_directories: Vec<String>,
+        generated_directories: Vec<String>,
+        env: Vec<(String, String)>,
+        runtime_cohort_sha256: [u8; 32],
+    ) -> Result<Self, DependencyContextError> {
+        validate_generated_directories(&source_directories)
+            .map_err(|_| invalid("workspace source directory inventory is invalid"))?;
+        let mut context = Self::new_in_profile(
+            true,
+            true,
+            layout::WORKSPACE.to_owned(),
+            cwd,
+            layout::TOOLCHAIN.to_owned(),
+            format!("{}/bin/rustc", layout::TOOLCHAIN),
+            out_dir,
+            dependency_dirs,
+            loader_dirs,
+            artifact_roots,
+            generated_root,
+            env,
+            runtime_cohort_sha256,
+        )?;
+        // The process cwd and Cargo's package directory must actually exist in
+        // the complete source image, not merely lie beneath its lexical root.
+        let manifest = context
+            .env
+            .iter()
+            .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+            .map(|(_, value)| value.as_str())
+            .expect("validated workspace manifest directory");
+        for path in [context.cwd.as_str(), manifest] {
+            if path != layout::WORKSPACE
+                && path
+                    .strip_prefix(&format!("{}/", layout::WORKSPACE))
+                    .is_none_or(|relative| {
+                        source_directories
+                            .binary_search_by(|candidate| candidate.as_str().cmp(relative))
+                            .is_err()
+                    })
+            {
+                return Err(invalid(
+                    "workspace cwd or package directory is absent from its source inventory",
+                ));
+            }
+        }
+        context.source_directories = source_directories;
+        context
+            .with_generated_directories(generated_directories)
+            .map(|context| context.with_execution_mode(mode))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_in_profile(
+        canonical_cargo: bool,
+        workspace_execution_only: bool,
+        source_root: String,
+        cwd: String,
+        toolchain_root: String,
+        compiler: String,
+        out_dir: String,
+        dependency_dirs: Vec<String>,
         mut loader_dirs: Vec<String>,
         mut artifact_roots: Vec<DependencyArtifactRoot>,
         generated_root: Option<String>,
         mut env: Vec<(String, String)>,
         runtime_cohort_sha256: [u8; 32],
     ) -> Result<Self, DependencyContextError> {
+        if canonical_cargo {
+            let environment = |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            let source_allowed = if workspace_execution_only {
+                source_root == layout::WORKSPACE
+            } else {
+                [layout::WORKSPACE, layout::CARGO_HOME]
+                    .iter()
+                    .any(|root| canonical_descendant(&source_root, root))
+            };
+            let manifest_allowed = if workspace_execution_only {
+                environment("CARGO_MANIFEST_DIR").is_some_and(|directory| {
+                    directory == layout::WORKSPACE
+                        || canonical_descendant(directory, layout::WORKSPACE)
+                })
+            } else {
+                environment("CARGO_MANIFEST_DIR") == Some(cwd.as_str())
+            };
+            if !source_allowed
+                || toolchain_root != layout::TOOLCHAIN
+                || generated_root
+                    .as_ref()
+                    .is_some_and(|root| !canonical_descendant(root, "/__rabs/out/cargo"))
+                || !canonical_descendant(&out_dir, "/__rabs/out/cargo")
+                || dependency_dirs
+                    .iter()
+                    .any(|root| !canonical_descendant(root, "/__rabs/out/cargo"))
+                || loader_dirs.iter().any(|root| {
+                    root != "/__rabs/out/cargo" && !canonical_descendant(root, "/__rabs/out/cargo")
+                })
+                || environment("HOME") != Some(layout::HOME)
+                || environment("CARGO_HOME") != Some(layout::CARGO_HOME)
+                || !manifest_allowed
+            {
+                return Err(invalid(
+                    "canonical dependency context has an invalid Cargo layout",
+                ));
+            }
+        }
+        let valid_alias = |value: &str| {
+            if canonical_cargo {
+                canonical_alias(value) || (workspace_execution_only && value == layout::WORKSPACE)
+            } else {
+                valid_alias(value)
+            }
+        };
         let roots: Vec<_> = [&source_root, &toolchain_root, &out_dir]
             .into_iter()
             .chain(generated_root.iter())
@@ -534,9 +810,14 @@ impl DependencyExecContext {
         }
         env.sort_by(|left, right| left.0.cmp(&right.0));
         let context = Self {
+            canonical_cargo,
+            workspace_execution_only,
             execution_mode: DependencyExecutionMode::Metadata,
             source_root,
+            source_directories: Vec::new(),
             generated_root,
+            generated_directories: Vec::new(),
+            native_roots: Vec::new(),
             cwd,
             toolchain_root,
             compiler,
@@ -550,6 +831,28 @@ impl DependencyExecContext {
         // Validate even when runtime observation is deferred until acquisition.
         context.loader_search_paths(Path::new(&context.toolchain_root))?;
         Ok(context)
+    }
+
+    /// Exact wire version selected for this validated path profile.
+    pub const fn version(&self) -> &'static str {
+        if self.workspace_execution_only {
+            CANONICAL_WORKSPACE_CONTEXT_VERSION
+        } else if self.canonical_cargo {
+            CANONICAL_DEPENDENCY_CONTEXT_VERSION
+        } else {
+            DEPENDENCY_CONTEXT_VERSION
+        }
+    }
+
+    /// Whether names came from a canonical Cargo planning namespace.
+    pub const fn canonical_cargo(&self) -> bool {
+        self.canonical_cargo
+    }
+
+    /// Whether this context permits only request-owned workspace execution.
+    /// It must never be interpreted as dependency cache or publication proof.
+    pub const fn workspace_execution_only(&self) -> bool {
+        self.workspace_execution_only
     }
 
     /// Select the independently negotiated output class after path validation.
@@ -569,9 +872,96 @@ impl DependencyExecContext {
     pub fn source_root(&self) -> &str {
         &self.source_root
     }
+    /// Complete sorted workspace source subdirectories, root excluded. This
+    /// inventory is explicit only in the workspace execution-only profile.
+    pub fn source_directories(&self) -> &[String] {
+        &self.source_directories
+    }
     /// Original captured build-script output tree, when present.
     pub fn generated_root(&self) -> Option<&str> {
         self.generated_root.as_deref()
+    }
+    /// Complete sorted generated subdirectories relative to OUT_DIR. The root
+    /// itself is implicit; the worker checks this inventory against the paired
+    /// sealed generated files before constructing its private read-only tree.
+    pub fn generated_directories(&self) -> &[String] {
+        &self.generated_directories
+    }
+
+    /// Bind the complete captured generated-directory inventory to this
+    /// execution. No directories may exist without a generated input root.
+    /// File collisions and file-parent coverage require the separately retained
+    /// source manifest and are checked before execution, never assumed here.
+    ///
+    /// # Errors
+    /// A missing root, unsafe path, unsorted or duplicate name, missing parent,
+    /// or directory inventory exceeding the negotiated bound.
+    pub fn with_generated_directories(
+        mut self,
+        directories: Vec<String>,
+    ) -> Result<Self, DependencyContextError> {
+        if self.generated_root.is_none() && !directories.is_empty() {
+            return Err(invalid(
+                "dependency generated directories require a generated root",
+            ));
+        }
+        validate_generated_directories(&directories)
+            .map_err(|_| invalid("dependency generated directory inventory is invalid"))?;
+        self.generated_directories = directories;
+        Ok(self)
+    }
+
+    /// Retain additional complete native search trees from canonical Cargo's
+    /// completed dependency build scripts. Their files and run records are
+    /// acquired by the coordinator; this validates only the mount contract.
+    /// Sorted paths define stable bundle prefixes without host path aliases.
+    pub fn with_native_roots(
+        mut self,
+        roots: Vec<DependencyNativeRoot>,
+    ) -> Result<Self, DependencyContextError> {
+        if roots.len() > MAX_NATIVE_ROOTS
+            || (!roots.is_empty() && !self.canonical_cargo)
+            || roots.windows(2).any(|pair| pair[0].path >= pair[1].path)
+        {
+            return Err(invalid(
+                "native input roots require a bounded canonical sorted set",
+            ));
+        }
+        for (index, root) in roots.iter().enumerate() {
+            if !canonical_descendant(&root.path, "/__rabs/out/cargo")
+                || !root.path.ends_with("/out")
+                || root.prefix != format!("native/{index:04}")
+            {
+                return Err(invalid(
+                    "native input root has an invalid canonical path or prefix",
+                ));
+            }
+            validate_generated_directories(&root.directories)
+                .map_err(|_| invalid("native input directory inventory is invalid"))?;
+            let visible = Path::new(&root.path);
+            if [&self.source_root, &self.toolchain_root, &self.out_dir]
+                .into_iter()
+                .chain(self.generated_root.iter())
+                .chain(self.dependency_dirs.iter())
+                .any(|other| overlaps(visible, Path::new(other)))
+                || roots[index + 1..]
+                    .iter()
+                    .any(|other| overlaps(visible, Path::new(&other.path)))
+                || self
+                    .loader_dirs
+                    .iter()
+                    .any(|directory| Path::new(directory).starts_with(visible))
+            {
+                return Err(invalid("native input root shadows another mount"));
+            }
+        }
+        self.native_roots = roots;
+        Ok(self)
+    }
+
+    /// Ordered additional retained build-output trees, each with exact topology.
+    pub fn native_roots(&self) -> &[DependencyNativeRoot] {
+        &self.native_roots
     }
     /// Original compiler working directory.
     pub fn cwd(&self) -> &str {
@@ -619,6 +1009,12 @@ impl DependencyExecContext {
         let Some((_, value)) = self.env.iter().find(|(name, _)| name == "LD_LIBRARY_PATH") else {
             return Ok(Vec::new());
         };
+        // Preserve Cargo's whole-empty binding verbatim while representing its
+        // zero search entries. Empty components in a nonempty colon list have
+        // different loader semantics and remain invalid absolute paths below.
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut paths = Vec::new();
         for directory in value.split(':') {
             if !normalized_absolute(directory) {
@@ -688,6 +1084,7 @@ impl DependencyExecContext {
                 .chain(std::iter::once(self.out_dir.as_str()))
                 .chain(self.artifact_roots.iter().map(|root| root.path.as_str()))
                 .chain(self.generated_root())
+                .chain(self.native_roots.iter().map(|root| root.path.as_str()))
             {
                 if let Ok(relative) = Path::new(child).strip_prefix(*alias)
                     && !relative.as_os_str().is_empty()
@@ -733,7 +1130,10 @@ impl DependencyExecContext {
             Bind::new(source_backing, &self.source_root),
             Bind::new(toolchain_backing, &self.toolchain_root),
         ];
-        if !self.artifact_roots.is_empty() || self.generated_root.is_some() {
+        if !self.artifact_roots.is_empty()
+            || self.generated_root.is_some()
+            || !self.native_roots.is_empty()
+        {
             if source_backing.file_name() != Some(std::ffi::OsStr::new("package")) {
                 return Err(invalid("dependency source is not a sealed package bundle"));
             }
@@ -750,6 +1150,11 @@ impl DependencyExecContext {
                 self.artifact_roots
                     .iter()
                     .filter(|root| root.path != self.out_dir)
+                    .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
+            );
+            spec.ro_binds.extend(
+                self.native_roots
+                    .iter()
                     .map(|root| Bind::new(bundle.join(&root.prefix), &root.path)),
             );
         }
@@ -779,6 +1184,67 @@ pub fn build_dependency_argv(
     program: &str,
     args: &[String],
 ) -> Result<NamespaceLaunch, IsolationError> {
+    if context.workspace_execution_only() {
+        return Err(IsolationError::InvalidSpec {
+            reason: "workspace execution requires its retained source-owner package anchor".into(),
+        });
+    }
+    build_dependency_argv_with_package_anchor(context, spec, runtime, support, program, args, None)
+}
+
+/// Compile a workspace execution namespace after the source owner has rebuilt
+/// its complete directory topology in separate private storage. The source
+/// mount now names that rebuilt tree, while read-only dependency candidates
+/// remain anchored in the original sealed transfer bundle.
+///
+/// `retained_package` must come from the live source owner's verified
+/// dependency_root, never from a wire field or a guessed spec path. The caller
+/// must retain that owner and independently protect every exact source and
+/// artifact mount through completion. This only separates those two owned
+/// backings; it grants no authority to read arbitrary coordinator paths.
+#[allow(clippy::too_many_arguments)]
+pub fn build_workspace_dependency_argv(
+    context: &DependencyExecContext,
+    spec: &CanonicalNamespaceSpec,
+    runtime: &RetainedRuntime,
+    support: &DependencyIsolationSupport,
+    program: &str,
+    args: &[String],
+    retained_package: &Path,
+) -> Result<NamespaceLaunch, IsolationError> {
+    if !context.workspace_execution_only()
+        || !retained_package.is_absolute()
+        || retained_package.starts_with("/__rabs")
+        || retained_package.file_name() != Some(std::ffi::OsStr::new("package"))
+        || !std::fs::symlink_metadata(retained_package).is_ok_and(|metadata| metadata.is_dir())
+        || !std::fs::canonicalize(retained_package)
+            .is_ok_and(|canonical| canonical == retained_package)
+    {
+        return Err(IsolationError::InvalidSpec {
+            reason: "workspace execution lacks its ordinary retained package anchor".into(),
+        });
+    }
+    build_dependency_argv_with_package_anchor(
+        context,
+        spec,
+        runtime,
+        support,
+        program,
+        args,
+        Some(retained_package),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dependency_argv_with_package_anchor(
+    context: &DependencyExecContext,
+    spec: &CanonicalNamespaceSpec,
+    runtime: &RetainedRuntime,
+    support: &DependencyIsolationSupport,
+    program: &str,
+    args: &[String],
+    retained_package: Option<&Path>,
+) -> Result<NamespaceLaunch, IsolationError> {
     support.require_mode(context.execution_mode())?;
     let refuse = || IsolationError::InvalidSpec {
         reason: "dependency namespace differs from its validated context".to_owned(),
@@ -789,6 +1255,7 @@ pub fn build_dependency_argv(
     ]
     .into_iter()
     .chain(context.generated_root())
+    .chain(context.native_roots.iter().map(|root| root.path.as_str()))
     .chain(context.empty_aliases())
     .chain(
         context
@@ -813,8 +1280,8 @@ pub fn build_dependency_argv(
         if source.backing.file_name() != Some(std::ffi::OsStr::new("package")) {
             return Err(refuse());
         }
-        let retained = source
-            .backing
+        let retained = retained_package
+            .unwrap_or(&source.backing)
             .parent()
             .ok_or_else(refuse)?
             .join(&root.prefix);
@@ -938,6 +1405,896 @@ pub fn build_dependency_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CANONICAL_SOURCE: &str = "/__rabs/cargo-home/registry/src/index/leaf-1.0.0";
+    const CANONICAL_OUTPUT: &str = "/__rabs/out/cargo/debug/deps";
+
+    fn workspace_context(
+        mode: DependencyExecutionMode,
+        source_directories: Vec<String>,
+        generated_root: Option<&str>,
+        generated_directories: Vec<String>,
+        artifacts: Vec<DependencyArtifactRoot>,
+    ) -> Result<DependencyExecContext, DependencyContextError> {
+        let mut env = vec![
+            ("HOME".into(), layout::HOME.into()),
+            ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+            (
+                "CARGO_MANIFEST_DIR".into(),
+                "/__rabs/workspace/member".into(),
+            ),
+            ("CARGO_PKG_NAME".into(), "member".into()),
+            ("CARGO_PRIMARY_PACKAGE".into(), "1".into()),
+            ("ARBITRARY_COMPILE_INPUT".into(), "exact value".into()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!("{CANONICAL_OUTPUT}:/__rabs/toolchain/lib"),
+            ),
+        ];
+        if let Some(root) = generated_root {
+            env.push(("OUT_DIR".into(), root.into()));
+        }
+        DependencyExecContext::new_canonical_workspace_execution(
+            mode,
+            layout::WORKSPACE.into(),
+            CANONICAL_OUTPUT.into(),
+            vec![CANONICAL_OUTPUT.into()],
+            Vec::new(),
+            artifacts,
+            generated_root.map(str::to_owned),
+            source_directories,
+            generated_directories,
+            env,
+            [0; 32],
+        )
+    }
+
+    fn workspace_directories() -> Vec<String> {
+        vec!["empty".into(), "member".into(), "member/src".into()]
+    }
+
+    fn native_root(path: &str, index: usize) -> DependencyNativeRoot {
+        DependencyNativeRoot {
+            path: path.into(),
+            prefix: format!("native/{index:04}"),
+            directories: vec!["empty".into(), "nested".into()],
+        }
+    }
+
+    #[test]
+    fn canonical_native_roots_keep_disjoint_complete_mounts_without_out_dir() {
+        let roots = vec![
+            native_root("/__rabs/out/cargo/debug/build/a-hash/out", 0),
+            native_root("/__rabs/out/cargo/debug/build/b-hash/out", 1),
+        ];
+        let context = canonical_context()
+            .with_native_roots(roots.clone())
+            .unwrap();
+        assert_eq!(context.native_roots(), roots);
+        assert!(context.generated_root().is_none());
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        for root in &roots {
+            assert!(spec.ro_binds.contains(&Bind::new(
+                Path::new("/private/bundle").join(&root.prefix),
+                &root.path
+            )));
+            assert!(
+                !spec
+                    .rw_binds
+                    .iter()
+                    .any(|bind| bind.visible == Path::new(&root.path))
+            );
+        }
+        for path in [
+            "/host/native/out",
+            "/__rabs/out/cargo/debug/build/a/../out",
+            "/__rabs/out/cargo/debug/build/a",
+            CANONICAL_OUTPUT,
+        ] {
+            assert!(
+                canonical_context()
+                    .with_native_roots(vec![native_root(path, 0)])
+                    .is_err(),
+                "{path}"
+            );
+        }
+        let mut reversed = roots.clone();
+        reversed.reverse();
+        assert!(canonical_context().with_native_roots(reversed).is_err());
+        let mut bad_prefix = roots.clone();
+        bad_prefix[1].prefix = "native/0000".into();
+        assert!(canonical_context().with_native_roots(bad_prefix).is_err());
+        let mut parentless = roots.clone();
+        parentless[0].directories = vec!["missing/parent".into()];
+        assert!(canonical_context().with_native_roots(parentless).is_err());
+        let overlap = vec![
+            roots[0].clone(),
+            native_root(&format!("{}/nested/out", roots[0].path), 1),
+        ];
+        assert!(canonical_context().with_native_roots(overlap).is_err());
+        let own = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(&roots[0].path),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(own.with_native_roots(roots).is_err());
+    }
+
+    #[test]
+    fn workspace_context_negotiates_complete_source_and_preserves_primary_member_environment() {
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let context =
+                workspace_context(mode, workspace_directories(), None, Vec::new(), Vec::new())
+                    .unwrap();
+            assert!(context.canonical_cargo());
+            assert!(context.workspace_execution_only());
+            assert_eq!(context.version(), CANONICAL_WORKSPACE_CONTEXT_VERSION);
+            assert_eq!(context.execution_mode(), mode);
+            assert_eq!(context.source_root(), layout::WORKSPACE);
+            assert_eq!(context.cwd(), layout::WORKSPACE);
+            assert_eq!(context.source_directories(), workspace_directories());
+            assert!(
+                context
+                    .env()
+                    .contains(&("CARGO_PRIMARY_PACKAGE".into(), "1".into()))
+            );
+            assert!(
+                context
+                    .env()
+                    .contains(&("ARBITRARY_COMPILE_INPUT".into(), "exact value".into()))
+            );
+            assert!(context.env().contains(&(
+                "CARGO_MANIFEST_DIR".into(),
+                "/__rabs/workspace/member".into()
+            )));
+            assert!(
+                DependencyExecContext::new_canonical_cargo(
+                    mode,
+                    context.source_root.clone(),
+                    context.cwd.clone(),
+                    context.out_dir.clone(),
+                    context.dependency_dirs.clone(),
+                    context.loader_dirs.clone(),
+                    Vec::new(),
+                    context.env.clone(),
+                    [0; 32],
+                )
+                .is_err(),
+                "the old dependency version cannot mount the complete workspace"
+            );
+        }
+        let dependency = canonical_context();
+        assert!(!dependency.workspace_execution_only());
+        assert!(dependency.source_directories().is_empty());
+    }
+
+    #[test]
+    fn workspace_context_rejects_incomplete_source_topology_and_unowned_cargo_directories() {
+        for directories in [
+            Vec::new(),
+            vec!["member/src".into()],
+            vec!["member".into(), "member".into()],
+            vec!["member/src".into(), "member".into()],
+            vec!["/member".into()],
+            vec!["member".into(), "member/../escape".into()],
+            vec!["member".into(), "member//src".into()],
+            vec!["member".into(), "member/./src".into()],
+        ] {
+            assert!(
+                workspace_context(
+                    DependencyExecutionMode::Metadata,
+                    directories,
+                    None,
+                    Vec::new(),
+                    Vec::new()
+                )
+                .is_err()
+            );
+        }
+        let valid = workspace_context(
+            DependencyExecutionMode::Metadata,
+            workspace_directories(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        for (cwd, manifest) in [
+            ("/__rabs/workspace/absent", "/__rabs/workspace/member"),
+            ("/__rabs/workspace", "/__rabs/workspace/absent"),
+            ("/__rabs/workspace", "/__rabs/cargo-home/registry/package"),
+            ("/__rabs/workspace/../home", "/__rabs/workspace/member"),
+            ("/outside/workspace", "/__rabs/workspace/member"),
+        ] {
+            let mut env = valid.env.clone();
+            env.iter_mut()
+                .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                .unwrap()
+                .1 = manifest.into();
+            assert!(
+                DependencyExecContext::new_canonical_workspace_execution(
+                    DependencyExecutionMode::Metadata,
+                    cwd.into(),
+                    valid.out_dir.clone(),
+                    valid.dependency_dirs.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    workspace_directories(),
+                    Vec::new(),
+                    env,
+                    [0; 32],
+                )
+                .is_err(),
+                "cwd={cwd}, manifest={manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_context_retains_empty_generated_roots_and_refuses_parentless_generated_dirs() {
+        const ROOT: &str = "/__rabs/out/cargo/debug/build/member-123/out";
+        let empty = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(ROOT),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(empty.generated_root(), Some(ROOT));
+        assert!(empty.generated_directories().is_empty());
+        let full = workspace_context(
+            DependencyExecutionMode::Rlib,
+            workspace_directories(),
+            Some(ROOT),
+            vec!["nested".into(), "nested/empty".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(full.generated_directories(), &["nested", "nested/empty"]);
+        assert_ne!(empty, full);
+        for (root, directories) in [
+            (None, vec!["nested".into()]),
+            (Some(ROOT), vec!["nested/empty".into()]),
+            (Some(ROOT), vec!["nested".into(), "nested".into()]),
+            (Some(CANONICAL_OUTPUT), Vec::new()),
+            (Some("/__rabs/workspace/generated"), Vec::new()),
+        ] {
+            assert!(
+                workspace_context(
+                    DependencyExecutionMode::Metadata,
+                    workspace_directories(),
+                    root,
+                    directories,
+                    Vec::new()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_namespace_keeps_dependency_files_anchored_to_the_original_sealed_owner() {
+        let owner = tempfile::tempdir().unwrap();
+        let original = owner.path().join("original/package");
+        let rebuilt = owner.path().join("rebuilt/package");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(rebuilt.join("member/src")).unwrap();
+        std::fs::create_dir(rebuilt.join("empty")).unwrap();
+        let artifact = original
+            .parent()
+            .unwrap()
+            .join("dependencies/0000/libleaf.rmeta");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"retained exact dependency").unwrap();
+        let mut context = workspace_context(
+            DependencyExecutionMode::Metadata,
+            workspace_directories(),
+            None,
+            Vec::new(),
+            vec![DependencyArtifactRoot {
+                path: CANONICAL_OUTPUT.into(),
+                prefix: "dependencies/0000".into(),
+            }],
+        )
+        .unwrap();
+        let mut spec = context
+            .namespace(
+                &original,
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+        spec.ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == Path::new(layout::WORKSPACE))
+            .unwrap()
+            .backing = rebuilt.clone();
+        let visible = Path::new(CANONICAL_OUTPUT).join("libleaf.rmeta");
+        spec.ro_binds.push(Bind::new(&artifact, &visible));
+        let support = fixture_support(context.execution_mode());
+        assert!(
+            build_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[]
+            )
+            .is_err(),
+            "workspace cannot borrow implicit dependency anchoring"
+        );
+        let launch = build_workspace_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &[],
+            &original,
+        )
+        .unwrap();
+        assert!(launch.argv.windows(3).any(|args| args[0] == "--ro-bind"
+            && args[1] == artifact.as_os_str()
+            && args[2] == visible.as_os_str()));
+        assert!(launch.argv.windows(3).any(|args| args[0] == "--ro-bind"
+            && args[1] == rebuilt.as_os_str()
+            && args[2] == layout::WORKSPACE));
+        let mut substituted = spec.clone();
+        substituted
+            .ro_binds
+            .iter_mut()
+            .find(|bind| bind.visible == visible)
+            .unwrap()
+            .backing = rebuilt
+            .parent()
+            .unwrap()
+            .join("dependencies/0000/libleaf.rmeta");
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &substituted,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &original
+            )
+            .is_err()
+        );
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &rebuilt
+            )
+            .is_err(),
+            "a real but different anchor cannot reassign artifact custody"
+        );
+        let alias = owner.path().join("alias");
+        std::os::unix::fs::symlink(original.parent().unwrap(), &alias).unwrap();
+        assert!(
+            build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &alias.join("package")
+            )
+            .is_err()
+        );
+        assert!(
+            build_workspace_dependency_argv(
+                &canonical_context(),
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+                &original
+            )
+            .is_err()
+        );
+    }
+
+    fn canonical_context() -> DependencyExecContext {
+        DependencyExecContext::new_canonical_cargo(
+            DependencyExecutionMode::Metadata,
+            CANONICAL_SOURCE.into(),
+            CANONICAL_SOURCE.into(),
+            CANONICAL_OUTPUT.into(),
+            vec![CANONICAL_OUTPUT.into()],
+            vec!["/__rabs/out/cargo/debug".into()],
+            Vec::new(),
+            vec![
+                ("HOME".into(), layout::HOME.into()),
+                ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    format!("{CANONICAL_OUTPUT}:/__rabs/out/cargo/debug:/__rabs/toolchain/lib"),
+                ),
+            ],
+            [0; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_dependency_context_is_explicit_and_mounts_only_one_package() {
+        let context = canonical_context();
+        assert!(context.canonical_cargo());
+        assert_eq!(context.version(), CANONICAL_DEPENDENCY_CONTEXT_VERSION);
+        assert_eq!(context.execution_mode(), DependencyExecutionMode::Metadata);
+        assert!(context.generated_root().is_none());
+        assert!(
+            DependencyExecContext::new_with_artifacts(
+                context.source_root.clone(),
+                context.cwd.clone(),
+                context.toolchain_root.clone(),
+                context.compiler.clone(),
+                context.out_dir.clone(),
+                context.dependency_dirs.clone(),
+                context.loader_dirs.clone(),
+                context.artifact_roots.clone(),
+                context.env.clone(),
+                context.runtime_cohort_sha256,
+            )
+            .is_err(),
+            "ordinary dependency-exec-v8 cannot reinterpret canonical paths"
+        );
+        let spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let ro: BTreeSet<_> = spec
+            .ro_binds
+            .iter()
+            .map(|bind| bind.visible.as_path())
+            .collect();
+        assert_eq!(
+            ro,
+            BTreeSet::from([
+                Path::new(CANONICAL_SOURCE),
+                Path::new(layout::TOOLCHAIN),
+                Path::new("/__rabs/out/cargo/debug"),
+            ])
+        );
+        assert_eq!(
+            spec.rw_binds,
+            [
+                Bind::new("/private/output", CANONICAL_OUTPUT),
+                Bind::new("/private/home", layout::HOME),
+            ]
+        );
+        assert_eq!(
+            context
+                .loader_search_paths(Path::new("/private/toolchain"))
+                .unwrap(),
+            [PathBuf::from("/private/toolchain/lib")]
+        );
+    }
+
+    fn canonical_generated_context(
+        root: &str,
+        mode: DependencyExecutionMode,
+    ) -> Result<DependencyExecContext, DependencyContextError> {
+        let base = canonical_context();
+        let mut env = base.env;
+        env.push(("OUT_DIR".into(), root.into()));
+        DependencyExecContext::new_canonical_cargo_with_generated(
+            mode,
+            base.source_root,
+            base.cwd,
+            base.out_dir,
+            base.dependency_dirs,
+            base.loader_dirs,
+            base.artifact_roots,
+            Some(root.into()),
+            env,
+            base.runtime_cohort_sha256,
+        )
+    }
+
+    #[test]
+    fn canonical_generated_inputs_require_a_disjoint_cargo_target_and_exact_environment() {
+        let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+        let validate = |context: DependencyExecContext| {
+            DependencyExecContext::new_canonical_cargo_with_generated(
+                context.execution_mode,
+                context.source_root,
+                context.cwd,
+                context.out_dir,
+                context.dependency_dirs,
+                context.loader_dirs,
+                context.artifact_roots,
+                context.generated_root,
+                context.env,
+                context.runtime_cohort_sha256,
+            )
+        };
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let context = canonical_generated_context(generated, mode).unwrap();
+            assert_eq!(context.version(), "canonical-dependency-exec-v4");
+            assert_eq!(context.generated_root(), Some(generated));
+            assert_eq!(context.execution_mode(), mode);
+            assert!(
+                context
+                    .env()
+                    .contains(&("OUT_DIR".into(), generated.into()))
+            );
+            assert_eq!(validate(context.clone()).unwrap(), context);
+            for dependency in [
+                generated,
+                "/__rabs/out/cargo/debug/build",
+                "/__rabs/out/cargo/debug/build/leaf-123/out/deps",
+            ] {
+                let mut changed = context.clone();
+                changed.dependency_dirs.push(dependency.into());
+                assert!(validate(changed).is_err(), "dependency root {dependency}");
+            }
+            for loader in [generated, "/__rabs/out/cargo/debug/build/leaf-123/out/lib"] {
+                let mut changed = context.clone();
+                changed.loader_dirs.push(loader.into());
+                assert!(validate(changed).is_err(), "loader root {loader}");
+            }
+            for value in ["", "/__rabs/out/cargo/other-generated"] {
+                let mut changed = context.clone();
+                changed
+                    .env
+                    .iter_mut()
+                    .find(|(name, _)| name == "OUT_DIR")
+                    .unwrap()
+                    .1 = value.into();
+                assert!(validate(changed).is_err());
+            }
+            let mut missing_root = context.clone();
+            missing_root.generated_root = None;
+            assert!(validate(missing_root).is_err());
+            let mut env = context.env.clone();
+            env.retain(|(name, _)| name != "OUT_DIR");
+            assert!(
+                DependencyExecContext::new_canonical_cargo_with_generated(
+                    mode,
+                    context.source_root,
+                    context.cwd,
+                    context.out_dir,
+                    context.dependency_dirs,
+                    context.loader_dirs,
+                    context.artifact_roots,
+                    Some(generated.into()),
+                    env,
+                    context.runtime_cohort_sha256,
+                )
+                .is_err()
+            );
+        }
+        for root in [
+            "/__rabs",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo/debug",
+            CANONICAL_OUTPUT,
+            "/__rabs/out/cargo/debug/deps/generated",
+            "/__rabs/out/cargo/debug/build/../out",
+            "/__rabs/out/cargo/debug//out",
+            "/__rabs/out/cargo-other/build/leaf/out",
+            CANONICAL_SOURCE,
+            "/__rabs/workspace/generated",
+            "/__rabs/cargo-home/generated",
+            "/__rabs/toolchain/generated",
+            "/__rabs/home/control",
+            "/tmp/generated",
+            "relative/generated",
+        ] {
+            for mode in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::Rlib,
+            ] {
+                assert!(
+                    canonical_generated_context(root, mode).is_err(),
+                    "generated root escaped its closed canonical input contract: {root}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_generated_namespace_keeps_inputs_read_only_under_the_loader_parent() {
+        let generated = "/__rabs/out/cargo/debug/build/leaf-123/out";
+        for mode in [
+            DependencyExecutionMode::Metadata,
+            DependencyExecutionMode::Rlib,
+        ] {
+            let mut context = canonical_generated_context(generated, mode).unwrap();
+            let empty = tempfile::tempdir().unwrap();
+            context.prepare_empty_backings(empty.path()).unwrap();
+            let mut spec = context
+                .namespace(
+                    Path::new("/private/bundle/package"),
+                    Path::new("/private/toolchain"),
+                    Path::new("/private/output"),
+                    empty.path(),
+                    Path::new("/private/home"),
+                )
+                .unwrap();
+            let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+            let parent = spec
+                .ro_binds
+                .iter()
+                .find(|bind| bind.visible == Path::new("/__rabs/out/cargo/debug"))
+                .unwrap();
+            assert!(parent.backing.starts_with(empty.path()));
+            let generated_mountpoint = parent.backing.join("build/leaf-123/out");
+            assert!(generated_mountpoint.is_dir());
+            assert_eq!(std::fs::read_dir(&generated_mountpoint).unwrap().count(), 0);
+            assert!(
+                spec.ro_binds
+                    .contains(&Bind::new("/private/bundle/generated", generated))
+            );
+            let support = fixture_support(mode);
+            let launch = build_dependency_argv(
+                &context,
+                &spec,
+                &runtime.runtime,
+                &support,
+                context.compiler(),
+                &[],
+            )
+            .unwrap();
+            let argv = launch
+                .argv
+                .iter()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>();
+            let parent_at = argv
+                .windows(3)
+                .position(|row| {
+                    row == [
+                        "--ro-bind",
+                        parent.backing.to_str().unwrap(),
+                        "/__rabs/out/cargo/debug",
+                    ]
+                })
+                .unwrap();
+            let generated_at = argv
+                .windows(3)
+                .position(|row| row == ["--ro-bind", "/private/bundle/generated", generated])
+                .unwrap();
+            assert!(parent_at < generated_at);
+            assert_eq!(
+                argv.contains(&"--proc"),
+                mode == DependencyExecutionMode::Metadata
+            );
+            assert_eq!(
+                argv.contains(&"--dev"),
+                mode == DependencyExecutionMode::Metadata
+            );
+            assert!(
+                spec.rw_binds
+                    .iter()
+                    .all(|bind| !overlaps(&bind.visible, Path::new(generated)))
+            );
+            let mut missing = spec.clone();
+            missing
+                .ro_binds
+                .retain(|bind| bind.visible != Path::new(generated));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &missing,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+            let mut writable_only = spec.clone();
+            let generated_at = writable_only
+                .ro_binds
+                .iter()
+                .position(|bind| bind.visible == Path::new(generated))
+                .unwrap();
+            writable_only
+                .rw_binds
+                .push(writable_only.ro_binds.remove(generated_at));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &writable_only,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+            let mut writable = spec;
+            writable
+                .rw_binds
+                .push(Bind::new("/private/bundle/generated", generated));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &writable,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &[],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_dependency_layout_cannot_expose_outer_driver_or_host_roots() {
+        let original = canonical_context();
+        let validate = |context: DependencyExecContext| {
+            DependencyExecContext::new_canonical_cargo(
+                context.execution_mode,
+                context.source_root,
+                context.cwd,
+                context.out_dir,
+                context.dependency_dirs,
+                context.loader_dirs,
+                context.artifact_roots,
+                context.env,
+                context.runtime_cohort_sha256,
+            )
+        };
+        for root in [
+            "/__rabs",
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+            "/__rabs/cargo-home-other/package",
+            "/tmp/package",
+            "/__rabs/workspace/vendor/../other",
+        ] {
+            let mut context = original.clone();
+            context.source_root = root.into();
+            context.cwd = root.into();
+            context
+                .env
+                .iter_mut()
+                .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                .unwrap()
+                .1 = root.into();
+            assert!(validate(context).is_err(), "source root {root}");
+        }
+        for root in [
+            "/__rabs/out",
+            "/__rabs/out/cargo",
+            "/__rabs/out/cargo-other/deps",
+            "/tmp/deps",
+        ] {
+            let mut context = original.clone();
+            context.out_dir = root.into();
+            context.dependency_dirs = vec![root.into()];
+            assert!(validate(context).is_err(), "output root {root}");
+        }
+        for root in [
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+            "/__rabs/out",
+            "/usr/lib",
+        ] {
+            let mut context = original.clone();
+            context.loader_dirs.push(root.into());
+            assert!(validate(context).is_err(), "loader root {root}");
+        }
+        for (name, value) in [
+            ("HOME", "/home/user"),
+            ("CARGO_HOME", "/home/user/.cargo"),
+            ("OUT_DIR", "/__rabs/out/cargo/debug/generated"),
+        ] {
+            let mut context = original.clone();
+            context.env.retain(|(key, _)| key != name);
+            context.env.push((name.into(), value.into()));
+            assert!(validate(context).is_err(), "environment {name}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_dependency_namespace_preserves_paths_and_refuses_extra_mounts_and_wrong_mode() {
+        let mut context = canonical_context();
+        let mut spec = context
+            .namespace(
+                Path::new("/private/bundle/package"),
+                Path::new("/private/toolchain"),
+                Path::new("/private/output"),
+                Path::new("/private/empty"),
+                Path::new("/private/home"),
+            )
+            .unwrap();
+        let runtime = RuntimeFixture::prepare(&mut context, &mut spec);
+        let support = fixture_support(DependencyExecutionMode::Metadata);
+        let args = vec![
+            format!("{CANONICAL_SOURCE}/src/lib.rs"),
+            "--emit=dep-info,metadata".into(),
+        ];
+        let launch = build_dependency_argv(
+            &context,
+            &spec,
+            &runtime.runtime,
+            &support,
+            context.compiler(),
+            &args,
+        )
+        .unwrap();
+        assert!(launch.boundary.mounts_closed_view);
+        assert!(!launch.boundary.host_usr_ro);
+        let argv = launch
+            .argv
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(argv.ends_with(&[context.compiler(), args[0].as_str(), args[1].as_str()]));
+        for visible in [
+            layout::WORKSPACE,
+            layout::CARGO_HOME,
+            "/__rabs/home/control",
+        ] {
+            let mut extra = spec.clone();
+            extra
+                .ro_binds
+                .push(Bind::new("/private/outer-driver", visible));
+            assert!(
+                build_dependency_argv(
+                    &context,
+                    &extra,
+                    &runtime.runtime,
+                    &support,
+                    context.compiler(),
+                    &args
+                )
+                .is_err()
+            );
+        }
+        let archive = context.with_execution_mode(DependencyExecutionMode::Rlib);
+        assert!(matches!(
+            build_dependency_argv(&archive, &spec, &runtime.runtime, &support, archive.compiler(), &args),
+            Err(IsolationError::InvalidSpec { reason }) if reason.contains("another execution mode")
+        ));
+    }
 
     // Pure namespace-construction fixtures, never kernel capability evidence.
     fn fixture_support(mode: DependencyExecutionMode) -> DependencyIsolationSupport {
@@ -1227,6 +2584,63 @@ mod tests {
     }
 
     #[test]
+    fn generated_directory_context_binds_complete_tree_in_both_path_profiles() {
+        let root = "/work/build/generated/unit/out";
+        let original = generated_context(
+            Some(root),
+            vec![("OUT_DIR".to_owned(), root.to_owned())],
+            Vec::new(),
+        )
+        .unwrap();
+        let canonical = canonical_generated_context(
+            "/__rabs/out/cargo/debug/build/leaf-123/out",
+            DependencyExecutionMode::Rlib,
+        )
+        .unwrap();
+        assert_eq!(original.version(), "dependency-exec-v8");
+        assert_eq!(canonical.version(), "canonical-dependency-exec-v4");
+        for context in [original, canonical] {
+            assert!(context.generated_directories().is_empty());
+            let populated = context
+                .clone()
+                .with_generated_directories(vec!["empty".into(), "empty/child".into()])
+                .unwrap();
+            assert_eq!(populated.generated_directories(), &["empty", "empty/child"]);
+            assert_ne!(populated, context);
+            assert_eq!(populated.generated_root(), context.generated_root());
+            assert_eq!(populated.env(), context.env());
+            for directories in [
+                vec!["empty/child".into()],
+                vec!["empty".into(), "empty".into()],
+                vec!["empty".into(), "empty/../other".into()],
+                vec!["z".into(), "a".into()],
+                vec!["/absolute".into()],
+            ] {
+                assert!(
+                    context
+                        .clone()
+                        .with_generated_directories(directories)
+                        .is_err()
+                );
+            }
+        }
+        for context in [context(Vec::new()), canonical_context()] {
+            assert!(context.generated_root().is_none());
+            assert!(
+                context
+                    .clone()
+                    .with_generated_directories(Vec::new())
+                    .is_ok()
+            );
+            assert!(
+                context
+                    .with_generated_directories(vec!["empty".into()])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn generated_root_and_out_dir_environment_form_one_exact_contract() {
         let root = "/work/build/generated/unit/out";
         let env = vec![("OUT_DIR".to_owned(), root.to_owned())];
@@ -1473,7 +2887,33 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn archive_mode_removes_process_and_entropy_files_without_exposing_host_devices() {
-        let mut context = context(Vec::new()).with_execution_mode(DependencyExecutionMode::Rlib);
+        assert_archive_mode_namespace(
+            context(Vec::new()).with_execution_mode(DependencyExecutionMode::Rlib),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_archive_mode_removes_process_and_entropy_files_and_outer_driver_mounts() {
+        let metadata = canonical_context();
+        let archive = DependencyExecContext::new_canonical_cargo(
+            DependencyExecutionMode::Rlib,
+            metadata.source_root,
+            metadata.cwd,
+            metadata.out_dir,
+            metadata.dependency_dirs,
+            metadata.loader_dirs,
+            metadata.artifact_roots,
+            metadata.env,
+            metadata.runtime_cohort_sha256,
+        )
+        .unwrap();
+        assert_eq!(archive.version(), "canonical-dependency-exec-v4");
+        assert_archive_mode_namespace(archive);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_archive_mode_namespace(mut context: DependencyExecContext) {
         let mut spec = context
             .namespace(
                 Path::new("/private/source"),
@@ -1513,6 +2953,32 @@ mod tests {
                 |row| matches!(row[0], "--bind" | "--ro-bind" | "--dev-bind") && row[1] == "/dev"
             )
         );
+        if context.canonical_cargo() {
+            for visible in [
+                layout::WORKSPACE,
+                layout::CARGO_HOME,
+                "/__rabs/home/control",
+            ] {
+                assert!(!argv.windows(3).any(|row| {
+                    matches!(row[0], "--bind" | "--ro-bind" | "--dev-bind") && row[2] == visible
+                }));
+                let mut extra = spec.clone();
+                extra
+                    .ro_binds
+                    .push(Bind::new("/private/outer-driver", visible));
+                assert!(
+                    build_dependency_argv(
+                        &context,
+                        &extra,
+                        &fixture.runtime,
+                        &support,
+                        context.compiler(),
+                        &[],
+                    )
+                    .is_err()
+                );
+            }
+        }
 
         // The separately negotiated metadata mode preserves its established
         // execution semantics; the archive policy must not quietly replace it.
@@ -1794,6 +3260,186 @@ mod tests {
     #[test]
     #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
     fn real_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
+        assert_real_archive_view_closes_assembler_inputs(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the full Metadata bubblewrap namespace with private procfs and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_workspace_binary_example_and_test_metadata_preserve_exact_empty_outputs() {
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Metadata);
+        assert!(support.is_supported(), "{support:?}");
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("bundle/package");
+        let output = owner.path().join("outputs");
+        let home = owner.path().join("home");
+        let empty = owner.path().join("empty");
+        let source_directories = [
+            "empty",
+            "member",
+            "member/examples",
+            "member/src",
+            "member/tests",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for relative in &source_directories {
+            std::fs::create_dir_all(source.join(relative)).unwrap();
+        }
+        for directory in [&output, &home, &empty] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(source.join("shared.txt"), "retained workspace input\n").unwrap();
+        for relative in [
+            "member/src/main.rs",
+            "member/examples/demo.rs",
+            "member/tests/check.rs",
+        ] {
+            std::fs::write(
+                source.join(relative),
+                "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../../shared.txt\");\n#[cfg(not(test))]\nfn main() {}\n#[test]\nfn metadata_only() { panic!(\"metadata checking must not execute tests\"); }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            source.join("member/tests/custom.rs"),
+            "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../../shared.txt\");\nfn main() { panic!(\"metadata checking must not execute custom harnesses\"); }\n",
+        )
+        .unwrap();
+        let runtime = crate::runtime_cohort::retain_runtime_cohort(
+            &toolchain.join("bin/rustc"),
+            &toolchain,
+            &[toolchain.join("lib")],
+            &output,
+            owner.path(),
+            || false,
+        )
+        .unwrap();
+        for (name, relative, crate_type, test, custom_harness) in [
+            (
+                "workspace_bin",
+                "member/src/main.rs",
+                Some("bin"),
+                false,
+                false,
+            ),
+            (
+                "workspace_example",
+                "member/examples/demo.rs",
+                Some("bin"),
+                false,
+                false,
+            ),
+            (
+                "workspace_integration",
+                "member/tests/check.rs",
+                None,
+                true,
+                false,
+            ),
+            (
+                "workspace_unit",
+                "member/src/main.rs",
+                Some("lib"),
+                true,
+                false,
+            ),
+            (
+                "workspace_custom",
+                "member/tests/custom.rs",
+                None,
+                false,
+                true,
+            ),
+        ] {
+            let destination = output.join(name);
+            std::fs::create_dir(&destination).unwrap();
+            let mut context = workspace_context(
+                DependencyExecutionMode::Metadata,
+                source_directories.clone(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            context.runtime_cohort_sha256 = runtime.cohort().bytes;
+            context.prepare_empty_backings(&empty).unwrap();
+            let spec = context
+                .namespace(&source, &toolchain, &destination, &empty, &home)
+                .unwrap();
+            let mut args = vec![
+                relative.into(),
+                format!("--crate-name={name}"),
+                "--edition=2024".into(),
+                "--emit=dep-info,metadata".into(),
+                "--error-format=json".into(),
+                "-Cextra-filename=-retained".into(),
+                format!("--out-dir={}", context.out_dir()),
+            ];
+            if let Some(kind) = crate_type {
+                args.push(format!("--crate-type={kind}"));
+            }
+            if test {
+                args.push("--test".into());
+            }
+            if custom_harness {
+                args.push("--cfg=test".into());
+            }
+            let launch = build_workspace_dependency_argv(
+                &context,
+                &spec,
+                &runtime,
+                &support,
+                context.compiler(),
+                &args,
+                &source,
+            )
+            .unwrap();
+            assert!(launch.boundary.proc_private);
+            assert!(launch.boundary.net_isolated && launch.boundary.mounts_closed_view);
+            let result = crate::canonical_namespace::command_for(&launch)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let metadata = format!("lib{name}-retained.rmeta");
+            let dep_info = format!("{name}-retained.d");
+            let names: BTreeSet<_> = std::fs::read_dir(&destination)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(names, BTreeSet::from([metadata.clone(), dep_info.clone()]));
+            assert_eq!(
+                std::fs::metadata(destination.join(metadata)).unwrap().len(),
+                0
+            );
+            let dep_info = std::fs::read_to_string(destination.join(dep_info)).unwrap();
+            assert!(dep_info.contains(relative) && dep_info.contains("shared.txt"));
+            assert!(
+                !destination.join(name).exists(),
+                "checking must not link a binary"
+            );
+            runtime.verify(|| false).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_rustc_archive_view_closes_assembler_inputs_missing_from_dep_info() {
+        assert_real_archive_view_closes_assembler_inputs(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_real_archive_view_closes_assembler_inputs(canonical: bool) {
         let toolchain = PathBuf::from(
             std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
                 .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
@@ -1822,18 +3468,38 @@ mod tests {
             || false,
         )
         .unwrap();
-        let context = DependencyExecContext::new(
-            "/source/package".into(),
-            "/source/package".into(),
-            "/toolchains/pinned".into(),
-            "/toolchains/pinned/bin/rustc".into(),
-            "/target/output".into(),
-            Vec::new(),
-            vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
-            runtime.cohort().bytes,
-        )
-        .unwrap()
-        .with_execution_mode(DependencyExecutionMode::Rlib);
+        let context = if canonical {
+            DependencyExecContext::new_canonical_cargo(
+                DependencyExecutionMode::Rlib,
+                CANONICAL_SOURCE.into(),
+                CANONICAL_SOURCE.into(),
+                CANONICAL_OUTPUT.into(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    ("HOME".into(), layout::HOME.into()),
+                    ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                    ("CARGO_MANIFEST_DIR".into(), CANONICAL_SOURCE.into()),
+                    ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
+                ],
+                runtime.cohort().bytes,
+            )
+            .unwrap()
+        } else {
+            DependencyExecContext::new(
+                "/source/package".into(),
+                "/source/package".into(),
+                "/toolchains/pinned".into(),
+                "/toolchains/pinned/bin/rustc".into(),
+                "/target/output".into(),
+                Vec::new(),
+                vec![("LD_LIBRARY_PATH".into(), "/toolchains/pinned/lib".into())],
+                runtime.cohort().bytes,
+            )
+            .unwrap()
+            .with_execution_mode(DependencyExecutionMode::Rlib)
+        };
         context.prepare_empty_backings(&empty).unwrap();
         let spec = context
             .namespace(&source, &toolchain, &output, &empty, &home)
@@ -1854,7 +3520,7 @@ mod tests {
                 "--edition=2024".into(),
                 "--crate-type=rlib".into(),
                 "--emit=dep-info,metadata,link".into(),
-                "--out-dir=/target/output".into(),
+                format!("--out-dir={}", context.out_dir()),
                 "-Cembed-bitcode=no".into(),
             ];
             let launch = build_dependency_argv(
@@ -1870,7 +3536,10 @@ mod tests {
                 .output()
                 .unwrap()
         };
-        let result = compile("/source/package/payload.bin", "closed_archive");
+        let result = compile(
+            &format!("{}/payload.bin", context.source_root()),
+            "closed_archive",
+        );
         assert!(
             result.status.success(),
             "{}",
@@ -1909,6 +3578,302 @@ mod tests {
             assert!(!output.join(format!("lib{name}.rlib")).exists());
         }
         runtime.verify(|| false).unwrap();
+    }
+
+    /// Use the actual production archive view, including the retained sparse
+    /// runtime, without requiring the broader Cargo namespace's private procfs.
+    /// Native objects must come from the captured tree; a thin archive cannot
+    /// read an original host object merely because that object still exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap, cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_archive_bundles_retained_native_inputs_and_denies_thin_escape() {
+        assert_real_native_archive_view(false);
+    }
+
+    /// Exercise a downstream package with no OUT_DIR, whose native search paths
+    /// name two separately retained dependency build-script trees.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap, cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT naming an installed rustc toolchain"]
+    fn real_canonical_archive_bundles_propagated_native_roots_and_denies_thin_escape() {
+        assert_real_native_archive_view(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_real_native_archive_view(foreign: bool) {
+        use std::process::Command;
+
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let support = DependencyIsolationSupport::probe(DependencyExecutionMode::Rlib);
+        assert!(support.is_supported(), "{support:?}");
+        for workspace in [false, true] {
+            let owner = tempfile::tempdir().unwrap();
+            let source = owner.path().join("bundle/package");
+            let generated = owner.path().join(if foreign {
+                "bundle/native/0000/native"
+            } else {
+                "bundle/generated/native"
+            });
+            let thin_generated = if foreign {
+                owner.path().join("bundle/native/0001/native")
+            } else {
+                generated.clone()
+            };
+            let original = owner.path().join("original");
+            let output = owner.path().join("output");
+            let home = owner.path().join("home");
+            let empty = owner.path().join("empty");
+            for directory in [&source, &generated, &original, &output, &home, &empty] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::create_dir_all(&thin_generated).unwrap();
+            let checked = |command: &mut Command| {
+                let result = command.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{command:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                result
+            };
+            std::fs::write(
+                original.join("answer.c"),
+                "unsigned int rabs_native_answer(void) { return 37; }\n",
+            )
+            .unwrap();
+            checked(
+                Command::new("cc")
+                    .args(["-c", "-fPIC", "-o"])
+                    .arg(original.join("answer.o"))
+                    .arg(original.join("answer.c")),
+            );
+            checked(
+                Command::new("ar")
+                    .arg("crsD")
+                    .arg(original.join("libretained.a"))
+                    .arg(original.join("answer.o")),
+            );
+            checked(
+                Command::new("ar")
+                    .arg("crsTD")
+                    .arg(original.join("libthin.a"))
+                    .arg(original.join("answer.o")),
+            );
+            assert!(
+                std::fs::read(original.join("libthin.a"))
+                    .unwrap()
+                    .starts_with(b"!<thin>\n"),
+                "the escape case must be an actual thin archive"
+            );
+            for (name, destination) in [
+                ("libretained.a", &generated),
+                ("libthin.a", &thin_generated),
+            ] {
+                std::fs::copy(original.join(name), destination.join(name)).unwrap();
+            }
+            // Corrupt only the original archive after the private snapshot exists.
+            // The original object deliberately remains readable on the host for
+            // the thin-archive escape oracle below.
+            std::fs::write(original.join("libretained.a"), b"not an archive").unwrap();
+            std::fs::write(
+            source.join("lib.rs"),
+            "unsafe extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer() -> u32 { unsafe { rabs_native_answer() } }\n",
+        )
+        .unwrap();
+            let control = owner.path().join("host-control");
+            std::fs::create_dir(&control).unwrap();
+            // Prove this compiler actually accepts the same thin archive when
+            // its original object is visible. A generic unsupported-archive error
+            // must never stand in for successful namespace confinement.
+            checked(
+                Command::new(toolchain.join("bin/rustc"))
+                    .arg(source.join("lib.rs"))
+                    .args([
+                        "--crate-name=thin_control",
+                        "--edition=2024",
+                        "--crate-type=rlib",
+                        "--emit=dep-info,metadata,link",
+                        "-lstatic=thin",
+                    ])
+                    .arg("--out-dir")
+                    .arg(&control)
+                    .arg(format!("-Lnative={}", original.display())),
+            );
+            assert!(control.join("libthin_control.rlib").is_file());
+            let runtime = crate::runtime_cohort::retain_runtime_cohort(
+                &toolchain.join("bin/rustc"),
+                &toolchain,
+                &[toolchain.join("lib")],
+                &output,
+                owner.path(),
+                || false,
+            )
+            .unwrap();
+            let generated_root = "/__rabs/out/cargo/debug/build/native-hash/out";
+            let foreign_second_root = "/__rabs/out/cargo/debug/build/native-z-hash/out";
+            let own_root = (!foreign).then(|| generated_root.to_owned());
+            let own_directories = if foreign {
+                Vec::new()
+            } else {
+                vec!["native".into()]
+            };
+            let package_root = if workspace {
+                layout::WORKSPACE
+            } else {
+                CANONICAL_SOURCE
+            };
+            let mut env = vec![
+                ("HOME".into(), layout::HOME.into()),
+                ("CARGO_HOME".into(), layout::CARGO_HOME.into()),
+                ("CARGO_MANIFEST_DIR".into(), package_root.into()),
+                ("CARGO_PKG_NAME".into(), "native_fixture".into()),
+                ("LD_LIBRARY_PATH".into(), "/__rabs/toolchain/lib".into()),
+            ];
+            if let Some(root) = &own_root {
+                env.push(("OUT_DIR".into(), root.clone()));
+            }
+            let context = if workspace {
+                env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+                DependencyExecContext::new_canonical_workspace_execution(
+                    DependencyExecutionMode::Rlib,
+                    layout::WORKSPACE.into(),
+                    CANONICAL_OUTPUT.into(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    own_root,
+                    Vec::new(),
+                    own_directories,
+                    env,
+                    runtime.cohort().bytes,
+                )
+                .unwrap()
+            } else {
+                DependencyExecContext::new_canonical_cargo_with_generated(
+                    DependencyExecutionMode::Rlib,
+                    CANONICAL_SOURCE.into(),
+                    CANONICAL_SOURCE.into(),
+                    CANONICAL_OUTPUT.into(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    own_root,
+                    env,
+                    runtime.cohort().bytes,
+                )
+                .unwrap()
+                .with_generated_directories(own_directories)
+                .unwrap()
+            };
+            let context = if foreign {
+                assert!(context.generated_root().is_none());
+                context
+                    .with_native_roots(vec![
+                        DependencyNativeRoot {
+                            path: generated_root.into(),
+                            prefix: "native/0000".into(),
+                            directories: vec!["native".into()],
+                        },
+                        DependencyNativeRoot {
+                            path: foreign_second_root.into(),
+                            prefix: "native/0001".into(),
+                            directories: vec!["native".into()],
+                        },
+                    ])
+                    .unwrap()
+            } else {
+                context
+            };
+            assert_eq!(context.workspace_execution_only(), workspace);
+            context.prepare_empty_backings(&empty).unwrap();
+            let spec = context
+                .namespace(&source, &toolchain, &output, &empty, &home)
+                .unwrap();
+            let compile = |library: &str, name: &str| {
+                let mut args = vec![
+                    "lib.rs".into(),
+                    format!("--crate-name={name}"),
+                    "--edition=2024".into(),
+                    "--crate-type=rlib".into(),
+                    "--emit=dep-info,metadata,link".into(),
+                    format!("--out-dir={}", context.out_dir()),
+                    format!("-Lnative={generated_root}/native"),
+                    format!("-lstatic={library}"),
+                ];
+                if foreign {
+                    args.push(format!("-Lnative={foreign_second_root}/native"));
+                }
+                let launch = if workspace {
+                    build_workspace_dependency_argv(
+                        &context,
+                        &spec,
+                        &runtime,
+                        &support,
+                        context.compiler(),
+                        &args,
+                        &source,
+                    )
+                } else {
+                    build_dependency_argv(
+                        &context,
+                        &spec,
+                        &runtime,
+                        &support,
+                        context.compiler(),
+                        &args,
+                    )
+                }
+                .unwrap();
+                crate::canonical_namespace::command_for(&launch)
+                    .output()
+                    .unwrap()
+            };
+            let built = compile("retained", "native_bridge");
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            assert!(
+                !std::fs::read_to_string(output.join("native_bridge.d"))
+                    .unwrap()
+                    .contains("libretained.a"),
+                "the archive is a real compiler input absent from dep-info"
+            );
+            let main = owner.path().join("main.rs");
+            std::fs::write(
+            &main,
+            "fn main() { assert_eq!(native_bridge::answer(), 37); println!(\"{}\", native_bridge::answer()); }\n",
+        )
+        .unwrap();
+            let binary = owner.path().join("linked-native");
+            checked(
+                Command::new(toolchain.join("bin/rustc"))
+                    .arg(&main)
+                    .arg("--edition=2024")
+                    .arg("--extern")
+                    .arg(format!(
+                        "native_bridge={}",
+                        output.join("libnative_bridge.rlib").display()
+                    ))
+                    .arg("-o")
+                    .arg(&binary),
+            );
+            assert_eq!(checked(&mut Command::new(&binary)).stdout, b"37\n");
+            let denied = compile("thin", "native_escape");
+            assert!(
+                !denied.status.success(),
+                "thin archive unexpectedly read the unmounted original host object"
+            );
+            assert!(String::from_utf8_lossy(&denied.stderr).contains("error"));
+            assert!(!output.join("libnative_escape.rlib").exists());
+            runtime.verify(|| false).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2235,6 +4200,116 @@ mod tests {
                     [7; 32]
                 )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_loader_list_is_preserved_in_every_execution_profile() {
+        for base in [
+            context(Vec::new()),
+            canonical_context(),
+            workspace_context(
+                DependencyExecutionMode::Metadata,
+                workspace_directories(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        ] {
+            let rebuild = |env| {
+                if base.workspace_execution_only() {
+                    DependencyExecContext::new_canonical_workspace_execution(
+                        base.execution_mode,
+                        base.cwd.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        base.generated_root.clone(),
+                        base.source_directories.clone(),
+                        base.generated_directories.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                } else if base.canonical_cargo() {
+                    DependencyExecContext::new_canonical_cargo(
+                        base.execution_mode,
+                        base.source_root.clone(),
+                        base.cwd.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                } else {
+                    DependencyExecContext::new_with_artifacts(
+                        base.source_root.clone(),
+                        base.cwd.clone(),
+                        base.toolchain_root.clone(),
+                        base.compiler.clone(),
+                        base.out_dir.clone(),
+                        base.dependency_dirs.clone(),
+                        base.loader_dirs.clone(),
+                        base.artifact_roots.clone(),
+                        env,
+                        base.runtime_cohort_sha256,
+                    )
+                }
+            };
+            let mut absent_env = base.env.clone();
+            absent_env.retain(|(name, _)| name != "LD_LIBRARY_PATH");
+            let absent = rebuild(absent_env.clone()).unwrap();
+            assert!(
+                absent
+                    .loader_search_paths(Path::new("/retained/toolchain"))
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut empty_env = absent_env;
+            empty_env.push(("LD_LIBRARY_PATH".into(), String::new()));
+            let empty = rebuild(empty_env.clone()).unwrap();
+            assert_eq!(empty.version(), base.version());
+            assert!(
+                empty
+                    .env()
+                    .contains(&("LD_LIBRARY_PATH".into(), String::new()))
+            );
+            assert_ne!(empty.env(), absent.env());
+            assert!(
+                empty
+                    .loader_search_paths(Path::new("/retained/toolchain"))
+                    .unwrap()
+                    .is_empty()
+            );
+            for value in [
+                ":".to_owned(),
+                format!(":{}/lib", base.toolchain_root),
+                format!("{}/lib:", base.toolchain_root),
+                format!(
+                    "{}/lib::{}/lib/rustlib",
+                    base.toolchain_root, base.toolchain_root
+                ),
+            ] {
+                let mut invalid = empty_env.clone();
+                invalid
+                    .iter_mut()
+                    .find(|(name, _)| name == "LD_LIBRARY_PATH")
+                    .unwrap()
+                    .1 = value.clone();
+                assert!(
+                    rebuild(invalid).is_err(),
+                    "{} must refuse {value:?}",
+                    base.version()
+                );
+            }
+            empty_env.push(("LD_PRELOAD".into(), String::new()));
+            assert!(
+                rebuild(empty_env).is_err(),
+                "an empty search list cannot bypass loader-control checks"
             );
         }
     }

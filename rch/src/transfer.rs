@@ -11,6 +11,42 @@ mod retrieval_space;
 mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
+/// Upload a finite program before acquiring its source-activity lock. An SSH
+/// channel stalled halfway through `sh -s` must not hold that lock before any
+/// workload or recoverable process identity exists. The outer compound also
+/// refuses EOF before the whole heredoc and closing brace arrive: a bare
+/// unterminated heredoc can otherwise execute on some POSIX shells.
+///
+/// The existing prefix checks ownership after acquiring the lock, so a late
+/// completed upload still observes a cancellation or retirement. Keep the
+/// script on stdin, including large programs and workers using cmd.exe as the
+/// SSH login shell. This is not a framing protocol for streamed archive data.
+pub(crate) fn source_activity_finite_script(prefix: &str, script: &str) -> String {
+    source_activity_finite_script_with_delimiter(
+        prefix,
+        script,
+        format!("RCH_SOURCE_ACTIVITY_{}", uuid::Uuid::new_v4().simple()),
+    )
+}
+
+fn source_activity_finite_script_with_delimiter(
+    prefix: &str,
+    script: &str,
+    mut delimiter: String,
+) -> String {
+    while script.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    format!(
+        r#"{{
+exec {prefix} sh -s <<'{delimiter}'
+{script}
+{delimiter}
+}}
+"#
+    )
+}
+
 fn artifact_header_probe_script(
     remote: &str,
     cargo_target_root: Option<&str>,
@@ -781,6 +817,7 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch_dep_fingerprint.json",
     ".rch_dep_fingerprint.json.tmp",
     ".rch_prepare_logs/",
+    ".rch_last_used",
 ];
 // Host-local language environments are neither source nor portable build
 // inputs.  They commonly contain absolute symlinks (for example
@@ -1161,9 +1198,11 @@ fn check_archive_upload_result(
     })
 }
 
-/// Typed source-sync stall error (issue #59): the transfer produced NO output
-/// at all — no rsync progress refresh, stats, or itemized line — for the
-/// configured silence window. Deliberately distinct from the wall-clock
+/// Typed source-sync stall error (issue #59): either the transfer produced no
+/// output for the configured silence window, or rsync reported its peer I/O
+/// timeout. The detail distinguishes these observations; neither establishes
+/// that the worker activity or durable source grant has been retired.
+/// Deliberately distinct from the wall-clock
 /// attempt timeout: silence means a dead channel or wedged rsync, so the hook
 /// releases the worker's reservation and re-enters selection EXCLUDING this
 /// worker instead of waiting out a cap that scales to an hour.
@@ -1208,6 +1247,16 @@ pub(crate) struct SyncSilencePolicy {
     pub(crate) limit: std::time::Duration,
     pub(crate) worker_id: String,
     pub(crate) phase: &'static str,
+}
+
+/// rsync accepts whole seconds in a signed integer. Round a finite deadline
+/// upward, never to zero (which would disable its peer-side I/O timeout).
+fn rsync_io_timeout_arg(limit: std::time::Duration) -> String {
+    let seconds = limit
+        .as_secs()
+        .saturating_add(u64::from(limit.subsec_nanos() != 0))
+        .clamp(1, 2_147_483_647);
+    format!("--timeout={seconds}")
 }
 
 /// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
@@ -1298,6 +1347,23 @@ fi
 )"#,
         path = escape(Cow::from(path)),
         marker = escape(Cow::from(live_checkout_host_marker()))
+    )
+}
+
+/// Sync only these records, including directories. Explicit fsync avoids both
+/// syncfs and uutils versions that silently implement `sync FILE` as sync().
+/// Python is also used by the existing namespace and artifact custody paths.
+/// Missing Python or any failed barrier is an error, never a broad-sync fallback.
+pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
+    let script = "import os, sys\nfor path in sys.argv[1:]:\n fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n try: os.fsync(fd)\n finally: os.close(fd)";
+    format!(
+        "python3 -I -S -c {} {}",
+        escape(Cow::Borrowed(script)),
+        paths
+            .iter()
+            .map(|path| escape(Cow::Borrowed(*path)).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
     )
 }
 
@@ -1757,7 +1823,10 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
 /// same variable on rch's own local re-exec. The shim checks it before anything
 /// else, so it short-circuits regardless of how the remote-required intent
 /// reached the worker.
-const REMOTE_LOOP_BREAK_ENV: (&str, &str) = ("RCH_CARGO_WRAPPER_BYPASS", "1");
+const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &[
+    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+];
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -2604,7 +2673,7 @@ async fn execute_source_rsync_attempt(cmd: Command) -> Result<std::process::Outp
     .into())
 }
 
-fn use_mock_transport(worker: &WorkerConfig) -> bool {
+pub(crate) fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
 
@@ -2766,6 +2835,7 @@ pub struct TransferPipeline {
     /// Worker-side activity lease bound to the persisted source grant. Every
     /// source operation checks the grant after joining its drain barrier.
     source_authority_prefix: Option<String>,
+    source_authority_namespace: crate::hook::SourceAuthorityNamespace,
     /// Cooperative collection-only cancellation; the sender never drops a live child future.
     retrieval_control: Option<(tokio::sync::watch::Receiver<bool>, TokioInstant)>,
 }
@@ -2884,6 +2954,7 @@ impl TransferPipeline {
             rsync_override: None,
             recovery_completion: None,
             source_authority_prefix: None,
+            source_authority_namespace: crate::hook::SourceAuthorityNamespace::Current,
             retrieval_control: None,
         }
     }
@@ -3005,18 +3076,31 @@ impl TransferPipeline {
     }
 
     #[cfg(unix)]
-    pub(crate) fn with_source_authority(mut self, identity: String) -> Result<Self> {
-        self.source_authority_prefix =
-            Some(crate::hook::source_authority_activity_prefix(&identity)?);
+    pub(crate) fn with_source_authority(self, identity: String) -> Result<Self> {
+        self.with_source_authority_in(identity, crate::hook::SourceAuthorityNamespace::Current)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_source_authority_in(
+        mut self,
+        identity: String,
+        namespace: crate::hook::SourceAuthorityNamespace,
+    ) -> Result<Self> {
+        self.source_authority_prefix = Some(namespace.activity_prefix(&identity, false)?);
+        self.source_authority_namespace = namespace;
         Ok(self)
     }
 
     /// Cleanup is admitted only while the exact active grant is cancelling.
     /// Final cancellation drains these operations before releasing its roots.
     #[cfg(unix)]
-    pub(crate) fn with_source_authority_cleanup(mut self, identity: String) -> Result<Self> {
-        self.source_authority_prefix =
-            Some(crate::hook::source_authority_cleanup_prefix(&identity)?);
+    pub(crate) fn with_source_authority_cleanup(
+        mut self,
+        identity: String,
+        namespace: crate::hook::SourceAuthorityNamespace,
+    ) -> Result<Self> {
+        self.source_authority_prefix = Some(namespace.activity_prefix(&identity, true)?);
+        self.source_authority_namespace = namespace;
         Ok(self)
     }
 
@@ -3024,6 +3108,13 @@ impl TransferPipeline {
         match &self.source_authority_prefix {
             Some(prefix) => format!("{prefix} sh -c {}", escape(Cow::from(command))),
             None => command.to_owned(),
+        }
+    }
+
+    fn source_activity_script<'a>(&self, script: &'a str) -> Cow<'a, str> {
+        match &self.source_authority_prefix {
+            Some(prefix) => Cow::Owned(source_activity_finite_script(prefix, script)),
+            None => Cow::Borrowed(script),
         }
     }
 
@@ -3184,12 +3275,17 @@ impl TransferPipeline {
         // The receipts stay private, but the workload runs under the caller's
         // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
         // carried those modes home.
+        // sync -f uses syncfs, and uutils 0.10 even implements sync FILE as
+        // global sync(). Both can hold a completed job behind unrelated writes.
+        // Call fsync explicitly, including the directory after publication.
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n) </dev/null; s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n) </dev/null; s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && {sync_pending} && mv -f -- {pending} {done} && {sync_directory}; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
-            directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+            sync_pending = file_fsync_command(&[&format!("{path}.pending")]),
+            sync_directory =
+                file_fsync_command(&[Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
         // The disk/process wrappers already contain quoted scripts. Passing
         // their composition as one more `sh -c` argument can exceed Linux's
@@ -3248,6 +3344,7 @@ impl TransferPipeline {
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
              [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
+             {sync_completion} || {{ printf '%s\\n' 'RCH: completion durability unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -3265,6 +3362,8 @@ impl TransferPipeline {
             identity = quote(identity),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
             stall_ticks = stall_secs * 5,
+            sync_completion =
+                file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         )
     }
 
@@ -3275,9 +3374,13 @@ impl TransferPipeline {
         let Some((path, identity)) = &self.recovery_completion else {
             return Ok(None);
         };
+        // A rename can be visible before its directory barrier succeeds. A
+        // reconnect must re-establish both barriers before trusting that name.
         let script = format!(
-            "if [ -f {p} ] && [ ! -L {p} ]; then cat -- {p}; fi",
-            p = escape(Cow::from(path.as_str()))
+            "if [ -f {p} ] && [ ! -L {p} ]; then {sync_completion} && cat -- {p}; fi",
+            p = escape(Cow::from(path.as_str())),
+            sync_completion =
+                file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
         let output = tokio::time::timeout(
             Duration::from_secs(10),
@@ -3879,6 +3982,20 @@ impl TransferPipeline {
         })
     }
 
+    /// A local progress timeout cannot close a half-open worker SSH channel.
+    /// rsync forwards this I/O-idle bound to its actual server, so the receiver
+    /// or sender can relinquish activity without a live dispatcher. Preserve
+    /// the established zero opt-out for source synchronization; timeout never
+    /// releases the durable source claim or acknowledges preparation cleanup.
+    fn append_source_rsync_io_timeout(&self, command: &mut Command) {
+        let seconds = self.transfer_config.source_sync_silence_timeout_secs;
+        if seconds != 0 {
+            command.arg(rsync_io_timeout_arg(std::time::Duration::from_secs(
+                seconds,
+            )));
+        }
+    }
+
     /// Override the remote project path used for sync and command execution.
     ///
     /// Intended for canonical multi-repo layouts where the remote path must
@@ -4221,13 +4338,12 @@ impl TransferPipeline {
             applied.push(key.to_string());
         }
 
-        // Remote loop-break (see REMOTE_LOOP_BREAK_ENV): stop the worker's own
+        // Remote loop-break (see REMOTE_LOOP_BREAK_ENVS): stop the worker's own
         // cargo shim from offloading the job onward. Injected unconditionally
         // and last-wins over a forwarded value, because a caller that exported
         // RCH_CARGO_WRAPPER_BYPASS=0 locally must not be able to re-arm the
         // shim on the worker and reintroduce the bounce.
-        {
-            let (key, value) = REMOTE_LOOP_BREAK_ENV;
+        for &(key, value) in REMOTE_LOOP_BREAK_ENVS {
             if let Some(escaped) = shell_escape_value(value) {
                 let assignment_prefix = format!("{key}=");
                 parts.retain(|part| !part.starts_with(&assignment_prefix));
@@ -4547,6 +4663,7 @@ impl TransferPipeline {
         } else {
             self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
         };
+        self.append_source_rsync_io_timeout(&mut cmd);
         cmd.arg("-azn")
             .arg("--checksum")
             .arg("--itemize-changes")
@@ -5451,6 +5568,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     fn build_estimate_command(&self, worker: &WorkerConfig) -> Command {
         let effective_excludes = self.get_effective_excludes();
         let (mut cmd, _capabilities) = self.rsync_command();
+        // Estimates retain their own finite policy even when the operator
+        // disables silence detection for actual source uploads.
+        cmd.arg(rsync_io_timeout_arg(self.transfer_estimate_timeout()));
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = format!(
@@ -5611,6 +5731,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         effective_excludes: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
+        self.append_source_rsync_io_timeout(&mut cmd);
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
@@ -5672,6 +5793,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         effective_excludes: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
+        self.append_source_rsync_io_timeout(&mut cmd);
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
@@ -5866,6 +5988,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     async move {
                         let mut rsync = Command::new(&rsync_path); // ubs:ignore — same trusted rsync resolver as rsync_command; payload remains argv
                         rch_common::rsync_flavor::configure_rsync_remote_args(rsync.as_std_mut());
+                        self.append_source_rsync_io_timeout(&mut rsync);
                         rsync
                             .env("LC_ALL", "C")
                             .arg("-a")
@@ -5976,7 +6099,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// (`mkdir: missing operand`). Feeding the script on stdin to `sh -s` — Git's
     /// POSIX shell — sidesteps that entirely, exactly as the exec path does.
     async fn run_remote_sh(&self, worker: &WorkerConfig, script: &str) -> Result<()> {
-        let mut cmd = self.worker_ssh_command(worker, &["sh", "-s"]);
+        let script = self.source_activity_script(script);
+        let mut cmd = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -6255,9 +6379,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // required for execution. -P (the default) does not traverse symlinks.
         // A NUL-delimited inventory preserves spaces and shell metacharacters.
         let inventory_script = windows_artifact_inventory_script(remote_path);
+        let inventory_script = self.source_activity_script(&inventory_script);
         let mut inventory = Vec::new();
         run_windows_artifact_process(
-            self.worker_ssh_command(worker, &["sh", "-s"]),
+            self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false),
             &inventory_script,
             &mut inventory,
             MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES as u64,
@@ -6277,9 +6402,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let deadline = started + Duration::from_millis(retry.total_timeout_ms);
             let (archive, archive_bound) = self.windows_retrieval_archive(selected_size, count)?;
             let mut output = tokio::fs::File::from_std(archive.reopen()?);
+            let archive_script = windows_artifact_archive_script(remote_path, &selected);
+            let archive_script = self.source_activity_script(&archive_script);
             bytes = run_windows_artifact_process(
-                self.worker_ssh_command(worker, &["sh", "-s"]),
-                &windows_artifact_archive_script(remote_path, &selected),
+                self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false),
+                &archive_script,
                 &mut output,
                 archive_bound,
                 deadline,
@@ -6818,13 +6945,13 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
         }
 
-        // IMPORTANT: pass the script via stdin (`sh -s`) to avoid quoting issues with
-        // newlines/comments in `remote_script`. This preserves the prior mux behavior
-        // where the script is an argv payload, not re-parsed by the user's login shell.
+        // Upload the complete finite program before taking activity authority.
+        // Its inner prefix still checks the grant after acquiring the mutex;
+        // an interrupted bootstrap never strands that mutex before the workload
+        // supervisor and process identity can exist. Stdin also avoids login-
+        // shell quoting and the per-argument size limit for large build scripts.
+        let remote_script = self.source_activity_script(remote_script);
         cmd.arg(&destination);
-        if let Some(prefix) = &self.source_authority_prefix {
-            cmd.arg(prefix);
-        }
         cmd.arg("sh").arg("-s");
 
         cmd.stdin(Stdio::piped())
@@ -7459,7 +7586,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // root. A missing/unreadable candidate is not evidence of compatibility.
         let cargo_target_root = self.remote_cargo_target_dir();
         let script = artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
-        let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
+        let script = self.source_activity_script(&script);
+        let mut command = self.worker_ssh_command_with_activity(worker, &["sh", "-s"], false);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -7626,6 +7754,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
+            // Match ordinary artifact retrieval: a dead receiver must not
+            // leave this remote sender holding source activity indefinitely.
+            .arg("--timeout=30")
             .arg("--safe-links")
             .arg("--exclude=.rch-clean-overlay-base.tar")
             .arg("-e")
@@ -7662,7 +7793,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         control_dir: &str,
         attempt: &str,
     ) -> Result<()> {
-        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(attempt, false)?;
         anyhow::ensure!(
             !self.worker_platform.is_windows()
                 && self.source_authority_prefix.as_deref() == Some(active.as_str()),
@@ -7693,7 +7826,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         control_dir: &str,
         attempt: &str,
     ) -> Result<()> {
-        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(attempt, false)?;
         anyhow::ensure!(
             !self.worker_platform.is_windows()
                 && self.source_authority_prefix.as_deref() == Some(active.as_str()),
@@ -8292,8 +8427,12 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
             !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
             "retained source retirement requires an active Linux source grant"
         );
-        let active = crate::hook::source_authority_activity_prefix(identity)?;
-        let cleanup = crate::hook::source_authority_cleanup_prefix(identity)?;
+        let active = self
+            .source_authority_namespace
+            .activity_prefix(identity, false)?;
+        let cleanup = self
+            .source_authority_namespace
+            .activity_prefix(identity, true)?;
         anyhow::ensure!(
             self.source_authority_prefix.as_deref() == Some(active.as_str())
                 || self.source_authority_prefix.as_deref() == Some(cleanup.as_str()),
@@ -9486,6 +9625,22 @@ where
         }
     };
     if !status.success() {
+        if status.code() == Some(30)
+            && let Some(policy) = effective_silence
+        {
+            // A peer timeout can win the race with the local progress timer.
+            // Keep the same no-in-place-retry / worker-failover classification,
+            // without treating a child exit as worker retirement evidence.
+            return Err(SourceSyncStalled {
+                worker_id: policy.worker_id.clone(),
+                phase: policy.phase,
+                silence: policy.limit,
+                detail: format!(
+                    "{operation_name}: rsync peer I/O timeout (exit 30; worker activity retirement remains unconfirmed)"
+                ),
+            }
+            .into());
+        }
         return Err(TransferError::SyncFailed {
             reason: "rsync failed".to_string(),
             exit_code: status.code(),
@@ -10283,6 +10438,92 @@ mod tests {
         assert!(std::path::Path::new(&receipt).is_file());
     }
 
+    /// A busy filesystem must not become the completion barrier for an
+    /// unrelated job. Exercise the generated supervisor and actual file fsync;
+    /// injected barrier failures must leave even a visible receipt untrusted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_uses_file_sync_and_requires_both_barriers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, workload_status, expected) in [
+            ("ok", 0, 0),
+            ("workload_failure", 3, 3),
+            ("pending", 0, 255),
+            ("directory", 0, 255),
+            ("receipt", 0, 255),
+        ] {
+            let root = retained.join(case);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let global_sync = bin.join("sync");
+            std::fs::write(&global_sync, "#!/bin/sh\nexit 91\n").unwrap();
+            std::fs::set_permissions(&global_sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let receipt = root.join("completion");
+            let calls = root.join("sync.calls");
+            let invocations = root.join("invocations");
+            let sync = bin.join("python3");
+            std::fs::write(
+                &sync,
+                "#!/bin/sh\n\
+                 for path do\n\
+                  case \"$path\" in /*) printf '%s\\n' \"$path\" >> \"$RCH_TEST_SYNC_LOG\";; *) continue;; esac\n\
+                  case \"$RCH_TEST_SYNC_FAILURE:$path\" in pending:*.pending) exit 74;; esac\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = directory ] && [ -d \"$path\" ]; then exit 74; fi\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = receipt ] && [ \"$path\" = \"$RCH_TEST_RECEIPT\" ]; then exit 74; fi\n\
+                 done\n\
+                 exec /usr/bin/python3 \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let pipeline = TransferPipeline::new(
+                root.clone(),
+                "sync-barrier".into(),
+                "abc123".into(),
+                TransferConfig::default(),
+            )
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "barrier".into());
+            let command = pipeline.durable_execution_command(format!(
+                "printf 'once\\n' >> {}; printf 'rendered\\n'; exit {workload_status}",
+                escape(Cow::from(invocations.to_str().unwrap()))
+            ));
+            let script = root.join("command.sh");
+            std::fs::write(&script, command).unwrap();
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "sh"])
+                .arg(script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("RCH_TEST_SYNC_FAILURE", case)
+                .env("RCH_TEST_SYNC_LOG", &calls)
+                .env("RCH_TEST_RECEIPT", &receipt)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
+            assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+            let calls = std::fs::read_to_string(calls).unwrap();
+            assert!(calls.contains("completion.pending"), "{calls}");
+            if expected != 255 {
+                assert_eq!(output.stdout, b"rendered\n");
+                assert_eq!(
+                    std::fs::read_to_string(&receipt).unwrap(),
+                    format!("barrier {workload_status}\n")
+                );
+            } else if case == "pending" {
+                assert!(!receipt.exists());
+            } else {
+                // A failed post-rename barrier must not turn a visible record
+                // into permission to release the job's ownership.
+                assert!(receipt.is_file());
+                assert!(
+                    std::fs::read_to_string(root.join("completion.stderr"))
+                        .unwrap()
+                        .contains("completion durability unconfirmed")
+                );
+            }
+        }
+    }
+
     /// A real shell must start a supervisor larger than Linux MAX_ARG_STRLEN,
     /// without expanding its contents or exposing the script as workload stdin.
     #[cfg(target_os = "linux")]
@@ -10320,11 +10561,22 @@ mod tests {
     async fn durable_execution_composed_disk_budget_preserves_all_outcomes() {
         let _guard = test_guard!();
         let retained = tempfile::tempdir().unwrap().keep();
-        for (index, (workload, status, seconds, refuse)) in [
-            ("printf built > artifact; printf ready", 0, 15, false),
-            ("printf 'compiler failed' >&2; exit 101", 101, 15, false),
-            ("sleep 20", 137, 1, false),
-            ("printf forbidden > artifact", 120, 15, true),
+        for (index, (workload, status, seconds, refusal_floor)) in [
+            ("printf built > artifact; printf ready", 0, 15, None),
+            ("printf 'compiler failed' >&2; exit 101", 101, 15, None),
+            ("sleep 20", 137, 1, None),
+            // The supervisor admits signed-64-bit sizes. An impossible but
+            // valid floor exercises its actual pre-payload disk refusal.
+            (
+                "printf forbidden > artifact",
+                120,
+                15,
+                Some(i64::MAX as u64),
+            ),
+            // Invalid policy input has no supervisor receipt. The outer
+            // wrapper must conservatively refuse replay, not invent proof
+            // that execution never began.
+            ("printf forbidden > artifact", 120, 15, Some(u64::MAX)),
         ]
         .into_iter()
         .enumerate()
@@ -10335,10 +10587,10 @@ mod tests {
             let mut pipeline =
                 disk_budget_test_pipeline(&directory, Some(index as u64 + 1), seconds)
                     .with_recovery_completion(receipt.to_str().unwrap().into(), "composed".into());
-            if refuse {
+            if let Some(min_free_bytes) = refusal_floor {
                 pipeline = pipeline.with_disk_budget(Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 8 << 20,
-                    min_free_bytes: u64::MAX,
+                    min_free_bytes,
                 }));
             }
             let command =
@@ -10370,13 +10622,14 @@ mod tests {
                 std::fs::read_to_string(&receipt).unwrap(),
                 format!("composed {status}\n")
             );
-            if refuse {
+            if let Some(min_free_bytes) = refusal_floor {
                 let error = pipeline.ensure_remote_disk_budget(&result).unwrap_err();
-                assert!(
-                    !error
+                assert_eq!(
+                    error
                         .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
                         .unwrap()
-                        .started
+                        .started,
+                    min_free_bytes == u64::MAX
                 );
                 assert!(!directory.join("artifact").exists());
             } else {
@@ -12224,10 +12477,12 @@ Number of files transferred: 42
                 false,
                 15,
             ),
-            (Some(2), "exit 101", 101, false, 15),
-            (None, "exit 137", 137, false, 15),
-            (Some(3), "exec sleep 20", 137, true, 1),
-            (None, "exec sleep 20", 137, true, 1),
+            // The color wrapper runs the first word through env(1), so each
+            // workload starts with a program, as a real build command does.
+            (Some(2), "sh -c 'exit 101'", 101, false, 15),
+            (None, "sh -c 'exit 137'", 137, false, 15),
+            (Some(3), "sleep 20", 137, true, 1),
+            (None, "sleep 20", 137, true, 1),
         ]
         .into_iter()
         .enumerate()
@@ -12780,6 +13035,82 @@ Number of files transferred: 42
     }
 
     #[test]
+    fn source_rsync_idle_timeout_respects_source_opt_out_and_estimate_budget() {
+        let _guard = test_guard!();
+        let worker = estimate_test_worker();
+        let timeout_args = |command: Command| {
+            command
+                .as_std()
+                .get_args()
+                .filter_map(|arg| arg.to_str())
+                .filter(|arg| arg.starts_with("--timeout="))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for (seconds, explicit_ms, expected_estimate) in [
+            (120, None, "--timeout=120"),
+            (7, None, "--timeout=7"),
+            (0, None, "--timeout=120"),
+            (0, Some(1_500), "--timeout=2"),
+            (120, Some(1_001), "--timeout=2"),
+        ] {
+            let pipeline = TransferPipeline::new(
+                PathBuf::from("/home/user/project"),
+                "idle-policy".into(),
+                "abcdef".into(),
+                TransferConfig {
+                    source_sync_silence_timeout_secs: seconds,
+                    sync_timeout_ms: explicit_ms,
+                    ..TransferConfig::default()
+                },
+            )
+            .with_rsync(pinned_rsync(RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            }))
+            .with_ssh_options(SshOptions {
+                control_master: false,
+                ..SshOptions::default()
+            });
+            let expected_source: Vec<String> = (seconds != 0)
+                .then(|| format!("--timeout={seconds}"))
+                .into_iter()
+                .collect();
+            for command in [
+                pipeline.build_sync_command(&worker, "worker:/source", "/source", &[]),
+                pipeline.build_sync_streaming_command(&worker, "worker:/source", "/source", &[]),
+                pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
+                pipeline.build_source_content_rsync_barrier_command(&worker, &[], Some(true)),
+            ] {
+                assert_eq!(timeout_args(command), expected_source);
+            }
+            assert_eq!(
+                timeout_args(pipeline.build_estimate_command(&worker)),
+                [expected_estimate]
+            );
+            // Source silence opt-out must not remove artifact collection's
+            // existing peer-I/O deadline, including declared result dirs.
+            for command in [
+                pipeline.build_retrieve_command(&worker, "/source", &["target/**".into()]),
+                pipeline.build_retrieve_streaming_command(
+                    &worker,
+                    "/source",
+                    &["target/**".into()],
+                ),
+                pipeline.build_result_dir_retrieve_command(&worker, "/source", Path::new("out")),
+            ] {
+                assert_eq!(timeout_args(command), ["--timeout=30"]);
+            }
+        }
+        assert_eq!(
+            rsync_io_timeout_arg(Duration::from_millis(1)),
+            "--timeout=1"
+        );
+        assert_eq!(rsync_io_timeout_arg(Duration::MAX), "--timeout=2147483647");
+    }
+
+    #[test]
     fn test_estimate_command_uses_configured_ssh_keepalive() {
         // Issue #74: the estimate's ssh must carry ServerAliveInterval like the
         // upload's, and keep its connect bound.
@@ -13238,6 +13569,44 @@ Number of files transferred: 42
             .unwrap();
         assert_eq!(output.status.code(), Some(73), "{output:?}");
         assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_source_activity_script_preserves_colliding_delimiters_and_literal_bytes() {
+        use std::io::Write as _;
+
+        let delimiter = "RCH_SOURCE_ACTIVITY_TEST";
+        let literal = format!(
+            "{delimiter}\n{delimiter}_\n$(printf expanded) `printf expanded` $HOME 'literal'\n"
+        );
+        let script = format!(
+            "# {}\ntest \"$RCH_ACTIVITY_TEST\" = owned || exit 99\ncat <<'EXPECTED_LITERAL'\n{literal}EXPECTED_LITERAL\n",
+            "x".repeat(256 * 1024),
+        );
+        let framed = source_activity_finite_script_with_delimiter(
+            "env RCH_ACTIVITY_TEST=owned",
+            &script,
+            delimiter.to_owned(),
+        );
+        let mut child = std::process::Command::new("sh")
+            .args(["-s"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // No program bytes travel through argv, even beyond MAX_ARG_STRLEN.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(framed.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, literal.as_bytes());
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 
     #[cfg(unix)]
@@ -14058,7 +14427,10 @@ Number of files transferred: 42
                     let pipeline = match mode {
                         "active" => pipeline.with_source_authority("ab12".into()).unwrap(),
                         "cleanup" => pipeline
-                            .with_source_authority_cleanup("ab12".into())
+                            .with_source_authority_cleanup(
+                                "ab12".into(),
+                                crate::hook::SourceAuthorityNamespace::Current,
+                            )
                             .unwrap(),
                         _ => pipeline,
                     };
@@ -15943,6 +16315,10 @@ Number of files transferred: 42
             excludes.iter().any(|e| e == ".rch-go/"),
             "effective excludes must include .rch-go/: {excludes:?}"
         );
+        assert!(
+            excludes.iter().any(|e| e == ".rch_last_used"),
+            "effective excludes must include .rch_last_used: {excludes:?}"
+        );
     }
 
     #[test]
@@ -16112,7 +16488,8 @@ Number of files transferred: 42
             .env_remove("CARGO_BUILD_BUILD_DIR")
             // Nested compiles execute on the worker running this RCH-offloaded
             // test, through its real Cargo rather than recursively offloading.
-            .env("RCH_CARGO_WRAPPER_BYPASS", "1");
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "rch");
         if checksum {
             command.arg("-Zchecksum-freshness");
         }
@@ -16862,6 +17239,7 @@ fn main() {
                 .env("CARGO_TARGET_DIR", &pool)
                 .env_remove("CARGO_BUILD_BUILD_DIR")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
                 .env("RCH_FRESHNESS_BUILD_COUNT", &counter)
                 .env("RCH_EXPECTED_EFFECT", expected)
                 .output()
@@ -17429,7 +17807,8 @@ fn main() {
         assert!(!script.contains("kill -KILL -- "));
         // Boot/start identity and a process-table observation guard group signals.
         assert!(script.contains("rch_remote_leader_matches || return 43"));
-        assert!(script.contains("ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp="));
+        assert!(script.contains("ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp="));
+        assert!(script.contains(r#"ps -L -q "$pids" -o pid= -o lwp= -o pgid= -o stat= -o nlwp="#));
         assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
         assert!(script.contains("RCH_E104_KILL=still_alive"));
@@ -20065,6 +20444,71 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             limit: std::time::Duration::from_millis(millis),
             worker_id: "stall-worker".to_string(),
             phase: "source_sync",
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_rsync_peer_timeout_keeps_stall_classification_without_in_place_retry() {
+        let _guard = test_guard!();
+        let policy = test_silence_policy(10_000);
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 30_000,
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf 'recent progress\\r'; printf 'rsync error: timeout in data send/receive (code 30)\\n' >&2; exit 30",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        };
+        let error = run_command_streaming_with_retry(
+            &retry,
+            "source_sync",
+            Some(Duration::from_secs(30)),
+            Some(&policy),
+            build,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        let stall =
+            find_source_sync_stall(&error).expect("rsync I/O timeout remains a source stall");
+        assert_eq!(stall.worker_id, "stall-worker");
+        assert_eq!(stall.silence, policy.limit);
+        assert!(stall.detail.contains("peer I/O timeout"));
+        assert!(stall.detail.contains("retirement remains unconfirmed"));
+        assert!(!streaming_error_is_retryable(&error));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        for policy in [None, Some(test_silence_policy(0))] {
+            let error = run_command_streaming(
+                build(),
+                "artifact_collection",
+                Duration::from_secs(30),
+                policy.as_ref(),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(find_source_sync_stall(&error).is_none());
+            assert!(matches!(
+                error.downcast_ref::<TransferError>(),
+                Some(TransferError::SyncFailed {
+                    exit_code: Some(30),
+                    ..
+                })
+            ));
         }
     }
 

@@ -37,7 +37,7 @@ use crate::coord::live::{
 };
 use crate::edge::live_facts::{
     DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
-    digest_stable, read_stable,
+    digest_stable, native_snapshot_root, read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -48,9 +48,9 @@ use rabs_cas::publication::{
     OfferPreparedActionResult, PublicationOutcome, observable_result_digest_v1,
 };
 use rabs_key::live_dependency::{
-    DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
-    LiveDependencyKey, canonicalize_placements, check_dependency_cache_read_closure,
-    dep_info_closure_violation, render_placements,
+    DependencyActionPlan, DependencySourceKind, LiveDependencyKey,
+    canonicalize_compiler_transcript, canonicalize_placements, check_dependency_cache_read_closure,
+    dep_info_closure_violation, render_compiler_transcript,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -70,10 +70,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod canonical;
 pub mod remote;
 
 mod capture_pins;
 mod output_capture;
+pub(crate) mod shared_work;
 use capture_pins::CapturePins;
 
 /// Decision-receipt kind binding an action key to its canonical
@@ -93,7 +95,7 @@ pub const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const BUNDLE_ROOT_ENCODING: &str = "artifact-bundle-root-v1";
 
 /// Everything the edge observed and keyed for one request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LiveDependencyRequest {
     /// The exact key and its descriptor.
     pub key: LiveDependencyKey,
@@ -109,10 +111,39 @@ pub struct LiveDependencyRequest {
     pub toolchain: ToolchainGuard,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
+    /// Driver-owned namespace/backing capability. Ordinary wrapper requests
+    /// cannot construct it. Remote requests carry only the logical context;
+    /// this owner remains on the coordinator for observation and installation.
+    pub canonical_paths: Option<Arc<canonical::CanonicalPaths>>,
 }
 
 impl LiveDependencyRequest {
+    fn is_execution_only(&self) -> bool {
+        self.plan.source_kind == DependencySourceKind::WorkspaceExecutionOnly
+    }
+
     fn verify_read_closure(&self) -> Result<(), String> {
+        if self.is_execution_only() {
+            return Err("workspace execution requires a fresh isolated remote compiler".into());
+        }
+        if self.plan.canonical_cargo != self.canonical_paths.is_some() {
+            return Err("canonical compiler plan lacks its retained driver capability".into());
+        }
+        if let Some(paths) = &self.canonical_paths {
+            paths.require_local_capture()?;
+            if self.plan.generated_root.is_some()
+                || !self.plan.native_roots.is_empty()
+                || self
+                    .plan
+                    .execution_env
+                    .iter()
+                    .any(|(name, _)| name == "OUT_DIR")
+            {
+                return Err(
+                    "canonical-generated-inputs-require-isolated-dependency-execution".into(),
+                );
+            }
+        }
         check_dependency_cache_read_closure(&self.plan.invocation)
             .map_err(|refusal| refusal.to_string())?;
         self.verify_output_contract()
@@ -125,6 +156,9 @@ impl LiveDependencyRequest {
         &self,
         remote: Option<&remote::RemoteValidation>,
     ) -> Result<(), String> {
+        if self.plan.canonical_cargo != self.canonical_paths.is_some() {
+            return Err("canonical compiler plan lacks its retained driver capability".into());
+        }
         match remote {
             Some(remote) => remote.verify_read_closure(self),
             None => self.verify_read_closure(),
@@ -132,10 +166,17 @@ impl LiveDependencyRequest {
     }
 
     fn verify_output_contract(&self) -> Result<(), String> {
-        let expected = rabs_key::output_derivation::derive_dependency_output_declarations(
-            &self.plan.invocation,
-            &self.plan.host_triple,
-        )
+        let expected = if self.is_execution_only() {
+            rabs_key::output_derivation::derive_workspace_output_declarations(
+                &self.plan.invocation,
+                &self.plan.host_triple,
+            )
+        } else {
+            rabs_key::output_derivation::derive_dependency_output_declarations(
+                &self.plan.invocation,
+                &self.plan.host_triple,
+            )
+        }
         .map_err(|error| error.to_string())?;
         if expected.canonical_bytes() != self.plan.outputs.canonical_bytes() {
             return Err(
@@ -146,8 +187,58 @@ impl LiveDependencyRequest {
     }
 
     fn verify_toolchain(&self) -> Result<(), String> {
+        let physical = self.io_plan()?;
         self.toolchain
-            .verify_unchanged(Path::new(&self.plan.compiler))
+            .verify_unchanged(Path::new(&physical.compiler))
+    }
+
+    fn io_plan(&self) -> Result<std::borrow::Cow<'_, DependencyActionPlan>, String> {
+        match &self.canonical_paths {
+            Some(paths) => paths.project_plan(&self.plan).map(std::borrow::Cow::Owned),
+            None => Ok(std::borrow::Cow::Borrowed(&self.plan)),
+        }
+    }
+
+    fn output_directory(&self) -> Result<PathBuf, String> {
+        match &self.canonical_paths {
+            Some(paths) => paths.physical(Path::new(&self.plan.out_dir)),
+            None => Ok(PathBuf::from(&self.plan.out_dir)),
+        }
+    }
+
+    fn installation_outputs(&self) -> Result<ExpectedOutputs, String> {
+        match &self.canonical_paths {
+            Some(paths) => Ok(ExpectedOutputs::CanonicalCargo {
+                paths: self.plan.output_names().into_iter().collect(),
+                working_directory: self.plan.cwd.as_bytes().to_vec(),
+                mappings: paths.output_mappings()?,
+            }),
+            None => Ok(expected_outputs(&self.plan)),
+        }
+    }
+
+    fn verify_package(&self) -> Result<(), String> {
+        let physical = self.io_plan()?;
+        self.package
+            .verify_unchanged(Path::new(&physical.source_root))?;
+        self.package.verify_generated_disjoint(&physical)
+    }
+
+    fn verify_canonical_surface(
+        &self,
+        surface: rabs_sandbox::leak_scanner::Surface,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match &self.canonical_paths {
+            Some(paths) => {
+                let roots = paths.backing_roots();
+                let (first, rest) = roots
+                    .split_first()
+                    .ok_or("missing canonical backing roots")?;
+                verify_canonical_surface_free_of_roots(surface, bytes, first, rest)
+            }
+            None => verify_canonical_surface_free_of_staging_roots(surface, bytes, &self.plan),
+        }
     }
 }
 
@@ -195,6 +286,9 @@ pub enum LiveDecision {
     Execute(LocalAttempt),
     /// Reserved private worker execution, awaiting subscriber acceptance.
     Remote(remote::PendingRemote),
+    /// One service-owned private execution shared by independently consenting
+    /// subscribers. The offer itself grants no destination write authority.
+    SharedRemote(remote::PendingSharedRemote),
     /// Another subscriber owns this action's dispatch. No execution or
     /// destination writer was admitted for this request. A bounded follower
     /// may resubmit its original request; the edge must reobserve its inputs
@@ -291,20 +385,22 @@ impl PendingServe {
         if let Err(reason) = self
             .request
             .verify_toolchain()
-            .and_then(|()| {
-                self.request
-                    .package
-                    .verify_unchanged(Path::new(&plan.source_root))
-            })
-            .and_then(|()| self.request.package.verify_generated_disjoint(plan))
+            .and_then(|()| self.request.verify_package())
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
             return InstallResult::Declined(reason);
         }
-        let expected = expected_outputs(plan);
+        let expected = match self.request.installation_outputs() {
+            Ok(expected) => expected,
+            Err(reason) => return InstallResult::Declined(reason),
+        };
+        let physical = match self.request.io_plan() {
+            Ok(physical) => physical,
+            Err(reason) => return InstallResult::Declined(reason),
+        };
         match self.coord.serve_for_subscriber(
             &self.request.key.action_key,
-            Path::new(&plan.out_dir),
+            Path::new(&physical.out_dir),
             &expected,
             now_micros(),
             ServeMode::Install,
@@ -347,8 +443,8 @@ impl PendingServe {
                 finish_installation(
                     &self.request.dependencies,
                     &self.request.package,
-                    plan,
-                    render_placements(&self.canonical_transcript, plan),
+                    &physical,
+                    render_compiler_transcript(&self.canonical_transcript, plan),
                     installed,
                 )
             }
@@ -374,6 +470,12 @@ fn mappings_for_plan(plan: &DependencyActionPlan) -> Vec<(String, String)> {
     let mut mappings = vec![(PACKAGE_ROOT.to_owned(), plan.source_virtual_root())];
     if plan.generated_root.is_some() {
         mappings.push((GENERATED_ROOT.to_owned(), plan.generated_virtual_root()));
+    }
+    for index in 0..plan.native_roots.len() {
+        mappings.push((
+            native_snapshot_root(index),
+            plan.native_input_virtual_root(index),
+        ));
     }
     mappings
 }
@@ -756,6 +858,12 @@ impl LiveDependencyLane {
         request: LiveDependencyRequest,
         remote_validation: Option<&remote::RemoteValidation>,
     ) -> Result<Result<PendingServe, LiveDependencyRequest>, String> {
+        // An execution-only descriptor coordinates one fresh compiler run. It
+        // never authorizes looking up another request's result, even if a
+        // stale or externally inserted publication happens to name this key.
+        if request.is_execution_only() {
+            return Err("workspace execution-only results cannot be previewed".into());
+        }
         // Retained codegen publications from an older daemon are immutable
         // history, not current serving authority. Check before any lookup.
         request.verify_enforced_read_closure(remote_validation)?;
@@ -779,10 +887,11 @@ impl LiveDependencyLane {
         let Some((manifest, canonical_transcript)) = loaded else {
             return Ok(Err(request));
         };
-        let expected = expected_outputs(&request.plan);
+        let expected = request.installation_outputs()?;
+        let physical_outputs = request.output_directory()?;
         match self.coord.serve_for_subscriber(
             &key,
-            Path::new(&request.plan.out_dir),
+            &physical_outputs,
             &expected,
             now_micros(),
             ServeMode::Preview,
@@ -828,17 +937,30 @@ impl LiveDependencyLane {
             store
                 .upsert_action_entry(&ActionEntryRow {
                     action_key: key.clone(),
-                    key_epoch: LIVE_DEPENDENCY_KEY_EPOCH,
-                    projection_epoch: LIVE_DEPENDENCY_PROJECTION_EPOCH,
+                    key_epoch: request.key.descriptor.key_epoch,
+                    projection_epoch: request.key.descriptor.projection_epoch,
                 })
                 .map_err(|error| format!("action entry: {error:?}"))?;
         }
         let mappings = mappings_for_plan(&request.plan);
-        let submission = ActionSubmission::from_snapshot(
+        let evidence = request
+            .package
+            .native
+            .iter()
+            .enumerate()
+            .map(|(index, native)| {
+                (
+                    request.plan.native_record_virtual_path(index),
+                    native.build_script_output.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let submission = ActionSubmission::from_snapshot_with_evidence(
             request.key.descriptor.clone(),
             &request.inputs,
             Arc::clone(&request.package.snapshot),
             &mappings,
+            &evidence,
         )
         .map_err(refusal)?;
         if submission.key() != key {
@@ -910,6 +1032,23 @@ struct ExecutionAttempt {
     settled: bool,
 }
 
+/// Complete the observed drain and durably retire its dispatch without needing
+/// a publication decision. The exact admitted claim is checked at every step.
+pub(super) fn settle_completed_dispatch(
+    coord: &CoordLive,
+    key: &TypedDigest,
+    serial: u64,
+    authority: &AttemptAuthority,
+) -> Result<(), SubmissionRefusal> {
+    coord.advance_started_dispatch(key, serial, authority, AttemptState::Draining)?;
+    coord.advance_started_dispatch(key, serial, authority, AttemptState::Finished)?;
+    coord.complete_started_dispatch(key, serial, authority)?;
+    if !coord.retire_finished_action(key)? {
+        return Err(SubmissionRefusal::StaleDispatch);
+    }
+    Ok(())
+}
+
 impl LocalAttempt {
     #[must_use]
     pub fn execution_env(&self) -> &[(String, String)] {
@@ -937,8 +1076,8 @@ impl LocalAttempt {
     /// Capture caller-owned outputs before acknowledging their custody.
     pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
         let attempt = self.0;
-        let result =
-            attempt.capture_result(report, Path::new(&attempt.request.plan.out_dir), None)?;
+        let outputs = attempt.request.output_directory()?;
+        let result = attempt.capture_result(report, &outputs, None)?;
         Ok(CapturedLocalAttempt { attempt, result })
     }
 }
@@ -984,34 +1123,27 @@ impl ExecutionAttempt {
     /// Drain → Finished → complete the dispatch → retire the flight, so
     /// the next request for this key can submit a fresh attempt.
     fn settle(&mut self) {
+        let _ = self.settle_checked();
+    }
+
+    /// A request-owned result may outlive its completed worker lease, but only
+    /// after the action was durably retired. This prevents a successful private
+    /// result from leaving the next identical request waiting on a dead flight.
+    fn settle_checked(&mut self) -> Result<(), String> {
         if self.settled {
-            return;
+            return Ok(());
         }
         self.settled = true;
         let Some(authority) = self.authority.as_ref() else {
             self.coord.release_dispatch_claim(&self.key, self.serial);
-            return;
+            return Err("execution has no admitted authority to retire".into());
         };
-        let finished = self
-            .coord
-            .advance_started_dispatch(&self.key, self.serial, authority, AttemptState::Draining)
-            .and_then(|()| {
-                self.coord.advance_started_dispatch(
-                    &self.key,
-                    self.serial,
-                    authority,
-                    AttemptState::Finished,
-                )
-            })
-            .and_then(|()| {
-                self.coord
-                    .complete_started_dispatch(&self.key, self.serial, authority)
-            })
-            .and_then(|()| self.coord.retire_finished_action(&self.key).map(|_| ()));
+        let finished = settle_completed_dispatch(&self.coord, &self.key, self.serial, authority);
         if finished.is_err() {
             // Leave the reconciliation-required state rather than guess.
             self.coord.release_dispatch_claim(&self.key, self.serial);
         }
+        finished.map_err(|error| format!("execution retirement: {error:?}"))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1021,6 +1153,13 @@ impl ExecutionAttempt {
         physical_outputs: &Path,
         remote_receipt: Option<&serde_json::Value>,
     ) -> Result<CapturedLocalResult, String> {
+        if self.request.is_execution_only()
+            && (remote_receipt.is_none() || self.remote_validation.is_none())
+        {
+            return Err(
+                "workspace execution-only results require authenticated remote capture".into(),
+            );
+        }
         self.request
             .verify_enforced_read_closure(self.remote_validation.as_ref())?;
         self.advance(AttemptState::ProcessExited)?;
@@ -1038,17 +1177,13 @@ impl ExecutionAttempt {
         }
         self.request.verify_toolchain()?;
         let plan = &self.request.plan;
-        self.request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))?;
-        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
-        let transcript = canonicalize_placements(&report.stderr, plan)?;
-        verify_canonical_surface_free_of_staging_roots(
+        let transcript = canonicalize_compiler_transcript(&report.stderr, plan)?;
+        self.request.verify_canonical_surface(
             rabs_sandbox::leak_scanner::Surface::CompilerEvents,
             &transcript,
-            plan,
         )?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let authority = self.authority.clone().ok_or("attempt not admitted")?;
@@ -1081,10 +1216,9 @@ impl ExecutionAttempt {
                     return Err(format!("closure: {violation}"));
                 }
                 let bytes = canonicalize_placements(&raw, plan)?;
-                verify_canonical_surface_free_of_staging_roots(
+                self.request.verify_canonical_surface(
                     rabs_sandbox::leak_scanner::Surface::DepInfo,
                     &bytes,
-                    plan,
                 )?;
                 (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
@@ -1116,10 +1250,7 @@ impl ExecutionAttempt {
         }
         // The complete capture must be from one stable input generation, not
         // just start with one. After this barrier publication uses CAS only.
-        self.request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))?;
-        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
         self.request.verify_toolchain()?;
         // Each put takes the store lock for itself only: decisions for other
@@ -1143,12 +1274,16 @@ impl ExecutionAttempt {
                 "input_manifest": digest_key(&self.request.key.descriptor.action_inputs),
             }))
             .map_err(|error| error.to_string())?;
+            let directories = match &self.request.canonical_paths {
+                Some(paths) => paths.dependency_facts(&self.request.dependencies.directories)?,
+                None => self.request.dependencies.directories.clone(),
+            };
             let observed = serde_json::to_vec(&serde_json::json!({
                 "kind": "rabs-live-dependency-observed-inputs-v2",
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
-                "dependency_directories": self.request.dependencies.directories.iter().map(|directory| {
+                "dependency_directories": directories.iter().map(|directory| {
                     serde_json::json!({
                         "path": directory.path,
                         "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),
@@ -1193,8 +1328,8 @@ impl ExecutionAttempt {
         let manifest = CanonicalActionResultManifest {
             action_key: self.key.clone(),
             canonical_descriptor_digest: self.request.key.descriptor_digest.clone(),
-            key_epoch: LIVE_DEPENDENCY_KEY_EPOCH,
-            projection_epoch: LIVE_DEPENDENCY_PROJECTION_EPOCH,
+            key_epoch: self.request.key.descriptor.key_epoch,
+            projection_epoch: self.request.key.descriptor.projection_epoch,
             result_kind: ResultKind::Success,
             artifact_bundle_root: None,
             logical_outputs,
@@ -1267,6 +1402,9 @@ impl ExecutionAttempt {
         &self,
         captured: CapturedLocalResult,
     ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+        if self.request.is_execution_only() {
+            return Err("workspace execution-only results cannot be published".into());
+        }
         self.request
             .verify_enforced_read_closure(self.remote_validation.as_ref())?;
         let CapturedLocalResult {
