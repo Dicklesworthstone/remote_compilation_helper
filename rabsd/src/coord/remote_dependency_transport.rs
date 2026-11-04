@@ -29,6 +29,7 @@ use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
     CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION,
 };
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION;
 use serde_json::Value;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -247,6 +248,23 @@ impl RemoteDependencyTransport {
             return None;
         }
         snapshot.load.filter(|load| load.fresh_at(now))
+    }
+
+    /// Whether this exact authenticated standby connection can reuse verified
+    /// toolchain files. This is only a placement hint: the transfer protocol
+    /// still negotiates reuse and verifies every imported file before execution.
+    pub(crate) fn placement_toolchain_file_reuse(&self, generation: u64) -> bool {
+        let Some(snapshot) = self.readiness.snapshot() else {
+            return false;
+        };
+        snapshot.generation == generation
+            && snapshot.hello["toolchain_file_reuses"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == TOOLCHAIN_FILE_REUSE_VERSION)
+                })
     }
 
     /// Recheck after taking physical capacity so a revoked snapshot cannot
