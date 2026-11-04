@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Current execution TODO, November4 at22:31UTC:** stock passes; the first public
+**Current execution TODO, November4 at23:02UTC:** stock passes; the first public
 RABS round failed before execution with E2BIG. Two-layer transport fixes that
 kernel boundary, but the follow-up guard comparison is RED: preceding9478/8,
 candidateb606/8, two original6s pipe/deadline checks time out. Candidatec72 restores
@@ -88,18 +88,23 @@ Report SHAa6d26706f174fc22a30da7a6c543d845ee2eed90e5555a5b45e4f1a55db154f9.
 Quality DSRce1ee4d9 started22:24:26UTC under the original3600s cap. Its
 original ignored native reflink isolation case passes1/1/raw0 with an actual
 COW clone required; copy fallback cannot satisfy it. This adds one actual
-native case to104 component cases, but full workspace check/strictClippy/fmt
-remain running/pending. Do not call the whole QA stage green before terminal
-results. The prior06ded84c quality controller remains superseded/UNRUN.
+native case to104 component cases. Full workspace/all-target check now passes
+raw0/1235.3s, strictClippy-Dwarnings0/765.0s and fmt0/19.9s. Terminal DSR
+ce1ee4d9 is SUCCESS; report3797B/SHA4c18547f029b7476ea00fee5ca0507b7d79bb
+409cecd2f1823cfa5a45dd8ce61 binds104-case producer and original native COW1,
+all1740 source/control/tools/harness beforeafter. Prior06ded84c remains
+superseded/UNRUN.
 Stage a four-call ABBA comparison of real ordinary-release rabsd SDK
 preparation using oldAC82 and new04ffa in the SAME invocation, COMPLETE
 original1.921GB SDK and unchanged600s per-command/3600s DSR caps. Require
 both producers/fullQA, the native COW case, all four successful preparations,
 semantic equality and independent full byte/namespace/mode/inode verification.
 Whole-SDK input is already retained on TRJ; transfer only the new normal CLI,
-frozen1740-file source and evidence. This preparation comparison is UNRUN
-until new fullQA succeeds; it cannot stand in for Cargo/cache/program/fleet
-or merged-main qualification. No runtime or performance win yet.
+frozen1740-file source and evidence. This preparation comparison starts
+23:00:34UTC via DSR27ba5785, controller6f30ce5a/9794B. Required old/new
+producers/fullQA are verified; no completed timing result yet. It cannot stand
+in for Cargo/cache/program/fleet or merged-main qualification. No performance
+win yet.
 Prior103-case/fullQA proof applies only to AC82. A concurrent commit e32a153e
 records this three-file repair, then merge95787df5 adds newer SDK checkpoint/
 adoption work and changes two implementation files. Frozen tests do NOT
@@ -112,8 +117,31 @@ started22:05:58UTC with a separate genuinely cold target, normal profiles,
 jobs1/original3600s cap and unchanged host concurrency4. Formatting is RED1:
 two line-wrap/import issues in live_dependency/remote.rs. These are manually
 fixed in the shared checkout under lease1113; local whole-workspace fmt0.
-Frozen main957 remains unchanged and its compiler check continues. New fixed
+Frozen main957 full compiler check passes0/3192.0s. Its DSR remains FAILED
+because original fmt is1; all1747 source/control beforeafter match. New fixed
 source needs its own native checks; no old test count is relabeled as main.
+Concurrent HEAD advances to94aa1a3b (only an RCH test-fixture change, no RABS
+code changes). Preserve current indexc2f54e5f; earlier329e6abb/858f9f03 are
+historical. Frozen current94aa plus ONLY the two manual formatting corrections
+has1747 files, source6426f99b, archive65781760B/SHAf047696d9ad901850d797fd
+68240524fa49caae4fcb5086cad53cfbd8f12d82b. All1747 frozen files are now
+independently verified on TS2. Full native check/strictClippy/fmt DSR2e2cad61
+starts23:01:37UTC, controllerdbe6e0a3/5242B, original3600s cap/jobs1/concurrency4.
+It explicitly reuses the now-idle private main957 target; no cold-build claim.
+Earlier957 cannot qualify the additional RCH fixture edit or format correction.
+The ordinary RCH setup helper only starts/probes the daemon; SDK capture is
+later. Its original default7s setup/250ms cleanup failure is a SEPARATE gate
+from full-SDK cloning. A fresh untraced default setup diagnostic with new04ffa
+normal rabsd/wrapper starts22:53:07UTC via DSR, controller012a4fe2/7145B.
+Its workload is only a Python wrapper-environment assertion, NEVER Cargo or a
+cache request. Original startup5s/setup7s/cleanup250ms/diagnostic100ms bounds
+remain; fresh private state/socket and own-idle-daemon pidfd settlement only.
+Default setup DSR e612e57d is SUCCESS/native0/10s: actual setup raw0/3.267843s,
+expected active flag/exact wrapper, stderr empty. Idle daemon1229951/UID1000/
+birth157251011 is executable/hash/environment verified; pidfd SIGTERM yields
+death0.054s, none remain. Report6727B/SHA7315d667d5eacb9dd3c71d57c4891c000
+d0d62d74079d38db907cf7bc529a2f1. This is setup-only, not a public RCH/cache/
+fleet pass or a causal performance comparison.
 No installed SDK, daemon, worker configuration or capacity is changed. Public cache
 rounds remain0/4; no practical-usefulness, fleet or release qualification.
 The earlier dated sections are retained checkpoints, not additional active runs.
@@ -657,8 +685,9 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   Additional original native reflink gate plus full QA controller89e1f81c/
   6562B runs as DSRce1ee4d9-39c2-4230-b5c4-cffdce096198, launched22:24:26UTC,
   at `job-sdk-slow-clone-quality-cow-20261104`. Original native COW case now
-  passes1/1/raw0; fallback cannot pass it. Full check/Clippy/fmt still pending
-  terminal results. Earlier06ded84c controller remains superseded/UNRUN.
+  passes1/1/raw0; fallback cannot pass it. Full check passes0/1235.3s;
+  Clippy/fmt still pending terminal results. Earlier06ded84c controller remains
+  superseded/UNRUN.
   This isolated QA is required for exact old/new preparation comparison;
   concurrently merged main has its own separate cold-target native check.
 - [ ] Compare actual complete-SDK preparation through LIVE ordinary old and
@@ -694,8 +723,9 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   tests/gates; require normal full worker/coordinator/reactor and actual TLS
   integrations. Upstream component proofs do not establish full native/fleet
   correctness. Concurrent process committed the repair as e32a153e; root did
-  not stage/commit/merge during qualification. Preserve current index329e6abb;
-  old858f9f03 is historical and must never be restored over concurrent work.
+  not stage/commit/merge during qualification. After another concurrent RCH-only
+  fixture commit94aa, current index is c2f54e5f; old329e6abb/858f9f03 are
+  historical and must never be restored over concurrent work.
   Exact committed1747-file archive/source/control are verified on physical49.
   Main DSR725e89d0-06bf-41df-9152-7e90b2b0ea55/toolrabs_main957_check
   v2.1.34-main957.aabe7277 launched22:05:58UTC/PID7275. Frozen controller
@@ -714,6 +744,33 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   current957 compiler result; fix any actual compiler/Clippy failures without
   weakening flags, shrinking tests or substituting component facades. Preserve
   the original957 failure and every frozen source/control receipt.
+- [x] Freeze current94aa plus only the manual remote.rs formatting correction,
+  complete1747-file manifest/source6426f99b/archive65781760B/SHAf047696d.
+  Earlier freeze guard refused changed HEAD before creating its archive. The
+  corrected freeze requires actual94aa and preserves current indexc2f54e5f.
+  New native validation is UNRUN; all prior source scopes remain separate.
+- [x] Stage and independently verify matching04ffa normal worker/wrapper/root
+  and ordinary752384672B canonical harness on TRJ, compressed archive176972261B/
+  SHA8fb39cc4. Original4role hashes and harness match the104-case producer;
+  no installed or peer binaries changed. Source archive contains1740 regular
+  files and308 directories: first overly narrow member-count assertion refuses
+  before writing any source file; corrected extraction still requires all1740
+  exact file names/hashes/modes and refuses non-file/non-directory members.
+- [ ] Execute BOTH complete04ffa canonical check/cache and archive/program gates
+  after full new QA and preparation comparison. Functional controllerd3ef4d23/
+  19619B is frozen0400 on physical54; its expected denominator is2 actual named
+  native cases. It retains original300s Cargo/600s helper/3600s DSR clocks,
+  whole1.921GB SDK, native cleanup, receipts and any sampler limitations.
+  It is not a whole-pipeline speed comparison; previous incumbent pass and
+  paired timeout remain separate. Actual preparation speed needs live ABBA.
+- [ ] Diagnose ordinary worker-cache cold startup with the new normal tools
+  under unchanged defaults. DSR rabs_worker_cache_default version
+  2.1.34-workerdefault.04ffa.012a4fe2 launched22:53:07UTC/PID85787 on TRJ.
+  Python-only environment assertion is a setup diagnostic, not compiler/cache
+  or public RCH proof. Require actual own daemon settlement and retain failures.
+- [x] Verify existing trusted TS2-to-TRJ SSH succeeds as UID1000, without trust
+  or configuration changes. This enables staging a later distinct-host TLS
+  compiler test; no cross-host compiler test has run yet.
 - [x] Reconcile tracker import after the concurrent merge using JSONL truth
   and the existing single graph writer. M6 comment21:47 triggered many newer/
   equal-row import warnings but exported successfully; no DB/graph repair or
