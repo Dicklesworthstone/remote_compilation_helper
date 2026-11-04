@@ -680,13 +680,15 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   build0/847.9s, all version/compiler probes0, harness0/252.5s/exact case1.
   All1740 source inputs/control/tools/harness match beforeafter; report17300B/
   SHAa6d26706f174fc22a30da7a6c543d845ee2eed90e5555a5b45e4f1a55db154f9.
-- [ ] Run full workspace/all-target check, strictClippy-Dwarnings and fmt on
+- [x] Run full workspace/all-target check, strictClippy-Dwarnings and fmt on
   the exact104-case source. Prior AC82 QA does not qualify the new code.
   Additional original native reflink gate plus full QA controller89e1f81c/
   6562B runs as DSRce1ee4d9-39c2-4230-b5c4-cffdce096198, launched22:24:26UTC,
   at `job-sdk-slow-clone-quality-cow-20261104`. Original native COW case now
   passes1/1/raw0; fallback cannot pass it. Full check passes0/1235.3s;
-  Clippy/fmt still pending terminal results. Earlier06ded84c controller remains
+  Clippy passes0/765.0s and fmt0/19.9s. Terminal DSRce1ee4d9 SUCCESS; report
+  3797B/SHA4c18547f binds all1740 source/control/tools/harness beforeafter and
+  the104-case producer plus real native COW1. Earlier06ded84c remains
   superseded/UNRUN.
   This isolated QA is required for exact old/new preparation comparison;
   concurrently merged main has its own separate cold-target native check.
@@ -699,8 +701,11 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   output byte/entry/link/execute bit/independent inode and identical semantic
   requests. CLI time is separate from post-audits; audits warm caches, so this
   is not a cold-storage or isolated-host claim. Child CPU/block counters are
-  countermetrics. New CLI/source/proofs stage on TRJ while QA runs; launch only
-  after full new QA0. Tailscale SSH timed out during staging before creating
+  countermetrics. All new CLI/source/proofs verified; full QA0 required and
+  now satisfied. DSR27ba5785-25a7-441f-9526-82234d105bfb launches23:00:34UTC/
+  PID60858, version2.1.34-sdkprepare.04ffa.6f30ce5a. Complete pre-audits finish;
+  first old CLI is active, no completed timings yet. Original3600/600s caps.
+  Tailscale SSH timed out during staging before creating
   rabsd; existing trusted alias trj succeeds. No global route/config change.
   Then repeat full canonical TLS/check/cache/invalidation/archive/program and
   persistent-service gates before committing or claiming practical usefulness.
@@ -739,7 +744,9 @@ The earlier dated sections are retained checkpoints, not additional active runs.
 - [x] Fix two actual merged-main native fmt failures manually in existing
   live_dependency/remote.rs (import grouping and one test line-wrap), lease1113
   through00:10UTC. No semantic/assertion/gate change; local cargo fmt--check0
-  and diffcheck0. Original frozen957 fmt remains raw1; compiler check continues.
+  and diffcheck0. Original frozen957 fmt remains raw1; full compiler check now
+  passes0/3192.0s. Terminal DSR725e89d0 is FAILED solely due fmt1; all1747
+  source/control beforeafter match. No original result is relabeled green.
 - [ ] Bind native validation to the formatting-corrected merged source after
   current957 compiler result; fix any actual compiler/Clippy failures without
   weakening flags, shrinking tests or substituting component facades. Preserve
@@ -748,7 +755,11 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   complete1747-file manifest/source6426f99b/archive65781760B/SHAf047696d.
   Earlier freeze guard refused changed HEAD before creating its archive. The
   corrected freeze requires actual94aa and preserves current indexc2f54e5f.
-  New native validation is UNRUN; all prior source scopes remain separate.
+  All1747 source/execute-bit inputs verified on TS2. New native full static
+  quality DSR2e2cad61-c071-4a4e-8586-02283ee7a158 launches23:01:37UTC/PID3377,
+  version2.1.34-main94aa.6426f99b.dbe6e0a3/controllerdbe6e0a3/5242B. Genuine
+  now-idle main957 target reuse; original3600s cap/jobs1/concurrency4. New fmt
+  passes0/18.1s; full check/strictClippy are active/pending. Scopes stay separate.
 - [x] Stage and independently verify matching04ffa normal worker/wrapper/root
   and ordinary752384672B canonical harness on TRJ, compressed archive176972261B/
   SHA8fb39cc4. Original4role hashes and harness match the104-case producer;
@@ -763,11 +774,15 @@ The earlier dated sections are retained checkpoints, not additional active runs.
   whole1.921GB SDK, native cleanup, receipts and any sampler limitations.
   It is not a whole-pipeline speed comparison; previous incumbent pass and
   paired timeout remain separate. Actual preparation speed needs live ABBA.
-- [ ] Diagnose ordinary worker-cache cold startup with the new normal tools
+- [x] Diagnose ordinary worker-cache cold startup with the new normal tools
   under unchanged defaults. DSR rabs_worker_cache_default version
   2.1.34-workerdefault.04ffa.012a4fe2 launched22:53:07UTC/PID85787 on TRJ.
   Python-only environment assertion is a setup diagnostic, not compiler/cache
-  or public RCH proof. Require actual own daemon settlement and retain failures.
+  or public RCH proof. Terminal DSRe612e57d SUCCESS/native0/10s; actual startup
+  raw0/3.267843s under all original defaults, exact wrapper/activeflag/no stderr.
+  Own idle daemon1229951/UID1000/birth157251011 executable/hash/environment
+  verified; pidfd SIGTERM death0.054s and none remain. Report6727B/SHA7315d667.
+  No whole-Cargo/public cache or causal performance claim from this success.
 - [x] Verify existing trusted TS2-to-TRJ SSH succeeds as UID1000, without trust
   or configuration changes. This enables staging a later distinct-host TLS
   compiler test; no cross-host compiler test has run yet.
