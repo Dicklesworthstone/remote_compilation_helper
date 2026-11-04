@@ -16,19 +16,37 @@
 #   RABS_WORKER_STATE_DIR=/var/lib/rabs/leaf-worker \
 #   RABS_WORKER_TARGET_CACHE_BYTES=1073741824 \
 #   RABS_WORKER_TARGET_CACHE_EPOCH=worker-image-2026-01 \
+#   RABS_WORKER_SOURCE_CACHE_BYTES=536870912 \
+#   RABS_WORKER_TOOLCHAIN_CACHE_BYTES=8589934592 \
+#   RABS_WORKER_TOOLCHAIN_CACHE_DIR=/var/lib/rabs/toolchains \
+#   RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES=8589934592 \
+#   RABS_WORKER_HOST_BUDGET_DIR=/var/lib/rabs/host-budget \
+#   RABS_WORKER_HOST_SLOTS=32 \
 #   rabs_fleet_deploy.sh <worker-ssh-host> <coordinator-host:port> \
 #       [path-to-release-rabs-wkr]
 #
 # TLS paths above are LOCAL files. All four settings are required, including
 # for loopback. The CA authenticates the coordinator; the worker certificate
 # may be issued by a different CA. This script never creates or learns trust.
-# Identity, state directory and target-cache settings are optional. Omit them
+# Identity, state directory, cache and shared-host settings are optional. Omit them
 # to retain previous managed settings, or worker defaults on a fresh install.
 # RABS_DEPLOY_CAPABILITY is canonical (default) or dependency-rlib. It selects
 # only this deployment's admission probe and is not saved in the service.
 # A nonempty target-cache epoch enables retention across restarts; change it
 # before updating host tools, libraries or any other runtime input. An empty
 # epoch selects process-only retention; zero bytes disables all target reuse.
+# Source/target cache quotas are bounded at 8 GiB; whole-SDK and interrupted-SDK
+# file cache quotas at 64 GiB. No quota is enabled or enlarged by deployment.
+# RABS_SOURCE_CACHE_DIR selects an existing private remote directory; an empty
+# override restores the worker journal directory. A nonempty toolchain cache
+# directory requires an explicitly supplied nonzero toolchain quota. An empty
+# RABS_WORKER_TOOLCHAIN_CACHE_DIR restores process-only SDK retention; supply it
+# together with a zero quota to disable previously persistent SDK retention.
+# Shared host directory/slots must be supplied together (1..4096 slots); supply
+# both empty to remove shared-host admission. Existing host capacity is immutable:
+# the worker refuses incompatible changes rather than resetting live leases.
+# All directory ownership, permissions and existing cache contents are still
+# verified by the worker. Deployment does not repair or empty those directories.
 # The state path is on the REMOTE worker. Never
 # change it to retry an uncertain execution: that would abandon its journal.
 # Credential generations are private and retained across deployment attempts.
@@ -43,6 +61,10 @@ usage() {
   echo 'Required: RABS_WORKER_TLS_CA/CERT/KEY (local PEM files), RABS_WORKER_TLS_SERVER_NAME' >&2
   echo 'Optional: RABS_WORKER_ID, RABS_WORKER_STATE_DIR (absolute remote journal directory)' >&2
   echo 'Optional: RABS_WORKER_TARGET_CACHE_BYTES (0..8589934592), RABS_WORKER_TARGET_CACHE_EPOCH (stable host runtime identity)' >&2
+  echo 'Optional: RABS_WORKER_SOURCE_CACHE_BYTES (0..8589934592), RABS_SOURCE_CACHE_DIR (private remote directory; empty restores default)' >&2
+  echo 'Optional: RABS_WORKER_TOOLCHAIN_CACHE_BYTES (0..68719476736), RABS_WORKER_TOOLCHAIN_CACHE_DIR (private remote directory; empty clears persistence)' >&2
+  echo 'Optional: RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES (0..68719476736)' >&2
+  echo 'Optional: RABS_WORKER_HOST_BUDGET_DIR and RABS_WORKER_HOST_SLOTS (1..4096; both empty disables shared admission)' >&2
   echo 'Optional: RABS_DEPLOY_CAPABILITY=canonical|dependency-rlib (default canonical; this deployment only)' >&2
   exit 2
 }
@@ -117,36 +139,118 @@ fi
 TLS_SERVER_NAME=${RABS_WORKER_TLS_SERVER_NAME:-}
 dns_name "$TLS_SERVER_NAME" || ipv6_address "$TLS_SERVER_NAME" ||
   input_error 'RABS_WORKER_TLS_SERVER_NAME must be a DNS name or literal IP address'
-WORKER_ID_SET=0
-WORKER_STATE_SET=0
-TARGET_CACHE_BYTES_SET=0
-TARGET_CACHE_EPOCH_SET=0
-if [[ ${RABS_WORKER_ID+x} == x ]]; then
-  [[ ${#RABS_WORKER_ID} -le 128 && $RABS_WORKER_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-    input_error 'RABS_WORKER_ID must be 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit'
-  WORKER_ID_SET=1
-fi
-if [[ ${RABS_WORKER_STATE_DIR+x} == x ]]; then
-  # Bound the systemd EnvironmentFile value and refuse control/non-ASCII bytes
-  # before any SSH operation. Quotes and shell punctuation are encoded below,
-  # never interpolated into the remote command or expanded as a local path.
-  [[ $RABS_WORKER_STATE_DIR == /* && $RABS_WORKER_STATE_DIR != / && ${#RABS_WORKER_STATE_DIR} -le 4096 ]] &&
-    (export LC_ALL=C; [[ $RABS_WORKER_STATE_DIR =~ ^[[:print:]]+$ ]]) ||
-    input_error 'RABS_WORKER_STATE_DIR must be an absolute printable ASCII remote directory, up to 4096 characters'
-  WORKER_STATE_SET=1
-fi
-if [[ ${RABS_WORKER_TARGET_CACHE_BYTES+x} == x ]]; then
-  [[ $RABS_WORKER_TARGET_CACHE_BYTES =~ ^[0-9]{1,10}$ ]] &&
-    ((10#$RABS_WORKER_TARGET_CACHE_BYTES <= 8589934592)) ||
-    input_error 'RABS_WORKER_TARGET_CACHE_BYTES must be 1..10 decimal digits representing 0 to 8589934592 bytes'
-  TARGET_CACHE_BYTES_SET=1
-fi
-if [[ ${RABS_WORKER_TARGET_CACHE_EPOCH+x} == x ]]; then
-  [[ -z $RABS_WORKER_TARGET_CACHE_EPOCH ]] ||
-    [[ ${#RABS_WORKER_TARGET_CACHE_EPOCH} -le 128 && $RABS_WORKER_TARGET_CACHE_EPOCH =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-    input_error 'RABS_WORKER_TARGET_CACHE_EPOCH must be empty or 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit'
-  TARGET_CACHE_EPOCH_SET=1
-fi
+RUNTIME_SETTINGS=(
+  RABS_WORKER_ID RABS_WORKER_STATE_DIR
+  RABS_WORKER_TARGET_CACHE_BYTES RABS_WORKER_TARGET_CACHE_EPOCH
+  RABS_WORKER_SOURCE_CACHE_BYTES RABS_SOURCE_CACHE_DIR
+  RABS_WORKER_TOOLCHAIN_CACHE_BYTES RABS_WORKER_TOOLCHAIN_CACHE_DIR
+  RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES
+  RABS_WORKER_HOST_BUDGET_DIR RABS_WORKER_HOST_SLOTS
+)
+
+runtime_setting_index() {
+  local index
+  for ((index=0; index<${#RUNTIME_SETTINGS[@]}; index++)); do
+    if [[ $1 == "${RUNTIME_SETTINGS[$index]}" ]]; then
+      RUNTIME_SETTING_INDEX=$index
+      return 0
+    fi
+  done
+  return 1
+}
+
+bounded_decimal() {
+  local value=$1 maximum=$2 max_digits=$3 normalized
+  [[ $value =~ ^[0-9]+$ && ${#value} -le $max_digits ]] || return 1
+  # Strip leading zeroes before arithmetic so even a padded SDK quota cannot
+  # overflow the shell's integer range. Retain the caller's exact bytes on disk.
+  normalized=${value#"${value%%[!0]*}"}
+  normalized=${normalized:-0}
+  [[ ${#normalized} -le ${#maximum} ]] && ((10#$normalized <= maximum))
+}
+
+runtime_directory() {
+  local name=$1 value=$2 LC_ALL=C
+  [[ $value == /* && $value != / && ${#value} -le 4096 && $value =~ ^[[:print:]]+$ ]] ||
+    input_error "$name must be an absolute printable ASCII remote directory, up to 4096 characters"
+  case "$name:$value/" in
+    RABS_WORKER_STATE_DIR:*) ;;
+    *'/../'*|*'/./'*) input_error "$name must not contain directory traversal components" ;;
+  esac
+}
+
+# The same validators run before the first SSH operation and after merging the
+# active managed service under its activation lock. Persisted settings do not
+# bypass quota, path or paired-configuration checks during a credential update.
+validate_runtime_settings() {
+  local assignment name value LC_ALL=C
+  local sdk_directory='' sdk_bytes='' host_directory='' host_slots=''
+  local host_directory_set=0 host_slots_set=0
+  for assignment in "$@"; do
+    [[ -n $assignment ]] || continue
+    name=${assignment%%=*}
+    value=${assignment#*=}
+    case "$name" in
+      RABS_WORKER_ID|RABS_WORKER_TARGET_CACHE_EPOCH)
+        if [[ $name == RABS_WORKER_TARGET_CACHE_EPOCH && -z $value ]]; then continue; fi
+        [[ ${#value} -le 128 && $value =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+          input_error "$name must be 1..128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
+        ;;
+      RABS_WORKER_STATE_DIR) runtime_directory "$name" "$value" ;;
+      RABS_SOURCE_CACHE_DIR|RABS_WORKER_TOOLCHAIN_CACHE_DIR|RABS_WORKER_HOST_BUDGET_DIR)
+        [[ -z $value ]] || runtime_directory "$name" "$value"
+        if [[ $name == RABS_WORKER_TOOLCHAIN_CACHE_DIR ]]; then sdk_directory=$value; fi
+        if [[ $name == RABS_WORKER_HOST_BUDGET_DIR ]]; then
+          host_directory=$value
+          host_directory_set=1
+        fi
+        ;;
+      RABS_WORKER_TARGET_CACHE_BYTES|RABS_WORKER_SOURCE_CACHE_BYTES)
+        bounded_decimal "$value" 8589934592 10 ||
+          input_error "$name must be 1..10 decimal digits representing 0 to 8589934592 bytes"
+        ;;
+      RABS_WORKER_TOOLCHAIN_CACHE_BYTES)
+        bounded_decimal "$value" 68719476736 4096 ||
+          input_error "$name must be an unsigned decimal byte count from 0 to 68719476736 (up to 4096 characters)"
+        sdk_bytes=$value
+        ;;
+      RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES)
+        bounded_decimal "$value" 68719476736 11 ||
+          input_error "$name must be 1..11 decimal digits representing 0 to 68719476736 bytes"
+        ;;
+      RABS_WORKER_HOST_SLOTS)
+        [[ -z $value ]] || { [[ $value =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$value <= 4096)); } ||
+          input_error "$name must be a canonical decimal number from 1 to 4096"
+        host_slots=$value
+        host_slots_set=1
+        ;;
+    esac
+  done
+  if [[ -n $sdk_directory ]]; then
+    [[ $sdk_bytes =~ [1-9] ]] ||
+      input_error 'RABS_WORKER_TOOLCHAIN_CACHE_DIR requires a nonzero RABS_WORKER_TOOLCHAIN_CACHE_BYTES; clear the directory explicitly to disable persistence'
+  fi
+  [[ $host_directory_set == "$host_slots_set" ]] ||
+    input_error 'RABS_WORKER_HOST_BUDGET_DIR and RABS_WORKER_HOST_SLOTS must be supplied together'
+  if [[ $host_directory_set == 1 ]]; then
+    [[ -n $host_directory && -n $host_slots ]] ||
+      [[ -z $host_directory && -z $host_slots ]] ||
+      input_error 'shared-host directory and slots must either both be configured or both be empty to disable admission'
+  fi
+}
+
+# Fixed indexed arrays keep the dispatcher compatible with macOS Bash 3.2.
+# Each slot is either absent (empty) or an exact NAME=value assignment. NAME=
+# therefore remains distinct from omission when clearing a previous setting.
+PROVIDED_RUNTIME=()
+for setting in "${RUNTIME_SETTINGS[@]}"; do
+  if declare -p "$setting" >/dev/null 2>&1; then
+    PROVIDED_RUNTIME+=("$setting=${!setting}")
+  else
+    PROVIDED_RUNTIME+=('')
+  fi
+done
+validate_runtime_settings "${PROVIDED_RUNTIME[@]}"
 [[ -f $LOCAL_BIN && -x $LOCAL_BIN ]] || input_error "no executable release binary at $LOCAL_BIN"
 command -v openssl >/dev/null 2>&1 || input_error 'openssl is required to validate TLS credentials'
 
@@ -281,7 +385,7 @@ CAP=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" "RABS_DEPLOY_CAPABILITY=$DEPLOY_CAPABI
       ;;
     *) echo "unsupported-deployment-capability"; exit 0 ;;
   esac
-  for tool in systemctl flock install mktemp cat chmod mv; do
+  for tool in bash systemctl flock install mktemp cat chmod mv; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing-deployment-tool"; exit 0; }
   done
   systemctl show-environment >/dev/null 2>&1 || { echo "systemd-unavailable"; exit 0; }
@@ -292,7 +396,7 @@ if [ "$CAP" != "$DEPLOY_CAPABILITY-ok" ]; then
   case "$CAP" in
     no-bwrap|bwrap-present-but-canonical-fails|bwrap-present-but-dependency-rlib-fails|\
     dependency-rlib-invalid-null-device|dependency-rlib-requires-linux|\
-    missing-rlib-probe-tool|missing-deployment-tool|systemd-unavailable)
+      missing-rlib-probe-tool|missing-deployment-tool|systemd-unavailable)
       emit capability-probe "refused:$CAP"
       printf 'REFUSED: %s (%s); no files copied\n' "$WORKER" "$CAP" >&2
       exit 1
@@ -338,24 +442,16 @@ environment_setting() {
 }
 
 worker_environment() {
+  local assignment
   cat <<ENV
 RABS_WORKER_TLS_CA=$STAGE/ca.pem
 RABS_WORKER_TLS_CERT=$STAGE/worker.pem
 RABS_WORKER_TLS_KEY=$STAGE/worker.key
 RABS_WORKER_TLS_SERVER_NAME=$TLS_SERVER_NAME
 ENV
-  if [[ $WORKER_ID_SET == 1 ]]; then
-    environment_setting RABS_WORKER_ID "$RABS_WORKER_ID"
-  fi
-  if [[ $WORKER_STATE_SET == 1 ]]; then
-    environment_setting RABS_WORKER_STATE_DIR "$RABS_WORKER_STATE_DIR"
-  fi
-  if [[ $TARGET_CACHE_BYTES_SET == 1 ]]; then
-    environment_setting RABS_WORKER_TARGET_CACHE_BYTES "$RABS_WORKER_TARGET_CACHE_BYTES"
-  fi
-  if [[ $TARGET_CACHE_EPOCH_SET == 1 ]]; then
-    environment_setting RABS_WORKER_TARGET_CACHE_EPOCH "$RABS_WORKER_TARGET_CACHE_EPOCH"
-  fi
+  for assignment in "${PROVIDED_RUNTIME[@]}"; do
+    [[ -z $assignment ]] || environment_setting "${assignment%%=*}" "${assignment#*=}"
+  done
 }
 worker_environment | ssh "${SSH_OPTS[@]}" "root@$WORKER" \
   "set -eu; umask 077; set -C; cat > '$STAGE/worker.env'; chmod 0600 '$STAGE/worker.env'" ||
@@ -400,62 +496,150 @@ VER=$(ssh "${SSH_OPTS[@]}" "root@$WORKER" "chmod 0755 '$REMOTE_BIN_STAGE' && '$R
 [[ $VER =~ ^rabs-wkr\ [A-Za-z0-9.+-]+$ ]] || failed verify 'staged binary did not identify itself as rabs-wkr'
 emit verify done
 
-# Serialize activation across concurrent deployments. Each unit names exactly
-# its own complete credentials. Retain all worker journals and prior credentials.
-ssh "${SSH_OPTS[@]}" "root@$WORKER" "
-  set -eu
+# Decode only a one-line EnvironmentFile value, never shell source. The managed
+# writer uses double quotes; simple unquoted and single-quoted operator settings
+# are accepted too. More complex syntax refuses instead of silently losing a
+# setting or making shell and systemd interpret different values.
+decode_environment_value() {
+  local encoded=$1 body character next index
+  DECODED_ENVIRONMENT_VALUE=''
+  [[ ${#encoded} -le 16384 ]] || input_error 'managed runtime setting is too large'
+  case "$encoded" in
+    \"*\")
+      body=${encoded:1:${#encoded}-2}
+      for ((index=0; index<${#body}; index++)); do
+        character=${body:index:1}
+        if [[ $character == \\ ]]; then
+          index=$((index + 1))
+          ((index < ${#body})) || input_error 'unfinished escape in managed runtime setting'
+          next=${body:index:1}
+          case "$next" in
+            \"|\\|\$|\`) DECODED_ENVIRONMENT_VALUE+=$next ;;
+            *) DECODED_ENVIRONMENT_VALUE+="\\$next" ;;
+          esac
+        elif [[ $character == \" ]]; then
+          input_error 'unescaped quote in managed runtime setting'
+        else
+          DECODED_ENVIRONMENT_VALUE+=$character
+        fi
+      done
+      ;;
+    \'*\')
+      DECODED_ENVIRONMENT_VALUE=${encoded:1:${#encoded}-2}
+      [[ $DECODED_ENVIRONMENT_VALUE != *\'* ]] || input_error 'unescaped single quote in managed runtime setting'
+      ;;
+    *)
+      [[ $encoded =~ ^[A-Za-z0-9_./:+-]*$ ]] ||
+        input_error 'managed runtime setting must use one-line quoted or simple unquoted syntax'
+      DECODED_ENVIRONMENT_VALUE=$encoded
+      ;;
+  esac
+}
+
+read_runtime_environment() {
+  local path=$1 contents='' line name value LC_ALL=C
+  READ_RUNTIME_SETTINGS=()
+  for name in "${RUNTIME_SETTINGS[@]}"; do READ_RUNTIME_SETTINGS+=(''); done
+  [[ -f $path && ! -L $path ]] || input_error 'managed worker environment is missing or not an ordinary file'
+  if IFS= read -r -d '' -n 131073 contents < "$path"; then
+    input_error 'managed worker environment contains a NUL or exceeds 128 KiB'
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line#"${line%%[!$' \t']*}"}
+    name=${line%%=*}
+    runtime_setting_index "$name" || continue
+    [[ $line == "$name="* && -z ${READ_RUNTIME_SETTINGS[$RUNTIME_SETTING_INDEX]} ]] ||
+      input_error "duplicate or malformed managed setting: $name"
+    value=${line#*=}
+    value=${value%"${value##*[!$' \t']}"}
+    decode_environment_value "$value"
+    READ_RUNTIME_SETTINGS[$RUNTIME_SETTING_INDEX]="$name=$DECODED_ENVIRONMENT_VALUE"
+  done <<< "$contents"
+}
+
+# Serialize activation across concurrent deployments. Merge the currently
+# active managed settings while holding the lock, then validate the resulting
+# worker configuration before replacing the binary or the service. None of the
+# prior environment file is executed, and explicit empty removals are omitted
+# from the final EnvironmentFile rather than passed as invalid worker values.
+activate_worker() {
+  local stage=$1 remote_bin_stage=$2 remote_bin=$3
+  local previous_environment='' line name assignment value index
+  local -a selected=() previous=()
   exec 9>/etc/rabs-wkr/deploy.lock
   flock -x 9
-  # Carry forward omitted runtime settings from the currently active managed
-  # unit while holding the activation lock. A credential-only redeploy must
-  # not select a fresh journal by silently restoring hostname/path defaults.
-  # Copy assignments as data; never source an environment file as shell code.
-  previous_environment=''
-  if [ -f /etc/systemd/system/rabs-wkr.service ]; then
-    while IFS= read -r line || [ -n \"\$line\" ]; do
-      case \"\$line\" in
+  read_runtime_environment "$stage/worker.env"
+  selected=("${READ_RUNTIME_SETTINGS[@]}")
+  if [[ -f /etc/systemd/system/rabs-wkr.service ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      case "$line" in
         EnvironmentFile=*)
-          test -z \"\$previous_environment\"
-          previous_environment=\${line#EnvironmentFile=}
+          [[ -z $previous_environment ]] || input_error 'existing worker service has multiple environment files'
+          previous_environment=${line#EnvironmentFile=}
           ;;
       esac
     done < /etc/systemd/system/rabs-wkr.service
   fi
-  if [ -n \"\$previous_environment\" ]; then
-    case \"\$previous_environment\" in
-      /etc/rabs-wkr/deploy.??????????/worker.env) ;;
-      *) echo 'existing worker service uses an unmanaged environment file' >&2; exit 1 ;;
-    esac
-    test -f \"\$previous_environment\"
-    while IFS= read -r line || [ -n \"\$line\" ]; do
-      case \"\$line\" in
-        RABS_WORKER_ID=*)
-          if [ '$WORKER_ID_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
-          ;;
-        RABS_WORKER_STATE_DIR=*)
-          if [ '$WORKER_STATE_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
-          ;;
-        RABS_WORKER_TARGET_CACHE_BYTES=*)
-          if [ '$TARGET_CACHE_BYTES_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
-          ;;
-        RABS_WORKER_TARGET_CACHE_EPOCH=*)
-          if [ '$TARGET_CACHE_EPOCH_SET' = 0 ]; then printf '%s\\n' \"\$line\" >> '$STAGE/worker.env'; fi
-          ;;
-      esac
-    done < \"\$previous_environment\"
+  if [[ -n $previous_environment ]]; then
+    [[ $previous_environment =~ ^/etc/rabs-wkr/deploy\.[A-Za-z0-9]{10}/worker\.env$ ]] ||
+      input_error 'existing worker service uses an unmanaged environment file'
+    read_runtime_environment "$previous_environment"
+    previous=("${READ_RUNTIME_SETTINGS[@]}")
+    for ((index=0; index<${#RUNTIME_SETTINGS[@]}; index++)); do
+      if [[ -z ${selected[$index]} ]]; then
+        selected[$index]=${previous[$index]}
+      fi
+    done
   fi
-  mv -f '$REMOTE_BIN_STAGE' '$REMOTE_BIN'
-  install -m 0644 -o root -g root '$STAGE/rabs-wkr.service' /etc/systemd/system/rabs-wkr.service.new
+  validate_runtime_settings "${selected[@]}"
+  (
+    set -C
+    {
+      while IFS= read -r line || [[ -n $line ]]; do
+        case "$line" in
+          RABS_WORKER_TLS_CA=*|RABS_WORKER_TLS_CERT=*|RABS_WORKER_TLS_KEY=*|RABS_WORKER_TLS_SERVER_NAME=*)
+            printf '%s\n' "$line"
+            ;;
+        esac
+      done < "$stage/worker.env"
+      for assignment in "${selected[@]}"; do
+        [[ -n $assignment ]] || continue
+        name=${assignment%%=*}
+        value=${assignment#*=}
+        case "$name" in
+          RABS_SOURCE_CACHE_DIR|RABS_WORKER_TOOLCHAIN_CACHE_DIR|RABS_WORKER_HOST_BUDGET_DIR|RABS_WORKER_HOST_SLOTS)
+            [[ -n $value ]] || continue
+            ;;
+        esac
+        environment_setting "$name" "$value"
+      done
+    } > "$stage/worker.env.complete"
+  )
+  chmod 0600 "$stage/worker.env.complete"
+  mv -f "$stage/worker.env.complete" "$stage/worker.env"
+  mv -f "$remote_bin_stage" "$remote_bin"
+  install -m 0644 -o root -g root "$stage/rabs-wkr.service" /etc/systemd/system/rabs-wkr.service.new
   mv -f /etc/systemd/system/rabs-wkr.service.new /etc/systemd/system/rabs-wkr.service
   systemctl daemon-reload
   systemctl enable rabs-wkr.service
   systemctl restart rabs-wkr.service
   systemctl is-active --quiet rabs-wkr.service
-" || failed unit 'service activation failed; inspect the worker before retrying'
+}
+
+activation_script() {
+  printf 'set -euo pipefail\numask 077\n'
+  declare -p RUNTIME_SETTINGS
+  declare -f input_error runtime_setting_index bounded_decimal runtime_directory validate_runtime_settings \
+    environment_setting decode_environment_value read_runtime_environment activate_worker
+  printf 'activate_worker "$@"\n'
+}
+activation_script | ssh "${SSH_OPTS[@]}" "root@$WORKER" \
+  "bash -s -- '$STAGE' '$REMOTE_BIN_STAGE' '$REMOTE_BIN'" ||
+  failed unit 'service activation failed; inspect the worker before retrying'
 emit unit done
 printf 'Installed %s on %s and restarted rabs-wkr.service for %s. Coordinator authentication was not checked.\n' \
   "$VER" "$WORKER" "$COORDINATOR" >&2
-if [[ $WORKER_ID_SET == 1 ]]; then
+if [[ ${RABS_WORKER_ID+x} == x ]]; then
   printf 'Coordinator enrollment: RABS_DEPENDENCY_WORKER_ID=%s\n' "$RABS_WORKER_ID" >&2
 else
   printf 'Coordinator worker ID: retained from the managed service, otherwise the remote short hostname.\n' >&2
