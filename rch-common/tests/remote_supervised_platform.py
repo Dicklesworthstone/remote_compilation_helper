@@ -270,6 +270,10 @@ rch_read_process() {{
             + self.blocking_payload())
         self.wait_ready(run[0])
         result, elapsed, signals = self.cancel_with_probe('''
+# Fix this fault workload at one 3s collection budget. Host load can otherwise
+# expand the adaptive budget to 8s before census and cleanup; adaptation has
+# separate production-budget coverage. Identity, signals and census stay real.
+rch_observation_budget() { rch_observation_seconds=3; }
 rch_read_process() {
     if [ "$1" != "$rch_pgid" ]; then sleep .4; fi
     rch_real_read_process "$1"
