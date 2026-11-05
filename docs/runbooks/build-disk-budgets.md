@@ -146,8 +146,9 @@ With the default 10 GiB floor and no other active reservations:
 The small control does not require pretending the reported failed build
 succeeded. It uses separate, successful output evidence. These rows describe the
 per-build admission calculation; slot availability, health, capabilities, and
-the existing disk-pressure policy still apply. In particular, 3.7% free also
-crosses the default 5% critical ratio rule, independently of this calculation.
+the disk-pressure policy still apply. With 33 GiB free at 3.7%, the disk
+thresholds produce Warning under the default 25 GiB cap. The larger growth
+budgets in the table are still refused.
 
 ## Reservations and fresh capacity
 
@@ -155,12 +156,19 @@ Admission requires all of the following:
 
 - A valid build-filesystem free and total capacity sample. Generic `/tmp` disk
   telemetry alone is insufficient when the actual build storage differs.
-- A current worker endpoint and probe generation, with a sample no older than
-  90 seconds. CPU telemetry and pressure reevaluation do not refresh disk age.
+- A current worker endpoint, probe generation, and transport generation, with
+  a sample no older than 90 seconds. CPU telemetry and pressure reevaluation
+  do not refresh disk age.
 - Enough free space for the new growth budget, every active growth reservation
   on that worker, and the largest applicable free-space floor, counted once.
 - Working durable ownership accounting. An accounting failure prevents new
   guarded admission.
+
+If active disk-budget ownership cannot be restored safely at startup, the
+daemon stops and retains the original snapshot. Invalid or mislabeled snapshots
+must not shed their reservations, protected floors, or conditional allowances
+through legacy quarantine recovery. Restore verified ownership before retrying;
+clearing the ledger does not establish that the old work stopped.
 
 Selection previews and the authoritative admission check use the same budget.
 The authoritative check and reservation update share the ownership lock, so
@@ -175,6 +183,13 @@ a new capacity probe must start strictly after completion. A probe already in
 flight at completion is insufficient. Interrupted or unconfirmed ownership
 remains reserved through retries and recovery; elapsed time or a reused PID is
 not evidence that the old work stopped.
+
+A connection loss invalidates earlier capacity measurements, including copies
+already held by an admission attempt. Reconnecting or re-enabling a worker
+does not restore those measurements or clear its reservations. Guarded
+admission requires a fresh capability probe; successful health recovery
+already schedules that probe. A probe started before the connection loss
+cannot establish recovered capacity.
 
 The worker checks capacity again immediately before launching the command. Its
 private, locked ledger at `/var/tmp/rch-build-disk-<uid>` coordinates guarded
@@ -315,7 +330,8 @@ rch status --remediation
 
 `disk_headroom_unknown` means a valid build-storage sample or durable accounting
 is unavailable. `disk_headroom_stale` requires a current daemon probe, including
-the probe-after-completion rule. `disk_headroom_insufficient` reports the free
+the probe-after-connection-change and probe-after-completion rules.
+`disk_headroom_insufficient` reports the free
 and required GiB, including active reservations and the floor. Inspect space on
 the actual remote build and target filesystems, and allow confirmed completion
 and a fresh probe to update capacity before diagnosing a retained reservation

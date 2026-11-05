@@ -14,15 +14,19 @@
 #[cfg(test)]
 mod tests {
     use crate::admission::{AdmissionConfig, AdmissionGate, AdmissionVerdict};
-    use crate::disk_pressure::{PressureAssessment, PressureConfidence, PressureState};
+    use crate::disk_pressure::{
+        DiskHeadroomAdmission, DiskHeadroomRejection, DiskPressurePolicyConfig, PressureAssessment,
+        PressureConfidence, PressureState, evaluate_pressure_policy,
+    };
     use crate::headroom::{HeadroomConfig, HeadroomEstimator};
-    use crate::history::BuildHistory;
+    use crate::history::{BuildCompletion, BuildHistory};
     use crate::reclaim::{ReclaimConfig, ReclaimMode, check_safety_gate};
     use crate::selection::WorkerSelector;
     use crate::workers::{WorkerPool, WorkerState};
     use rch_common::{
         BuildLocation, BuildRecord, CircuitBreakerConfig, CommandPriority, RequiredRuntime,
-        SelectionConfig, SelectionRequest, SelectionStrategy, WorkerConfig, WorkerId, test_guard,
+        SelectionConfig, SelectionRequest, SelectionStrategy, WorkerCapabilities, WorkerConfig,
+        WorkerId, test_guard,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -515,6 +519,322 @@ mod tests {
     // =================================================================
     // Selection Pipeline Integration
     // =================================================================
+
+    #[tokio::test]
+    async fn default_large_disk_admission_keeps_storage_budgets_and_explicit_policy() {
+        let _guard = test_guard!();
+        for total in [774.0, 900.0] {
+            let config = rch_common::RchConfig::default();
+            let pool = WorkerPool::with_selection_config(&config.selection);
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new("large-disk"),
+                host: "localhost".into(),
+                total_slots: 8,
+                ..Default::default()
+            })
+            .await;
+            let worker = pool.get(&WorkerId::new("large-disk")).await.unwrap();
+            let caps = |free| WorkerCapabilities {
+                disk_free_gb: Some(free),
+                disk_total_gb: Some(total),
+                build_disk_free_gb: Some(free),
+                build_disk_total_gb: Some(total),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            };
+            worker.set_capabilities(caps(30.0)).await;
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Warning
+            );
+            assert_eq!(worker.effective_total_slots().await, 2);
+            let history = Arc::new(BuildHistory::new(10));
+            let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+            let mut request = select_request("large-disk-budget");
+            request.disk_headroom_gib = 20;
+            assert!(
+                selector.select(&pool, &request).await.worker.is_some(),
+                "{total}"
+            );
+            assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 0);
+
+            // At 30 GiB free, the independent 10 GiB floor leaves exactly
+            // 20 GiB for this declaration. The cap never rounds that up.
+            request.disk_headroom_gib = 21;
+            let too_large = selector.select(&pool, &request).await;
+            assert!(too_large.worker.is_none(), "{total}");
+            assert!(
+                too_large.diagnostics.unwrap().workers[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "disk_headroom_insufficient")
+            );
+            request.disk_headroom_gib = 1;
+            request.command = Some("cargo test".into());
+            assert!(
+                selector.select(&pool, &request).await.worker.is_none(),
+                "a tiny declaration cannot underfund the cold test-build allowance"
+            );
+
+            request.command = None;
+            request.disk_headroom_gib = 20;
+            for cap in [None, Some(40.0)] {
+                let policy = DiskPressurePolicyConfig::from_selection(&SelectionConfig {
+                    disk_critical_ratio_cap_gb: cap,
+                    ..Default::default()
+                });
+                worker
+                    .set_pressure_assessment(evaluate_pressure_policy(&caps(30.0), None, &policy))
+                    .await;
+                assert_eq!(
+                    worker.pressure_assessment().await.state,
+                    PressureState::Critical
+                );
+                // A fresh gate keeps this check independent of recovery hysteresis.
+                let strict = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+                let result = strict.select(&pool, &request).await;
+                assert!(result.worker.is_none(), "explicit cap {cap:?}");
+                assert!(
+                    result.diagnostics.unwrap().workers[0]
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "pressure.critical")
+                );
+            }
+
+            worker.set_capabilities(caps(8.0)).await;
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Critical
+            );
+            assert_eq!(worker.available_slots().await, 0);
+            assert!(selector.select(&pool, &request).await.worker.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn large_disk_restart_preserves_reservations_and_requires_recovery_evidence() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(history_path.clone());
+        let config = WorkerConfig {
+            id: WorkerId::new("large-disk"),
+            host: "localhost".into(),
+            total_slots: 8,
+            ..Default::default()
+        };
+        let caps = |free| WorkerCapabilities {
+            disk_free_gb: Some(free),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        let original = WorkerState::new(config.clone());
+        original.set_capabilities(caps(30.0)).await;
+        let endpoint = original.endpoint_snapshot().await;
+        let slot = original
+            .reserve_slots_for_endpoint(1, &endpoint)
+            .await
+            .unwrap();
+        let active = history
+            .try_start_active_build_with_waiter(
+                "already-running".into(),
+                "large-disk".into(),
+                "custom-build".into(),
+                0,
+                Some("large-disk-owner".into()),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: 12,
+                    floor_gib: 10,
+                    warm_policy: None,
+                    capacity: slot.disk_capacity,
+                },
+                Some(endpoint),
+            )
+            .unwrap()
+            .unwrap();
+
+        // A worker outage and reconnect preserve ownership, but neither the
+        // previous disk sample nor a delayed pre-outage probe can fund work.
+        let before_restart = original.capability_probe_context().await;
+        let mut live_request = DiskHeadroomAdmission {
+            requested_gib: 8,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: original.disk_capacity_observation().await,
+        };
+        assert!(
+            history
+                .check_disk_headroom("large-disk", &live_request)
+                .is_ok()
+        );
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let health_probe = original
+            .health_probe_permit(heartbeat, &circuit)
+            .await
+            .unwrap();
+        assert_eq!(
+            original
+                .record_health_transport_result(&health_probe, false, heartbeat, &circuit)
+                .await,
+            Some((false, true))
+        );
+        drop(health_probe);
+        assert!(!original.reserve_slots(1).await);
+        assert_eq!(original.used_slots(), 1);
+        assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 12);
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Stale)
+        );
+
+        original
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Stale),
+            "a successful reconnect does not measure free disk capacity"
+        );
+        assert!(
+            !original
+                .publish_capabilities(before_restart, caps(30.0))
+                .await
+        );
+        original.set_capabilities(caps(8.0)).await;
+        assert_eq!(
+            original.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(original.available_slots().await, 0);
+        assert!(!original.reserve_slots(1).await);
+        original.set_capabilities(caps(30.0)).await;
+        assert_eq!(original.used_slots(), 1);
+        assert_eq!(original.available_slots().await, 1);
+        assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 12);
+        live_request.capacity = original.disk_capacity_observation().await;
+        assert!(
+            history
+                .check_disk_headroom("large-disk", &live_request)
+                .is_ok()
+        );
+        live_request.requested_gib = 9;
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31,
+            }),
+            "worker recovery retains the active 12 GiB budget and its 10 GiB floor"
+        );
+
+        // A separate daemon restart reconstructs the same durable ownership.
+        drop(history);
+        drop(original);
+
+        let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("large-disk"), 12);
+        let pool = WorkerPool::with_selection_config(&SelectionConfig::default())
+            .with_unmeasured_capacity_hold(Duration::from_secs(120));
+        pool.add_worker(config).await;
+        for running in restored.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&running.worker_id), running.slots)
+                .await
+                .unwrap();
+        }
+        let worker = pool.get(&WorkerId::new("large-disk")).await.unwrap();
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 0);
+        let mut request = DiskHeadroomAdmission {
+            requested_gib: 9,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+        // Expiry of the legacy startup hold does not authorize disk spending.
+        worker.hold_until_capacity_measured(Duration::ZERO);
+        assert!(worker.available_slots().await > 0);
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+
+        worker.set_capabilities(caps(8.0)).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(worker.available_slots().await, 0);
+        assert_eq!(worker.used_slots(), 1);
+        worker.set_capabilities(caps(30.0)).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert_eq!(worker.available_slots().await, 1);
+        request.capacity = worker.disk_capacity_observation().await;
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31
+            }),
+            "the recovered 12 GiB reservation retains its 10 GiB floor"
+        );
+        request.requested_gib = 8;
+        assert!(restored.check_disk_headroom("large-disk", &request).is_ok());
+
+        restored
+            .complete_durable(
+                active.id,
+                "large-disk",
+                Some("large-disk-owner"),
+                BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: Some(1),
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: None,
+                    disk_observation: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        worker.release_slots(1).await;
+        assert_eq!(worker.used_slots(), 0);
+        assert_eq!(restored.reserved_disk_headroom_gib("large-disk"), 0);
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Stale),
+            "completion releases ownership, not the bytes left by the build"
+        );
+
+        worker.set_capabilities(caps(30.0)).await;
+        request.capacity = worker.disk_capacity_observation().await;
+        request.requested_gib = 20;
+        request.floor_gib = 10;
+        assert!(restored.check_disk_headroom("large-disk", &request).is_ok());
+        assert_eq!(worker.available_slots().await, 2);
+        request.requested_gib = 21;
+        assert!(matches!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn daemon_admission_is_present_with_default_context() {

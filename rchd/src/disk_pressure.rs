@@ -165,6 +165,10 @@ pub struct DiskCapacityObservation {
     observed_at: Instant,
     generation: u64,
     current_generation: Arc<AtomicU64>,
+    /// Transport failures can be reported by historical owners without going
+    /// through the current WorkerState. Bind that shared endpoint epoch too.
+    transport_generation: u64,
+    current_transport_generation: Arc<AtomicU64>,
 }
 
 impl DiskCapacityObservation {
@@ -173,6 +177,8 @@ impl DiskCapacityObservation {
         capabilities: &WorkerCapabilities,
         generation: u64,
         current_generation: Arc<AtomicU64>,
+        transport_generation: u64,
+        current_transport_generation: Arc<AtomicU64>,
         observed_at: Instant,
     ) -> Option<Self> {
         // Pressure may describe /tmp instead of build storage. Older workers
@@ -195,7 +201,15 @@ impl DiskCapacityObservation {
             observed_at,
             generation,
             current_generation,
+            transport_generation,
+            current_transport_generation,
         })
+    }
+
+    fn generations_are_current(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) == self.generation
+            && self.current_transport_generation.load(Ordering::Acquire)
+                == self.transport_generation
     }
 
     /// Free build-disk GiB, only while this sample is the worker's current,
@@ -204,8 +218,8 @@ impl DiskCapacityObservation {
         (self.worker_id == worker_id
             && self.observed_at.elapsed()
                 <= DiskPressurePolicyConfig::default().telemetry_stale_after
-            && self.current_generation.load(Ordering::Acquire) == self.generation)
-            .then_some(self.free_gib)
+            && self.generations_are_current())
+        .then_some(self.free_gib)
     }
 
     pub(crate) fn observed_at(&self) -> Instant {
@@ -221,6 +235,8 @@ impl DiskCapacityObservation {
                 build_disk_total_gb: Some(free_gib.max(1.0)),
                 ..Default::default()
             },
+            1,
+            Arc::new(AtomicU64::new(1)),
             1,
             Arc::new(AtomicU64::new(1)),
             Instant::now(),
@@ -307,7 +323,7 @@ impl DiskHeadroomAdmission {
             .ok_or(DiskHeadroomRejection::Unknown)?;
         if capacity.observed_at.elapsed()
             > DiskPressurePolicyConfig::default().telemetry_stale_after
-            || capacity.current_generation.load(Ordering::Acquire) != capacity.generation
+            || !capacity.generations_are_current()
             || capacity_after.is_some_and(|cutoff| capacity.observed_at <= cutoff)
         {
             return Err(DiskHeadroomRejection::Stale);
@@ -1178,6 +1194,114 @@ mod tests {
     }
 
     #[test]
+    fn declared_disk_budget_revocation_invalidates_already_cloned_capacity() {
+        for shared_transport in [false, true] {
+            let sample = DiskCapacityObservation::fixture("worker", 30.0, Duration::ZERO);
+            let cloned = sample.clone();
+            let admission = DiskHeadroomAdmission {
+                requested_gib: 20,
+                floor_gib: 10,
+                warm_policy: None,
+                capacity: Some(sample.clone()),
+            };
+            assert_eq!(cloned.current_free_gib("worker"), Some(30));
+            assert!(admission.check("worker", 0).is_ok());
+
+            // Either a worker-local disconnect or a historical owner's shared
+            // transport failure must invalidate every already-issued clone.
+            let generation = if shared_transport {
+                &sample.current_transport_generation
+            } else {
+                &sample.current_generation
+            };
+            generation.fetch_add(1, Ordering::AcqRel);
+            for revoked in [&sample, &cloned] {
+                assert_eq!(revoked.current_free_gib("worker"), None);
+            }
+            assert_eq!(
+                admission.check("worker", 0),
+                Err(DiskHeadroomRejection::Stale),
+                "shared_transport={shared_transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_disk_budget_needs_new_epoch_sample_after_recovery() {
+        let caps = WorkerCapabilities {
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        for shared_transport in [false, true] {
+            let old = DiskCapacityObservation::fixture("worker", 30.0, Duration::ZERO);
+            let old_admission = DiskHeadroomAdmission {
+                requested_gib: 20,
+                floor_gib: 10,
+                warm_policy: None,
+                capacity: Some(old.clone()),
+            };
+            let generation = if shared_transport {
+                &old.current_transport_generation
+            } else {
+                &old.current_generation
+            };
+            generation.fetch_add(1, Ordering::AcqRel);
+
+            // Publication after revocation cannot refresh a probe's captured
+            // epoch, even if it constructs the observation at a later instant.
+            let delayed = DiskCapacityObservation::from_capabilities(
+                "worker".into(),
+                &caps,
+                old.generation,
+                Arc::clone(&old.current_generation),
+                old.transport_generation,
+                Arc::clone(&old.current_transport_generation),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(delayed.current_free_gib("worker"), None);
+            assert_eq!(
+                DiskHeadroomAdmission {
+                    capacity: Some(delayed),
+                    ..old_admission.clone()
+                }
+                .check("worker", 0),
+                Err(DiskHeadroomRejection::Stale)
+            );
+
+            let fresh = DiskCapacityObservation::from_capabilities(
+                "worker".into(),
+                &caps,
+                old.current_generation.load(Ordering::Acquire),
+                Arc::clone(&old.current_generation),
+                old.current_transport_generation.load(Ordering::Acquire),
+                Arc::clone(&old.current_transport_generation),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(fresh.current_free_gib("worker"), Some(30));
+            let recovered = DiskHeadroomAdmission {
+                capacity: Some(fresh),
+                ..old_admission.clone()
+            };
+            assert!(recovered.check("worker", 0).is_ok());
+            assert_eq!(
+                recovered.check("worker", 1),
+                Err(DiskHeadroomRejection::Insufficient {
+                    free_gib: 30,
+                    required_gib: 31,
+                })
+            );
+            assert_eq!(old.current_free_gib("worker"), None);
+            assert_eq!(
+                old_admission.check("worker", 0),
+                Err(DiskHeadroomRejection::Stale)
+            );
+        }
+    }
+
+    #[test]
     fn declared_disk_budget_rejects_invalid_or_partial_build_sample() {
         for (free, total) in [
             (None, None),
@@ -1200,6 +1324,8 @@ mod tests {
                 DiskCapacityObservation::from_capabilities(
                     "worker".into(),
                     &caps,
+                    1,
+                    Arc::new(AtomicU64::new(1)),
                     1,
                     Arc::new(AtomicU64::new(1)),
                     Instant::now()

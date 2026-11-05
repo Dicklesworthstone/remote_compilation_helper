@@ -326,7 +326,9 @@ enum BindAttempt {
 /// owners, but cannot reconstruct permanent dispatcher topology exclusions.
 /// Malformed/truncated JSON, or an invalid topology set, therefore cannot be
 /// replaced by an empty ledger: leave that evidence intact and fail startup.
-/// A readable legacy snapshot without topology records can still be recovered.
+/// A readable legacy snapshot without active storage authority can still be
+/// recovered; discarding a disk reservation or warm condition would free bytes
+/// still owned by a build.
 fn load_history_quarantining_invalid_ownership(
     history_path: &Path,
     capacity: usize,
@@ -349,15 +351,25 @@ fn load_history_quarantining_invalid_ownership(
     }
     let snapshot = history_path.with_extension("ownership.json");
     let original = std::fs::read(&snapshot).with_context(context)?;
-    // Decode this field directly, ignoring only the other ownership fields.
+    // Decode these fields directly, ignoring unrelated ownership metadata.
     // A Value round trip would collapse duplicate keys and could accidentally
-    // accept a later empty topology set after an earlier nonempty one.
+    // accept a later empty topology set or zero budget over earlier authority.
+    #[derive(serde::Deserialize)]
+    struct ActiveStorageAuthority {
+        #[serde(default)]
+        disk_headroom_gib: u32,
+        #[serde(default)]
+        disk_floor_gib: u64,
+        // Any non-null policy, even one too malformed to deserialize as a
+        // BuildDiskWarmPolicy, prevents destructive legacy recovery.
+        #[serde(default)]
+        disk_warm_policy: Option<serde::de::IgnoredAny>,
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RecoverableTopology {
         version: u32,
-        #[serde(rename = "active")]
-        _active: serde::de::IgnoredAny,
+        active: Vec<ActiveStorageAuthority>,
         #[serde(rename = "completed")]
         _completed: serde::de::IgnoredAny,
         #[serde(default, rename = "cancelled_wrappers")]
@@ -371,7 +383,7 @@ fn load_history_quarantining_invalid_ownership(
     }
     let retained: RecoverableTopology = serde_json::from_slice(&original).with_context(|| {
         format!(
-            "{}; cannot establish the complete source-topology exclusion set. \
+            "{}; cannot establish the source-topology exclusions and active storage authority. \
              Original snapshot retained at {}. Restore a valid ownership snapshot \
              before restarting; do not discard it to retry an incompatible worker",
             context(),
@@ -384,6 +396,18 @@ fn load_history_quarantining_invalid_ownership(
          Use a compatible daemon or restore a valid ownership snapshot before restarting",
         context(),
         retained.version,
+        snapshot.display()
+    );
+    anyhow::ensure!(
+        retained.active.iter().all(|state| {
+            state.disk_headroom_gib == 0
+                && state.disk_floor_gib == 0
+                && state.disk_warm_policy.is_none()
+        }),
+        "{}; active disk reservations or conditional policies cannot be discarded. \
+         Original snapshot retained at {}. Restore or reconcile its storage ownership \
+         before restarting",
+        context(),
         snapshot.display()
     );
     history::validate_source_topology_fences(&retained.source_topology_fences).with_context(
@@ -2153,10 +2177,9 @@ mod tests {
         }
     }
 
-    /// bd-tqmak: a contradictory ownership snapshot (the duplicate-wrapper case
-    /// 057bb508 rejects) must not stop the daemon from starting. It is set aside
-    /// byte-for-byte, the daemon loads without it, and the builds it recorded
-    /// are named for the operator.
+    /// bd-tqmak: a legacy, budget-free contradictory ownership snapshot (the
+    /// duplicate-wrapper case 057bb508 rejects) can be set aside byte-for-byte.
+    /// Current conditional storage ownership must never take this fallback.
     #[test]
     fn contradictory_ownership_snapshot_is_set_aside_and_startup_proceeds() {
         let root = tempfile::tempdir().unwrap();
@@ -2175,6 +2198,10 @@ mod tests {
         let snapshot_path = path.with_extension("ownership.json");
         let mut snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        snapshot["version"] = serde_json::json!(2);
+        assert_eq!(snapshot["active"][0]["disk_headroom_gib"], 0);
+        assert_eq!(snapshot["active"][0]["disk_floor_gib"], 0);
+        assert!(snapshot["active"][0]["disk_warm_policy"].is_null());
         let mut duplicate = snapshot["active"][0].clone();
         duplicate["id"] = serde_json::json!(original.id + 1);
         duplicate["worker_id"] = serde_json::json!("worker-b");
@@ -2197,6 +2224,178 @@ mod tests {
         let untracked = untracked_active_builds(&rejected[0]);
         assert!(untracked.contains(&format!("{}@worker-a[owner-1]", original.id)));
         assert!(untracked.contains(&format!("{}@worker-b[owner-1]", original.id + 1)));
+    }
+
+    fn assert_startup_retains_invalid_ownership(path: &Path, original: &[u8]) {
+        let snapshot = path.with_extension("ownership.json");
+        std::fs::write(&snapshot, original).unwrap();
+        assert!(BuildHistory::load_from_file(path, 10).is_err());
+        let error = load_history_quarantining_invalid_ownership(path, 10)
+            .err()
+            .expect("invalid storage ownership must stop startup");
+        assert!(
+            format!("{error:#}").contains("Original snapshot retained"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".rejected-")),
+            "storage authority must not be replaced with an empty ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_current_warm_ownership_preserves_budget_and_rejects_corruption() {
+        use crate::disk_pressure::{
+            DiskCapacityObservation, DiskHeadroomAdmission, DiskHeadroomRejection,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let worker = workers::WorkerState::new(rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("storage-worker"),
+            host: "localhost".into(),
+            ..Default::default()
+        });
+        let mut pools = [None; 8];
+        pools[0] = Some(rch_common::BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: rch_common::BuildDiskBudget::GIB,
+        });
+        let warm = rch_common::BuildDiskWarmPolicy {
+            cold_growth_bytes: 4 * rch_common::BuildDiskBudget::GIB,
+            pools,
+        };
+        let owner = history
+            .try_start_active_build_with_waiter(
+                "warm-restart".into(),
+                "storage-worker".into(),
+                "cargo check".into(),
+                0,
+                Some("warm-restart-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: 3,
+                    floor_gib: 10,
+                    capacity: Some(DiskCapacityObservation::fixture(
+                        "storage-worker",
+                        30.0,
+                        Duration::ZERO,
+                    )),
+                    warm_policy: Some(warm),
+                },
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        drop(history);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        assert_eq!(original["version"], 3);
+
+        let restored = load_history_quarantining_invalid_ownership(&path, 10).unwrap();
+        let recovered = restored.active_build(owner.id).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(recovered.slots, 1);
+        assert_eq!(recovered.disk_headroom_gib, 3);
+        assert_eq!(recovered.disk_floor_gib, 10);
+        assert_eq!(recovered.disk_warm_policy, Some(warm));
+        assert_eq!(restored.reserved_disk_headroom_gib("storage-worker"), 3);
+        assert_eq!(
+            restored.check_disk_headroom(
+                "storage-worker",
+                &DiskHeadroomAdmission {
+                    requested_gib: 3,
+                    floor_gib: 0,
+                    capacity: Some(DiskCapacityObservation::fixture(
+                        "storage-worker",
+                        15.0,
+                        Duration::ZERO,
+                    )),
+                    warm_policy: None,
+                },
+            ),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 15,
+                required_gib: 16,
+            }),
+            "a new request cannot discard the recovered owner's 10 GiB floor"
+        );
+        drop(restored);
+
+        let mut malformed = original.clone();
+        malformed["active"][0]["disk_warm_policy"]["cold_growth_bytes"] = serde_json::json!(0);
+        assert_startup_retains_invalid_ownership(&path, &serde_json::to_vec(&malformed).unwrap());
+        let mut contradictory = original.clone();
+        let mut duplicate = contradictory["active"][0].clone();
+        duplicate["id"] = serde_json::json!(owner.id + 1);
+        contradictory["active"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert_startup_retains_invalid_ownership(
+            &path,
+            &serde_json::to_vec(&contradictory).unwrap(),
+        );
+
+        // The normal loader rejects a warm condition in an older format. Its
+        // startup fallback must not turn that refusal into lost disk ownership.
+        for version in [1, 2] {
+            let mut downgraded = original.clone();
+            downgraded["version"] = serde_json::json!(version);
+            if version == 1 {
+                downgraded.as_object_mut().unwrap().remove("queued");
+                downgraded.as_object_mut().unwrap().remove("next_queue_id");
+            }
+            assert_startup_retains_invalid_ownership(
+                &path,
+                &serde_json::to_vec(&downgraded).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn startup_legacy_quarantine_refuses_storage_authority_and_ambiguous_fields() {
+        // Even when unrelated ownership metadata is incomplete, neither an
+        // explicit budget nor ambiguous storage fields may be guessed away.
+        let active_rows = [
+            r#"{"disk_headroom_gib":3}"#,
+            r#"{"disk_floor_gib":10}"#,
+            r#"{"disk_warm_policy":{}}"#,
+            r#"{"disk_warm_policy":false}"#,
+            r#"{"disk_headroom_gib":"3"}"#,
+            r#"{"disk_headroom_gib":null}"#,
+            r#"{"disk_headroom_gib":-1}"#,
+            r#"{"disk_headroom_gib":1.5}"#,
+            r#"{"disk_headroom_gib":4294967296}"#,
+            r#"{"disk_floor_gib":"10"}"#,
+            r#"{"disk_floor_gib":null}"#,
+            r#"{"disk_floor_gib":18446744073709551616}"#,
+            r#"{"disk_headroom_gib":3,"disk_headroom_gib":0}"#,
+            r#"{"disk_floor_gib":10,"disk_floor_gib":0}"#,
+            r#"{"disk_warm_policy":{},"disk_warm_policy":null}"#,
+            r#"{"disk_warm_policy":null,"disk_warm_policy":null}"#,
+        ];
+        for version in [1, 2] {
+            for row in active_rows {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("history.jsonl");
+                let original =
+                    format!(r#"{{"version":{version},"active":[{row}],"completed":[]}}"#);
+                assert_startup_retains_invalid_ownership(&path, original.as_bytes());
+            }
+        }
     }
 
     fn startup_source_topology_fence() -> history::SourceTopologyFence {

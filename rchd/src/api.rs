@@ -11816,10 +11816,13 @@ mod tests {
                 Some(next_wrapper.clone()),
             );
             tokio::pin!(selecting);
-            std::future::poll_fn(|cx| {
+            // A cooperative-budget yield can otherwise stop selection before
+            // the audit wait, while it still owns a cache read guard needed by
+            // release. Only the held audit lock should suspend this fixture.
+            tokio::task::unconstrained(std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(selecting.as_mut(), cx).is_pending());
                 std::task::Poll::Ready(())
-            })
+            }))
             .await;
             let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
                 "POST /release-worker?worker=worker1&build_id={first_id}&local_wrapper_id={first_wrapper}&exit_code=1&worker_source_topology_mismatch={}",
@@ -13651,6 +13654,150 @@ mod tests {
                 axum::http::StatusCode::OK,
                 "{case}"
             );
+        }
+    }
+
+    /// bd-lnbuz: removing a percentage-only exclusion must still require a
+    /// complete authorized byte budget at the actual API admission boundary.
+    #[tokio::test]
+    async fn default_large_disk_admission_preserves_budgets_and_recovers_capacity() {
+        use tower::ServiceExt;
+        let _guard = test_guard!();
+        let gib = rch_common::BuildDiskBudget::GIB;
+        for total in [774.0, 900.0] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("large-disk", 8)).await;
+            let worker = pool.get(&WorkerId::new("large-disk")).await.unwrap();
+            let capabilities = |free| WorkerCapabilities {
+                projects_root_ok: Some(true),
+                disk_free_gb: Some(free),
+                disk_total_gb: Some(total),
+                build_disk_free_gb: Some(free),
+                build_disk_total_gb: Some(total),
+                ..Default::default()
+            };
+            worker.set_capabilities(capabilities(30.0)).await;
+            let mut ctx = make_test_context(pool);
+            ctx.worker_selector = Arc::new(crate::daemon_worker_selector(
+                &rch_common::RchConfig::default(),
+                Arc::clone(&ctx.history),
+                None,
+            ));
+
+            let status = handle_status(&ctx).await.unwrap();
+            assert_eq!(status.daemon.slots_available, 2);
+            assert_eq!(status.workers[0].pressure_state, "warning");
+            assert!(
+                status.workers[0]
+                    .pressure_policy_rule
+                    .contains("selection.disk_critical_ratio_cap_gb=25")
+            );
+            assert!(handle_ready(&ctx).await.workers_available);
+            let http_ready = crate::http_api::create_router(crate::http_api::HttpState {
+                pool: ctx.pool.clone(),
+                version: "test",
+                started_at: Instant::now(),
+                pid: 1,
+            })
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(http_ready.status(), axum::http::StatusCode::OK);
+
+            let ApiRequest::SelectWorker { mut request, .. } = parse_request(
+                "GET /select-worker/disk-budget?project=first&command=cargo%20check&cores=1&disk_headroom_gib=21&runtime=none",
+            ).unwrap() else { panic!("expected selection") };
+            // 21 GiB plus the protected 10 GiB floor cannot fit in 30 GiB.
+            let preview = handle_select_worker_dry_run(&ctx, &request).await;
+            assert!(preview.worker.is_none());
+            let refused = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some("rchw-too-large".into()),
+            )
+            .await
+            .unwrap();
+            assert!(refused.worker.is_none());
+            assert!(refused.reason.to_string().contains("disk_headroom"));
+            assert!(ctx.history.active_builds().is_empty());
+            assert_eq!(worker.used_slots(), 0);
+
+            // At the exact budget boundary, return the authorization that is
+            // reserved in history and enforced by the worker disk watchdog.
+            request.disk_headroom_gib = 20;
+            let admitted = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some("rchw-large-disk-owner".into()),
+            )
+            .await
+            .unwrap();
+            let budget = admitted.worker.unwrap().disk_budget.unwrap();
+            assert_eq!(budget.max_growth_bytes, 20 * gib);
+            assert_eq!(budget.min_free_bytes, 10 * gib);
+            assert!(budget.warm_policy.is_none());
+            let build_id = admitted.build_id.unwrap();
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("large-disk"), 20);
+            assert_eq!(worker.used_slots(), 1);
+            assert_eq!(worker.available_slots().await, 1);
+
+            request.project = "second".into();
+            request.disk_headroom_gib = 4;
+            let blocked = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some("rchw-second-owner".into()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                blocked.worker.is_none(),
+                "a spare CPU slot cannot spend reserved bytes"
+            );
+            assert!(blocked.reason.to_string().contains("disk_headroom"));
+            assert_eq!(ctx.history.active_builds().len(), 1);
+            assert_eq!(worker.used_slots(), 1);
+
+            // Actual exhaustion still closes readiness and retains ownership.
+            worker.set_capabilities(capabilities(8.0)).await;
+            assert_eq!(handle_status(&ctx).await.unwrap().daemon.slots_available, 0);
+            assert!(!handle_ready(&ctx).await.workers_available);
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Critical
+            );
+            assert_eq!(worker.used_slots(), 1);
+            let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
+                "POST /release-worker?worker=large-disk&build_id={build_id}&local_wrapper_id=rchw-large-disk-owner&exit_code=0",
+            )).unwrap() else { panic!("expected release") };
+            handle_release_worker(&ctx, release).await.unwrap();
+            assert_eq!(worker.used_slots(), 0);
+
+            // Only a new post-completion observation can fund another build.
+            worker.set_capabilities(capabilities(30.0)).await;
+            assert_eq!(handle_status(&ctx).await.unwrap().daemon.slots_available, 2);
+            let recovered = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some("rchw-recovered-owner".into()),
+            )
+            .await
+            .unwrap();
+            assert!(recovered.worker.is_some(), "{}", recovered.reason);
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("large-disk"), 4);
         }
     }
 

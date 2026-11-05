@@ -436,6 +436,9 @@ struct EndpointTransport {
     probe: Arc<Mutex<()>>,
     recovery: Arc<Mutex<()>>,
     changes: watch::Sender<u64>,
+    /// Shared by current inventory and historical owners of this endpoint.
+    /// A transport loss invalidates every pre-outage disk observation.
+    disk_capacity_generation: Arc<AtomicU64>,
 }
 
 impl EndpointTransport {
@@ -445,6 +448,7 @@ impl EndpointTransport {
             probe: Arc::new(Mutex::new(())),
             recovery: Arc::new(Mutex::new(())),
             changes: watch::channel(0).0,
+            disk_capacity_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -463,6 +467,7 @@ impl EndpointTransport {
     }
 
     fn revoke(&self) {
+        self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         self.changes
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -863,6 +868,8 @@ pub(crate) struct CapabilityProbeContext {
     started_at: Instant,
     generation: u64,
     network_revision: u64,
+    transport_generation: u64,
+    current_transport_generation: Arc<AtomicU64>,
 }
 
 /// Configuration and identity of the endpoint a network operation actually used.
@@ -1001,6 +1008,9 @@ impl WorkerState {
     }
 
     fn revoke_background_network(&self) {
+        // Reconnecting or re-enabling cannot renew a pre-outage capacity
+        // sample, including a clone already handed to admission/history.
+        self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         self.network_changes
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -1777,11 +1787,14 @@ impl WorkerState {
 
     pub(crate) async fn capability_probe_context(&self) -> CapabilityProbeContext {
         let config = self.config.read().await;
+        let transport = self.transport();
         CapabilityProbeContext {
             config: config.clone(),
             started_at: Instant::now(),
             generation: self.disk_capacity_generation.load(Ordering::Acquire),
             network_revision: *self.network_changes.borrow(),
+            transport_generation: transport.disk_capacity_generation.load(Ordering::Acquire),
+            current_transport_generation: Arc::clone(&transport.disk_capacity_generation),
         }
     }
 
@@ -1795,7 +1808,10 @@ impl WorkerState {
     ) -> bool {
         let config = self.config.read().await;
         let _publication = self.network_transition.lock().await;
-        if *self.network_changes.borrow() != context.network_revision {
+        if *self.network_changes.borrow() != context.network_revision
+            || context.current_transport_generation.load(Ordering::Acquire)
+                != context.transport_generation
+        {
             return false;
         }
         if config.id != context.config.id
@@ -1823,6 +1839,8 @@ impl WorkerState {
             &capabilities,
             generation,
             Arc::clone(&self.disk_capacity_generation),
+            context.transport_generation,
+            context.current_transport_generation,
             context.started_at,
         );
         *self.disk_capacity_observation.write().await = observation;
@@ -7973,5 +7991,79 @@ mod tests {
     async fn test_pool_default() {
         let pool = WorkerPool::default();
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_transport_failure_invalidates_disk_capacity_until_fresh_probe() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        let worker = WorkerState::new(recovered_worker_config("shared-disk-worker", 8));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        assert!(worker.reserve_slots(1).await);
+        let before_failure = worker.capability_probe_context().await;
+        let mut budget = DiskHeadroomAdmission {
+            requested_gib: 8,
+            floor_gib: 10,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert!(budget.check("shared-disk-worker", 12).is_ok());
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+
+        // Historical recovery can revoke this shared endpoint directly,
+        // without invoking the current Worker's disconnect callback.
+        worker
+            .transport()
+            .record_result(false, heartbeat, &circuit)
+            .await;
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        worker
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert!(
+            !worker
+                .publish_capabilities(before_failure, caps.clone())
+                .await
+        );
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert_eq!(worker.used_slots(), 1);
+
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale),
+            "fresh telemetry cannot revive a previously captured admission token"
+        );
+        budget.capacity = worker.disk_capacity_observation().await;
+        assert!(budget.check("shared-disk-worker", 12).is_ok());
+        budget.requested_gib = 9;
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31,
+            })
+        );
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 1);
     }
 }

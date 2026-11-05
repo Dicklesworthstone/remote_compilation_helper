@@ -3388,6 +3388,7 @@ impl Default for BuildHistory {
 mod tests {
     use super::*;
     use rch_common::{WorkerId, test_guard};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
