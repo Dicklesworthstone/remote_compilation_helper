@@ -2015,7 +2015,13 @@ fn closed_metadata_cannot_enter_an_ordinary_workspace_session_or_advance_its_jou
     let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut report = report();
-    report.dependency_modes = vec![DependencyExecutionMode::ClosedMetadata];
+    // The ordinary metadata session must itself be available before testing
+    // that a closed-metadata request cannot enter it. Otherwise the session
+    // correctly refuses the unsupported selection before reading any frame.
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::ClosedMetadata,
+    ];
     let mut wire = Wire::default();
     let peer = wire.clone();
     peer.frame(closed_workspace_metadata_request());
