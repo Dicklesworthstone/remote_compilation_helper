@@ -1167,15 +1167,14 @@ async fn main() -> Result<()> {
     // Before any worker is evaluated: placement, the monitor and the sweep
     // all read this one disk policy (bd-xxck3).
     let disk_policy = DiskPressurePolicyConfig::from_selection(&rch_config.selection);
-    if disk_policy.critical_free_ratio != DiskPressurePolicyConfig::default().critical_free_ratio
-        || disk_policy.critical_free_ratio_cap_gb.is_some()
-    {
-        info!(
-            critical_free_ratio = disk_policy.critical_free_ratio,
-            critical_free_ratio_cap_gb = ?disk_policy.critical_free_ratio_cap_gb,
-            "disk pressure policy overridden by [selection]"
-        );
-    }
+    info!(
+        critical_free_ratio = disk_policy.critical_free_ratio,
+        critical_free_ratio_cap_gb = ?disk_policy.critical_free_ratio_cap_gb,
+        critical_free_gb = disk_policy.critical_free_gb,
+        min_free_gb = ?rch_config.selection.min_free_gb,
+        disk_gb_per_slot = rch_config.selection.disk_gb_per_slot,
+        "effective disk pressure policy (GiB); an uncapped ratio has no absolute cap"
+    );
     DiskPressurePolicyConfig::install(disk_policy);
     let (socket, client_socket) =
         daemon_socket_for_startup(&matches, &rch_config.general.socket_path, |name| {

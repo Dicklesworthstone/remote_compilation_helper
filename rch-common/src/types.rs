@@ -451,19 +451,64 @@ pub struct SelectionConfig {
         deserialize_with = "deserialize_disk_gb_per_slot"
     )]
     pub disk_gb_per_slot: f64,
-    /// Free-disk ratio at or below which rchd marks a worker Critical and
-    /// gives it no slots (bd-xxck3). Read by rchd at startup.
+    /// Free-disk ratio used by rchd's critical rule, together with
+    /// `disk_critical_ratio_cap_gb` (bd-xxck3). Read by rchd at startup.
     #[serde(default = "default_disk_critical_free_ratio")]
     pub disk_critical_free_ratio: f64,
-    /// When set, the ratio rule above trips only while free space is also at
-    /// or below this many GB, so a large disk is judged by absolute headroom
-    /// (5% of 900 GB is 45 GB). Unset keeps the ratio rule unconditional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The ratio rule above trips only while free space is also at or below
+    /// this many GiB (default: 25), so large disks retain usable headroom.
+    /// Explicit `None`, JSON null, or TOML `"uncapped"` keeps the ratio rule
+    /// unconditional. This does not disable the absolute floor or build budgets.
+    #[serde(
+        default = "default_disk_critical_ratio_cap_gb",
+        serialize_with = "serialize_disk_critical_ratio_cap_gb",
+        deserialize_with = "deserialize_disk_critical_ratio_cap_gb"
+    )]
     pub disk_critical_ratio_cap_gb: Option<f64>,
 }
 
 fn default_disk_critical_free_ratio() -> f64 {
     0.05
+}
+
+fn default_disk_critical_ratio_cap_gb() -> Option<f64> {
+    Some(25.0)
+}
+
+fn serialize_disk_critical_ratio_cap_gb<S>(
+    cap: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match cap {
+        Some(cap) => cap.serialize(serializer),
+        // TOML has no null. Omitting None would restore the default cap when
+        // a config edit, overlay or cache reload deserializes it (bd-lnbuz).
+        None => serializer.serialize_str("uncapped"),
+    }
+}
+
+fn deserialize_disk_critical_ratio_cap_gb<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RatioCap {
+        Gib(f64),
+        Mode(String),
+    }
+
+    match Option::<RatioCap>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RatioCap::Gib(cap)) => Ok(Some(cap)),
+        Some(RatioCap::Mode(mode)) if mode == "uncapped" => Ok(None),
+        Some(RatioCap::Mode(_)) => Err(serde::de::Error::custom(
+            "disk_critical_ratio_cap_gb must be a number or \"uncapped\"",
+        )),
+    }
 }
 
 impl Default for SelectionConfig {
@@ -478,7 +523,7 @@ impl Default for SelectionConfig {
             min_free_gb: default_min_free_gb(),
             disk_gb_per_slot: default_disk_gb_per_slot(),
             disk_critical_free_ratio: default_disk_critical_free_ratio(),
-            disk_critical_ratio_cap_gb: None,
+            disk_critical_ratio_cap_gb: default_disk_critical_ratio_cap_gb(),
         }
     }
 }
@@ -7368,6 +7413,8 @@ retry_max = 2
         assert_eq!(config.max_load_per_core, Some(2.0));
         assert_eq!(config.min_free_gb, Some(10.0));
         assert_eq!(config.disk_gb_per_slot, 10.0);
+        assert_eq!(config.disk_critical_free_ratio, 0.05);
+        assert_eq!(config.disk_critical_ratio_cap_gb, Some(25.0));
     }
 
     #[test]
@@ -7395,6 +7442,60 @@ retry_max = 2
         }
         let default: SelectionConfig = toml::from_str("").unwrap();
         assert_eq!(default.disk_gb_per_slot, 10.0);
+    }
+
+    #[test]
+    fn selection_disk_ratio_cap_defaults_for_missing_and_partial_config() {
+        for contents in ["", "[selection]\n", "[selection]\ndisk_gb_per_slot = 5.0\n"] {
+            let config: RchConfig = toml::from_str(contents).unwrap();
+            assert_eq!(config.selection.disk_critical_ratio_cap_gb, Some(25.0));
+            assert_eq!(config.selection.disk_critical_free_ratio, 0.05);
+            assert_eq!(config.selection.min_free_gb, Some(10.0));
+        }
+        let selection: SelectionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(selection.disk_critical_ratio_cap_gb, Some(25.0));
+    }
+
+    #[test]
+    fn selection_disk_ratio_overrides_survive_toml_and_json_roundtrips() {
+        for cap in [Some(15.0), Some(25.0), Some(30.0), None] {
+            let selection = SelectionConfig {
+                disk_critical_free_ratio: 0.03,
+                disk_critical_ratio_cap_gb: cap,
+                ..SelectionConfig::default()
+            };
+            let toml = toml::to_string(&selection).unwrap();
+            let json = serde_json::to_string(&selection).unwrap();
+            if cap.is_none() {
+                assert!(toml.contains("disk_critical_ratio_cap_gb = \"uncapped\""));
+                assert!(json.contains("\"disk_critical_ratio_cap_gb\":\"uncapped\""));
+            }
+            for restored in [
+                toml::from_str::<SelectionConfig>(&toml).unwrap(),
+                serde_json::from_str::<SelectionConfig>(&json).unwrap(),
+            ] {
+                assert_eq!(restored.disk_critical_ratio_cap_gb, cap);
+                assert_eq!(restored.disk_critical_free_ratio, 0.03);
+            }
+        }
+
+        let explicit_null: SelectionConfig =
+            serde_json::from_str(r#"{"disk_critical_ratio_cap_gb":null}"#).unwrap();
+        assert_eq!(explicit_null.disk_critical_ratio_cap_gb, None);
+        let explicit_uncapped: SelectionConfig =
+            toml::from_str("disk_critical_ratio_cap_gb = \"uncapped\"").unwrap();
+        assert_eq!(explicit_uncapped.disk_critical_ratio_cap_gb, None);
+    }
+
+    #[test]
+    fn selection_disk_ratio_cap_rejects_unknown_modes() {
+        for value in ["\"\"", "\"none\"", "\"25\"", "true", "[]"] {
+            assert!(
+                toml::from_str::<SelectionConfig>(&format!("disk_critical_ratio_cap_gb = {value}"))
+                    .is_err(),
+                "invalid disk ratio cap {value}"
+            );
+        }
     }
 
     #[test]

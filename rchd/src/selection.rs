@@ -4677,6 +4677,7 @@ mod tests {
                 memory_pressure: None,
                 telemetry_age_secs: Some(0),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 0,
             })
             .await;
@@ -7428,6 +7429,7 @@ mod tests {
                 memory_pressure: Some(15.0),
                 telemetry_age_secs: Some(8),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;
@@ -8235,6 +8237,7 @@ mod tests {
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(5),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;
@@ -8377,6 +8380,7 @@ mod tests {
                 memory_pressure: Some(15.0),
                 telemetry_age_secs: Some(8),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;
@@ -8756,6 +8760,7 @@ mod tests {
                 memory_pressure: Some(55.0),
                 telemetry_age_secs: Some(8),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;
@@ -8919,6 +8924,7 @@ mod tests {
                 memory_pressure: None,
                 telemetry_age_secs: Some(600),
                 telemetry_fresh: false,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;

@@ -426,6 +426,7 @@ mod tests {
             memory_pressure: None,
             telemetry_age_secs: Some(5),
             telemetry_fresh: true,
+            telemetry_received_at_unix_ms: None,
             evaluated_at_unix_ms: 1000,
         }
     }

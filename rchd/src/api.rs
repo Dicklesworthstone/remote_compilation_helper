@@ -13378,11 +13378,12 @@ mod tests {
             pool.add_worker(make_test_worker("w1", 8)).await;
             let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
             if case == "disk_critical" {
-                // 45 GB of 926 GB (4.9%): below the 5% critical ratio, via the
-                // same policy path the capabilities probe takes.
+                // At the default 25 GiB cap and below the 5% ratio: still
+                // Critical via the same path the capabilities probe takes.
+                // The above-cap positive is covered alongside this test.
                 worker
                     .set_capabilities(WorkerCapabilities {
-                        disk_free_gb: Some(45.0),
+                        disk_free_gb: Some(25.0),
                         disk_total_gb: Some(926.0),
                         ..Default::default()
                     })
@@ -13600,6 +13601,7 @@ mod tests {
                 memory_pressure: Some(44.0),
                 telemetry_age_secs: Some(8),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;
@@ -13650,6 +13652,7 @@ mod tests {
                 memory_pressure: Some(82.0),
                 telemetry_age_secs: Some(7),
                 telemetry_fresh: true,
+                telemetry_received_at_unix_ms: None,
                 evaluated_at_unix_ms: 1_700_000_000_000,
             })
             .await;

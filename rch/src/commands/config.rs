@@ -20,6 +20,7 @@ use super::types::{
 
 const SUPPORTED_CONFIG_KEYS: &str = concat!(
     "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url, ",
+    "selection.disk_critical_free_ratio, selection.disk_critical_ratio_cap_gb, ",
     "circuit.failure_threshold, circuit.down_after_failures, circuit.success_threshold, circuit.error_rate_threshold, circuit.window_secs, circuit.open_cooldown_secs, circuit.half_open_max_probes, circuit.command_failure_threshold, circuit.open_cooldown_max_secs, circuit.recovery_probe_interval_secs"
 );
 
@@ -964,6 +965,21 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "selection.disk_critical_free_ratio",
+        config.selection.disk_critical_free_ratio.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "selection.disk_critical_ratio_cap_gb",
+        config
+            .selection
+            .disk_critical_ratio_cap_gb
+            .map_or_else(|| "uncapped".to_string(), |cap| cap.to_string()),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "selection.weights.disk",
         config.selection.weights.disk.to_string(),
         sources,
@@ -1538,6 +1554,38 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
             }
             config.selection.disk_gb_per_slot = budget;
         }
+        "selection.disk_critical_free_ratio" => {
+            let ratio = parse_f64(value, key)?;
+            if !ratio.is_finite() || ratio <= 0.0 || ratio >= 0.12 {
+                return Err(ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason: format!("value {ratio} is outside (0, 0.12)"),
+                    suggestion: "Use a finite ratio above 0 and below the 0.12 warning ratio"
+                        .to_string(),
+                }
+                .into());
+            }
+            config.selection.disk_critical_free_ratio = ratio;
+        }
+        "selection.disk_critical_ratio_cap_gb" => {
+            config.selection.disk_critical_ratio_cap_gb = if value.trim().trim_matches('"')
+                == "uncapped"
+            {
+                None
+            } else {
+                let cap = parse_f64(value, key)?;
+                if !cap.is_finite() || cap < 10.0 {
+                    return Err(ConfigError::InvalidValue {
+                            field: key.to_string(),
+                            reason: format!("value {cap} is below the 10 GiB critical floor or is not finite"),
+                            suggestion: "Use a finite cap of at least 10 GiB, or uncapped for the unconditional ratio rule"
+                                .to_string(),
+                        }
+                        .into());
+                }
+                Some(cap)
+            };
+        }
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
@@ -1784,6 +1832,18 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "selection.disk_gb_per_slot" => {
             config.selection.disk_gb_per_slot = defaults.selection.disk_gb_per_slot;
             config.selection.disk_gb_per_slot.to_string()
+        }
+        "selection.disk_critical_free_ratio" => {
+            config.selection.disk_critical_free_ratio = defaults.selection.disk_critical_free_ratio;
+            config.selection.disk_critical_free_ratio.to_string()
+        }
+        "selection.disk_critical_ratio_cap_gb" => {
+            config.selection.disk_critical_ratio_cap_gb =
+                defaults.selection.disk_critical_ratio_cap_gb;
+            config
+                .selection
+                .disk_critical_ratio_cap_gb
+                .map_or_else(|| "uncapped".to_string(), |cap| cap.to_string())
         }
         "selection.weights.disk" => {
             config.selection.weights.disk = defaults.selection.weights.disk;
@@ -3583,6 +3643,85 @@ mod tests {
         for invalid in ["0", "-1", "NaN", "inf", "-inf", "not-a-number"] {
             assert!(config_set_at(&config_path, key, invalid, &ctx).is_err());
             assert_eq!(std::fs::read(&config_path).expect("read config"), before);
+        }
+    }
+
+    #[test]
+    fn config_disk_ratio_policy_roundtrip_get_and_reset() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        let ratio_key = "selection.disk_critical_free_ratio";
+        let cap_key = "selection.disk_critical_ratio_cap_gb";
+        config_set_at(&config_path, ratio_key, "0.03", &ctx).unwrap();
+
+        for (value, expected_cap) in [("15", Some(15.0)), ("30", Some(30.0)), ("uncapped", None)] {
+            config_set_at(&config_path, cap_key, value, &ctx).unwrap();
+            // Setting an unrelated key must not reset an explicit uncapped
+            // policy to the default when the entire config is serialized.
+            config_set_at(&config_path, "selection.disk_gb_per_slot", "5", &ctx).unwrap();
+            let config: RchConfig =
+                toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            assert_eq!(config.selection.disk_critical_ratio_cap_gb, expected_cap);
+            assert_eq!(config.selection.disk_critical_free_ratio, 0.03);
+            let values = collect_value_sources(&config, &Default::default());
+            assert_eq!(
+                values
+                    .iter()
+                    .find(|entry| entry.key == cap_key)
+                    .unwrap()
+                    .value,
+                value
+            );
+            assert_eq!(
+                values
+                    .iter()
+                    .find(|entry| entry.key == ratio_key)
+                    .unwrap()
+                    .value,
+                "0.03"
+            );
+        }
+
+        config_reset_at(&config_path, cap_key, &ctx).unwrap();
+        config_reset_at(&config_path, ratio_key, &ctx).unwrap();
+        let config: RchConfig =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config.selection.disk_critical_ratio_cap_gb, Some(25.0));
+        assert_eq!(config.selection.disk_critical_free_ratio, 0.05);
+        assert_eq!(config.selection.disk_gb_per_slot, 5.0);
+    }
+
+    #[test]
+    fn config_disk_ratio_policy_rejects_invalid_values_without_changing_file() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        let cap_key = "selection.disk_critical_ratio_cap_gb";
+        config_set_at(&config_path, cap_key, "25", &ctx).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        for (key, invalid) in [
+            (cap_key, "0"),
+            (cap_key, "9.99"),
+            (cap_key, "-1"),
+            (cap_key, "NaN"),
+            (cap_key, "inf"),
+            (cap_key, "-inf"),
+            (cap_key, "none"),
+            ("selection.disk_critical_free_ratio", "0"),
+            ("selection.disk_critical_free_ratio", "-0.01"),
+            ("selection.disk_critical_free_ratio", "0.12"),
+            ("selection.disk_critical_free_ratio", "1"),
+            ("selection.disk_critical_free_ratio", "NaN"),
+            ("selection.disk_critical_free_ratio", "inf"),
+        ] {
+            assert!(
+                config_set_at(&config_path, key, invalid, &ctx).is_err(),
+                "{key} = {invalid}"
+            );
+            assert_eq!(std::fs::read(&config_path).unwrap(), before);
         }
     }
 

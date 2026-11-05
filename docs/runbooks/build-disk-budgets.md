@@ -184,6 +184,8 @@ The existing selection settings remain independent controls:
 [selection]
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
+disk_critical_free_ratio = 0.05
+disk_critical_ratio_cap_gb = 25.0
 ```
 
 Despite the legacy `gb` names, these capacity calculations use GiB.
@@ -197,11 +199,30 @@ silently remove protection.
 
 `disk_gb_per_slot` remains a positive allowance for deriving effective slot
 capacity; changing it does not override a particular project's growth budget.
-The separate `disk_critical_free_ratio` and optional
-`disk_critical_ratio_cap_gb` still control the ratio-based critical rule. Restart
-the daemon after selection-policy changes. Update the dispatcher, daemon, and
-worker together: a new dispatcher talking to an older daemon uses a conservative
-cold command budget and a 10 GiB floor, without the new daemon history policy.
+The separate critical ratio rule requires both free ratio at or below
+`disk_critical_free_ratio` and free GiB at or below `disk_critical_ratio_cap_gb`.
+The defaults are 5% and 25 GiB, including on a dispatcher without a config file.
+Thus a 900 GiB disk with 30 GiB free can retain slots, while the same disk at
+8 GiB free still triggers the independent 10 GiB critical floor. Existing
+small-filesystem and `/tmp` rules still apply. Stale or unavailable build
+storage telemetry, outstanding reservations, and an authorized budget that
+cannot fit still refuse admission regardless of the cap.
+
+An explicit numeric cap remains authoritative; `disk_critical_ratio_cap_gb =
+"uncapped"` retains an unconditional ratio rule. Programmatic `None` and JSON
+`null` have the same meaning and serialize as `"uncapped"` so configuration
+edits cannot silently reinstate the default cap. `rch config get
+selection.disk_critical_ratio_cap_gb --sources` reports the value and its source;
+`rch config set selection.disk_critical_ratio_cap_gb uncapped` selects the
+stricter mode. Numeric caps must be finite and at least 10 GiB. The CLI rejects
+invalid values before writing; invalid numeric file settings make the daemon
+use the stricter uncapped rule and log the reason.
+
+Restart the daemon after selection-policy changes; the startup log records the
+effective critical thresholds, protected floor and per-slot budget. Update the
+dispatcher, daemon, and worker together: a new dispatcher talking to an older
+daemon uses a conservative cold command budget and a 10 GiB floor, without the
+new daemon history policy.
 
 To investigate a refusal, inspect the selected worker and the daemon's capacity
 observations:

@@ -5,7 +5,7 @@
 use crate::DaemonContext;
 use crate::disk_pressure::{
     DiskCapacityObservation, DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment,
-    evaluate_pressure_policy,
+    PressureState, refresh_pressure_policy,
 };
 use crate::health::probe_worker_capabilities;
 use rch_common::bypass_record::AdminDisableStore;
@@ -1484,8 +1484,9 @@ impl WorkerState {
     ///
     /// All admission evidence is collected before the CAS. Retaining the
     /// config, pressure, and lifecycle read guards through the CAS prevents
-    /// administrative or capacity changes from racing that commit. Cancellation
-    /// while awaiting those guards never changes slot accounting.
+    /// administrative, pressure, or capacity changes from racing that commit.
+    /// Recheck Critical pressure here even if selection previously admitted the
+    /// worker. Cancellation while awaiting those guards never changes accounting.
     pub async fn reserve_slots(&self, count: u32) -> bool {
         if count == 0 {
             return false;
@@ -1493,7 +1494,7 @@ impl WorkerState {
         let config = self.config.read().await;
         let pressure = self.pressure_assessment.read().await;
         let lifecycle = self.lifecycle.read().await;
-        if !lifecycle.is_schedulable() {
+        if !lifecycle.is_schedulable() || pressure.state == PressureState::Critical {
             return false;
         }
         let total_slots = self.slots_for(config.total_slots, &pressure);
@@ -1505,8 +1506,8 @@ impl WorkerState {
     ///
     /// There is no await after slot accounting succeeds. The caller can therefore
     /// synchronously publish durable ownership before cancellation becomes
-    /// observable again. A retarget, retirement, stale lifecycle, or insufficient
-    /// capacity is refused before accounting changes.
+    /// observable again. A retarget, retirement, stale lifecycle, Critical
+    /// pressure, or insufficient capacity is refused before accounting changes.
     pub(crate) async fn reserve_slots_for_endpoint(
         &self,
         count: u32,
@@ -1527,7 +1528,10 @@ impl WorkerState {
                 .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
             && endpoint.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
             && same_endpoint(&config, &endpoint.config);
-        if !endpoint_current || !lifecycle.is_schedulable() {
+        if !endpoint_current
+            || !lifecycle.is_schedulable()
+            || pressure.state == PressureState::Critical
+        {
             return None;
         }
 
@@ -1823,24 +1827,9 @@ impl WorkerState {
         );
         *self.disk_capacity_observation.write().await = observation;
         let pressure_config = DiskPressurePolicyConfig::configured();
-        let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
-        *self.capabilities.write().await = capabilities;
-
-        let now_ms = current_unix_ms();
+        *self.capabilities.write().await = capabilities.clone();
         let mut current = self.pressure_assessment.write().await;
-        if pressure.state != crate::disk_pressure::PressureState::Critical
-            && refresh_preserved_pressure_age(&mut current, &pressure_config, now_ms)
-        {
-            current.disk_free_gb = pressure.disk_free_gb;
-            current.disk_total_gb = pressure.disk_total_gb;
-            current.disk_free_ratio = pressure.disk_free_ratio;
-            current.build_disk_free_gb = pressure.build_disk_free_gb;
-            current.build_disk_total_gb = pressure.build_disk_total_gb;
-            current.evaluated_at_unix_ms = now_ms;
-            return true;
-        }
-
-        *current = pressure;
+        *current = refresh_pressure_policy(&capabilities, &current, &pressure_config);
         true
     }
 
@@ -2689,29 +2678,6 @@ fn current_unix_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(duration_millis_i64)
         .unwrap_or_default()
-}
-
-fn refresh_preserved_pressure_age(
-    assessment: &mut PressureAssessment,
-    config: &DiskPressurePolicyConfig,
-    now_ms: i64,
-) -> bool {
-    if !assessment.telemetry_fresh {
-        return false;
-    }
-
-    let Some(previous_age_secs) = assessment.telemetry_age_secs else {
-        return false;
-    };
-
-    let elapsed_secs = now_ms
-        .saturating_sub(assessment.evaluated_at_unix_ms)
-        .max(0) as u64
-        / 1_000;
-    let age_secs = previous_age_secs.saturating_add(elapsed_secs);
-    assessment.telemetry_age_secs = Some(age_secs);
-    assessment.telemetry_fresh = age_secs <= config.telemetry_stale_after.as_secs();
-    assessment.telemetry_fresh
 }
 
 // ============================================================================
@@ -3669,6 +3635,71 @@ mod tests {
             .expect("current healthy endpoint should reserve");
         assert_eq!(admission.disk_capacity.is_some(), before.is_some());
         assert_eq!(worker.used_slots(), 2);
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn critical_pressure_after_selection_cannot_spend_remaining_slots() {
+        let worker = WorkerState::new(recovered_worker_config("pressure-race", 8));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert!(worker.reserve_slots(1).await);
+        let selected = worker.endpoint_snapshot().await;
+
+        // The endpoint and absolute slot capacity are unchanged, but an
+        // operator's unconditional ratio rule makes this worker Critical after
+        // selection. Admission must recheck that verdict before its CAS.
+        let strict = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_critical_ratio_cap_gb: None,
+            ..Default::default()
+        });
+        worker
+            .set_pressure_assessment(crate::disk_pressure::evaluate_pressure_policy(
+                &caps, None, &strict,
+            ))
+            .await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(worker.available_slots().await, 1);
+        assert!(!worker.reserve_slots(1).await);
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "the existing owner keeps its reservation"
+        );
+
+        // Re-evaluating recovery permits new work without resetting usage.
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected)
+                .await
+                .is_some()
+        );
+        assert_eq!(worker.used_slots(), 2);
+        assert!(!worker.reserve_slots(1).await);
         worker.release_slots(2).await;
     }
 
@@ -5345,6 +5376,54 @@ mod tests {
             Err(DiskHeadroomRejection::Stale),
             "probe duration is part of age"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_pressure_does_not_fund_stale_large_disk_capacity() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+        let worker = WorkerState::new(test_config("stale-large-disk"));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        let mut delayed = worker.capability_probe_context().await;
+        delayed.started_at = Instant::now() - Duration::from_secs(91);
+        assert!(worker.publish_capabilities(delayed, caps.clone()).await);
+        let mut cpu_refresh = worker.pressure_assessment().await;
+        cpu_refresh.telemetry_age_secs = Some(0);
+        cpu_refresh.telemetry_fresh = true;
+        cpu_refresh.disk_io_util_pct = Some(0.0);
+        cpu_refresh.memory_pressure = Some(10.0);
+        cpu_refresh.evaluated_at_unix_ms = current_unix_ms();
+        worker.set_pressure_assessment(cpu_refresh).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        let mut budget = DiskHeadroomAdmission {
+            requested_gib: 20,
+            floor_gib: 10,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert_eq!(
+            budget.check("stale-large-disk", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            budget.check("stale-large-disk", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        budget.capacity = worker.disk_capacity_observation().await;
+        assert!(budget.check("stale-large-disk", 0).is_ok());
+        assert!(matches!(
+            budget.check("stale-large-disk", 1),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
     }
 
     #[tokio::test]
@@ -7173,6 +7252,7 @@ mod tests {
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),
+                telemetry_received_at_unix_ms: None,
                 telemetry_fresh: true,
                 evaluated_at_unix_ms: current_unix_ms(),
             })
@@ -7186,7 +7266,8 @@ mod tests {
 
         let pressure = state.pressure_assessment().await;
         assert_eq!(pressure.state, crate::disk_pressure::PressureState::Healthy);
-        assert_eq!(pressure.reason_code, "all_pressure_rules_within_threshold");
+        assert_eq!(pressure.reason_code, "pressure_healthy");
+        assert_eq!(pressure.policy_rule, "all_pressure_rules_within_threshold");
         assert_eq!(pressure.disk_free_gb, Some(90.0));
         assert_eq!(pressure.disk_total_gb, Some(120.0));
         assert_eq!(pressure.disk_free_ratio, Some(0.75));
@@ -7213,6 +7294,7 @@ mod tests {
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),
+                telemetry_received_at_unix_ms: None,
                 telemetry_fresh: true,
                 evaluated_at_unix_ms: current_unix_ms(),
             })
@@ -7229,12 +7311,132 @@ mod tests {
             pressure.state,
             crate::disk_pressure::PressureState::Critical
         );
-        assert_eq!(
-            pressure.reason_code,
-            "disk_critical_without_fresh_telemetry"
-        );
+        assert_eq!(pressure.reason_code, "disk_free_below_critical_gb");
         assert_eq!(pressure.disk_free_gb, Some(2.0));
-        assert!(!pressure.telemetry_fresh);
+        assert!(pressure.telemetry_fresh);
+        assert_eq!(pressure.disk_io_util_pct, Some(0.0));
+        assert_eq!(pressure.memory_pressure, Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_restores_large_disk_capacity_without_erasing_owners() {
+        let worker = WorkerState::new(test_config("large-disk-recovery"));
+        let caps = |free| WorkerCapabilities {
+            disk_free_gb: Some(free),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps(30.0)).await;
+        assert!(worker.reserve_slots(1).await);
+
+        let mut low = crate::disk_pressure::evaluate_pressure_policy(
+            &caps(8.0),
+            None,
+            &DiskPressurePolicyConfig::default(),
+        );
+        low.telemetry_fresh = true;
+        low.telemetry_age_secs = Some(5);
+        low.disk_io_util_pct = Some(0.0);
+        low.memory_pressure = Some(10.0);
+        worker.set_pressure_assessment(low).await;
+        assert_eq!(worker.available_slots().await, 0);
+        assert_eq!(worker.used_slots(), 1);
+
+        // Fresh CPU/IO evidence must not freeze the old disk Critical verdict
+        // when a new capability probe demonstrates recovery above the cap.
+        worker.set_capabilities(caps(30.0)).await;
+        let recovered = worker.pressure_assessment().await;
+        assert_eq!(recovered.state, PressureState::Warning);
+        assert_eq!(recovered.reason_code, "disk_ratio_below_warning");
+        assert!(recovered.telemetry_fresh);
+        assert_eq!(recovered.memory_pressure, Some(10.0));
+        assert!(recovered.telemetry_age_secs.unwrap() >= 5);
+        assert_eq!(worker.effective_total_slots().await, 2);
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 1);
+        assert!(worker.reserve_slots(1).await);
+        assert!(!worker.reserve_slots(1).await);
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_does_not_erase_fresh_memory_or_io_pressure() {
+        for (free, total, io, memory, reason) in [
+            (30.0, 900.0, 0.0, 98.0, "memory_pressure_critical"),
+            (
+                24.0,
+                200.0,
+                99.0,
+                10.0,
+                "disk_io_saturated_with_low_headroom",
+            ),
+        ] {
+            let worker = WorkerState::new(test_config(reason));
+            let mut previous = crate::disk_pressure::evaluate_pressure_policy(
+                &WorkerCapabilities {
+                    disk_free_gb: Some(2.0),
+                    disk_total_gb: Some(total),
+                    ..Default::default()
+                },
+                None,
+                &DiskPressurePolicyConfig::default(),
+            );
+            previous.disk_io_util_pct = Some(io);
+            previous.memory_pressure = Some(memory);
+            previous.telemetry_age_secs = Some(5);
+            previous.telemetry_fresh = true;
+            worker.set_pressure_assessment(previous).await;
+            worker
+                .set_capabilities(WorkerCapabilities {
+                    disk_free_gb: Some(free),
+                    disk_total_gb: Some(total),
+                    build_disk_free_gb: Some(free),
+                    build_disk_total_gb: Some(total),
+                    ..Default::default()
+                })
+                .await;
+            let pressure = worker.pressure_assessment().await;
+            assert_eq!(pressure.state, PressureState::Critical, "{reason}");
+            assert_eq!(pressure.reason_code, reason);
+            assert!(pressure.telemetry_fresh);
+            assert_eq!(pressure.memory_pressure, Some(memory));
+            assert_eq!(pressure.disk_io_util_pct, Some(io));
+            assert!(worker.available_slots().await > 0);
+            assert!(!worker.reserve_slots(1).await, "{reason}");
+            assert_eq!(worker.used_slots(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_ages_previous_telemetry_instead_of_rejuvenating_it() {
+        let worker = WorkerState::new(test_config("aged-pressure"));
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: PressureState::Critical,
+                memory_pressure: Some(98.0),
+                disk_io_util_pct: Some(0.0),
+                telemetry_age_secs: Some(89),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms() - 2_001,
+                ..Default::default()
+            })
+            .await;
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            worker.set_capabilities(caps.clone()).await;
+            let pressure = worker.pressure_assessment().await;
+            assert_eq!(pressure.state, PressureState::Warning);
+            assert!(!pressure.telemetry_fresh);
+            assert!(pressure.telemetry_age_secs.unwrap() >= 91);
+        }
     }
 
     #[tokio::test]

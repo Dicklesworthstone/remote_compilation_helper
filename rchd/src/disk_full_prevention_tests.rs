@@ -45,6 +45,7 @@ mod tests {
             disk_io_util_pct: None,
             memory_pressure: None,
             telemetry_age_secs: Some(5),
+            telemetry_received_at_unix_ms: None,
             telemetry_fresh: true,
             evaluated_at_unix_ms: 1000,
         }

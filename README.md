@@ -820,9 +820,9 @@ strategy = "balanced"
 # Reserve this much free disk, then budget space for each concurrent slot (GiB).
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
-# A worker at or below this free-disk ratio gets no slots (rchd reads it at start).
+# Critical when both this ratio and the absolute cap below are reached.
 # disk_critical_free_ratio = 0.05
-# Judge large disks by absolute headroom: the ratio rule applies only at or below this many GB.
+# Default cap in GiB; use "uncapped" for an unconditional critical ratio.
 # disk_critical_ratio_cap_gb = 25.0
 
 [self_healing]
@@ -913,13 +913,27 @@ builds retain their reservations when capacity drops; new work waits for space.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
 
-Separately, rchd marks a worker Critical, with no slots at all, when its free
-space falls to `selection.disk_critical_free_ratio` (default `0.05`) or to 10 GB.
-On a 900 GB worker the ratio line is 45 GB. Set `selection.disk_critical_ratio_cap_gb`
-(for example `25.0`) so the ratio rule applies only at or below that many free GB and
-large disks are judged by absolute headroom. Both keys go in the daemon's
-`config.toml` and take effect when rchd restarts; the defaults keep the ratio rule
-unconditional.
+Separately, on build filesystems of at least 50 GiB, rchd marks a worker Critical
+when free space falls to 10 GiB, or when **both** the free ratio is at or below
+`selection.disk_critical_free_ratio` (default `0.05`) and free space is at or below
+`selection.disk_critical_ratio_cap_gb` (default `25.0` GiB). These defaults also
+apply when the dispatcher has no `config.toml`. A 900 GiB disk with 30 GiB free
+retains disk-budgeted capacity despite its low free percentage; the same disk
+with 8 GiB free stays Critical. Existing small-filesystem and `/tmp` rules still
+apply. A noncritical classification alone does not admit a
+build: fresh storage evidence, active reservations, the authorized build budget
+and safety buffers must still fit.
+
+Explicit caps such as `15.0` or `30.0` and custom critical ratios remain honored.
+Set `disk_critical_ratio_cap_gb = "uncapped"` to enforce the ratio independently
+of absolute free space. A finite cap must be at least 10 GiB; invalid numeric
+caps fall back to the stricter uncapped rule with a daemon warning. Inspect or
+change the settings with `rch config get selection.disk_critical_ratio_cap_gb --sources`
+and `rch config set selection.disk_critical_ratio_cap_gb 25`. The `get` and `set`
+commands also accept `selection.disk_critical_free_ratio`.
+Both keys take effect when rchd restarts, and its startup log reports the
+effective disk policy. The cap does not change per-slot allowances, protected
+free-space floors, or authorized build-storage budgets.
 
 Balanced selection also favors free disk before a worker reaches the admission
 floor. `selection.weights.disk` (default `0.2`, range `0` to `1`) adds disk
