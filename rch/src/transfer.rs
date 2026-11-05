@@ -3024,6 +3024,14 @@ impl GitArchiveCacheStatus {
     }
 }
 
+/// Original-argv evidence for the Cargo cache paths a worker may write.
+#[derive(Clone)]
+struct CargoDiskCache {
+    name: String,
+    additional_home: Option<String>,
+    verified: bool,
+}
+
 /// Transfer pipeline for remote compilation.
 #[derive(Clone)]
 pub struct TransferPipeline {
@@ -3034,6 +3042,12 @@ pub struct TransferPipeline {
     /// Whole selected source root when execution is rebased to a subdirectory.
     /// Disk supervision must keep accounting for writes above the command cwd.
     disk_source_root: Option<String>,
+    /// Cache roots proved from the original Cargo argv before it is wrapped in
+    /// source guards and opaque shells. Paths resolve on the selected worker.
+    cargo_disk_cache: Option<CargoDiskCache>,
+    /// Distinguish a checked non-Cargo command from an old direct caller whose
+    /// opaque command has never supplied cache-scope evidence.
+    cargo_disk_scope_captured: bool,
     /// Local project root.
     project_root: PathBuf,
     /// Caller-owned tree used to distinguish source from artifact roots. A
@@ -3221,6 +3235,8 @@ impl TransferPipeline {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
             disk_budget: None,
             disk_source_root: None,
+            cargo_disk_cache: None,
+            cargo_disk_scope_captured: false,
             retrieval_reference_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
@@ -4060,6 +4076,44 @@ impl TransferPipeline {
 
     pub fn with_disk_budget(mut self, budget: Option<rch_common::BuildDiskBudget>) -> Self {
         self.disk_budget = budget;
+        self
+    }
+
+    /// Capture cache provenance before the original argv becomes opaque inside
+    /// Cargo isolation and source-authority wrappers. The base remains worker
+    /// local; neither a client TMPDIR nor an inherited CARGO_HOME selects it.
+    pub(crate) fn with_cargo_disk_cache(mut self, command: &str, worker: &WorkerId) -> Self {
+        self.cargo_disk_scope_captured = true;
+        self.cargo_disk_cache = None;
+        if command.contains("cargo") {
+            // Cargo isolation historically also wraps non-Cargo commands whose
+            // arguments contain "cargo" (for example cargo_bridge.c). Preserve
+            // those commands while still guarding its bounded cache setup.
+            let known_non_cargo = rch_common::classify_command(command)
+                .kind
+                .is_some_and(|kind| kind.command_base() != "cargo");
+            let clears_environment = shell_words::split(command).is_ok_and(|tokens| {
+                tokens.iter().any(|token| {
+                    matches!(token.as_str(), "-i" | "--ignore-environment" | "-S")
+                        || token.starts_with("--split-string")
+                })
+            });
+            let home = if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment
+            {
+                Ok(None)
+            } else {
+                crate::hook::cargo_disk_home_override(command)
+            };
+            self.cargo_disk_cache = Some(CargoDiskCache {
+                name: format!(
+                    "{}{}",
+                    rch_common::RCH_CARGO_CACHE_PREFIX,
+                    crate::hook::sanitize_cargo_home_token(worker.as_str())
+                ),
+                verified: home.is_ok(),
+                additional_home: home.ok().flatten(),
+            });
+        }
         self
     }
 
@@ -5655,11 +5709,23 @@ impl TransferPipeline {
             outputs.push(source_root);
         }
         let probes = outputs.clone();
+        let cargo_cache = self.cargo_disk_cache.as_ref().map(|cache| {
+            serde_json::json!({
+                "name": cache.name,
+                "additional_home": cache.additional_home,
+                "verified": cache.verified,
+            })
+        });
         let plan = serde_json::json!({
             "probe": probes, "output": outputs,
             "receipt": self.remote_disk_receipt_path(), "receipt_initialized": true,
             "timeout_seconds": timeout_seconds,
             "warm_policy": budget.warm_policy,
+            "cargo_cache": cargo_cache,
+            // Old direct callers have no original-argv proof. An opaque Cargo
+            // shell cannot silently inherit the target's warm disk allowance.
+            "cargo_cache_required": self.cargo_disk_cache.is_some()
+                || (!self.cargo_disk_scope_captured && command.contains("cargo")),
         });
         let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
@@ -13728,6 +13794,74 @@ Number of files transferred: 42
             remote_build_jobs: RemoteBuildJobs::Off,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn cargo_disk_cache_plan_preserves_original_scope_through_shell_wrappers() {
+        let worker = WorkerId::new("cache/worker");
+        let requested = "env -- CARGO_HOME='/worker/explicit cache' cargo check";
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/cache-plan-test"), None, 20)
+            .with_cargo_disk_cache(requested, &worker);
+        let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+        let command = pipeline.build_remote_command(&isolated, None);
+        assert!(command.contains("\"name\":\"rch-cargo-cache-cache-worker\""));
+        assert!(command.contains("\"additional_home\":\"/worker/explicit cache\""));
+        assert!(command.contains("\"verified\":true"));
+        assert!(command.contains("\"cargo_cache_required\":true"));
+        assert!(command.contains("pwd -P"));
+
+        let ordinary = disk_budget_test_pipeline(Path::new("/tmp/non-cargo-plan"), None, 20)
+            .with_cargo_disk_cache("gcc -c cargo_bridge.c", &worker);
+        assert!(ordinary.cargo_disk_cache.as_ref().unwrap().verified);
+        let ordinary = disk_budget_test_pipeline(Path::new("/tmp/non-cargo-plan"), None, 20)
+            .with_cargo_disk_cache("go test ./...", &worker);
+        assert!(ordinary.cargo_disk_cache.is_none());
+        let ordinary = ordinary.with_remote_path_override("/tmp/cargo-source-guard");
+        let guarded = ordinary
+            .build_remote_command("sh -c 'cd /tmp/cargo-source-guard && go test ./...'", None);
+        assert!(guarded.contains("\"cargo_cache_required\":false"));
+        assert!(guarded.contains("\"cargo_cache\":null"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_disk_cache_unresolved_scope_refuses_before_workload_and_learning() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, original) in [
+            "env -u CARGO_HOME cargo check",
+            "CARGO_HOME=relative cargo check",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = retained.join(case.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let worker = WorkerId::new("cache-scope-refusal");
+            let pipeline = disk_budget_test_pipeline(&directory, None, 15)
+                .with_cargo_disk_cache(original, &worker);
+            let command = crate::hook::add_cargo_isolation(original, &worker);
+            let output = run_external_timeout_fixture(
+                &directory,
+                &pipeline.build_remote_command(&command, None),
+            )
+            .await;
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(120), "{stderr}");
+            let failure = stderr
+                .split_inclusive('\n')
+                .find_map(|line| pipeline.parse_disk_budget_marker(line))
+                .expect("typed prestart refusal");
+            assert!(!failure.started);
+            assert!(
+                failure.detail.contains("literal absolute CARGO_HOME"),
+                "{failure:?}"
+            );
+            assert!(
+                !stderr.contains("_DISK_USAGE:"),
+                "partial roots cannot teach a footprint"
+            );
+        }
     }
 
     #[test]

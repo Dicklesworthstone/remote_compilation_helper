@@ -167,7 +167,7 @@ pub(super) fn cargo_target_env_overrides(
 /// alphanumerics, `-` and `_` are kept; everything else collapses to `-`,
 /// leading/trailing `-` are trimmed, and an empty result falls back to
 /// `"worker"`. Shared by the per-job target dir and isolated CARGO_HOME naming.
-pub(super) fn sanitize_cargo_home_token(token: &str) -> String {
+pub(crate) fn sanitize_cargo_home_token(token: &str) -> String {
     let safe = token
         .chars()
         .map(|ch| {
@@ -476,6 +476,100 @@ fn literal_cargo_tokens(
         anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
     }
     cargo_command_tokens_with_wrappers(command, allow_classified_wrappers)
+}
+
+/// Resolve only a literal command-local Cargo home. The isolated worker home
+/// otherwise remains authoritative. Removing its environment or introducing
+/// shell evaluation cannot certify a bounded set of cache output roots.
+pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<String>> {
+    let (tokens, cargo_index) = literal_cargo_tokens(command, false)?;
+    let mut selected = None;
+    let mut inherited = true;
+    let mut index = 0;
+    while index < cargo_index {
+        match Path::new(&tokens[index])
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            Some("env") => {
+                index += 1;
+                let mut options = true;
+                while index < cargo_index {
+                    let token = &tokens[index];
+                    if super::is_shell_assignment(token) {
+                        if let Some(value) = token.strip_prefix("CARGO_HOME=") {
+                            anyhow::ensure!(
+                                Path::new(value).is_absolute(),
+                                "disk supervision requires an absolute literal CARGO_HOME"
+                            );
+                            selected = Some(value.to_owned());
+                            inherited = true;
+                        }
+                        options = false;
+                        index += 1;
+                    } else if options {
+                        match token.as_str() {
+                            "--" => {
+                                options = false;
+                                index += 1;
+                            }
+                            "-i" | "--ignore-environment" => {
+                                selected = None;
+                                inherited = false;
+                                index += 1;
+                            }
+                            "-u" | "--unset" | "-C" | "--chdir" => {
+                                if matches!(token.as_str(), "-u" | "--unset")
+                                    && tokens[index + 1] == "CARGO_HOME"
+                                {
+                                    selected = None;
+                                    inherited = false;
+                                }
+                                index += 2;
+                            }
+                            value if value.starts_with("--unset=") => {
+                                if value == "--unset=CARGO_HOME" {
+                                    selected = None;
+                                    inherited = false;
+                                }
+                                index += 1;
+                            }
+                            value if value.starts_with("--chdir=") => index += 1,
+                            _ => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some("time") => {
+                index += 1;
+                while index < cargo_index && tokens[index].starts_with('-') {
+                    let token = &tokens[index];
+                    // Option values remain opaque, even when they spell an
+                    // assignment or an environment-clearing option.
+                    index += if matches!(token.as_str(), "-f" | "--format" | "-o" | "--output") {
+                        2
+                    } else {
+                        1
+                    };
+                    if token == "--" {
+                        break;
+                    }
+                }
+            }
+            Some("rustup") => {
+                index += 2; // rustup run, already validated by the shared parser
+                if tokens[index] == "--install" {
+                    index += 1;
+                }
+                index += 1; // the toolchain is an opaque option value
+            }
+            _ => anyhow::bail!("unsupported Cargo cache environment prefix"),
+        }
+    }
+    anyhow::ensure!(inherited, "command removes the supervised Cargo home");
+    Ok(selected)
 }
 
 /// Tokenize without evaluating shell syntax and skip supported executable
@@ -1293,6 +1387,74 @@ mod managed_build_dir_tests {
         bind_owned_cargo_target_dir, managed_clean_overlay_cargo_build_dir,
         managed_clean_overlay_cargo_tokens,
     };
+
+    #[test]
+    fn cargo_disk_cache_scope_preserves_literal_home_and_supported_prefixes() {
+        for command in [
+            "cargo check",
+            "RUSTFLAGS='-C debuginfo=0' cargo build",
+            "env -- CARGO_INCREMENTAL=1 rustup run nightly cargo check",
+            "time -p cargo test -- --nocapture",
+            "time -f CARGO_HOME=/format cargo check",
+            "time -f '-i' cargo check",
+            "env -C CARGO_HOME=/cwd cargo check",
+            "rustup run CARGO_HOME=/toolchain cargo check",
+        ] {
+            assert_eq!(
+                super::cargo_disk_home_override(command).unwrap(),
+                None,
+                "{command}"
+            );
+        }
+        for (command, home) in [
+            ("CARGO_HOME=/worker/cache cargo check", "/worker/cache"),
+            (
+                "env -- CARGO_HOME='/worker/cache with spaces' cargo check",
+                "/worker/cache with spaces",
+            ),
+            (
+                "env -i CARGO_HOME=/worker/cache cargo check",
+                "/worker/cache",
+            ),
+            (
+                "env -u CARGO_HOME CARGO_HOME=/worker/cache cargo check",
+                "/worker/cache",
+            ),
+            (
+                "rustup run nightly env CARGO_HOME=/worker/cache cargo check",
+                "/worker/cache",
+            ),
+        ] {
+            assert_eq!(
+                super::cargo_disk_home_override(command).unwrap().as_deref(),
+                Some(home),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_disk_cache_scope_rejects_unset_relative_and_opaque_homes() {
+        for command in [
+            "CARGO_HOME=relative cargo check",
+            "CARGO_HOME= cargo check",
+            "CARGO_HOME=$HOME/cache cargo check",
+            "env -i cargo check",
+            "env -u CARGO_HOME cargo check",
+            "env --unset=CARGO_HOME cargo check",
+            "env -uCARGO_HOME cargo check",
+            "env -u CARGO_HOME time -f CARGO_HOME=/format cargo check",
+            "env -u CARGO_HOME rustup run CARGO_HOME=/toolchain cargo check",
+            "env -S 'CARGO_HOME=/worker/cache OTHER=1' cargo check",
+            "sh -c 'CARGO_HOME=/worker/cache cargo check'",
+            "CARGO_HOME=/worker/cache cargo check; cargo build",
+        ] {
+            assert!(
+                super::cargo_disk_home_override(command).is_err(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn owned_target_binding_preserves_wrappers_and_passthrough() {

@@ -242,6 +242,71 @@ def verify_output_bindings(identities):
         raise BudgetFailure("monitor_unavailable", detail="output root changed during execution")
 
 
+def validate_cargo_cache_plan(plan, required=False):
+    if type(required) is not bool:
+        raise BudgetFailure("monitor_unavailable", detail="invalid Cargo cache requirement")
+    if plan is None and not required:
+        return
+    if (not isinstance(plan, dict)
+            or set(plan) != {"name", "additional_home", "verified"}
+            or type(plan["verified"]) is not bool
+            or not isinstance(plan["name"], str)
+            or not plan["name"].startswith("rch-cargo-cache-")
+            or not 16 < len(plan["name"]) <= 255
+            or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in plan["name"])
+            or plan["additional_home"] is not None
+            and (not isinstance(plan["additional_home"], str)
+                 or not os.path.isabs(plan["additional_home"])
+                 or "\0" in plan["additional_home"])):
+        raise BudgetFailure("monitor_unavailable", detail="missing or invalid original-command Cargo cache scope")
+    if not plan["verified"]:
+        raise BudgetFailure(
+            "monitor_unavailable",
+            detail="Cargo cache scope is unresolved; use a literal absolute CARGO_HOME and supported env prefix",
+        )
+
+
+def prepare_cargo_cache_roots(plan):
+    """Bind the worker's isolated home and only Cargo's known cache redirects.
+
+    The transfer shell resolves RCH_CH_BASE before client env forwarding and
+    before cd. Never expand a client path or walk arbitrary cache symlinks.
+    At most six individual directories are created before admission; missing
+    ancestor trees are refused rather than seeded outside the reservation.
+    """
+    if plan is None:
+        return [], {}
+    validate_cargo_cache_plan(plan)
+    base = os.environ.get("RCH_CH_BASE", "")
+    if (not os.path.isabs(base) or os.path.realpath(base) != base
+            or not os.path.isdir(base)):
+        raise BudgetFailure("monitor_unavailable", detail="worker Cargo cache base is not a resolved physical directory")
+    homes = [os.path.join(base, plan["name"])]
+    if plan["additional_home"] is not None:
+        homes.append(plan["additional_home"])
+    aliases = {}
+    for home in dict.fromkeys(homes):
+        for logical in (home, os.path.join(home, "registry"), os.path.join(home, "git")):
+            physical = os.path.realpath(logical)
+            if not os.path.isdir(os.path.dirname(physical)):
+                raise BudgetFailure("monitor_unavailable", detail="Cargo cache parent must already exist before admission")
+            try:
+                os.mkdir(physical)
+            except FileExistsError:
+                pass
+            if not stat.S_ISDIR(os.stat(physical, follow_symlinks=False).st_mode):
+                raise BudgetFailure("monitor_unavailable", detail="Cargo cache output root is not a physical directory")
+            aliases[logical] = physical
+    verify_cargo_cache_bindings(aliases)
+    return list(dict.fromkeys(aliases.values())), aliases
+
+
+def verify_cargo_cache_bindings(aliases):
+    for logical, physical in aliases.items():
+        if os.path.realpath(logical) != physical:
+            raise BudgetFailure("monitor_unavailable", detail="Cargo cache redirect changed during execution")
+
+
 class OutputScan:
     def __init__(self, total, records=None, pool_state=None, pool_bytes=0, added=None):
         self.total, self.records = total, records
@@ -459,15 +524,16 @@ class Registry:
 
 
 class Monitor:
-    def __init__(self, budget, floor, target, paths, outputs=None):
+    def __init__(self, budget, floor, target, paths, outputs=None, cargo_cache=None):
         self.budget, self.floor = budget, floor
         self.target = target
-        self.outputs = list(dict.fromkeys([target] + (outputs or [])))
+        self.boot, self.group = boot_identity(), os.getpgrp()
+        cache_outputs, self.cargo_cache_bindings = prepare_cargo_cache_roots(cargo_cache)
+        self.outputs = list(dict.fromkeys([target] + (outputs or []) + cache_outputs))
         # Every managed output volume needs both a reservation and ongoing
         # floor protection, even when a caller omitted it from its probe list.
         self.paths = list(dict.fromkeys(paths + [target] + self.outputs))
         self.bindings = output_bindings(self.outputs)
-        self.boot, self.group = boot_identity(), os.getpgrp()
         if self.group <= 1:
             raise BudgetFailure("monitor_unavailable", detail="build has no isolated process group")
         snapshot = process_snapshot()
@@ -498,15 +564,19 @@ class Monitor:
         self.previous = None
 
     def sample(self):
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         verify_output_bindings(self.bindings)
         samples = filesystem_sample(self.paths)
         verify_output_bindings(self.bindings)
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         return samples
 
     def scan(self):
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         verify_output_bindings(self.bindings)
         result = measure_outputs(self.outputs, self.target, getattr(self, "baseline_records", None))
         verify_output_bindings(self.bindings)
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         return result
 
     def pool_observation(self, scan):
@@ -733,7 +803,7 @@ def finish_descendants(monitor, heartbeat):
         time.sleep(0.025)
 
 
-def supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False):
+def supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False, cargo_cache=None, cargo_cache_required=False):
     monitor = child = None
     started = receipt_owned = False
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -750,8 +820,9 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                 os.close(descriptor)
             receipt_owned = True
         validate_warm_policy(warm_policy, budget)
+        validate_cargo_cache_plan(cargo_cache, cargo_cache_required)
         monitor = bounded_result(
-            executor.submit(Monitor, budget, floor, target, paths, outputs),
+            executor.submit(Monitor, budget, floor, target, paths, outputs, cargo_cache),
             time.monotonic() + SCAN_DEADLINE, heartbeat,
         )
         monitor.require_warm_pool(warm_policy)
@@ -849,7 +920,7 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         executor.shutdown(wait=False)
 
 
-def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, command, mode, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False):
+def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, command, mode, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False, cargo_cache=None, cargo_cache_required=False):
     if mode == "standalone":
         os.setsid()
     elif mode != "tracked":
@@ -869,7 +940,7 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
                 os.write(write_fd, value)
 
         parent_guardian = os.getppid()
-        result = supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds, receipt_initialized, warm_policy, require_incremental_tracking)
+        result = supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds, receipt_initialized, warm_policy, require_incremental_tracking, cargo_cache, cargo_cache_required)
         os.write(write_fd, b"C")
         os._exit(result)
     os.close(write_fd)
@@ -945,7 +1016,7 @@ def main(argv):
     require_incremental_tracking = plan.get("require_incremental_tracking", False)
     if type(require_incremental_tracking) is not bool:
         raise ValueError("invalid required output tracking mode")
-    return run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, argv[6:], mode, timeout_seconds, receipt_initialized, plan.get("warm_policy"), require_incremental_tracking)
+    return run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, argv[6:], mode, timeout_seconds, receipt_initialized, plan.get("warm_policy"), require_incremental_tracking, plan.get("cargo_cache"), plan.get("cargo_cache_required", False))
 
 
 if __name__ == "__main__":

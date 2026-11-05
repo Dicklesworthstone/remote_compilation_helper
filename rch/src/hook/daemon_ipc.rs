@@ -394,6 +394,13 @@ fn unresolved_toolchain_refusal(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionQueryIntent {
+    Admit,
+    ColdRetry,
+    Preview,
+}
+
 /// Query the daemon for a worker (reserves slots and opens a durable build).
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
 pub(crate) async fn query_daemon(
@@ -430,7 +437,51 @@ pub(crate) async fn query_daemon(
         preferred_workers,
         job_mode,
         required_tools,
-        false,
+        SelectionQueryIntent::Admit,
+        source_topology,
+    )
+    .await
+}
+
+/// Obtain an unconditional cold reservation after an acknowledged prelaunch
+/// refusal. The numeric headroom remains a minimum: it must not be the signal
+/// that disables warm admission, since ordinary callers also set that minimum.
+#[allow(clippy::too_many_arguments)] // Mirrors the owning selection query.
+pub(crate) async fn query_daemon_cold(
+    socket_path: &str,
+    project: &str,
+    cores: u32,
+    disk_headroom_gib: u32,
+    command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+    command_priority: CommandPriority,
+    classification_duration_us: u64,
+    hook_pid: Option<u32>,
+    local_wrapper_id: Option<&str>,
+    wait_for_worker: bool,
+    preferred_workers: &[WorkerId],
+    job_mode: bool,
+    required_tools: &[String],
+    source_topology: Option<&rch_common::SourceTopology>,
+) -> anyhow::Result<SelectionResponse> {
+    query_daemon_with_mode(
+        socket_path,
+        project,
+        cores,
+        disk_headroom_gib,
+        command,
+        toolchain,
+        required_runtime,
+        command_priority,
+        classification_duration_us,
+        hook_pid,
+        local_wrapper_id,
+        wait_for_worker,
+        preferred_workers,
+        job_mode,
+        required_tools,
+        SelectionQueryIntent::ColdRetry,
         source_topology,
     )
     .await
@@ -467,7 +518,7 @@ pub(crate) async fn query_daemon_dry_run(
         preferred_workers,
         false,
         &[],
-        true,
+        SelectionQueryIntent::Preview,
         source_topology,
     )
     .await
@@ -524,9 +575,10 @@ async fn query_daemon_with_mode(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
-    dry_run: bool,
+    intent: SelectionQueryIntent,
     source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
+    let dry_run = intent == SelectionQueryIntent::Preview;
     if let Some(topology) = source_topology {
         topology.validate().map_err(anyhow::Error::msg)?;
     }
@@ -570,10 +622,10 @@ async fn query_daemon_with_mode(
     // Only the durable exec path can acknowledge release and obtain a cold
     // reservation after an exact prelaunch pool refusal. Legacy hooks keep
     // conservative cold admission until they support that transition.
-    // A positive minimum also names the cold-retry route. Omit capability on
-    // that request even if concurrent history raises the cold requirement
-    // above its numeric minimum while reselection is in flight.
-    if (local_wrapper_id.is_some() || dry_run) && disk_headroom_gib == 0 {
+    // Explicit cold retries omit capability even if concurrent learning raises
+    // the cold requirement above the requested minimum. An ordinary positive
+    // minimum must not disable verified retained-pool credit.
+    if intent != SelectionQueryIntent::ColdRetry && (local_wrapper_id.is_some() || dry_run) {
         query.push_str(&format!(
             "&disk_observation_version={}",
             rch_common::BuildDiskObservation::VERSION
@@ -1297,7 +1349,7 @@ mod bounded_ipc_tests {
     use super::*;
 
     #[tokio::test]
-    async fn only_durable_exec_requests_advertise_conditional_disk_admission() {
+    async fn warm_capability_distinguishes_minimum_headroom_from_cold_retry() {
         let directory = tempfile::tempdir().unwrap().keep();
         let path = directory.join("warm-capability.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1310,7 +1362,7 @@ mod bounded_ipc_tests {
         .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..6 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut request = String::new();
@@ -1330,7 +1382,7 @@ mod bounded_ipc_tests {
             for (wrapper, headroom) in [
                 (None, 0),
                 (Some("warm-capability-wrapper"), 0),
-                (Some("warm-capability-wrapper"), 103),
+                (Some("warm-capability-wrapper"), 1),
             ] {
                 query_daemon(
                     path.to_str().unwrap(),
@@ -1353,12 +1405,56 @@ mod bounded_ipc_tests {
                 .await
                 .unwrap();
             }
+            // Explicit cold intent stays unconditional even if the minimum
+            // is smaller than newly learned cold history during selection.
+            for headroom in [1, 103] {
+                query_daemon_cold(
+                    path.to_str().unwrap(),
+                    "project",
+                    1,
+                    headroom,
+                    "make",
+                    None,
+                    RequiredRuntime::None,
+                    CommandPriority::Normal,
+                    0,
+                    None,
+                    Some("warm-capability-wrapper"),
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            query_daemon_dry_run(
+                path.to_str().unwrap(),
+                "project",
+                1,
+                1,
+                "make",
+                None,
+                RequiredRuntime::None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
         };
         let (requests, ()) = tokio::join!(server, client);
         assert!(!requests[0].contains("disk_observation_version="));
         assert!(requests[1].contains("&disk_observation_version=1"));
-        assert!(!requests[2].contains("disk_observation_version="));
-        assert!(requests[2].contains("disk_headroom_gib=103"));
+        assert!(requests[2].contains("&disk_observation_version=1"));
+        assert!(requests[2].contains("disk_headroom_gib=1"));
+        assert!(!requests[3].contains("disk_observation_version="));
+        assert!(requests[3].contains("disk_headroom_gib=1"));
+        assert!(!requests[4].contains("disk_observation_version="));
+        assert!(requests[4].contains("disk_headroom_gib=103"));
+        assert!(requests[5].contains("&disk_observation_version=1"));
+        assert!(requests[5].contains("disk_headroom_gib=1"));
+        assert!(requests[5].contains("dry_run=1"));
     }
 
     #[test]

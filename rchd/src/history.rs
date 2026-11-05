@@ -2,7 +2,9 @@
 //!
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
-use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+use crate::disk_pressure::{
+    DiskHeadroomAdmission, DiskHeadroomAvailability, DiskHeadroomRejection,
+};
 use crate::headroom::{
     FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
     legacy_footprint_key, warm_footprint_key,
@@ -394,6 +396,11 @@ pub struct QueuedBuildState {
     /// lack this authority and remain inspectable/cancellable, not resumable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_contract: Option<QueueSelectionContract>,
+    /// A later attempt may queue behind the same wrapper's completed attempt.
+    /// Bind that exact receipt so a stale, unconsumed queue beside a terminal
+    /// attempt never becomes replay authority during recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_attempt_id: Option<u64>,
     /// An exclusive waiter exists only in this daemon incarnation.
     #[serde(skip)]
     waiter_claim: Option<u64>,
@@ -1176,6 +1183,7 @@ impl BuildHistory {
 
     /// Advisory selection uses the same budget and completion boundary checked
     /// again by authoritative admission under the same ownership lock.
+    #[cfg(test)]
     pub(crate) fn check_disk_headroom(
         &self,
         worker_id: &str,
@@ -1183,6 +1191,42 @@ impl BuildHistory {
     ) -> Result<(), DiskHeadroomRejection> {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         self.check_disk_headroom_locked(&active, worker_id, disk)
+    }
+
+    /// Classify a refusal for the durable wait queue without weakening the
+    /// admission check. The ownership lock keeps reservations and completion
+    /// cutoffs consistent while asking whether this request fits on its own.
+    pub(crate) fn disk_headroom_availability(
+        &self,
+        worker_id: &str,
+        disk: &DiskHeadroomAdmission,
+    ) -> DiskHeadroomAvailability {
+        let active = self.active.read().unwrap_or_else(|e| e.into_inner());
+        let Err(failure) = self.check_disk_headroom_locked(&active, worker_id, disk) else {
+            return DiskHeadroomAvailability::Available;
+        };
+        match failure {
+            DiskHeadroomRejection::Insufficient { .. }
+                if active.values().any(|state| {
+                    state.location == BuildLocation::Remote && state.worker_id == worker_id
+                }) && disk.check_after_completion(worker_id, 0, None).is_ok() =>
+            {
+                // The real check already validated the completion cutoff. Use
+                // this request's floor: a larger competing floor retires with
+                // that owner, just like its whole growth reservation.
+                DiskHeadroomAvailability::Reserved(failure)
+            }
+            DiskHeadroomRejection::Stale
+                if disk.check_after_completion(worker_id, 0, None).is_ok() =>
+            {
+                // Without the completion fence this observation is still
+                // fresh, current-generation and sufficient for one request.
+                // Only an existing durable waiter may bridge the probe gap;
+                // neither new requests nor authoritative admission trust it.
+                DiskHeadroomAvailability::AwaitingProbe(failure)
+            }
+            _ => DiskHeadroomAvailability::Unavailable(failure),
+        }
     }
 
     fn check_disk_headroom_locked(
@@ -1939,13 +1983,7 @@ impl BuildHistory {
                     .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
                 || active
                     .values()
-                    .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
-                || self
-                    .terminal
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .any(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper)))
+                    .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper)))
         {
             return None;
         }
@@ -1964,6 +2002,15 @@ impl BuildHistory {
         let id = self.next_queue_id()?;
         let nonce = self.next_waiter_claim.fetch_add(1, Ordering::SeqCst);
         let queued_at = Utc::now().to_rfc3339();
+        let previous_attempt_id = local_wrapper_id.as_deref().and_then(|wrapper| {
+            self.terminal
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .filter(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
+                .map(|receipt| receipt.record.id)
+                .max()
+        });
         let state = QueuedBuildState {
             id,
             project_id,
@@ -1975,10 +2022,17 @@ impl BuildHistory {
             local_wrapper_id,
             slots_needed,
             selection_contract,
+            previous_attempt_id,
             waiter_claim: Some(nonce),
             estimated_start: None,
             recovered: false,
         };
+        if !queue_predecessor_matches(
+            &state,
+            &self.terminal.read().unwrap_or_else(|e| e.into_inner()),
+        ) {
+            return None;
+        }
 
         // Do not expose queue membership before both it and its ID high-water
         // mark are durable. A post-rename failure may leave the row on disk;
@@ -2693,7 +2747,7 @@ impl BuildHistory {
                     }
                     terminal.insert(id, receipt);
                 }
-                let mut occupied = occupied_wrapper_ids(&active, &terminal, &cancelled_wrappers);
+                let mut occupied = occupied_wrapper_ids(&active, &cancelled_wrappers);
                 let wall_now = Utc::now();
                 let mono_now = Instant::now();
                 let mut previous_id = None;
@@ -2704,6 +2758,7 @@ impl BuildHistory {
                         || state.local_wrapper_id.as_ref().is_some_and(|wrapper| {
                             wrapper.is_empty() || !occupied.insert(wrapper.clone())
                         })
+                        || !queue_predecessor_matches(state, &terminal)
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -2746,7 +2801,11 @@ impl BuildHistory {
         let queue_epoch = QUEUE_ID_NAMESPACE | epoch_id;
         let next_queue_id = next_queue_id.map_or(queue_epoch, |id| id.max(queue_epoch));
         // After max_id counted them: a pruned receipt's id is never reissued.
-        prune_terminal_receipts(&mut terminal, Utc::now());
+        let queue_predecessors = queued
+            .iter()
+            .filter_map(|row| row.previous_attempt_id)
+            .collect();
+        prune_terminal_receipts(&mut terminal, Utc::now(), &queue_predecessors);
 
         let history = Self {
             records: RwLock::new(records),
@@ -3130,9 +3189,17 @@ impl BuildHistory {
             pending_disk_fault,
             unapplied_disk_fault,
         };
+        let queue_predecessors = self
+            .queued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|row| row.previous_attempt_id)
+            .collect();
         prune_terminal_receipts(
             &mut self.terminal.write().unwrap_or_else(|e| e.into_inner()),
             Utc::now(),
+            &queue_predecessors,
         );
         self.persist_ownership(&active, Some(&receipt))?;
         self.terminal
@@ -3193,7 +3260,6 @@ impl BuildHistory {
         }
         let occupied = occupied_wrapper_ids(
             active,
-            &self.terminal.read().unwrap_or_else(|e| e.into_inner()),
             &self
                 .cancelled_wrappers
                 .read()
@@ -3304,32 +3370,59 @@ impl BuildHistory {
     }
 }
 
-/// Queue visibility and active/terminal/no-start ownership are disjoint for
-/// durable wrapper identities. Anonymous legacy queue rows cannot be joined
-/// to an execution by a reusable PID and are never guessed away here.
+/// Queue visibility is disjoint from live execution and cancellation. Terminal
+/// attempts own no resources: a later queued attempt may explicitly bind its
+/// predecessor without being removed by unrelated ownership publication.
 fn occupied_wrapper_ids(
     active: &HashMap<u64, ActiveBuildState>,
-    terminal: &HashMap<u64, TerminalOwnership>,
     cancelled: &HashSet<String>,
 ) -> HashSet<String> {
     active
         .values()
         .filter_map(|state| state.local_wrapper_id.clone())
-        .chain(
-            terminal
-                .values()
-                .filter_map(|receipt| receipt.local_wrapper_id.clone()),
-        )
         .chain(cancelled.iter().cloned())
         .collect()
 }
 
+/// Only an explicitly bound, identity-consistent later selection may coexist
+/// with an old terminal receipt. Legacy ambiguous overlaps remain invalid.
+fn queue_predecessor_matches(
+    queued: &QueuedBuildState,
+    terminal: &HashMap<u64, TerminalOwnership>,
+) -> bool {
+    let latest = queued.local_wrapper_id.as_deref().and_then(|wrapper| {
+        terminal
+            .values()
+            .filter(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
+            .max_by_key(|receipt| receipt.record.id)
+    });
+    match (queued.previous_attempt_id, latest) {
+        (None, None) => true,
+        (Some(previous), Some(receipt)) => {
+            queued.selection_contract.is_some()
+                && previous == receipt.record.id
+                && receipt.record.location == BuildLocation::Remote
+                && receipt.record.project_id == queued.project_id
+                && receipt.record.command == queued.command
+                && receipt.record.cancellation.is_none()
+                && receipt.record.exit_code != 130
+        }
+        _ => false,
+    }
+}
+
 /// Drop receipts past retention, then the oldest beyond the cap. An
-/// unparseable completion time sorts oldest.
-fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: DateTime<Utc>) {
+/// unparseable completion time sorts oldest. Queue predecessors are bounded by
+/// the live queue and must survive until its successor leaves or is admitted.
+fn prune_terminal_receipts(
+    terminal: &mut HashMap<u64, TerminalOwnership>,
+    now: DateTime<Utc>,
+    queue_predecessors: &HashSet<u64>,
+) {
     let cutoff = now - ChronoDuration::days(TERMINAL_RECEIPT_RETENTION_DAYS);
-    terminal.retain(|_, receipt| {
-        receipt.pending_disk_fault.is_some()
+    terminal.retain(|id, receipt| {
+        queue_predecessors.contains(id)
+            || receipt.pending_disk_fault.is_some()
             || DateTime::parse_from_rfc3339(&receipt.record.completed_at)
                 .map_or(true, |completed| completed >= cutoff)
     });
@@ -3338,7 +3431,9 @@ fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: 
     };
     let mut by_age: Vec<_> = terminal
         .iter()
-        .filter(|(_, receipt)| receipt.pending_disk_fault.is_none())
+        .filter(|(id, receipt)| {
+            !queue_predecessors.contains(*id) && receipt.pending_disk_fault.is_none()
+        })
         .map(|(id, receipt)| {
             (
                 DateTime::parse_from_rfc3339(&receipt.record.completed_at).ok(),
@@ -5020,6 +5115,137 @@ mod tests {
             Err(DiskHeadroomRejection::Stale)
         );
         assert!(disk_budget_admit_snapshot(&restored, "new", "w", sample()).is_some());
+    }
+
+    #[tokio::test]
+    async fn disk_contention_classification_never_relaxes_owned_admission() {
+        let history = BuildHistory::new(10);
+        let request = |worker, free, age| DiskHeadroomAdmission {
+            requested_gib: 64,
+            floor_gib: 10,
+            warm_policy: None,
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                worker, free, age,
+            )),
+        };
+        let original = request("worker", 100.0, Duration::ZERO);
+        let owner =
+            disk_budget_admit_snapshot(&history, "owner", "worker", original.clone()).unwrap();
+        assert!(matches!(
+            history.disk_headroom_availability("worker", &original),
+            DiskHeadroomAvailability::Reserved(_)
+        ));
+        assert!(
+            disk_budget_admit_snapshot(&history, "waiter", "worker", original.clone()).is_none()
+        );
+        assert_eq!(history.reserved_disk_headroom_gib("worker"), 64);
+
+        for (disk, expected) in [
+            (
+                request("worker", 51.0, Duration::ZERO),
+                DiskHeadroomRejection::Insufficient {
+                    free_gib: 51,
+                    required_gib: 138,
+                },
+            ),
+            (
+                request("worker", 100.0, Duration::from_secs(91)),
+                DiskHeadroomRejection::Stale,
+            ),
+            (
+                request("wrong-worker", 100.0, Duration::ZERO),
+                DiskHeadroomRejection::Unknown,
+            ),
+            (
+                DiskHeadroomAdmission {
+                    capacity: None,
+                    ..original.clone()
+                },
+                DiskHeadroomRejection::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                history.disk_headroom_availability("worker", &disk),
+                DiskHeadroomAvailability::Unavailable(expected)
+            );
+        }
+
+        // Cancellation/failure releases the owner's reservation, never its
+        // retained bytes. An existing waiter bridges only the fresh-probe gap.
+        finish_owned(&history, &owner, 130);
+        let awaiting = history.disk_headroom_availability("worker", &original);
+        assert_eq!(
+            awaiting,
+            DiskHeadroomAvailability::AwaitingProbe(DiskHeadroomRejection::Stale)
+        );
+        assert!(awaiting.can_wait(true));
+        assert!(!awaiting.can_wait(false));
+        assert_eq!(
+            history.check_disk_headroom("worker", &original),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(disk_budget_admit_snapshot(&history, "waiter", "worker", original).is_none());
+        let expired = request("worker", 100.0, Duration::from_secs(91));
+        assert_eq!(
+            history.disk_headroom_availability("worker", &expired),
+            DiskHeadroomAvailability::Unavailable(DiskHeadroomRejection::Stale)
+        );
+        let retained = request("worker", 20.0, Duration::ZERO);
+        assert!(matches!(
+            history.disk_headroom_availability("worker", &retained),
+            DiskHeadroomAvailability::Unavailable(DiskHeadroomRejection::Insufficient { .. })
+        ));
+        let fresh = request("worker", 100.0, Duration::ZERO);
+        assert_eq!(
+            history.disk_headroom_availability("worker", &fresh),
+            DiskHeadroomAvailability::Available
+        );
+        assert!(disk_budget_admit_snapshot(&history, "waiter", "worker", fresh).is_some());
+        assert_eq!(history.reserved_disk_headroom_gib("worker"), 64);
+    }
+
+    #[tokio::test]
+    async fn disk_contention_probe_wait_never_accepts_superseded_endpoint_evidence() {
+        use crate::disk_pressure::DiskCapacityObservation;
+        let history = BuildHistory::new(10);
+        let generation = std::sync::Arc::new(AtomicU64::new(1));
+        let transport = std::sync::Arc::new(AtomicU64::new(1));
+        let disk = DiskHeadroomAdmission {
+            requested_gib: 64,
+            floor_gib: 10,
+            warm_policy: None,
+            capacity: DiskCapacityObservation::from_capabilities(
+                "worker".into(),
+                &rch_common::WorkerCapabilities {
+                    build_disk_free_gb: Some(100.0),
+                    build_disk_total_gb: Some(200.0),
+                    ..Default::default()
+                },
+                1,
+                generation.clone(),
+                1,
+                transport.clone(),
+                Instant::now(),
+            ),
+        };
+        let owner = disk_budget_admit_snapshot(&history, "owner", "worker", disk.clone()).unwrap();
+        for epoch in [&generation, &transport] {
+            epoch.store(2, Ordering::Release);
+            assert_eq!(
+                history.disk_headroom_availability("worker", &disk),
+                DiskHeadroomAvailability::Unavailable(DiskHeadroomRejection::Stale)
+            );
+            epoch.store(1, Ordering::Release);
+        }
+        finish_owned(&history, &owner, 0);
+        for epoch in [&generation, &transport] {
+            epoch.store(2, Ordering::Release);
+            assert_eq!(
+                history.disk_headroom_availability("worker", &disk),
+                DiskHeadroomAvailability::Unavailable(DiskHeadroomRejection::Stale)
+            );
+            epoch.store(1, Ordering::Release);
+        }
     }
 
     #[tokio::test]
@@ -6831,7 +7057,7 @@ mod tests {
             .map(|id| receipt(id, now - ChronoDuration::seconds(id as i64)))
             .collect();
         terminal.extend([receipt(9_999, now - ChronoDuration::days(4))]);
-        prune_terminal_receipts(&mut terminal, now);
+        prune_terminal_receipts(&mut terminal, now, &HashSet::new());
         assert_eq!(terminal.len(), MAX_TERMINAL_RECEIPTS);
         assert!(!terminal.contains_key(&9_999), "expired receipt kept");
         assert!(terminal.contains_key(&1), "newest receipt dropped");
@@ -6839,6 +7065,41 @@ mod tests {
             !terminal.contains_key(&(MAX_TERMINAL_RECEIPTS as u64 + 10)),
             "oldest kept"
         );
+    }
+
+    #[test]
+    fn queued_retry_predecessor_survives_receipt_age_and_count_limits() {
+        let now = Utc::now();
+        let previous_id = MAX_TERMINAL_RECEIPTS as u64 + 10;
+        let mut terminal: HashMap<_, _> = (1..=previous_id)
+            .map(|id| {
+                let mut record = make_build_record(id);
+                record.completed_at = if id == previous_id {
+                    now - ChronoDuration::days(4)
+                } else {
+                    now - ChronoDuration::seconds(id as i64)
+                }
+                .to_rfc3339();
+                (
+                    id,
+                    TerminalOwnership {
+                        record,
+                        local_wrapper_id: None,
+                        source_topology_mismatch: None,
+                        pending_disk_fault: None,
+                        unapplied_disk_fault: None,
+                    },
+                )
+            })
+            .collect();
+        prune_terminal_receipts(&mut terminal, now, &HashSet::from([previous_id]));
+        assert_eq!(terminal.len(), MAX_TERMINAL_RECEIPTS);
+        assert!(terminal.contains_key(&previous_id));
+        assert!(terminal.contains_key(&1));
+        assert!(!terminal.contains_key(&(previous_id - 1)));
+        // Once the successor leaves the bounded queue, normal retention applies.
+        prune_terminal_receipts(&mut terminal, now, &HashSet::new());
+        assert!(!terminal.contains_key(&previous_id));
     }
 
     #[tokio::test]
@@ -6961,7 +7222,11 @@ mod tests {
         // A fault that was never delivered cannot expire as routine history.
         {
             let mut terminal = history.terminal.write().unwrap();
-            prune_terminal_receipts(&mut terminal, Utc::now() + ChronoDuration::days(4));
+            prune_terminal_receipts(
+                &mut terminal,
+                Utc::now() + ChronoDuration::days(4),
+                &HashSet::new(),
+            );
             assert!(terminal.contains_key(&build.id));
         }
         let fault = history.pending_disk_fault(build.id).unwrap();
@@ -7576,6 +7841,214 @@ mod tests {
             .unwrap()
             .unwrap()
             .1
+    }
+
+    fn enqueue_retry_attempt(
+        history: &BuildHistory,
+    ) -> Option<(QueuedBuildState, QueuedWaiterClaim)> {
+        history.enqueue_selection_build(
+            "retry-project".into(),
+            "cargo build".into(),
+            observable_test_process_id(),
+            2,
+            Some("retrying".into()),
+            QueueSelectionContract {
+                digest: [7; 32],
+                timeout_secs: 45,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_retry_predecessor_survives_publication_restart_and_owned_admission() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let previous = complete_retry_attempt(&history, "worker", "retrying");
+        let (queued, claim) = enqueue_retry_attempt(&history).unwrap();
+        assert_eq!(queued.previous_attempt_id, Some(previous.id));
+        assert!(
+            enqueue_retry_attempt(&history).is_none(),
+            "duplicate waiter rejected"
+        );
+        assert!(
+            history
+                .try_start_active_build_with_wrapper(
+                    "retry-project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    observable_test_process_id(),
+                    Some("retrying".into()),
+                    2,
+                    BuildLocation::Remote,
+                )
+                .unwrap()
+                .is_none(),
+            "a new request cannot consume the queued retry"
+        );
+        assert!(
+            history
+                .complete_durable(
+                    previous.id,
+                    "worker",
+                    Some("retrying"),
+                    disk_budget_completion(0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(history.owns_queued_waiter(&claim));
+
+        // A busy fleet can prune hundreds of ordinary receipts while a retry
+        // waits. Neither that pruning nor unrelated ownership writes may erase
+        // the predecessor required to recover this later queue safely.
+        history
+            .terminal
+            .write()
+            .unwrap()
+            .get_mut(&previous.id)
+            .unwrap()
+            .record
+            .completed_at = (Utc::now() - ChronoDuration::days(4)).to_rfc3339();
+        complete_retry_attempt(&history, "other-worker", "other-wrapper");
+        assert!(history.terminal_build(previous.id, "retrying").is_some());
+        assert!(history.queued_build(queued.id).is_some());
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.terminal_build(previous.id, "retrying").is_some());
+        assert_eq!(
+            restored
+                .queued_build(queued.id)
+                .unwrap()
+                .previous_attempt_id,
+            Some(previous.id)
+        );
+        let (_, resumed) = restored
+            .resume_queued_build("retrying", observable_test_process_id(), &[7; 32])
+            .unwrap();
+        let current = restored
+            .try_start_active_build_with_waiter(
+                "retry-project".into(),
+                "worker".into(),
+                "cargo build".into(),
+                observable_test_process_id(),
+                Some("retrying".into()),
+                2,
+                BuildLocation::Remote,
+                Some(&resumed),
+                DiskHeadroomAdmission::default(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(current.id, previous.id);
+        assert_eq!(restored.queue_depth(), 0);
+        assert!(
+            restored
+                .complete_durable(
+                    previous.id,
+                    "worker",
+                    Some("retrying"),
+                    disk_budget_completion(0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(restored.active_build(current.id).is_some());
+        let restarted = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restarted.active_build(current.id).is_some());
+        assert!(restarted.queued_build(queued.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_retry_predecessor_requires_exact_evidence_and_preserves_cancellation() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let previous = complete_retry_attempt(&history, "worker", "retrying");
+        assert!(
+            history
+                .enqueue_build(
+                    "retry-project".into(),
+                    "cargo build".into(),
+                    0,
+                    2,
+                    Some("retrying".into()),
+                )
+                .is_none(),
+            "legacy queue rows cannot authorize a retry"
+        );
+        let (queued, _) = enqueue_retry_attempt(&history).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        for scenario in [
+            "legacy",
+            "wrong-id",
+            "wrong-project",
+            "wrong-command",
+            "no-contract",
+            "missing-receipt",
+        ] {
+            let mut invalid = original.clone();
+            match scenario {
+                "legacy" => {
+                    invalid["queued"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("previous_attempt_id");
+                }
+                "wrong-id" => {
+                    invalid["queued"][0]["previous_attempt_id"] = serde_json::json!(previous.id + 1)
+                }
+                "wrong-project" => {
+                    invalid["queued"][0]["project_id"] = serde_json::json!("different")
+                }
+                "wrong-command" => {
+                    invalid["queued"][0]["command"] = serde_json::json!("cargo test")
+                }
+                "no-contract" => {
+                    invalid["queued"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("selection_contract");
+                }
+                "missing-receipt" => invalid["completed"] = serde_json::json!([]),
+                _ => unreachable!(),
+            }
+            let invalid_path = root.path().join(format!("{scenario}.jsonl"));
+            std::fs::write(
+                invalid_path.with_extension("ownership.json"),
+                serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                BuildHistory::load_from_file(&invalid_path, 10).is_err(),
+                "{scenario}"
+            );
+        }
+        assert!(matches!(
+            history.cancel_wrapper("retrying").unwrap(),
+            WrapperCancellation::BeforeStart
+        ));
+        assert!(history.queued_build(queued.id).is_none());
+        assert!(history.terminal_build(previous.id, "retrying").is_some());
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.wrapper_cancelled("retrying"));
+        assert!(restored.queued_build(queued.id).is_none());
+        assert!(enqueue_retry_attempt(&restored).is_none());
+        assert!(
+            restored
+                .complete_durable(
+                    previous.id,
+                    "worker",
+                    Some("retrying"),
+                    disk_budget_completion(0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(restored.wrapper_cancelled("retrying"));
     }
 
     #[tokio::test]

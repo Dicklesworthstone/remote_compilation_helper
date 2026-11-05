@@ -102,14 +102,25 @@ before admission and launch. A mismatch or an unfunded current source/cache
 baseline requires a **new cold reservation**; the worker cannot enlarge its
 allowance independently. After confirmed release, `rch exec` refreshes capacity
 and permits one cold reselection. A failed refresh does not waive freshness.
-An explicit positive client headroom request, including that retry, suppresses
-warm capability so concurrently learned cold requirements cannot turn it into
-another conditional reservation.
+An ordinary positive client headroom request remains a minimum and permits
+verified warm-pool credit. The client marks the cold retry explicitly and omits
+warm capability on that request, so concurrently learned cold requirements
+cannot turn the retry into another conditional reservation. Admission previews
+use the same minimum and warm capability as ordinary durable execution.
 
 New ownership snapshots use format version 3 so an older daemon cannot silently
 discard the warm condition and restore a discounted reservation as unconditional.
 The current daemon accepts legacy versions 1 and 2 only for cold reservations;
 conditional reservations require the complete, validated version 3 state.
+
+If the cold retry must queue, its durable row binds the exact previous remote
+attempt's completion receipt. An older receipt cannot stand in for the new
+waiter during cancellation, remove it on an unrelated ownership write, or
+release another active attempt. Recovery verifies the same wrapper, project,
+command, and predecessor ID; ambiguous legacy queued/terminal overlaps still
+refuse recovery. The predecessor receipt is retained while that waiter needs
+it. Older readers reject this additional queue field instead of discarding the
+retry relationship.
 
 Warm execution is currently limited to durable `rch exec` with ordinary,
 single-root Cargo source synchronization. Its rsync receiver runs under the
@@ -184,6 +195,23 @@ flight at completion is insufficient. Interrupted or unconfirmed ownership
 remains reserved through retries and recovery; elapsed time or a reused PID is
 not evidence that the old work stopped.
 
+When fresh capacity proves that a request fits by itself but competing owned
+reservations prevent admission, selection reports the worker as busy. With
+queueing enabled, the request enters the same durable wait queue as a request
+waiting for CPU slots. It retains the original deadline and cancellation
+identity and does not hold CPU slots while waiting for disk. Other suitability
+checks still apply; Critical pressure, insufficient capacity for a single
+request, missing observations, and expired or superseded evidence remain
+refusals.
+
+An existing queued request can bridge the short interval between a competing
+owner's confirmed completion and the next capacity probe. This permits waiting
+only: the old observation cannot fund admission, and its ordinary age and
+generation limits still apply. New requests retain the normal stale-capacity
+refresh/refusal behavior. A post-completion probe must prove enough current
+space, including retained artifacts and remaining owners, before the waiter
+receives a reservation.
+
 A connection loss invalidates earlier capacity measurements, including copies
 already held by an admission attempt. Reconnecting or re-enabling a worker
 does not restore those measurements or clear its reservations. Guarded
@@ -209,6 +237,31 @@ directory in the output scan. Physical directory identities are verified;
 symlink output roots, replacement roots, scan failures, and unaccounted
 filesystem changes cannot silently become zero usage. Hard links and nested
 output roots are deduplicated within a scan.
+
+Dispatcher-managed Cargo execution also includes the worker's durable
+`rch-cargo-cache-<worker>` home, an explicit literal absolute `CARGO_HOME`
+override, and physical destinations of their `registry` and `git` redirects.
+The client captures the original command before shell wrapping; the monitor
+resolves the default cache from the worker's canonical `RCH_CH_BASE`, before
+client environment forwarding or a change of working directory. Redirects and
+physical directory identities are rechecked during scans and free-space
+sampling. Every resulting filesystem participates in reservation and floor
+checks.
+
+Existing Cargo cache bytes receive no target-pool credit. They remain an
+unproven baseline, and an unfunded cache requires cold readmission before the
+workload starts. New cache allocations count even if target cleanup masks
+their filesystem free-space change. A dynamic, relative, removed, or otherwise
+unresolved Cargo home refuses before launch with `monitor_unavailable` and no
+learning receipt; a larger cold allowance cannot resolve an unknown output
+scope. Cache preparation creates only the bounded home/registry/git
+directories; their parent trees must already exist.
+
+Direct `rch-wkr execute` remains cold-only and rejects conditional warm
+budgets. Its existing inherited Cargo/Rustup home probes protect filesystem
+floors, but do not provide the dispatcher's cache-output attribution or resolve
+command-local home overrides. Arbitrary build-script destinations remain
+outside the declared output scope.
 
 The initial output size is the baseline. Runtime accounting tracks new and
 modified allocation as well as positive net growth, so concurrent cleanup cannot
@@ -337,6 +390,11 @@ the actual remote build and target filesystems, and allow confirmed completion
 and a fresh probe to update capacity before diagnosing a retained reservation
 as a leak. Use the [worker recovery runbook](worker-recovery.md) for uncertain
 process ownership; do not kill a process using only an old numeric PID.
+
+`disk_headroom_reserved` identifies a request that fits alone and can wait for
+competing reservations. `disk_headroom_awaiting_probe` identifies an existing
+waiter awaiting a post-completion sample. Neither diagnostic waives disk
+admission or reserves CPU capacity.
 
 Callers can reduce artifact size with validated Cargo profile settings such as
 `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_PROFILE_TEST_INCREMENTAL=false`.

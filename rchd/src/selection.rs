@@ -10,7 +10,9 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::admission::AdmissionGate;
-use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection, PressureState};
+use crate::disk_pressure::{
+    DiskHeadroomAdmission, DiskHeadroomAvailability, DiskHeadroomRejection, PressureState,
+};
 use crate::metrics::{
     self,
     latency::{DecisionTimer, DecisionType},
@@ -600,6 +602,9 @@ pub struct WorkerSelector {
     /// successful choice spends no half-open probe slot, fairness record,
     /// audit entry or selection metric.
     preview: bool,
+    /// Internal round state, never a caller-controlled selection field. An
+    /// existing durable waiter may bridge a just-completed owner's probe gap.
+    queued_disk_wait: bool,
 }
 
 /// Result of worker selection with reason.
@@ -648,6 +653,7 @@ impl WorkerSelector {
             reliability: None,
             ssh_pool: None,
             preview: false,
+            queued_disk_wait: false,
         }
     }
 
@@ -666,6 +672,7 @@ impl WorkerSelector {
             reliability: None,
             ssh_pool: None,
             preview: false,
+            queued_disk_wait: false,
         }
     }
 
@@ -781,29 +788,40 @@ impl WorkerSelector {
         worker_id: &str,
         request: &SelectionRequest,
     ) -> Option<DiskHeadroomRejection> {
+        self.disk_headroom_availability(worker, worker_id, request)
+            .await
+            .rejection()
+    }
+
+    async fn disk_headroom_availability(
+        &self,
+        worker: &WorkerState,
+        worker_id: &str,
+        request: &SelectionRequest,
+    ) -> DiskHeadroomAvailability {
         let endpoint = worker.endpoint_snapshot().await;
-        let budget = self.build_disk_budget_for_endpoint(request, &endpoint)?;
-        let Some(history) = &self.build_history else {
-            return Some(DiskHeadroomRejection::Unknown);
+        let Some(budget) = self.build_disk_budget_for_endpoint(request, &endpoint) else {
+            return DiskHeadroomAvailability::Available;
         };
-        history
-            .check_disk_headroom(
-                worker_id,
-                &DiskHeadroomAdmission {
-                    requested_gib: u32::try_from(
-                        budget
-                            .max_growth_bytes
-                            .div_ceil(rch_common::BuildDiskBudget::GIB),
-                    )
-                    .unwrap_or(u32::MAX),
-                    floor_gib: budget
-                        .min_free_bytes
+        let Some(history) = &self.build_history else {
+            return DiskHeadroomAvailability::Unavailable(DiskHeadroomRejection::Unknown);
+        };
+        history.disk_headroom_availability(
+            worker_id,
+            &DiskHeadroomAdmission {
+                requested_gib: u32::try_from(
+                    budget
+                        .max_growth_bytes
                         .div_ceil(rch_common::BuildDiskBudget::GIB),
-                    capacity: worker.disk_capacity_observation().await,
-                    warm_policy: budget.warm_policy,
-                },
-            )
-            .err()
+                )
+                .unwrap_or(u32::MAX),
+                floor_gib: budget
+                    .min_free_bytes
+                    .div_ceil(rch_common::BuildDiskBudget::GIB),
+                capacity: worker.disk_capacity_observation().await,
+                warm_policy: budget.warm_policy,
+            },
+        )
     }
 
     async fn source_topology_mismatch(
@@ -909,16 +927,30 @@ impl WorkerSelector {
         request: &'a SelectionRequest,
         excluded_worker_ids: &'a HashSet<String>,
     ) -> impl std::future::Future<Output = SelectionResult> + Send + 'a {
+        self.select_with_waiter(pool, request, excluded_worker_ids, false)
+    }
+
+    /// Only the API's already-claimed durable queue can enable completion-probe
+    /// waiting. Admission still repeats every authoritative budget check.
+    pub(crate) fn select_with_waiter<'a>(
+        &'a self,
+        pool: &'a WorkerPool,
+        request: &'a SelectionRequest,
+        excluded_worker_ids: &'a HashSet<String>,
+        existing_waiter: bool,
+    ) -> impl std::future::Future<Output = SelectionResult> + Send + 'a {
         async fn select_round(
             selector: &WorkerSelector,
             pool: &WorkerPool,
             request: &SelectionRequest,
             excluded_worker_ids: &HashSet<String>,
+            existing_waiter: bool,
         ) -> SelectionResult {
             // Scoring, diagnostics, and audit must see this request's verdicts.
             // A shared cache lets concurrent requests erase one another's disk
             // decisions. Recovery hysteresis stays shared inside the forked gate.
             let mut round = selector.clone();
+            round.queued_disk_wait = existing_waiter;
             round.admission_gate = selector
                 .admission_gate
                 .as_ref()
@@ -928,7 +960,7 @@ impl WorkerSelector {
                 .await
         }
 
-        select_round(self, pool, request, excluded_worker_ids)
+        select_round(self, pool, request, excluded_worker_ids, existing_waiter)
     }
 
     /// The worker [`Self::select_with_exclusions`] would choose, without
@@ -1774,8 +1806,8 @@ impl WorkerSelector {
             let topology_healthy =
                 capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)));
             let pressure = worker.pressure_assessment().await;
-            let disk_headroom_failure = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
+            let disk_availability = self
+                .disk_headroom_availability(&worker, worker_id.as_str(), request)
                 .await;
             let success_rate = self.health_score(&worker).await;
             let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
@@ -1884,9 +1916,22 @@ impl WorkerSelector {
                     WorkerSelectionDiagnosticDecision::Deny,
                     "worker already has an active build for this project".to_string(),
                 )
-            } else if let Some(failure) = disk_headroom_failure {
-                push_reason_code(&mut reason_codes, failure.reason_code());
-                (WorkerSelectionDiagnosticDecision::Deny, failure.to_string())
+            } else if let Some(failure) = disk_availability.rejection() {
+                let (reason_code, detail) = match disk_availability {
+                    DiskHeadroomAvailability::Reserved(_) => (
+                        "disk_headroom_reserved",
+                        format!("{failure}; request fits after competing disk reservations retire"),
+                    ),
+                    DiskHeadroomAvailability::AwaitingProbe(_) if self.queued_disk_wait => (
+                        "disk_headroom_awaiting_probe",
+                        format!(
+                            "{failure}; queued request is waiting for a post-completion capacity probe"
+                        ),
+                    ),
+                    _ => (failure.reason_code(), failure.to_string()),
+                };
+                push_reason_code(&mut reason_codes, reason_code);
+                (WorkerSelectionDiagnosticDecision::Deny, detail)
             } else if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
                 // Must mirror the gate in `get_eligible_workers`, and sit at
                 // the same point in the ladder (before runtime). Without it
@@ -2364,6 +2409,7 @@ impl WorkerSelector {
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
         let mut filtered_by_disk_headroom = 0usize;
+        let mut filtered_by_disk_contention = 0usize;
         let mut filtered_by_component = 0usize;
         // Workers excluded ONLY by the rustup-component gate, kept for the
         // one-shot stale-inventory capability refresh (issue #63(b)).
@@ -2456,12 +2502,14 @@ impl WorkerSelector {
 
             any_has_runtime = true;
 
-            // A build disk budget is a hard resource constraint, including
-            // for undersized CPU candidates and every health fail-open list.
-            if let Some(failure) = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), request)
-                .await
-            {
+            // Never select a worker whose build budget is unavailable. A
+            // fresh, individually feasible request can wait for competing
+            // owners, but it must clear all remaining hard gates first.
+            let disk_availability = self
+                .disk_headroom_availability(&worker, worker_id.as_str(), request)
+                .await;
+            let disk_waiting = disk_availability.can_wait(self.queued_disk_wait);
+            if !disk_waiting && let Some(failure) = disk_availability.rejection() {
                 debug!("Worker {} excluded: {}", worker_id, failure);
                 if failure == DiskHeadroomRejection::Stale {
                     stale_disk_excluded.push(Arc::clone(&worker));
@@ -2539,7 +2587,7 @@ impl WorkerSelector {
                     continue;
                 }
             }
-            if available_slots < request.estimated_cores {
+            if !disk_waiting && available_slots < request.estimated_cores {
                 if total_slots < request.estimated_cores {
                     // `estimated_cores` is an ESTIMATE (see
                     // `estimate_cores_for_command`), not a hard requirement: it
@@ -2838,6 +2886,27 @@ impl WorkerSelector {
                 continue;
             }
 
+            if disk_waiting {
+                // Disk contention cannot bypass toolchain, pressure, topology
+                // or reliability checks, nor enter any fail-open candidate
+                // list. Structural slot insufficiency remains terminal for
+                // explicit pins, just as it is without a disk reservation.
+                if total_slots == 0
+                    || (total_slots < request.estimated_cores
+                        && (has_preferred || available_slots == 0))
+                {
+                    filtered_by_capacity += 1;
+                } else if !passes_preflight {
+                    filtered_by_disk_headroom += 1;
+                    filtered_by_hard_preflight += 1;
+                } else if self.health_score(&worker).await < self.config.min_success_rate {
+                    filtered_by_health += 1;
+                } else {
+                    filtered_by_disk_contention += 1;
+                }
+                continue;
+            }
+
             // Skip workers failing preflight checks (but keep for fail-open)
             if !passes_preflight {
                 // Fail-open is for workers that CAN satisfy the request but look
@@ -2921,6 +2990,7 @@ impl WorkerSelector {
         // contributing filter.
         let filtered_by_anything_else = filtered_by_health
             + filtered_by_hard_preflight
+            + filtered_by_disk_contention
             + filtered_by_pressure
             + filtered_by_slots
             + filtered_by_capacity
@@ -2968,7 +3038,11 @@ impl WorkerSelector {
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
         }
-        if has_preferred && (filtered_by_slots > 0 || filtered_by_active_project > 0) {
+        if has_preferred
+            && (filtered_by_slots > 0
+                || filtered_by_disk_contention > 0
+                || filtered_by_active_project > 0)
+        {
             // Returning an empty eligible set maps to AllWorkersBusy in
             // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
             // the same requested allow-set instead of selecting an unrelated
@@ -3029,6 +3103,7 @@ impl WorkerSelector {
         // queueing as well, since useful capacity is already available.
         if !has_preferred
             && filtered_by_slots == 0
+            && filtered_by_disk_contention == 0
             && eligible.is_empty()
             && preferred.is_empty()
             && eligible_without_health.is_empty()
@@ -3073,16 +3148,16 @@ impl WorkerSelector {
         // Each queue poll re-runs full selection, so a busy worker that turns
         // critical or unhealthy while we wait is re-filtered, not trusted.
         if !has_preferred
-            && filtered_by_slots > 0
+            && (filtered_by_slots > 0 || filtered_by_disk_contention > 0)
             && eligible.is_empty()
             && preferred.is_empty()
             && eligible_without_health.is_empty()
             && preferred_without_health.is_empty()
         {
             debug!(
-                "No worker admissible now but {} capable worker(s) are busy; \
+                "No worker admissible now but {} worker(s) have slot contention and {} have disk contention; \
                  reporting the pool as busy so the request can queue",
-                filtered_by_slots
+                filtered_by_slots, filtered_by_disk_contention
             );
             return Ok(Vec::new());
         }
@@ -7728,6 +7803,97 @@ mod tests {
             selector.select(&pool, &request).await.worker.is_some(),
             "an ordinary build's cold budget still fits with the worker floor"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_contention_selection_preserves_pressure_and_suitability_refusals() {
+        for scenario in [
+            "reservation",
+            "too-small-disk",
+            "unknown-disk",
+            "critical",
+            "busy-and-critical",
+            "topology",
+            "missing-tool",
+            "undersized-pin",
+        ] {
+            let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+            let history = Arc::new(crate::history::BuildHistory::new(10));
+            selector.set_build_history(Arc::clone(&history));
+            request.estimated_cores = 1;
+            request.disk_headroom_gib = 64;
+            request.preferred_workers = vec![WorkerId::new("active-project")];
+            let worker = pool.get(&WorkerId::new("active-project")).await.unwrap();
+            history
+                .try_start_active_build_with_waiter(
+                    "other-owner".into(),
+                    "active-project".into(),
+                    "cargo check".into(),
+                    0,
+                    Some("disk-contention-owner".into()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission {
+                        requested_gib: 64,
+                        floor_gib: 10,
+                        capacity: worker.disk_capacity_observation().await,
+                        warm_policy: None,
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            match scenario {
+                "too-small-disk" | "unknown-disk" | "topology" => {
+                    let mut caps = worker.capabilities().await;
+                    match scenario {
+                        "too-small-disk" => caps.build_disk_free_gb = Some(51.0),
+                        "unknown-disk" => caps.build_disk_free_gb = None,
+                        "topology" => caps.projects_root_ok = Some(false),
+                        _ => unreachable!(),
+                    }
+                    worker.set_capabilities(caps).await;
+                }
+                "critical" | "busy-and-critical" => {
+                    if scenario == "busy-and-critical" {
+                        assert!(worker.reserve_slots(3).await);
+                    }
+                    let mut pressure = worker.pressure_assessment().await;
+                    pressure.state = PressureState::Critical;
+                    worker.set_pressure_assessment(pressure).await;
+                }
+                "missing-tool" => request.required_tools = vec!["missing-tool".into()],
+                "undersized-pin" => request.estimated_cores = 4,
+                "reservation" => {}
+                _ => unreachable!(),
+            }
+            let exclusions = HashSet::new();
+            for result in [
+                selector
+                    .preview_with_exclusions(&pool, &request, &exclusions)
+                    .await,
+                selector
+                    .select_with_waiter(&pool, &request, &exclusions, true)
+                    .await,
+            ] {
+                assert!(result.worker.is_none(), "{scenario}");
+                if scenario == "reservation" {
+                    assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+                    assert!(result.diagnostics.unwrap().workers.iter().any(|worker| {
+                        worker.worker_id.as_str() == "active-project"
+                            && worker
+                                .reason_codes
+                                .iter()
+                                .any(|code| code == "disk_headroom_reserved")
+                    }));
+                } else {
+                    assert_ne!(result.reason, SelectionReason::AllWorkersBusy, "{scenario}");
+                }
+            }
+            assert_eq!(history.reserved_disk_headroom_gib("active-project"), 64);
+            assert_eq!(history.active_builds().len(), 1);
+        }
     }
 
     /// Learned output is a hard condition across affinity and CPU degradation.

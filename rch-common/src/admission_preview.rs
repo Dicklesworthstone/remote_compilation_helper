@@ -96,11 +96,9 @@ impl PreviewRequest {
             command_priority: CommandPriority::Normal,
             estimated_cores: self.estimated_cores,
             disk_headroom_gib: self.disk_headroom_gib,
-            disk_observation_version: if self.disk_headroom_gib == 0 {
-                crate::BuildDiskObservation::VERSION
-            } else {
-                0
-            },
+            // The configured headroom is a minimum, not a cold-retry flag.
+            // Preview the same conditional budget as an ordinary durable exec.
+            disk_observation_version: crate::BuildDiskObservation::VERSION,
             preferred_workers: self.preferred_workers,
             toolchain: self.toolchain,
             required_runtime: self.required_runtime,
@@ -270,6 +268,11 @@ mod tests {
         );
         assert_eq!(selection.estimated_cores, 7);
         assert_eq!(selection.disk_headroom_gib, 31);
+        assert_eq!(
+            selection.disk_observation_version,
+            crate::BuildDiskObservation::VERSION,
+            "a configured minimum must still preview verified warm-pool admission"
+        );
         assert_eq!(selection.preferred_workers, original.preferred_workers);
         assert_eq!(selection.required_tools, original.required_tools);
         assert_eq!(selection.required_runtime, RequiredRuntime::Rust);

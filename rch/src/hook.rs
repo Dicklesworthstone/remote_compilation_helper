@@ -5859,7 +5859,7 @@ pub async fn run_exec(
             let preferred = vec![worker.id.clone()];
             if let Some(next_response) =
                 dispatch_retry_selection(&durable_lease, release_acknowledged, async || {
-                    query_daemon(
+                    daemon_ipc::query_daemon_cold(
                         &config.general.socket_path,
                         &selection_project,
                         estimated_cores,
@@ -6860,9 +6860,9 @@ use remote_result::{
 // imported here; the sibling `transfer_orchestration` imports the dir-naming / env
 // overrides directly from `super::cargo_target_dir`.
 mod cargo_target_dir;
+pub(crate) use cargo_target_dir::{cargo_disk_home_override, sanitize_cargo_home_token};
 use cargo_target_dir::{
     resolve_forwarded_cargo_target_dir, rewrite_cargo_target_dir_command_for_remote,
-    sanitize_cargo_home_token,
 };
 
 // The remote artifact-pattern selection cluster (which files travel back from a

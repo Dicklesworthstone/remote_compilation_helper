@@ -2413,6 +2413,7 @@ async fn execute_remote_compilation_inner(
     } else {
         pipeline
     };
+    let pipeline = pipeline.with_cargo_disk_cache(command, &worker_config.id);
     let owned_command = if owned_source_content_pair {
         Some(validate_owned_source_content_closure(
             &prepared_source_roots,

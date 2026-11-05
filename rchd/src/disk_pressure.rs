@@ -268,6 +268,32 @@ pub(crate) enum DiskHeadroomRejection {
     Insufficient { free_gib: u64, required_gib: u64 },
 }
 
+/// Advisory waiting classification. Only `Available` can fund admission;
+/// hypothetical capacity after other owners retire never releases their budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskHeadroomAvailability {
+    Available,
+    Reserved(DiskHeadroomRejection),
+    AwaitingProbe(DiskHeadroomRejection),
+    Unavailable(DiskHeadroomRejection),
+}
+
+impl DiskHeadroomAvailability {
+    pub(crate) fn rejection(self) -> Option<DiskHeadroomRejection> {
+        match self {
+            Self::Available => None,
+            Self::Reserved(reason) | Self::AwaitingProbe(reason) | Self::Unavailable(reason) => {
+                Some(reason)
+            }
+        }
+    }
+
+    pub(crate) fn can_wait(self, existing_waiter: bool) -> bool {
+        matches!(self, Self::Reserved(_))
+            || (existing_waiter && matches!(self, Self::AwaitingProbe(_)))
+    }
+}
+
 impl DiskHeadroomRejection {
     pub(crate) fn reason_code(self) -> &'static str {
         match self {

@@ -197,6 +197,144 @@ class DiskMonitorTests(unittest.TestCase):
         return {"cold_growth_bytes": value.budget * 2,
                 "pools": [value.baseline_pool] + [None] * 7}
 
+    def cargo_cache_roots(self, additional_home=None):
+        base = self.root / "worker cache base"
+        base.mkdir(exist_ok=True)
+        plan = {"name": "rch-cargo-cache-worker", "additional_home": additional_home,
+                "verified": True}
+        with patch.dict(os.environ, {"RCH_CH_BASE": str(base)}):
+            roots, aliases = monitor.prepare_cargo_cache_roots(plan)
+        return base / plan["name"], roots, aliases
+
+    def test_cargo_cache_growth_is_charged_when_cleanup_masks_total_growth(self):
+        retained = self.target / "retained"
+        retained.write_bytes(os.urandom(4 * MIB))
+        cache, cache_roots, _ = self.cargo_cache_roots()
+        roots = [str(self.target)] + cache_roots
+        value = self.measured_monitor(budget=MIB, outputs=roots)
+        value.require_warm_pool(self.measured_policy(value))
+        retained.write_bytes(b"")
+        (cache / "registry" / "download").write_bytes(os.urandom(2 * MIB))
+        scan = monitor.measure_outputs(roots, str(self.target), value.baseline_records)
+        self.assertLess(scan.total, value.baseline)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            value.observe_output(scan)
+        self.assertEqual(caught.exception.reason, "growth")
+        self.assertGreaterEqual(value.peak_added, 2 * MIB)
+        self.assertGreater(value.peak_growth, value.budget)
+
+    def test_cargo_cache_retained_bytes_never_borrow_target_pool_credit(self):
+        (self.target / "retained").write_bytes(os.urandom(4 * MIB))
+        cache, cache_roots, _ = self.cargo_cache_roots()
+        (cache / "registry" / "retained").write_bytes(os.urandom(5 * MIB))
+        value = self.measured_monitor(budget=4 * MIB, outputs=[str(self.target)] + cache_roots)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            value.require_warm_pool(self.measured_policy(value))
+        self.assertEqual(caught.exception.reason, "cold_required")
+        self.assertEqual(caught.exception.growth, 0)
+        self.assertIsNone(value.admitted_pool)
+        self.assertGreaterEqual(value.baseline - value.baseline_pool["retained_bytes"], 5 * MIB)
+
+    def test_cargo_cache_cold_growth_and_complete_footprint_include_cache(self):
+        (self.target / "retained").write_bytes(os.urandom(MIB))
+        cache, cache_roots, _ = self.cargo_cache_roots()
+        (cache / "registry" / "retained").write_bytes(os.urandom(5 * MIB))
+        roots = [str(self.target)] + cache_roots
+        value = self.measured_monitor(budget=4 * MIB, outputs=roots)
+        (cache / "git" / "new-pack").write_bytes(os.urandom(MIB))
+        value.observe_output(monitor.measure_outputs(roots, str(self.target), value.baseline_records))
+        self.assertGreaterEqual(value.peak_added, MIB)
+        self.assertLess(value.peak_growth, 2 * MIB)
+        self.assertGreaterEqual(value.peak_output, 7 * MIB)
+
+    def test_cargo_cache_warm_small_download_retains_target_credit_only(self):
+        (self.target / "retained").write_bytes(os.urandom(4 * MIB))
+        cache, cache_roots, _ = self.cargo_cache_roots()
+        (cache / "registry" / "retained").write_bytes(os.urandom(MIB))
+        roots = [str(self.target)] + cache_roots
+        value = self.measured_monitor(budget=4 * MIB, outputs=roots)
+        value.require_warm_pool(self.measured_policy(value))
+        (cache / "registry" / "download").write_bytes(os.urandom(MIB))
+        value.observe_output(monitor.measure_outputs(roots, str(self.target), value.baseline_records))
+        self.assertGreaterEqual(value.unproven_baseline, MIB)
+        self.assertGreaterEqual(value.peak_growth, 2 * MIB)
+        self.assertLess(value.peak_growth, 3 * MIB)
+        self.assertIsNotNone(value.admitted_pool)
+
+    def test_cargo_cache_explicit_home_and_registry_git_redirects_are_bound(self):
+        base = self.root / "worker cache base"
+        cache = base / "rch-cargo-cache-worker"
+        cache.mkdir(parents=True)
+        registry, git, explicit = (self.root / name for name in ("registry-store", "git-store", "explicit-home"))
+        registry.mkdir()
+        git.mkdir()
+        (cache / "registry").symlink_to(registry)
+        (cache / "git").symlink_to(git)
+        _, roots, aliases = self.cargo_cache_roots(str(explicit))
+        self.assertIn(str(registry), roots)
+        self.assertIn(str(git), roots)
+        self.assertIn(str(explicit), roots)
+        self.assertEqual(aliases[str(cache / "registry")], str(registry))
+        monitor.verify_cargo_cache_bindings(aliases)
+        (cache / "registry").rename(cache / "registry-retained-link")
+        (cache / "registry").symlink_to(git)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            monitor.verify_cargo_cache_bindings(aliases)
+        self.assertEqual(caught.exception.reason, "monitor_unavailable")
+
+    def test_cargo_cache_dangling_known_redirect_prepares_only_one_directory(self):
+        base = self.root / "worker cache base"
+        cache = base / "rch-cargo-cache-worker"
+        cache.mkdir(parents=True)
+        registry = self.root / "new-registry"
+        (cache / "registry").symlink_to(registry)
+        _, roots, _ = self.cargo_cache_roots()
+        self.assertTrue(registry.is_dir())
+        self.assertIn(str(registry), roots)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            self.cargo_cache_roots(str(self.root / "absent-parent" / "home"))
+        self.assertIn("parent must already exist", caught.exception.detail)
+        self.assertFalse((self.root / "absent-parent").exists())
+
+    def test_cargo_cache_unknown_scope_and_client_base_fail_closed(self):
+        plan = {"name": "rch-cargo-cache-worker", "additional_home": None, "verified": False}
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            monitor.validate_cargo_cache_plan(plan, True)
+        self.assertIn("literal absolute CARGO_HOME", caught.exception.detail)
+        with self.assertRaises(monitor.BudgetFailure):
+            monitor.validate_cargo_cache_plan(None, True)
+        plan["verified"] = True
+        for base in ("${TMPDIR}", "relative-client-base", str(self.root / "absent")):
+            with self.subTest(base=base), patch.dict(os.environ, {"RCH_CH_BASE": base}):
+                with self.assertRaises(monitor.BudgetFailure):
+                    monitor.prepare_cargo_cache_roots(plan)
+        for name in ("../outside", "rch-cargo-cache-a/b", "rch-cargo-cache-$(id)"):
+            with self.subTest(name=name), self.assertRaises(monitor.BudgetFailure):
+                monitor.validate_cargo_cache_plan({**plan, "name": name})
+
+    @unittest.skipUnless(os.path.isdir("/dev/shm"), "requires an available second filesystem")
+    def test_cargo_cache_distinct_filesystem_is_sampled_and_floor_protected(self):
+        external = Path(tempfile.mkdtemp(prefix="rch-cargo-cache-volume-", dir="/dev/shm"))
+        if external.stat().st_dev == self.target.stat().st_dev:
+            self.skipTest("/dev/shm is not a distinct filesystem")
+        _, cache_roots, _ = self.cargo_cache_roots(str(external))
+        roots = [str(self.target)] + cache_roots
+        samples = monitor.filesystem_sample(roots)
+        device = external.stat().st_dev
+        self.assertIn(device, samples)
+        value = self.measured_monitor(outputs=roots)
+        value.devices = set(samples)
+        value.free_start, value.free_min = dict(samples), dict(samples)
+        value.floors = {key: 0 for key in samples}
+        # Actual statvfs availability violates this configured cache-volume
+        # floor; the test never fills a real filesystem or fabricates free space.
+        value.floors[device] = samples[device] + 1
+        value.previous = None
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            value.observe_free(samples, 1)
+        self.assertEqual(caught.exception.reason, "free_floor")
+        self.assertEqual(caught.exception.free, samples[device])
+
     def usage(self, receipt):
         return json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
 
