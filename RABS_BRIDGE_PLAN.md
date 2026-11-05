@@ -2,6 +2,75 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
+**Latest execution checkpoint, November5 at00:03UTC (November4 local):**
+
+- [x] Qualify the current integration after moving the test-only file-reuse
+  constant import into worker_pool_tests, without suppressing warnings.
+  Frozen source8e2e2618+f9bf1d26/all1747 files: native DSR0d483f93 SUCCESS,
+  full workspace/all-target check0/585.9s, strictClippy-Dwarnings0/552.1s,
+  fmt0/17.9s. Earlier6426 check0/720.8s/fmt0/18.1s/Clippy101 unused-import
+  failure remains retained. Human/concurrent commits preserved prior formatting
+  fixes and tracker/TODO updates; root did not stage/commit/merge or restore an
+  old Git index. Frozen f9bf archive65648640B/SHA37bb652a, indexf4ce85b0.
+- [x] Run the expanded current SDK/worker/coordinator bank: DSR7709347e
+  SUCCESS,256/256 component cases plus original actual native COW1/1 =257.
+  Groups: identity1, wire14, worker-upload54, SDK-pool35, sandbox24 (including
+  actual complete installed-SDK compiler), sender28, entire remote module100.
+  Zero failed/ignored. Actual EXDEV case passes using existing healthy ZFS49
+  cache and ZFS54 upload fixture on TS2, each original20GiB SBH gate0. No new
+  filesystem, RAM-backed storage, capacity override or weakened inode/byte gate.
+  All104 old cases accounted:102 unchanged names and two explicitly reviewed
+  replacements for the intentional copy-to-owned-move change. Restart/reuse
+  now also checks every inode; generation-refresh rejection and charged pending
+  custody remain. New actual EXDEV copy-fallback/independence case is mandatory.
+  First0651 failure remains:15 cases passed,54 worker cases compiled/listed
+  but UNRUN because the two old literal test names had changed. Corrected
+  operator admits ONLY those two mappings and rejects any other missing case;
+  all listed current cases, including ignored native cases, execute. Also fix
+  the operator's nonexistent remote::tests selector by selecting the WHOLE
+  remote module. Product assertions/features/deadlines unchanged.
+- [x] Retain failed SDK preparation comparison27ba5785: oldAC82 CLI hits its
+  original600s limit, raw124/600.073s, new preparer UNRUN, only1/4 calls started.
+  Controller completes full source1740/SDK5256-entry/control/tool after-audits;
+  all match. Terminal6801B/SHA23847e19. DSR classifies child124 as native
+  timeout5/851s and FAILED6; it did NOT hit the outer3600s cap. No ratio or
+  optimization win is claimed, and no budget is raised.
+- [x] Retain failed isolated04ffa full-runtime run0af9aa07: check0/1/raw101/
+  696.896s, original600s helper deadline followed by cleanup. Archive/program
+  UNRUN; zero worker toolchain acquisitions/executions and journal last=null.
+  Source/control/SDK/tool after-audits complete separately. Observed root-role
+  residuals{}, but74 PermissionErrors limit independent descendant census;
+  do not label it complete or claim the timed-out native cleanup predicates
+  passed. Samples show Cargo planning around199s and actual Cargo around214s;
+  coordinator still holds private worker-admission meta.sqlite/journal at610s.
+  Open descriptors identify an investigation boundary, not a proven SQLite
+  root cause. SDK copying alone is not an established repair for this failure.
+- [ ] Complete current ordinary SEVEN-role release producer f904aaff, launched
+ 23:47:54UTC/PID14170: rch/rchd/rch-wkr and four RABS roles, ordinary canonical
+  harness and exact check/build case lists. Sourcef9bf/all1747, controller
+  9b47d1b5/7197B, original3600s cap/jobs1/concurrency4, genuine private Cargo
+  reuse. Default features/profiles and all gates retained. This BUILD-ONLY
+  stage is not runtime, file-checkpoint resume, public RCH, fleet or release
+  qualification; no installed/global daemon/configuration changes.
+- [x] Improve native timeout diagnostics in the existing canonical helper:
+  preserve the EXACT600s predicate, original64MiB drains and all cleanup/output
+  assertions. On failure only, report residual count and at most64KiB of each
+  already-drained stdout/stderr stream; read failures retain the timeout cause.
+  Local fmt/diffcheck0. Earlier helper asserted before reading captured output,
+  hiding the coordinator's real failure details. This is a test-only diagnostic
+  change; native compile/Clippy and a new harness/source binding remain REQUIRED.
+- [ ] Compile the diagnostic harness with its precise test-only overlay and
+  use it against matching current normal binaries. Then run real shared-service
+  requests, complete inline check/cache and archive/program42/43 gates with
+  original clocks; keep each scope and denominator separate. Public worker-cache
+  ladder remains0/4; file-checkpoint TLS resume, distinct-host compiler execution,
+  15-agent performance, installation/supply-chain and release remain open.
+- [x] Recheck actual Mac storage instead of relying on old notes: original
+  SBH20G check still refuses native build storage (86.6GB/2.17% free versus
+  original8.06% threshold). No threshold change or cleanup/deletion. Retained
+  private Mac copies are older85dc code; do not infer source from directory
+  labels. Linux DSR validation continues; no GitHub Actions.
+
 **Current execution TODO, November4 at23:02UTC:** stock passes; the first public
 RABS round failed before execution with E2BIG. Two-layer transport fixes that
 kernel boundary, but the follow-up guard comparison is RED: preceding9478/8,
