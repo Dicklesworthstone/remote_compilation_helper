@@ -1,6 +1,8 @@
 # Process-group identity shared by launch, timeout cleanup, and recovery.
 # A PID is not durable authority: bind it to the worker boot and leader start.
 set -f
+# Fixed printf/stat formats use double quotes: four transport layers multiply
+# literal apostrophes and must fit the existing 110 KB argument budget.
 
 rch_valid_pgid() {
     case "$1" in ''|*[!0-9]*|0*|1) return 1;; esac
@@ -110,7 +112,7 @@ rch_read_boot() {
             # alone can discard NULs from otherwise plausible UUID output.
             rch_observation_budget
             rch_boot_output=$(rch_control_capture "${rch_observation_seconds}s" /usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
-            printf '%s\n' "$rch_boot_output" | LC_ALL=C tr 'A-F' 'a-f';;
+            printf "%s\n" "$rch_boot_output" | LC_ALL=C tr "A-F" "a-f";;
         *) return 1;;
     esac
 }
@@ -118,8 +120,8 @@ rch_read_boot() {
 # BSD stat uses -f; do not let GNU-only receipt/output checks break recovery.
 rch_file_size() {
     case "$(uname -s)" in
-        Darwin) stat -f '%z' "$1";;
-        Linux) stat -c '%s' -- "$1";;
+        Darwin) stat -f "%z" "$1";;
+        Linux) stat -c "%s" -- "$1";;
         *) return 1;;
     esac
 }
@@ -178,7 +180,7 @@ rch_remote_record() {
     else
         rch_record="RCH_REMOTE_PROCESS_V1:$2:$rch_boot:$rch_pgid:$rch_start"
     fi
-    (umask 077; set -C; printf '%s\n' "$rch_record" > "$rch_record_tmp") || return 1
+    (umask 077; set -C; printf "%s\n" "$rch_record" > "$rch_record_tmp") || return 1
     mv -f "$rch_record_tmp" "$1"
 }
 
@@ -231,7 +233,7 @@ rch_group_state() {
         # needs the separate LWP census below (a zombie leader can have LWPs).
         [ "${rch_scope_bound:-0}" != 1 ] || return 2
         rch_snapshot=$(LC_ALL=C rch_control_capture "${rch_observation_seconds}s" ps -axo pid=,pgid=,stat=) || return 2
-        printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
+        printf "%s\n" "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
             NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZE][A-Za-z0-9+<>-]*$/ { bad=1; next }
             seen_pid[$1]++ { bad=1 }
             $1 == observer { seen=1; if ($2 == group) bad=1 }
@@ -269,7 +271,7 @@ rch_group_state() {
             printf "RCH_CENSUS_UNSETTLED %s\n" "${selection##*|}"
             exec ps -L -q "$pids" -o pid= -o lwp= -o pgid= -o stat= -o nlwp=
         ' rch-group-census "$rch_pgid" "$$") || return 2
-    rch_snapshot=$(printf '%s\n' "$rch_task_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
+    rch_snapshot=$(printf "%s\n" "$rch_task_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
         $1 == "RCH_CENSUS_UNSETTLED" {
             if (NF != 2 || $2 !~ /^[01]$/ || census_seen++) bad=1
             unsettled=$2
@@ -321,7 +323,7 @@ rch_capture_group_witnesses() {
     [ "$rch_identified" -eq 1 ] && rch_remote_leader_matches || return 43
     # rch_group_state normalized the validated LWP census to ID/group/state.
     # Retain live TIDs, not just process leaders, with the same birth fencing.
-    rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
+    rch_member_pids=$(printf "%s\n" "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
         $2 == group && $3 !~ /^[ZXx]/ { print $1 }
     ') || return 44
     # One timed exchange bounds ALL witnesses using the same protocol. Partial
@@ -428,6 +430,8 @@ rch_signal_group() {
 # No signal, mutation or success claim. A live supervisor cannot substitute a
 # changed receipt for stopping its still-owned child.
 rch_recovery_boot_state() (
+    # Darwin boot observation also uses the bounded control collector.
+    export rch_control_diskless=1
     [ "${rch_identified:-0}" = 1 ] && rch_check_procfs_namespace || exit 2
     current=$(rch_read_boot 2>/dev/null) || exit 2
     for value in "$rch_boot" "$current"; do
@@ -470,6 +474,13 @@ rch_remote_cancel() {
 # Only validated in-memory identity grants signal authority.
 rch_remote_cancel_loaded() (
     # Share 30s inside 45s SSH; subshell isolates deadlines and authority.
+    # A full build disk must not prevent observing that its writers stopped.
+    # Keep this preference local to cancellation/supervisor cleanup; workers
+    # without Python retain the existing bounded file-backed control path.
+    rch_control_diskless=1
+    # Witness helpers evaluate the protocol in fresh shells; their nested
+    # Darwin identity observations must use the same storage-independent path.
+    export rch_control_diskless
     rch_observation_clock_checked || return 44
     rch_cancel_deadline=$((rch_observation_now + 3000))
     if [ -n "${rch_observation_deadline:-}" ]; then
@@ -575,7 +586,7 @@ rch_remote_cancel_loaded() (
 # duplicate, unreadable or unenforced settings refuse setup; never eval policy.
 
 rch_policy_refuse() {
-    printf 'RCH_WORKER_POLICY_REFUSED:%s\n' "$1" >&2
+    printf "RCH_WORKER_POLICY_REFUSED:%s\n" "$1" >&2
     return 125
 }
 
@@ -625,7 +636,7 @@ rch_policy_read_file() {
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || {
         rch_policy_refuse unreadable_file; return 125;
     }
-    rch_policy_stat=$(LC_ALL=C stat -c '%u:%a:%s:%h' -- "$1") || {
+    rch_policy_stat=$(LC_ALL=C stat -c "%u:%a:%s:%h" -- "$1") || {
         rch_policy_refuse file_metadata; return 125;
     }
     rch_policy_file_uid=${rch_policy_stat%%:*}
@@ -694,7 +705,7 @@ rch_group_timeout() {
         # Isolated mode alone still imports installed .pth/sitecustomize hooks.
         # This monitor uses only stdlib: do not run unrelated startup code
         # before its alarm is armed or let it corrupt control observations.
-        python3 -I -S -c '
+        python3 -I -S -B -c '
 import os
 import signal
 import subprocess
@@ -748,12 +759,91 @@ rch_control_budget() {
         rch_control_timeout=${rch_control_remaining}s
 }
 
+# The existing timeout owns the collector, command and inherited pipe holders
+# as one process group. Never create another session here. Buffer only bounded,
+# validated bytes in memory, so cancellation needs no space on the build disk.
+rch_control_capture_memory() {
+    rch_control_output=$(
+        rch_group_timeout --signal=KILL "$rch_control_timeout" python3 -I -S -B -c '
+import signal
+import subprocess
+import sys
+
+limit = int(sys.argv[1])
+allowed = b"\t\n" + bytes(range(32, 127))
+output = bytearray()
+invalid = False
+interrupted = 0
+child = None
+def interrupt(signum, frame):
+    global interrupted
+    interrupted = interrupted or signum
+# Keep timeout alive if only its collector is interrupted. Exec resets these
+# handlers in the command; it retains its normal signal dispositions.
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, interrupt)
+if interrupted:
+    sys.exit(128 + interrupted)
+try:
+    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    while True:
+        chunk = child.stdout.read(8192)
+        if not chunk:
+            break
+        if not invalid:
+            if len(output) + len(chunk) > limit or chunk.translate(None, allowed):
+                invalid = True
+                output.clear()
+            else:
+                output.extend(chunk)
+        # Even invalid output must drain to EOF before the collector exits.
+        # Otherwise timeout could exit while an inherited pipe holder lives.
+    status = child.wait()
+except OSError:
+    if child is None:
+        sys.exit(125)
+    # An unreadable pipe is not proof that its holders exited. Keep the owned
+    # timeout alive to stop the complete group instead of abandoning children.
+    while True:
+        signal.pause()
+if interrupted:
+    sys.exit(128 + interrupted)
+if invalid:
+    sys.exit(125)
+try:
+    stream = sys.stdout.buffer if status == 0 else sys.stderr.buffer
+    stream.write(output)
+    stream.flush()
+except OSError:
+    sys.exit(125)
+sys.exit(128 + interrupted if interrupted else status if status >= 0 else 128 - status)
+' "$rch_control_limit" "$@" </dev/null || exit $?
+        # Preserve every trailing newline across shell command substitution.
+        printf "."
+    ) || return $?
+    rch_control_output=${rch_control_output%.}
+    rch_control_in_budget || return 125
+    printf "%s" "$rch_control_output" || return 125
+    rch_control_in_budget
+}
+
 rch_control_capture() {
     case "$1" in [1-8]s) ;; *) return 125;; esac
     rch_control_timeout=$1
     shift
     # Nested captures and retries consume one admission/cancellation deadline.
     rch_control_budget || return 125
+    rch_control_limit=65536
+    case "${1:-}:${4:-}" in
+        ps:*|/bin/sh:rch-group-census) rch_control_limit=1048576;;
+    esac
+    if [ "${rch_control_diskless:-0}" = 1 ] && command -v python3 >/dev/null 2>&1; then
+        # Interpreter lookup/setup is also inside the remaining shared budget.
+        rch_control_budget || return 125
+        rch_control_capture_memory "$@"
+        return $?
+    fi
     # Validate raw bytes before substitution discards NUL; keep output private.
     rch_control_base=${TMPDIR:-/tmp}
     case "$rch_control_base" in /*) ;; *) return 125;; esac
@@ -790,8 +880,8 @@ rch_control_capture() {
     # Balance case-pattern parentheses for the Darwin bash 3.2 parser.
     rch_control_metadata=$(
         case "$(uname -s)" in
-            (Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
-            (Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
+            (Darwin) LC_ALL=C stat -f "%Lp:%l:%z" "$rch_control_file";;
+            (Linux) LC_ALL=C stat -c "%a:%h:%s" -- "$rch_control_file";;
             (*) exit 125;;
         esac
     ) || {
@@ -806,10 +896,6 @@ rch_control_capture() {
     rch_control_size=${rch_control_metadata##*:}
     case "$rch_control_size" in
         ''|*[!0-9]*) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
-    esac
-    rch_control_limit=65536
-    case "${1:-}:${4:-}" in
-        ps:*|/bin/sh:rch-group-census) rch_control_limit=1048576;;
     esac
     if [ "$rch_control_size" -gt "$rch_control_limit" ] ||
         ! LC_ALL=C tr -cd '\11\12\40-\176' < "$rch_control_file" | cmp -s - "$rch_control_file"; then
@@ -861,7 +947,7 @@ rch_policy_current_cgroup() (
         esac
     done < "/proc/$$/cgroup"
     [ "$rch_policy_cgroup_count" -eq 1 ] || exit 125
-    printf '%s\n' "$rch_policy_cgroup_value"
+    printf "%s\n" "$rch_policy_cgroup_value"
 )
 
 rch_policy_enter_scope() {
@@ -932,7 +1018,7 @@ rch_policy_enforce() {
         rch_policy_enter_scope || return 125
     fi
     rch_remote_leader_matches || { rch_policy_refuse process_identity; return 125; }
-    printf 'RCH_WORKER_EXECUTION_POLICY:nice=%s,slice=%s,manager=%s,scope=%s\n' \
+    printf "RCH_WORKER_EXECUTION_POLICY:nice=%s,slice=%s,manager=%s,scope=%s\n" \
         "${rch_policy_nice:-inherit}" "${rch_policy_slice:-none}" \
         "$rch_policy_manager" "${rch_policy_scope:-none}" >&2
 }
@@ -1000,13 +1086,13 @@ EOF_RECORD
         [ "$rch_record_lines" -eq 1 ] || return 42
     # New records are private, single-link receipts created by the SSH user.
     # Do not treat an imported or externally writable scope name as authority.
-    [ "$(LC_ALL=C stat -c '%u:%a:%h' -- "$1")" = "$rch_scope_uid:600:1" ] || return 42
+    [ "$(LC_ALL=C stat -c "%u:%a:%h" -- "$1")" = "$rch_scope_uid:600:1" ] || return 42
     rch_identified=1
     rch_scope_bound=1
 }
 
 rch_scope_root() {
-    printf '%s\n' /sys/fs/cgroup
+    printf "%s\n" /sys/fs/cgroup
 }
 
 # One manager snapshot, with a bounded wait. Missing/duplicate fields and
@@ -1048,9 +1134,9 @@ rch_scope_same_view() {
     rch_check_procfs_namespace &&
         [ "$(cat /proc/sys/kernel/random/boot_id)" = "$rch_boot" ] &&
         [ "$(id -u)" = "$rch_scope_uid" ] &&
-        [ "$(stat -Lc '%i' /proc/self/ns/cgroup)" = "$rch_scope_namespace" ] &&
-        [ "$(stat -c '%d.%i' -- "$rch_scope_mount")" = "$rch_scope_root_id" ] &&
-        [ "$(stat -fc '%T' -- "$rch_scope_mount")" = cgroup2fs ] &&
+        [ "$(stat -Lc "%i" /proc/self/ns/cgroup)" = "$rch_scope_namespace" ] &&
+        [ "$(stat -c "%d.%i" -- "$rch_scope_mount")" = "$rch_scope_root_id" ] &&
+        [ "$(stat -fc "%T" -- "$rch_scope_mount")" = cgroup2fs ] &&
         [ "$(CDPATH= cd -- "$rch_scope_mount" && pwd -P)" = "$rch_scope_mount" ]
 }
 
@@ -1109,8 +1195,8 @@ rch_scope_operation() (
     esac
     rch_scope_snapshot_matches || exit 3
     exec 8<"$rch_scope_mount$rch_scope_cgroup" || exit 2
-    [ "$(stat -Lc '%d.%i' /proc/self/fd/8)" = "$rch_scope_node_id" ] &&
-        [ "$(stat -fLc '%T' /proc/self/fd/8)" = cgroup2fs ] || exit 3
+    [ "$(stat -Lc "%d.%i" /proc/self/fd/8)" = "$rch_scope_node_id" ] &&
+        [ "$(stat -fLc "%T" /proc/self/fd/8)" = cgroup2fs ] || exit 3
     # Repeat generation evidence AFTER pinning the inode. Holding this directory
     # prevents inode reuse; subsequent opens never resolve its pathname again.
     rch_scope_snapshot || exit 2
@@ -1132,7 +1218,7 @@ rch_scope_operation() (
             # cgroups, including fork races and processes which called setsid.
             [ -f /proc/self/fd/8/cgroup.kill ] || exit 2
             exec 7>/proc/self/fd/8/cgroup.kill || exit 2
-            if [ "$1" = kill ]; then printf '1\n' >&7 || exit 2; fi
+            if [ "$1" = kill ]; then printf "1\n" >&7 || exit 2; fi
             exit 0;;
         *) exit 2;;
     esac
@@ -1143,10 +1229,10 @@ rch_scope_bind_created() {
     rch_scope_manager=$rch_policy_manager
     rch_scope_cgroup=$rch_policy_expected_cgroup
     rch_scope_invocation=$(rch_policy_systemctl show --value --property=InvocationID -- "$rch_policy_scope") || return 1
-    rch_scope_namespace=$(stat -Lc '%i' /proc/self/ns/cgroup) || return 1
+    rch_scope_namespace=$(stat -Lc "%i" /proc/self/ns/cgroup) || return 1
     rch_scope_mount=$(rch_scope_root) || return 1
-    rch_scope_root_id=$(stat -c '%d.%i' -- "$rch_scope_mount") || return 1
-    rch_scope_node_id=$(stat -c '%d.%i' -- "$rch_scope_mount$rch_scope_cgroup") || return 1
+    rch_scope_root_id=$(stat -c "%d.%i" -- "$rch_scope_mount") || return 1
+    rch_scope_node_id=$(stat -c "%d.%i" -- "$rch_scope_mount$rch_scope_cgroup") || return 1
     rch_scope_binding_valid || return 1
     # Retry observations of this same binding, never scope creation or a
     # changed identity. Keep the payload gate closed throughout the retries.
