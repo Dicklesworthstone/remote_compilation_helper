@@ -36,6 +36,22 @@ def private(info, directory=False):
         refuse("registry lock has multiple links")
 
 
+def heal_group_writable_lock(descriptor):
+    # A lock file created by a pre-umask-077 wrapper (2.1.34 ran under the
+    # worker's umask 002) keeps group/other write bits. The enclosing registry
+    # directory is already verified private (0700, our uid), so those bits grant
+    # no access, but private() still refuses them and strands the worker on the
+    # next settle-cancel. Clear ONLY the group/other write bits in place, on our
+    # own just-opened fd: a regular file, our uid, a single link, and no
+    # setuid/setgid. Anything else is left for private() to refuse. fchmod binds
+    # to the verified inode, and O_NOFOLLOW above already excluded a symlink.
+    info = os.fstat(descriptor)
+    if (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and info.st_nlink == 1 and (info.st_mode & 0o022)
+            and not (info.st_mode & (stat.S_ISUID | stat.S_ISGID))):
+        os.fchmod(descriptor, info.st_mode & 0o7777 & ~0o022)
+
+
 def main():
     if len(sys.argv) != 8:
         refuse("invalid settlement request")
@@ -112,6 +128,7 @@ def main():
         for path, _, directory in registries:
             descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
                                  0o600, dir_fd=directory)
+            heal_group_writable_lock(descriptor)
             private(os.fstat(descriptor))
             if any(identity(os.fstat(item[2])) == identity(os.fstat(descriptor)) for item in locks):
                 refuse("registry locks alias the same inode")

@@ -3863,6 +3863,9 @@ fn scan_client_leases_with(
         let path = entry.path();
         let bytes =
             read_lease_bytes(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        if torn_legacy_lease(&path, &bytes) {
+            continue;
+        }
         let lease: DurableJobLease = serde_json::from_slice(&bytes)
             .map_err(|error| anyhow!("cannot parse {}: {error}", path.display()))?;
         if lease_blocks_restart(&lease, now_unix_ms, || {
@@ -3895,6 +3898,22 @@ fn scan_client_leases_with(
     }
     blocked.sort();
     Ok(blocked)
+}
+
+/// Wrappers before atomic journal publication created the file and then wrote
+/// it, so ENOSPC or a crash in between left an empty journal. Once no writer can
+/// still be filling it, it names no job and holds no recovery recipe, so it
+/// cannot block a restart. Before this check, one such file made every scan
+/// fail, which left restart readiness unknown for good. The file stays on disk.
+fn torn_legacy_lease(path: &std::path::Path, bytes: &[u8]) -> bool {
+    bytes.is_empty()
+        && std::fs::symlink_metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| {
+                age >= std::time::Duration::from_millis(DEAD_WRAPPER_HEARTBEAT_STALE_MS)
+            })
 }
 
 /// Scheduling release does not release evidence custody. Recovery is an opaque
@@ -7750,6 +7769,56 @@ mod tests {
         assert!(recent_path.exists(), "recent non-blocker kept");
         assert!(fresh_path.exists(), "blocker kept");
         assert!(dir.join("README.txt").exists(), "non-json untouched");
+    }
+
+    #[test]
+    fn scan_passes_an_old_empty_lease_but_not_a_fresh_or_garbled_one() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let dir = directory.path();
+        let private = |path: &std::path::Path, bytes: &[u8]| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            file
+        };
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_millis(DEAD_WRAPPER_HEARTBEAT_STALE_MS + 60_000);
+
+        // A writer may still be filling a fresh empty journal.
+        let torn = dir.join("rchw-6f1d1c55-3c1f-4b0e-9d43-2f7c2a0e1b01.json");
+        let torn_file = private(&torn, b"");
+        let error = scan_client_leases(dir).unwrap_err();
+        assert!(error.to_string().contains("cannot parse"), "{error}");
+
+        // Once it is old, it is passed over and the other leases still count.
+        torn_file.set_modified(old).unwrap();
+        drop(torn_file);
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let fresh = make_test_lease(now, 1);
+        let fresh_path = dir.join(format!("{}.json", fresh.identity.local_wrapper_id));
+        drop(private(&fresh_path, &serde_json::to_vec(&fresh).unwrap()));
+        assert_eq!(
+            scan_client_leases(dir).unwrap(),
+            vec![fresh.identity.local_wrapper_id.clone()]
+        );
+        assert!(torn.exists(), "an empty journal is left on disk");
+
+        // Only an empty file is passed over: old garbled bytes stay unreadable evidence.
+        let garbled = dir.join("rchw-6f1d1c55-3c1f-4b0e-9d43-2f7c2a0e1b02.json");
+        let garbled_file = private(&garbled, b"{");
+        garbled_file.set_modified(old).unwrap();
+        drop(garbled_file);
+        assert!(scan_client_leases(dir).is_err());
     }
 
     #[test]
