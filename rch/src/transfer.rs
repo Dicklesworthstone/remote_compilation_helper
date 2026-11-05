@@ -393,6 +393,54 @@ where
     }
 }
 
+/// Capture a read-only completion probe while owning its local transport group.
+/// A streaming-channel close can drop this future during a receipt read; the
+/// direct SSH child and same-group proxy descendants must stop together. Drain
+/// output before reaping so the owned leader pins the group identity on drop.
+async fn completion_probe_output(
+    mut command: tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(not(unix))]
+    {
+        command.output().await
+    }
+    #[cfg(unix)]
+    {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = rch_common::ssh::OwnedProcessGroup::spawn(&mut command)?;
+        let mut stdout = process
+            .take_stdout()
+            .ok_or_else(|| std::io::Error::other("completion probe stdout missing"))?;
+        let mut stderr = process
+            .take_stderr()
+            .ok_or_else(|| std::io::Error::other("completion probe stderr missing"))?;
+        let (stdout, stderr) = tokio::try_join!(
+            async {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            },
+            async {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            },
+        )?;
+        let status = process.wait().await?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
 async fn run_source_content_rsync_capture(
     mut cmd: Command,
     operation: &str,
@@ -3282,6 +3330,19 @@ impl TransferPipeline {
         self
     }
 
+    fn check_retrieval_control(&self, config: &RetryConfig, operation: &str) -> Result<()> {
+        if let Some((cancel, started)) = &self.retrieval_control {
+            if *cancel.borrow() {
+                return Err(RetrievalCancelled.into());
+            }
+            anyhow::ensure!(
+                TokioInstant::now() < *started + Duration::from_millis(config.total_timeout_ms),
+                "{operation}: retrieval deadline exceeded"
+            );
+        }
+        Ok(())
+    }
+
     async fn execute_retrieval_rsync(
         &self,
         config: &RetryConfig,
@@ -3789,12 +3850,11 @@ impl TransferPipeline {
             // This immutable identity-bound receipt is outside source-tree
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
-            self.worker_ssh_command_with_activity(
+            completion_probe_output(self.worker_ssh_command_with_activity(
                 worker,
                 &["sh", "-c", &escape(Cow::from(script.as_str()))],
                 false,
-            )
-            .output(),
+            )),
         )
         .await??;
         anyhow::ensure!(output.status.success(), "completion probe SSH failed");
@@ -4253,15 +4313,15 @@ impl TransferPipeline {
         retry
     }
 
-    async fn artifact_retry_config(
+    async fn artifact_retrieval_plan(
         &self,
         worker: &WorkerConfig,
         remote_path: &str,
         patterns: &[String],
-    ) -> Result<RetryConfig> {
+    ) -> Result<RetrievalPlan> {
         // Both artifact builders use the same flavour-specific integrity
         // policy. Only checksummed staging can earn allocation reuse credit.
-        self.retrieval_retry_config_inner(
+        self.retrieval_plan(
             || self.build_retrieve_command(worker, remote_path, patterns),
             Self::artifact_integrity_arg(self.resolved_rsync().flavor) == "--checksum",
         )
@@ -4269,7 +4329,10 @@ impl TransferPipeline {
     }
 
     async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
-        self.retrieval_retry_config_inner(command, false).await
+        // A declared result directory still needs its directory materialized,
+        // including when it is empty. Only implicit artifact collection may
+        // use the verified-empty selection to omit a second connection.
+        Ok(self.retrieval_plan(command, false).await?.retry_config)
     }
 
     /// Openrsync does not universally implement --checksum. Never fall back
@@ -4281,11 +4344,11 @@ impl TransferPipeline {
         }
     }
 
-    async fn retrieval_retry_config_inner(
+    async fn retrieval_plan(
         &self,
         command: impl Fn() -> Command,
         checksummed: bool,
-    ) -> Result<RetryConfig> {
+    ) -> Result<RetrievalPlan> {
         let fallback = self.effective_rsync_retry_config();
         let estimate = self
             .execute_retrieval_rsync(
@@ -4328,7 +4391,27 @@ impl TransferPipeline {
                         total_timeout_ms = retry.total_timeout_ms,
                         "Artifact retrieval budget from selected remote files"
                     );
-                    return Ok(retry);
+                    let empty_selection = (output.stderr.is_empty()
+                        && detect_partial_transfer(&String::from_utf8_lossy(&output.stdout))
+                            .is_none()
+                        && retrieval_space::RsyncStoragePlan::empty_selection(&output.stdout)
+                            .is_some())
+                    .then(|| ArtifactRetrieval {
+                        stats: SyncResult {
+                            bytes_transferred: parse_rsync_bytes(
+                                &String::from_utf8_lossy(&output.stdout),
+                                RsyncTransferDirection::Download,
+                            ),
+                            files_transferred: 0,
+                            duration_ms: 0,
+                        },
+                        manifest_regular_files: Vec::new(),
+                        matched_regular_files: Some(0),
+                    });
+                    return Ok(RetrievalPlan {
+                        retry_config: retry,
+                        empty_selection,
+                    });
                 }
                 warn!("Artifact size estimate missing; retaining configured retrieval budget");
             }
@@ -4336,6 +4419,9 @@ impl TransferPipeline {
                 "Artifact size estimate failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
+            // The receiver has already been stopped and reaped. Preserve the
+            // typed acknowledgment so same-job recovery can retry collection.
+            Err(error) if error.is::<RetrievalCancelled>() => return Err(error),
             Err(error) => warn!(
                 "Artifact size estimate failed: {error}; retaining configured retrieval budget"
             ),
@@ -4346,7 +4432,10 @@ impl TransferPipeline {
             self.project_root == self.retrieval_reference_root,
             "cannot establish artifact size for durable retrieval staging; outputs and ownership retained"
         );
-        Ok(fallback)
+        Ok(RetrievalPlan {
+            retry_config: fallback,
+            empty_selection: None,
+        })
     }
 
     fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
@@ -8150,8 +8239,6 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let command_timeout = self.ssh_options.command_timeout;
         const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
-        let mut completion_tick = tokio::time::interval(Duration::from_secs(3));
-        completion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut durable_status = None;
         // Seeing the completion receipt means the workload finished, not that
         // its output has arrived: the remote wrapper is still streaming the
@@ -8185,6 +8272,28 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let status = match tokio::time::timeout(command_timeout, async {
             let mut upload = Box::pin(upload);
+            // This probe is a fallback for a stuck streaming channel, not the
+            // completion clock. Keep it inside the select so an SSH round trip
+            // cannot stop output draining or delay an ordinary channel close.
+            // The first tick follows the upload by a full interval; probing at
+            // interval()'s immediate tick adds a needless connection to every
+            // no-op build. Dropping this future on channel close stops its owned
+            // local transport group, including same-group proxy descendants,
+            // without signalling the remote workload or the separate master.
+            let mut completion_probe = Box::pin(async {
+                let period = Duration::from_secs(3);
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + period,
+                    period,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
+                        break status;
+                    }
+                }
+            });
             let mut uploaded = false;
             let mut streams_open = true;
             loop {
@@ -8210,13 +8319,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             continue;
                         }
                     },
-                    _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
-                        if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
-                            durable_status = Some(status);
-                            let now = tokio::time::Instant::now();
-                            drain_cap = Some(now + COMPLETION_DRAIN_CAP);
-                            drain_deadline = Some(now + COMPLETION_DRAIN_IDLE);
-                        }
+                    status = completion_probe.as_mut(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
+                        durable_status = Some(status);
+                        let now = tokio::time::Instant::now();
+                        drain_cap = Some(now + COMPLETION_DRAIN_CAP);
+                        drain_deadline = Some(now + COMPLETION_DRAIN_IDLE);
                         continue;
                     }
                     () = drain_expired => {
@@ -8249,6 +8356,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             }
 
+            drop(completion_probe);
             child.wait().await.context("Failed to wait for ssh command")
         })
         .await
@@ -8799,12 +8907,20 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let retry_config = self
-            .artifact_retry_config(worker, &remote_path, artifact_patterns)
+        let plan = self
+            .artifact_retrieval_plan(worker, &remote_path, artifact_patterns)
             .await?;
+        if let Some(mut empty) = plan.empty_selection {
+            // The payload process used to check control again after the
+            // dry-run. Retain that boundary without starting an empty copy.
+            self.check_retrieval_control(&plan.retry_config, "retrieve_artifacts")?;
+            empty.stats.duration_ms = start.elapsed().as_millis() as u64;
+            info!("Artifact selection is verified empty; skipping payload connection");
+            return Ok(empty);
+        }
         let output = self
             .execute_retrieval_rsync(
-                &retry_config,
+                &plan.retry_config,
                 "retrieve_artifacts",
                 || self.build_retrieve_command(worker, &remote_path, artifact_patterns),
                 |_| {},
@@ -10057,13 +10173,19 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         );
 
         let retrieval_start = std::time::Instant::now();
-        let retry_config = self
-            .artifact_retry_config(worker, &remote_path, artifact_patterns)
+        let plan = self
+            .artifact_retrieval_plan(worker, &remote_path, artifact_patterns)
             .await?;
+        if let Some(mut empty) = plan.empty_selection {
+            self.check_retrieval_control(&plan.retry_config, "retrieve_artifacts_streaming")?;
+            empty.stats.duration_ms = retrieval_start.elapsed().as_millis() as u64;
+            info!("Artifact selection is verified empty; skipping payload connection");
+            return Ok(empty);
+        }
         let output = if self.retrieval_control.is_some() {
             let output = self
                 .execute_retrieval_rsync(
-                    &retry_config,
+                    &plan.retry_config,
                     "retrieve_artifacts_streaming",
                     build_cmd,
                     &mut on_line,
@@ -10085,7 +10207,7 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
             combined
         } else {
             run_command_streaming_with_retry(
-                &retry_config,
+                &plan.retry_config,
                 "retrieve_artifacts_streaming",
                 None,
                 None,
@@ -10342,6 +10464,13 @@ pub struct ArtifactRetrieval {
     pub manifest_regular_files: Vec<String>,
     /// Regular-file count from `--stats`, when parseable.
     pub matched_regular_files: Option<u32>,
+}
+
+/// The same source-fenced dry run budgets a pull and may prove it has no
+/// payload at all. A missing/ambiguous proof always retains ordinary retrieval.
+struct RetrievalPlan {
+    retry_config: RetryConfig,
+    empty_selection: Option<ArtifactRetrieval>,
 }
 
 impl ArtifactRetrieval {
@@ -11734,6 +11863,222 @@ sys.stdout.buffer.write(b'complete')
             .parse()
             .unwrap();
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    /// A completion probe can be cancelled while its local SSH process and a
+    /// ProxyCommand-like descendant are still alive. This runs real processes
+    /// through the production capture helper; it does not emulate a worker.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_probe_cancellation_stops_descendant_and_reaps_leader() {
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+        use std::os::fd::{AsFd, OwnedFd};
+        use std::time::Duration;
+
+        struct FixtureProcesses {
+            leader: OwnedFd,
+            descendant: OwnedFd,
+        }
+        impl Drop for FixtureProcesses {
+            fn drop(&mut self) {
+                // Also clean up the negative regression safely: these stable
+                // handles refer only to processes created by this fixture.
+                let _ = rustix::process::pidfd_send_signal(&self.descendant, Signal::KILL);
+                let _ = rustix::process::pidfd_send_signal(&self.leader, Signal::KILL);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let ready = directory.join("processes.json");
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .arg("-c")
+            .arg(
+                r#"import json, os, signal, sys
+descendant = os.fork()
+signal.alarm(120)
+if descendant == 0:
+    while True:
+        signal.pause()
+pending = sys.argv[1] + '.pending'
+with open(pending, 'x') as output:
+    json.dump([os.getpid(), descendant], output)
+os.rename(pending, sys.argv[1])
+while True:
+    signal.pause()
+"#,
+            )
+            .arg(&ready);
+        let mut capture = Box::pin(completion_probe_output(command));
+        let identities = tokio::time::timeout(Duration::from_secs(5), async {
+            let announced = async {
+                loop {
+                    match std::fs::read(&ready) {
+                        Ok(bytes) => break serde_json::from_slice::<[i32; 2]>(&bytes).unwrap(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("read fixture process identities: {error}"),
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut capture => panic!("probe ended before cancellation: {result:?}"),
+                identities = announced => identities,
+            }
+        })
+        .await
+        .expect("probe must publish both live process identities");
+        let open =
+            |pid| rustix::process::pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty());
+        let processes = match (open(identities[0]), open(identities[1])) {
+            (Ok(leader), Ok(descendant)) => FixtureProcesses { leader, descendant },
+            (leader, descendant) => {
+                drop(capture);
+                panic!(
+                    "native cancellation regression requires pidfd observation: leader={leader:?}, descendant={descendant:?}"
+                );
+            }
+        };
+        let leader = tokio::io::unix::AsyncFd::new(processes.leader.as_fd()).unwrap();
+        let descendant = tokio::io::unix::AsyncFd::new(processes.descendant.as_fd()).unwrap();
+        assert!(
+            rustix::process::waitid(
+                WaitId::PidFd(processes.leader.as_fd()),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            )
+            .unwrap()
+            .is_none(),
+            "the owned leader must still be alive before cancellation"
+        );
+
+        // EOF in the execution channel drops this same in-flight future.
+        // Merely killing its direct child leaves the descendant's pipes open.
+        drop(capture);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let _ = tokio::try_join!(leader.readable(), descendant.readable()).unwrap();
+            loop {
+                match rustix::process::waitid(
+                    WaitId::PidFd(processes.leader.as_fd()),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                ) {
+                    Err(rustix::io::Errno::CHILD) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("observe direct-child reaping: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled probe must terminate its descendant and reap its direct child");
+    }
+
+    /// These are transport-scheduler regressions with a scripted SSH peer, not
+    /// real-worker latency measurements. The peer blocks its completion probe
+    /// until a stdout callback acknowledges progress, then separately leaves a
+    /// probe blocked after the execution channel closes. An inline probe await
+    /// deadlocks both cases; neither test depends on a tight wall-time race.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn completion_probe_never_blocks_stream_progress_or_channel_close() {
+        const CHILD: &str = "RCH_TEST_CONCURRENT_COMPLETION_PROBE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let directory = tempfile::tempdir().unwrap().keep();
+            let peer = directory.join("ssh");
+            std::fs::write(
+                &peer,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_TEST_CONCURRENT_COMPLETION_PROBE
+case "$*" in
+  *' sh -s')
+    cat >/dev/null
+    while [ ! -f "$root/probe-started" ]; do sleep 0.01; done
+    printf 'unblock-probe\n'
+    if [ "$RCH_TEST_COMPLETION_SCENARIO" = progress ]; then
+      while [ ! -f "$root/release-probe" ]; do sleep 0.01; done
+    fi
+    printf 'final diagnostic\n' >&2
+    exit 7
+    ;;
+  *)
+    read -r pid rest </proc/self/stat
+    printf '%s\n' "$pid" > "$root/probe.pid"
+    : > "$root/probe-started"
+    while [ ! -f "$root/release-probe" ]; do sleep 0.01; done
+    printf 'completion-test 7\n'
+    ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for scenario in ["progress", "close"] {
+                let root = directory.join(scenario);
+                std::fs::create_dir(&root).unwrap();
+                let path = std::env::join_paths(std::iter::once(directory.clone()).chain(
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+                ))
+                .unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "transfer::tests::completion_probe_never_blocks_stream_progress_or_channel_close",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, root)
+                    .env("RCH_TEST_COMPLETION_SCENARIO", scenario)
+                    .env("PATH", path)
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(output.status.success(), "{scenario}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let scenario = std::env::var("RCH_TEST_COMPLETION_SCENARIO").unwrap();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "completion".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(
+            root.join("completion").to_str().unwrap().into(),
+            "completion-test".into(),
+        )
+        .with_command_timeout(Duration::from_secs(8));
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let result = pipeline
+            .execute_over_ssh_streaming(
+                &estimate_test_worker(),
+                "unused-scripted-peer-input",
+                |line| {
+                    stdout.push_str(line);
+                    if scenario == "progress" && line == "unblock-probe\n" {
+                        std::fs::write(root.join("release-probe"), b"released").unwrap();
+                    }
+                },
+                |line| stderr.push_str(line),
+            )
+            .await
+            .expect("a blocked receipt read must not block execution-channel progress");
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(stdout, "unblock-probe\n");
+        assert_eq!(stderr, "final diagnostic\n");
+        let pid = std::fs::read_to_string(root.join("probe.pid")).unwrap();
+        let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed or cancelled probe must be reaped");
     }
 
     /// The wrapper's stream must end with the command's last byte, however
@@ -22733,6 +23078,356 @@ Total file size: 123 bytes";
             parse_rsync_selected_size("Total file size: 0 bytes"),
             Some(0)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn counted_artifact_peer(delay: &str) -> (PathBuf, TransferPipeline, WorkerConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let source = root.join("worker");
+        let caller = root.join("caller");
+        let stage = root.join("stage");
+        for directory in [&source, &caller, &stage] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(caller.join("Cargo.lock"), b"caller lockfile sentinel\n").unwrap();
+        std::fs::write(caller.join("source.rs"), b"caller source sentinel\n").unwrap();
+        let peer = root.join("counted-rsync");
+        let calls = escape(root.join("calls").to_string_lossy()).into_owned();
+        let warnings = escape(root.join("warnings").to_string_lossy()).into_owned();
+        let malformed = escape(root.join("malformed").to_string_lossy()).into_owned();
+        std::fs::write(
+            &peer,
+            format!(
+                r#"#!/bin/sh
+case "$1" in --version|-V) exec /usr/bin/rsync "$@" ;; esac
+phase=payload
+for arg do
+    if [ "$arg" = --dry-run ]; then phase=selection; fi
+done
+printf '%s\n' "$phase" >> {calls}
+sleep {delay}
+if [ -f {warnings} ]; then printf '%s\n' 'rsync: partial transfer: Permission denied (13)' >&2; fi
+if [ "$phase" = selection ] && [ -f {malformed} ]; then
+    printf '%s\n' 'Total file size: 0 bytes'
+    exit 0
+fi
+exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift; exec \"\$@\"' rch-local-peer"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pipeline = TransferPipeline::new(
+            caller,
+            "empty-artifacts".into(),
+            "empty-artifacts".into(),
+            TransferConfig {
+                rsync_bin: Some(peer.to_string_lossy().into_owned()),
+                retry: RetryConfig {
+                    max_attempts: 1,
+                    total_timeout_ms: 5_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .with_local_root(stage)
+        .with_remote_path_override(source.to_str().unwrap());
+        (root, pipeline, worker_with_os(None))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn artifact_peer_calls(root: &Path) -> usize {
+        std::fs::read_to_string(root.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_empty_artifacts_omit_one_remote_call_in_both_collectors() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0");
+        std::fs::create_dir_all(root.join("worker/target/debug")).unwrap();
+        std::fs::write(
+            root.join("worker/target/debug/cache.rmeta"),
+            b"worker cache",
+        )
+        .unwrap();
+        let patterns = default_rust_test_artifact_patterns();
+        for streaming in [false, true] {
+            let before = artifact_peer_calls(&root);
+            let result = if streaming {
+                pipeline
+                    .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                    .await
+            } else {
+                pipeline.retrieve_artifacts(&worker, &patterns).await
+            }
+            .unwrap();
+            assert_eq!(artifact_peer_calls(&root) - before, 1);
+            assert_eq!(result.matched_regular_files, Some(0));
+            assert!(result.manifest_regular_files.is_empty());
+            assert_eq!(result.stats.files_transferred, 0);
+            assert_eq!(std::fs::read_dir(root.join("stage")).unwrap().count(), 0);
+        }
+        assert_eq!(
+            std::fs::read(root.join("caller/Cargo.lock")).unwrap(),
+            b"caller lockfile sentinel\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("caller/source.rs")).unwrap(),
+            b"caller source sentinel\n"
+        );
+        // A declared directory is itself caller output, even with no files.
+        std::fs::create_dir(root.join("worker/reports")).unwrap();
+        let before = artifact_peer_calls(&root);
+        pipeline
+            .retrieve_result_dir(&worker, Path::new("reports"))
+            .await
+            .unwrap();
+        assert_eq!(artifact_peer_calls(&root) - before, 2);
+        assert!(root.join("stage/reports").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_empty_selection_rechecks_control_after_probe() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0");
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let pipeline = pipeline.with_retrieval_control(receiver.clone(), TokioInstant::now());
+        let plan = pipeline
+            .artifact_retrieval_plan(
+                &worker,
+                &pipeline.remote_path(),
+                &default_rust_test_artifact_patterns(),
+            )
+            .await
+            .unwrap();
+        assert!(plan.empty_selection.is_some());
+        assert_eq!(plan.retry_config.total_timeout_ms, 30_000);
+        assert_eq!(artifact_peer_calls(&root), 1);
+
+        // Exercise the exact synchronous gate used by both empty returns after
+        // obtaining a real empty proof. A recovery request can arrive after
+        // that process has exited and been reaped; it still needs its typed
+        // acknowledgment, without another process or an asynchronous gap.
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            pipeline
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap();
+        }
+        cancel.send(true).unwrap();
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            let error = pipeline
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap_err();
+            assert!(error.is::<RetrievalCancelled>());
+        }
+
+        // Distinct budgets make this a deterministic absolute-deadline
+        // regression: passing a larger probe allowance cannot authorize a
+        // result after the selected plan's deadline. Current size planning
+        // never shrinks its configured allowance, but the gate must enforce
+        // the plan it receives independently of that policy.
+        cancel.send(false).unwrap();
+        let expired = pipeline
+            .with_retrieval_control(receiver, TokioInstant::now() - Duration::from_secs(60));
+        let probe_allowance = RetryConfig {
+            total_timeout_ms: 120_000,
+            ..plan.retry_config.clone()
+        };
+        expired
+            .check_retrieval_control(&probe_allowance, "estimate_artifact_retrieval")
+            .unwrap();
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            let error = expired
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap_err();
+            assert!(error.to_string().contains("retrieval deadline exceeded"));
+        }
+        assert_eq!(artifact_peer_calls(&root), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_shortcut_preserves_zero_byte_reports_symlinks_and_checksum_noops() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        for streaming in [false, true] {
+            for case in ["empty-file", "report", "checksum-noop", "symlink"] {
+                let (root, pipeline, worker) = counted_artifact_peer("0");
+                let source = root.join("worker/junit.xml");
+                let destination = root.join("stage/junit.xml");
+                if case == "symlink" {
+                    std::fs::write(root.join("worker/report-target"), b"report").unwrap();
+                    std::os::unix::fs::symlink("report-target", &source).unwrap();
+                } else {
+                    let contents: &[u8] = if case == "empty-file" {
+                        b""
+                    } else {
+                        b"report\n"
+                    };
+                    std::fs::write(&source, contents).unwrap();
+                    if case == "checksum-noop" {
+                        std::fs::write(&destination, contents).unwrap();
+                        let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&destination)
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                }
+                let patterns = default_rust_test_artifact_patterns();
+                let result = if streaming {
+                    pipeline
+                        .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                        .await
+                } else {
+                    pipeline.retrieve_artifacts(&worker, &patterns).await
+                }
+                .unwrap();
+                assert_eq!(
+                    artifact_peer_calls(&root),
+                    2,
+                    "{case}, streaming={streaming}"
+                );
+                if case == "symlink" {
+                    assert_eq!(
+                        std::fs::read_link(&destination).unwrap(),
+                        Path::new("report-target")
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(&destination).unwrap(),
+                        std::fs::read(&source).unwrap()
+                    );
+                    assert_eq!(result.matched_regular_files, Some(1));
+                    assert_eq!(result.manifest_regular_files, ["junit.xml"]);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_shortcut_never_bypasses_uncertain_evidence_or_storage_reserve() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        for streaming in [false, true] {
+            for case in ["malformed", "warnings", "reserve", "cancel"] {
+                let (root, mut pipeline, worker) = counted_artifact_peer("0");
+                let (_cancel, receiver) = tokio::sync::watch::channel(case == "cancel");
+                if case == "reserve" {
+                    pipeline.transfer_config.retrieval_min_free_bytes = u64::MAX;
+                } else if case == "cancel" {
+                    pipeline = pipeline.with_retrieval_control(receiver, TokioInstant::now());
+                } else {
+                    std::fs::write(root.join(case), b"enabled").unwrap();
+                }
+                let patterns = default_rust_test_artifact_patterns();
+                let result = if streaming {
+                    pipeline
+                        .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                        .await
+                } else {
+                    pipeline.retrieve_artifacts(&worker, &patterns).await
+                };
+                if case == "cancel" {
+                    assert!(result.unwrap_err().is::<RetrievalCancelled>());
+                    assert_eq!(
+                        artifact_peer_calls(&root),
+                        0,
+                        "cancelled selection must not start"
+                    );
+                } else if case == "reserve" {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("insufficient controller retrieval storage")
+                    );
+                    assert_eq!(artifact_peer_calls(&root), 1);
+                } else if case == "warnings" {
+                    assert!(
+                        result.is_err(),
+                        "partial output must remain a delivery error"
+                    );
+                    assert_eq!(artifact_peer_calls(&root), 2);
+                } else {
+                    assert!(result.is_ok());
+                    assert_eq!(
+                        artifact_peer_calls(&root),
+                        2,
+                        "incomplete evidence must retain collection"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_latency_pairs_real_rsync_with_the_previous_two_call_path() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0.25");
+        let patterns = default_rust_test_artifact_patterns();
+        let remote = pipeline.remote_path();
+        let mut previous_ms = Vec::new();
+        let mut optimized_ms = Vec::new();
+        for _ in 0..3 {
+            let before = artifact_peer_calls(&root);
+            let started = std::time::Instant::now();
+            // The incumbent always follows the existing budget/selection
+            // dry-run with a payload rsync, even when no files were selected.
+            let plan = pipeline
+                .artifact_retrieval_plan(&worker, &remote, &patterns)
+                .await
+                .unwrap();
+            assert!(plan.empty_selection.is_some());
+            let copied = pipeline
+                .execute_retrieval_rsync(
+                    &plan.retry_config,
+                    "previous_empty_artifact_collection",
+                    || pipeline.build_retrieve_command(&worker, &remote, &patterns),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(copied.status.success());
+            previous_ms.push(started.elapsed().as_millis());
+            assert_eq!(artifact_peer_calls(&root) - before, 2);
+
+            let before = artifact_peer_calls(&root);
+            let started = std::time::Instant::now();
+            let empty = pipeline
+                .retrieve_artifacts(&worker, &patterns)
+                .await
+                .unwrap();
+            optimized_ms.push(started.elapsed().as_millis());
+            assert_eq!(artifact_peer_calls(&root) - before, 1);
+            assert_eq!(empty.matched_regular_files, Some(0));
+        }
+        // Counts are the deterministic latency regression gate. These actual
+        // wall times are a paired local-rsync measurement with injected delay,
+        // not a claim about a real high-latency worker or a complete rch build.
+        eprintln!(
+            "empty-artifact native rsync, injected 250ms/call: previous_ms={previous_ms:?}, optimized_ms={optimized_ms:?}; remote calls 2 -> 1; retained={}",
+            root.display()
+        );
+        assert_eq!(std::fs::read_dir(root.join("stage")).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
