@@ -543,6 +543,16 @@ impl TlsFiles {
         let chain =
             CertificateChain::from_pem(&read_pem(&self.certificate)?).map_err(|e| e.to_string())?;
         let key = PrivateKey::from_pem(&read_pem(&self.private_key)?).map_err(|e| e.to_string())?;
+        // The pinned acceptor selects ring for ServerConfig, but its required
+        // WebPkiClientVerifier still uses the process default. Combined RCH/RABS
+        // builds also enable AWS-LC via reqwest, so inference would panic.
+        // Preserve an application-selected provider. A concurrent installer may
+        // win the OnceLock; that is the only install_default error and is safe.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .unwrap_or(());
+        }
         TlsAcceptor::builder(chain, key)
             .require_client_auth(roots)
             .alpn_protocols_required(vec![WORKER_ALPN.to_vec()])
@@ -748,6 +758,138 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::Waker;
+
+    #[cfg(unix)]
+    #[test]
+    fn mutual_tls_factories_handle_both_crypto_backends_in_fresh_processes() {
+        const CASE: &str = "worker_transport::tests::mutual_tls_factories_handle_both_crypto_backends_in_fresh_processes";
+        const CHILD: &str = "RABS_TLS_PROVIDER_REGRESSION_CHILD";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["unset", "aws"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("1 passed; 0 failed; 0 ignored;"),
+                    "fresh provider probe must execute its exact case"
+                );
+            }
+            return;
+        };
+        // Both symbols must compile: a ring-only test build cannot certify the
+        // real RCH/reqwest + RABS feature-unification regression.
+        let ring = rustls::crypto::ring::default_provider();
+        let aws = rustls::crypto::aws_lc_rs::default_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        if mode == "aws" {
+            aws.install_default().unwrap();
+        } else {
+            assert_eq!(mode, "unset");
+        }
+        drop(ring);
+        let previous = rustls::crypto::CryptoProvider::get_default().cloned();
+        let root = tempfile::tempdir().unwrap();
+        let openssl = |args: &[&str]| {
+            let output = std::process::Command::new("openssl")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .expect("OpenSSL is required for the TLS provider regression");
+            assert!(
+                output.status.success(),
+                "openssl {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-sha256",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=RABS provider test CA",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.pem",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ]);
+        openssl(&[
+            "req",
+            "-new",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-sha256",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            "peer.key",
+            "-out",
+            "peer.csr",
+        ]);
+        std::fs::write(root.path().join("peer.ext"),
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:localhost\n").unwrap();
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "peer.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-set_serial",
+            "2",
+            "-days",
+            "1",
+            "-sha256",
+            "-extfile",
+            "peer.ext",
+            "-out",
+            "peer.pem",
+        ]);
+        let files = TlsFiles {
+            ca: root.path().join("ca.pem"),
+            certificate: root.path().join("peer.pem"),
+            private_key: root.path().join("peer.key"),
+        };
+        for _ in 0..2 {
+            let acceptor = files.acceptor().unwrap();
+            let connector = files.connector().unwrap();
+            assert_eq!(acceptor.handshake_timeout(), Some(HANDSHAKE_TIMEOUT));
+            assert_eq!(connector.handshake_timeout(), Some(HANDSHAKE_TIMEOUT));
+            assert_eq!(acceptor.config().alpn_protocols, vec![WORKER_ALPN.to_vec()]);
+            assert_eq!(
+                connector.config().alpn_protocols,
+                vec![WORKER_ALPN.to_vec()]
+            );
+        }
+        let selected = rustls::crypto::CryptoProvider::get_default().unwrap();
+        if let Some(previous) = previous {
+            assert!(std::sync::Arc::ptr_eq(&previous, selected));
+        }
+    }
 
     static VIRTUAL_CLOCK_NANOS: AtomicU64 = AtomicU64::new(1_000_000_000);
 

@@ -2,7 +2,108 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at00:03UTC (November4 local):**
+**Latest execution checkpoint, November5 at01:52UTC (November4 local):**
+
+- [x] Consume the seven-role retry b7acde59 SUCCESS: normal build0/707.9s,
+  six version probes and actual wrapper/compiler0; original native harness
+  compile0/135.0s and two exact native case lists. Diagnostic-only bf231ad5
+  also SUCCESS: ordinary harness0/1506.9s, fmt0/22.1s, full workspace/all-target
+  check0/641.3s, strictClippy0/790.5s. Source/control/tool audits match.
+  These are build/static receipts, not native Cargo or TLS proof.
+- [x] Run the original two-case full-SDK consumer with those matched tools:
+  DSRe2f2fa04 FAIL, CHECK0/1/raw101/173.886s; BUILD/program UNRUN. The actual
+  combined seven-role worker listener panics in rustls0.23.45: Cargo enables
+  both ring (Asupersync) and AWS-LC (RCH/reqwest), while the pinned acceptor's
+  required-client-auth verifier infers a process provider. This is a concrete
+  startup failure, separate from the older isolated04ffa helper600s timeout.
+  Original complete SDK5256 entries/4270 files/1921340623 bytes and source/tool
+  before/after audits match; observed owned processes retired, independent
+  sampling remains supplementary. No compiler/cache success from this run.
+- [x] Repair provider initialization in the sole RABS TLS adapter, preserving
+  any application-selected provider and the existing required mutual-auth,
+  CA/ALPN/5s handshake policy. Keep exact Asup78b64636 and rustls0.23.45;
+  expose already-linked ring/std directly, and enable already-present AWS-LC
+  in dev tests to reproduce the real combined feature union. Add a genuine
+  fresh-process/real-PKI regression for unset and preselected-AWS defaults,
+  two repeated factory calls, preserved ALPN/timeouts/provider identity.
+  Factory proof alone is not a network handshake or compiler execution.
+- [ ] Qualify TLS repair snapshot9d78eb1c+e1a23b9c/all1747 with only THREE
+  manual TLS inputs; archive65689600B/SHA671f6b44, frozen controller9705B/
+  SHA33fcd906. Native DSR launched01:52:17UTC/PID21149, original3600s/jobs1/
+  concurrency4/root20GiB. First complete adapter worker_transport module and
+  unchanged feature-profile contract; then full check/strictClippy/fmt, ALL
+  seven normal roles, requiring actual release rustls artifact to retain BOTH
+  ring and AWS-LC, ordinary native harness and all four exact case lists.
+  UBS on the three TLS inputs reports0 critical/124 warning/35 info; local
+  fmt/diff0. Native compilation/tests remain pending at this checkpoint.
+- [ ] Run matching combined-role TLS/compiler/cache CHECK and BUILD with the
+  original complete SDK and original300s/600s/combined3600s clocks. Also run
+  the separate explicit-prewarm shared-service case, requiring persisted
+  full SDK, first-request reuse, three fresh real worker executions, idle
+  heartbeats, service restart and cleanup. No four-role-only substitution,
+  timer increase, reduced SDK, action-cache substitute or provider removal.
+- [x] Retain warm-only a4e95463 terminal FAIL: native timeout5/3603s at the
+  original3600s cap during ordinary harness compile. Before timeout: fmt0/
+  16.9s, full check0/1146.8s, strictClippy0/1001.4s, all38 SDK-pool cases PASS/
+  2.803s (35 existing plus3 new), zero ignored/failed; normal four-role build0/
+  993s, version/actual compiler probes0, three real CLI negatives raw2/2/1.
+  The harness/case lists remain UNQUALIFIED; no terminal producer0 receipt.
+  This source predates the TLS repair and cannot qualify combined startup.
+- [ ] Separately exercise the actual normal warm CLI from that exact partial
+  producer against the COMPLETE original SDK on TRJ: first durable capture,
+  then a second-process reopen with complete independent byte/namespace/mode/
+  symlink verification and all4270 published regular-file inodes unchanged.
+  The FIVE warm implementation inputs match the newer TLS snapshot exactly.
+  Preserve producer timeout and original bounds; this proves only the SDK
+  preparation capability, never network/worker restart/Cargo/action-cache/
+  performance/fleet/release. New private job-full-sdk-warm-cli-20261105 inputs
+  are staged; native execution remains pending at02:05UTC.
+
+**Bounded real-work and honesty audit, resumed work through02:05UTC:**
+README purpose: transparently offload agent compilation and return its outputs
+without saturating the workstation. Four work items: adapter startup repair
+USER (implemented, not yet qualified/shipped); regression/build qualification
+ENABLER; actual full-SDK runtime execution ENABLER; plan/Beads tracking PROCESS.
+No quota is inferred from that tally. Last four actual commits include the warm
+feature and three tracker/docs commits; the root made no commits or closes.
+Verdict DRIFTING: operator scaffolding and receipts have consumed too much work
+while the native capability remains red. Correction: freeze additional report
+machinery and focus the next block on completing these actual SDK/TLS/Cargo
+executions and fixing their concrete failures. A two-minute working demo of
+the current combined build is not yet available. Omitting the process item
+would not change runtime behavior. Prior seven-role build enabled the actual
+e2f2 failure reproduction; newer enablers have not yet produced a runtime pass.
+Oldest user-facing acceptance remains usable M6 fleet builds, not more closes.
+
+Honesty questions1-6: No weakening (checked full0b3 warm/test diff, current TLS
+diff, immutable original consumer clocks and unchanged feature-profile gate);
+no success mock (checked real filesystem/PKI/subprocess paths); no golden
+regeneration (checked touched-file diff); new ignored native warm case retains
+the original cold case and is explicitly invoked by name, not counted by a
+zero-run result. No new suppressions, feature removal or tolerance changes
+(checked manifests, lock edge and frozen controls); no zero-run green is
+accepted (compiled names and exact libtest denominators are mandatory).
+Questions7-12: Native TLS-repair compilation is still PENDING, older257 and
+newer38 component passes are separate source/proof scopes. Producer timeouts,
+e2f2 actual crypto panic, legacy-receipt KeyError and staged-tar directory
+refusal are retained; the last two are operator errors, not product evidence.
+No closure/requirements rewrite/golden or stderr suppression (checked root
+commands, full captured logs, Bead comment and current plan). The corrected
+legacy admission accepts only its exact known receipt hash and all original
+zero checks; the staging correction accepts only manifest files plus their
+ancestor directories. No runtime gate was changed by either correction.
+Questions13-17: solo execution; no subagent results or agreement accepted as
+proof. Question18: case sets/module selectors fixed before execution; compiled
+names are inventoried before running, not chosen after results. Question19:
+the partial producer must never be described as successful because its warm
+binary is used for a narrower diagnostic; its timeout is explicitly required
+and recorded by that diagnostic. Question20: strongest current new evidence is
+the reproducible combined-build panic, not an unobserved repair pass. Prior
+full-SDK native successes remain revision-bound. Disposition: corrections and
+failure chains disclosed in commentary/M6; countermeasures against proof-class
+inflation, zero-run greens, gate weakening and scope-splitting remain enforcing.
+
+**Earlier execution checkpoint (retained):**
 
 - [x] Retain normal-seven producer f904aaff FAILED: native timeout5/3604s,
   overall6/3607s at the unchanged3600s limit, while compiling rchd. No complete

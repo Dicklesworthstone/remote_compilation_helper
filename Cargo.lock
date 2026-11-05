@@ -5100,6 +5100,7 @@ dependencies = [
  "rabs-action",
  "rabs-protocol",
  "rustix",
+ "rustls",
  "tempfile",
 ]
 

@@ -29,6 +29,10 @@ doctest = false
 asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "78b64636e99fea4ea2d868096576021dd3b8e519", default-features = false, features = ["proc-macros", "tls"] }
 rabs-action = { path = "../rabs-action" }
 rabs-protocol = { path = "../rabs-protocol" }
+# The pinned TLS acceptor's client-certificate verifier still consults the
+# process provider. Select it explicitly when Cargo also enables reqwest's
+# AWS-LC backend; these ring/std features already come from Asupersync TLS.
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["process"] }
@@ -36,6 +40,8 @@ rustix = { version = "1.1.4", features = ["process"] }
 [dev-dependencies]
 tempfile = "3.25.0"
 parking_lot = "0.12"
+# Reproduce the real combined RCH/RABS workspace provider union in adapter tests.
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs"] }
 
 [lints.rust]
 unsafe_code = "forbid"

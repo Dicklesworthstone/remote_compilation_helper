@@ -68,6 +68,35 @@ fn asupersync_uses_the_minimal_profile() {
     );
 }
 
+fn check_consumer_pin(consumer: &str, source: &str) -> Result<usize, String> {
+    let runtime = runtime_deps_section(source);
+    let production_edges = runtime
+        .lines()
+        .filter(|line| line.trim_start().starts_with("asupersync ="))
+        .count();
+    if production_edges != 1 {
+        return Err(format!(
+            "{consumer} must have exactly one production Asupersync edge, found {production_edges}"
+        ));
+    }
+    let mut edges = 0;
+    for line in source.lines().map(str::trim) {
+        if !line.starts_with("asupersync =") {
+            continue;
+        }
+        edges += 1;
+        if !(line.contains("version = \"=0.5.0\"")
+            && line.contains("rev = \"78b64636e99fea4ea2d868096576021dd3b8e519\"")
+            && line.contains("git = \"https://github.com/Dicklesworthstone/asupersync.git\""))
+        {
+            return Err(format!(
+                "{consumer} runtime pin differs from ADR 007: {line}"
+            ));
+        }
+    }
+    Ok(edges)
+}
+
 #[test]
 fn every_runtime_consumer_uses_the_same_release_pin() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -75,21 +104,69 @@ fn every_runtime_consumer_uses_the_same_release_pin() {
     for consumer in ["rabs-asupersync", "rabsd", "rabs-wkr"] {
         let source = fs::read_to_string(workspace.join(consumer).join("Cargo.toml"))
             .expect("read runtime consumer manifest");
-        for line in source.lines().map(str::trim) {
-            if !line.starts_with("asupersync =") {
-                continue;
-            }
-            edges += 1;
-            assert!(
-                line.contains("version = \"=0.5.0\"")
-                    && line.contains("rev = \"78b64636e99fea4ea2d868096576021dd3b8e519\"")
-                    && line
-                        .contains("git = \"https://github.com/Dicklesworthstone/asupersync.git\""),
-                "{consumer} runtime pin differs from ADR 007: {line}"
-            );
+        edges += check_consumer_pin(consumer, &source).unwrap();
+    }
+    // 41970726 removed rabsd's unused test-internals dev edge when its actor
+    // test switched to a real runtime. Every production edge remains required;
+    // any optional fourth declaration must still use the exact same pin.
+    assert!(
+        (3..=4).contains(&edges),
+        "three production edges and at most one dev edge, found {edges}"
+    );
+}
+
+#[test]
+fn pin_guard_rejects_drift_in_production_and_optional_dev_edges() {
+    let source = manifest();
+    let valid = source
+        .lines()
+        .find(|line| line.starts_with("asupersync ="))
+        .unwrap();
+    for (original, changed) in [
+        ("=0.5.0", "=0.5.1"),
+        (
+            "78b64636e99fea4ea2d868096576021dd3b8e519",
+            "0000000000000000000000000000000000000000",
+        ),
+        (
+            "https://github.com/Dicklesworthstone/asupersync.git",
+            "https://example.invalid/asupersync.git",
+        ),
+    ] {
+        let changed = valid.replace(original, changed);
+        for candidate in [
+            format!("[dependencies]\n{changed}\n"),
+            format!("[dependencies]\n{valid}\n[dev-dependencies]\n{changed}\n"),
+        ] {
+            assert!(check_consumer_pin("mutant", &candidate).is_err());
         }
     }
-    assert_eq!(edges, 4, "three production edges and the rabsd dev edge");
+}
+
+#[test]
+fn dev_edge_cannot_replace_a_production_edge_or_hide_a_duplicate() {
+    let source = manifest();
+    let valid = source
+        .lines()
+        .find(|line| line.starts_with("asupersync ="))
+        .unwrap();
+    assert_eq!(
+        check_consumer_pin("valid", &format!("[dependencies]\n{valid}\n")),
+        Ok(1)
+    );
+    assert_eq!(
+        check_consumer_pin(
+            "valid-with-dev",
+            &format!("[dependencies]\n{valid}\n[dev-dependencies]\n{valid}\n")
+        ),
+        Ok(2)
+    );
+    for candidate in [
+        format!("[dependencies]\n[dev-dependencies]\n{valid}\n"),
+        format!("[dependencies]\n{valid}\n{valid}\n"),
+    ] {
+        assert!(check_consumer_pin("mutant", &candidate).is_err());
+    }
 }
 
 #[test]
