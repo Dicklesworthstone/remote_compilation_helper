@@ -657,6 +657,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     // A refusal keeps the original fresh workspace plan, before any action or
     // worker attempt exists. The captured full-workspace image is identical for
     // both profiles; its class label never supplies cache authority by itself.
+    // Qualification belongs to this selected, independently isolated action.
+    // Other project executors in the operation do not veto remote cache use;
+    // the operation-wide local-completion refusal is preserved below through
+    // unavailable workers, warming, and every remote failure/fallback path.
     let mut committed_workspace_inputs = None;
     if workspace_requested
         && let Some(paths) = &live.canonical

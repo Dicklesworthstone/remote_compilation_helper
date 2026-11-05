@@ -449,29 +449,28 @@ impl CanonicalPaths {
         Ok(())
     }
 
-    /// Complete-workspace cache classes require a selected ordinary leaf
-    /// library in the exact build/check mode and a graph that cannot execute
-    /// project code. The wrapper supplies neither membership nor absence proof.
+    /// Qualify a selected ordinary leaf library in its exact build/check mode
+    /// for independently isolated worker execution. Other Cargo units may run
+    /// project code: their presence does not change this action's sealed input
+    /// view. The wrapper supplies neither membership nor execution evidence;
+    /// remote keying/capture must still retain the closed worker proof, and
+    /// `require_local_capture` remains a separate operation-wide refusal.
     pub(crate) fn require_workspace_closed_library(
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<(), String> {
         rabs_key::live_dependency::workspace_cache::validate_closed_workspace_library_plan(plan)
             .map_err(|error| error.to_string())?;
-        self.require_workspace_execution(plan)?;
-        if self.closed_dependency_execution_required {
-            return Err(
-                "closed workspace library caching requires a Cargo graph without project executors"
-                    .into(),
-            );
-        }
-        Ok(())
+        self.require_workspace_execution(plan)
     }
 
     /// The exact committed policy validates source origin and compiler shape.
-    /// Workspace consumers also retain selected-unit and executor-free graph
-    /// authority. Immutable dependencies use their retained package mounts and
-    /// require isolated execution plus committed inputs at the remote boundary.
+    /// Workspace consumers also retain exact selected-unit authority. This
+    /// qualifies only the selected closed action, including when other units
+    /// may execute project code; it never authorizes local completion. Immutable
+    /// dependencies use their retained package mounts. Every consumer still
+    /// requires isolated execution plus exact committed input owners at the
+    /// remote boundary.
     pub(crate) fn require_committed_dependency_library(
         &self,
         plan: &DependencyActionPlan,
@@ -486,12 +485,6 @@ impl CanonicalPaths {
                 plan.source_kind
                     == rabs_key::live_dependency::DependencySourceKind::WorkspaceTerminalMetadata,
             )?;
-            if self.closed_dependency_execution_required {
-                return Err(
-                    "committed workspace caching requires a Cargo graph without project executors"
-                        .into(),
-                );
-            }
         } else {
             for root in [&plan.source_root, &plan.package_root] {
                 let physical = self.physical(Path::new(root))?;
@@ -1582,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_workspace_libraries_require_the_selected_output_mode_and_no_project_executors() {
+    fn closed_workspace_libraries_keep_selected_action_authority_with_project_executors() {
         use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
 
         for (command, mode) in [
@@ -1609,6 +1602,14 @@ mod tests {
                 &execution,
             )
             .unwrap();
+            let committed = if mode == "build" {
+                rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_rlib(&execution)
+            } else {
+                rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_metadata(&execution)
+            }
+            .unwrap();
+            let committed_policy =
+                CommittedDependencyPolicy::from_source_kind(committed.source_kind).unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_err());
             let mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&execution).unwrap();
             let policy = CommittedDependencyPolicy::from_source_kind(mixed.source_kind).unwrap();
@@ -1706,21 +1707,186 @@ mod tests {
                 "a selected {mode} unit cannot authorize the other compiler output class"
             );
             let guarded = paths.require_closed_dependency_execution().unwrap();
-            assert!(guarded.require_workspace_closed_library(&closed).is_err());
+            guarded.require_workspace_closed_library(&closed).unwrap();
+            guarded
+                .require_committed_dependency_library(&committed, committed_policy)
+                .unwrap();
+            guarded
+                .require_committed_dependency_library(&mixed, policy)
+                .unwrap();
+            guarded
+                .require_committed_dependency_library(&mixed, dag_policy)
+                .unwrap();
+            assert!(guarded.require_local_capture().is_err());
             assert!(
                 guarded
-                    .require_committed_dependency_library(&mixed, policy)
+                    .require_workspace_closed_library(&execution)
                     .is_err()
             );
             assert!(
                 guarded
-                    .require_committed_dependency_library(&mixed, dag_policy)
+                    .require_workspace_closed_library(&other_mode)
                     .is_err()
             );
+            for mutation in 0..6 {
+                for original in [&closed, &committed, &mixed] {
+                    let mut other = original.clone();
+                    match mutation {
+                        0 => other.invocation.crate_name = Some("unselected".into()),
+                        1 => other.invocation.features.clear(),
+                        2 => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+                        3 => other.package_root = "/__rabs/workspace/other".into(),
+                        4 => other.invocation.crate_types = vec!["rlib".into()],
+                        _ => {
+                            other.invocation.source = Some(
+                                rabs_key::invocation::SourceInput::Path("other/src/lib.rs".into()),
+                            );
+                        }
+                    }
+                    assert!(guarded.require_workspace_closed_library(&other).is_err());
+                    for policy in [committed_policy, policy, dag_policy] {
+                        assert!(
+                            guarded
+                                .require_committed_dependency_library(&other, policy)
+                                .is_err(),
+                            "{mode}, {policy:?}, mutation {mutation}"
+                        );
+                    }
+                }
+            }
             assert!(
                 guarded.require_workspace_execution(&execution).is_ok(),
                 "project executors retain fresh remote execution"
             );
+        }
+    }
+
+    #[test]
+    fn executor_graphs_qualify_only_the_exact_selected_terminal_metadata_root() {
+        use rabs_key::live_dependency::workspace_dependency_cache::plan_terminal_workspace_metadata;
+
+        for (kind, crate_type, test_harness, test_cfg) in [
+            ("bin", Some("bin"), false, false),
+            ("example", Some("bin"), false, false),
+            ("test", None, true, false),
+            ("bench", None, false, true),
+        ] {
+            let paths = workspace_target_paths(kind, "bin", true, true, None)
+                .require_closed_dependency_execution()
+                .unwrap();
+            let execution =
+                workspace_metadata_plan_with_test_cfg(crate_type, test_harness, test_cfg);
+            let terminal = plan_terminal_workspace_metadata(&execution).unwrap();
+            assert!(paths.require_local_capture().is_err());
+            assert!(paths.require_workspace_closed_library(&terminal).is_err());
+            for policy in [
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            ] {
+                paths
+                    .require_committed_dependency_library(&terminal, policy)
+                    .unwrap();
+                let prerequisite = workspace_target_paths(kind, "bin", true, false, None)
+                    .require_closed_dependency_execution()
+                    .unwrap();
+                assert!(
+                    prerequisite
+                        .require_committed_dependency_library(&terminal, policy)
+                        .is_err(),
+                    "{kind}, {policy:?}: a prerequisite is not a selected terminal root"
+                );
+                for mutation in 0..4 {
+                    let mut other = terminal.clone();
+                    match mutation {
+                        0 => other.invocation.features.clear(),
+                        1 => other.invocation.emit.push("link".into()),
+                        2 => other.invocation.crate_name = Some("unselected".into()),
+                        _ => {
+                            other.invocation.source = Some(
+                                rabs_key::invocation::SourceInput::Path("app/src/main.rs".into()),
+                            );
+                        }
+                    }
+                    assert!(
+                        paths
+                            .require_committed_dependency_library(&other, policy)
+                            .is_err(),
+                        "{kind}, {policy:?}, mutation {mutation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn executor_graphs_keep_generated_and_native_libraries_in_fresh_execution() {
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library;
+        use rabs_key::live_dependency::{DependencySourceKind, remote_workspace_execution_shape};
+
+        for native in [false, true] {
+            let paths = workspace_target_paths("lib", "lib", false, true, None)
+                .require_closed_dependency_execution()
+                .unwrap();
+            let mut execution = workspace_plan();
+            let generated = "/__rabs/out/cargo/debug/build/project-abc/out";
+            let physical = paths.physical(Path::new(generated)).unwrap();
+            std::fs::create_dir_all(&physical).unwrap();
+            std::fs::write(physical.join("config.rs"), b"pub const VALUE: u32 = 42;\n").unwrap();
+            execution.generated_root = Some(generated.into());
+            execution
+                .execution_env
+                .push(("OUT_DIR".into(), generated.into()));
+            execution.execution_env.sort();
+            execution.keyed_env = execution.execution_env.clone();
+            if native {
+                std::fs::write(
+                    physical.join("libgenerated.a"),
+                    crate::test_util::closed_rlib_fixture(b"retained native input"),
+                )
+                .unwrap();
+                execution
+                    .invocation
+                    .lib_search
+                    .push(format!("native={generated}"));
+                execution
+                    .invocation
+                    .native_libs
+                    .push("static=generated".into());
+            }
+            // These are valid fresh worker execution shapes, not malformed
+            // plans that happen to fail both the old and new cache boundary.
+            paths.require_workspace_execution(&execution).unwrap();
+            remote_workspace_execution_shape(&execution, &[], "/__rabs/toolchain").unwrap();
+            assert!(paths.require_local_capture().is_err());
+            assert!(plan_closed_workspace_library(&execution).is_err());
+            assert!(plan_mixed_workspace_library(&execution).is_err());
+            let mut relabeled = execution.clone();
+            relabeled.source_kind = DependencySourceKind::WorkspaceClosedMetadata;
+            assert!(paths.require_workspace_closed_library(&relabeled).is_err());
+            for (source_kind, policies) in [
+                (
+                    DependencySourceKind::WorkspaceCommittedMetadata,
+                    &[CommittedDependencyPolicy::WorkspaceMetadata][..],
+                ),
+                (
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                    &[
+                        CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                        CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    ][..],
+                ),
+            ] {
+                relabeled.source_kind = source_kind;
+                for policy in policies {
+                    assert!(
+                        paths
+                            .require_committed_dependency_library(&relabeled, *policy)
+                            .is_err(),
+                        "native={native}, {policy:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1813,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_workspace_metadata_requires_selected_check_and_executor_free_graph() {
+    fn committed_workspace_metadata_requires_selected_check_even_with_project_executors() {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
         };
@@ -1880,9 +2046,13 @@ mod tests {
             );
         }
         let guarded = paths.require_closed_dependency_execution().unwrap();
+        guarded
+            .require_committed_dependency_library(&metadata, policy)
+            .unwrap();
+        assert!(guarded.require_local_capture().is_err());
         assert!(
             guarded
-                .require_committed_dependency_library(&metadata, policy)
+                .require_committed_dependency_library(&archive, policy)
                 .is_err()
         );
         guarded.require_workspace_execution(&execution).unwrap();

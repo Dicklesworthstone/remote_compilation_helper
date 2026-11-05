@@ -5112,7 +5112,7 @@ mod execution_resource_tests {
             &runtime,
         )
         .unwrap();
-        assert_eq!(key.descriptor.key_epoch, 7);
+        assert_eq!(key.descriptor.key_epoch, 19);
         let policy = Some(CommittedDependencyPolicy::WorkspaceMetadata);
         assert!(
             verify_execution_policy(

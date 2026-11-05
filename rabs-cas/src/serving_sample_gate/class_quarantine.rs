@@ -19,18 +19,18 @@ use crate::metadata_store::{RabsMetadataStore, SqlValue, StoreError};
 // ActionDescriptor. Keep this versioned vocabulary identical to its writer.
 const CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
-const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
-const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
-const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
-const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
-const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
-const WORKSPACE_MIXED_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
+const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
+const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
+const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
+const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
+const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
+const WORKSPACE_MIXED_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v2";
 const IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
-const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
-const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
-const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v1";
-const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v1";
+const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
+const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
+const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v2";
+const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -434,6 +434,82 @@ mod tests {
         // Once the real submission binding exists, legacy evidence is not lost.
         bind(&mut store, &legacy, DEPENDENCY_CLASS);
         assert_hold(&mut store, 1, &legacy, "divergence-incident");
+    }
+
+    #[test]
+    fn retired_workspace_classes_cannot_borrow_v2_sampling_authority() {
+        for (retired, current, risk) in [
+            (
+                "rustc-workspace-closed-rlib-v1",
+                WORKSPACE_RLIB_CLASS,
+                ActionClassRisk::ClosedWorkspaceRlib,
+            ),
+            (
+                "rustc-workspace-closed-metadata-v1",
+                WORKSPACE_METADATA_CLASS,
+                ActionClassRisk::ClosedWorkspaceMetadata,
+            ),
+            (
+                "rustc-workspace-committed-rlib-v1",
+                WORKSPACE_COMMITTED_RLIB_CLASS,
+                ActionClassRisk::CommittedWorkspaceRlib,
+            ),
+            (
+                "rustc-workspace-committed-metadata-v1",
+                WORKSPACE_COMMITTED_METADATA_CLASS,
+                ActionClassRisk::CommittedWorkspaceMetadata,
+            ),
+            (
+                "rustc-workspace-committed-mixed-rlib-v1",
+                WORKSPACE_MIXED_RLIB_CLASS,
+                ActionClassRisk::MixedWorkspaceRlib,
+            ),
+            (
+                "rustc-workspace-committed-mixed-metadata-v1",
+                WORKSPACE_MIXED_METADATA_CLASS,
+                ActionClassRisk::MixedWorkspaceMetadata,
+            ),
+            (
+                "rustc-workspace-committed-dag-rlib-v1",
+                WORKSPACE_DAG_RLIB_CLASS,
+                ActionClassRisk::WorkspaceDagRlib,
+            ),
+            (
+                "rustc-workspace-committed-dag-metadata-v1",
+                WORKSPACE_DAG_METADATA_CLASS,
+                ActionClassRisk::WorkspaceDagMetadata,
+            ),
+            (
+                "rustc-workspace-terminal-leaf-metadata-v1",
+                WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                ActionClassRisk::WorkspaceTerminalLeafMetadata,
+            ),
+            (
+                "rustc-workspace-terminal-metadata-v1",
+                WORKSPACE_TERMINAL_METADATA_CLASS,
+                ActionClassRisk::WorkspaceTerminalMetadata,
+            ),
+        ] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let old_key = published(&mut store, 1, 10);
+            bind(&mut store, &old_key, retired);
+            samples(&mut store, 1, 10, 3, 0);
+            let current_key = published(&mut store, 2, 11);
+            bind(&mut store, &current_key, current);
+            samples(&mut store, 2, 11, 3, 0);
+            let policy = SamplingPolicy::sample_all(2, 10_000);
+            assert_eq!(
+                serving_sample_decision(&mut store, &action(1), risk, &policy).unwrap(),
+                SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ElevatedClassRisk),
+                "retired receipt {retired} cannot reuse positive evidence as {current}"
+            );
+            assert_eq!(
+                serving_sample_decision(&mut store, &action(2), risk, &policy).unwrap(),
+                SampleGateDecision::ServeFromCache,
+                "current receipt {current} recognizes its own fresh evidence"
+            );
+        }
     }
 
     #[test]

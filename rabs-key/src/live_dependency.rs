@@ -392,6 +392,9 @@ pub enum PlannedExtern {
 
 /// The Cargo-managed source layout and corresponding capture policy.
 /// Directory names classify the source; captured bytes establish identity.
+/// Workspace cache V2 profiles qualify the independently isolated compiler
+/// action even when other units in the Cargo operation execute project code.
+/// Their names never grant trust to local wrapper-completion claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencySourceKind {
     /// One complete package below Cargo's registry source directory.
@@ -405,7 +408,8 @@ pub enum DependencySourceKind {
     WorkspaceExecutionOnly,
     /// A complete canonical workspace for a separately qualified, closed pure
     /// Rust leaf-library archive. Its worker receipt and cache policy remain
-    /// distinct from the unrestricted fresh workspace execution class.
+    /// distinct from the unrestricted fresh workspace execution class and from
+    /// the operation's other project executors.
     WorkspaceClosedRlib,
     /// A complete canonical workspace for a separately qualified ordinary Rust
     /// leaf-library metadata check. Its explicit closed metadata worker context
@@ -440,13 +444,13 @@ impl DependencySourceKind {
             Self::GitCheckout => "git-checkout",
             Self::DirectoryPackage => "directory-package",
             Self::WorkspaceExecutionOnly => "canonical-workspace-execution-only",
-            Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v1",
-            Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v1",
-            Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v1",
-            Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
-            Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v1",
-            Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v1",
-            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v1",
+            Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v2",
+            Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v2",
+            Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v2",
+            Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v2",
+            Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v2",
+            Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v2",
+            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v2",
         }
     }
 

@@ -240,10 +240,10 @@ impl CoordLive {
     ) -> Result<CanonicalActionResultManifest, String> {
         let (risk, key_epoch) = match policy {
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
-                (ActionClassRisk::WorkspaceTerminalLeafMetadata, 14)
+                (ActionClassRisk::WorkspaceTerminalLeafMetadata, 24)
             }
             CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
-                (ActionClassRisk::WorkspaceTerminalMetadata, 15)
+                (ActionClassRisk::WorkspaceTerminalMetadata, 25)
             }
             _ => return Err("terminal completion has a nonterminal policy".into()),
         };
@@ -1032,6 +1032,17 @@ pub(crate) mod tests {
             outputs: &[(&str, OutputRole, &[u8])],
             class: &str,
         ) -> OfferPreparedActionResult {
+            self.prepare_class_with_key_epoch(tag, parents, outputs, class, None)
+        }
+
+        fn prepare_class_with_key_epoch(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            class: &str,
+            key_epoch: Option<u32>,
+        ) -> OfferPreparedActionResult {
             assert!(!outputs.is_empty());
             let logical_outputs: Vec<_> = outputs
                 .iter()
@@ -1063,11 +1074,11 @@ pub(crate) mod tests {
             authority.action_key = tagged_digest("rabs.action-key.sha256.v1", tag);
             let mut manifest = base.manifest.clone();
             manifest.action_key = authority.action_key.clone();
-            manifest.key_epoch = match class {
-                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 14,
-                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 15,
+            manifest.key_epoch = key_epoch.unwrap_or(match class {
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 _ => manifest.key_epoch,
-            };
+            });
             manifest.logical_outputs = logical_outputs;
             let declared: Vec<_> = manifest
                 .logical_outputs
@@ -1478,6 +1489,84 @@ pub(crate) mod tests {
                         wrong,
                     )
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_completion_rejects_retired_epochs_under_current_class_receipts() {
+        for (policy, class, retired_epoch) in [
+            (
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                14,
+            ),
+            (
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+                15,
+            ),
+        ] {
+            let fixture = WorkspaceLineageFixture::new();
+            let parents = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+                let upstream = fixture.commit_metadata_leaf(
+                    90,
+                    &[(
+                        "libupstream.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"library metadata",
+                    )],
+                );
+                vec![consumes(&upstream)]
+            } else {
+                Vec::new()
+            };
+            let outputs = [
+                (
+                    "libterminal.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"".as_slice(),
+                ),
+                (
+                    "terminal.d",
+                    OutputRole::DepInfo,
+                    b"/__rabs/out/libterminal.rmeta:\n".as_slice(),
+                ),
+            ];
+            let current = fixture.prepare_terminal(91, parents.clone(), &outputs, policy);
+            fixture.commit(&current);
+            fixture
+                .coord
+                .verify_terminal_completion(
+                    &current.manifest.action_key,
+                    &current.manifest.canonical_descriptor_digest,
+                    &current.manifest_id.0,
+                    policy,
+                )
+                .expect("current-epoch completion remains qualified");
+
+            // Build, hash and publish an internally consistent old-epoch
+            // manifest. Even a current class receipt cannot upgrade its epoch.
+            let retired = fixture.prepare_class_with_key_epoch(
+                92,
+                parents,
+                &outputs,
+                class,
+                Some(retired_epoch),
+            );
+            fixture.commit(&retired);
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &retired.manifest.action_key,
+                        &retired.manifest.canonical_descriptor_digest,
+                        &retired.manifest_id.0,
+                        policy,
+                    )
+                    .unwrap_err()
+                    .contains("differs from its exact class or manifest"),
+                "retired epoch {retired_epoch} must not acquire v2 completion standing"
             );
         }
     }

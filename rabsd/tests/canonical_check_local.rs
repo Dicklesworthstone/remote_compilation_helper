@@ -2044,9 +2044,23 @@ fn canonical_shared_workspace_queue_keeps_fresh_executions_and_cancels_one_waite
         "src/main.rs",
         "fn main() { println!(\"{}\", canonical_app::answer()); }\n",
     );
-    // A real selected project executor keeps this queue fixture in the fresh
-    // workspace class, even when ordinary leaf libraries can earn cache hits.
-    write(&source, "build.rs", "fn main() {}\n");
+    // This unit consumes generated input, keeping the queue fixture in the
+    // fresh workspace class even when unrelated project executors no longer
+    // prevent ordinary closed libraries from earning cache hits.
+    write(
+        &source,
+        "build.rs",
+        r#"fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("answer.rs"), "pub fn answer()->u32 { 42 }\n").unwrap();
+}
+"#,
+    );
+    write(
+        &source,
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/answer.rs\"));\n",
+    );
     let (mut worker, environment) = NativeWorker::start(root);
     let socket = root.join("canonical-service.sock");
     let service_profile = root.join("shared-workspace-queue-service.json");
@@ -4632,6 +4646,29 @@ fn workspace_execution_feature(root: &Path) {
     fs::create_dir_all(root.join("empty-workspace/nested")).unwrap();
 }
 
+/// Keep fresh-execution fixtures outside the closed workspace classes through
+/// this unit's actual generated input, rather than an unrelated graph executor.
+fn add_generated_workspace_input(root: &Path, warning: &str) {
+    write(
+        root,
+        "build.rs",
+        format!(
+            r#"fn main() {{
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("fresh_input.rs"), "pub const GENERATED_FRESH_INPUT: usize = 17;\n").unwrap();
+    println!("cargo:warning={warning}");
+}}
+"#,
+        ),
+    );
+    let source = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    write(
+        root,
+        "src/lib.rs",
+        format!("{source}\ninclude!(concat!(env!(\"OUT_DIR\"), \"/fresh_input.rs\"));\n"),
+    );
+}
+
 fn distinct_check_binary(root: &Path) {
     // Keep one binary with an independently observable crate name. The build
     // variants retain canonical_app as their linked executable.
@@ -5497,6 +5534,17 @@ fn workspace_dag_archive_outputs(
         .collect::<Vec<_>>();
     assert_eq!(completed.len(), 1, "{output}");
     let target = PathBuf::from(completed[0]["target_directory"].as_str().unwrap());
+    let (files, diagnostics) = workspace_dag_archive_files(&target, output, names);
+    (target, files, diagnostics)
+}
+
+/// Inspect the same actual Cargo outputs in a delivered build or a retained
+/// private target. Executed test/run outcomes never use build delivery.
+fn workspace_dag_archive_files(
+    target: &Path,
+    output: &str,
+    names: &[&str],
+) -> (BTreeMap<String, Vec<u8>>, Vec<String>) {
     let mut files = BTreeMap::new();
     for &name in names {
         let artifacts = output
@@ -5511,13 +5559,13 @@ fn workspace_dag_archive_outputs(
             artifacts[0]["fresh"], false,
             "Cargo freshness bypassed a DAG compiler request: {output}"
         );
-        let archives = delivered_cargo_outputs(&target, output, name, "rlib");
+        let archives = delivered_cargo_outputs(target, output, name, "rlib");
         assert_eq!(archives.len(), 1, "{name}: {output}");
         let mut extensions = BTreeSet::new();
         // Cargo may publish an unhashed archive alias while its compiler
         // outputs live in deps/ or a per-unit build directory. Inspect the
         // delivered target, not a guessed unit location or a private worker.
-        let mut pending = vec![target.clone()];
+        let mut pending = vec![target.to_path_buf()];
         let mut visited = 0;
         while let Some(directory) = pending.pop() {
             for entry in fs::read_dir(directory).unwrap() {
@@ -5549,7 +5597,7 @@ fn workspace_dag_archive_outputs(
                     assert!(bytes.starts_with(b"!<arch>\n"));
                     assert_eq!(bytes, read_bounded(&archives[0]));
                 }
-                let relative = path.strip_prefix(&target).unwrap().to_str().unwrap();
+                let relative = path.strip_prefix(target).unwrap().to_str().unwrap();
                 assert!(files.insert(relative.to_owned(), bytes).is_none());
             }
         }
@@ -5558,7 +5606,7 @@ fn workspace_dag_archive_outputs(
         }
     }
     let diagnostics = workspace_dag_diagnostics(output, names);
-    (target, files, diagnostics)
+    (files, diagnostics)
 }
 
 fn workspace_dag_diagnostics(output: &str, names: &[&str]) -> Vec<String> {
@@ -5964,9 +6012,9 @@ fn mixed_workspace_dag_replay(command: &str) {
             let class = if index == 0 {
                 "rustc-dependency-compile"
             } else if command == "build" {
-                "rustc-workspace-committed-mixed-rlib-v1"
+                "rustc-workspace-committed-mixed-rlib-v2"
             } else {
-                "rustc-workspace-committed-mixed-metadata-v1"
+                "rustc-workspace-committed-mixed-metadata-v2"
             };
             assert_closed_workspace_leaf_evidence(
                 root,
@@ -5990,7 +6038,7 @@ fn mixed_workspace_dag_replay(command: &str) {
                 root,
                 &actual[WORKSPACE_METADATA_DAG_CONSUMER],
                 number.min(3) as usize,
-                "rustc-workspace-terminal-metadata-v1",
+                "rustc-workspace-terminal-metadata-v2",
             );
         }
         let (files, diagnostics) =
@@ -6300,9 +6348,9 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
         for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
             let class = match (mixed, index) {
                 (true, 0) => "rustc-dependency-compile",
-                (false, 0) => "rustc-workspace-closed-metadata-v1",
-                (true, _) => "rustc-workspace-committed-mixed-metadata-v1",
-                (false, _) => "rustc-workspace-committed-metadata-v1",
+                (false, 0) => "rustc-workspace-closed-metadata-v2",
+                (true, _) => "rustc-workspace-committed-mixed-metadata-v2",
+                (false, _) => "rustc-workspace-committed-metadata-v2",
             };
             assert_closed_workspace_leaf_evidence(
                 root,
@@ -6359,7 +6407,7 @@ fn warm_committed_metadata_replay(mixed: bool, include_consumer: bool) {
                 } else {
                     number.div_ceil(2).min(3) as usize
                 },
-                "rustc-workspace-terminal-metadata-v1",
+                "rustc-workspace-terminal-metadata-v2",
             );
             keys.insert(WORKSPACE_METADATA_DAG_CONSUMER.to_owned(), terminal);
         }
@@ -6826,8 +6874,8 @@ fn immutable_workspace_dag_replay(command: &str) {
                 (0, _) => "rustc-dependency-compile",
                 (1, "build") => "rustc-immutable-committed-dag-rlib-v1",
                 (1, _) => "rustc-immutable-committed-dag-metadata-v1",
-                (_, "build") => "rustc-workspace-committed-dag-rlib-v1",
-                _ => "rustc-workspace-committed-dag-metadata-v1",
+                (_, "build") => "rustc-workspace-committed-dag-rlib-v2",
+                _ => "rustc-workspace-committed-dag-metadata-v2",
             };
             assert_closed_workspace_leaf_evidence(
                 root,
@@ -6852,7 +6900,7 @@ fn immutable_workspace_dag_replay(command: &str) {
                 root,
                 &actual[WORKSPACE_METADATA_DAG_CONSUMER],
                 number.min(3) as usize,
-                "rustc-workspace-terminal-metadata-v1",
+                "rustc-workspace-terminal-metadata-v2",
             );
         }
         let (files, diagnostics) = workspace_dag_outputs(
@@ -7069,9 +7117,9 @@ fn canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees() 
                 &offered[*name],
                 number as usize,
                 if index == 0 {
-                    "rustc-workspace-closed-rlib-v1"
+                    "rustc-workspace-closed-rlib-v2"
                 } else {
-                    "rustc-workspace-committed-rlib-v1"
+                    "rustc-workspace-committed-rlib-v2"
                 },
             );
         }
@@ -7133,9 +7181,9 @@ fn canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees() 
                 &keys[*name],
                 3,
                 if index == 0 {
-                    "rustc-workspace-closed-rlib-v1"
+                    "rustc-workspace-closed-rlib-v2"
                 } else {
-                    "rustc-workspace-committed-rlib-v1"
+                    "rustc-workspace-committed-rlib-v2"
                 },
             );
         }
@@ -7162,6 +7210,295 @@ fn canonical_workspace_committed_dag_earns_transitive_replay_across_worktrees() 
         );
     }
     worker.finish();
+}
+
+fn executor_workspace_dag_source(root: &Path, command: &str) {
+    closed_workspace_dag_source(root);
+    let target = match command {
+        "test" => "[[test]]\nname='executor_behavior'\npath='tests/behavior.rs'\n",
+        "run" => "[[bin]]\nname='executor_program'\npath='src/main.rs'\ntest=false\nbench=false\n",
+        _ => panic!("unsupported executor fixture command"),
+    };
+    write(
+        root,
+        "top/Cargo.toml",
+        format!(
+            "[package]\nname='canonical_dag_top'\nversion='0.1.0'\nedition='2021'\nautobins=false\nautotests=false\n[lib]\ntest=false\ndoctest=false\n[dependencies]\ncanonical_dag_middle={{path='../middle'}}\n{target}"
+        ),
+    );
+    if command == "test" {
+        write(
+            root,
+            "top/tests/behavior.rs",
+            r#"#[test]
+fn current_success() {
+    assert_eq!(canonical_dag_top::ANSWER, 42);
+    println!("RABS_EXECUTOR_CURRENT_TEST_PASS");
+}
+
+#[test]
+fn current_failure() {
+    assert_eq!(canonical_dag_top::ANSWER, 42);
+    panic!("RABS_EXECUTOR_CURRENT_TEST_FAILURE");
+}
+"#,
+        );
+    } else {
+        write(
+            root,
+            "top/src/main.rs",
+            r#"fn main() {
+    assert_eq!(canonical_dag_top::ANSWER, 42);
+    let current = std::env::args().nth(1).expect("current request argument");
+    println!("RABS_EXECUTOR_CURRENT_PROGRAM={current}");
+    if std::env::args().any(|arg| arg == "--fail") {
+        std::process::exit(7);
+    }
+}
+"#,
+        );
+    }
+}
+
+fn executor_workspace_selection(command: &str, round: u32) -> Value {
+    if command == "test" {
+        json!({
+            "packages":["canonical_dag_top"], "test":["executor_behavior"],
+            "test_filter":if round == 5 { "current_failure" } else { "current_success" },
+            "test_args":["--nocapture", "--exact", "--test-threads=1"],
+        })
+    } else {
+        let mut arguments = vec![format!("request-{round}")];
+        if round == 5 {
+            arguments.push("--fail".into());
+        }
+        json!({"packages":["canonical_dag_top"], "bin":["executor_program"],
+            "run_args":arguments})
+    }
+}
+
+fn assert_current_workspace_executor(
+    command: &str,
+    round: u32,
+    code: i32,
+    events: &[Value],
+    output: &str,
+) {
+    let failed = round == 5;
+    assert_eq!(
+        code,
+        if failed {
+            if command == "test" { 101 } else { 7 }
+        } else {
+            0
+        },
+        "the current {command} outcome was not preserved: {output}"
+    );
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["command"], command);
+    assert_eq!(started[0]["private_target_state"], "cold");
+    assert_eq!(started[0]["test_result_cache"], false);
+    assert_eq!(started[0]["program_result_cache"], false);
+    assert_eq!(started[0]["test_execution"], command == "test");
+    assert_eq!(started[0]["run_execution"], command == "run");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed"),
+        "a current executor outcome became a cached compilation delivery: {output}"
+    );
+    let name = if command == "test" {
+        assert!(
+            output.contains(if failed {
+                "RABS_EXECUTOR_CURRENT_TEST_FAILURE"
+            } else {
+                "RABS_EXECUTOR_CURRENT_TEST_PASS"
+            }),
+            "{output}"
+        );
+        "executor_behavior"
+    } else {
+        assert!(
+            output.contains(&format!("RABS_EXECUTOR_CURRENT_PROGRAM=request-{round}")),
+            "the program replayed another request's output: {output}"
+        );
+        "executor_program"
+    };
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact" && event["target"]["name"] == name)
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 1, "{output}");
+    assert_eq!(artifacts[0]["fresh"], false, "{output}");
+    assert!(artifacts[0]["executable"].is_string(), "{output}");
+    assert_eq!(artifacts[0]["profile"]["test"], command == "test");
+    for decision in ["remote-offer", "execute", "hit"] {
+        assert!(
+            !decisions(events, decision).contains_key(name),
+            "the final executable or harness gained compiler cache authority: {output}"
+        );
+    }
+}
+
+/// The Cargo operation can execute arbitrary project code while each admitted
+/// ordinary library still obtains its result from an independent closed worker.
+/// Runtime arguments/filters change after library qualification; current test
+/// and program failures must survive even when all three library actions hit.
+fn workspace_executor_dag_replay(command: &str) {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("executor-dag-a");
+    let second = root.join("executor-dag-b");
+    executor_workspace_dag_source(&first, command);
+    executor_workspace_dag_source(&second, command);
+    profile["source_root"] = json!(first);
+    profile["vendor"] = Value::Null;
+    profile["command"] = json!(command);
+    profile["selection"] = executor_workspace_selection(command, 0);
+    profile["env"] = json!({"WORKSPACE_DAG_INPUT":"closed libraries with current executors"});
+    profile["jobs"] = json!(1);
+    profile["target_cache"] = json!({
+        "runtime_epoch":format!("executor-{command}-stock-v1"), "max_bytes":268435456,
+    });
+
+    // With no configured remote worker, the project-executor barrier must
+    // preserve ordinary Cargo compilation without admitting local evidence.
+    let (code, events, output) = run(root, 1400, &profile);
+    assert_current_workspace_executor(command, 0, code, &events, &output);
+    for decision in ["remote-offer", "execute", "hit"] {
+        assert!(decisions(&events, decision).is_empty(), "{output}");
+    }
+    let stock_target = sole_retained_target(root);
+    let baseline = workspace_dag_archive_files(&stock_target, &output, &WORKSPACE_DAG_NAMES);
+    let mut families =
+        BTreeSet::from([stock_target.parent().unwrap().parent().unwrap().to_owned()]);
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut keys: Option<BTreeMap<String, String>> = None;
+    let mut receipts = BTreeSet::new();
+
+    for round in 1..=5 {
+        if round == 5 {
+            profile["source_root"] = json!(second);
+        }
+        profile["selection"] = executor_workspace_selection(command, round);
+        // Each operation retains a distinct cold target, so every ordinary
+        // library must reach rustc or the real action cache, never Cargo Fresh.
+        profile["target_cache"] = json!({
+            "runtime_epoch":format!("executor-{command}-{round}-v1"), "max_bytes":268435456,
+        });
+        let hit = round >= 4;
+        let journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(root, 1400 + round, &profile, &environment);
+        assert_current_workspace_executor(command, round, code, &events, &output);
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "an isolated library failed or silently fell back locally: {output}"
+        );
+        let actual = decisions(&events, if hit { "hit" } else { "remote-offer" });
+        assert_eq!(
+            actual.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(WORKSPACE_DAG_NAMES),
+            "every ordinary workspace library must reach its isolated cache class: {output}"
+        );
+        assert!(
+            decisions(&events, if hit { "remote-offer" } else { "hit" }).is_empty(),
+            "unearned replay or a missed trained action: {output}"
+        );
+        if let Some(expected) = &keys {
+            assert_eq!(
+                &actual, expected,
+                "runtime arguments, target placement or worktree location split library identity"
+            );
+        } else {
+            keys = Some(actual.clone());
+        }
+        for (index, name) in WORKSPACE_DAG_NAMES.iter().enumerate() {
+            assert_closed_workspace_leaf_evidence(
+                root,
+                &actual[*name],
+                round.min(3) as usize,
+                if index == 0 {
+                    "rustc-workspace-closed-rlib-v2"
+                } else {
+                    "rustc-workspace-committed-rlib-v2"
+                },
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event["key"] == actual[*name]
+                        && if hit {
+                            event["decision"] == "served"
+                        } else {
+                            event["kind"] == "rabsd-remote-dependency-executed"
+                        }
+                }),
+                "library result never completed its claimed path: {output}"
+            );
+        }
+        let retained = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<BTreeSet<_>>();
+        let added = retained.difference(&families).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            added.len(),
+            1,
+            "this request must retain its own cold target"
+        );
+        families = retained;
+        let target = added[0].join("seed/target");
+        let outputs = workspace_dag_archive_files(&target, &output, &WORKSPACE_DAG_NAMES);
+        assert_closed_workspace_dag_ancestry(root, &actual, &outputs.0);
+        assert_eq!(
+            outputs, baseline,
+            "isolated compilation or replay changed stock library artifacts/diagnostics"
+        );
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            3 * round.min(3) as usize,
+            "the harness/program must stay local and trained libraries must avoid execution"
+        );
+        if let Some(journal) = journal {
+            assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event["kind"].as_str(),
+                    Some("rabsd-remote-dependency-admitted" | "rabsd-remote-dependency-executed")
+                )),
+                "a replayed library or current runtime body reached worker compiler admission"
+            );
+        } else {
+            assert!(receipts.insert(worker.completed_receipt()["request_id"].as_u64().unwrap()));
+        }
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+    }
+    worker.finish();
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real Cargo test with sampled workspace library replay and a current failing harness"]
+fn canonical_cargo_test_reuses_closed_workspace_libraries_but_executes_current_tests() {
+    workspace_executor_dag_replay("test");
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real Cargo run with sampled workspace library replay, current arguments and program failure"]
+fn canonical_cargo_run_reuses_closed_workspace_libraries_but_executes_current_program() {
+    workspace_executor_dag_replay("run");
 }
 
 #[test]
@@ -7319,11 +7656,11 @@ fn canonical_workspace_committed_metadata_dag_earns_transitive_replay_across_wor
                     1
                 },
                 if *name == WORKSPACE_METADATA_DAG_CONSUMER {
-                    "rustc-workspace-terminal-metadata-v1"
+                    "rustc-workspace-terminal-metadata-v2"
                 } else if index == 0 {
-                    "rustc-workspace-closed-metadata-v1"
+                    "rustc-workspace-closed-metadata-v2"
                 } else {
-                    "rustc-workspace-committed-metadata-v1"
+                    "rustc-workspace-committed-metadata-v2"
                 },
             );
         }
@@ -7566,7 +7903,7 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
             root,
             actual,
             number as usize,
-            "rustc-workspace-closed-rlib-v1",
+            "rustc-workspace-closed-rlib-v2",
         );
     }
     let key = key.unwrap();
@@ -7624,7 +7961,7 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
                 .count(),
             executions
         );
-        assert_closed_workspace_leaf_evidence(root, &key, 3, "rustc-workspace-closed-rlib-v1");
+        assert_closed_workspace_leaf_evidence(root, &key, 3, "rustc-workspace-closed-rlib-v2");
     }
 
     let mut previous_key = key;
@@ -7695,20 +8032,16 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
             root,
             &offered[NAME],
             1,
-            "rustc-workspace-closed-rlib-v1",
+            "rustc-workspace-closed-rlib-v2",
         );
         previous_key = offered[NAME].clone();
         previous_files = files;
     }
 
-    // The same ordinary library remains supported for fresh worker execution
-    // when its selected graph adds project code. It must lose all replay and
-    // publication authority, even after the closed leaf class has earned hits.
-    write(
-        &second,
-        "member/build.rs",
-        "fn main() { println!(\"cargo:warning=WORKSPACE_EXECUTOR_RAN\"); }\n",
-    );
+    // Adding this library's own generated input removes its closed-class
+    // authority while preserving fresh worker execution and every existing
+    // absence-of-publication assertion.
+    add_generated_workspace_input(&second.join("member"), "WORKSPACE_EXECUTOR_RAN");
     let mut private_attempts = BTreeMap::new();
     for number in 10..=11 {
         let (code, events, output) =
@@ -7735,7 +8068,7 @@ fn canonical_cargo_workspace_leaf_archives_earn_hits_with_complete_source_closur
 fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_consumer() {
     const LEAF: &str = "canonical_workspace_leaf";
     const CONSUMER: &str = "canonical_workspace_consumer";
-    const CLASS: &str = "rustc-workspace-closed-metadata-v1";
+    const CLASS: &str = "rustc-workspace-closed-metadata-v2";
 
     let (owner, mut profile) = native_fixture();
     let root = owner.path();
@@ -7886,7 +8219,7 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
         );
         for (name, class) in [
             (LEAF, CLASS),
-            (CONSUMER, "rustc-workspace-terminal-metadata-v1"),
+            (CONSUMER, "rustc-workspace-terminal-metadata-v2"),
         ] {
             if hit {
                 assert!(
@@ -7948,13 +8281,9 @@ fn canonical_cargo_workspace_leaf_metadata_earns_hits_and_typechecks_a_fresh_con
         previous_keys = Some(keys);
     }
 
-    // Selecting actual project code removes cache authority for this operation.
-    // The same library still compiles remotely and its consumer remains valid.
-    write(
-        &second,
-        "member/build.rs",
-        "fn main() { println!(\"cargo:warning=WORKSPACE_METADATA_EXECUTOR_RAN\"); }\n",
-    );
+    // This library's generated input cannot become a closed-class producer;
+    // its downstream consumer must retain fresh execution as well.
+    add_generated_workspace_input(&second.join("member"), "WORKSPACE_METADATA_EXECUTOR_RAN");
     for number in 9..=10 {
         let (code, events, output) =
             run_with_environment(root, 850 + number, &profile, &environment);
@@ -8577,7 +8906,7 @@ fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harn
                 } else {
                     1
                 },
-                "rustc-workspace-terminal-leaf-metadata-v1",
+                "rustc-workspace-terminal-leaf-metadata-v2",
             );
             let cas = rabsd::janitor::store::mount_and_reconcile(
                 &root.join("state/canonical-compile-v1/cas"),
@@ -8685,7 +9014,7 @@ fn warm_terminal_metadata_quarantine(class_quarantine: bool) {
     use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore, SqlValue};
     use rabs_sandbox::cargo_target::state::PrivateTreeSnapshot;
 
-    const CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v1";
+    const CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v2";
     const TARGET_BYTES: u64 = 268435456;
 
     let (owner, mut profile) = native_fixture();
@@ -9111,12 +9440,12 @@ fn canonical_cargo_check_offloads_binary_example_and_test_harness_metadata_witho
                     assert!(
                         matches!(
                             class.as_str(),
-                            "rustc-workspace-closed-metadata-v1"
-                                | "rustc-workspace-committed-metadata-v1"
-                                | "rustc-workspace-committed-mixed-metadata-v1"
-                                | "rustc-workspace-committed-dag-metadata-v1"
-                                | "rustc-workspace-terminal-leaf-metadata-v1"
-                                | "rustc-workspace-terminal-metadata-v1"
+                            "rustc-workspace-closed-metadata-v2"
+                                | "rustc-workspace-committed-metadata-v2"
+                                | "rustc-workspace-committed-mixed-metadata-v2"
+                                | "rustc-workspace-committed-dag-metadata-v2"
+                                | "rustc-workspace-terminal-leaf-metadata-v2"
+                                | "rustc-workspace-terminal-metadata-v2"
                         ),
                         "a check borrowed an incompatible publication class: {class}"
                     );
@@ -9243,6 +9572,13 @@ impl GeneratedDependency {
             );
         } else {
             assert_answer(root, answer, workspace_edit);
+            if self == Self::None {
+                // The plain dependency-replay scenario deliberately keeps its
+                // workspace result fresh. Supply an actual per-unit exclusion
+                // now that other project executors no longer block closed
+                // workspace library publication across the operation.
+                add_generated_workspace_input(root, "FRESH_WORKSPACE_GENERATED_INPUT");
+            }
         }
     }
 }

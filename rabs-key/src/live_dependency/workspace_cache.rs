@@ -3,10 +3,11 @@
 //! These workspace serving classes deliberately retain the entire sealed
 //! workspace, including every directory listing. It is not an observed minimal
 //! closure and unrelated workspace edits invalidate it. The canonical driver
-//! must independently retain the selected ordinary library unit and a Cargo
-//! graph with no project executors. Archive and metadata executions require
-//! distinct, independently supervised worker profiles without procfs or entropy
-//! devices. Ordinary workspace metadata execution is not this closed profile.
+//! must independently retain the selected ordinary library unit. Other units
+//! in the Cargo operation may execute project code; local wrapper completion
+//! remains untrusted. Archive and metadata executions require distinct,
+//! independently supervised worker profiles without procfs or entropy devices.
+//! Ordinary workspace metadata execution is not this closed profile.
 //! Generated/native inputs, explicit externs and loadable implicit crate
 //! candidates remain in the fresh execution-only class. Exact empty metadata
 //! is still keyed and supplied as an inert file in the read-only input view.
@@ -25,22 +26,24 @@ use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::result_identity::TypedDigest;
 
-// Archive and metadata policies remain independently keyed. The policy text
-// binds exact-empty search metadata admission without borrowing the ordinary
-// metadata namespace's filesystem or producer authority.
-const KEY_EPOCH: u32 = 4;
+// V2 qualifies the isolated compiler action independently of other executors in
+// its Cargo operation. New epochs cannot borrow the old graph-wide evidence.
+// Archive and metadata policies remain independently keyed; the worker contexts
+// themselves are unchanged, including the closed-metadata-v1 capability.
+const KEY_EPOCH: u32 = 16;
 const PROJECTION_EPOCH: u32 = 1;
-const POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.isolation.v1";
-const SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.semantics.v1";
-const SEMANTICS: &str = "completed independently supervised pure Rust leaf-library archive; complete sealed workspace and every directory listing; no project executors, externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
-const METADATA_KEY_EPOCH: u32 = 5;
-const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.isolation.v1";
-const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.semantics.v1";
-const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust leaf-library metadata check; canonical-workspace-closed-metadata-v1 explicitly negotiated in closed-metadata mode without procfs or entropy devices; complete sealed workspace and every directory listing; no project executors, externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
+const POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.isolation.v2";
+const SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-rlib.semantics.v2";
+const SEMANTICS: &str = "completed independently supervised pure Rust leaf-library archive; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; complete sealed workspace and every directory listing; no externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
+const METADATA_KEY_EPOCH: u32 = 17;
+const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.isolation.v2";
+const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-closed-metadata.semantics.v2";
+const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust leaf-library metadata check; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; canonical-workspace-closed-metadata-v1 explicitly negotiated in closed-metadata mode without procfs or entropy devices; complete sealed workspace and every directory listing; no externs, loadable crate candidates, generated or native inputs; exact empty search metadata remains keyed and materialized without producer authority; exact environment; authenticated drained receipt; existing publication, independent verification, class quarantine and private installation gates";
 
-pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-closed-rlib-v1: \
-    driver-retained Cargo-selected ordinary library build in a graph without \
-    project executors; canonical-workspace-exec-v3 namespace explicitly \
+pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-closed-rlib-v2: \
+    driver-retained Cargo-selected ordinary library build; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-exec-v3 namespace explicitly \
     negotiated in Rlib mode; complete immutable canonical workspace with exact \
     file identities and every immediate directory listing including empty \
     directories; exact canonical argv, cwd, manifest path, output placement, \
@@ -58,9 +61,10 @@ pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-closed-rlib-v1: 
     publication, independent samples, release authorization, class quarantine \
     and subscriber-owned private installation gates; no provisional outputs";
 
-pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-closed-metadata-v1: \
-    driver-retained Cargo-selected ordinary library check in a graph without \
-    project executors; canonical-workspace-closed-metadata-v1 namespace \
+pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-closed-metadata-v2: \
+    driver-retained Cargo-selected ordinary library check; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-closed-metadata-v1 namespace \
     explicitly negotiated in closed-metadata mode, independently measured \
     without borrowing ordinary Metadata or Rlib execution authority; complete \
     immutable canonical workspace with exact file identities and every \
@@ -132,15 +136,15 @@ impl ClosedWorkspaceLibraryClass {
 
     const fn environment_domain(self) -> &'static str {
         match self {
-            Self::Rlib => "rabs.canonical-workspace-closed-rlib.environment.v1",
-            Self::Metadata => "rabs.canonical-workspace-closed-metadata.environment.v1",
+            Self::Rlib => "rabs.canonical-workspace-closed-rlib.environment.v2",
+            Self::Metadata => "rabs.canonical-workspace-closed-metadata.environment.v2",
         }
     }
 
     const fn invocation_domain(self) -> &'static str {
         match self {
-            Self::Rlib => "rabs.canonical-workspace-closed-rlib.invocation.v1",
-            Self::Metadata => "rabs.canonical-workspace-closed-metadata.invocation.v1",
+            Self::Rlib => "rabs.canonical-workspace-closed-rlib.invocation.v2",
+            Self::Metadata => "rabs.canonical-workspace-closed-metadata.invocation.v2",
         }
     }
 }
@@ -300,6 +304,26 @@ pub fn closed_workspace_library_descriptor_class(
             && descriptor.sandbox_semantic_policy == class.isolation_policy()
             && descriptor.execution_semantics == class.execution_semantics()
     })
+}
+
+/// Detect a claimed closed workspace leaf namespace without granting its class.
+/// Retired profiles and malformed or relabeled descriptors must not acquire
+/// generic immutable-dependency authority when exact leaf recognition fails.
+/// The original leaf epochs 4/5 overlap other historical identities, so their
+/// typed domains establish that claim; current leaf epochs 16/17 are reserved.
+/// This does not imply committed dependency inputs or producer witnesses.
+#[must_use]
+pub fn uses_closed_workspace_library_namespace(descriptor: &ActionDescriptor) -> bool {
+    matches!(descriptor.key_epoch, KEY_EPOCH | METADATA_KEY_EPOCH)
+        || [
+            descriptor.sandbox_semantic_policy.domain,
+            descriptor.execution_semantics.domain,
+        ]
+        .into_iter()
+        .any(|domain| {
+            domain.starts_with("rabs.canonical-workspace-closed-rlib.")
+                || domain.starts_with("rabs.canonical-workspace-closed-metadata.")
+        })
 }
 
 /// Bind the complete retained workspace and exact closed library execution.
@@ -542,9 +566,9 @@ mod tests {
             assert_eq!(
                 plan.source_kind.as_str(),
                 match class {
-                    ClosedWorkspaceLibraryClass::Rlib => "canonical-workspace-closed-rlib-v1",
+                    ClosedWorkspaceLibraryClass::Rlib => "canonical-workspace-closed-rlib-v2",
                     ClosedWorkspaceLibraryClass::Metadata =>
-                        "canonical-workspace-closed-metadata-v1",
+                        "canonical-workspace-closed-metadata-v2",
                 }
             );
             assert_eq!(
@@ -564,6 +588,14 @@ mod tests {
             .unwrap();
             assert_ne!(key.action_key, fresh_key.action_key);
             assert!(closed_workspace_library_descriptor_class(&fresh_key.descriptor).is_none());
+            assert!(!uses_closed_workspace_library_namespace(
+                &fresh_key.descriptor
+            ));
+            assert!(
+                !super::super::workspace_dependency_cache::uses_committed_dependency_namespace(
+                    &key.descriptor,
+                )
+            );
             assert!(
                 remote_closed_workspace_library_key(
                     &fresh,
@@ -623,8 +655,8 @@ mod tests {
         let metadata = plan(ClosedWorkspaceLibraryClass::Metadata);
         let archive_key = key(&archive, &inputs(&archive)).unwrap();
         let metadata_key = key(&metadata, &inputs(&metadata)).unwrap();
-        assert_eq!(archive_key.descriptor.key_epoch, 4);
-        assert_eq!(metadata_key.descriptor.key_epoch, 5);
+        assert_eq!(archive_key.descriptor.key_epoch, 16);
+        assert_eq!(metadata_key.descriptor.key_epoch, 17);
         assert_ne!(archive_key.action_key, metadata_key.action_key);
         assert_ne!(
             archive_key.descriptor.sandbox_semantic_policy,
@@ -903,6 +935,7 @@ mod tests {
         for class in CLASSES {
             let plan = plan(class);
             let descriptor = key(&plan, &inputs(&plan)).unwrap().descriptor;
+            assert!(uses_closed_workspace_library_namespace(&descriptor));
             for change in 0..5 {
                 let mut other = descriptor.clone();
                 match change {
@@ -913,6 +946,75 @@ mod tests {
                     _ => other.execution_semantics.bytes[0] ^= 1,
                 }
                 assert!(closed_workspace_library_descriptor_class(&other).is_none());
+                assert!(uses_closed_workspace_library_namespace(&other));
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_workspace_leaf_v2_requires_fresh_evidence_and_blocks_legacy_downgrades() {
+        for (class, old_epoch, isolation, semantics) in [
+            (
+                ClosedWorkspaceLibraryClass::Rlib,
+                4,
+                "rabs.canonical-workspace-closed-rlib.isolation.v1",
+                "rabs.canonical-workspace-closed-rlib.semantics.v1",
+            ),
+            (
+                ClosedWorkspaceLibraryClass::Metadata,
+                5,
+                "rabs.canonical-workspace-closed-metadata.isolation.v1",
+                "rabs.canonical-workspace-closed-metadata.semantics.v1",
+            ),
+        ] {
+            let plan = plan(class);
+            let keyed = key(&plan, &inputs(&plan)).unwrap();
+            assert_eq!(keyed.descriptor.key_epoch, old_epoch + 12);
+            assert!(
+                keyed
+                    .descriptor
+                    .sandbox_semantic_policy
+                    .domain
+                    .ends_with(".v2")
+            );
+            assert!(keyed.descriptor.execution_semantics.domain.ends_with(".v2"));
+            assert_eq!(
+                closed_workspace_library_descriptor_class(&keyed.descriptor),
+                Some(class)
+            );
+            // Old epoch and each old domain independently veto recognition.
+            // Relabeling their action class must still trigger the namespace
+            // guard before a coordinator's generic immutable fallback.
+            for change in 0..4 {
+                let mut old = keyed.descriptor.clone();
+                match change {
+                    0 => old.key_epoch = old_epoch,
+                    1 => old.sandbox_semantic_policy.domain = isolation,
+                    2 => old.execution_semantics.domain = semantics,
+                    _ => {
+                        old.key_epoch = old_epoch;
+                        old.sandbox_semantic_policy.domain = isolation;
+                        old.execution_semantics.domain = semantics;
+                    }
+                }
+                assert!(closed_workspace_library_descriptor_class(&old).is_none());
+                assert!(uses_closed_workspace_library_namespace(&old));
+                assert_ne!(compute_action_key(&old).final_key, keyed.action_key);
+                old.action_class = ActionClass::RustcDependencyCompile;
+                old.key_epoch = super::super::LIVE_DEPENDENCY_KEY_EPOCH;
+                assert!(closed_workspace_library_descriptor_class(&old).is_none());
+                assert!(uses_closed_workspace_library_namespace(&old));
+            }
+            // Preserve the separately measured worker namespace. The v2
+            // cache policy never invents a closed-metadata-v2 capability.
+            let profile = match class {
+                ClosedWorkspaceLibraryClass::Rlib => ISOLATION_PROFILE,
+                ClosedWorkspaceLibraryClass::Metadata => METADATA_ISOLATION_PROFILE,
+            };
+            assert!(profile.contains("other units in the operation may execute project code"));
+            assert!(profile.contains("local wrapper completion authority"));
+            if class == ClosedWorkspaceLibraryClass::Metadata {
+                assert!(profile.contains("canonical-workspace-closed-metadata-v1 namespace"));
             }
         }
     }

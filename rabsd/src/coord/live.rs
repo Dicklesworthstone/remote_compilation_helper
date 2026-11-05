@@ -471,19 +471,23 @@ fn resolve_destination(root: &Path, virtual_path: &[u8]) -> Option<PathBuf> {
 // an action key has one semantic class, independent of attempts and restarts.
 const LIVE_CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
-const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
-const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
-const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
-const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
-const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
-const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
+// V2 qualifies the selected, independently isolated compiler action even when
+// other units in its Cargo operation can execute project code. Earlier graph-
+// restricted class receipts do not enroll these revised descriptor profiles.
+// Local completion remains untrusted for the entire operation.
+const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
+const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
+const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
+const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
+const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
+const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v2";
 const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
-const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
-const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
+const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
+const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
-    "rustc-workspace-terminal-leaf-metadata-v1";
-const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v1";
+    "rustc-workspace-terminal-leaf-metadata-v2";
+const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -506,6 +510,7 @@ fn record_descriptor_class(
 ) -> Result<(), StoreError> {
     use rabs_key::live_dependency::workspace_cache::{
         ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
+        uses_closed_workspace_library_namespace,
     };
     use rabs_key::live_dependency::workspace_dependency_cache::{
         CommittedDependencyPolicy, committed_dependency_descriptor_policy,
@@ -534,18 +539,23 @@ fn record_descriptor_class(
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
             }
         }
-    } else if uses_committed_dependency_namespace(descriptor) {
+    } else if let Some(class) = closed_workspace_library_descriptor_class(descriptor) {
+        match class {
+            ClosedWorkspaceLibraryClass::Rlib => LIVE_WORKSPACE_RLIB_CLASS,
+            ClosedWorkspaceLibraryClass::Metadata => LIVE_WORKSPACE_METADATA_CLASS,
+        }
+    } else if uses_committed_dependency_namespace(descriptor)
+        || uses_closed_workspace_library_namespace(descriptor)
+    {
+        // A historical or malformed workspace profile cannot become an
+        // ordinary dependency merely by changing its action-family field.
         LIVE_PRIVATE_CLASS
     } else if descriptor.action_class
         == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
     {
         LIVE_DEPENDENCY_CLASS
     } else {
-        match closed_workspace_library_descriptor_class(descriptor) {
-            Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
-            Some(ClosedWorkspaceLibraryClass::Metadata) => LIVE_WORKSPACE_METADATA_CLASS,
-            None => LIVE_PRIVATE_CLASS,
-        }
+        LIVE_PRIVATE_CLASS
     };
     store.record_action_key_provenance(authority, descriptor, class)
 }
@@ -5886,12 +5896,11 @@ mod tests {
                 ActionClassRisk::WorkspaceTerminalMetadata,
             ),
         ];
-        assert_eq!(descriptors[2].0.key_epoch, 6);
-        assert_eq!(descriptors[3].0.key_epoch, 7);
-        assert_eq!(descriptors[4].0.key_epoch, 8);
-        assert_eq!(descriptors[5].0.key_epoch, 9);
-        for (index, (descriptor, _)) in descriptors[6..].iter().enumerate() {
-            assert_eq!(descriptor.key_epoch, 10 + u32::try_from(index).unwrap());
+        for ((descriptor, _), expected_epoch) in descriptors
+            .iter()
+            .zip([16, 17, 18, 19, 20, 21, 10, 11, 22, 23, 24, 25])
+        {
+            assert_eq!(descriptor.key_epoch, expected_epoch);
         }
         for (index, (descriptor, _)) in descriptors.iter().enumerate() {
             for (other, _) in &descriptors[index + 1..] {
@@ -5908,11 +5917,11 @@ mod tests {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
                 record_descriptor_class(&mut *store, &authority, descriptor).unwrap();
-                let dag = (10..=15).contains(&descriptor.key_epoch);
-                for mutation in 0..if dag { 6 } else { 4 } {
+                let committed = !matches!(descriptor.key_epoch, 16 | 17);
+                for mutation in [0, 1, 2, 3, 5].into_iter().chain(committed.then_some(4)) {
                     let mut changed = descriptor.clone();
                     match mutation {
-                        0 => changed.key_epoch = if dag { 1 } else { changed.key_epoch + 1 },
+                        0 => changed.key_epoch = if committed { 1 } else { changed.key_epoch + 1 },
                         1 => changed.projection_epoch += 1,
                         2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
                         3 => changed.execution_semantics.bytes[0] ^= 1,
@@ -5950,6 +5959,50 @@ mod tests {
             assert_eq!(
                 recorded_action_risk(&mut *store, &key).unwrap(),
                 ActionClassRisk::Elevated
+            );
+        }
+    }
+
+    #[test]
+    fn executor_free_workspace_receipts_cannot_enroll_action_scoped_workspace_classes() {
+        let (state, coord) = submission_coordinator();
+        let old_classes = [
+            "rustc-workspace-closed-rlib-v1",
+            "rustc-workspace-closed-metadata-v1",
+            "rustc-workspace-committed-rlib-v1",
+            "rustc-workspace-committed-metadata-v1",
+            "rustc-workspace-committed-mixed-rlib-v1",
+            "rustc-workspace-committed-mixed-metadata-v1",
+            "rustc-workspace-committed-dag-rlib-v1",
+            "rustc-workspace-committed-dag-metadata-v1",
+            "rustc-workspace-terminal-leaf-metadata-v1",
+            "rustc-workspace-terminal-metadata-v1",
+        ];
+        let mut actions = Vec::new();
+        {
+            let mut store = coord.live_cas().unwrap().store().lock().unwrap();
+            for class in old_classes {
+                let action = rabs_key::typed_digest::compute(DOMAIN_ACTION_KEY, class.as_bytes());
+                store
+                    .record_decision_receipt(
+                        LIVE_CLASS_RECEIPT,
+                        &digest_key(&action),
+                        0,
+                        class,
+                        "retained prior workspace class enrollment",
+                    )
+                    .unwrap();
+                actions.push(action);
+            }
+        }
+        drop(coord);
+        let reopened = mount_and_reconcile(state.path()).unwrap();
+        let mut store = reopened.store().lock().unwrap();
+        for action in actions {
+            assert_eq!(
+                recorded_action_risk(&mut *store, &action).unwrap(),
+                ActionClassRisk::Elevated,
+                "old class evidence cannot authorize the expanded remote workspace profile"
             );
         }
     }
