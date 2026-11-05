@@ -67,6 +67,9 @@ WORKER_BIN="rch-wkr"
 USE_COLOR=true
 USE_GUM=false
 TEMP_DIR=""
+# An upgrading client must not restart its daemon until the new sibling daemon
+# has been installed. The old client remains in place until that drain succeeds.
+DAEMON_BINARY_INSTALLED=false
 # Expand arrays that may be empty as ${a[@]+"${a[@]}"}: under `set -u`, macOS's
 # /bin/bash 3.2 treats an empty "${a[@]}" as an unbound variable and exits.
 PROXY_ARGS=()
@@ -655,8 +658,34 @@ install_binary_file() {
     local dest_path="$2"
     local temp_path="${dest_path}.tmp.$$"
 
-    install -m 755 "$source_path" "$temp_path"
-    mv -f "$temp_path" "$dest_path"
+    install -m 755 "$source_path" "$temp_path" || return 1
+
+    if [[ "$dest_path" == "$INSTALL_DIR/$HOOK_BIN" &&
+          "${MODE:-local}" == "local" && "${EASY_MODE:-false}" == "true" &&
+          "${RCH_SKIP_DAEMON_RESTART:-}" != "1" && -x "$dest_path" ]] &&
+       ! system_rchd_service_active; then
+        if [[ "$DAEMON_BINARY_INSTALLED" != "true" ]]; then
+            warn "Cannot upgrade the client before installing its sibling daemon; existing client retained at $dest_path"
+            warn "Incoming client is staged at $temp_path"
+            return 1
+        fi
+        # The running daemon can speak an older admission protocol than the
+        # incoming client (notably 2.1.34 -> 2.1.35). Let its existing client
+        # drain it and launch the new sibling rchd before replacing that client.
+        # A stop before binary installation would race supervisor respawning.
+        # Keep the final new-client restart below: the legacy client's success
+        # is not proof of readiness under the new maintenance protocol.
+        info "Using the existing client to drain rchd before replacing it..."
+        if ! restart_daemon_if_needed; then
+            warn "Existing client retained at $dest_path; incoming client staged at $temp_path"
+            return 1
+        fi
+    fi
+
+    mv -f "$temp_path" "$dest_path" || return 1
+    if [[ "$dest_path" == "$INSTALL_DIR/$DAEMON_BIN" ]]; then
+        DAEMON_BINARY_INSTALLED=true
+    fi
 }
 
 # A021 split-profile installer: resolve NAME built under PROFILE, falling back
@@ -679,7 +708,7 @@ install_split_binary() {
         info "Optional binary $name not present; skipping"
         return 0
     fi
-    install_binary_file "$src" "$INSTALL_DIR/$name"
+    install_binary_file "$src" "$INSTALL_DIR/$name" || return 1
     success "Installed $name ($profile)"
 }
 
@@ -814,13 +843,14 @@ build_from_source() {
     build_rabs_toolset "$project_dir"
 
     if [[ "$MODE" == "worker" ]]; then
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
     else
         # Local mode: hook CLI from wrapper-release; daemon and worker from
-        # daemon-release (worker binary needed for fleet deploy).
-        install_split_binary "$HOOK_BIN" "wrapper-release" required
-        install_split_binary "$DAEMON_BIN" "daemon-release" required
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        # daemon-release (worker binary needed for fleet deploy). Install the
+        # client last so the existing client can drain the running daemon.
+        install_split_binary "$DAEMON_BIN" "daemon-release" required || return 1
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
+        install_split_binary "$HOOK_BIN" "wrapper-release" required || return 1
     fi
 
     success "Build complete"
@@ -987,7 +1017,7 @@ download_binaries() {
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN" || return 1
             success "Installed $WORKER_BIN"
         else
             warn "Worker binary not in release"
@@ -997,9 +1027,9 @@ download_binaries() {
             return
         fi
     else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
+        for binary in "$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary" || return 1
                 success "Installed $binary"
             else
                 warn "$binary not in release"
@@ -1075,11 +1105,11 @@ clone_and_build_from_source() {
     build_rabs_toolset "$TEMP_DIR/rch"
 
     if [[ "$MODE" == "worker" ]]; then
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
     else
-        install_split_binary "$HOOK_BIN" "wrapper-release" required
-        install_split_binary "$DAEMON_BIN" "daemon-release" required
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$DAEMON_BIN" "daemon-release" required || return 1
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
+        install_split_binary "$HOOK_BIN" "wrapper-release" required || return 1
     fi
 
     success "Build from source complete"
@@ -1801,31 +1831,26 @@ install_from_tarball() {
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN" || return 1
             success "Installed $WORKER_BIN"
         else
             die "Worker binary not found in tarball"
         fi
     else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
+        for binary in "$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary" || return 1
                 success "Installed $binary"
+            elif [[ "$binary" == "$WORKER_BIN" ]]; then
+                if [[ "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
+                    warn "Worker binary not found in tarball (fleet sync disabled)"
+                else
+                    die "Worker binary not found in tarball (required for fleet deploy)"
+                fi
             else
                 warn "$binary not found in tarball"
             fi
         done
-
-        if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
-            success "Installed $WORKER_BIN"
-        else
-            if [[ "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
-                warn "Worker binary not found in tarball (fleet sync disabled)"
-            else
-                die "Worker binary not found in tarball (required for fleet deploy)"
-            fi
-        fi
     fi
 
     success "Offline installation complete"

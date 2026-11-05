@@ -6,9 +6,11 @@ All fixtures and subprocess transcripts are retained for inspection. No service
 manager, worker, download, installed binary, or user home is modified.
 """
 
+import hashlib
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -80,6 +82,53 @@ fi
 printf 'fixture: original daemon retired; replacement readiness confirmed\n'
 '''
 
+UPGRADE_CLIENT = r'''
+set -euo pipefail
+printf '%s rch %s\n' "$generation" "$*" >> "$RCH_TEST_TRACE"
+if [[ "$*" != 'daemon restart --drain --drain-timeout 300' ]]; then
+    printf 'unexpected maintenance command: %s\n' "$*" >&2
+    exit 97
+fi
+if [[ "$generation" == legacy ]]; then
+    if [[ -n "${RCH_TEST_UPGRADE_REFUSAL:-}" ]]; then
+        printf '%s\n' "$RCH_TEST_UPGRADE_REFUSAL" >&2
+        exit 23
+    fi
+    if [[ "${RCH_TEST_UPGRADE_INTERRUPT:-0}" == 1 ]]; then
+        kill -INT "$$"
+    fi
+    [[ "$(cat "$RCH_TEST_DAEMON_GENERATION")" == legacy ]] || exit 96
+    # Exercise sibling lookup with a real executable, as the installed client
+    # does for an unmanaged daemon. This is a protocol stand-in, not rchd.
+    "$(dirname "$0")/rchd" --fixture-restart
+else
+    if [[ "$(cat "$RCH_TEST_DAEMON_GENERATION")" != current ]]; then
+        printf 'legacy admission response malformed: missing success\n' >&2
+        exit 24
+    fi
+fi
+'''
+
+UPGRADE_DAEMON = r'''#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == --fixture-restart ]] || exit 97
+[[ -x "$(dirname "$0")/rch-wkr" ]] || exit 95
+printf 'current rchd launched\n' >> "$RCH_TEST_TRACE"
+if [[ "${RCH_TEST_DAEMON_REMAINS_LEGACY:-0}" != 1 ]]; then
+    printf 'current\n' > "$RCH_TEST_DAEMON_GENERATION"
+fi
+'''
+
+REAL_INSTALL_HELPERS = r'''
+EASY_MODE=true
+WITH_RABS=false
+cleanup_lock() { :; }
+# Keep extraction and failed-hook staging files after either outcome. The
+# production installer retains its ordinary extraction-directory cleanup.
+mktemp() { printf '%s\n' "$RCH_TEST_EXTRACT"; }
+rm() { trace "retained cleanup $*"; }
+'''
+
 
 class InstallerDaemonUpgradeTests(unittest.TestCase):
     @classmethod
@@ -132,6 +181,245 @@ class InstallerDaemonUpgradeTests(unittest.TestCase):
             if event.startswith("launchctl "):
                 self.assertEqual(event, "launchctl list")
             self.assertNotIn("UNEXPECTED", event)
+
+    def prepare_upgrade(self):
+        self.bundle = self.case / "bundle"
+        self.bundle.mkdir(exist_ok=True)
+        self.extract = self.case / "extracted"
+        self.extract.mkdir(exist_ok=True)
+        self.generation = self.case / "daemon-generation"
+        self.generation.write_text("legacy\n")
+        self.client.write_text("#!/usr/bin/env bash\ngeneration=legacy\n" + UPGRADE_CLIENT)
+        self.old_client = self.client.read_bytes()
+        for name, contents in (
+            ("rch", "#!/usr/bin/env bash\ngeneration=current\n" + UPGRADE_CLIENT),
+            ("rchd", UPGRADE_DAEMON),
+            ("rch-wkr", "#!/usr/bin/env bash\nexit 0\n"),
+        ):
+            path = self.bundle / name
+            path.write_text(contents)
+            path.chmod(0o755)
+        self.tarball = self.case / "release.tar.gz"
+        with tarfile.open(self.tarball, "w:gz") as archive:
+            for path in self.bundle.iterdir():
+                archive.add(path, arcname=path.name)
+        self.env.update(
+            RCH_TEST_ARCHIVE=str(self.tarball),
+            RCH_TEST_BUNDLE=str(self.bundle),
+            RCH_TEST_EXTRACT=str(self.extract),
+            RCH_TEST_DAEMON_GENERATION=str(self.generation),
+        )
+
+    def assert_installed_client(self):
+        self.assertEqual(self.client.read_bytes(), (self.bundle / "rch").read_bytes())
+        self.assertEqual(self.generation.read_text(), "current\n")
+        events = self.events()
+        self.assertLess(events.index("legacy rch daemon restart --drain --drain-timeout 300"),
+                        events.index("current rchd launched"))
+        self.assertLess(events.index("current rchd launched"),
+                        events.index("current rch daemon restart --drain --drain-timeout 300"))
+        self.assert_no_supervisor_mutation()
+
+    def prepare_split_build(self):
+        target = self.case / "target"
+        for profile, names in (("wrapper-release", ("rch",)),
+                               ("daemon-release", ("rchd", "rch-wkr"))):
+            directory = target / profile
+            directory.mkdir(parents=True)
+            for name in names:
+                destination = directory / name
+                destination.write_bytes((self.bundle / name).read_bytes())
+                destination.chmod(0o755)
+        self.env["CARGO_TARGET_DIR"] = str(target)
+
+    def test_offline_upgrade_uses_existing_client_before_replacing_it(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n'
+            'restart_daemon_if_needed\n'
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+
+    def test_source_upgrade_uses_existing_client_and_installs_split_profiles(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ncargo() { trace "cargo $*"; }\n'
+            'build_from_source\nrestart_daemon_if_needed\n'
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+        self.assertEqual((self.case / "rch-wkr").read_bytes(),
+                         (self.bundle / "rch-wkr").read_bytes())
+
+    def test_download_upgrade_verifies_archive_and_drains_before_client_swap(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + r'''
+VERSION=2.1.35
+RELEASE_ARCHIVE_EXT=tar.gz
+RELEASE_TARGETS=(fixture-linux)
+TARGET=fixture-linux
+curl() {
+    [[ $# == 4 && "$1" == -fsSL && "$3" == -o ]] || return 97
+    trace "download $2"
+    case "$2" in
+        */rch-v2.1.35-fixture-linux.tar.gz)
+            cp "$RCH_TEST_ARCHIVE" "$4" ;;
+        */rch-v2.1.35-fixture-linux.tar.gz.sha256)
+            printf '%s  %s\n' "$RCH_TEST_CHECKSUM" rch-v2.1.35-fixture-linux.tar.gz > "$4" ;;
+        *) return 96 ;;
+    esac
+}
+download_binaries
+restart_daemon_if_needed
+''',
+            RCH_TEST_CHECKSUM=hashlib.sha256(self.tarball.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+        self.assertEqual(len([e for e in self.events() if e.startswith("download ")]), 2)
+
+    def test_cloned_source_upgrade_keeps_existing_client_until_daemon_drain(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        # Source acquisition and compilation are explicit stand-ins. The
+        # clone install path still reads actual profile files and executes the
+        # installed client and its sibling daemon. Release binding has its own
+        # real Git tests in test_install_rabs.py.
+        project = self.case / "source"
+        project.mkdir()
+        (project / "Cargo.toml").write_text("# installer source fixture\n")
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + r'''
+VERSION=2.1.35
+cargo() { trace "cargo $*"; }
+git() {
+    trace "git $*"
+    if [[ "$1" == clone ]]; then
+        cp -R "$RCH_TEST_SOURCE" "$TEMP_DIR/rch"
+    elif [[ "$1" == -C && "$3" == rev-parse ]]; then
+        printf 'fixture-release\n'
+    elif [[ "$1" != -C || "$3" != status ]]; then
+        return 97
+    fi
+}
+clone_and_build_from_source
+restart_daemon_if_needed
+''',
+            RCH_TEST_SOURCE=str(project),
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+        self.assertTrue(any(e.startswith("git clone --depth 1 --branch v2.1.35 -- ")
+                            for e in self.events()))
+
+    def test_retry_after_old_client_drain_refusal_completes_the_upgrade(self):
+        self.prepare_upgrade()
+        first = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n',
+            RCH_TEST_UPGRADE_REFUSAL="legacy builds still running",
+        )
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(self.client.read_bytes(), self.old_client)
+        second = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n'
+            'restart_daemon_if_needed\n'
+        )
+        self.assertEqual(second.returncode, 0, (second.stdout, second.stderr))
+        self.assert_installed_client()
+        self.assertEqual(self.events().count(
+            "legacy rch daemon restart --drain --drain-timeout 300"), 2)
+
+    def test_failed_old_client_drain_keeps_it_available_and_new_hook_staged(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n'
+            'trace UNEXPECTED-completed-upgrade\n',
+            RCH_TEST_UPGRADE_REFUSAL="active legacy builds did not drain",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("active legacy builds did not drain", result.stdout)
+        self.assertEqual(self.client.read_bytes(), self.old_client)
+        self.assertEqual((self.case / "rchd").read_bytes(),
+                         (self.bundle / "rchd").read_bytes())
+        staged = list(self.case.glob("rch.tmp.*"))
+        self.assertEqual(len(staged), 1)
+        self.assertEqual(staged[0].read_bytes(), (self.bundle / "rch").read_bytes())
+        self.assertEqual(self.generation.read_text(), "legacy\n")
+        self.assert_no_supervisor_mutation()
+
+    def test_interrupt_during_old_client_drain_keeps_the_old_hook(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n'
+            'trace UNEXPECTED-completed-upgrade\n',
+            RCH_TEST_UPGRADE_INTERRUPT="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.client.read_bytes(), self.old_client)
+        self.assertEqual(self.generation.read_text(), "legacy\n")
+        self.assert_no_supervisor_mutation()
+
+    def test_missing_hook_source_fails_before_old_client_drain(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\nDAEMON_BINARY_INSTALLED=true\n'
+            'install_binary_file "$RCH_TEST_BUNDLE/missing-rch" "$INSTALL_DIR/rch"\n'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.client.read_bytes(), self.old_client)
+        self.assertEqual(self.events(), [])
+
+    def test_hook_upgrade_requires_daemon_to_be_installed_first(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\n'
+            'install_binary_file "$RCH_TEST_BUNDLE/rch" "$INSTALL_DIR/rch"\n'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.client.read_bytes(), self.old_client)
+        self.assertEqual(self.generation.read_text(), "legacy\n")
+        self.assertFalse(any(" rch daemon " in event for event in self.events()))
+        self.assert_no_supervisor_mutation()
+
+    def test_no_restart_upgrade_preserves_existing_daemon_behavior(self):
+        for mode in ("default", "skip", "system"):
+            with self.subTest(mode=mode):
+                self.prepare_upgrade()
+                script = REAL_INSTALL_HELPERS
+                env = {}
+                if mode == "default":
+                    script += "\nEASY_MODE=false\n"
+                elif mode == "skip":
+                    env["RCH_SKIP_DAEMON_RESTART"] = "1"
+                else:
+                    env["RCH_TEST_SYSTEM_ACTIVE"] = "1"
+                result = self.run_installer(
+                    script + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n', **env
+                )
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                self.assertEqual(self.client.read_bytes(), (self.bundle / "rch").read_bytes())
+                self.assertEqual(self.generation.read_text(), "legacy\n")
+                self.assertFalse(any(" rch daemon " in event for event in self.events()))
+                self.assert_no_supervisor_mutation()
+
+    def test_new_client_must_confirm_readiness_before_fleet_sync(self):
+        self.prepare_upgrade()
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + MAIN_STUBS + '\n'
+            'install_binaries() { install_from_tarball "$RCH_TEST_ARCHIVE"; }\n'
+            'main --easy-mode --yes\n',
+            RCH_TEST_DAEMON_REMAINS_LEGACY="1",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("current rchd launched", self.events())
+        self.assertIn("legacy admission response malformed", result.stdout)
+        self.assertIn("installation stopped before worker sync", result.stderr)
+        for step in ("harmonize_workers", "run_doctor", "print_summary"):
+            self.assertNotIn(step, self.events())
+        self.assert_no_supervisor_mutation()
 
     def test_success_requests_bounded_drain_without_force(self):
         result = self.run_installer("restart_daemon_if_needed")
