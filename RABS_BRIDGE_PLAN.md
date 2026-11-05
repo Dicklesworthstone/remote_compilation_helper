@@ -2,7 +2,64 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at19:47UTC:**
+**Active qualification checkpoint, November5 at20:45UTC:**
+
+- [x] Preserve B5 DSR38bda00e TIMEOUT at original3600s: workspace/alltargets
+  check0/1409.17s, fmt0/16.09s, strictClippy0/1437.87s; CLI test executable
+  was still compiling, ZERO completed inventories. CLI6/native5, not green.
+  ALL1758/control7547B/abc1f3cb unchanged, owned source/job/TMP processes absent.
+  Results/TMP preserved by rename to *-timeout-38bda00e; local receipt
+  terminal-metadata-privatecopy-b5-timeout.json/cc589fb5. No threshold changed.
+- [ ] SAME B5 full9 gate retry RUNNING, same source/control/version/3600s,
+  normal Cargo cache. Retry fmt0/20.89s, workspacecheck0/2.73s, strictClippy0/
+  2.64s; CLI test executable compiling. Cached QA speed earns no RABS win.
+- [x] Stage genuine B1 candidate privately at worker bin-metadata-privatecopy/
+  rabsd:8178704B/a362888a,0500,uid1000/single-link and release receipt checked.
+  NOT started. Exact B5quality receipt and terminal DSR success still required
+  before prepared9-case comparison; shared TRJ remains unreserved.
+- [x] Shared main advanced independently to e8671b02 and includes our changes
+  plus concurrent disk work. Preserve it; no root commit/push or relabeling.
+  Freeze exact e867 source1758files/tar64870400B/ec28a8dd. Its UNUSED quality
+  controller6551B/efbb5a29 and config are preserved, superseded by frozen7be1
+  including the preview repair. Current prepared controller8171B/9bc308ea/
+  inode14093656/dev49 requires matching194-pass component proof plus B5pass,
+  then full compiler gates/ALL9 suites retaining EVERY B5test name. Source
+  installation/execution HELD until B5terminal/audit/quiescence/retirement.
+- [x] Review UBS delta: five added test assertions and one fixture expect explain
+  all six added warnings (6672→6678); four critical shell-fixture findings are
+  unchanged from baseline. No suppression and no scanner-clean claim.
+- [x] Preserve separate old native worker gate FAILED150/151. Code confirms
+  its collect_prefix assumes lossless bytes,
+  while production Lane::record uses try_lock and explicitly reports contention
+  gaps. A legitimate repair must account exact data OR explicit gaps, retain
+  complete output/hash checks and detect invalid queries consuming the cursor;
+  merely accepting offset5 or sleeping is insufficient. Failed raw frame was
+  not retained: contention is source-supported diagnosis, not captured causation.
+- [x] Manual TEST-ONLY repair under lease2062 accounts all prefix bytes by exact
+  returned hex slices OR exact explicit gaps; unchanged3s/no-progress bound and
+  full retained output/hash/terminal/lease assertions. Three new cases exercise
+  mixed data/gap and planted silent-consumption/substitution refusals. No runtime
+  edit or performance credit. Local pinnedrustfmt check0; UBS1critical/140warning
+  versus baseline1critical/126warning. Existing panic is in cfg(test) module;
+  added warnings are four assertions, three bounded slices and seven unwraps
+  in test accounting. No new runtime panic and no scanner-clean claim.
+- [x] DSR7fbd9186 preview components SUCCESS0/1037s: frozen7be1,1758files,
+  control7369B/0d7dbcb2, source/control aftermatch. Actual154/154worker +40/40
+  SDKpool, zeroignored, every original151 name retained. Four original native
+  cases compiled/listed, ZERO native scenarios executed. Normal3600s/profiles/
+  pins/jobs1. Local collected components_linux_amd64.json28350B/907fadf5;
+  genuine harness760638200B/7d21f895. This is component proof, not useful RABS.
+- [ ] Native4 consumer PREPARED, NOT dispatched: control26460B/c75dc60c/
+  inode14095288/dev49, original four CHECK/BUILD/cold/persistent-service cases,
+  normal genuine B1ALL7/bothTLS tools and matching7be1 harness. Complete original
+  SDK5256entries/4270files/1921340623B, original Cargo300s/helper600s/SDK30min/
+  concurrency4/DSR3600s and all storage/source/ownership guards. B5full9 and
+  matching component PASS are prerequisites. Same-host loopback scope only.
+- [x] Read-only Mac dependency attribution: retained NFS asupersync checkout
+  78b6463 has unresolvable HEAD, zero indexed paths and no .cargo-ok. This is an
+  incomplete Git checkout, not a valid prepared dependency tree; it does not
+  independently establish why the prior timed-out run stalled. No Mac build,
+  storage-policy change, checkout overwrite or root-pressure bypass performed.
 
 - [x] Retain ad13d607 FAILURE: all783 core/RABS/regression tests pass, API
   277/280pass/3fail/0ignored,266.15s; all1758 source/control aftermatch.
@@ -26,7 +83,8 @@
   advance changed-file mtimes so Cargo honestly rebuilds. Retirement receipt
   in job-metadata-privatecopy-lease-quality-20261105/source-retirement.json.
 - [ ] B5 full quality RUNNING, control7547B/abc1f3cb, source b5dba07c.
-  Fmt actual0/16.09s; fullworkspacecheck in progress. SAME original3600s,
+  First timeout retained; unchanged retry compiler gates all0 as above.
+  SAME original3600s,
   normal profiles/pins/jobs1, ALL9 inventories/zeroignored and compiler gates.
   Runner also uses private RCH/XDG/socket state, never a substituted HOME.
 - [ ] Local per-context scan-permit follow-up is NOT qualified yet. Context
@@ -49,7 +107,8 @@
   ALL6 ACK/all4release. Fresh reservation only AFTER qualification; no peer
   cancellation/timeout/policy changes. Include population cost/break-even.
 - [ ] Qualify latest scan-permit follow-up, review final UBS vs baseline,
-  fresh ownership guards, commit only owned changes, push main and legacy mirror.
+  fresh ownership guards, commit only remaining owned changes, push main and
+  legacy mirror if needed. Existing e867 shared commit is preserved.
   M6/fleet/native/Mac acceptance remains open; no closes or wins claimed.
 
 **Build/check checkpoint, November5 at17:49UTC (work ongoing):**
