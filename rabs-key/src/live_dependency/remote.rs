@@ -152,6 +152,95 @@ pub(super) const CANONICAL_GENERATED_NATIVE_METADATA_ISOLATION_EXTENSION: &str =
     dynamic/framework/system searches, link modifiers, foreign generated roots, \
     proc macros, build-script execution or local capture authority";
 
+// Only explicit modifier spellings receive this extension. Existing bare
+// static libraries retain their previous policy identity and verification
+// history; that evidence cannot authorize the extended invocation class.
+pub(super) const CANONICAL_NATIVE_ARCHIVE_MODIFIERS_ISOLATION_EXTENSION: &str = "canonical-generated-static-modifiers-v1: \
+    extends only the canonical retained static archive spelling; bundle must \
+    remain enabled, with optional explicit +bundle and signed whole-archive \
+    and verbatim modifiers, each at most once; +verbatim selects one exact \
+    safe .a filename, otherwise the selected filename is libNAME.a; every \
+    selected archive must occur in the complete keyed retained native search \
+    inventory; exact original modifiers and ordering remain semantic; complete \
+    archive bytes, alternative search candidates and Cargo run records stay \
+    keyed; archive member reads remain confined to retained keyed inputs \
+    regardless of filename; packed native outputs require versioned closure \
+    validation bound to every exact rlib object before capture or replay can \
+    expose any result, including metadata; no -bundle, rename, dynamic/framework library, \
+    external search, compiler/linker invocation or local capture authority";
+
+/// Resolve one admitted static library argument to its Linux archive filename.
+///
+/// This is the same lookup rule used by coordinator input validation and worker
+/// admission. Explicit default bundling, signed verbatim and whole-archive
+/// modifiers are supported only while the native archive remains bundled. The
+/// exact original argument must still participate in the action key: this
+/// filename is a lookup result, never a replacement for the invocation.
+///
+/// Rustc can pack a thin archive or linker script for `+whole-archive` without
+/// resolving its external reads. The complete output must therefore pass the
+/// versioned native archive closure validator before capture or replay exposes
+/// any result. The action's namespace alone cannot vouch for those later reads.
+///
+/// Verbatim inputs are bounded to a single safe `.a` filename. Input member
+/// reads execute inside the existing closed namespace; packed output payloads
+/// are independently checked rather than trusted because rustc accepted them.
+///
+/// # Errors
+/// Non-static or nonbundled libraries, unknown/duplicate modifiers, renames,
+/// path-bearing names and filenames outside the bounded archive class.
+pub fn generated_native_archive_filename(library: &str) -> Result<String, LiveRefusal> {
+    let refused = || LiveRefusal::NativeLibrary(library.to_owned());
+    let (kind, name) = library.split_once('=').ok_or_else(refused)?;
+    let mut verbatim = false;
+    if kind != "static" {
+        let modifiers = kind.strip_prefix("static:").ok_or_else(refused)?;
+        let mut seen = 0_u8;
+        for modifier in modifiers.split(',') {
+            let bit = match modifier {
+                "+bundle" => 1,
+                "+verbatim" => {
+                    verbatim = true;
+                    2
+                }
+                "-verbatim" => 2,
+                "+whole-archive" | "-whole-archive" => 4,
+                _ => return Err(refused()),
+            };
+            if seen & bit != 0 {
+                return Err(refused());
+            }
+            seen |= bit;
+        }
+    }
+    // Linux component limits include the conventional lib prefix and .a suffix.
+    let max_name_bytes = if verbatim { 255 } else { 250 };
+    if !super::safe_component(name)
+        || name.len() > max_name_bytes
+        || (verbatim && !name.ends_with(".a"))
+    {
+        return Err(refused());
+    }
+    Ok(if verbatim {
+        name.to_owned()
+    } else {
+        format!("lib{name}.a")
+    })
+}
+
+/// Whether this invocation requires the independently negotiated static
+/// archive modifier capability and policy component.
+///
+/// This only selects the extra contract. Callers must also validate the
+/// invocation and its complete retained native inputs before admitting work.
+#[must_use]
+pub fn requires_generated_native_archive_modifiers(invocation: &NormalizedRustcInvocation) -> bool {
+    invocation
+        .native_libs
+        .iter()
+        .any(|library| library.starts_with("static:"))
+}
+
 /// Output and isolation class selected from a bounded compiler invocation.
 /// This is not execution or serving authority: the caller must enforce the
 /// matching worker context and retain every observed input through completion.
@@ -202,8 +291,8 @@ pub fn remote_dependency_output_class(
 /// archive membership and directory topology before mounting those inputs.
 ///
 /// # Errors
-/// A typed refusal for ordinary/local contexts, unsupported outputs, dynamic or
-/// modified library arguments, or searches outside the exact generated tree.
+/// A typed refusal for ordinary/local contexts, unsupported outputs, dynamic
+/// libraries or unsupported modifiers, or searches outside the exact generated tree.
 pub fn validate_generated_native_inputs(
     invocation: &NormalizedRustcInvocation,
     generated_root: Option<&str>,
@@ -331,7 +420,7 @@ fn validate_native_root_layout(
 /// capability before executing this extended class.
 ///
 /// # Errors
-/// Invalid root membership/order, native modifiers or external searches, and
+/// Invalid root membership/order, unsupported native modifiers or external searches, and
 /// any use of foreign roots outside isolated canonical compilation.
 pub fn validate_generated_native_inputs_with_roots(
     invocation: &NormalizedRustcInvocation,
@@ -398,14 +487,10 @@ pub fn validate_generated_native_inputs_with_roots(
         }
     }
     for library in &invocation.native_libs {
-        if native_dirs.is_empty()
-            || library.strip_prefix("static=").is_none_or(|name| {
-                // Linux filename limit leaves room for the lib prefix and .a.
-                !super::safe_component(name) || name.len() > 250
-            })
-        {
+        if native_dirs.is_empty() {
             return Err(LiveRefusal::NativeLibrary(library.clone()));
         }
+        generated_native_archive_filename(library)?;
     }
     native_dirs.sort();
     Ok(native_dirs)
@@ -486,6 +571,9 @@ pub fn remote_dependency_isolation_policy(
         }
         if !plan.native_roots.is_empty() {
             policy.str(CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION);
+        }
+        if requires_generated_native_archive_modifiers(&plan.invocation) {
+            policy.str(CANONICAL_NATIVE_ARCHIVE_MODIFIERS_ISOLATION_EXTENSION);
         }
         return Ok(compute(
             CANONICAL_REMOTE_DEPENDENCY_ISOLATION_DOMAIN,
@@ -819,11 +907,9 @@ pub(super) fn validate_generated_native_manifest(
         virtual_directories.push(virtual_directory);
     }
     for library in &plan.invocation.native_libs {
-        let name = library
-            .strip_prefix("static=")
-            .ok_or_else(|| LiveRefusal::NativeLibrary(library.clone()))?;
+        let filename = generated_native_archive_filename(library)?;
         if !virtual_directories.iter().any(|directory| {
-            let path = format!("{directory}/lib{name}.a");
+            let path = format!("{directory}/{filename}");
             inputs
                 .inputs
                 .iter()
@@ -2206,6 +2292,272 @@ mod tests {
         retained
     }
 
+    fn native_modifier_plan(emit: &str, library: &str) -> DependencyActionPlan {
+        canonical_plan_with_generated_args(
+            "/__rabs/out/cargo/debug/deps",
+            emit,
+            Some(NATIVE_ROOT),
+            &[
+                "-L".into(),
+                format!("native={NATIVE_ROOT}"),
+                "-L".into(),
+                format!("native={NATIVE_ROOT}/native"),
+                "-l".into(),
+                library.into(),
+            ],
+        )
+    }
+
+    fn add_native_archive(
+        retained: &mut ActionInputManifest,
+        plan: &DependencyActionPlan,
+        filename: &str,
+        bytes: &[u8],
+    ) {
+        retained.directory_enumerations[0]
+            .entries
+            .push(RawBytes::from(filename));
+        retained.directory_enumerations[0]
+            .entries
+            .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        retained.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path(filename).into_bytes()),
+            object: ObjectId(compute("rabs.test.v1", bytes)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn generated_native_archive_filenames_match_bundled_static_modifiers() {
+        for (library, expected) in [
+            ("static=math", "libmath.a"),
+            ("static:+bundle=math", "libmath.a"),
+            ("static:+whole-archive=math", "libmath.a"),
+            ("static:+bundle,+whole-archive=math", "libmath.a"),
+            ("static:-verbatim=math", "libmath.a"),
+            ("static:-whole-archive=math", "libmath.a"),
+            ("static:+bundle,-verbatim,-whole-archive=math", "libmath.a"),
+            ("static:-whole-archive,+bundle,-verbatim=math", "libmath.a"),
+            ("static:+verbatim=math.custom.a", "math.custom.a"),
+            ("static:+bundle,+verbatim=math.custom.a", "math.custom.a"),
+            ("static:+verbatim,+bundle=math.custom.a", "math.custom.a"),
+            (
+                "static:-whole-archive,+bundle,+verbatim=math.custom.a",
+                "math.custom.a",
+            ),
+            (
+                "static:+whole-archive,+bundle,+verbatim=math.custom.a",
+                "math.custom.a",
+            ),
+            (
+                "static:+verbatim,+whole-archive,+bundle=math.custom.a",
+                "math.custom.a",
+            ),
+        ] {
+            assert_eq!(
+                generated_native_archive_filename(library).unwrap(),
+                expected
+            );
+        }
+
+        let longest_conventional = "x".repeat(250);
+        assert_eq!(
+            generated_native_archive_filename(&format!("static={longest_conventional}"))
+                .unwrap()
+                .len(),
+            255
+        );
+        assert!(
+            generated_native_archive_filename(&format!("static={longest_conventional}x")).is_err()
+        );
+        let longest_verbatim = format!("{}.a", "x".repeat(253));
+        assert_eq!(
+            generated_native_archive_filename(&format!("static:+verbatim={longest_verbatim}"))
+                .unwrap(),
+            longest_verbatim
+        );
+        assert!(
+            generated_native_archive_filename(&format!("static:+verbatim=x{longest_verbatim}"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_native_archive_modifiers_refuse_ambiguous_or_unclosed_inputs() {
+        for library in [
+            "math",
+            "dylib:+verbatim=libmath.a",
+            "framework:+bundle=math",
+            "static=",
+            "static:=math",
+            "static:+bundle,=math",
+            "static:,+bundle=math",
+            "static:bundle=math",
+            "static:-bundle=math",
+            "static:+bundle,-bundle=math",
+            "static:+whole-archive,-bundle=math",
+            "static:+bundle,+bundle=math",
+            "static:+whole-archive,+whole-archive=math",
+            "static:+whole-archive,-whole-archive=math",
+            "static:+verbatim,-verbatim=libmath.a",
+            "static:+verbatim,+verbatim=libmath.a",
+            "static:+as-needed=math",
+            "static:+unknown=math",
+            "static:+verbatim=math",
+            "static:+verbatim=libmath.so",
+            "static:+verbatim=../libmath.a",
+            "static:+verbatim=/libmath.a",
+            "static:+verbatim=nested/libmath.a",
+            "static:+verbatim=nested\\libmath.a",
+            "static:+verbatim=math.a:renamed",
+            "static:+verbatim=math.a\0",
+            "static:+bundle=math:renamed",
+            "static:+bundle=math,extra",
+            "static:+bundle=math=extra",
+        ] {
+            assert!(
+                matches!(
+                    generated_native_archive_filename(library),
+                    Err(LiveRefusal::NativeLibrary(ref value)) if value == library
+                ),
+                "{library:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_static_modifiers_keep_exact_flags_and_bytes_in_the_key() {
+        let record = b"cargo::rustc-env=BUILD_LABEL=pinned\n";
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let bare = native_modifier_plan(emit, "static=math");
+            let retained = native_inputs(&bare);
+            let original = generated_key(&bare, &retained, Some(record)).unwrap();
+            assert!(!requires_generated_native_archive_modifiers(
+                &bare.invocation
+            ));
+            let mut keys = std::collections::HashSet::new();
+            keys.insert(original.action_key.bytes);
+            for library in [
+                "static:+bundle=math",
+                "static:+whole-archive=math",
+                "static:+bundle,+whole-archive=math",
+                "static:-verbatim=math",
+                "static:-whole-archive=math",
+                "static:+bundle,-verbatim,-whole-archive=math",
+                "static:-verbatim,+bundle,-whole-archive=math",
+                "static:+verbatim=libmath.a",
+                "static:+whole-archive,+bundle,+verbatim=libmath.a",
+                "static:+verbatim,+whole-archive,+bundle=libmath.a",
+            ] {
+                let plan = native_modifier_plan(emit, library);
+                let current = generated_key(&plan, &retained, Some(record)).unwrap();
+                assert!(requires_generated_native_archive_modifiers(
+                    &plan.invocation
+                ));
+                assert!(
+                    keys.insert(current.action_key.bytes),
+                    "original modifier bytes and their ordering stay keyed: {library}"
+                );
+                assert_ne!(
+                    original.descriptor.sandbox_semantic_policy,
+                    current.descriptor.sandbox_semantic_policy,
+                    "old native execution evidence must not authorize modifiers"
+                );
+                assert_ne!(
+                    original.descriptor.normalized_invocation,
+                    current.descriptor.normalized_invocation
+                );
+
+                let mut changed = retained.clone();
+                changed.inputs.last_mut().unwrap().object = ObjectId(compute(
+                    "rabs.test.v1",
+                    b"changed alternative native archive",
+                ));
+                assert_ne!(
+                    current.action_key,
+                    generated_key(&plan, &changed, Some(record))
+                        .unwrap()
+                        .action_key,
+                    "the complete search view stays keyed even with explicit modifiers"
+                );
+                let mut reordered = plan.clone();
+                reordered.invocation.lib_search.swap(1, 2);
+                assert_ne!(
+                    current.action_key,
+                    generated_key(&reordered, &retained, Some(record))
+                        .unwrap()
+                        .action_key
+                );
+                assert!(
+                    canonical_cargo_dependency_key(
+                        &plan,
+                        &toolchain(),
+                        &[],
+                        &directories(&plan),
+                        Some(record),
+                        &retained,
+                    )
+                    .is_err(),
+                    "extended native inputs never gain unsandboxed local authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_static_verbatim_requires_the_exact_retained_archive() {
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let plan = native_modifier_plan(emit, "static:+bundle,+verbatim=math.custom.a");
+            let record = b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rustc-link-lib=static:+bundle,+verbatim=math.custom.a\n";
+            let mut retained = native_inputs(&plan);
+            assert!(generated_key(&plan, &retained, Some(record)).is_err());
+            // libNAME.a is not a substitute for a verbatim filename.
+            add_native_archive(
+                &mut retained,
+                &plan,
+                "libmath.custom.a.a",
+                b"conventional-name decoy",
+            );
+            assert!(generated_key(&plan, &retained, Some(record)).is_err());
+            add_native_archive(
+                &mut retained,
+                &plan,
+                "math.custom.a",
+                b"first archive bytes",
+            );
+            let original = generated_key(&plan, &retained, Some(record)).unwrap();
+            let mut changed = retained.clone();
+            changed.inputs.last_mut().unwrap().object =
+                ObjectId(compute("rabs.test.v1", b"changed selected archive bytes"));
+            assert_ne!(
+                original.action_key,
+                generated_key(&plan, &changed, Some(record))
+                    .unwrap()
+                    .action_key
+            );
+            let changed_record = b"cargo::rustc-env=BUILD_LABEL=pinned\ncargo::rustc-link-lib=static:+verbatim,+bundle=math.custom.a\n";
+            assert_ne!(
+                original.action_key,
+                generated_key(&plan, &retained, Some(changed_record))
+                    .unwrap()
+                    .action_key,
+                "exact Cargo directive bytes stay semantic"
+            );
+
+            let mut symlink = retained.clone();
+            symlink.inputs.last_mut().unwrap().file_type = InputFileType::Symlink;
+            symlink
+                .inputs
+                .last_mut()
+                .unwrap()
+                .symlink_resolution
+                .push(RawBytes::from("/usr/lib/math.custom.a"));
+            assert!(generated_key(&plan, &symlink, Some(record)).is_err());
+        }
+    }
+
     const FOREIGN_NATIVE_A: &str = "/__rabs/out/cargo/debug/build/provider-a/a111111111111111/out";
     const FOREIGN_NATIVE_B: &str = "/__rabs/out/cargo/debug/build/provider-b/out";
 
@@ -2674,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_native_scope_refuses_dynamic_modifiers_host_searches_and_local_metadata() {
+    fn generated_native_scope_refuses_unclosed_modifiers_host_searches_and_local_metadata() {
         for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
             let original = native_plan(emit);
             for library in [
@@ -2685,9 +3037,14 @@ mod tests {
                 "static=../math",
                 "static=/usr/lib/math",
                 "static=math:renamed",
-                "static:+bundle=math",
                 "static:-bundle=math",
-                "static:+whole-archive=math",
+                "static:+bundle,-bundle=math",
+                "static:+bundle,+bundle=math",
+                "static:+whole-archive,-bundle=math",
+                "static:+whole-archive,-whole-archive=math",
+                "static:+verbatim,-verbatim=libmath.a",
+                "static:+as-needed=math",
+                "static:+verbatim=libmath.so",
                 "static=math,extra",
             ] {
                 let mut plan = original.clone();

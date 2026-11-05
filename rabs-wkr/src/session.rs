@@ -495,8 +495,8 @@ pub fn validate_dependency_execution(
 ) -> Result<(), String> {
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
-        RemoteDependencyOutputClass, remote_dependency_output_class,
-        validate_generated_native_inputs_with_roots,
+        RemoteDependencyOutputClass, generated_native_archive_filename,
+        remote_dependency_output_class, validate_generated_native_inputs_with_roots,
     };
     use std::collections::BTreeSet;
     use std::path::{Component, Path};
@@ -564,9 +564,8 @@ pub fn validate_dependency_execution(
             .map(|file| file.path.as_str())
             .collect::<BTreeSet<_>>();
         for library in &invocation.native_libs {
-            let name = library
-                .strip_prefix("static=")
-                .ok_or("native inputs require default-bundle static archives")?;
+            let filename = generated_native_archive_filename(library)
+                .map_err(|error| format!("dependency native archive: {error}"))?;
             let present = native_directories.iter().any(|directory| {
                 let Some((root, _, prefix)) = native_tree(directory) else {
                     return false;
@@ -574,9 +573,7 @@ pub fn validate_dependency_execution(
                 let Ok(relative) = Path::new(directory).strip_prefix(root) else {
                     return false;
                 };
-                let path = Path::new(prefix)
-                    .join(relative)
-                    .join(format!("lib{name}.a"));
+                let path = Path::new(prefix).join(relative).join(&filename);
                 path.to_str().is_some_and(|path| files.contains(path))
             });
             if !present {

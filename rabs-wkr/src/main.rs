@@ -23,9 +23,9 @@ use rabs_protocol::metadata_prefetch::VERSION as METADATA_PREFETCH_VERSION;
 use rabs_protocol::worker_standby::{self, WorkerStandby};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost,
-    DependencyExecutionMode,
+    CANONICAL_NATIVE_MODIFIERS_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY,
+    CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost, DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{
@@ -2259,7 +2259,7 @@ fn worker_hello(
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
-        "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY],
+        "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_NATIVE_MODIFIERS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "dependency_execution_hosts": DependencyExecutionHost::native().into_iter()
