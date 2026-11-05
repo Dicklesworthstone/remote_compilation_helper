@@ -487,6 +487,10 @@ pub async fn execute_with_disk_budget(
     let mut disk_receipt = None;
     let mut cmd = if let Some(budget) = disk_budget {
         anyhow::ensure!(budget.max_growth_bytes > 0, "positive disk budget required");
+        anyhow::ensure!(
+            budget.warm_policy.is_none(),
+            "conditional warm budgets require dispatcher-owned admission"
+        );
         let root = std::fs::canonicalize(workdir)?;
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
@@ -757,6 +761,7 @@ mod tests {
         let budget = Some(rch_common::BuildDiskBudget {
             max_growth_bytes: 8 << 20,
             min_free_bytes: 0,
+            warm_policy: None,
         });
         execute_with_disk_budget(
             directory.path().to_str().unwrap(),
@@ -789,6 +794,7 @@ mod tests {
             Some(rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 62,
+                warm_policy: None,
             }),
         )
         .await
@@ -811,6 +817,7 @@ mod tests {
                 Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 1 << 20,
                     min_free_bytes: 1 << 20,
+                    warm_policy: None,
                 }),
             ),
         )

@@ -473,6 +473,38 @@ fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
         )
 }
 
+/// Only an exact prelaunch refusal, followed by acknowledged ownership release,
+/// may spend one cold retry. A started or uncertain execution is never replayed.
+fn cold_disk_retry_gib(
+    error: &anyhow::Error,
+    worker: &rch_common::SelectedWorker,
+    release_acknowledged: bool,
+    already_retried: bool,
+) -> Option<u32> {
+    if !release_acknowledged || already_retried || requires_recovery_before_release(error) {
+        return None;
+    }
+    let budget = worker.disk_budget?;
+    let policy = budget.warm_policy?;
+    let failure = error.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()?;
+    if !policy.valid_for_budget(budget.max_growth_bytes)
+        || failure.reason != "cold_required"
+        || failure.started
+        || failure.growth_bytes != 0
+        || failure.worker_id != worker.id.as_str()
+        || failure.max_growth_bytes != budget.max_growth_bytes
+        || failure.required_growth_bytes != Some(policy.cold_growth_bytes)
+    {
+        return None;
+    }
+    u32::try_from(
+        policy
+            .cold_growth_bytes
+            .div_ceil(rch_common::BuildDiskBudget::GIB),
+    )
+    .ok()
+}
+
 fn source_topology_preflight_failure<'a>(
     error: &'a anyhow::Error,
     worker_id: &WorkerId,
@@ -502,6 +534,7 @@ fn remote_release_faults<'a>(
             source_busy: false,
             source_topology_mismatch: None,
             disk_peak_output_bytes: result.disk_peak_output_bytes,
+            disk_observation: result.disk_observation,
         },
         Err(error) if !requires_recovery_before_release(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
@@ -518,7 +551,7 @@ fn remote_release_faults<'a>(
                 .filter(|failure| failure.worker_id == worker_id.as_str())
             {
                 return daemon_ipc::ReleaseFaults {
-                    worker_fault: true,
+                    worker_fault: failure.reason != "cold_required",
                     worker_disk_full: failure.reason == "free_floor",
                     worker_disk_roots: &failure.roots,
                     disk_peak_output_bytes: failure.peak_output_bytes,
@@ -536,6 +569,7 @@ fn remote_release_faults<'a>(
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                 },
                 None => daemon_ipc::ReleaseFaults {
                     live_checkout_refused,
@@ -5393,6 +5427,7 @@ pub async fn run_exec(
         max_remote_attempts()
     };
     let mut tried_workers: Vec<WorkerId> = Vec::new();
+    let mut cold_disk_retried = false;
     // The worker set requested for the CURRENT `response`. Attempt 1 uses the
     // operator's env pin (`RCH_WORKER(S)`); each retry pins the chosen bigger
     // worker so the daemon reserves exactly it.
@@ -5792,6 +5827,65 @@ pub async fn run_exec(
                     )?,
                 });
                 std::process::exit(130);
+            }
+        }
+
+        // Pool state is verified by the supervisor before starting the command.
+        // If it changed since learning, obtain a NEW, fully funded reservation;
+        // never increase the worker's allowance behind durable admission's back.
+        if let Err(error) = result.as_ref()
+            && (!source_content_receipt
+                || error.is::<transfer_orchestration::ColdDiskPreparationRequired>())
+            && let Some(cold_gib) =
+                cold_disk_retry_gib(error, &worker, release_acknowledged, cold_disk_retried)
+        {
+            cold_disk_retried = true;
+            durable_lease.ensure_released_for_retry()?;
+            reporter.verbose(&format!(
+                "[RCH] target pool changed on {}; requesting a cold disk reservation",
+                worker.id
+            ));
+            // Completion fences the old capacity sample even for a prelaunch
+            // refusal. Use the existing daemon probe path; an unsuccessful
+            // refresh cannot waive the selector's strict freshness check.
+            if let Err(error) = crate::commands::send_daemon_command_to_socket(
+                Path::new(&config.general.socket_path),
+                "GET /workers/capabilities?refresh=true\n",
+            )
+            .await
+            {
+                warn!(%error, "Could not refresh capacity before cold disk admission");
+            }
+            let preferred = vec![worker.id.clone()];
+            if let Some(next_response) =
+                dispatch_retry_selection(&durable_lease, release_acknowledged, async || {
+                    query_daemon(
+                        &config.general.socket_path,
+                        &selection_project,
+                        estimated_cores,
+                        cold_gib.max(config.compilation.disk_headroom_gib),
+                        &remote_command,
+                        toolchain.as_ref(),
+                        required_runtime,
+                        command_priority,
+                        0,
+                        Some(std::process::id()),
+                        Some(&wrapper_id),
+                        wait_for_worker,
+                        &preferred,
+                        classification.kind == Some(CompilationKind::Job),
+                        &required_tools,
+                        Some(&source_topology),
+                    )
+                    .await
+                })
+                .await?
+                && (next_response.worker.is_some()
+                    || selection_cancelled_before_start(&next_response))
+            {
+                current_query_preferred = preferred;
+                response = next_response;
+                continue;
             }
         }
 

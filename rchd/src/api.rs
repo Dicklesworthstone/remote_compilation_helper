@@ -1731,6 +1731,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut duration_ms = None;
         let mut bytes_transferred = None;
         let mut disk_peak_output_bytes = None;
+        let mut disk_observation = None;
         let mut local_wrapper_id = None;
         let mut worker_fault = false;
         let mut worker_disk_full = false;
@@ -1768,6 +1769,15 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                             .context("Invalid disk peak output measurement")?,
                     );
                 }
+                "disk_observation" => {
+                    anyhow::ensure!(disk_observation.is_none(), "Duplicate disk observation");
+                    disk_observation = Some(
+                        serde_json::from_str::<rch_common::BuildDiskObservation>(
+                            &percent_unescape_query_value(value),
+                        )
+                        .context("Invalid disk observation")?,
+                    );
+                }
                 "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
                 "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 "worker_disk_full" => worker_disk_full = matches!(value, "1" | "true"),
@@ -1802,6 +1812,13 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             disk_peak_output_bytes.is_none() || exit_code.is_some(),
             "Disk output measurement requires an explicit release exit code"
         );
+        anyhow::ensure!(
+            disk_observation.as_ref().is_none_or(|observation| {
+                exit_code.is_some()
+                    && disk_peak_output_bytes.is_some_and(|peak| observation.valid_for_peak(peak))
+            }),
+            "Disk observation requires a valid peak and explicit release exit code"
+        );
         return Ok(ApiRequest::ReleaseWorker(ReleaseRequest {
             worker_id: rch_common::WorkerId::new(worker_id),
             slots,
@@ -1810,6 +1827,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             duration_ms,
             bytes_transferred,
             disk_peak_output_bytes,
+            disk_observation,
             local_wrapper_id,
             timing: None,
             worker_fault,
@@ -2099,6 +2117,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command = None;
     let mut cores = None;
     let mut disk_headroom_gib = None;
+    let mut disk_observation_version = None;
     let mut wait_for_worker = false;
     let mut job_mode = false;
     let mut wait_timeout_secs = None;
@@ -2145,6 +2164,17 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     value
                         .parse::<u32>()
                         .context("disk_headroom_gib must be an unsigned whole GiB count")?,
+                );
+            }
+            "disk_observation_version" => {
+                anyhow::ensure!(
+                    disk_observation_version.is_none(),
+                    "Duplicate disk observation version"
+                );
+                disk_observation_version = Some(
+                    value
+                        .parse::<u32>()
+                        .context("Invalid disk observation version")?,
                 );
             }
             "wait" | "queue" => {
@@ -2236,6 +2266,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             command_priority,
             estimated_cores,
             disk_headroom_gib,
+            disk_observation_version: disk_observation_version.unwrap_or(0),
             preferred_workers,
             toolchain,
             required_runtime,
@@ -2704,6 +2735,7 @@ async fn handle_select_worker_dry_run(
             // RwLock is fair, and available_slots() reads the config itself.
             let slots_available = worker.available_slots().await;
             let speed_score = worker.get_speed_score();
+            let endpoint = worker.endpoint_snapshot().await;
             let config = worker.config.read().await;
             Some(SelectedWorker {
                 id: config.id.clone(),
@@ -2714,7 +2746,9 @@ async fn handle_select_worker_dry_run(
                 speed_score,
                 declared_os: rch_common::declared_os(&config.tags),
                 project_lane: 0,
-                disk_budget: ctx.worker_selector.build_disk_budget(request),
+                disk_budget: ctx
+                    .worker_selector
+                    .build_disk_budget_for_endpoint(request, &endpoint),
             })
         }
         None => None,
@@ -3006,7 +3040,9 @@ async fn handle_select_worker_mode(
                         .clone()
                         .unwrap_or_else(|| "<unknown>".to_string());
 
-                    let disk_budget = ctx.worker_selector.build_disk_budget(request);
+                    let disk_budget = ctx
+                        .worker_selector
+                        .build_disk_budget_for_endpoint(request, &selected_endpoint);
                     let disk = crate::disk_pressure::DiskHeadroomAdmission {
                         requested_gib: disk_budget.map_or(0, |budget| {
                             u32::try_from(
@@ -3022,6 +3058,7 @@ async fn handle_select_worker_mode(
                                 .div_ceil(rch_common::BuildDiskBudget::GIB)
                         }),
                         capacity: slot_admission.disk_capacity,
+                        warm_policy: disk_budget.and_then(|budget| budget.warm_policy),
                     };
 
                     let admission = ctx.history.try_start_active_build_in_lanes(
@@ -3117,6 +3154,7 @@ async fn handle_select_worker_mode(
                                     min_free_bytes: state
                                         .disk_floor_gib
                                         .saturating_mul(rch_common::BuildDiskBudget::GIB),
+                                    warm_policy: state.disk_warm_policy,
                                 })
                             } else if state.recovered {
                                 // Legacy live rows are charged a cold allowance by
@@ -3132,6 +3170,7 @@ async fn handle_select_worker_mode(
                                     ) * rch_common::BuildDiskBudget::GIB,
                                     min_free_bytes: disk_budget
                                         .map_or(0, |budget| budget.min_free_bytes),
+                                    warm_policy: None,
                                 })
                             } else {
                                 None
@@ -4149,6 +4188,15 @@ async fn handle_release_worker_from(
         request.disk_peak_output_bytes.is_none() || request.exit_code.is_some(),
         "Disk output measurement requires an explicit release exit code"
     );
+    anyhow::ensure!(
+        request.disk_observation.as_ref().is_none_or(|observation| {
+            request.exit_code.is_some()
+                && request
+                    .disk_peak_output_bytes
+                    .is_some_and(|peak| observation.valid_for_peak(peak))
+        }),
+        "Disk observation requires a valid peak and explicit release exit code"
+    );
     let _release_guard = ctx.history.lock_releases().await;
     if request.local_wrapper_id.is_none()
         && let (Some(build_id), Some(peer)) = (request.build_id, peer)
@@ -4199,6 +4247,7 @@ async fn handle_release_worker_from(
                         duration_ms: request.duration_ms,
                         bytes_transferred: request.bytes_transferred,
                         disk_peak_output_bytes: request.disk_peak_output_bytes,
+                        disk_observation: request.disk_observation,
                         timing: request.timing,
                         cancellation: None,
                     },
@@ -5752,6 +5801,7 @@ mod tests {
         );
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             project: "resume-project".into(),
             command: Some("cargo build".into()),
             command_priority: CommandPriority::Normal,
@@ -6271,6 +6321,7 @@ mod tests {
         let release = |owner: &str| ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             local_wrapper_id: Some(owner.into()),
             worker_id: WorkerId::new("large"),
             slots: 99,
@@ -6347,6 +6398,132 @@ mod tests {
             "duplicate completion must not release the new build's budget"
         );
         assert_eq!(worker.used_slots(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_disk_api_preview_and_owned_admission_return_the_same_pool_condition() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("warm-worker", 8)).await;
+        let ctx = make_test_context(pool);
+        let gib = rch_common::BuildDiskBudget::GIB;
+        let added = 300 * 1024 * 1024;
+        let retained = rch_common::BuildDiskPool {
+            identity: [7; 32],
+            state: [9; 32],
+            retained_bytes: 81 * gib - added,
+        };
+        let observation = rch_common::BuildDiskObservation {
+            version: rch_common::BuildDiskObservation::VERSION,
+            baseline_output_bytes: retained.retained_bytes,
+            peak_added_output_bytes: added,
+            peak_free_drop_bytes: added,
+            baseline_pool: retained,
+            final_pool: retained,
+        };
+        let encoded = urlencoding_encode(&serde_json::to_string(&observation).unwrap());
+        let ApiRequest::SelectWorker { request, .. } = parse_request(
+            "GET /select-worker?project=warm-api&command=cargo%20check&cores=1&worker=warm-worker&runtime=none&disk_observation_version=1",
+        ).unwrap() else {
+            panic!("expected warm-capable selection");
+        };
+        for index in 0..2 {
+            set_test_build_disk(&ctx.pool, "warm-worker", 200.0).await;
+            let owner = format!("warm-api-{index}");
+            let selected = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some(owner.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                selected
+                    .worker
+                    .unwrap()
+                    .disk_budget
+                    .unwrap()
+                    .warm_policy
+                    .is_none()
+            );
+            let build_id = selected.build_id.unwrap();
+            let line = format!(
+                "POST /release-worker?worker=warm-worker&build_id={build_id}&local_wrapper_id={owner}&exit_code=0&disk_peak_output_bytes={}&disk_observation={encoded}",
+                81 * gib,
+            );
+            assert!(
+                line.len() < MAX_LINE_SIZE,
+                "encoded observations fit the actual socket protocol limit"
+            );
+            let ApiRequest::ReleaseWorker(receipt) = parse_request(&line).unwrap() else {
+                panic!("expected measured completion");
+            };
+            assert_eq!(receipt.disk_observation, Some(observation));
+            assert!(parse_request(&format!("{line}&disk_observation={encoded}")).is_err());
+            handle_release_worker(&ctx, receipt).await.unwrap();
+        }
+        // The old total requires 102 + 10 GiB. A matched warm proof permits
+        // 3 + 10 GiB on this fresh low-capacity observation instead.
+        set_test_build_disk(&ctx.pool, "warm-worker", 40.0).await;
+        let preview = handle_select_worker_dry_run(&ctx, &request).await;
+        let budget = preview.worker.unwrap().disk_budget.unwrap();
+        assert_eq!(budget.max_growth_bytes, 3 * gib);
+        assert_eq!(budget.warm_policy.unwrap().cold_growth_bytes, 102 * gib);
+        assert_eq!(budget.warm_policy.unwrap().pools[0], Some(retained));
+        assert!(ctx.history.active_builds().is_empty());
+        let mut old_client = request.clone();
+        old_client.disk_observation_version = 0;
+        assert!(
+            handle_select_worker_dry_run(&ctx, &old_client)
+                .await
+                .worker
+                .is_none()
+        );
+
+        let response = handle_select_worker_with_wrapper(
+            &ctx,
+            request,
+            false,
+            None,
+            Some("warm-api-active".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.worker.unwrap().disk_budget, Some(budget));
+        let state = ctx
+            .history
+            .active_build(response.build_id.unwrap())
+            .unwrap();
+        assert_eq!(state.disk_warm_policy, budget.warm_policy);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("warm-worker"), 3);
+    }
+
+    #[test]
+    fn warm_disk_protocol_capability_is_bound_to_queued_identity() {
+        let ApiRequest::SelectWorker { mut request, .. } =
+            parse_request("GET /select-worker?project=p&cores=1").unwrap()
+        else {
+            panic!("expected selection");
+        };
+        assert_eq!(request.disk_observation_version, 0);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("disk_observation_version")
+                .is_none()
+        );
+        let legacy = queue_selection_digest(&request, Some(30)).unwrap();
+        request.disk_observation_version = rch_common::BuildDiskObservation::VERSION;
+        assert_ne!(queue_selection_digest(&request, Some(30)).unwrap(), legacy);
+        for line in [
+            "GET /select-worker?project=p&disk_observation_version=-1",
+            "GET /select-worker?project=p&disk_observation_version=1&disk_observation_version=1",
+            "POST /release-worker?worker=w&disk_observation=%7B%7D",
+        ] {
+            assert!(parse_request(line).is_err(), "accepted {line}");
+        }
     }
 
     #[tokio::test]
@@ -6580,6 +6757,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "dry-run-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -6625,6 +6803,7 @@ mod tests {
             .fence_live_checkout("inventory-project", "fenced");
         let mut request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "inventory-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -7314,6 +7493,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7350,6 +7530,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7383,6 +7564,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7416,6 +7598,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7457,6 +7640,7 @@ mod tests {
             let wrapper = format!("rchw-{}", Uuid::new_v4());
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "cancel-queued".into(),
                 command: Some("cargo build".into()),
@@ -7588,6 +7772,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7619,6 +7804,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7656,6 +7842,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -7690,6 +7877,7 @@ mod tests {
         ctx.admission_barrier.write().await.begin_shutdown();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "restart-guard".to_string(),
             command: Some("cargo test".to_string()),
@@ -8756,6 +8944,7 @@ mod tests {
             .await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -8789,6 +8978,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8833,6 +9023,7 @@ mod tests {
                 worker_source_topology_mismatch: None,
                 local_wrapper_id: Some("rchw-daemon-correlation".to_string()),
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 worker_id: WorkerId::new("worker1"),
                 slots: 2,
                 build_id: Some(build_id),
@@ -8945,6 +9136,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = |hook_pid| SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "other-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -9007,6 +9199,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -9032,6 +9225,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -9078,6 +9272,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -9103,6 +9298,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -9142,6 +9338,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let shard = |pid: u32, job_mode: bool| SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode,
             project: "burst-project".to_string(),
             command: Some("./run_shard.sh".to_string()),
@@ -9194,6 +9391,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
             command: Some("cargo check".to_string()),
@@ -9215,6 +9413,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "project-b".to_string(),
             command: Some("cargo check".to_string()),
@@ -9252,6 +9451,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -9277,6 +9477,7 @@ mod tests {
         // handing back worker1.
         let absent_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-absent".to_string(),
             command: None,
@@ -11982,6 +12183,7 @@ mod tests {
         ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             local_wrapper_id: Some("disk-owner".into()),
             worker_id: WorkerId::new("worker1"),
             slots: 2,
@@ -12043,6 +12245,7 @@ mod tests {
                         exit_code: 101,
                         duration_ms: Some(50),
                         disk_peak_output_bytes: None,
+                        disk_observation: None,
                         bytes_transferred: None,
                         timing: None,
                         cancellation: None,
@@ -12276,6 +12479,7 @@ mod tests {
                                 exit_code: 101,
                                 duration_ms: None,
                                 disk_peak_output_bytes: None,
+                                disk_observation: None,
                                 bytes_transferred: None,
                                 timing: None,
                                 cancellation: None,
@@ -12383,6 +12587,7 @@ mod tests {
             slots: 4,
             build_id: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             exit_code: None,
             duration_ms: None,
             bytes_transferred: None,
@@ -12406,6 +12611,7 @@ mod tests {
         let wrapper = format!("rchw-{}", Uuid::new_v4());
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "legacy-client-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -12487,6 +12693,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_observation: None,
                         timing: None,
                         cancellation: None,
                     },
@@ -12535,6 +12742,7 @@ mod tests {
             slots: 4,
             build_id: Some(build_id),
             disk_peak_output_bytes: None,
+            disk_observation: None,
             exit_code: Some(0),
             duration_ms: None,
             bytes_transferred: None,
@@ -12614,6 +12822,7 @@ mod tests {
             build_id: Some(build_id),
             exit_code: Some(0),
             disk_peak_output_bytes: None,
+            disk_observation: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
@@ -12686,6 +12895,7 @@ mod tests {
                     &ctx,
                     SelectionRequest {
                         source_topology: None,
+                        disk_observation_version: 0,
                         job_mode: false,
                         project: "finished-build".into(),
                         command: Some("cargo build".into()),
@@ -12746,6 +12956,7 @@ mod tests {
                 local_wrapper_id: None,
                 worker_id: original.id.clone(),
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 slots: 999,
                 build_id: Some(build_id),
                 exit_code: Some(0),
@@ -12815,6 +13026,7 @@ mod tests {
             worker_id: WorkerId::new("worker1"),
             slots: 0,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             build_id: Some(build_id),
             exit_code: Some(0),
             duration_ms: Some(5000),
@@ -12855,6 +13067,7 @@ mod tests {
         let release = || ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
@@ -12907,6 +13120,7 @@ mod tests {
                         worker_source_topology_mismatch: None,
                         local_wrapper_id: None,
                         disk_peak_output_bytes: None,
+                        disk_observation: None,
                         worker_id: WorkerId::new("worker1"),
                         slots: 4,
                         build_id: Some(build_id),
@@ -12951,6 +13165,7 @@ mod tests {
                 worker_id: WorkerId::new("worker1"),
                 slots: 4,
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 build_id: Some(build_id),
                 exit_code: Some(1),
                 duration_ms: None,
@@ -12999,6 +13214,7 @@ mod tests {
         let release = |build_id| ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 2,
@@ -13123,6 +13339,7 @@ mod tests {
             build_id: Some(build_id),
             exit_code: Some(101),
             disk_peak_output_bytes: None,
+            disk_observation: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
@@ -13476,6 +13693,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "disk-capacity".to_string(),
             command: None,
@@ -13510,6 +13728,7 @@ mod tests {
                 local_wrapper_id: None,
                 worker_id: WorkerId::new("disk-worker"),
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 slots: 4,
                 build_id: Some(build_id),
                 exit_code: Some(0),
@@ -13550,6 +13769,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "degraded-busy".to_string(),
             command: None,

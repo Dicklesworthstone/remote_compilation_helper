@@ -5,7 +5,7 @@
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
 use crate::headroom::{
     FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
-    legacy_footprint_key,
+    legacy_footprint_key, warm_footprint_key,
 };
 use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -35,8 +35,8 @@ struct DurableOwnership {
     cancelled_wrappers: HashSet<String>,
     #[serde(default)]
     next_queue_id: Option<u64>,
-    /// Required in version 2. Absence in version 1 means that the old daemon
-    /// never persisted its queue, not that a version-2 queue may be discarded.
+    /// Required in versions 2 and 3. Absence in version 1 means that the old
+    /// daemon never persisted its queue, not that a newer queue may be discarded.
     #[serde(default)]
     queued: Option<VecDeque<QueuedBuildState>>,
     /// Deterministic refusals have no time expiry. Only an exact, successful
@@ -208,6 +208,9 @@ pub struct BuildCompletion {
     pub bytes_transferred: Option<u64>,
     /// Attributed peak allocated output, including the starting artifact pool.
     pub disk_peak_output_bytes: Option<u64>,
+    /// Complete, versioned allocation and retained-pool observations. These
+    /// never replace cold evidence without a worker-validated pool condition.
+    pub disk_observation: Option<rch_common::BuildDiskObservation>,
     pub timing: Option<CommandTimingBreakdown>,
     pub cancellation: Option<BuildCancellationMetadata>,
 }
@@ -301,6 +304,10 @@ pub struct ActiveBuildState {
     /// Worker free-space floor admitted for this owner, retained across restart.
     #[serde(default)]
     pub disk_floor_gib: u64,
+    /// A conditional warm allowance is part of durable ownership. Recovery
+    /// must re-emit the same proof, never turn it into an unconditional budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_warm_policy: Option<rch_common::BuildDiskWarmPolicy>,
     /// Free build-disk GiB on the worker at admission (bd-wv746 footprint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_start_gib: Option<u64>,
@@ -657,6 +664,7 @@ impl BuildHistory {
             project_lane: 0,
             disk_headroom_gib: 0,
             disk_floor_gib: 0,
+            disk_warm_policy: None,
             disk_free_start_gib: None,
             disk_free_min_gib: None,
             disk_shared: false,
@@ -779,6 +787,14 @@ impl BuildHistory {
         requested_source_topology: Option<rch_common::SourceTopology>,
         project_lanes: u32,
     ) -> std::io::Result<Option<ActiveBuildState>> {
+        if disk.warm_policy.is_some()
+            && (location != BuildLocation::Remote || worker_endpoint.is_none())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "warm disk admission requires a remote worker endpoint",
+            ));
+        }
         if worker_endpoint.as_ref().is_some_and(|endpoint| {
             endpoint.config.id.as_str() != worker_id || location != BuildLocation::Remote
         }) {
@@ -831,6 +847,7 @@ impl BuildHistory {
             project_lane: 0,
             disk_headroom_gib: disk.requested_gib,
             disk_floor_gib: disk.floor_gib,
+            disk_warm_policy: disk.warm_policy,
             disk_free_start_gib,
             disk_free_min_gib: None,
             disk_shared: false,
@@ -1028,6 +1045,23 @@ impl BuildHistory {
         }
     }
 
+    /// Candidate-specific incremental evidence is a conditional alternative
+    /// to cold sizing, not a reduction of the project's cold high-water mark.
+    pub(crate) fn learned_warm_footprint(
+        &self,
+        project_id: &str,
+        command: &str,
+        endpoint: &WorkerEndpointIdentity,
+    ) -> Option<(f64, [Option<rch_common::BuildDiskPool>; 8])> {
+        self.footprints
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .warm_estimate(
+                &warm_footprint_key(project_id, command, endpoint),
+                Utc::now().timestamp(),
+            )
+    }
+
     /// Diagnostic estimate only: this never releases an active reservation.
     /// Learned growth minus a worker's observed drop is not admission credit.
     #[cfg(test)]
@@ -1055,51 +1089,84 @@ impl BuildHistory {
             .sum()
     }
 
-    /// Only attributed total output can prove a small successful build.
-    /// Filesystem deltas can be deflated by concurrent cleanup even when this
-    /// daemon owns the worker's only job, so they are incomplete lower bounds.
+    /// Total output remains cold evidence. Incremental observations are kept
+    /// separately and require a successful retained-pool anchor. Filesystem
+    /// deltas alone can be deflated by concurrent cleanup even when this daemon
+    /// owns the worker's only job, so they remain incomplete lower bounds.
     fn learn_footprint(
         &self,
         state: &ActiveBuildState,
         exit_code: i32,
         disk_peak_output_bytes: Option<u64>,
+        disk_observation: Option<rch_common::BuildDiskObservation>,
+        cancelled: bool,
     ) {
-        // A cancelled build stopped early; its growth says little.
-        if state.location != BuildLocation::Remote || exit_code == 130 {
+        if state.location != BuildLocation::Remote {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        let mut book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        if let Some(endpoint) = state.worker_endpoint.as_ref() {
+            let key = warm_footprint_key(
+                &state.project_id,
+                &state.command,
+                &WorkerEndpointIdentity::from_config(&endpoint.config),
+            );
+            let observation = disk_observation.filter(|observation| {
+                !cancelled
+                    && exit_code != 130
+                    && !endpoint.source_was_retargeted()
+                    && disk_peak_output_bytes.is_some_and(|peak| observation.valid_for_peak(peak))
+            });
+            if let Some(observation) = observation {
+                book.record_pool(&key, &observation, now, exit_code == 0);
+                changed = true;
+            } else {
+                changed |= book.invalidate_pools(&key);
+            }
+        }
+        // Cancelled output cannot establish a complete cold or warm build.
+        // Its former warm anchor was invalidated before this early return.
+        if cancelled || exit_code == 130 {
+            if changed {
+                self.persist_footprints(&mut book, now);
+            }
             return;
         }
         let measured_output = disk_peak_output_bytes
             .filter(|bytes| *bytes > 0)
             .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0));
         let growth = match measured_output {
-            Some(output) => output,
-            None if !state.disk_shared => {
-                let (Some(start), Some(min)) = (state.disk_free_start_gib, state.disk_free_min_gib)
-                else {
-                    return;
-                };
-                start.saturating_sub(min) as f64
-            }
-            None => return,
+            Some(output) => Some(output),
+            None if !state.disk_shared => state
+                .disk_free_start_gib
+                .zip(state.disk_free_min_gib)
+                .map(|(start, min)| start.saturating_sub(min) as f64),
+            None => None,
         };
         let complete = exit_code == 0 && measured_output.is_some();
-        let now = Utc::now().timestamp();
-        let exact_key = footprint_key(&state.project_id, &state.command);
-        let family_key = family_footprint_key(&state.project_id, &state.command);
-        let mut book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
-        if !book.record(&exact_key, growth, now, complete) {
-            return;
+        if let Some(growth) = growth {
+            let exact_key = footprint_key(&state.project_id, &state.command);
+            let family_key = family_footprint_key(&state.project_id, &state.command);
+            changed |= book.record(&exact_key, growth, now, complete);
+            changed |= book.record(&family_key, growth, now, false);
+            debug!(
+                build_id = state.id,
+                project = %state.project_id,
+                worker = %state.worker_id,
+                growth_gib = growth,
+                complete,
+                "learned remote build cold disk footprint"
+            );
         }
-        book.record(&family_key, growth, now, false);
+        if changed {
+            self.persist_footprints(&mut book, now);
+        }
+    }
+
+    fn persist_footprints(&self, book: &mut FootprintBook, now: i64) {
         book.prune(now);
-        debug!(
-            build_id = state.id,
-            project = %state.project_id,
-            worker = %state.worker_id,
-            growth_gib = growth,
-            complete,
-            "learned remote build disk footprint"
-        );
         if let Some(path) = self.persistence_path.as_deref().map(footprint_path)
             && let Err(error) = book.persist(&path)
         {
@@ -1325,6 +1392,7 @@ impl BuildHistory {
                 duration_ms,
                 bytes_transferred,
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 timing,
                 cancellation: None,
             },
@@ -1350,6 +1418,7 @@ impl BuildHistory {
                 duration_ms: None,
                 bytes_transferred,
                 disk_peak_output_bytes: None,
+                disk_observation: None,
                 timing: None,
                 cancellation,
             },
@@ -2428,7 +2497,7 @@ impl BuildHistory {
                 source_topology_fences = snapshot.source_topology_fences;
                 queued = match (snapshot.version, snapshot.queued) {
                     (1, None) => VecDeque::new(),
-                    (2, Some(queue)) if snapshot.next_queue_id.is_some() => queue,
+                    (2 | 3, Some(queue)) if snapshot.next_queue_id.is_some() => queue,
                     _ => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -2461,6 +2530,23 @@ impl BuildHistory {
                 // contradictory evidence into an apparently valid snapshot.
                 let mut active_wrappers = HashSet::new();
                 for mut state in snapshot.active {
+                    if state.disk_warm_policy.is_some_and(|policy| {
+                        // Pre-warm daemons reject version 3. A conditional
+                        // allowance in an older format would lose its proof
+                        // on downgrade and become an unsafe cold allowance.
+                        snapshot.version < 3
+                            || state.location != BuildLocation::Remote
+                            || state.worker_endpoint.is_none()
+                            || !policy.valid_for_budget(
+                                u64::from(state.disk_headroom_gib)
+                                    * rch_common::BuildDiskBudget::GIB,
+                            )
+                    }) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid active warm disk policy",
+                        ));
+                    }
                     if let Some(topology) = &state.requested_source_topology {
                         topology.validate().map_err(|error| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
@@ -2949,6 +3035,7 @@ impl BuildHistory {
             duration_ms,
             bytes_transferred,
             disk_peak_output_bytes,
+            disk_observation,
             timing,
             cancellation,
         } = completion;
@@ -3084,6 +3171,8 @@ impl BuildHistory {
             &state,
             exit_code,
             disk_peak_output_bytes.filter(|_| record.cancellation.is_none()),
+            disk_observation,
+            record.cancellation.is_some(),
         );
         self.record(record.clone());
         Ok(Some((state, record)))
@@ -3159,7 +3248,9 @@ impl BuildHistory {
         let path = path.with_extension("ownership.json");
         let terminal = self.terminal.read().unwrap_or_else(|e| e.into_inner());
         let snapshot = DurableOwnership {
-            version: 2,
+            // Old loaders ignore unknown ActiveBuildState fields, so the
+            // version must fence them before a warm proof can be discarded.
+            version: 3,
             active: active
                 .values()
                 .filter(|state| completed.is_none_or(|receipt| receipt.record.id != state.id))
@@ -3678,6 +3769,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -3751,6 +3843,7 @@ mod tests {
                         duration_ms: Some(1),
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_observation: None,
                         timing: None,
                         cancellation: None,
                     },
@@ -3782,6 +3875,7 @@ mod tests {
                     duration_ms: Some(1),
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -3807,6 +3901,7 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: budget,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     worker,
                     free,
@@ -3890,6 +3985,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             timing: None,
             cancellation: None,
         }
@@ -3905,6 +4001,684 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+    }
+
+    async fn warm_test_endpoint() -> WorkerEndpointSnapshot {
+        crate::workers::WorkerState::new(rch_common::WorkerConfig {
+            id: WorkerId::new("issue132-worker"),
+            host: "issue132-host".into(),
+            user: "builder".into(),
+            identity_file: "test-key".into(),
+            total_slots: 16,
+            priority: 100,
+            tags: vec![],
+            tools: vec![],
+        })
+        .endpoint_snapshot()
+        .await
+    }
+
+    fn warm_test_request(project: &str, command: &str) -> rch_common::SelectionRequest {
+        serde_json::from_value(serde_json::json!({
+            "project": project,
+            "command": command,
+            "estimated_cores": 1,
+            "disk_observation_version": rch_common::BuildDiskObservation::VERSION,
+        }))
+        .unwrap()
+    }
+
+    fn warm_test_disk(
+        endpoint: &WorkerEndpointSnapshot,
+        budget: rch_common::BuildDiskBudget,
+        free_gib: f64,
+    ) -> DiskHeadroomAdmission {
+        DiskHeadroomAdmission {
+            requested_gib: u32::try_from(
+                budget
+                    .max_growth_bytes
+                    .div_ceil(rch_common::BuildDiskBudget::GIB),
+            )
+            .unwrap(),
+            floor_gib: budget
+                .min_free_bytes
+                .div_ceil(rch_common::BuildDiskBudget::GIB),
+            capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                endpoint.config.id.as_str(),
+                free_gib,
+                Duration::ZERO,
+            )),
+            warm_policy: budget.warm_policy,
+        }
+    }
+
+    fn warm_test_admit(
+        history: &BuildHistory,
+        endpoint: &WorkerEndpointSnapshot,
+        request: &rch_common::SelectionRequest,
+        budget: rch_common::BuildDiskBudget,
+        owner: &str,
+        free_gib: f64,
+    ) -> Option<ActiveBuildState> {
+        history
+            .try_start_active_build_with_waiter(
+                request.project.clone(),
+                endpoint.config.id.to_string(),
+                request.command.clone().unwrap(),
+                0,
+                Some(owner.to_owned()),
+                1,
+                BuildLocation::Remote,
+                None,
+                warm_test_disk(endpoint, budget, free_gib),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+    }
+
+    fn warm_test_observation(
+        identity: u8,
+        total_peak_gib: u64,
+    ) -> rch_common::BuildDiskObservation {
+        let added = 300 * 1024 * 1024;
+        // The incremental command briefly allocates 300 MiB and removes its
+        // temporary output, leaving the same retained pool at completion.
+        let pool = rch_common::BuildDiskPool {
+            identity: [identity; 32],
+            state: [42; 32],
+            retained_bytes: total_peak_gib * rch_common::BuildDiskBudget::GIB - added,
+        };
+        rch_common::BuildDiskObservation {
+            version: rch_common::BuildDiskObservation::VERSION,
+            baseline_output_bytes: pool.retained_bytes,
+            peak_added_output_bytes: added,
+            peak_free_drop_bytes: added,
+            baseline_pool: pool,
+            final_pool: pool,
+        }
+    }
+
+    fn warm_test_complete(
+        history: &BuildHistory,
+        state: &ActiveBuildState,
+        peak_gib: u64,
+        observation: Option<rch_common::BuildDiskObservation>,
+        exit_code: i32,
+    ) {
+        history
+            .complete_durable(
+                state.id,
+                &state.worker_id,
+                state.local_wrapper_id.as_deref(),
+                BuildCompletion {
+                    disk_peak_output_bytes: Some(peak_gib * rch_common::BuildDiskBudget::GIB),
+                    disk_observation: observation,
+                    ..disk_budget_completion(exit_code)
+                },
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue132_warm_pools_admit_three_concurrent_builds_and_preserve_cold_budget() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let history = Arc::new(BuildHistory::new(100));
+        let endpoint = warm_test_endpoint().await;
+        let mut config = rch_common::RchConfig::default();
+        config.selection.min_free_gb = Some(10.0);
+        let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+        let requests = [
+            warm_test_request("issue132-a", "cargo check -p a"),
+            warm_test_request("issue132-b", "cargo check -p b"),
+            warm_test_request("issue132-c", "cargo check -p c"),
+        ];
+        let total_peaks = [81, 84, 95];
+        let unguarded_fixture = rch_common::BuildDiskBudget {
+            max_growth_bytes: 0,
+            min_free_bytes: 0,
+            warm_policy: None,
+        };
+        // Seed receipts in the legacy format through actual owned completion.
+        for (index, request) in requests.iter().enumerate() {
+            let state = warm_test_admit(
+                &history,
+                &endpoint,
+                request,
+                unguarded_fixture,
+                &format!("legacy-{index}"),
+                220.0,
+            )
+            .unwrap();
+            warm_test_complete(&history, &state, total_peaks[index], None, 0);
+        }
+        let cold_budgets = requests.each_ref().map(|request| {
+            let budget = selector
+                .build_disk_budget_for_endpoint(request, &endpoint)
+                .unwrap();
+            assert_eq!(
+                budget.warm_policy, None,
+                "legacy totals cannot qualify a pool"
+            );
+            budget
+        });
+        assert_eq!(
+            cold_budgets.map(|budget| budget.max_growth_bytes / GIB),
+            [102, 105, 119]
+        );
+        let mut cold_states = Vec::new();
+        let mut cold_admitted = [false; 3];
+        for (index, request) in requests.iter().enumerate() {
+            if let Some(state) = warm_test_admit(
+                &history,
+                &endpoint,
+                request,
+                cold_budgets[index],
+                &format!("cold-{index}"),
+                220.0,
+            ) {
+                cold_admitted[index] = true;
+                cold_states.push(state);
+            }
+        }
+        assert_eq!(cold_admitted, [true, true, false]);
+        assert_eq!(history.reserved_disk_headroom_gib("issue132-worker"), 207);
+        assert_eq!(
+            history.check_disk_headroom(
+                "issue132-worker",
+                &warm_test_disk(&endpoint, cold_budgets[2], 220.0)
+            ),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 220,
+                required_gib: 336
+            }),
+        );
+        for state in &cold_states {
+            finish_owned(&history, state, 130);
+        }
+
+        // Two serial, cold-funded runs qualify each exact pool. The first
+        // establishes an anchor; only the matching second run teaches growth.
+        for (index, request) in requests.iter().enumerate() {
+            for receipt in 0..2 {
+                let before = selector
+                    .build_disk_budget_for_endpoint(request, &endpoint)
+                    .unwrap();
+                assert_eq!(before.warm_policy, None);
+                let state = warm_test_admit(
+                    &history,
+                    &endpoint,
+                    request,
+                    before,
+                    &format!("qualification-{index}-{receipt}"),
+                    220.0,
+                )
+                .unwrap();
+                warm_test_complete(
+                    &history,
+                    &state,
+                    total_peaks[index],
+                    Some(warm_test_observation(index as u8 + 1, total_peaks[index])),
+                    0,
+                );
+            }
+        }
+        let warm_budgets = requests.each_ref().map(|request| {
+            selector
+                .build_disk_budget_for_endpoint(request, &endpoint)
+                .unwrap()
+        });
+        assert_eq!(
+            warm_budgets.map(|budget| budget.max_growth_bytes / GIB),
+            [3, 3, 3]
+        );
+        for (index, request) in requests.iter().enumerate() {
+            let policy = warm_budgets[index].warm_policy.unwrap();
+            assert_eq!(
+                policy.cold_growth_bytes,
+                cold_budgets[index].max_growth_bytes
+            );
+            assert_eq!(
+                policy.pools[0],
+                Some(warm_test_observation(index as u8 + 1, total_peaks[index]).final_pool)
+            );
+            for version in [0, rch_common::BuildDiskObservation::VERSION + 1] {
+                let mut incompatible = request.clone();
+                incompatible.disk_observation_version = version;
+                assert_eq!(
+                    selector.build_disk_budget_for_endpoint(&incompatible, &endpoint),
+                    Some(cold_budgets[index])
+                );
+            }
+            let mut explicit_cold = request.clone();
+            explicit_cold.disk_headroom_gib = (cold_budgets[index].max_growth_bytes / GIB) as u32;
+            assert_eq!(
+                selector.build_disk_budget_for_endpoint(&explicit_cold, &endpoint),
+                Some(cold_budgets[index])
+            );
+            // A retry's earlier cold minimum may be below newer cold history.
+            // Suppressing the warm capability, not just declaring the old
+            // minimum, guarantees a fully funded unconditional retry.
+            explicit_cold.disk_headroom_gib -= 1;
+            assert!(
+                selector
+                    .build_disk_budget_for_endpoint(&explicit_cold, &endpoint)
+                    .unwrap()
+                    .warm_policy
+                    .is_some(),
+                "capable independent callers retain explicit-minimum semantics"
+            );
+            explicit_cold.disk_observation_version = 0;
+            assert_eq!(
+                selector.build_disk_budget_for_endpoint(&explicit_cold, &endpoint),
+                Some(cold_budgets[index]),
+                "a cold retry must remain unconditional after history increases"
+            );
+            let mut changed_endpoint = endpoint.clone();
+            changed_endpoint.config.host = "replacement-host".into();
+            assert_eq!(
+                selector.build_disk_budget_for_endpoint(request, &changed_endpoint),
+                Some(cold_budgets[index])
+            );
+        }
+
+        let mut warm_admitted = [false; 3];
+        for (index, request) in requests.iter().enumerate() {
+            let disk = warm_test_disk(&endpoint, warm_budgets[index], 220.0);
+            assert!(
+                history
+                    .check_disk_headroom("issue132-worker", &disk)
+                    .is_ok(),
+                "preview must agree with locked admission"
+            );
+            warm_admitted[index] = warm_test_admit(
+                &history,
+                &endpoint,
+                request,
+                warm_budgets[index],
+                &format!("warm-{index}"),
+                220.0,
+            )
+            .is_some();
+        }
+        assert_eq!(warm_admitted, [true, true, true]);
+        assert_eq!(history.reserved_disk_headroom_gib("issue132-worker"), 9);
+        assert_eq!(
+            history.check_disk_headroom(
+                "issue132-worker",
+                &warm_test_disk(&endpoint, warm_budgets[0], 21.0)
+            ),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 21,
+                required_gib: 22
+            }),
+            "warm evidence never bypasses real capacity pressure",
+        );
+        history.observe_build_disk("issue132-worker", 210, Instant::now());
+        assert_eq!(
+            history.reserved_disk_headroom_gib("issue132-worker"),
+            9,
+            "observed growth is never new admission credit"
+        );
+        eprintln!(
+            "issue132 deterministic regression replay; modeled free_gib=220 floor_gib=10 total_peak_gib={total_peaks:?}; cold_budget_gib={:?} cold_admitted={cold_admitted:?}; warm_budget_gib={:?} warm_admitted={warm_admitted:?}; modeled_added_bytes_per_build={}; no live-worker or 220-GiB allocation measurement",
+            cold_budgets.map(|budget| budget.max_growth_bytes / GIB),
+            warm_budgets.map(|budget| budget.max_growth_bytes / GIB),
+            300 * 1024 * 1024,
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_disk_reservation_preserves_its_condition_through_recovery_and_cancellation() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = Arc::new(BuildHistory::new(20).with_persistence(path.clone()));
+        let endpoint = warm_test_endpoint().await;
+        let request = warm_test_request("recovered-warm", "cargo check");
+        let config = rch_common::RchConfig::default();
+        let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+        for index in 0..2 {
+            let budget = selector
+                .build_disk_budget_for_endpoint(&request, &endpoint)
+                .unwrap();
+            assert!(budget.warm_policy.is_none());
+            let state = warm_test_admit(
+                &history,
+                &endpoint,
+                &request,
+                budget,
+                &format!("anchor-{index}"),
+                220.0,
+            )
+            .unwrap();
+            warm_test_complete(&history, &state, 81, Some(warm_test_observation(1, 81)), 0);
+        }
+        let warm = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        assert_eq!(warm.max_growth_bytes, 3 * rch_common::BuildDiskBudget::GIB);
+        let active =
+            warm_test_admit(&history, &endpoint, &request, warm, "recover-me", 14.0).unwrap();
+        assert_eq!(active.disk_warm_policy, warm.warm_policy);
+        drop(selector);
+        drop(history);
+
+        let ownership_path = path.with_extension("ownership.json");
+        let ownership = std::fs::read(&ownership_path).unwrap();
+
+        // Pre-warm ActiveBuildState deserialization ignores the new field.
+        // The outer format version must reject that reader before it can
+        // reinterpret the small reservation as an unconditional allowance.
+        #[derive(Deserialize)]
+        struct LegacyDiskOwner {
+            disk_headroom_gib: u32,
+        }
+        #[derive(Deserialize)]
+        struct LegacyOwnership {
+            version: u32,
+            active: Vec<LegacyDiskOwner>,
+            #[serde(default)]
+            next_queue_id: Option<u64>,
+            #[serde(default)]
+            queued: Option<VecDeque<serde_json::Value>>,
+        }
+        let legacy: LegacyOwnership = serde_json::from_slice(&ownership).unwrap();
+        assert_eq!(legacy.active[0].disk_headroom_gib, 3);
+        assert_eq!(legacy.version, 3);
+        let old_loader_accepts = match (legacy.version, legacy.queued) {
+            (1, None) => true,
+            (2, Some(_)) if legacy.next_queue_id.is_some() => true,
+            _ => false,
+        };
+        assert!(
+            !old_loader_accepts,
+            "downgrade must not discard the warm condition"
+        );
+
+        // Even the new loader must refuse an incorrectly down-versioned
+        // snapshot, retaining the original ownership evidence unchanged.
+        for version in [1, 2] {
+            let mut downgraded: serde_json::Value = serde_json::from_slice(&ownership).unwrap();
+            downgraded["version"] = serde_json::json!(version);
+            if version == 1 {
+                downgraded.as_object_mut().unwrap().remove("queued");
+                downgraded.as_object_mut().unwrap().remove("next_queue_id");
+            }
+            let bytes = serde_json::to_vec(&downgraded).unwrap();
+            std::fs::write(&ownership_path, &bytes).unwrap();
+            let error = match BuildHistory::load_from_file(&path, 20) {
+                Err(error) => error,
+                Ok(_) => panic!("warm ownership accepted in version {version}"),
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&ownership_path).unwrap(), bytes);
+        }
+
+        // Corrupted policy must not deserialize into an unconditional small
+        // recovered allowance. Restore the original snapshot after the check.
+        let mut malformed: serde_json::Value = serde_json::from_slice(&ownership).unwrap();
+        malformed["active"][0]["disk_warm_policy"]["cold_growth_bytes"] = serde_json::json!(0);
+        std::fs::write(&ownership_path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let error = match BuildHistory::load_from_file(&path, 20) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid conditional ownership was accepted"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        std::fs::write(&ownership_path, ownership).unwrap();
+
+        let restored = Arc::new(BuildHistory::load_from_file(&path, 20).unwrap());
+        let recovered = restored.active_build(active.id).unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(recovered.disk_warm_policy, warm.warm_policy);
+        assert_eq!(recovered.disk_headroom_gib, 3);
+        assert_eq!(restored.reserved_disk_headroom_gib("issue132-worker"), 3);
+        let mut no_floor = warm_test_disk(&endpoint, warm, 15.0);
+        no_floor.floor_gib = 0;
+        assert_eq!(
+            restored.check_disk_headroom("issue132-worker", &no_floor),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 15,
+                required_gib: 16
+            }),
+            "a new request cannot remove the recovered owner's reserve floor",
+        );
+        let before_completion = warm_test_disk(&endpoint, warm, 14.0);
+        assert!(
+            restored
+                .complete_durable(
+                    active.id,
+                    "issue132-worker",
+                    Some("forged"),
+                    disk_budget_completion(130)
+                )
+                .is_err()
+        );
+        assert_eq!(restored.reserved_disk_headroom_gib("issue132-worker"), 3);
+        finish_owned(&restored, &active, 130);
+        assert_eq!(restored.reserved_disk_headroom_gib("issue132-worker"), 0);
+        assert_eq!(
+            restored.check_disk_headroom("issue132-worker", &before_completion),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        let identity = WorkerEndpointIdentity::from_config(&endpoint.config);
+        assert_eq!(
+            restored.learned_warm_footprint(&request.project, "cargo check", &identity),
+            None
+        );
+        let selector = crate::daemon_worker_selector(&config, Arc::clone(&restored), None);
+        let cold = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        assert_eq!(cold.warm_policy, None);
+        assert_eq!(
+            cold.max_growth_bytes,
+            102 * rch_common::BuildDiskBudget::GIB
+        );
+        assert!(
+            warm_test_admit(&restored, &endpoint, &request, cold, "after-cancel", 14.0).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cold_ownership_upgrades_without_losing_reservations_or_queue() {
+        for version in [1, 2] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let history = BuildHistory::new(20).with_persistence(path.clone());
+            let endpoint = warm_test_endpoint().await;
+            let request = warm_test_request("legacy-cold", "cargo check");
+            let cold = rch_common::BuildDiskBudget {
+                max_growth_bytes: 102 * rch_common::BuildDiskBudget::GIB,
+                min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                warm_policy: None,
+            };
+            let active =
+                warm_test_admit(&history, &endpoint, &request, cold, "legacy-owner", 220.0)
+                    .unwrap();
+            let queued = (version == 2).then(|| {
+                history
+                    .enqueue_build(
+                        "queued-project".into(),
+                        "cargo check".into(),
+                        0,
+                        1,
+                        Some("queued-owner".into()),
+                    )
+                    .unwrap()
+            });
+            let ownership_path = path.with_extension("ownership.json");
+            let mut legacy: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ownership_path).unwrap()).unwrap();
+            legacy["version"] = serde_json::json!(version);
+            assert!(legacy["active"][0].get("disk_warm_policy").is_none());
+            if version == 1 {
+                legacy.as_object_mut().unwrap().remove("queued");
+                legacy.as_object_mut().unwrap().remove("next_queue_id");
+            }
+            std::fs::write(&ownership_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            drop(history);
+
+            let restored = BuildHistory::load_from_file(&path, 20).unwrap();
+            let recovered = restored.active_build(active.id).unwrap();
+            assert!(recovered.recovered);
+            assert_eq!(recovered.disk_headroom_gib, 102);
+            assert_eq!(recovered.disk_floor_gib, 10);
+            assert_eq!(recovered.disk_warm_policy, None);
+            assert_eq!(recovered.local_wrapper_id.as_deref(), Some("legacy-owner"));
+            assert_eq!(restored.reserved_disk_headroom_gib("issue132-worker"), 102);
+            if let Some(queued) = queued {
+                let recovered_waiter = restored.queued_build(queued.id).unwrap();
+                assert!(recovered_waiter.recovered);
+                assert_eq!(
+                    recovered_waiter.local_wrapper_id.as_deref(),
+                    Some("queued-owner")
+                );
+            } else {
+                assert_eq!(restored.queue_depth(), 0);
+            }
+            let rewritten: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ownership_path).unwrap()).unwrap();
+            assert_eq!(rewritten["version"], 3);
+            assert!(rewritten["active"][0].get("disk_warm_policy").is_none());
+            assert!(rewritten["queued"].is_array());
+            assert!(rewritten["next_queue_id"].as_u64().unwrap() >= QUEUE_ID_NAMESPACE);
+        }
+    }
+
+    #[tokio::test]
+    async fn attributed_warm_receipts_allow_overlap_but_failed_or_partial_jobs_remove_eligibility()
+    {
+        let history = Arc::new(BuildHistory::new(30));
+        let endpoint = warm_test_endpoint().await;
+        let requests = [
+            warm_test_request("overlap-a", "cargo check"),
+            warm_test_request("overlap-b", "cargo check"),
+        ];
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        let identity = WorkerEndpointIdentity::from_config(&endpoint.config);
+        for round in 0..2 {
+            let states: Vec<_> = requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    let budget = selector
+                        .build_disk_budget_for_endpoint(request, &endpoint)
+                        .unwrap();
+                    warm_test_admit(
+                        &history,
+                        &endpoint,
+                        request,
+                        budget,
+                        &format!("overlap-{round}-{index}"),
+                        220.0,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(
+                states
+                    .iter()
+                    .all(|state| history.active_build(state.id).unwrap().disk_shared)
+            );
+            // Aggregate probes cannot be attributed to either job. Complete
+            // per-build output observations still qualify their distinct pools.
+            history.observe_build_disk("issue132-worker", 100, Instant::now());
+            for (index, state) in states.iter().enumerate() {
+                let mut observation = warm_test_observation(index as u8 + 1, 81);
+                observation.peak_free_drop_bytes = if index == 0 {
+                    6 * rch_common::BuildDiskBudget::GIB
+                } else {
+                    0
+                };
+                warm_test_complete(&history, state, 81, Some(observation), 0);
+            }
+        }
+        assert_eq!(
+            history
+                .learned_warm_footprint("overlap-a", "cargo check", &identity)
+                .unwrap()
+                .0,
+            6.0
+        );
+        assert_eq!(
+            history
+                .learned_warm_footprint("overlap-b", "cargo check", &identity)
+                .unwrap()
+                .0,
+            1.0
+        );
+
+        let mut funded = requests[0].clone();
+        funded.disk_headroom_gib = 128;
+        let budget = selector
+            .build_disk_budget_for_endpoint(&funded, &endpoint)
+            .unwrap();
+        let failed =
+            warm_test_admit(&history, &endpoint, &funded, budget, "failed", 220.0).unwrap();
+        let mut observation = warm_test_observation(1, 81);
+        observation.peak_added_output_bytes = 20 * rch_common::BuildDiskBudget::GIB;
+        observation.peak_free_drop_bytes = 0;
+        warm_test_complete(&history, &failed, 101, Some(observation), 101);
+        assert_eq!(
+            history.learned_warm_footprint("overlap-a", "cargo check", &identity),
+            None
+        );
+        assert!(
+            selector
+                .build_disk_budget_for_endpoint(&requests[0], &endpoint)
+                .unwrap()
+                .warm_policy
+                .is_none()
+        );
+
+        let small = selector
+            .build_disk_budget_for_endpoint(&requests[1], &endpoint)
+            .unwrap();
+        let partial =
+            warm_test_admit(&history, &endpoint, &requests[1], small, "partial", 220.0).unwrap();
+        warm_test_complete(&history, &partial, 81, None, 0);
+        assert_eq!(
+            history.learned_warm_footprint("overlap-b", "cargo check", &identity),
+            None
+        );
+        for round in 0..2 {
+            let budget = selector
+                .build_disk_budget_for_endpoint(&requests[0], &endpoint)
+                .unwrap();
+            assert!(budget.warm_policy.is_none());
+            let recovered = warm_test_admit(
+                &history,
+                &endpoint,
+                &requests[0],
+                budget,
+                &format!("after-failure-{round}"),
+                220.0,
+            )
+            .unwrap();
+            warm_test_complete(
+                &history,
+                &recovered,
+                81,
+                Some(warm_test_observation(1, 81)),
+                0,
+            );
+        }
+        assert_eq!(
+            history
+                .learned_warm_footprint("overlap-a", "cargo check", &identity)
+                .unwrap()
+                .0,
+            20.0,
+            "later small successes cannot erase the failed job's larger observed allocation"
+        );
+        assert_eq!(
+            history.learned_footprint_gib("overlap-a", "cargo check"),
+            Some(101.0)
+        );
     }
 
     #[tokio::test]
@@ -4004,6 +4778,7 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: 0,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     "w",
                     200.0,
@@ -4158,6 +4933,7 @@ mod tests {
         let sample = || DiskHeadroomAdmission {
             requested_gib: 4,
             floor_gib: 13,
+            warm_policy: None,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "hz3",
                 33.0,
@@ -4227,6 +5003,7 @@ mod tests {
         let sample = || DiskHeadroomAdmission {
             requested_gib: 4,
             floor_gib: 10,
+            warm_policy: None,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "w",
                 40.0,
@@ -4252,6 +5029,7 @@ mod tests {
         let request = |worker, free| DiskHeadroomAdmission {
             requested_gib: 80,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 worker,
                 free,
@@ -4352,6 +5130,7 @@ mod tests {
             let sample = DiskHeadroomAdmission {
                 requested_gib: 80,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                     "worker",
                     100.0,
@@ -4410,6 +5189,7 @@ mod tests {
         let sample = DiskHeadroomAdmission {
             requested_gib: 1,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -4432,6 +5212,7 @@ mod tests {
                 &DiskHeadroomAdmission {
                     requested_gib: 20,
                     floor_gib: 0,
+                    warm_policy: None,
                     capacity: None
                 }
             ),
@@ -4446,6 +5227,7 @@ mod tests {
         let sample = DiskHeadroomAdmission {
             requested_gib: 80,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                 "worker",
                 100.0,
@@ -4531,6 +5313,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             timing: None,
             cancellation: None,
         };
@@ -4575,6 +5358,7 @@ mod tests {
                 DiskHeadroomAdmission {
                     requested_gib: 64,
                     floor_gib: 0,
+                    warm_policy: None,
                     capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                         "worker",
                         100.0,
@@ -6075,6 +6859,7 @@ mod tests {
             duration_ms: Some(10),
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_observation: None,
             timing: None,
             cancellation: None,
         };
@@ -6165,6 +6950,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -6229,6 +7015,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -6780,6 +7567,7 @@ mod tests {
                     duration_ms: Some(17),
                     bytes_transferred: Some(23),
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -6840,6 +7628,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_observation: None,
                         timing: None,
                         cancellation: None,
                     }
@@ -7757,6 +8546,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },

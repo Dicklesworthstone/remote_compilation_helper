@@ -1113,6 +1113,9 @@ pub(crate) struct RemoteBuildDiskBudgetExceeded {
     pub started: bool,
     #[serde(default)]
     pub peak_output_bytes: Option<u64>,
+    /// A verified prelaunch pool mismatch needs a new daemon reservation.
+    #[serde(default)]
+    pub required_growth_bytes: Option<u64>,
     #[serde(default)]
     pub detail: String,
     #[serde(skip)]
@@ -1129,6 +1132,10 @@ struct RemoteBuildDiskUsage {
     peak_growth_bytes: u64,
     complete: bool,
     exit_code: Option<i32>,
+    #[serde(default)]
+    incremental: Option<rch_common::BuildDiskObservation>,
+    #[serde(default)]
+    admitted_pool: Option<rch_common::BuildDiskPool>,
 }
 
 pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
@@ -3438,6 +3445,69 @@ impl TransferPipeline {
         )
     }
 
+    /// Fund and guard source writes before the compiler's warm-pool check.
+    /// Only ordinary uploads use this wrapper; verifiers and retrieval retain
+    /// their existing read-only receiver. The upload has no target-pool credit
+    /// and cannot publish a receipt that acknowledges compiler completion.
+    fn source_upload_rsync_path(
+        &self,
+        escaped_remote_path: &str,
+        upload_prefix: Option<&str>,
+    ) -> String {
+        let warm_budget = self
+            .disk_budget
+            .filter(|budget| budget.warm_policy.is_some());
+        let receiver = match warm_budget {
+            Some(budget) => {
+                let source = self.remote_path();
+                let plan = serde_json::json!({
+                    "probe": [&source], "output": [&source],
+                    "receipt": null, "warm_policy": null,
+                    "require_incremental_tracking": true,
+                });
+                // The monitor and rsync inherit the original binary input
+                // stream. Server arguments are appended by rsync after this
+                // fragment and forwarded unchanged through the activity fence.
+                format!(
+                    "python3 -I -S -c {} {} {} {} {} {} standalone rsync",
+                    escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT)),
+                    budget.max_growth_bytes,
+                    budget.min_free_bytes,
+                    escape(Cow::Owned(format!(
+                        "{}_SOURCE_UPLOAD_DISK_BUDGET:",
+                        self.deadline_marker
+                    ))),
+                    escape(Cow::Borrowed(source.as_str())),
+                    escape(Cow::Owned(plan.to_string())),
+                )
+            }
+            None => "rsync".to_owned(),
+        };
+        let receiver = format!(
+            "{}mkdir -p {} && {receiver}",
+            self.source_sync_prune_prefix(escaped_remote_path),
+            escaped_remote_path,
+        );
+        let rsync_path = match upload_prefix {
+            Some(prefix) => self.source_rsync_path_at_with_prefix(
+                format!(
+                    "{} || exit 73; {receiver}",
+                    live_checkout_sync_guard(&self.remote_path())
+                ),
+                &self.remote_path(),
+                Some(prefix),
+            ),
+            None => self.source_rsync_path(receiver),
+        };
+        // --rsync-path itself is a single local exec argument. Leave room
+        // below Linux's per-argument limit even after nested shell quoting;
+        // an oversized wrapper must refuse before any remote source writes.
+        if warm_budget.is_some() && rsync_path.len() > 120 * 1024 {
+            return "sh -c 'printf \"%s\\n\" \"RCH: guarded source upload command exceeds safe argument bound\" >&2; exit 120' rch-source-upload".to_owned();
+        }
+        rsync_path
+    }
+
     /// rsync appends its server argv to this shell fragment. Forward those
     /// arguments inside the lease, after any destination setup has completed.
     fn source_rsync_path(&self, command: String) -> String {
@@ -5589,6 +5659,7 @@ impl TransferPipeline {
             "probe": probes, "output": outputs,
             "receipt": self.remote_disk_receipt_path(), "receipt_initialized": true,
             "timeout_seconds": timeout_seconds,
+            "warm_policy": budget.warm_policy,
         });
         let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
@@ -5666,13 +5737,32 @@ exit \"$__rch_disk_status\"; }}"
         if failure.max_growth_bytes != budget.max_growth_bytes
             || failure.min_free_bytes != budget.min_free_bytes
             || (!failure.started && failure.growth_bytes != 0)
-            || failure
-                .peak_output_bytes
-                .is_some_and(|peak| peak < failure.growth_bytes)
+            || failure.peak_output_bytes.is_some_and(|peak| {
+                let bound = if budget.warm_policy.is_some() {
+                    peak.saturating_mul(2)
+                } else {
+                    peak
+                };
+                failure.growth_bytes > bound
+            })
             || !matches!(
                 failure.reason.as_str(),
-                "admission" | "growth" | "free_floor" | "monitor_unavailable" | "interrupted"
+                "admission"
+                    | "growth"
+                    | "free_floor"
+                    | "monitor_unavailable"
+                    | "interrupted"
+                    | "cold_required"
             )
+            || if failure.reason == "cold_required" {
+                failure.started
+                    || !budget.warm_policy.is_some_and(|policy| {
+                        policy.valid_for_budget(budget.max_growth_bytes)
+                            && failure.required_growth_bytes == Some(policy.cold_growth_bytes)
+                    })
+            } else {
+                failure.required_growth_bytes.is_some()
+            }
         {
             return None;
         }
@@ -5699,14 +5789,40 @@ exit \"$__rch_disk_status\"; }}"
             && usage
                 .exit_code
                 .is_some_and(|code| (0..=255).contains(&code))
-            && usage.peak_growth_bytes <= usage.peak_output_bytes
-            && usage.peak_growth_bytes <= usage.max_growth_bytes)
+            // A warm charge includes unproven baseline roots as well as new
+            // allocations. Rewriting one such inode can charge it twice;
+            // neither component can exceed the observed total-output peak.
+            && usage.peak_growth_bytes <= if budget.warm_policy.is_some() {
+                usage.peak_output_bytes.saturating_mul(2)
+            } else {
+                usage.peak_output_bytes
+            }
+            && usage.peak_growth_bytes <= usage.max_growth_bytes
+            && usage.incremental.is_none_or(|observation| {
+                observation.valid_for_peak(usage.peak_output_bytes)
+            })
+            && budget.warm_policy.is_none_or(|policy| {
+                policy.valid_for_budget(budget.max_growth_bytes)
+                    && usage.admitted_pool.is_some_and(|admitted| {
+                        admitted.retained_bytes <= usage.peak_output_bytes
+                            && policy.pools.iter().flatten().any(|pool| *pool == admitted)
+                            && usage.incremental.is_none_or(|observation| observation.baseline_pool == admitted)
+                    })
+            }))
             .then_some(usage)
     }
 
     pub(crate) fn parse_disk_usage_marker(&self, line: &str) -> Option<u64> {
         self.parse_complete_disk_usage(line)
             .map(|usage| usage.peak_output_bytes)
+    }
+
+    pub(crate) fn parse_disk_observation_marker(
+        &self,
+        line: &str,
+    ) -> Option<rch_common::BuildDiskObservation> {
+        self.parse_complete_disk_usage(line)
+            .and_then(|usage| usage.incremental)
     }
 
     pub(crate) fn parse_disk_usage_exit_code(&self, line: &str) -> Option<i32> {
@@ -6378,11 +6494,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // shell invocation includes the configured sweeps only without a
         // durable source grant (bd-wfumv); granted transfers sweep only their
         // TMPDIR under guards, and owned materializations sweep nothing.
-        cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
-            "{}mkdir -p {} && rsync",
-            self.source_sync_prune_prefix(escaped_remote_path),
-            escaped_remote_path
-        )));
+        cmd.arg("--rsync-path")
+            .arg(self.source_upload_rsync_path(escaped_remote_path, None));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -6461,23 +6574,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // same remote shell invocation includes the configured sweeps only
         // without a durable source grant (bd-wfumv); granted transfers sweep
         // only their TMPDIR under guards, owned materializations nothing.
-        let receiver = format!(
-            "{}mkdir -p {} && rsync",
-            self.source_sync_prune_prefix(escaped_remote_path),
-            escaped_remote_path
-        );
-        let rsync_path = match upload_prefix {
-            Some(prefix) => self.source_rsync_path_at_with_prefix(
-                format!(
-                    "{} || exit 73; {receiver}",
-                    live_checkout_sync_guard(&self.remote_path())
-                ),
-                &self.remote_path(),
-                Some(prefix),
-            ),
-            None => self.source_rsync_path(receiver),
-        };
-        cmd.arg("--rsync-path").arg(rsync_path);
+        cmd.arg("--rsync-path")
+            .arg(self.source_upload_rsync_path(escaped_remote_path, upload_prefix));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -11862,6 +11960,7 @@ sys.stdout.buffer.write(b'complete')
                 pipeline = pipeline.with_disk_budget(Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 8 << 20,
                     min_free_bytes,
+                    warm_policy: None,
                 }));
             }
             let command =
@@ -13621,6 +13720,7 @@ Number of files transferred: 42
         .with_disk_budget(Some(rch_common::BuildDiskBudget {
             max_growth_bytes: 8 << 20,
             min_free_bytes: 1 << 20,
+            warm_policy: None,
         }))
         .with_compilation_config(rch_common::CompilationConfig {
             build_timeout_sec: seconds,
@@ -13728,6 +13828,232 @@ Number of files transferred: 42
         );
     }
 
+    #[test]
+    fn conditional_disk_receipts_bind_pool_proof_and_cold_readmission() {
+        use rch_common::{
+            BuildDiskBudget, BuildDiskObservation, BuildDiskPool, BuildDiskWarmPolicy,
+        };
+
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 << 30,
+        };
+        let policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 103 << 30,
+            pools: [Some(pool), None, None, None, None, None, None, None],
+        };
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/warm-disk-marker"), Some(1), 20)
+            .with_disk_budget(Some(BuildDiskBudget {
+                max_growth_bytes: 3 << 30,
+                min_free_bytes: 10 << 30,
+                warm_policy: Some(policy),
+            }));
+        let observation = BuildDiskObservation {
+            version: BuildDiskObservation::VERSION,
+            baseline_output_bytes: 81 << 30,
+            peak_added_output_bytes: 1 << 28,
+            peak_free_drop_bytes: 1 << 29,
+            baseline_pool: pool,
+            final_pool: BuildDiskPool {
+                state: [3; 32],
+                ..pool
+            },
+        };
+        let usage = serde_json::json!({
+            "max_growth_bytes": 3_u64 << 30, "min_free_bytes": 10_u64 << 30,
+            "peak_output_bytes": 82_u64 << 30, "peak_growth_bytes": 1 << 28,
+            "complete": true, "exit_code": 0,
+            "admitted_pool": pool, "incremental": observation,
+        });
+        let usage_line = |value: &serde_json::Value| {
+            format!("{}_DISK_USAGE:{value}\n", pipeline.deadline_marker)
+        };
+        assert_eq!(
+            pipeline.parse_disk_observation_marker(&usage_line(&usage)),
+            Some(observation)
+        );
+        for field in ["admitted_pool", "incremental"] {
+            let mut corrupt = usage.clone();
+            if field == "admitted_pool" {
+                corrupt[field]["state"] = serde_json::to_value([9_u8; 32]).unwrap();
+            } else {
+                corrupt[field]["baseline_pool"]["state"] =
+                    serde_json::to_value([9_u8; 32]).unwrap();
+            }
+            assert!(
+                pipeline
+                    .parse_disk_usage_marker(&usage_line(&corrupt))
+                    .is_none()
+            );
+        }
+        // Completion is independent of optional learning. A later oversized
+        // scan cannot erase an already validated admission or authorize replay.
+        let mut no_learning = usage.clone();
+        no_learning["incremental"] = serde_json::Value::Null;
+        assert_eq!(
+            pipeline.parse_disk_usage_exit_code(&usage_line(&no_learning)),
+            Some(0)
+        );
+        let mut impossible_peak = no_learning.clone();
+        impossible_peak["peak_output_bytes"] = serde_json::json!(1_u64 << 30);
+        assert!(
+            pipeline
+                .parse_disk_usage_exit_code(&usage_line(&impossible_peak))
+                .is_none()
+        );
+        no_learning["admitted_pool"] = serde_json::Value::Null;
+        assert!(
+            pipeline
+                .parse_disk_usage_exit_code(&usage_line(&no_learning))
+                .is_none()
+        );
+
+        let refusal = serde_json::json!({
+            "reason": "cold_required", "free_bytes": 220_u64 << 30,
+            "growth_bytes": 0, "max_growth_bytes": 3_u64 << 30,
+            "min_free_bytes": 10_u64 << 30, "started": false,
+            "detail": "pool changed", "peak_output_bytes": 82_u64 << 30,
+            "required_growth_bytes": 103_u64 << 30,
+        });
+        let refusal_line = |value: &serde_json::Value| {
+            format!("{}_DISK_BUDGET:{value}\n", pipeline.deadline_marker)
+        };
+        let parsed = pipeline
+            .parse_disk_budget_marker(&refusal_line(&refusal))
+            .unwrap();
+        assert!(!parsed.started);
+        assert_eq!(parsed.required_growth_bytes, Some(103 << 30));
+        for (field, value) in [
+            ("started", serde_json::json!(true)),
+            ("growth_bytes", serde_json::json!(1)),
+            ("required_growth_bytes", serde_json::json!(4_u64 << 30)),
+            ("reason", serde_json::json!("admission")),
+        ] {
+            let mut corrupt = refusal.clone();
+            corrupt[field] = value;
+            assert!(
+                pipeline
+                    .parse_disk_budget_marker(&refusal_line(&corrupt))
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_real_shell_reuses_exact_pool_and_refuses_changed_pool_before_launch() {
+        use rch_common::{BuildDiskBudget, BuildDiskWarmPolicy};
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap().keep();
+        let pool = directory.join("retained-target");
+        std::fs::create_dir(&pool).unwrap();
+        let artifact = pool.join("retained-artifact");
+        std::fs::write(&artifact, vec![1_u8; 16 << 20]).unwrap();
+        let make_pipeline = |id, warm_policy| {
+            disk_budget_test_pipeline(&directory, Some(id), 15)
+                .with_remote_cargo_target_dir_override(pool.to_str().unwrap())
+                .with_disk_budget(Some(BuildDiskBudget {
+                    max_growth_bytes: 8 << 20,
+                    min_free_bytes: 1 << 20,
+                    warm_policy,
+                }))
+        };
+        let initial = make_pipeline(701, None);
+        let output = run_external_timeout_fixture(
+            &directory,
+            &initial.build_remote_command("printf observed", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        initial.ensure_remote_disk_budget(&result).unwrap();
+        let observation = result
+            .stderr
+            .split_inclusive('\n')
+            .find_map(|line| initial.parse_disk_observation_marker(line))
+            .expect("stable retained target must produce bounded incremental evidence");
+        assert!(observation.final_pool.retained_bytes >= 16 << 20);
+        assert!(observation.peak_added_output_bytes < 8 << 20);
+        let policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 64 << 20,
+            pools: [
+                Some(observation.final_pool),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        };
+        let warm = make_pipeline(702, Some(policy));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &warm.build_remote_command("printf warm-ok", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        warm.ensure_remote_disk_budget(&result).unwrap();
+        assert_eq!(result.stdout, "warm-ok");
+        assert_eq!(std::fs::metadata(&artifact).unwrap().len(), 16 << 20);
+
+        // Same path and byte count are insufficient: changing a retained inode
+        // invalidates its credit, even without replacing the pool directory.
+        std::fs::write(&artifact, vec![2_u8; 16 << 20]).unwrap();
+        let changed = make_pipeline(703, Some(policy));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &changed.build_remote_command("printf started > must-not-start", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        let error = changed.ensure_remote_disk_budget(&result).unwrap_err();
+        let refusal = error
+            .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert_eq!(refusal.reason, "cold_required", "{result:?}");
+        assert!(!refusal.started);
+        assert_eq!(refusal.required_growth_bytes, Some(64 << 20));
+        assert!(!directory.join("must-not-start").exists());
+
+        // A separate cold reservation and a fresh attempt can now execute.
+        let cold = make_pipeline(704, None).with_disk_budget(Some(BuildDiskBudget {
+            max_growth_bytes: 64 << 20,
+            min_free_bytes: 1 << 20,
+            warm_policy: None,
+        }));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &cold.build_remote_command("printf cold-ok", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        cold.ensure_remote_disk_budget(&result).unwrap();
+        assert_eq!(result.stdout, "cold-ok");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disk_budget_real_shell_preserves_small_build_status_and_deadlines() {
@@ -13808,6 +14134,7 @@ Number of files transferred: 42
             rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 20,
+                warm_policy: None,
             },
         ));
         let output = run_external_timeout_fixture(
@@ -13857,6 +14184,7 @@ Number of files transferred: 42
             .with_disk_budget(Some(rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 20,
+                warm_policy: None,
             }));
         let output = run_external_timeout_fixture(
             &source,
@@ -13903,6 +14231,7 @@ Number of files transferred: 42
                 Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 1 << 20,
                     min_free_bytes: 1 << 62,
+                    warm_policy: None,
                 }),
             );
             let command = pipeline.build_remote_command("printf started > workload-started", None);
@@ -15011,6 +15340,276 @@ Number of files transferred: 42
         assert!(
             !denied.exists(),
             "a rejected lease must precede destination setup"
+        );
+    }
+
+    #[cfg(unix)]
+    fn warm_source_upload_test_budget() -> rch_common::BuildDiskBudget {
+        rch_common::BuildDiskBudget {
+            max_growth_bytes: 3 << 30,
+            min_free_bytes: 10 << 30,
+            warm_policy: Some(rch_common::BuildDiskWarmPolicy {
+                cold_growth_bytes: 103 << 30,
+                pools: [
+                    Some(rch_common::BuildDiskPool {
+                        identity: [1; 32],
+                        state: [2; 32],
+                        retained_bytes: 80 << 30,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_upload_guard_is_bounded_with_real_authority_and_excludes_readers() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        // A wildcard exercises the additional literal-path shell wrapper.
+        let pipeline = flavour_test_pipeline(
+            RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            0,
+        )
+        .with_remote_path_override("/data/rch/source [literal] ' space")
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_disk_budget(Some(warm_source_upload_test_budget()));
+        let remote = pipeline.remote_path();
+        let escaped = escape(Cow::from(remote.as_str()));
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let upload_prefix =
+            crate::hook::ssh::source_authority_upload_prefix("ab12", &remote).unwrap();
+        for command in [
+            pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command_with_upload_prefix(
+                &worker,
+                &destination,
+                &escaped,
+                &[],
+                Some(&upload_prefix),
+            ),
+        ] {
+            let args = command_args(&command);
+            assert!(args.iter().all(|argument| argument.len() < 120 * 1024));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(receiver.contains("_SOURCE_UPLOAD_DISK_BUDGET:"));
+            assert!(receiver.contains(" standalone rsync"));
+            assert!(!receiver.contains("command exceeds safe argument bound"));
+        }
+
+        for command in [
+            pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &[],
+                SourceContentBarrier::Ordinary,
+            ),
+            pipeline.build_retrieve_command(&worker, &remote, &["target/**".into()]),
+            pipeline.build_retrieve_streaming_command(&worker, &remote, &["target/**".into()]),
+        ] {
+            assert!(
+                !command_args(&command)
+                    .iter()
+                    .any(|argument| argument.contains("_SOURCE_UPLOAD_DISK_BUDGET:"))
+            );
+        }
+        let cold = pipeline
+            .clone()
+            .with_disk_budget(Some(rch_common::BuildDiskBudget {
+                warm_policy: None,
+                ..warm_source_upload_test_budget()
+            }));
+        assert!(
+            !cold
+                .source_upload_rsync_path(&escaped, None)
+                .contains("_SOURCE_UPLOAD_DISK_BUDGET:")
+        );
+
+        // Future script growth or unusually large authority data fails before
+        // local exec, rather than crossing the operating-system argv limit.
+        let mut oversized = pipeline;
+        oversized.source_authority_prefix =
+            Some(format!("env RCH_TEST_OVERSIZED={}", "x".repeat(120 * 1024)));
+        let refused = oversized.source_upload_rsync_path(&escaped, None);
+        assert!(refused.len() < 1024);
+        assert!(refused.contains("command exceeds safe argument bound"));
+        assert!(!refused.contains("mkdir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_upload_guard_preserves_binary_stream_argv_and_source_fencing() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let _host = LiveCheckoutHostMarker::declared_in(&retained);
+        let bin = retained.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // This is a command-construction test, not a process-ownership proof.
+        // Capture the exact embedded supervisor and plan, then relay the
+        // command so a real shell can check rsync's binary protocol stream.
+        let capture = bin.join("python3");
+        std::fs::write(
+            &capture,
+            "#!/bin/sh\nset -eu\n\
+            [ \"$RCH_ACTIVITY_TEST\" = \"$RCH_TEST_EXPECTED_ACTIVITY\" ]\n\
+            printf '%s\\0' \"$@\" > \"$RCH_TEST_UPLOAD_ARGV\"\n\
+            shift 10\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let receiver = bin.join("rsync");
+        std::fs::write(
+            &receiver,
+            "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$@\" > \"$RCH_TEST_SERVER_ARGV\"\nexec cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let payload = b"\0rsync-binary-input\xff\n' $literal\0";
+        let worker = flavour_test_worker();
+        for mode in 0..3 {
+            let remote = retained.join(format!("source-{mode} [literal] ' space"));
+            let remote = remote.to_str().unwrap();
+            let mut pipeline = flavour_test_pipeline(
+                RsyncFlavor::Rsync {
+                    major: 3,
+                    minor: 2,
+                    patch: 7,
+                },
+                0,
+            )
+            .with_remote_path_override(remote)
+            .with_disk_budget(Some(warm_source_upload_test_budget()));
+            pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+            let escaped = escape(Cow::from(remote));
+            let destination = pipeline.rsync_remote_spec(&worker, remote);
+            let command = match mode {
+                0 => pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+                1 => pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+                _ => pipeline.build_sync_streaming_command_with_upload_prefix(
+                    &worker,
+                    &destination,
+                    &escaped,
+                    &[],
+                    Some("env RCH_ACTIVITY_TEST=shared"),
+                ),
+            };
+            let args = command_args(&command);
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            let server_args = [
+                "--server",
+                "-logDtpre.iLsfxCIvu",
+                "literal '$value; flag",
+                ".",
+                ".",
+            ];
+            let program = format!(
+                "{receiver} {}",
+                server_args
+                    .iter()
+                    .map(|argument| escape(Cow::from(*argument)).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(program.len() < 120 * 1024);
+            let captured = retained.join(format!("monitor-argv-{mode}"));
+            let forwarded = retained.join(format!("server-argv-{mode}"));
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", &program])
+                .env("PATH", &path)
+                .env(
+                    "RCH_TEST_EXPECTED_ACTIVITY",
+                    if mode == 2 { "shared" } else { "owned" },
+                )
+                .env("RCH_TEST_UPLOAD_ARGV", &captured)
+                .env("RCH_TEST_SERVER_ARGV", &forwarded)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, payload);
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let captured = std::fs::read(captured).unwrap();
+            let captured = captured
+                .strip_suffix(&[0])
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &captured[..3],
+                [b"-I".as_slice(), b"-S".as_slice(), b"-c".as_slice()]
+            );
+            assert_eq!(
+                captured[3],
+                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT.as_bytes()
+            );
+            assert_eq!(captured[4], (3_u64 << 30).to_string().as_bytes());
+            assert_eq!(captured[5], (10_u64 << 30).to_string().as_bytes());
+            assert_eq!(
+                captured[6],
+                format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", pipeline.deadline_marker).as_bytes()
+            );
+            assert_eq!(captured[7], remote.as_bytes());
+            let plan: serde_json::Value = serde_json::from_slice(captured[8]).unwrap();
+            assert_eq!(
+                plan,
+                serde_json::json!({"probe": [remote], "output": [remote], "receipt": null, "warm_policy": null, "require_incremental_tracking": true})
+            );
+            assert_eq!(captured[9], b"standalone");
+            assert_eq!(captured[10], b"rsync");
+            let mut expected = server_args.to_vec();
+            *expected.last_mut().unwrap() = remote;
+            let expected = expected
+                .iter()
+                .flat_map(|argument| argument.bytes().chain(std::iter::once(0)))
+                .collect::<Vec<_>>();
+            assert_eq!(std::fs::read(forwarded).unwrap(), expected);
+        }
+
+        let denied = retained.join("denied-source");
+        let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_remote_path_override(denied.to_str().unwrap())
+            .with_disk_budget(Some(warm_source_upload_test_budget()));
+        pipeline.source_authority_prefix = Some("false".into());
+        let program = pipeline.source_upload_rsync_path(&escape(denied.to_string_lossy()), None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &program])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            !denied.exists(),
+            "source authority must precede setup and receiver"
         );
     }
 

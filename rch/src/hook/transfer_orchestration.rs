@@ -907,17 +907,63 @@ fn admitted_execution_disk_budget(
             Some(BuildDiskBudget {
                 max_growth_bytes: u64::from(admitted_headroom_gib) * BuildDiskBudget::GIB,
                 min_free_bytes: 0,
+                warm_policy: None,
             })
         } else {
             BuildDiskBudget::cold_for_command(command)
         }
     });
     if let Some(budget) = budget.as_mut() {
+        anyhow::ensure!(
+            budget
+                .warm_policy
+                .is_none_or(|policy| policy.valid_for_budget(budget.max_growth_bytes)),
+            "invalid conditional execution disk budget"
+        );
         budget.min_free_bytes = budget
             .min_free_bytes
             .max((floor * BuildDiskBudget::GIB as f64).ceil() as u64);
     }
     Ok(budget)
+}
+
+/// This refusal precedes source preparation and any content receipt. Receipt
+/// mode may safely request cold admission here without emitting two proofs.
+#[derive(Debug, thiserror::Error)]
+#[error("source preparation requires a cold disk reservation")]
+pub(super) struct ColdDiskPreparationRequired;
+
+fn require_guarded_warm_source_mode(
+    worker_id: &WorkerId,
+    budget: Option<rch_common::BuildDiskBudget>,
+    guarded: bool,
+) -> anyhow::Result<()> {
+    if guarded {
+        return Ok(());
+    }
+    let Some(budget) = budget.filter(|budget| budget.warm_policy.is_some()) else {
+        return Ok(());
+    };
+    let policy = budget
+        .warm_policy
+        .expect("conditional budget checked above");
+    Err(
+        anyhow::Error::new(crate::transfer::RemoteBuildDiskBudgetExceeded {
+            worker_id: worker_id.to_string(),
+            roots: Vec::new(),
+            reason: "cold_required".to_owned(),
+            free_bytes: 0,
+            growth_bytes: 0,
+            max_growth_bytes: budget.max_growth_bytes,
+            min_free_bytes: budget.min_free_bytes,
+            started: false,
+            peak_output_bytes: None,
+            required_growth_bytes: Some(policy.cold_growth_bytes),
+            detail: "this source preparation mode requires a cold reservation before uploading"
+                .to_owned(),
+        })
+        .context(ColdDiskPreparationRequired),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1159,6 +1205,19 @@ async fn execute_remote_compilation_inner(
         }
         dependency_plan.sync_roots
     };
+    // Only ordinary single-root Cargo uploads currently carry the same disk
+    // supervisor as execution. Other materializers keep cold admission until
+    // their writes can be charged throughout preparation, not just afterward.
+    require_guarded_warm_source_mode(
+        &worker_config.id,
+        execution_disk_budget,
+        !worker_is_windows
+            && durable_lease.is_some()
+            && clean_overlay.is_none()
+            && !source_content_receipt
+            && exact_dependency_closure_sync
+            && raw_sync_roots.len() == 1,
+    )?;
     let project_id = project_id_from_path(&normalized_project_root);
     if clean_overlay.is_some() && kind.is_some_and(|kind| kind.command_base() == "cargo") {
         // Reject unsupported command grammar before claiming a persistent
@@ -1466,6 +1525,11 @@ async fn execute_remote_compilation_inner(
             };
         }
     }
+    require_guarded_warm_source_mode(
+        &worker_config.id,
+        execution_disk_budget,
+        sync_plan.len() == 1,
+    )?;
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
@@ -1841,6 +1905,7 @@ async fn execute_remote_compilation_inner(
         && !source_content_receipt
         && project_lane == 0
         && !topology_policy.is_off_root()
+        && execution_disk_budget.is_none_or(|budget| budget.warm_policy.is_none())
     {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
@@ -2629,6 +2694,7 @@ async fn execute_remote_compilation_inner(
     let deadline_triggered = Rc::new(Cell::new(false));
     let disk_failure = Rc::new(RefCell::new(None));
     let disk_peak_output_bytes = Rc::new(Cell::new(None::<u64>));
+    let disk_observation = Rc::new(Cell::new(None::<rch_common::BuildDiskObservation>));
     let disk_usage_exit_code = Rc::new(Cell::new(None::<i32>));
     let disk_usage_conflict = Rc::new(Cell::new(false));
 
@@ -2686,6 +2752,7 @@ async fn execute_remote_compilation_inner(
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
     let disk_failure_stderr = Rc::clone(&disk_failure);
     let disk_peak_output_stderr = Rc::clone(&disk_peak_output_bytes);
+    let disk_observation_stderr = Rc::clone(&disk_observation);
     let disk_usage_exit_stderr = Rc::clone(&disk_usage_exit_code);
     let disk_usage_conflict_stderr = Rc::clone(&disk_usage_conflict);
     let deadline_pipeline = pipeline.clone();
@@ -2763,11 +2830,19 @@ async fn execute_remote_compilation_inner(
             }
             if let Some(peak) = deadline_pipeline.parse_disk_usage_marker(line) {
                 let status = deadline_pipeline.parse_disk_usage_exit_code(line);
+                let observation = deadline_pipeline.parse_disk_observation_marker(line);
                 // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                 if disk_usage_exit_stderr.get().is_some() && disk_usage_exit_stderr.get() != status
                 {
                     disk_usage_conflict_stderr.set(true);
                 }
+                if disk_peak_output_stderr.get().is_some()
+                    && (disk_peak_output_stderr.get() != Some(peak)
+                        || disk_observation_stderr.get() != observation)
+                {
+                    disk_usage_conflict_stderr.set(true);
+                }
+                disk_observation_stderr.set(observation);
                 disk_usage_exit_stderr.set(status);
                 disk_peak_output_stderr
                     .set(Some(disk_peak_output_stderr.get().unwrap_or(0).max(peak)));
@@ -2840,11 +2915,19 @@ async fn execute_remote_compilation_inner(
                 }
                 if let Some(peak) = pipeline.parse_disk_usage_marker(line) {
                     let status = pipeline.parse_disk_usage_exit_code(line);
+                    let observation = pipeline.parse_disk_observation_marker(line);
                     // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                     if disk_usage_exit_code.get().is_some() && disk_usage_exit_code.get() != status
                     {
                         disk_usage_conflict.set(true);
                     }
+                    if disk_peak_output_bytes.get().is_some()
+                        && (disk_peak_output_bytes.get() != Some(peak)
+                            || disk_observation.get() != observation)
+                    {
+                        disk_usage_conflict.set(true);
+                    }
+                    disk_observation.set(observation);
                     disk_usage_exit_code.set(status);
                     disk_peak_output_bytes
                         .set(Some(disk_peak_output_bytes.get().unwrap_or(0).max(peak)));
@@ -3929,6 +4012,7 @@ async fn execute_remote_compilation_inner(
         result_dirs: exec_dir_stats,
         disk_roots,
         disk_peak_output_bytes: disk_peak_output_bytes.get(),
+        disk_observation: disk_observation.get(),
         cargo_stdout,
     })
 }
@@ -4017,6 +4101,7 @@ mod tests {
             Some(BuildDiskBudget {
                 max_growth_bytes: 80 * gib,
                 min_free_bytes: 30 * gib,
+                warm_policy: None,
             }),
             "cargo test --workspace",
             100,
@@ -4048,6 +4133,49 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn unguarded_source_modes_require_cold_admission_before_preparation() {
+        use rch_common::{BuildDiskBudget, BuildDiskPool, BuildDiskWarmPolicy, WorkerId};
+        let gib = BuildDiskBudget::GIB;
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 * gib,
+        };
+        let warm = BuildDiskBudget {
+            max_growth_bytes: 3 * gib,
+            min_free_bytes: 10 * gib,
+            warm_policy: Some(BuildDiskWarmPolicy {
+                cold_growth_bytes: 103 * gib,
+                pools: [Some(pool), None, None, None, None, None, None, None],
+            }),
+        };
+        let worker = WorkerId::new("source-mode-worker");
+        super::require_guarded_warm_source_mode(&worker, Some(warm), true).unwrap();
+        let error =
+            super::require_guarded_warm_source_mode(&worker, Some(warm), false).unwrap_err();
+        assert!(error.is::<super::ColdDiskPreparationRequired>());
+        let refusal = error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert!(!refusal.started);
+        assert_eq!(refusal.reason, "cold_required");
+        assert_eq!(refusal.worker_id, worker.as_str());
+        assert_eq!(refusal.required_growth_bytes, Some(103 * gib));
+        assert_eq!(refusal.max_growth_bytes, 3 * gib);
+        assert!(
+            refusal.peak_output_bytes.is_none(),
+            "no source or output scan occurred"
+        );
+        let cold = BuildDiskBudget {
+            max_growth_bytes: 103 * gib,
+            warm_policy: None,
+            ..warm
+        };
+        super::require_guarded_warm_source_mode(&worker, Some(cold), false).unwrap();
+        super::require_guarded_warm_source_mode(&worker, None, false).unwrap();
     }
 
     use super::clean_overlay_remote_project_hash;

@@ -8965,6 +8965,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             result_dirs: Vec::new(),
             disk_roots: vec!["/build-volume/target".into()],
             disk_peak_output_bytes: None,
+            disk_observation: None,
             cargo_stdout: None,
         });
         let faults = remote_release_faults(&result, &worker);
@@ -9015,6 +9016,7 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         result_dirs: Vec::new(),
         disk_roots: Vec::new(),
         disk_peak_output_bytes: None,
+        disk_observation: None,
         cargo_stdout: None,
     });
     assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
@@ -9051,6 +9053,7 @@ fn clean_overlay_disk_budget_diagnostic_survives_saturated_ui_and_unconfirmed_co
     let budget = rch_common::BuildDiskBudget {
         max_growth_bytes: 10 * rch_common::BuildDiskBudget::GIB,
         min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+        warm_policy: None,
     };
     let pipeline = TransferPipeline::new(
         PathBuf::from("/tmp/disk-diagnostic-capture"),
@@ -9172,6 +9175,7 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
                 max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
                 min_free_bytes: 13 * rch_common::BuildDiskBudget::GIB,
                 peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                required_growth_bytes: None,
                 detail: "guard stopped before ENOSPC".into(),
             };
             let error = anyhow::Error::new(failure.clone());
@@ -9214,6 +9218,94 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
             );
         }
     }
+}
+
+#[test]
+fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
+    let gib = rch_common::BuildDiskBudget::GIB;
+    let pool = rch_common::BuildDiskPool {
+        identity: [1; 32],
+        state: [2; 32],
+        retained_bytes: 80 * gib,
+    };
+    let worker = rch_common::SelectedWorker {
+        id: WorkerId::new("warm-worker"),
+        host: "worker.example".into(),
+        user: "builder".into(),
+        identity_file: "/test/key".into(),
+        slots_available: 8,
+        speed_score: 50.0,
+        declared_os: None,
+        project_lane: 0,
+        disk_budget: Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 3 * gib,
+            min_free_bytes: 10 * gib,
+            warm_policy: Some(rch_common::BuildDiskWarmPolicy {
+                cold_growth_bytes: 105 * gib,
+                pools: [Some(pool), None, None, None, None, None, None, None],
+            }),
+        }),
+    };
+    let refusal = crate::transfer::RemoteBuildDiskBudgetExceeded {
+        worker_id: worker.id.as_str().into(),
+        roots: vec!["/worker/pool".into()],
+        reason: "cold_required".into(),
+        started: false,
+        free_bytes: 220 * gib,
+        growth_bytes: 0,
+        max_growth_bytes: 3 * gib,
+        min_free_bytes: 10 * gib,
+        peak_output_bytes: Some(81 * gib),
+        required_growth_bytes: Some(105 * gib),
+        detail: "pool changed before launch".into(),
+    };
+    let error = anyhow::Error::new(refusal.clone());
+    assert_eq!(cold_disk_retry_gib(&error, &worker, true, false), Some(105));
+    assert_eq!(cold_disk_retry_gib(&error, &worker, false, false), None);
+    assert_eq!(cold_disk_retry_gib(&error, &worker, true, true), None);
+    let faults = remote_release_faults(&Err(anyhow::Error::new(refusal.clone())), &worker.id);
+    assert!(
+        !faults.worker_fault,
+        "a changed pool is not an unhealthy worker"
+    );
+    assert!(!faults.worker_disk_full);
+    for invalid in [
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            started: true,
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            worker_id: "other".into(),
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            growth_bytes: 1,
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            required_growth_bytes: Some(4 * gib),
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            reason: "free_floor".into(),
+            ..refusal.clone()
+        },
+    ] {
+        assert_eq!(
+            cold_disk_retry_gib(&anyhow::Error::new(invalid), &worker, true, false),
+            None
+        );
+    }
+    let unconfirmed =
+        anyhow::Error::new(refusal).context(crate::transfer::RemoteExecutionUnconfirmed);
+    assert_eq!(
+        cold_disk_retry_gib(&unconfirmed, &worker, true, false),
+        None
+    );
+    assert_eq!(
+        classify_remote_pipeline_failure(&unconfirmed),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
 }
 
 #[test]

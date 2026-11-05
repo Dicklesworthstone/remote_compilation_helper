@@ -96,6 +96,11 @@ impl PreviewRequest {
             command_priority: CommandPriority::Normal,
             estimated_cores: self.estimated_cores,
             disk_headroom_gib: self.disk_headroom_gib,
+            disk_observation_version: if self.disk_headroom_gib == 0 {
+                crate::BuildDiskObservation::VERSION
+            } else {
+                0
+            },
             preferred_workers: self.preferred_workers,
             toolchain: self.toolchain,
             required_runtime: self.required_runtime,

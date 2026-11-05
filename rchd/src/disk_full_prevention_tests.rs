@@ -83,6 +83,7 @@ mod tests {
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
             disk_headroom_gib: 0,
+            disk_observation_version: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),

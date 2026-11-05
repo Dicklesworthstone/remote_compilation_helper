@@ -729,6 +729,49 @@ impl WorkerSelector {
         Some(rch_common::BuildDiskBudget {
             max_growth_bytes: u64::from(growth_gib) * rch_common::BuildDiskBudget::GIB,
             min_free_bytes: floor_gib.saturating_mul(rch_common::BuildDiskBudget::GIB),
+            warm_policy: None,
+        })
+    }
+
+    /// A warm allowance is specific to this endpoint and remains conditional
+    /// on the worker's exact prelaunch pool scan. Legacy clients, unknown
+    /// endpoints, and explicit cold-funded retries retain the cold allowance.
+    pub(crate) fn build_disk_budget_for_endpoint(
+        &self,
+        request: &SelectionRequest,
+        endpoint: &WorkerEndpointSnapshot,
+    ) -> Option<rch_common::BuildDiskBudget> {
+        let cold = self.build_disk_budget(request)?;
+        if request.disk_observation_version != rch_common::BuildDiskObservation::VERSION
+            || endpoint.source_was_retargeted()
+            || u64::from(request.disk_headroom_gib) * rch_common::BuildDiskBudget::GIB
+                >= cold.max_growth_bytes
+        {
+            return Some(cold);
+        }
+        let Some((growth, pools)) = request.command.as_deref().and_then(|command| {
+            self.build_history.as_ref()?.learned_warm_footprint(
+                &request.project,
+                command,
+                &crate::workers::WorkerEndpointIdentity::from_config(&endpoint.config),
+            )
+        }) else {
+            return Some(cold);
+        };
+        let max_growth_bytes = u64::from(
+            rch_common::BuildDiskBudget::growth_budget_gib(growth).max(request.disk_headroom_gib),
+        ) * rch_common::BuildDiskBudget::GIB;
+        let policy = rch_common::BuildDiskWarmPolicy {
+            cold_growth_bytes: cold.max_growth_bytes,
+            pools,
+        };
+        if !policy.valid_for_budget(max_growth_bytes) {
+            return Some(cold);
+        }
+        Some(rch_common::BuildDiskBudget {
+            max_growth_bytes,
+            warm_policy: Some(policy),
+            ..cold
         })
     }
 
@@ -736,9 +779,10 @@ impl WorkerSelector {
         &self,
         worker: &WorkerState,
         worker_id: &str,
-        budget: Option<rch_common::BuildDiskBudget>,
+        request: &SelectionRequest,
     ) -> Option<DiskHeadroomRejection> {
-        let budget = budget?;
+        let endpoint = worker.endpoint_snapshot().await;
+        let budget = self.build_disk_budget_for_endpoint(request, &endpoint)?;
         let Some(history) = &self.build_history else {
             return Some(DiskHeadroomRejection::Unknown);
         };
@@ -756,6 +800,7 @@ impl WorkerSelector {
                         .min_free_bytes
                         .div_ceil(rch_common::BuildDiskBudget::GIB),
                     capacity: worker.disk_capacity_observation().await,
+                    warm_policy: budget.warm_policy,
                 },
             )
             .err()
@@ -1410,7 +1455,7 @@ impl WorkerSelector {
         }
 
         if self
-            .disk_headroom_failure(&worker, &fallback_id, self.build_disk_budget(request))
+            .disk_headroom_failure(&worker, &fallback_id, request)
             .await
             .is_some()
         {
@@ -1713,8 +1758,6 @@ impl WorkerSelector {
         let mut active_project_exclusion_count = 0usize;
 
         let required_os = required_os_for_request(request);
-        let disk_budget = self.build_disk_budget(request);
-
         for worker in all_workers {
             let config = worker.config.read().await;
             let worker_id = config.id.clone();
@@ -1732,7 +1775,7 @@ impl WorkerSelector {
                 capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)));
             let pressure = worker.pressure_assessment().await;
             let disk_headroom_failure = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
+                .disk_headroom_failure(&worker, worker_id.as_str(), request)
                 .await;
             let success_rate = self.health_score(&worker).await;
             let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
@@ -2329,7 +2372,6 @@ impl WorkerSelector {
         let mut any_has_runtime = false;
 
         let required_os = required_os_for_request(request);
-        let disk_budget = self.build_disk_budget(request);
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -2411,7 +2453,7 @@ impl WorkerSelector {
             // A build disk budget is a hard resource constraint, including
             // for undersized CPU candidates and every health fail-open list.
             if let Some(failure) = self
-                .disk_headroom_failure(&worker, worker_id.as_str(), disk_budget)
+                .disk_headroom_failure(&worker, worker_id.as_str(), request)
                 .await
             {
                 debug!("Worker {} excluded: {}", worker_id, failure);
@@ -4787,6 +4829,7 @@ mod tests {
             let worker = make_worker("test", 16, 80.0);
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
@@ -4825,6 +4868,7 @@ mod tests {
         }
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "disk-ranking".to_string(),
             command: None,
@@ -4888,6 +4932,7 @@ mod tests {
         }
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "disk-legacy".to_string(),
             command: None,
@@ -4944,6 +4989,7 @@ mod tests {
             let worker = make_worker("zero", 0, 80.0);
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
@@ -4985,6 +5031,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5012,6 +5059,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "metrics-fallback-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -5082,6 +5130,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5116,6 +5165,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5154,6 +5204,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5196,6 +5247,7 @@ mod tests {
         let selector = WorkerSelector::with_config(SelectionConfig::default(), circuit.clone());
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5267,6 +5319,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5323,6 +5376,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5368,6 +5422,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5407,6 +5462,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5442,6 +5498,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5482,6 +5539,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5537,6 +5595,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
             command: None,
@@ -5699,6 +5758,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -5741,6 +5801,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some(command.to_string()),
@@ -5864,6 +5925,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo build --target x86_64-pc-windows-msvc".to_string()),
@@ -5980,6 +6042,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo check".to_string()),
@@ -6028,6 +6091,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6074,6 +6138,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6112,6 +6177,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6179,6 +6245,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6219,6 +6286,7 @@ mod tests {
     fn tool_gate_request() -> SelectionRequest {
         SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             project: "tool-gate".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6323,6 +6391,7 @@ mod tests {
     fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
         SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: project.to_string(),
             command: Some(command.to_string()),
@@ -6500,6 +6569,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6539,6 +6609,7 @@ mod tests {
 
         let base_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "proj".to_string(),
             command: None,
@@ -6599,6 +6670,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -6639,6 +6711,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6694,6 +6767,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6762,6 +6836,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: None,
@@ -6817,6 +6892,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let nix_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
             command: Some("nix build .#foo".to_string()),
@@ -6880,6 +6956,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo test".to_string()),
@@ -6934,6 +7011,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo build".to_string()),
@@ -7027,6 +7105,7 @@ mod tests {
         // RCH_QUEUE_WHEN_BUSY polling queues instead of failing to local.
         let job_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: true,
             project: "sharded".to_string(),
             command: Some("./run_shards.sh".to_string()),
@@ -7049,6 +7128,7 @@ mod tests {
         // Compilation requests keep the immediate NoAdmissibleWorkers verdict.
         let compile_request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "sharded".to_string(),
             command: Some("cargo build".to_string()),
@@ -7150,6 +7230,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo test -p rchd --lib".to_string()),
@@ -7214,6 +7295,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo test --no-run".to_string()),
@@ -7253,6 +7335,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -7451,6 +7534,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "pressure-plus-busy".to_string(),
             command: Some("cargo test".to_string()),
@@ -7501,6 +7585,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "derated-fleet".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -7553,6 +7638,7 @@ mod tests {
             .await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "concurrent-project".to_string(),
             command: Some("cargo build".to_string()),
@@ -7637,6 +7723,7 @@ mod tests {
                 crate::disk_pressure::DiskHeadroomAdmission {
                     requested_gib: 0,
                     floor_gib: 0,
+                    warm_policy: None,
                     capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
                         "seed-worker",
                         120.0,
@@ -7658,6 +7745,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: Some(64 * rch_common::BuildDiskBudget::GIB),
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -7761,6 +7849,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        disk_observation: None,
                         timing: None,
                         cancellation: None,
                     },
@@ -7906,6 +7995,7 @@ mod tests {
                 DiskHeadroomAdmission {
                     requested_gib: 64,
                     floor_gib: 0,
+                    warm_policy: None,
                     capacity: worker.disk_capacity_observation().await,
                 },
                 Some(worker.endpoint_snapshot().await),
@@ -7964,6 +8054,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -8246,6 +8337,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "degraded-must-respect-pressure".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8307,6 +8399,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "os-gate-hijack".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8389,6 +8482,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "os-gate-plus-pressure".to_string(),
             command: Some("cargo build --release".to_string()),
@@ -8431,6 +8525,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "topology-flap".to_string(),
             command: Some("cargo check".to_string()),
@@ -8643,6 +8738,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo check".to_string()),
@@ -8707,6 +8803,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -8769,6 +8866,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "pressure-critical".to_string(),
             command: Some("cargo build".to_string()),
@@ -8819,6 +8917,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "pressure-and-health".to_string(),
             command: Some("cargo test".to_string()),
@@ -8870,6 +8969,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "pressure-mixed".to_string(),
             command: Some("cargo test".to_string()),
@@ -8933,6 +9033,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "pressure-gap".to_string(),
             command: Some("cargo build".to_string()),
@@ -8988,6 +9089,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9042,6 +9144,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9083,6 +9186,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "proj".to_string(),
             command: Some("cargo test".to_string()),
@@ -9128,6 +9232,7 @@ mod tests {
         // No cache warmth recorded for either worker
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "new-project".to_string(),
             command: None,
@@ -9166,6 +9271,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9227,6 +9333,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9270,6 +9377,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9305,6 +9413,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9345,6 +9454,7 @@ mod tests {
         selector.record_success("fallback", "test-project").await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9388,6 +9498,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9440,6 +9551,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9494,6 +9606,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
             command: None,
@@ -9724,6 +9837,7 @@ mod tests {
         // Make a selection request
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "audit-test-project".to_string(),
             command: Some("cargo test".to_string()),
@@ -9780,6 +9894,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, selector).await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "poolrepro".to_string(),
             command: Some("cargo build -j 2".to_string()),
@@ -10126,6 +10241,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -10160,6 +10276,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             project: "project-a".to_string(),
             estimated_cores: 1,
             disk_headroom_gib: 0,
@@ -10211,6 +10328,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -10260,6 +10378,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
             command: None,
@@ -10347,6 +10466,7 @@ mod tests {
 
                     let request = SelectionRequest {
                         source_topology: None,
+                        disk_observation_version: 0,
                         project: "worker-status-proptest".to_string(),
                         command: None,
                         command_priority: CommandPriority::Normal,
@@ -10968,6 +11088,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-penalty".to_string(),
                 command: Some("cargo build --workspace".to_string()),
@@ -11034,6 +11155,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-quarantine".to_string(),
                 command: Some("cargo test".to_string()),
@@ -11126,6 +11248,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-recovery".to_string(),
                 command: Some("cargo test".to_string()),
@@ -11177,6 +11300,7 @@ mod tests {
         fn make_selection_request(project: &str) -> SelectionRequest {
             SelectionRequest {
                 source_topology: None,
+                disk_observation_version: 0,
                 job_mode: false,
                 project: project.to_string(),
                 command: Some("cargo build".to_string()),

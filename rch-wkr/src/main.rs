@@ -258,6 +258,7 @@ async fn run_worker(cli: Cli) -> Result<()> {
                     Some(rch_common::BuildDiskBudget {
                         max_growth_bytes,
                         min_free_bytes,
+                        warm_policy: None,
                     })
                 }
                 _ => rch_common::BuildDiskBudget::cold_for_command(&command),

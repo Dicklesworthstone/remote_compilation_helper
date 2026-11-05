@@ -567,6 +567,18 @@ async fn query_daemon_with_mode(
 
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
+    // Only the durable exec path can acknowledge release and obtain a cold
+    // reservation after an exact prelaunch pool refusal. Legacy hooks keep
+    // conservative cold admission until they support that transition.
+    // A positive minimum also names the cold-retry route. Omit capability on
+    // that request even if concurrent history raises the cold requirement
+    // above its numeric minimum while reselection is in flight.
+    if (local_wrapper_id.is_some() || dry_run) && disk_headroom_gib == 0 {
+        query.push_str(&format!(
+            "&disk_observation_version={}",
+            rch_common::BuildDiskObservation::VERSION
+        ));
+    }
     if disk_headroom_gib > 0 {
         query.push_str(&format!("&disk_headroom_gib={disk_headroom_gib}"));
     }
@@ -822,6 +834,7 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) source_topology_mismatch: Option<&'a rch_common::SourceTopologyMismatch>,
     /// Attributable output high water, even when the job exceeded its budget.
     pub(crate) disk_peak_output_bytes: Option<u64>,
+    pub(crate) disk_observation: Option<rch_common::BuildDiskObservation>,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -879,6 +892,18 @@ pub(crate) async fn release_worker_with_fault(
     }
     if let Some(peak) = faults.disk_peak_output_bytes {
         request.push_str(&format!("&disk_peak_output_bytes={peak}"));
+    }
+    if let Some(observation) = faults.disk_observation {
+        anyhow::ensure!(
+            faults
+                .disk_peak_output_bytes
+                .is_some_and(|peak| observation.valid_for_peak(peak)),
+            "invalid incremental disk observation"
+        );
+        request.push_str(&format!(
+            "&disk_observation={}",
+            urlencoding_encode(&serde_json::to_string(&observation)?)
+        ));
     }
     if faults.worker_fault {
         request.push_str("&worker_fault=1");
@@ -1270,6 +1295,71 @@ mod daemon_io_timeout_tests {
 #[cfg(test)]
 mod bounded_ipc_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_durable_exec_requests_advertise_conditional_disk_admission() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("warm-capability.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let body = serde_json::to_string(&SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        })
+        .unwrap();
+        let server = async {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                requests.push(request);
+                writer
+                    .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            requests
+        };
+        let client = async {
+            for (wrapper, headroom) in [
+                (None, 0),
+                (Some("warm-capability-wrapper"), 0),
+                (Some("warm-capability-wrapper"), 103),
+            ] {
+                query_daemon(
+                    path.to_str().unwrap(),
+                    "project",
+                    1,
+                    headroom,
+                    "make",
+                    None,
+                    RequiredRuntime::None,
+                    CommandPriority::Normal,
+                    0,
+                    None,
+                    wrapper,
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let (requests, ()) = tokio::join!(server, client);
+        assert!(!requests[0].contains("disk_observation_version="));
+        assert!(requests[1].contains("&disk_observation_version=1"));
+        assert!(!requests[2].contains("disk_observation_version="));
+        assert!(requests[2].contains("disk_headroom_gib=103"));
+    }
 
     #[test]
     fn tool_requirement_routes_never_fall_back_to_legacy_selection() {
@@ -1701,6 +1791,7 @@ mod bounded_ipc_tests {
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                    disk_observation: None,
                 },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {

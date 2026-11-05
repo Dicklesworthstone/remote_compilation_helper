@@ -149,6 +149,10 @@ pub struct SelectionRequest {
     /// this build's lifetime; zero leaves disk admission to the ordinary policy.
     #[serde(default, skip_serializing_if = "disk_headroom_disabled")]
     pub disk_headroom_gib: u32,
+    /// Worker receipt/conditional-admission version understood by this client.
+    /// Older clients must never receive a discounted budget they cannot fence.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub disk_observation_version: u32,
     /// Preferred worker IDs (e.g., from project config).
     #[serde(default)]
     pub preferred_workers: Vec<WorkerId>,
@@ -727,6 +731,93 @@ fn default_fallback_min_success_rate() -> f64 {
     0.5 // More lenient than normal min_success_rate (0.8)
 }
 
+/// Physical identity and exact retained state of one managed Cargo target.
+/// The worker computes both digests from bounded scans, without trusting a
+/// pathname or a directory's byte count as proof that its artifacts survived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskPool {
+    pub identity: [u8; 32],
+    pub state: [u8; 32],
+    pub retained_bytes: u64,
+}
+
+impl BuildDiskPool {
+    pub fn is_valid(&self) -> bool {
+        self.identity != [0; 32] && self.state != [0; 32] && self.retained_bytes <= i64::MAX as u64
+    }
+}
+
+/// Additional allocations observed without subtracting concurrent cleanup.
+/// Only a complete, exit-status-bound supervisor receipt may supply this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskObservation {
+    pub version: u32,
+    pub baseline_output_bytes: u64,
+    pub peak_added_output_bytes: u64,
+    pub peak_free_drop_bytes: u64,
+    pub baseline_pool: BuildDiskPool,
+    pub final_pool: BuildDiskPool,
+}
+
+impl BuildDiskObservation {
+    pub const VERSION: u32 = 1;
+
+    pub fn valid_for_peak(&self, peak_output_bytes: u64) -> bool {
+        self.version == Self::VERSION
+            && peak_output_bytes <= i64::MAX as u64
+            && self.baseline_output_bytes <= peak_output_bytes
+            && self.peak_added_output_bytes <= peak_output_bytes
+            && self.peak_free_drop_bytes <= i64::MAX as u64
+            && self.baseline_pool.is_valid()
+            && self.final_pool.is_valid()
+            && self.baseline_pool.identity == self.final_pool.identity
+            && self.baseline_pool.retained_bytes <= self.baseline_output_bytes
+            && self.final_pool.retained_bytes <= peak_output_bytes
+            && self.additional_bytes() <= i64::MAX as u64
+    }
+
+    /// Only the attested target pool receives retained allocation credit.
+    /// Source staging and other output/cache roots remain charged in full.
+    /// Other writers may inflate the free-space decline; it can raise this
+    /// bound, but never replace the attributed output scan.
+    pub fn additional_bytes(&self) -> u64 {
+        self.baseline_output_bytes
+            .saturating_sub(self.baseline_pool.retained_bytes)
+            .saturating_add(self.peak_added_output_bytes.max(self.peak_free_drop_bytes))
+    }
+}
+
+/// A warm allowance is conditional on one of these exact pool snapshots.
+/// Eight proofs cover bounded project lanes without an unbounded wire/ledger
+/// payload. A mismatch requires a new cold reservation before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskWarmPolicy {
+    pub cold_growth_bytes: u64,
+    pub pools: [Option<BuildDiskPool>; 8],
+}
+
+impl BuildDiskWarmPolicy {
+    pub fn valid_for_budget(&self, max_growth_bytes: u64) -> bool {
+        max_growth_bytes > 0
+            && self.cold_growth_bytes > max_growth_bytes
+            && self.cold_growth_bytes <= i64::MAX as u64
+            && self.pools.iter().any(Option::is_some)
+            && self.pools.iter().enumerate().all(|(index, pool)| {
+                pool.is_none_or(|pool| {
+                    pool.is_valid()
+                        && pool.retained_bytes > 0
+                        && !self.pools[..index]
+                            .iter()
+                            .flatten()
+                            .any(|previous| previous.identity == pool.identity)
+                })
+            })
+    }
+}
+
 /// A job's additional allocation allowance and the worker's protected reserve.
 ///
 /// The daemon reserves growth atomically; the worker enforces these byte limits
@@ -735,6 +826,8 @@ fn default_fallback_min_success_rate() -> f64 {
 pub struct BuildDiskBudget {
     pub max_growth_bytes: u64,
     pub min_free_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_policy: Option<BuildDiskWarmPolicy>,
 }
 
 impl BuildDiskBudget {
@@ -809,6 +902,7 @@ impl BuildDiskBudget {
         Some(Self {
             max_growth_bytes: u64::from(Self::growth_budget_gib(f64::from(footprint))) * Self::GIB,
             min_free_bytes: 10 * Self::GIB,
+            warm_policy: None,
         })
     }
 }
@@ -961,6 +1055,10 @@ pub struct ReleaseRequest {
     /// Only a confirmed worker receipt may supply this measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_peak_output_bytes: Option<u64>,
+    /// Qualified additional allocation evidence, never inferred from an old
+    /// total-output or filesystem-delta sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_observation: Option<BuildDiskObservation>,
     /// Optional per-phase timing breakdown for the build pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CommandTimingBreakdown>,
@@ -5457,6 +5555,137 @@ retry_max = 2
         for invalid in [f64::NAN, f64::INFINITY, -1.0] {
             assert_eq!(BuildDiskBudget::growth_budget_gib(invalid), u32::MAX);
         }
+    }
+
+    #[test]
+    fn incremental_disk_observations_reject_inconsistent_or_unversioned_evidence() {
+        let gib = BuildDiskBudget::GIB;
+        let baseline = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 * gib,
+        };
+        let observation = BuildDiskObservation {
+            version: BuildDiskObservation::VERSION,
+            baseline_output_bytes: 81 * gib,
+            peak_added_output_bytes: gib / 4,
+            peak_free_drop_bytes: gib / 2,
+            baseline_pool: baseline,
+            final_pool: BuildDiskPool {
+                state: [3; 32],
+                ..baseline
+            },
+        };
+        let peak = 82 * gib;
+        assert!(observation.valid_for_peak(peak));
+        assert_eq!(observation.additional_bytes(), gib + gib / 2);
+        let encoded = serde_json::to_string(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<BuildDiskObservation>(&encoded).unwrap(),
+            observation
+        );
+        for invalid in [
+            BuildDiskObservation {
+                version: 0,
+                ..observation
+            },
+            BuildDiskObservation {
+                version: 2,
+                ..observation
+            },
+            BuildDiskObservation {
+                baseline_output_bytes: peak + 1,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_added_output_bytes: peak + 1,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_free_drop_bytes: u64::MAX,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_free_drop_bytes: i64::MAX as u64,
+                ..observation
+            },
+            BuildDiskObservation {
+                final_pool: BuildDiskPool {
+                    identity: [9; 32],
+                    ..baseline
+                },
+                ..observation
+            },
+            BuildDiskObservation {
+                baseline_pool: BuildDiskPool {
+                    retained_bytes: peak,
+                    ..baseline
+                },
+                ..observation
+            },
+            BuildDiskObservation {
+                final_pool: BuildDiskPool {
+                    state: [0; 32],
+                    ..baseline
+                },
+                ..observation
+            },
+        ] {
+            assert!(!invalid.valid_for_peak(peak), "{invalid:?}");
+        }
+        // An aggregate free-space drop can exceed this job's output; it can
+        // only raise the estimate, never supply attributed complete output.
+        let shared = BuildDiskObservation {
+            peak_free_drop_bytes: 100 * gib,
+            ..observation
+        };
+        assert!(shared.valid_for_peak(peak));
+        assert_eq!(shared.additional_bytes(), 101 * gib);
+        let only_pool = BuildDiskObservation {
+            baseline_output_bytes: 80 * gib,
+            ..observation
+        };
+        assert_eq!(only_pool.additional_bytes(), gib / 2);
+    }
+
+    #[test]
+    fn conditional_disk_policy_is_bounded_and_never_silently_widens_a_reservation() {
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 4096,
+        };
+        let mut policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 100 * BuildDiskBudget::GIB,
+            pools: [None; 8],
+        };
+        let warm = 3 * BuildDiskBudget::GIB;
+        assert!(!policy.valid_for_budget(warm));
+        policy.pools[0] = Some(pool);
+        assert!(policy.valid_for_budget(warm));
+        assert!(!policy.valid_for_budget(0));
+        assert!(!policy.valid_for_budget(policy.cold_growth_bytes));
+        assert!(!policy.valid_for_budget(u64::MAX));
+        policy.pools[1] = Some(pool);
+        assert!(
+            !policy.valid_for_budget(warm),
+            "duplicate physical pools are invalid"
+        );
+        policy.pools[1] = Some(BuildDiskPool {
+            identity: [3; 32],
+            ..pool
+        });
+        assert!(policy.valid_for_budget(warm));
+        let mut wire = serde_json::to_value(policy).unwrap();
+        wire["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::Null);
+        assert!(serde_json::from_value::<BuildDiskWarmPolicy>(wire).is_err());
+        let legacy: BuildDiskBudget =
+            serde_json::from_str(r#"{"max_growth_bytes":4294967296,"min_free_bytes":10737418240}"#)
+                .unwrap();
+        assert!(legacy.warm_policy.is_none());
     }
 
     #[test]

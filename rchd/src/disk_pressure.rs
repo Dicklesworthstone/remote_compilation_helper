@@ -240,6 +240,9 @@ pub struct DiskHeadroomAdmission {
     /// Charge the largest active floor once for the worker, not once per job.
     pub floor_gib: u64,
     pub capacity: Option<DiskCapacityObservation>,
+    /// The allowance may only be used after the worker matches a retained
+    /// pool. This condition follows the reservation into durable ownership.
+    pub warm_policy: Option<rch_common::BuildDiskWarmPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +291,12 @@ impl DiskHeadroomAdmission {
         reserved_gib: u64,
         capacity_after: Option<Instant>,
     ) -> Result<(), DiskHeadroomRejection> {
+        if self.warm_policy.is_some_and(|policy| {
+            !policy
+                .valid_for_budget(u64::from(self.requested_gib) * rch_common::BuildDiskBudget::GIB)
+        }) {
+            return Err(DiskHeadroomRejection::Unknown);
+        }
         if self.requested_gib == 0 && self.floor_gib == 0 {
             return Ok(());
         }
@@ -1091,6 +1100,7 @@ mod tests {
         let disk = DiskHeadroomAdmission {
             requested_gib: 80,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(sample),
         };
         for cutoff in [observed_at, observed_at + Duration::from_nanos(1)] {
@@ -1115,6 +1125,7 @@ mod tests {
         let admission = |free, age| DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(DiskCapacityObservation::fixture("worker", free, age)),
         };
         assert!(matches!(
@@ -1147,6 +1158,7 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: 1,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: None
             }
             .check("worker", 0),
@@ -1203,6 +1215,7 @@ mod tests {
         let mut admission = DiskHeadroomAdmission {
             requested_gib: rch_common::BuildDiskBudget::growth_budget_gib(21.0),
             floor_gib: 13,
+            warm_policy: None,
             capacity: Some(DiskCapacityObservation::fixture(
                 "hz3",
                 33.0,

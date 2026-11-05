@@ -278,7 +278,9 @@ async fn observe(
                     speed_score,
                     declared_os: rch_common::declared_os(&config.tags),
                     project_lane,
-                    disk_budget: ctx.worker_selector.build_disk_budget(&request),
+                    disk_budget: ctx
+                        .worker_selector
+                        .build_disk_budget_for_endpoint(&request, &endpoint),
                 })
             }
             None => None,
@@ -516,6 +518,7 @@ mod tests {
                 crate::disk_pressure::DiskHeadroomAdmission {
                     requested_gib: 0,
                     floor_gib: 0,
+                    warm_policy: None,
                     capacity: None,
                 },
                 None,
@@ -538,6 +541,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -850,6 +854,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        disk_observation: None,
                         timing: None,
                         cancellation: None,
                     },
@@ -890,6 +895,7 @@ mod tests {
                 Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 4 * rch_common::BuildDiskBudget::GIB,
                     min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                    warm_policy: None,
                 })
             );
             // The independent flat-slot policy derates this 33 GiB worker

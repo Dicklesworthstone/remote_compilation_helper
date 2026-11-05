@@ -5269,6 +5269,7 @@ mod tests {
         let first = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(first.check("disk-worker", 0).is_ok());
@@ -5296,6 +5297,7 @@ mod tests {
         let second = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(matches!(
@@ -5325,6 +5327,7 @@ mod tests {
         let before_reload = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         let mut config = recovered_worker_config("disk-worker", 8);
@@ -5370,6 +5373,7 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: 64,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: worker.disk_capacity_observation().await,
             }
             .check("disk-worker", 0),
@@ -5406,6 +5410,7 @@ mod tests {
         let mut budget = DiskHeadroomAdmission {
             requested_gib: 20,
             floor_gib: 10,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         assert_eq!(
@@ -5649,6 +5654,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },

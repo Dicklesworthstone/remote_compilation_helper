@@ -47,6 +47,7 @@ pub(super) struct RemoteExecutionResult {
     pub(super) disk_roots: Vec<String>,
     /// Total allocated output high water from a confirmed worker receipt.
     pub(super) disk_peak_output_bytes: Option<u64>,
+    pub(super) disk_observation: Option<rch_common::BuildDiskObservation>,
     /// Opt-in Cargo stdout, released only after daemon acknowledgment. A
     /// delivery failure supplies no caller-local success records.
     pub(super) cargo_stdout: Option<Vec<u8>>,
