@@ -405,12 +405,49 @@ mod linux {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::path::Component;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     // A successful clone may still wait for filesystem writeback. Stop trying
     // this optional optimization after one slow call rather than multiplying
     // that wait by every large SDK file. Ordinary copies keep all verification.
     const MAX_USEFUL_CLONE_LATENCY: Duration = Duration::from_millis(50);
+
+    // One optional reader is shared by ALL dataset scans in this process.
+    // Small datasets and contended callers keep the original sequential path;
+    // there is no thread pool, queue, detached reader or cached byte digest.
+    const PARALLEL_READ_BYTES: u64 = 4 * 1024 * 1024;
+    const READ_BUFFER_BYTES: usize = 64 * 1024;
+    static READ_HELPER_BUSY: AtomicBool = AtomicBool::new(false);
+
+    struct ReadHelperPermit<'a>(&'a AtomicBool);
+
+    impl<'a> ReadHelperPermit<'a> {
+        fn acquire(busy: &'a AtomicBool) -> Option<Self> {
+            busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .ok()
+                .map(|_| Self(busy))
+        }
+    }
+
+    impl Drop for ReadHelperPermit<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    struct StopReaders<'a> {
+        stopped: &'a AtomicBool,
+        armed: bool,
+    }
+
+    impl Drop for StopReaders<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.stopped.store(true, Ordering::Release);
+            }
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Stamp {
@@ -899,6 +936,11 @@ mod linux {
             destination: Option<&Path>,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<ToolchainIdentity> {
+            if destination.is_none()
+                && let Some((identity, _)) = self.parallel_read(stopped, &READ_HELPER_BUSY)?
+            {
+                return Ok(identity);
+            }
             self.stream_with_cloner(destination, stopped, &|_, _, _| false, None)
         }
 
@@ -906,6 +948,9 @@ mod linux {
             &self,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<(ToolchainIdentity, Vec<[u8; 32]>)> {
+            if let Some(result) = self.parallel_read(stopped, &READ_HELPER_BUSY)? {
+                return Ok(result);
+            }
             // Retain only digests in the inventory's immutable canonical order.
             // At most 100,000 hashes are stored; paths are cloned only when a
             // bounded file-transfer manifest is actually requested.
@@ -913,6 +958,200 @@ mod linux {
             let identity =
                 self.stream_with_cloner(None, stopped, &|_, _, _| false, Some(&mut hashes))?;
             Ok((identity, hashes))
+        }
+
+        /// Independently read every selected file, then fold its digest in the
+        /// original canonical order. Namespace barriers still belong to the
+        /// caller, exactly as for the sequential byte scan below.
+        fn parallel_read(
+            &self,
+            stopped: &impl Fn() -> bool,
+            helper_busy: &AtomicBool,
+        ) -> io::Result<Option<(ToolchainIdentity, Vec<[u8; 32]>)>> {
+            if self.bytes < PARALLEL_READ_BYTES
+                || self
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        matches!(entry.kind, Kind::File)
+                            && entry.stamp.size >= READ_BUFFER_BYTES as u64
+                    })
+                    .take(2)
+                    .count()
+                    < 2
+            {
+                return Ok(None);
+            }
+            checkpoint(stopped)?;
+            let Some(permit) = ReadHelperPermit::acquire(helper_busy) else {
+                return Ok(None);
+            };
+            let jobs: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.kind, Kind::File))
+                .collect();
+            let mut order: Vec<_> = (0..jobs.len()).collect();
+            order.sort_unstable_by_key(|&index| {
+                (std::cmp::Reverse(jobs[index].1.stamp.size), index)
+            });
+            let next = AtomicUsize::new(0);
+            let abort = AtomicBool::new(false);
+            let hashes: Option<Vec<[u8; 32]>> = std::thread::scope(|scope| {
+                // This guard runs before scope's mandatory join on unwinding,
+                // including a panic in the caller's non-Sync stop callback.
+                let _owner = StopReaders {
+                    stopped: &abort,
+                    armed: true,
+                };
+                let (jobs, order, next, abort) = (&jobs, &order, &next, &abort);
+                let helper = std::thread::Builder::new()
+                    .name("rabs-dataset-read".into())
+                    .spawn_scoped(scope, move || {
+                        let _permit = permit;
+                        let mut failure = StopReaders {
+                            stopped: abort,
+                            armed: true,
+                        };
+                        let result =
+                            self.read_jobs(jobs, order, next, &|| abort.load(Ordering::Acquire));
+                        failure.armed = result.is_err();
+                        result
+                    });
+                let Ok(helper) = helper else {
+                    // A refused thread start drops its permit and closure.
+                    // No reads have started; use the ordinary scanner in full.
+                    return Ok(None);
+                };
+                let mut owner = self.read_jobs(jobs, order, next, &|| {
+                    abort.load(Ordering::Acquire) || stopped()
+                });
+                if owner.is_err() {
+                    abort.store(true, Ordering::Release);
+                }
+                // The helper may own the last large file. Keep evaluating the
+                // original callback on its owner's thread while awaiting it;
+                // neither deadlines nor cancellation require Fn: Sync/Send.
+                while !helper.is_finished() {
+                    if !abort.load(Ordering::Acquire) && stopped() {
+                        abort.store(true, Ordering::Release);
+                        owner = Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "toolchain capture interrupted",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let other = helper
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("toolchain dataset reader panicked")));
+                // A helper I/O/integrity failure may have interrupted its owner.
+                // Preserve that cause rather than reporting only its abort.
+                let mut complete = match (owner, other) {
+                    (Ok(mut owner), Ok(other)) => {
+                        owner.extend(other);
+                        owner
+                    }
+                    (Err(error), _) if error.kind() != io::ErrorKind::Interrupted => {
+                        return Err(error);
+                    }
+                    (_, Err(error)) | (Err(error), _) => return Err(error),
+                };
+                complete.sort_unstable_by_key(|(index, _)| *index);
+                require(
+                    complete.len() == jobs.len()
+                        && complete
+                            .iter()
+                            .enumerate()
+                            .all(|(position, (index, _))| position == *index),
+                    "toolchain dataset read lost a selected file",
+                )?;
+                Ok(Some(
+                    complete.into_iter().map(|(_, digest)| digest).collect(),
+                ))
+            })?;
+            let Some(hashes) = hashes else {
+                return Ok(None);
+            };
+            let mut digest = Sha256::new();
+            digest.update(TOOLCHAIN_DATASET_VERSION.as_bytes());
+            let mut files = hashes.iter();
+            for (path, entry) in &self.entries {
+                checkpoint(stopped)?;
+                digest.update((path.len() as u64).to_be_bytes());
+                digest.update(path.as_bytes());
+                match &entry.kind {
+                    Kind::Directory => digest.update([0]),
+                    Kind::Link(target) => {
+                        digest.update([1]);
+                        digest.update((target.len() as u64).to_be_bytes());
+                        digest.update(target.as_bytes());
+                    }
+                    Kind::File => {
+                        digest.update([2, u8::from(entry.stamp.mode & 0o111 != 0)]);
+                        digest.update(entry.stamp.size.to_be_bytes());
+                        digest.update(
+                            files
+                                .next()
+                                .ok_or_else(|| invalid("toolchain file digest absent"))?,
+                        );
+                    }
+                }
+            }
+            Ok(Some((
+                ToolchainIdentity {
+                    sha256: digest.finalize().into(),
+                    files: self.files,
+                    bytes: self.bytes,
+                },
+                hashes,
+            )))
+        }
+
+        fn read_jobs(
+            &self,
+            jobs: &[(&String, &Entry)],
+            order: &[usize],
+            next: &AtomicUsize,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Vec<(usize, [u8; 32])>> {
+            let mut complete = Vec::new();
+            let mut buffer = [0_u8; READ_BUFFER_BYTES];
+            loop {
+                checkpoint(stopped)?;
+                let Some(&index) = order.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    return Ok(complete);
+                };
+                let (path, entry) = jobs[index];
+                let mut source =
+                    self.open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
+                require(
+                    Stamp::of(&source.metadata()?) == entry.stamp,
+                    "toolchain changed before read",
+                )?;
+                if let Some(bytes) = std::num::NonZeroU64::new(entry.stamp.size.min(1024 * 1024)) {
+                    let _ = fadvise(&source, 0, Some(bytes), Advice::WillNeed);
+                }
+                let mut digest = Sha256::new();
+                let mut copied = 0_u64;
+                loop {
+                    checkpoint(stopped)?;
+                    let read = source.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    copied = copied
+                        .checked_add(read as u64)
+                        .filter(|bytes| *bytes <= entry.stamp.size)
+                        .ok_or_else(|| invalid("toolchain file grew during capture"))?;
+                    digest.update(&buffer[..read]);
+                }
+                require(
+                    copied == entry.stamp.size && Stamp::of(&source.metadata()?) == entry.stamp,
+                    "toolchain file changed during capture",
+                )?;
+                complete.push((index, digest.finalize().into()));
+            }
         }
 
         fn stream_with_cloner(
@@ -1152,6 +1391,231 @@ mod linux {
             source_inventory: Some(inventory),
             file_hashes,
         })
+    }
+
+    #[cfg(test)]
+    mod scan_tests {
+        use super::*;
+        use std::cell::Cell;
+
+        fn fixture() -> (tempfile::TempDir, Inventory) {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("lib")).unwrap();
+            fs::create_dir(root.path().join("empty")).unwrap();
+            fs::write(root.path().join("compiler"), vec![43; 3 * 1024 * 1024 + 17]).unwrap();
+            fs::set_permissions(
+                root.path().join("compiler"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::write(
+                root.path().join("lib/runtime"),
+                vec![71; 2 * 1024 * 1024 + 3],
+            )
+            .unwrap();
+            fs::write(root.path().join("lib/zero"), b"").unwrap();
+            fs::write(root.path().join("lib/small"), b"small\0\xff").unwrap();
+            symlink("lib/runtime", root.path().join("alias")).unwrap();
+            let inventory =
+                Inventory::scan(root.path(), &ToolchainLimits::default(), &|| false).unwrap();
+            (root, inventory)
+        }
+
+        fn sequential(inventory: &Inventory) -> (ToolchainIdentity, Vec<[u8; 32]>) {
+            let mut hashes = Vec::new();
+            let identity = inventory
+                .stream_with_cloner(None, &|| false, &|_, _, _| false, Some(&mut hashes))
+                .unwrap();
+            (identity, hashes)
+        }
+
+        #[test]
+        fn parallel_reads_match_original_ordered_identity_and_file_hashes() {
+            let (root, inventory) = fixture();
+            let expected = sequential(&inventory);
+            let busy = AtomicBool::new(false);
+            let owner = std::thread::current().id();
+            let checks = Cell::new(0);
+            let actual = inventory
+                .parallel_read(
+                    &|| {
+                        assert_eq!(std::thread::current().id(), owner);
+                        checks.set(checks.get() + 1);
+                        false
+                    },
+                    &busy,
+                )
+                .unwrap()
+                .expect("the fixture must exercise the actual helper");
+            assert_eq!(actual, expected);
+            assert!(checks.get() > 1);
+            assert!(!busy.load(Ordering::Acquire));
+            inventory.verify_source(root.path(), &|| false).unwrap();
+        }
+
+        #[test]
+        fn occupied_read_capacity_and_small_datasets_keep_the_serial_path() {
+            let (_root, inventory) = fixture();
+            let busy = AtomicBool::new(true);
+            assert!(inventory.parallel_read(&|| false, &busy).unwrap().is_none());
+            assert!(busy.load(Ordering::Acquire));
+            // Losing the optional permit does not prevent a complete scan.
+            assert_eq!(sequential(&inventory).0.bytes, inventory.bytes);
+
+            let small = tempfile::tempdir().unwrap();
+            fs::write(small.path().join("small"), b"ordinary input").unwrap();
+            let small =
+                Inventory::scan(small.path(), &ToolchainLimits::default(), &|| false).unwrap();
+            let available = AtomicBool::new(false);
+            assert!(
+                small
+                    .parallel_read(&|| false, &available)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!available.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn mutation_during_parallel_reads_cannot_refresh_the_original_inventory() {
+            for replacement in [false, true] {
+                let (root, inventory) = fixture();
+                let replacement_root = tempfile::tempdir().unwrap();
+                fs::write(
+                    replacement_root.path().join("runtime"),
+                    vec![71; 2 * 1024 * 1024 + 3],
+                )
+                .unwrap();
+                let busy = AtomicBool::new(false);
+                let checks = Cell::new(0);
+                let changed = Cell::new(false);
+                let result = inventory
+                    .parallel_read(
+                        &|| {
+                            checks.set(checks.get() + 1);
+                            if checks.get() == 2 {
+                                if replacement {
+                                    fs::rename(
+                                        replacement_root.path().join("runtime"),
+                                        root.path().join("lib/runtime"),
+                                    )
+                                    .unwrap();
+                                } else {
+                                    fs::write(
+                                        root.path().join("lib/runtime"),
+                                        vec![72; 2 * 1024 * 1024 + 3],
+                                    )
+                                    .unwrap();
+                                }
+                                changed.set(true);
+                            }
+                            false
+                        },
+                        &busy,
+                    )
+                    .and_then(|value| {
+                        inventory.verify_source(root.path(), &|| false)?;
+                        Ok(value)
+                    });
+                assert!(changed.get(), "mutation must occur after helper start");
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert!(!busy.load(Ordering::Acquire));
+            }
+        }
+
+        #[test]
+        fn failed_cancelled_and_panicking_read_owners_join_and_release_the_helper() {
+            let (root, inventory) = fixture();
+            let busy = AtomicBool::new(false);
+            let checks = Cell::new(0);
+            let error = inventory
+                .parallel_read(
+                    &|| {
+                        let count = checks.get() + 1;
+                        checks.set(count);
+                        count >= 8
+                    },
+                    &busy,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(!busy.load(Ordering::Acquire));
+            inventory.verify_source(root.path(), &|| false).unwrap();
+
+            let checks = Cell::new(0);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = inventory.parallel_read(
+                    &|| {
+                        checks.set(checks.get() + 1);
+                        assert!(checks.get() != 2, "owner callback panic after helper start");
+                        false
+                    },
+                    &busy,
+                );
+            }));
+            assert!(panic.is_err());
+            assert!(!busy.load(Ordering::Acquire));
+            assert_eq!(
+                inventory.parallel_read(&|| false, &busy).unwrap().unwrap(),
+                sequential(&inventory)
+            );
+
+            fs::write(root.path().join("lib/runtime"), b"changed generation").unwrap();
+            let error = inventory.parallel_read(&|| false, &busy).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!busy.load(Ordering::Acquire));
+        }
+
+        #[test]
+        #[ignore = "reads a complete installed SDK; run explicitly with RABS_TEST_TOOLCHAIN_ROOT"]
+        fn installed_toolchain_serial_and_parallel_read_comparison() {
+            let root = std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to an actual installed Rust toolchain");
+            let root = Path::new(&root);
+            let inventory = Inventory::scan(root, &ToolchainLimits::default(), &|| false).unwrap();
+            let busy = AtomicBool::new(false);
+            let read = |parallel| {
+                let started = Instant::now();
+                inventory.verify_source(root, &|| false).unwrap();
+                let observed = if parallel {
+                    inventory
+                        .parallel_read(&|| false, &busy)
+                        .unwrap()
+                        .expect("installed SDK must exercise the actual helper")
+                } else {
+                    sequential(&inventory)
+                };
+                inventory.verify_source(root, &|| false).unwrap();
+                (observed, started.elapsed())
+            };
+            // The unchanged serial scanner is live in this SAME invocation.
+            // Alternate order; compare every file digest as well as the final
+            // dataset identity. Timing is evidence, never a correctness gate.
+            for pair in 0..4 {
+                let (serial, parallel) = if pair % 2 == 0 {
+                    (read(false), read(true))
+                } else {
+                    let parallel = read(true);
+                    (read(false), parallel)
+                };
+                assert_eq!(serial.0, parallel.0);
+                assert!(!busy.load(Ordering::Acquire));
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "kind": "toolchain-dataset-read-comparison",
+                        "pair": pair,
+                        "first": if pair % 2 == 0 { "serial" } else { "parallel" },
+                        "files": inventory.files,
+                        "bytes": inventory.bytes,
+                        "entries": inventory.entries.len(),
+                        "sha256": rabs_protocol::raw_bytes::encode_hex(&serial.0.0.sha256),
+                        "serial_seconds": serial.1.as_secs_f64(),
+                        "parallel_seconds": parallel.1.as_secs_f64(),
+                    })
+                );
+            }
+        }
     }
 }
 
