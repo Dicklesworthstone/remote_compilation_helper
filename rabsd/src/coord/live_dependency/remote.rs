@@ -18,6 +18,9 @@ use super::{
     render_compiler_transcript, verify_metadata_head,
 };
 use crate::coord::live::RequestOwnedInstallError;
+use crate::coord::remote_dependency_transport::locality::{
+    SourceDemand, WorkerProcess, captured_outputs,
+};
 use crate::coord::remote_dependency_transport::{
     PlacementReadiness, RemoteDependencyReservation, RemoteDependencyTransport,
 };
@@ -390,16 +393,17 @@ impl DependencyWorkerPool {
 
     #[cfg(test)]
     fn try_reserve(&self, key: &TypedDigest) -> io::Result<(PoolReservation, PendingActionClaim)> {
-        self.try_reserve_for(key, None)
+        self.try_reserve_for(key, None, None)
     }
 
     fn try_reserve_for(
         &self,
         key: &TypedDigest,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<(PoolReservation, PendingActionClaim)> {
         let claim = self.try_claim(key)?;
-        self.try_reserve_worker_excluding_for(&HashSet::new(), request)
+        self.try_reserve_worker_excluding_for(&HashSet::new(), request, sources)
             .map(|reservation| (reservation, claim))
     }
 
@@ -413,15 +417,16 @@ impl DependencyWorkerPool {
         &self,
         attempted: &HashSet<String>,
     ) -> io::Result<PoolReservation> {
-        self.try_reserve_worker_excluding_for(attempted, None)
+        self.try_reserve_worker_excluding_for(attempted, None, None)
     }
 
     fn try_reserve_worker_excluding_for(
         &self,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<PoolReservation> {
-        match self.probe_worker_excluding(attempted, request)? {
+        match self.probe_worker_excluding(attempted, request, sources)? {
             WorkerProbe::Reserved(reservation) => Ok(reservation),
             WorkerProbe::Waiting(_) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -443,7 +448,7 @@ impl DependencyWorkerPool {
         key: &TypedDigest,
         claim: &mut Option<PendingActionClaim>,
     ) -> io::Result<WorkerProbe> {
-        self.probe_claimed_worker_for(key, claim, None)
+        self.probe_claimed_worker_for(key, claim, None, None)
     }
 
     fn probe_claimed_worker_for(
@@ -451,11 +456,12 @@ impl DependencyWorkerPool {
         key: &TypedDigest,
         claim: &mut Option<PendingActionClaim>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<WorkerProbe> {
         if claim.is_none() {
             *claim = Some(self.try_claim(key)?);
         }
-        self.probe_worker_excluding(&HashSet::new(), request)
+        self.probe_worker_excluding(&HashSet::new(), request, sources)
     }
 
     fn ready_worker_order(
@@ -463,6 +469,7 @@ impl DependencyWorkerPool {
         start: usize,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
         now: Instant,
     ) -> Vec<(usize, PlacementReadiness)> {
         let mut order: Vec<_> = (0..self.workers.len())
@@ -487,6 +494,9 @@ impl DependencyWorkerPool {
                         position,
                         (index, readiness),
                         load,
+                        sources.map_or(0, |demand| {
+                            worker.placement_source_bytes(generation, demand, now)
+                        }),
                         worker.placement_toolchain_file_reuse(generation),
                     )
                 })
@@ -495,21 +505,24 @@ impl DependencyWorkerPool {
         // Unknown/expired measurements keep their original round-robin
         // positions; they are neither idle scores nor exclusion evidence.
         // Sort only the measured positions. Normalized load remains primary;
-        // when two authenticated workers are equally loaded, prefer the one
-        // that can reuse verified toolchain files and avoid redundant SDK
-        // transfer bytes. Equal hints still retain round-robin order.
+        // when two authenticated workers are equally loaded, prefer observed
+        // dependency-output locality, then verified toolchain-file reuse.
+        // These are transfer estimates only: ordinary source and SDK negotiation
+        // still prove any reuse. Equal hints retain round-robin order.
         let positions: Vec<_> = measured
             .iter()
-            .map(|(position, _, _, _)| *position)
+            .map(|(position, _, _, _, _)| *position)
             .collect();
         measured.sort_by(
-            |(_, _, left_load, left_reuse), (_, _, right_load, right_reuse)| {
+            |(_, _, left_load, left_sources, left_reuse),
+             (_, _, right_load, right_sources, right_reuse)| {
                 left_load
                     .compare(*right_load)
+                    .then_with(|| right_sources.cmp(left_sources))
                     .then_with(|| right_reuse.cmp(left_reuse))
             },
         );
-        for (position, (_, candidate, _, _)) in positions.into_iter().zip(measured) {
+        for (position, (_, candidate, _, _, _)) in positions.into_iter().zip(measured) {
             order[position] = candidate;
         }
         order
@@ -519,6 +532,7 @@ impl DependencyWorkerPool {
         &self,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<WorkerProbe> {
         // A failed transport probe can briefly own its occupied bit before
         // discovering cooldown. Serialize only these short probes, so another
@@ -541,7 +555,7 @@ impl DependencyWorkerPool {
         let mut request_excluded = false;
         let mut request_candidate = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        let ready_order = self.ready_worker_order(start, attempted, request, observed);
+        let ready_order = self.ready_worker_order(start, attempted, request, sources, observed);
         // Readiness is a preference, not execution authority. First try every
         // compatible live peer before assigning a job to an absent worker's
         // connection deadline. The second pass reobserves hints, preserving
@@ -719,6 +733,7 @@ pub struct RemoteInvocation {
     argv: Vec<String>,
     context: DependencyExecContext,
     requirements: Value,
+    source_demand: SourceDemand,
     validation: RemoteValidation,
 }
 
@@ -1504,6 +1519,12 @@ impl RemoteDependencies {
                 argv: argv.to_vec(),
                 context,
                 requirements,
+                source_demand: SourceDemand::new(directories.iter().flat_map(|directory| {
+                    directory
+                        .artifacts
+                        .iter()
+                        .map(|artifact| &artifact.content_digest)
+                })),
                 validation,
             },
         )))
@@ -1693,7 +1714,11 @@ impl LiveDependencyLane {
         } else {
             remote
                 .workers
-                .try_reserve_for(&request.key.action_key, Some(&invocation.requirements))
+                .try_reserve_for(
+                    &request.key.action_key,
+                    Some(&invocation.requirements),
+                    Some(&invocation.source_demand),
+                )
                 .map(|(reservation, claim)| (Some(reservation), claim))
         };
         match admitted {
@@ -1934,6 +1959,14 @@ impl PendingRemote {
             .validation
             .verify(&attempt.request)
             .map_err(settled)?;
+        // Output lengths come from the verified delivery, while identities
+        // come from captured CAS bytes. Remote delivery inode signatures are
+        // deliberately absent from captured.known and must stay that way.
+        let produced = captured_outputs(&manifest, &delivery.receipt["artifact_manifest"]);
+        let producer_process = attempt.authority.as_ref().map(|authority| WorkerProcess {
+            boot: authority.worker_boot_generation,
+            incarnation: authority.worker_incarnation_id,
+        });
         let result = if attempt.request.is_execution_only() {
             let result = RequestOwnedResult::new(captured, attempt, delivery, wire, continuation)
                 .map_err(settled)?;
@@ -1959,7 +1992,7 @@ impl PendingRemote {
         // before waiting for permission to write any caller destination. Retain
         // only immutable result custody and this subscriber's input witnesses;
         // the settled execution attempt is not an installation owner.
-        Ok(PendingRemoteInstall {
+        let ready = PendingRemoteInstall {
             coord: Arc::clone(&attempt.coord),
             request: attempt.request.clone(),
             output: Arc::new(RemoteOutput {
@@ -1969,7 +2002,16 @@ impl PendingRemote {
             }),
             validation: invocation.validation,
             result,
-        })
+        };
+        // Only the actual successful reservation learns these advisory hints,
+        // after result custody and durable retirement. Never turn cancellation,
+        // a failed capture/publication or an uncertain worker into locality.
+        if !cancellation.is_cancelled()
+            && let Some(process) = producer_process
+        {
+            execution.remember_produced_outputs(process, &produced, Instant::now());
+        }
+        Ok(ready)
     }
 }
 
@@ -2765,6 +2807,7 @@ impl PendingRemoteInstall {
 #[cfg(test)]
 mod worker_pool_tests {
     use super::*;
+    use crate::coord::remote_dependency_transport::locality::ProducedObject;
     use rabs_asupersync::worker_transport::TlsFiles;
     use rabs_key::typed_digest::compute;
     use rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION;
@@ -2914,21 +2957,42 @@ mod worker_pool_tests {
         })
     }
 
+    pub(super) fn remember_output(
+        pool: &DependencyWorkerPool,
+        worker: usize,
+        hello: &Value,
+        object: &TypedDigest,
+        bytes: u64,
+        observed: Instant,
+    ) {
+        // Like scheduling_hello, this injects evidence at the completion-owner
+        // boundary. It does not execute a compiler or mint publication authority.
+        let reservation = pool.workers[worker].try_reserve().unwrap();
+        reservation.remember_produced_outputs(
+            WorkerProcess::from_hello(hello).unwrap(),
+            &[ProducedObject {
+                object: object.clone(),
+                bytes,
+            }],
+            observed,
+        );
+    }
+
     #[test]
     fn authenticated_ready_worker_precedes_an_absent_endpoint_without_durable_admission() {
         let state = crate::test_util::private_tempdir();
         let pool = pool(state.path(), 2);
         let advertisement = pool.workers[1].advertise_for_test(&scheduling_hello());
         let request = scheduling_request(true);
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         // Preference must not manufacture a second physical slot, and an
         // absent endpoint still retains the ordinary bounded connection path.
-        let (unknown, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (unknown, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(unknown.worker(), "worker-1");
         assert_eq!(
-            pool.try_reserve_for(&key(3), Some(&request))
+            pool.try_reserve_for(&key(3), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -2952,12 +3016,13 @@ mod worker_pool_tests {
         let second = pool.workers[1].advertise_for_test(&four_cpus);
         // The second worker has higher absolute load but half the load per
         // advertised CPU. Plain round-robin would choose worker-1 first.
-        let (preferred, preferred_claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (preferred, preferred_claim) =
+            pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(preferred.worker(), "worker-2");
-        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(other.worker(), "worker-1");
         assert_eq!(
-            pool.try_reserve_for(&key(3), Some(&request))
+            pool.try_reserve_for(&key(3), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -2990,9 +3055,10 @@ mod worker_pool_tests {
         // Equal normalized load would otherwise preserve round-robin and pick
         // worker-1 first. Reuse is only an advisory tie-breaker; every ordinary
         // request, capability and transfer verification still runs afterward.
-        let (preferred, preferred_claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (preferred, preferred_claim) =
+            pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(preferred.worker(), "worker-2");
-        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(other.worker(), "worker-1");
         drop((
             preferred,
@@ -3002,6 +3068,202 @@ mod worker_pool_tests {
             first,
             second,
         ));
+    }
+
+    #[test]
+    fn equal_pressure_prefers_matching_output_bytes_and_busy_producers_yield_capacity() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let request = scheduling_request(true);
+        let small = compute("rabs.object.sha256.v1", b"small metadata");
+        let large = compute("rabs.object.sha256.v1", b"large archive");
+        let demand = SourceDemand::new([&small, &large, &large]);
+        let mut first_hello = scheduling_hello();
+        first_hello["load_x100"] = json!(100);
+        first_hello["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+        let mut second_hello = scheduling_hello();
+        second_hello["load_x100"] = json!(100);
+        let first = pool.workers[0].advertise_for_test(&first_hello);
+        let second = pool.workers[1].advertise_for_test(&second_hello);
+        remember_output(&pool, 0, &first_hello, &small, 37, Instant::now());
+        remember_output(&pool, 1, &second_hello, &large, 9000, Instant::now());
+
+        let (producer, producer_claim) = pool
+            .try_reserve_for(&key(1), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(producer.worker(), "worker-2");
+        let (spare, spare_claim) = pool
+            .try_reserve_for(&key(2), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(spare.worker(), "worker-1");
+        assert_eq!(
+            pool.try_reserve_for(&key(3), Some(&request), Some(&demand))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((producer, producer_claim, spare, spare_claim));
+
+        // A different request gains no preference from unrelated large outputs.
+        let only_small = SourceDemand::new([&small]);
+        let (matching, claim) = pool
+            .try_reserve_for(&key(4), Some(&request), Some(&only_small))
+            .unwrap();
+        assert_eq!(matching.worker(), "worker-1");
+        drop((matching, claim, first, second));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_locality_never_overrides_pressure_unknown_samples_or_capabilities() {
+        let object = compute("rabs.object.sha256.v1", b"retained archive");
+        let demand = SourceDemand::new([&object]);
+        let request = scheduling_request(false);
+        for case in [
+            "higher-load",
+            "unknown-load",
+            "expired-load",
+            "incompatible",
+        ] {
+            let pool = pool(Path::new("/private/locality-load-pool"), 2);
+            let mut ordinary = scheduling_hello();
+            ordinary["load_x100"] = if case == "unknown-load" {
+                Value::Null
+            } else {
+                json!(100)
+            };
+            let mut producer = scheduling_hello();
+            producer["load_x100"] = if case == "higher-load" {
+                json!(200)
+            } else {
+                json!(0)
+            };
+            if case == "incompatible" {
+                producer["dependency_execution_modes"] = json!(["closed-metadata"]);
+            }
+            let first_at = if case == "expired-load" {
+                Instant::now()
+                    - rabs_protocol::worker_standby::LOAD_MAX_AGE
+                    - std::time::Duration::from_secs(1)
+            } else {
+                Instant::now()
+            };
+            let first = pool.workers[0].advertise_at_for_test(&ordinary, first_at);
+            let second = pool.workers[1].advertise_for_test(&producer);
+            remember_output(&pool, 1, &producer, &object, 9000, Instant::now());
+            let (selected, claim) = pool
+                .try_reserve_for(&key(1), Some(&request), Some(&demand))
+                .unwrap();
+            assert_eq!(selected.worker(), "worker-1", "{case}");
+            drop((selected, claim, first, second));
+        }
+    }
+
+    #[test]
+    fn output_locality_survives_standby_reconnect_but_not_worker_restart_or_expiry() {
+        let pool = pool(Path::new("/private/locality-process-pool"), 2);
+        let object = compute("rabs.object.sha256.v1", b"retained metadata");
+        let demand = SourceDemand::new([&object]);
+        let request = scheduling_request(true);
+        let mut hello = scheduling_hello();
+        hello["load_x100"] = json!(100);
+        let first = pool.workers[0].advertise_for_test(&hello);
+        let second = pool.workers[1].advertise_for_test(&hello);
+        let PlacementReadiness::Ready(old_generation) =
+            pool.workers[1].placement_readiness(Some(&request))
+        else {
+            panic!("missing authenticated readiness");
+        };
+        remember_output(&pool, 1, &hello, &object, 9000, Instant::now());
+        drop(second);
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(old_generation, &demand, Instant::now()),
+            0
+        );
+        let reconnected = pool.workers[1].advertise_for_test(&hello);
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(old_generation, &demand, Instant::now()),
+            0
+        );
+        let (selected, claim) = pool
+            .try_reserve_for(&key(1), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(selected.worker(), "worker-2");
+        drop((selected, claim, reconnected));
+
+        hello["boot_generation"] = json!(2);
+        hello["incarnation"] = json!("00000000000000000000000000000002");
+        let restarted = pool.workers[1].advertise_for_test(&hello);
+        let PlacementReadiness::Ready(new_generation) =
+            pool.workers[1].placement_readiness(Some(&request))
+        else {
+            panic!("missing restarted readiness");
+        };
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(new_generation, &demand, Instant::now()),
+            0
+        );
+        // Expired observations from the correct process also give no score.
+        remember_output(
+            &pool,
+            1,
+            &hello,
+            &object,
+            9000,
+            Instant::now() - std::time::Duration::from_secs(601),
+        );
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(new_generation, &demand, Instant::now()),
+            0
+        );
+        drop((first, restarted));
+    }
+
+    #[test]
+    fn equal_output_locality_keeps_round_robin_and_alternate_worker_exclusions() {
+        let pool = pool(Path::new("/private/locality-fairness-pool"), 3);
+        let object = compute("rabs.object.sha256.v1", b"shared metadata");
+        let additional = compute("rabs.object.sha256.v1", b"additional archive");
+        let demand = SourceDemand::new([&object, &additional]);
+        let request = scheduling_request(true);
+        let mut hello = scheduling_hello();
+        hello["load_x100"] = json!(100);
+        let advertisements = pool
+            .workers
+            .iter()
+            .map(|worker| worker.advertise_for_test(&hello))
+            .collect::<Vec<_>>();
+        for index in 0..3 {
+            remember_output(&pool, index, &hello, &object, 73, Instant::now());
+        }
+        for (index, expected) in ["worker-1", "worker-2", "worker-3", "worker-1"]
+            .into_iter()
+            .enumerate()
+        {
+            let (selected, claim) = pool
+                .try_reserve_for(
+                    &key(u8::try_from(index).unwrap()),
+                    Some(&request),
+                    Some(&demand),
+                )
+                .unwrap();
+            assert_eq!(selected.worker(), expected);
+            drop((selected, claim));
+        }
+        // The next round-robin start is worker-2, but worker-3 has more matching
+        // bytes. An attempted worker remains excluded regardless of its score.
+        remember_output(&pool, 2, &hello, &additional, 9000, Instant::now());
+        let attempted = HashSet::from(["worker-1".to_owned()]);
+        let selected = pool
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(selected.worker(), "worker-3");
+        let spare = pool
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(spare.worker(), "worker-2");
+        drop((selected, spare, advertisements));
     }
 
     #[test]
@@ -3020,14 +3282,14 @@ mod worker_pool_tests {
             .enumerate()
         {
             let (reserved, claim) = pool
-                .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request), None)
                 .unwrap();
             assert_eq!(reserved.worker(), expected);
             drop((reserved, claim));
         }
         let excluded = HashSet::from(["worker-1".to_owned()]);
         let reserved = pool
-            .try_reserve_worker_excluding_for(&excluded, Some(&request))
+            .try_reserve_worker_excluding_for(&excluded, Some(&request), None)
             .unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         drop((reserved, first, second));
@@ -3057,7 +3319,7 @@ mod worker_pool_tests {
             let second = pool.workers[1].advertise_for_test(&second_hello);
             for (index, expected) in ["worker-1", "worker-2"].into_iter().enumerate() {
                 let (reserved, claim) = pool
-                    .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                    .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request), None)
                     .unwrap();
                 assert_eq!(reserved.worker(), expected);
                 drop((reserved, claim));
@@ -3092,7 +3354,7 @@ mod worker_pool_tests {
                 PlacementReadiness::Incompatible,
                 "{field}"
             );
-            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
             assert_eq!(reserved.worker(), "worker-2", "{field}");
             drop((reserved, claim, unsuitable, suitable));
         }
@@ -3124,7 +3386,7 @@ mod worker_pool_tests {
                 pool.workers[0].placement_readiness(Some(&request)),
                 PlacementReadiness::Incompatible,
             );
-            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
             assert_eq!(reserved.worker(), "worker-2");
             assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
             drop((reserved, claim, unsuitable, suitable));
@@ -3144,7 +3406,7 @@ mod worker_pool_tests {
         let first = pool.workers[0].advertise_for_test(&foreign);
         let second = pool.workers[1].advertise_for_test(&foreign);
         assert_eq!(
-            pool.try_reserve_for(&key(1), Some(&request))
+            pool.try_reserve_for(&key(1), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported,
@@ -3156,7 +3418,7 @@ mod worker_pool_tests {
         // Cargo's output target remains the other architecture.
         drop(second);
         let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         drop((reserved, claim, first, replacement));
@@ -3174,12 +3436,14 @@ mod worker_pool_tests {
         let metadata = scheduling_request(true);
         let mut archive_claim = None;
         assert_eq!(
-            pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+            pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
         );
-        let (reserved, metadata_claim) = pool.try_reserve_for(&key(2), Some(&metadata)).unwrap();
+        let (reserved, metadata_claim) = pool
+            .try_reserve_for(&key(2), Some(&metadata), None)
+            .unwrap();
         assert_eq!(reserved.worker(), "worker-1");
         assert!(pool.try_claim(&key(1)).is_err());
         drop((reserved, metadata_claim, advertisement));
@@ -3188,7 +3452,7 @@ mod worker_pool_tests {
             PlacementReadiness::Unknown
         );
         let WorkerProbe::Reserved(reconnected) = pool
-            .probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+            .probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive), None)
             .unwrap()
         else {
             panic!("revoked capability evidence must not exclude the next connection");
@@ -3207,7 +3471,7 @@ mod worker_pool_tests {
         let second = pool.workers[1].advertise_for_test(&metadata_only);
         let archive = scheduling_request(false);
         assert_eq!(
-            pool.try_reserve_for(&key(1), Some(&archive))
+            pool.try_reserve_for(&key(1), Some(&archive), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
@@ -3219,7 +3483,7 @@ mod worker_pool_tests {
         // claim. A new compatible connection may serve the same action.
         drop(second);
         let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&archive), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         drop((reserved, claim, first, replacement));
@@ -3236,18 +3500,18 @@ mod worker_pool_tests {
             let second =
                 advertised.then(|| pool.workers[1].advertise_for_test(&scheduling_hello()));
             let archive = scheduling_request(false);
-            let (busy, busy_claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+            let (busy, busy_claim) = pool.try_reserve_for(&key(1), Some(&archive), None).unwrap();
             assert_eq!(busy.worker(), "worker-2");
             let mut queued_claim = None;
             assert!(matches!(
-                pool.probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                pool.probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive), None)
                     .unwrap(),
                 WorkerProbe::RequestWaiting(None)
             ));
             assert!(queued_claim.is_some());
             drop((busy, busy_claim));
             let WorkerProbe::Reserved(reserved) = pool
-                .probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                .probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive), None)
                 .unwrap()
             else {
                 panic!("the queued request must use the released eligible endpoint");
@@ -3270,6 +3534,7 @@ mod worker_pool_tests {
             pool.try_reserve_worker_excluding_for(
                 &HashSet::from(["worker-1".to_owned()]),
                 Some(&archive),
+                None,
             )
             .unwrap_err()
             .kind(),
@@ -3287,12 +3552,12 @@ mod worker_pool_tests {
         let request = scheduling_request(true);
         let mut attempted = HashSet::from(["worker-1".to_owned()]);
         let selected = pool
-            .try_reserve_worker_excluding_for(&attempted, Some(&request))
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), None)
             .unwrap();
         assert_eq!(selected.worker(), "worker-3");
         attempted.extend(["worker-2".to_owned(), "worker-3".to_owned()]);
         assert_eq!(
-            pool.try_reserve_worker_excluding_for(&attempted, Some(&request))
+            pool.try_reserve_worker_excluding_for(&attempted, Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound

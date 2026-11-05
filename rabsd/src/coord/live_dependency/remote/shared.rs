@@ -398,7 +398,7 @@ fn probe_in_order(
     key: &TypedDigest,
     claim: &mut Option<PendingActionClaim>,
 ) -> io::Result<WorkerProbe> {
-    probe_in_order_for(waiting_keys, workers, key, claim, None)
+    probe_in_order_for(waiting_keys, workers, key, claim, None, None)
 }
 
 fn probe_in_order_for(
@@ -407,6 +407,7 @@ fn probe_in_order_for(
     key: &TypedDigest,
     claim: &mut Option<PendingActionClaim>,
     requirements: Option<&serde_json::Value>,
+    sources: Option<&super::SourceDemand>,
 ) -> io::Result<WorkerProbe> {
     if waiting_keys.contains(key) {
         return Err(io::Error::new(
@@ -414,7 +415,7 @@ fn probe_in_order_for(
             "an earlier queued request is waiting for this action key",
         ));
     }
-    let result = workers.probe_claimed_worker_for(key, claim, requirements);
+    let result = workers.probe_claimed_worker_for(key, claim, requirements, sources);
     if result
         .as_ref()
         .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -496,6 +497,7 @@ fn dispatch(work: Arc<SharedWork<FlightKey, SharedRemoteResult>>, queue: Arc<Que
                     &pending.request.key.action_key,
                     &mut pending.action_claim,
                     Some(&pending.invocation.requirements),
+                    Some(&pending.invocation.source_demand),
                 ) {
                     Ok(WorkerProbe::Reserved(reservation)) => {
                         let mut pending = queued.pending.take().expect("queued input owner");
@@ -1020,7 +1022,7 @@ mod tests {
         let running_key =
             rabs_key::typed_digest::compute("rabs.test.capability-queue.v1", b"running");
         let busy = workers
-            .try_reserve_for(&running_key, Some(&archive))
+            .try_reserve_for(&running_key, Some(&archive), None)
             .unwrap();
         assert_eq!(busy.0.worker(), "worker-2");
         let mut waiting_keys = HashSet::new();
@@ -1032,6 +1034,7 @@ mod tests {
                 &blocked_key,
                 &mut earlier,
                 Some(&archive),
+                None,
             )
             .unwrap(),
             WorkerProbe::RequestWaiting(None)
@@ -1044,6 +1047,7 @@ mod tests {
                 &blocked_key,
                 &mut later,
                 Some(&archive),
+                None,
             )
             .unwrap_err()
             .kind(),
@@ -1057,6 +1061,7 @@ mod tests {
             &ready_key,
             &mut ready_claim,
             Some(&metadata),
+            None,
         )
         .unwrap() else {
             panic!("an incompatible queue head must not hide usable worker capacity");
@@ -1099,6 +1104,7 @@ mod tests {
             &key,
             &mut action_claim,
             Some(&request),
+            None,
         )
         .unwrap_err();
         assert_eq!(refusal.kind(), io::ErrorKind::Unsupported);
@@ -1128,6 +1134,88 @@ mod tests {
         assert!(executions.dispatcher.lock().unwrap().worker.is_none());
         drop(advertisement);
         executions.shutdown().unwrap();
+    }
+
+    #[test]
+    fn queued_output_locality_preserves_same_key_order_and_spare_worker_capacity() {
+        use super::super::SourceDemand;
+        use super::super::worker_pool_tests::{
+            pool, remember_output, scheduling_hello, scheduling_request,
+        };
+
+        let workers = pool(std::path::Path::new("/private/queued-output-locality"), 2);
+        let object = rabs_key::typed_digest::compute("rabs.object.sha256.v1", b"queued dependency");
+        let sources = SourceDemand::new([&object]);
+        let mut hello = scheduling_hello();
+        hello["load_x100"] = serde_json::json!(100);
+        let first = workers.workers[0].advertise_for_test(&hello);
+        let second = workers.workers[1].advertise_for_test(&hello);
+        remember_output(&workers, 1, &hello, &object, 9000, Instant::now());
+        let request = scheduling_request(true);
+        let key = rabs_key::typed_digest::compute("rabs.test.queued-locality.v1", b"first");
+        let unrelated = rabs_key::typed_digest::compute("rabs.test.queued-locality.v1", b"other");
+        let mut waiting_keys = HashSet::new();
+        let mut claim = None;
+        let WorkerProbe::Reserved(producer) = probe_in_order_for(
+            &mut waiting_keys,
+            &workers,
+            &key,
+            &mut claim,
+            Some(&request),
+            Some(&sources),
+        )
+        .unwrap() else {
+            panic!("queued consumer should reserve its available producer");
+        };
+        assert_eq!(producer.worker(), "worker-2");
+        let mut same_key = None;
+        assert_eq!(
+            probe_in_order_for(
+                &mut waiting_keys,
+                &workers,
+                &key,
+                &mut same_key,
+                Some(&request),
+                Some(&sources),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(same_key.is_none());
+        let mut other_claim = None;
+        let WorkerProbe::Reserved(spare) = probe_in_order_for(
+            &mut waiting_keys,
+            &workers,
+            &unrelated,
+            &mut other_claim,
+            Some(&request),
+            Some(&sources),
+        )
+        .unwrap() else {
+            panic!("locality must not make unrelated queued work wait for its busy producer");
+        };
+        assert_eq!(spare.worker(), "worker-1");
+        drop((producer, claim));
+        // This same dispatch pass cannot let a later same-key request overtake
+        // the earlier waiter merely because its producer released capacity.
+        let mut later = None;
+        assert_eq!(
+            probe_in_order_for(
+                &mut waiting_keys,
+                &workers,
+                &key,
+                &mut later,
+                Some(&request),
+                Some(&sources),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(later.is_none());
+        drop((spare, other_claim, first, second));
+        assert!(workers.pending.lock().unwrap().is_empty());
     }
 
     #[test]

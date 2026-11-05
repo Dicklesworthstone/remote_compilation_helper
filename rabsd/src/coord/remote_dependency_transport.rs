@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+pub(crate) mod locality;
 mod standby;
 
 /// Includes both the outward reconnect and TLS handshake. The established ATP
@@ -136,6 +137,7 @@ pub struct RemoteDependencyTransport {
     stopped: AtomicBool,
     cooldown: Arc<Mutex<ConnectionCooldown>>,
     readiness: Arc<standby::Readiness>,
+    source_locality: Mutex<locality::SourceLocality>,
     listener: Mutex<Option<Arc<standby::Listener>>>,
     admission: Mutex<Option<Arc<PinnedWorkerAdmission>>>,
 }
@@ -184,6 +186,7 @@ impl RemoteDependencyTransport {
             stopped: AtomicBool::new(false),
             cooldown: Arc::new(Mutex::new(ConnectionCooldown::default())),
             readiness: Arc::new(standby::Readiness::default()),
+            source_locality: Mutex::new(locality::SourceLocality::default()),
             listener: Mutex::new(None),
             admission: Mutex::new(None),
         })
@@ -293,6 +296,30 @@ impl RemoteDependencyTransport {
                         .iter()
                         .any(|version| version == TOOLCHAIN_FILE_REUSE_VERSION)
                 })
+    }
+
+    /// Estimated dependency bytes retained by this same authenticated worker
+    /// process. A standby reconnect preserves hints; a restart does not. This
+    /// neither waits for the hint store nor establishes a source-cache hit.
+    pub(crate) fn placement_source_bytes(
+        &self,
+        generation: u64,
+        demand: &locality::SourceDemand,
+        now: Instant,
+    ) -> u64 {
+        let Some(snapshot) = self.readiness.snapshot() else {
+            return 0;
+        };
+        if snapshot.generation != generation {
+            return 0;
+        }
+        let Some(process) = locality::WorkerProcess::from_hello(&snapshot.hello) else {
+            return 0;
+        };
+        let Ok(locality) = self.source_locality.try_lock() else {
+            return 0;
+        };
+        locality.reusable_bytes(process, demand, now)
     }
 
     /// Recheck after taking physical capacity so a revoked snapshot cannot
@@ -632,6 +659,21 @@ impl RemoteDependencyReservation {
         self.transport.worker()
     }
 
+    /// The completion owner calls this only after verified successful capture
+    /// and durable attempt retirement, while this exact worker slot is held.
+    /// Optional worker retention may still have missed, so this is placement
+    /// advice only. Contention or poisoned state simply loses the advice.
+    pub(crate) fn remember_produced_outputs(
+        &self,
+        process: locality::WorkerProcess,
+        objects: &[locality::ProducedObject],
+        now: Instant,
+    ) {
+        if let Ok(mut locality) = self.transport.source_locality.try_lock() {
+            locality.remember(process, objects, now);
+        }
+    }
+
     /// Persist only this selected worker's exact recovery context. A pool can
     /// change membership or order while an uncertain result remains retained;
     /// its aggregate status cannot identify the owner of this request.
@@ -944,6 +986,56 @@ mod tests {
             PlacementReadiness::Unknown
         );
         assert!(transport.placement_load(generation, now).is_none());
+    }
+
+    #[test]
+    fn locality_contention_never_waits_or_grants_input_or_worker_authority() {
+        let transport = transport();
+        let now = Instant::now();
+        let hello = serde_json::json!({
+            "boot_generation":1,"incarnation":"00000000000000000000000000000001"
+        });
+        let advertisement = transport.advertise_for_test(&hello);
+        let PlacementReadiness::Ready(generation) = transport.placement_readiness(None) else {
+            panic!("missing authenticated readiness");
+        };
+        let process = locality::WorkerProcess::from_hello(&hello).unwrap();
+        let output = locality::ProducedObject {
+            object: rabs_key::typed_digest::compute("rabs.object.sha256.v1", b"retained output"),
+            bytes: 37,
+        };
+        let demand = locality::SourceDemand::new([&output.object]);
+        let reservation = transport.try_reserve().unwrap();
+        {
+            let _busy = transport.source_locality.lock().unwrap();
+            reservation.remember_produced_outputs(process, std::slice::from_ref(&output), now);
+            assert_eq!(
+                transport.placement_source_bytes(generation, &demand, now),
+                0
+            );
+        }
+        assert_eq!(
+            transport.placement_source_bytes(generation, &demand, now),
+            0
+        );
+        reservation.remember_produced_outputs(process, &[output], now);
+        assert_eq!(
+            transport.placement_source_bytes(generation, &demand, now),
+            37
+        );
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(reservation.request_id.is_none());
+        assert!(reservation.admission.is_none());
+        assert!(!reservation.dispatch_attempted);
+        drop((reservation, advertisement));
+        assert_eq!(
+            transport.placement_source_bytes(generation, &demand, now),
+            0
+        );
+        assert!(transport.try_reserve().is_ok());
     }
 
     #[test]
