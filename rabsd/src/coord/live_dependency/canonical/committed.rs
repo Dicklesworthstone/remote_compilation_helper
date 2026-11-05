@@ -1105,6 +1105,8 @@ impl CanonicalPaths {
             DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -3525,6 +3527,8 @@ mod tests {
             DependencySourceKind::WorkspaceExecutionOnly,
             DependencySourceKind::WorkspaceClosedRlib,
             DependencySourceKind::WorkspaceClosedMetadata,
+            DependencySourceKind::WorkspaceGeneratedRlib,
+            DependencySourceKind::WorkspaceGeneratedMetadata,
             DependencySourceKind::RegistryPackage,
         ] {
             assert!(CommittedDependencyPolicy::from_source_kind(kind).is_none());
@@ -3576,6 +3580,116 @@ mod tests {
         );
         fixture.quarantine(&offer.manifest.action_key);
         assert!(metadata.verify_original().is_err());
+    }
+
+    #[test]
+    fn generated_leaf_outputs_require_publication_installation_and_consumer_mode_proof() {
+        for archive in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let mut outputs = vec![(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )];
+            if archive {
+                outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
+            }
+            // Class enrollment is the explicit unit fixture boundary. CAS
+            // publication, retained file generations and ancestry are real.
+            let offer = fixture.prepare_generated_leaf(47, &outputs, !archive);
+            let original = paths().require_closed_dependency_execution().unwrap();
+            assert!(original.require_local_capture().is_err());
+            let installed = outputs
+                .iter()
+                .map(|(name, _, bytes)| install_bytes(&original, &offer, name, bytes))
+                .collect::<Vec<_>>();
+            assert!(register(&original, &fixture, &offer, &installed).is_err());
+            assert!(original.committed_outputs.0.lock().unwrap().is_empty());
+            fixture.commit(&offer);
+            assert!(
+                original
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&original, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err(),
+                "publication alone cannot discover installed ancestry"
+            );
+            register(&original, &fixture, &offer, &installed).unwrap();
+            let captured = original
+                .capture_committed_inputs(
+                    &fixture.coord,
+                    observed(&original, false),
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                )
+                .unwrap();
+            captured.verify_original().unwrap();
+            assert_eq!(captured.ancestors().len(), 1);
+            assert_eq!(
+                captured.ancestors()[0].producer_action_key,
+                offer.manifest.action_key
+            );
+            assert_eq!(
+                captured.ancestors()[0].consumed_object.0,
+                object_id(METADATA).unwrap()
+            );
+            let archive_consumer = original.capture_committed_inputs(
+                &fixture.coord,
+                observed(&original, archive),
+                CommittedDependencyPolicy::WorkspaceRlib,
+            );
+            if archive {
+                let inputs = archive_consumer.unwrap();
+                inputs.verify_original().unwrap();
+                assert_eq!(inputs.dependencies().len(), 2);
+            } else {
+                assert!(
+                    archive_consumer.is_err(),
+                    "generated check output authorized codegen"
+                );
+            }
+            for policy in [
+                CommittedDependencyPolicy::ImmutableDagRlib,
+                CommittedDependencyPolicy::ImmutableDagMetadata,
+            ] {
+                assert!(
+                    original
+                        .capture_committed_inputs(
+                            &fixture.coord,
+                            observed(&original, false),
+                            policy,
+                        )
+                        .is_err(),
+                    "generated workspace provenance escaped into {policy:?}"
+                );
+            }
+            let copied = paths();
+            for (name, _, bytes) in &outputs {
+                install_bytes(&copied, &offer, name, bytes);
+            }
+            assert!(
+                copied
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&copied, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err(),
+                "matching files in another target acquired installation authority"
+            );
+            fixture.quarantine(&offer.manifest.action_key);
+            assert!(captured.verify_original().is_err());
+            assert!(
+                original
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&original, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3666,7 +3780,7 @@ mod tests {
 
     #[test]
     fn project_executors_cannot_replace_committed_metadata_or_archive_generations() {
-        for archive in [false, true] {
+        for (archive, generated) in [(false, false), (true, false), (false, true), (true, true)] {
             for same_bytes in [false, true] {
                 let fixture = WorkspaceLineageFixture::new();
                 let mut outputs = vec![(
@@ -3674,17 +3788,22 @@ mod tests {
                     OutputRole::ProvisionalMetadata,
                     METADATA,
                 )];
-                let (offer, policy) = if archive {
+                if archive {
                     outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
-                    (
-                        fixture.commit_leaf(41, &outputs),
-                        CommittedDependencyPolicy::WorkspaceRlib,
-                    )
+                }
+                let offer = if generated {
+                    let offer = fixture.prepare_generated_leaf(41, &outputs, !archive);
+                    fixture.commit(&offer);
+                    offer
+                } else if archive {
+                    fixture.commit_leaf(41, &outputs)
                 } else {
-                    (
-                        fixture.commit_metadata_leaf(41, &outputs),
-                        CommittedDependencyPolicy::WorkspaceMetadata,
-                    )
+                    fixture.commit_metadata_leaf(41, &outputs)
+                };
+                let policy = if archive {
+                    CommittedDependencyPolicy::WorkspaceRlib
+                } else {
+                    CommittedDependencyPolicy::WorkspaceMetadata
                 };
                 let paths = paths().require_closed_dependency_execution().unwrap();
                 assert!(paths.require_local_capture().is_err());
@@ -3731,7 +3850,7 @@ mod tests {
                             policy,
                         )
                         .is_err(),
-                    "archive={archive}, same_bytes={same_bytes}"
+                    "archive={archive}, generated={generated}, same_bytes={same_bytes}"
                 );
                 // Only a separately verified reinstall can mint the new
                 // generation. Old observations never refresh themselves.

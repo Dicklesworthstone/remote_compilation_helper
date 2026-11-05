@@ -108,10 +108,11 @@ impl ProducerPolicy {
             ProducerDomain::ImmutableDag | ProducerDomain::WorkspaceDag
         );
         match risk {
-            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib => {
-                workspace
-            }
+            ActionClassRisk::ClosedWorkspaceRlib
+            | ActionClassRisk::GeneratedWorkspaceRlib
+            | ActionClassRisk::CommittedWorkspaceRlib => workspace,
             ActionClassRisk::ClosedWorkspaceMetadata
+            | ActionClassRisk::GeneratedWorkspaceMetadata
             | ActionClassRisk::CommittedWorkspaceMetadata => workspace && self.metadata_allowed,
             ActionClassRisk::MixedWorkspaceRlib => mixed,
             ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
@@ -472,6 +473,16 @@ pub(super) fn check_offer(
     lease_now: &dyn Fn() -> u64,
 ) -> Result<(), String> {
     let risk = recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?;
+    if matches!(
+        risk,
+        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+    ) {
+        return if offer.provisional_ancestors.is_empty() {
+            Ok(())
+        } else {
+            Err("generated workspace leaf offer contains unexpected producer ancestry".into())
+        };
+    }
     if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
         return if offer.provisional_ancestors.is_empty() {
             Ok(())
@@ -511,6 +522,20 @@ pub(super) fn check_serving(
     epoch: u64,
 ) -> Result<(), String> {
     let risk = recorded_action_risk(store, action).map_err(store_error)?;
+    if matches!(
+        risk,
+        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+    ) {
+        return if store
+            .list_provisional_ancestors(&digest_key(action))
+            .map_err(store_error)?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err("generated workspace leaf publication contains unexpected producer ancestry".into())
+        };
+    }
     if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
         return if store
             .list_provisional_ancestors(&digest_key(action))
@@ -703,6 +728,7 @@ fn verify_graph(
         let metadata_producer = matches!(
             risk,
             ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::GeneratedWorkspaceMetadata
                 | ActionClassRisk::CommittedWorkspaceMetadata
                 | ActionClassRisk::MixedWorkspaceMetadata
                 | ActionClassRisk::ImmutableDagMetadata
@@ -774,6 +800,8 @@ fn verify_graph(
             risk,
             ActionClassRisk::ClosedWorkspaceRlib
                 | ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::GeneratedWorkspaceRlib
+                | ActionClassRisk::GeneratedWorkspaceMetadata
                 | ActionClassRisk::LowRiskRegistry
         ) && !ancestors.is_empty())
             || (matches!(
@@ -964,6 +992,24 @@ pub(crate) mod tests {
             self.prepare_class(tag, parents, outputs, class)
         }
 
+        pub(crate) fn prepare_generated_leaf(
+            &self,
+            tag: u8,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            self.prepare_class(
+                tag,
+                Vec::new(),
+                outputs,
+                if metadata {
+                    LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+                } else {
+                    LIVE_GENERATED_WORKSPACE_RLIB_CLASS
+                },
+            )
+        }
+
         pub(crate) fn prepare_mixed(
             &self,
             tag: u8,
@@ -1075,6 +1121,8 @@ pub(crate) mod tests {
             let mut manifest = base.manifest.clone();
             manifest.action_key = authority.action_key.clone();
             manifest.key_epoch = key_epoch.unwrap_or(match class {
+                LIVE_GENERATED_WORKSPACE_RLIB_CLASS => 26,
+                LIVE_GENERATED_WORKSPACE_METADATA_CLASS => 27,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 _ => manifest.key_epoch,
@@ -1390,6 +1438,147 @@ pub(crate) mod tests {
         );
         fixture.commit(&c);
         [a, b, c]
+    }
+
+    #[test]
+    fn generated_workspace_leaves_keep_output_roles_origin_and_empty_ancestry() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let mut outputs = vec![(
+                "libgenerated.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated library metadata".as_slice(),
+            )];
+            if !metadata {
+                outputs.push((
+                    "libgenerated.rlib",
+                    OutputRole::Materializable,
+                    b"generated library implementation".as_slice(),
+                ));
+            }
+            let leaf = fixture.prepare_generated_leaf(70, &outputs, metadata);
+            assert_eq!(leaf.manifest.key_epoch, if metadata { 27 } else { 26 });
+            fixture.commit(&leaf);
+            fixture.assert_unsampled(&leaf);
+            for (policy, allows_metadata, allows_workspace) in [
+                (CommittedDependencyPolicy::WorkspaceRlib, false, true),
+                (CommittedDependencyPolicy::WorkspaceMetadata, true, true),
+                (CommittedDependencyPolicy::MixedWorkspaceRlib, false, true),
+                (
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                    true,
+                    true,
+                ),
+                (CommittedDependencyPolicy::WorkspaceDagRlib, false, true),
+                (CommittedDependencyPolicy::WorkspaceDagMetadata, true, true),
+                (
+                    CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                    true,
+                    true,
+                ),
+                (CommittedDependencyPolicy::ImmutableDagRlib, false, false),
+                (CommittedDependencyPolicy::ImmutableDagMetadata, true, false),
+            ] {
+                let result = fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(&leaf)], policy);
+                assert_eq!(
+                    result.is_ok(),
+                    allows_workspace && (!metadata || allows_metadata),
+                    "metadata={metadata}, policy={policy:?}, result={result:?}"
+                );
+            }
+
+            let consumer = if metadata {
+                fixture.prepare_metadata(
+                    71,
+                    vec![consumes(&leaf)],
+                    &[(
+                        "libconsumer.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"consumer metadata",
+                    )],
+                )
+            } else {
+                fixture.prepare(
+                    71,
+                    vec![consumes(&leaf)],
+                    &[
+                        (
+                            "libconsumer.rmeta",
+                            OutputRole::ProvisionalMetadata,
+                            b"consumer metadata",
+                        ),
+                        (
+                            "libconsumer.rlib",
+                            OutputRole::Materializable,
+                            b"consumer archive",
+                        ),
+                    ],
+                )
+            };
+            fixture.commit(&consumer);
+            fixture.compare_twice(&leaf);
+            fixture.compare_twice(&consumer);
+            for (name, offer) in [("generated", &leaf), ("consumer", &consumer)] {
+                let destination = fixture.root.path().join(format!("healthy-{name}"));
+                assert!(matches!(
+                    fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::Served { .. }
+                ));
+            }
+
+            // Generated leaves cannot acquire a producer graph merely through
+            // a generated class receipt, either at commit or after retention.
+            let invalid = fixture.prepare_class(
+                72,
+                vec![consumes(&leaf)],
+                &outputs,
+                if metadata {
+                    LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+                } else {
+                    LIVE_GENERATED_WORKSPACE_RLIB_CLASS
+                },
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&invalid, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains("generated workspace leaf offer")
+            ));
+            fixture.assert_unpublished(&invalid);
+
+            let parent = consumes(&consumer);
+            let held = fixture.cas.store().lock().unwrap();
+            let mut engine =
+                RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+            assert_eq!(
+                engine.execute(
+                    "INSERT INTO provisional_ancestry (consumer_action_key, producer_action_key, role, virtual_path, object_key, adopted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    &[
+                        SqlValue::Text(digest_key(&leaf.manifest.action_key)),
+                        SqlValue::Text(digest_key(&parent.producer_action_key)),
+                        SqlValue::Text("provisional-metadata".into()),
+                        SqlValue::Blob(parent.virtual_path.as_bytes().to_vec()),
+                        SqlValue::Text(digest_key(&parent.consumed_object.0)),
+                    ],
+                ).unwrap(),
+                1,
+            );
+            drop(engine);
+            drop(held);
+            for (name, offer, refusal) in [
+                ("generated", &leaf, "generated workspace leaf publication"),
+                ("consumer", &consumer, "inconsistent class ancestry"),
+            ] {
+                let destination = fixture.root.path().join(format!("refused-{name}"));
+                assert!(matches!(
+                    fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                        if reason.contains(refusal)
+                ));
+                assert!(!destination.exists());
+            }
+        }
     }
 
     #[test]

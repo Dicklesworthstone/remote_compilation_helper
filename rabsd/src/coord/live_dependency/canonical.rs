@@ -1819,12 +1819,12 @@ mod tests {
     }
 
     #[test]
-    fn executor_graphs_keep_generated_and_native_libraries_in_fresh_execution() {
+    fn executor_graphs_qualify_generated_leaves_but_keep_native_searches_fresh() {
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
         use rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library;
         use rabs_key::live_dependency::{DependencySourceKind, remote_workspace_execution_shape};
 
-        for native in [false, true] {
+        for native in 0..3 {
             let paths = workspace_target_paths("lib", "lib", false, true, None)
                 .require_closed_dependency_execution()
                 .unwrap();
@@ -1839,7 +1839,7 @@ mod tests {
                 .push(("OUT_DIR".into(), generated.into()));
             execution.execution_env.sort();
             execution.keyed_env = execution.execution_env.clone();
-            if native {
+            if native > 0 {
                 std::fs::write(
                     physical.join("libgenerated.a"),
                     crate::test_util::closed_rlib_fixture(b"retained native input"),
@@ -1849,17 +1849,45 @@ mod tests {
                     .invocation
                     .lib_search
                     .push(format!("native={generated}"));
-                execution
-                    .invocation
-                    .native_libs
-                    .push("static=generated".into());
+                if native == 2 {
+                    execution
+                        .invocation
+                        .native_libs
+                        .push("static=generated".into());
+                }
             }
             // These are valid fresh worker execution shapes, not malformed
             // plans that happen to fail both the old and new cache boundary.
             paths.require_workspace_execution(&execution).unwrap();
             remote_workspace_execution_shape(&execution, &[], "/__rabs/toolchain").unwrap();
             assert!(paths.require_local_capture().is_err());
-            assert!(plan_closed_workspace_library(&execution).is_err());
+            if native == 0 {
+                let generated = plan_closed_workspace_library(&execution).unwrap();
+                assert_eq!(
+                    generated.source_kind,
+                    DependencySourceKind::WorkspaceGeneratedMetadata
+                );
+                paths.require_workspace_closed_library(&generated).unwrap();
+                let mut unselected = generated.clone();
+                unselected.invocation.features.clear();
+                assert!(paths.require_workspace_closed_library(&unselected).is_err());
+                let mut no_generated = generated;
+                no_generated.generated_root = None;
+                no_generated
+                    .execution_env
+                    .retain(|(name, _)| name != "OUT_DIR");
+                no_generated.keyed_env = no_generated.execution_env.clone();
+                assert!(
+                    paths
+                        .require_workspace_closed_library(&no_generated)
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    plan_closed_workspace_library(&execution).is_err(),
+                    "search-only native inputs must also retain fresh execution"
+                );
+            }
             assert!(plan_mixed_workspace_library(&execution).is_err());
             let mut relabeled = execution.clone();
             relabeled.source_kind = DependencySourceKind::WorkspaceClosedMetadata;
@@ -2434,12 +2462,211 @@ mod tests {
             }
         }
 
+        fn workspace(mut self, archive: bool) -> Self {
+            use rabs_key::live_dependency::plan_canonical_workspace_execution;
+            use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+            use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
+
+            let package = "/__rabs/workspace/app";
+            let source = self.paths.physical(Path::new(package)).unwrap();
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("Cargo.toml"),
+                b"[package]\nname='generated'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='lib.rs'\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("lib.rs"),
+                b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+            )
+            .unwrap();
+            let argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=generated".into(),
+                "--crate-type=lib".into(),
+                if archive {
+                    "--emit=dep-info,metadata,link".into()
+                } else {
+                    "--emit=dep-info,metadata".into()
+                },
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                format!("--out-dir={}", self.plan.out_dir),
+                "app/lib.rs".into(),
+            ];
+            let mut env = self.plan.execution_env.clone();
+            for (name, value) in &mut env {
+                if name == "CARGO_MANIFEST_DIR" {
+                    *value = package.into();
+                }
+            }
+            env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: "/__rabs/workspace",
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
+                "pkg_id":"path+file:///__rabs/workspace/app#generated@0.1.0",
+                "target":{"kind":["lib"],"crate_types":["lib"],"name":"generated",
+                    "src_path":"/__rabs/workspace/app/lib.rs","edition":"2021"},
+                "profile":{"name":"dev"},"platform":null,
+                "mode":if archive { "build" } else { "check" },
+                "features":[],"dependencies":[]
+            }]});
+            let graph = validate_compilation_unit_graph(
+                &graph,
+                if archive {
+                    CompilationCommand::Build
+                } else {
+                    CompilationCommand::Check
+                },
+            )
+            .unwrap();
+            self.paths = self
+                .paths
+                .with_workspace_units(graph.workspace_units(), None)
+                .unwrap()
+                .require_closed_dependency_execution()
+                .unwrap();
+            self.plan = plan_closed_workspace_library(&fresh).unwrap();
+            self.physical = self.paths.project_plan(&self.plan).unwrap();
+            self.binding = self
+                .paths
+                .generated_root(&self.plan, &self.physical)
+                .unwrap()
+                .unwrap();
+            self
+        }
+
         fn capture(
             &self,
             facts: &Arc<crate::edge::live_facts::LiveFacts>,
         ) -> Result<Arc<crate::edge::live_facts::PackageFacts>, crate::edge::live_facts::FactsMiss>
         {
             facts.package_canonical(&self.physical, Some(&self.binding), &[])
+        }
+    }
+
+    #[test]
+    fn generated_workspace_leaves_retain_original_tree_and_cargo_record_generations() {
+        use crate::edge::live_facts::LiveFacts;
+        use rabs_key::live_dependency::DependencySourceKind;
+
+        for archive in [false, true] {
+            for mutation in [
+                "generated-bytes",
+                "same-byte-file",
+                "added-member",
+                "empty-directory",
+                "source-member",
+                "stdout",
+                "same-byte-record",
+                "root-output",
+                "output-alias",
+            ] {
+                let fixture = GeneratedFixture::new(true, archive).workspace(archive);
+                assert_eq!(
+                    fixture.plan.source_kind,
+                    if archive {
+                        DependencySourceKind::WorkspaceGeneratedRlib
+                    } else {
+                        DependencySourceKind::WorkspaceGeneratedMetadata
+                    }
+                );
+                fixture
+                    .paths
+                    .require_workspace_closed_library(&fixture.plan)
+                    .unwrap();
+                assert!(fixture.paths.require_local_capture().is_err());
+                let facts = LiveFacts::new();
+                let captured = fixture.capture(&facts).unwrap();
+                captured
+                    .verify_unchanged(Path::new(&fixture.physical.source_root))
+                    .unwrap();
+                captured
+                    .verify_generated_disjoint(&fixture.physical)
+                    .unwrap();
+                assert_eq!(captured.generated_files.len(), 1);
+                assert_eq!(
+                    captured.build_script_output.as_deref(),
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n".as_slice())
+                );
+                assert!(
+                    !captured
+                        .source_directory_enumerations(&fixture.plan)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    captured
+                        .generated_directory_enumerations(&fixture.plan)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let generated = fixture.binding.physical();
+                match mutation {
+                    "generated-bytes" => {
+                        std::fs::write(generated.join("value.rs"), b"pub const VALUE: u32 = 23;\n")
+                    }
+                    "same-byte-file" => {
+                        let replacement = fixture._owner.path().join("replacement.rs");
+                        std::fs::write(
+                            &replacement,
+                            std::fs::read(generated.join("value.rs")).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::rename(replacement, generated.join("value.rs"))
+                    }
+                    "added-member" => {
+                        std::fs::write(generated.join("new.rs"), b"new generated input")
+                    }
+                    "empty-directory" => std::fs::create_dir(generated.join("new-empty")),
+                    "source-member" => std::fs::write(
+                        Path::new(&fixture.physical.source_root).join("new-shared-input"),
+                        b"new source input",
+                    ),
+                    "stdout" => {
+                        std::fs::write(&fixture.stdout, b"cargo::rustc-env=BUILD_LABEL=changed\n")
+                    }
+                    "same-byte-record" => {
+                        let replacement = fixture._owner.path().join("replacement-output");
+                        std::fs::write(&replacement, std::fs::read(&fixture.stdout).unwrap())
+                            .unwrap();
+                        std::fs::rename(replacement, &fixture.stdout)
+                    }
+                    "root-output" => {
+                        std::fs::write(&fixture.record, b"/__rabs/out/cargo/debug/build/other/out")
+                    }
+                    "output-alias" => std::fs::hard_link(
+                        generated.join("value.rs"),
+                        Path::new(&fixture.physical.out_dir).join(&fixture.plan.output_names()[0]),
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert!(
+                    captured
+                        .verify_unchanged(Path::new(&fixture.physical.source_root))
+                        .is_err(),
+                    "archive={archive}, {mutation}: original generated proof refreshed itself"
+                );
+                if mutation == "output-alias" {
+                    assert!(
+                        captured
+                            .verify_generated_disjoint(&fixture.physical)
+                            .is_err()
+                    );
+                }
+                if mutation == "root-output" {
+                    assert!(fixture.capture(&facts).is_err());
+                }
+            }
         }
     }
 

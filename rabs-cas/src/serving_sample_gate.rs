@@ -68,6 +68,13 @@ pub enum ActionClassRisk {
     /// negotiated closed metadata namespace. Archive and dependency evidence
     /// cannot promote this separately qualified class.
     ClosedWorkspaceMetadata,
+    /// Workspace leaf archives with a complete sealed Cargo OUT_DIR, exact
+    /// build-script output record and environment. This qualifies the compiler
+    /// action only; the build script still executes for the current operation.
+    GeneratedWorkspaceRlib,
+    /// The separately sampled closed-metadata counterpart of generated-input
+    /// workspace leaves. Neither pure-workspace nor archive evidence enrolls it.
+    GeneratedWorkspaceMetadata,
     /// Complete-workspace archives whose entire retained Rust candidate set
     /// comes from exact committed workspace producers. Separate class evidence
     /// and transitive producer safety are required; dependency SPRT stays closed.
