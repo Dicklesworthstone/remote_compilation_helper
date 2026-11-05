@@ -2,7 +2,58 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at02:38UTC (November4 local):**
+**Latest execution checkpoint, November5 at04:16UTC (November4 local):**
+
+- [x] Finish DSR56c5601e: full workspace check and strict Clippy PASS, normal
+  SEVEN release roles PASS, actual Rustls artifact retains BOTH ring/AWS-LC,
+  ordinary canonical harness compiles and all four exact native names exist.
+  Source/control/tool after-audits match. Native overall0; terminal receipt
+  `terminal-main-tls-pin-guard-build.json` (29342B/ae38f26e).
+- [x] Exercise original cold CHECK+BUILD with those exact normal binaries:
+  DSRf91c15ca FAIL, CHECK0/1/raw101/358.891s; BUILD/program UNRUN. Actual TLS
+  worker startup, admission, pinned/adopted complete SDK and captured runtime
+  work; no crypto panic. The unchanged Cargo300s deadline expires. Execution
+  completion later fails/retains uncertainty; it is not a compiler pass.
+- [x] Exercise explicit full-SDK prewarm/shared-service: first attempt6f56b769
+  refuses an existing scratch directory before any native case (operator
+  staging error, preserved). Retry884ad905 uses a fresh short path, with only
+  job/path/context changes and all original bounds. Case0/1/raw101/464.120s:
+  real warm succeeds, TLS worker remains ready through six idle heartbeats,
+  FIRST SDK acquisition is pinned/reused and runtime is captured. FIRST real
+  Cargo client still expires at300s; later requests/service restart UNRUN.
+  Executed/cancelled exit130 receipt is not compilation success. Complete
+  original SDK/source/tool after-audits match in both actual runtime runs.
+- [x] Correct stale TRJ status reporting:06f80ff7 had already failed its exact
+  inventory preflight (72810 installed entries versus original5256), before
+  any warm invocation. c630127d subsequently failed original30min warm bound
+  on the original retained ZFS SDK; second process UNRUN. Root mistakenly
+  treated partial run.json as active instead of terminal DSR state; disclosed.
+  TS2b874727f complete-SDK CLI capture/reopen remains separately PASS.
+- [x] Test then abandon256KiB verification buffer experiment: DSRc4dcdecb
+  terminal0; six scan unit cases plus two explicitly invoked native comparison
+  cases PASS. SAME invocation has LIVE64KiB two-reader incumbent versus256KiB,
+  four complete-SDK pairs and identical file/ordered digests. Only1–2.5percent
+  improvement; experiment removed manually. Current module matches committed
+  431c01f1 exactly (68702B/9f8b6b36); no peer changes discarded. Prototype
+  source and proof retained. This is not a fleet or end-to-end win.
+- [x] Identify the larger already-implemented gap: failed cold/warm binaries
+  predate431c01f1 bounded parallel verifier. The live full-SDK serial comparison
+  measures about44s versus22s per scan; every byte/stamp/namespace barrier and
+  ONE optional process-wide helper remain. Current code needs normal combined
+  binary qualification and original runtime execution, not another microbuffer.
+- [ ] Freeze current committed source, compile normal ALL7 and ordinary harness;
+  execute existing scan and real-filesystem tests without zero-run credit.
+- [ ] Complete current full workspace/all-target check, strict Clippy and fmt.
+- [ ] Run matching original full-SDK CHECK+BUILD and separate prewarmed shared
+  service with unchanged300s/600s/3600s bounds, SDK, profiles and storage gates.
+  Require actual compiler success, outputs/replay, cleanup and terminal receipts.
+- [ ] If still red, profile the failed phase and fix that measured bottleneck;
+  do not skip full verification, add SDK memoization, trim SDK or relax clocks.
+- [ ] Public ordinary-RCH cache ladder0/4, worker restart, cross-host compiler,
+  M6 two15-agent/no-swap-collapse runs and signed S7 two-host installation remain
+  UNRUN/unqualified. Existing Beads remain open; no overall operational claim.
+
+**Earlier execution checkpoint, November5 at02:38UTC (retained):**
 
 - [x] Qualify the actual full-SDK warm CLI on TS2, DSRb874727f (launched
   02:30:46UTC; controller9239B/d04d1bd1). Sourcebf76 normal worker from the
