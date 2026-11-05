@@ -566,6 +566,7 @@ mod tests {
             error: None,
             error_code: None,
             capabilities: None,
+            source_topology: None,
             missing_components: Vec::new(),
             disk: Default::default(),
         };
@@ -588,6 +589,7 @@ mod tests {
             error: Some("Connection refused".to_string()),
             error_code: Some("RCH-E108".to_string()),
             capabilities: None,
+            source_topology: None,
             missing_components: Vec::new(),
             disk: Default::default(),
         };

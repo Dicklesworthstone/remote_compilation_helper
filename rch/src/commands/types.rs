@@ -94,6 +94,10 @@ pub struct WorkerProbeResult {
     /// Exact runtime/toolchain capability inventory returned by `rch-wkr`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<WorkerCapabilities>,
+    /// Fresh check of this dispatcher's canonical/alias roots, independent of
+    /// the worker-default topology in its capability inventory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_topology: Option<crate::source_topology_probe::SourceTopologyProbe>,
     /// Project-declared rustup components absent from this worker's matching
     /// toolchain. Non-empty means connectivity succeeded but command admission
     /// must not report the worker as ready.
@@ -108,9 +112,9 @@ pub struct WorkerProbeResult {
 pub struct WorkerProbeSummary {
     /// Total workers probed.
     pub total: usize,
-    /// Workers that answered the health check successfully.
+    /// Workers that passed connectivity, runtime and applicable namespace checks.
     pub healthy: usize,
-    /// Workers that reachable but failed the health check.
+    /// Reachable workers that failed health or dispatcher namespace checks.
     pub unhealthy: usize,
     /// Reachable workers missing a project-declared toolchain component.
     pub capability_missing: usize,

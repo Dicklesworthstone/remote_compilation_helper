@@ -20,6 +20,7 @@ pub mod fleet;
 mod hook;
 pub mod local_builds;
 mod self_healing_overrides;
+mod source_topology_probe;
 pub mod state;
 mod status_display;
 mod status_types;

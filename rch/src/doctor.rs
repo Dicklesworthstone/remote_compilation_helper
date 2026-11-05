@@ -7,6 +7,7 @@ use crate::commands::{
     DoctorCheck, DoctorCheckStatus, DoctorFixApplied, DoctorResponse, DoctorSummary, config_dir,
     load_workers_from_config, send_daemon_command,
 };
+use crate::source_topology_probe::{self, SourceTopologyOutcome, SourceTopologyProbe};
 use crate::state::primitives::IdempotentResult;
 use crate::status_display::query_daemon_full_status;
 use crate::status_types::{
@@ -383,10 +384,9 @@ impl ReliabilityCategory {
 /// Each named variant maps to one of the `reliability_*_diagnostics`
 /// probes in `run_reliability_doctor`. Operators triaging a known
 /// symptom can pass `--scope=pressure` (or any subset, comma-separated)
-/// to skip the irrelevant probes — typical 8-probe sweep takes ~2s
-/// against an 8-worker fleet (the ownership fan-out adds one bounded
-/// SSH round-trip per worker, run concurrently), scope=topology is
-/// still ~50ms.
+/// to skip the irrelevant probes. Topology includes a read-only check of the
+/// dispatcher's canonical/alias roots on each worker, with eight concurrent
+/// SSH probes and a nine-second fleet deadline. Ownership also probes workers.
 ///
 /// Naming uses the operator-facing labels per the bead: `convergence`
 /// (not `repo_presence`), `triage` (not `process_debt`), `helpers`
@@ -1232,6 +1232,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     // Phase 2 — sync file I/O. These are microseconds each and can run
     // on the current thread while the spawned probes are in flight.
     let config_result = if scope.needs_rollout_config()
+        || scope.matches(ReliabilityScope::Topology)
         || scope.matches(ReliabilityScope::Ownership)
         || scope.matches(ReliabilityScope::Triage)
     {
@@ -1242,7 +1243,8 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     tracing::debug!(
         target: "rch::doctor::config_loads",
         loaded = matches!(config_result.as_ref(), Some(Ok(_))),
-        skipped = !(scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership)
+        skipped = !(scope.needs_rollout_config() || scope.matches(ReliabilityScope::Topology)
+            || scope.matches(ReliabilityScope::Ownership)
             || scope.matches(ReliabilityScope::Triage)),
         "doctor.config.load",
     );
@@ -1282,6 +1284,32 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         }
     } else {
         (None, None)
+    };
+    let requested_source_topology = match config_result.as_ref() {
+        Some(Ok(config)) => source_topology_probe::requested_topology(config),
+        Some(Err(error)) => Err(format!(
+            "cannot load dispatcher topology configuration: {error}"
+        )),
+        None => Err("topology scope not selected".to_string()),
+    };
+    let source_topology_handle = if scope.matches(ReliabilityScope::Topology) {
+        workers
+            .as_ref()
+            .filter(|workers| !workers.is_empty())
+            .map(|workers| {
+                let workers = workers.clone();
+                let requested = requested_source_topology.clone();
+                tokio::spawn(async move {
+                    timed_async_probe("source_topology", async {
+                        Ok::<_, String>(
+                            source_topology_probe::probe_fleet(&workers, &requested).await,
+                        )
+                    })
+                    .await
+                })
+            })
+    } else {
+        None
     };
     // Phase 2.5 — bd-kugfc: the ownership probe needs the loaded worker
     // list, so it spawns after Phase 2 and joins with everything else in
@@ -1340,6 +1368,8 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         join_isolated_async_probe("repo_convergence", convergence_handle).await;
     let (helper_diags_override, helpers_outcome) =
         join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
+    let (source_topology_results, source_topology_outcome) =
+        join_isolated_async_probe("source_topology", source_topology_handle).await;
     let (ownership_results, ownership_outcome) = join_ownership_probe(ownership_handle).await;
     let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
     tracing::info!(
@@ -1347,6 +1377,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         daemon = %daemon_outcome.label(),
         repo_convergence = %convergence_outcome.label(),
         helpers = %helpers_outcome.label(),
+        source_topology = %source_topology_outcome.label(),
         join_elapsed_ms,
         "doctor.probes.joined",
     );
@@ -1365,6 +1396,12 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
             workers.as_deref(),
             daemon_status.as_ref(),
             worker_config_error.clone(),
+        ));
+        diagnostics.extend(reliability_source_topology_diagnostics(
+            workers.as_deref(),
+            source_topology_results.as_deref(),
+            &requested_source_topology,
+            source_topology_outcome,
         ));
     }
     if scope.matches(ReliabilityScope::Ownership) {
@@ -2389,6 +2426,61 @@ fn reliability_topology_diagnostics(
 
     diagnostics.extend(status.workers.iter().map(worker_topology_diagnostic));
     diagnostics
+}
+
+fn reliability_source_topology_diagnostics(
+    workers: Option<&[rch_common::WorkerConfig]>,
+    results: Option<&[SourceTopologyProbe]>,
+    requested: &Result<rch_common::SourceTopology, String>,
+    outcome: ProbeOutcome,
+) -> Vec<ReliabilityDiagnostic> {
+    let Some(workers) = workers else {
+        // The existing workers-config diagnostic reports this failure.
+        return Vec::new();
+    };
+    let fallback = SourceTopologyProbe::unavailable(
+        requested.as_ref().ok(),
+        &format!("namespace probe did not report ({})", outcome.label()),
+    );
+    workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| {
+            let probe = results
+                .and_then(|results| results.get(index))
+                .unwrap_or(&fallback);
+            let (severity, code) = match probe.outcome {
+                SourceTopologyOutcome::Compatible => (
+                    ReliabilitySeverity::Pass,
+                    ReliabilityReasonCode::WorkerReady,
+                ),
+                SourceTopologyOutcome::Skipped => (
+                    ReliabilitySeverity::Info,
+                    ReliabilityReasonCode::WorkersConfigured,
+                ),
+                _ => (
+                    ReliabilitySeverity::Warning,
+                    ReliabilityReasonCode::WorkerDegraded,
+                ),
+            };
+            let mut diagnostic = ReliabilityDiagnostic::new(
+                ReliabilityCategory::Topology,
+                "worker_source_topology",
+                severity,
+                format!("Worker {}: {}", worker.id, probe.outcome.summary()),
+                code,
+            )
+            .with_worker(worker.id.to_string())
+            .with_details(probe.describe());
+            if severity == ReliabilitySeverity::Warning {
+                diagnostic = diagnostic.with_remediation(
+                    "rch config show --sources",
+                    format!("rch workers probe {} --json", worker.id),
+                );
+            }
+            diagnostic
+        })
+        .collect()
 }
 
 /// bd-kugfc: build mirror-ownership diagnostics from the per-worker
@@ -5990,10 +6082,49 @@ fn check_claude_code_hook() -> CheckResult {
 // Worker Checks
 // =============================================================================
 
+fn worker_source_topology_check(worker_id: &str, probe: &SourceTopologyProbe) -> CheckResult {
+    let status = match probe.outcome {
+        SourceTopologyOutcome::Compatible => CheckStatus::Pass,
+        SourceTopologyOutcome::Unavailable => CheckStatus::Warning,
+        SourceTopologyOutcome::Skipped => CheckStatus::Skipped,
+        _ => CheckStatus::Fail,
+    };
+    let suggestion = if probe.outcome.is_defect() {
+        Some(format!(
+            "Ask the worker's directory owner to verify the configured canonical/alias mapping; \
+             recheck with 'rch workers probe {worker_id}'. Existing directories are never repaired by this check."
+        ))
+    } else if probe.outcome == SourceTopologyOutcome::Unavailable {
+        Some(format!(
+            "Review dispatcher configuration and SSH access, then run 'rch workers probe {worker_id}'"
+        ))
+    } else {
+        None
+    };
+    CheckResult {
+        category: "workers".to_string(),
+        name: format!("source_topology:{worker_id}"),
+        status,
+        message: format!(
+            "Worker {worker_id}: {}",
+            if probe.outcome.is_defect() {
+                probe.describe()
+            } else {
+                probe.outcome.summary().to_string()
+            }
+        ),
+        details: Some(probe.describe()),
+        suggestion,
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
 async fn check_workers(
     checks: &mut Vec<CheckResult>,
     ctx: &OutputContext,
-    options: &DoctorOptions,
+    _options: &DoctorOptions,
 ) {
     let style = ctx.theme();
 
@@ -6002,7 +6133,6 @@ async fn check_workers(
         println!();
     }
 
-    // Only check connectivity if verbose mode or explicitly requested
     let workers = match load_workers_from_config() {
         Ok(w) => w,
         Err(_) => {
@@ -6061,12 +6191,12 @@ async fn check_workers(
     print_check_result(&count_result, ctx);
     checks.push(count_result);
 
-    // Only probe workers in verbose mode
-    if options.verbose && !ctx.is_json() {
-        println!(
-            "  {}",
-            style.muted("(use --verbose to probe worker connectivity)")
-        );
+    let requested = source_topology_probe::load_requested_topology();
+    let probes = source_topology_probe::probe_fleet(&workers, &requested).await;
+    for (worker, probe) in workers.iter().zip(&probes) {
+        let result = worker_source_topology_check(worker.id.as_str(), probe);
+        print_check_result(&result, ctx);
+        checks.push(result);
     }
 
     if !ctx.is_json() {
@@ -6588,6 +6718,87 @@ mod tests {
             "total_slots": 8
         }))
         .expect("worker config fixture should parse")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_topology_actual_conflict_reaches_both_doctor_reports_without_repair() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let canonical = fixture.path().join("dispatcher-projects");
+        let physical = fixture.path().join("worker-projects");
+        let alias = fixture.path().join("alias");
+        std::fs::create_dir(&canonical).unwrap();
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let physical_resolved = std::fs::canonicalize(&physical).unwrap();
+        let requested = rch_common::SourceTopology {
+            canonical_root: canonical.to_str().unwrap().to_string(),
+            alias_root: alias.to_str().unwrap().to_string(),
+        };
+        let probe = source_topology_probe::probe_local_for_test(&requested, fixture.path());
+        let normal = worker_source_topology_check("fixture", &probe);
+        assert_eq!(normal.status, CheckStatus::Fail);
+        assert!(normal.message.contains(canonical.to_str().unwrap()));
+        assert!(normal.message.contains(physical_resolved.to_str().unwrap()));
+        assert!(!normal.fixable);
+        assert!(!normal.fix_applied);
+        let diagnostics = reliability_source_topology_diagnostics(
+            Some(&[ownership_worker("fixture")]),
+            Some(&[probe]),
+            &Ok(requested),
+            ProbeOutcome::Ok,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].check_name, "worker_source_topology");
+        assert_eq!(diagnostics[0].severity, ReliabilitySeverity::Warning);
+        assert_eq!(diagnostics[0].worker_id.as_deref(), Some("fixture"));
+        assert!(
+            diagnostics[0]
+                .details
+                .as_ref()
+                .unwrap()
+                .contains(physical_resolved.to_str().unwrap())
+        );
+        assert!(auto_config_flip(diagnostics[0].code).is_none());
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+    }
+
+    #[test]
+    fn source_topology_missing_probe_and_skipped_probe_never_become_passes() {
+        let workers = [ownership_worker("unavailable"), ownership_worker("skipped")];
+        let unavailable = SourceTopologyProbe::unavailable(None, "configuration unavailable");
+        let mut skipped =
+            SourceTopologyProbe::unavailable(None, "Windows namespace does not apply");
+        skipped.outcome = SourceTopologyOutcome::Skipped;
+        assert_eq!(
+            worker_source_topology_check("unavailable", &unavailable).status,
+            CheckStatus::Warning
+        );
+        assert_eq!(
+            worker_source_topology_check("skipped", &skipped).status,
+            CheckStatus::Skipped
+        );
+        let diagnostics = reliability_source_topology_diagnostics(
+            Some(&workers),
+            Some(&[unavailable, skipped]),
+            &Err("invalid config".to_string()),
+            ProbeOutcome::Ok,
+        );
+        assert_eq!(diagnostics[0].severity, ReliabilitySeverity::Warning);
+        assert_eq!(diagnostics[1].severity, ReliabilitySeverity::Info);
+        let timed_out = reliability_source_topology_diagnostics(
+            Some(&workers),
+            None,
+            &Err("invalid config".to_string()),
+            ProbeOutcome::Timeout,
+        );
+        assert_eq!(timed_out.len(), 2);
+        assert!(
+            timed_out
+                .iter()
+                .all(|diagnostic| diagnostic.severity == ReliabilitySeverity::Warning)
+        );
     }
 
     #[test]
