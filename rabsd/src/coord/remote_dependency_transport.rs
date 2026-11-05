@@ -137,6 +137,7 @@ pub struct RemoteDependencyTransport {
     cooldown: Arc<Mutex<ConnectionCooldown>>,
     readiness: Arc<standby::Readiness>,
     listener: Mutex<Option<Arc<standby::Listener>>>,
+    admission: Mutex<Option<Arc<PinnedWorkerAdmission>>>,
 }
 
 impl RemoteDependencyTransport {
@@ -184,6 +185,7 @@ impl RemoteDependencyTransport {
             cooldown: Arc::new(Mutex::new(ConnectionCooldown::default())),
             readiness: Arc::new(standby::Readiness::default()),
             listener: Mutex::new(None),
+            admission: Mutex::new(None),
         })
     }
 
@@ -222,6 +224,32 @@ impl RemoteDependencyTransport {
 
     pub fn worker(&self) -> &str {
         &self.worker
+    }
+
+    /// Open once on a blocking lane, then retain the exclusive store and boot
+    /// authority between requests. Only the transport's sole reserved slot
+    /// passes this shared owner into delivery; it grants no execution rights.
+    fn admission(&self) -> io::Result<Arc<PinnedWorkerAdmission>> {
+        let mut owner = self
+            .admission
+            .lock()
+            .map_err(|_| io::Error::other("remote admission owner poisoned"))?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
+        if let Some(admission) = owner.as_ref() {
+            return Ok(Arc::clone(admission));
+        }
+        let admission = Arc::new(PinnedWorkerAdmission::open(
+            &self.state,
+            &self.worker,
+            self.pin,
+        )?);
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
+        *owner = Some(Arc::clone(&admission));
+        Ok(admission)
     }
 
     /// Inspect only the currently parked, TLS-pinned hello. Missing evidence
@@ -363,7 +391,17 @@ impl RemoteDependencyTransport {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        owner.map_or(Ok(()), |owner| owner.shutdown())
+        let result = owner.map_or(Ok(()), |owner| owner.shutdown());
+        // Listener shutdown joins every accepted operation before releasing
+        // its durable owner. A reservation still preparing or publishing keeps
+        // its own reference, so shutdown cannot expose a still-owned store.
+        let admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(admission);
+        result
     }
 
     /// Reserve before telling Cargo's wrapper that remote work is admitted.
@@ -483,7 +521,7 @@ impl RemoteDependencyTransport {
 
     fn execute_reserved(
         &self,
-        admission: Option<PinnedWorkerAdmission>,
+        admission: Option<Arc<PinnedWorkerAdmission>>,
         request: &Value,
         destination: &Path,
         cancellation: OperationCancellation,
@@ -533,8 +571,7 @@ impl RemoteDependencyTransport {
         // below must separately admit the actual offer into the LIVE authority.
         let admission = match admission {
             Some(admission) => admission,
-            None => PinnedWorkerAdmission::open(&self.state, &self.worker, self.pin)
-                .map_err(&before_dispatch)?,
+            None => self.admission().map_err(&before_dispatch)?,
         };
         let operation = match operation {
             ReservedOperation::Execute {
@@ -567,7 +604,7 @@ impl Drop for RemoteDependencyTransport {
 /// including any capture/publication after delivery. It cannot be cloned.
 pub struct RemoteDependencyReservation {
     transport: Arc<RemoteDependencyTransport>,
-    admission: Option<PinnedWorkerAdmission>,
+    admission: Option<Arc<PinnedWorkerAdmission>>,
     request_id: Option<u64>,
     dispatch_attempted: bool,
     /// Only this reservation's own interrupted receive can grant one reconnect.
@@ -614,8 +651,8 @@ impl RemoteDependencyReservation {
 
     /// Allocate after the wrapper accepts remote execution, before preparing
     /// the immutable request and uploads. This is blocking metadata work, never
-    /// part of the decision lane. The persistent worker lock stays owned until
-    /// execute finishes or this reservation is dropped.
+    /// part of the decision lane. The transport retains its persistent worker
+    /// lock between requests; this reservation also owns it through completion.
     pub fn allocate_request_id(&mut self) -> io::Result<u64> {
         if self.transport.stopped.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -638,11 +675,7 @@ impl RemoteDependencyReservation {
             ));
         }
         if self.admission.is_none() {
-            self.admission = Some(PinnedWorkerAdmission::open(
-                &self.transport.state,
-                &self.transport.worker,
-                self.transport.pin,
-            )?);
+            self.admission = Some(self.transport.admission()?);
         }
         let admission = self
             .admission
@@ -688,7 +721,7 @@ impl RemoteDependencyReservation {
             ));
         }
         let outcome = self.transport.execute_reserved(
-            self.admission.take(),
+            self.admission.clone(),
             request,
             destination,
             cancellation.clone(),
@@ -737,7 +770,7 @@ impl RemoteDependencyReservation {
             ));
         }
         let outcome = self.transport.execute_reserved(
-            None,
+            self.admission.clone(),
             request,
             destination,
             cancellation.clone(),
@@ -751,8 +784,9 @@ impl RemoteDependencyReservation {
 
 impl Drop for RemoteDependencyReservation {
     fn drop(&mut self) {
-        // Release persistent ownership before making the in-process slot
-        // available; its next owner must never race a still-held store lock.
+        // The transport retains persistent ownership for the next reservation.
+        // Release this reference before capacity, including after shutdown has
+        // removed the transport's reference to this admission generation.
         drop(self.admission.take());
         self.transport.occupied.store(false, Ordering::Release);
     }
@@ -819,11 +853,15 @@ mod tests {
     }
 
     fn transport_at(state: &Path) -> Arc<RemoteDependencyTransport> {
+        transport_for(state, "worker", [1; 32])
+    }
+
+    fn transport_for(state: &Path, worker: &str, pin: [u8; 32]) -> Arc<RemoteDependencyTransport> {
         Arc::new(
             RemoteDependencyTransport::new(
                 "127.0.0.1:9123".parse().unwrap(),
-                "worker".into(),
-                [1; 32],
+                worker.into(),
+                pin,
                 state.to_path_buf(),
                 TlsFiles {
                     ca: PathBuf::from("/private/ca.pem"),
@@ -1090,6 +1128,7 @@ mod tests {
             io::ErrorKind::Interrupted
         );
         assert!(reserved.admission.is_none());
+        assert!(transport.admission.lock().unwrap().is_none());
         drop(reserved);
         assert_eq!(
             transport.try_reserve().unwrap_err().kind(),
@@ -1102,13 +1141,18 @@ mod tests {
     }
 
     #[test]
-    fn allocation_keeps_the_persistent_worker_lock_until_reservation_release() {
+    fn abandoned_allocations_reuse_admission_and_exclude_competing_owners_between_calls() {
         let state = tempfile::tempdir().unwrap();
         let transport = transport_at(state.path());
         let independent = transport_at(state.path());
         let mut reservation = transport.try_reserve().unwrap();
+        assert!(transport.admission.lock().unwrap().is_none());
+        assert!(!state.path().join("worker-admission").exists());
         let first = reservation.allocate_request_id().unwrap();
         assert!(first > 0);
+        let admission = reservation.admission.as_ref().unwrap();
+        let owner = Arc::downgrade(admission);
+        let authority = admission.authority_for_test();
         assert_eq!(
             reservation.allocate_request_id().unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
@@ -1118,12 +1162,96 @@ mod tests {
         drop(competing);
         drop(reservation);
 
-        let mut next = independent.try_reserve().unwrap();
-        assert!(next.allocate_request_id().unwrap() > first);
-        assert!(transport.try_reserve().is_ok());
-        drop(next);
-        let mut reopened = transport.try_reserve().unwrap();
-        assert!(reopened.allocate_request_id().unwrap() > first);
+        let mut last = first;
+        for _ in 0..3 {
+            let mut competing = independent.try_reserve().unwrap();
+            assert!(
+                competing.allocate_request_id().is_err(),
+                "idle transports retain their exclusive durable store ownership"
+            );
+            drop(competing);
+            let mut next = transport.try_reserve().unwrap();
+            let allocated = next.allocate_request_id().unwrap();
+            assert!(
+                allocated > last,
+                "abandoned preparation burns its request ID"
+            );
+            last = allocated;
+            let reused = next.admission.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&owner.upgrade().unwrap(), reused));
+            assert_eq!(reused.authority_for_test(), authority);
+        }
+
+        transport.shutdown().unwrap();
+        assert!(owner.upgrade().is_none());
+        let mut reopened = independent.try_reserve().unwrap();
+        assert!(reopened.allocate_request_id().unwrap() > last);
+        assert_eq!(
+            reopened
+                .admission
+                .as_ref()
+                .unwrap()
+                .authority_for_test()
+                .term,
+            authority.term + 1,
+            "only a new transport lifetime acquires another boot authority"
+        );
+    }
+
+    #[test]
+    fn retained_admission_isolated_by_worker_name_and_released_on_transport_drop() {
+        let state = tempfile::tempdir().unwrap();
+        let transport = transport_at(state.path());
+        let other = transport_for(state.path(), "other-worker", [2; 32]);
+        let changed_pin = transport_for(state.path(), "worker", [2; 32]);
+        let mut first = transport.try_reserve().unwrap();
+        let first_id = first.allocate_request_id().unwrap();
+        let mut second = other.try_reserve().unwrap();
+        let second_id = second.allocate_request_id().unwrap();
+        assert!(second_id > 0);
+        drop((first, second));
+
+        let mut competing = changed_pin.try_reserve().unwrap();
+        assert!(
+            competing.allocate_request_id().is_err(),
+            "changing the pin cannot bypass another live owner for this name"
+        );
+        drop(competing);
+        let mut second = other.try_reserve().unwrap();
+        assert!(second.allocate_request_id().unwrap() > second_id);
+        drop(second);
+        drop(transport);
+
+        let replacement = transport_at(state.path());
+        let mut reserved = replacement.try_reserve().unwrap();
+        assert!(reserved.allocate_request_id().unwrap() > first_id);
+    }
+
+    #[test]
+    fn shutdown_retains_preparing_reservations_until_their_last_owner_releases() {
+        let state = tempfile::tempdir().unwrap();
+        let transport = transport_at(state.path());
+        let independent = transport_at(state.path());
+        let mut reserved = transport.try_reserve().unwrap();
+        let first = reserved.allocate_request_id().unwrap();
+        let owner = Arc::downgrade(reserved.admission.as_ref().unwrap());
+        transport.shutdown().unwrap();
+        transport.shutdown().unwrap();
+        assert!(transport.admission.lock().unwrap().is_none());
+        assert!(owner.upgrade().is_some());
+        assert_eq!(
+            reserved.allocate_request_id().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let mut competing = independent.try_reserve().unwrap();
+        assert!(competing.allocate_request_id().is_err());
+        drop(reserved);
+        assert!(owner.upgrade().is_none());
+        assert!(competing.allocate_request_id().unwrap() > first);
+        assert_eq!(
+            transport.try_reserve().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[cfg(unix)]

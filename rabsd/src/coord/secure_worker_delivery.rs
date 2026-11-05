@@ -1683,7 +1683,7 @@ pub fn receive_authenticated_with_admission(
     receive_authenticated_inner(
         runtime,
         peer,
-        admission,
+        Arc::new(admission),
         request,
         destination,
         mode,
@@ -1701,11 +1701,13 @@ pub fn receive_authenticated_with_admission(
 /// complete prefetched hello passes through the ordinary capability and session
 /// checks, under a fresh admission budget. Continuation remains result-only and
 /// retains the original sealed result's deadline and identity restrictions.
+/// The transport retains this owner between requests and serializes delivery
+/// through its exclusive reservation. Public operator APIs consume their owner.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_standby_with_admission(
     runtime: &Runtime,
     peer: StandbyPeer,
-    admission: PinnedWorkerAdmission,
+    admission: Arc<PinnedWorkerAdmission>,
     request: &Value,
     destination: &Path,
     upload: Option<&SourceUpload>,
@@ -1748,7 +1750,7 @@ pub(crate) fn receive_standby_with_admission(
 fn receive_authenticated_inner(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
-    admission: PinnedWorkerAdmission,
+    admission: Arc<PinnedWorkerAdmission>,
     request: &Value,
     destination: &Path,
     mode: DeliveryMode,
@@ -1811,7 +1813,6 @@ fn receive_authenticated_inner(
         .map_err(&failure)?;
         source.validate_destination(destination).map_err(&failure)?;
     }
-    let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
     let cache = configured_artifact_byte_cache().map_err(&failure)?;
     let mut records =
