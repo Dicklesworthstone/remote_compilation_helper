@@ -2,7 +2,41 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at04:26UTC (November4 local):**
+**Latest execution checkpoint, November5 at07:00UTC (November5 local):**
+
+- [x] DSR81e4b380 normal current ALL7+harness terminalSUCCESS: normal release
+  build0/1187.64s, versions and actual wrapper/compiler0, ordinary harness0/
+  126.41s, all4 exact native names. Complete before/after source/control/tools
+  match. Terminal20377B/2f7d1d79. Production source remains exact dfa32.
+- [x] DSRb5637f2b full workspace check0/557.92s, strictClippy0/598.34s and
+  fmt0/15.27s. Scanner5/5 PASS. Real-filesystem suite24PASS/1FAIL/0ignored:
+  root launcher used include-ignored without required RABS_TEST_TOOLCHAIN_ROOT.
+  Installed compiler case fails before copying/compiling; original test is
+  correct and remains unchanged. Overall101/DSR6 retained; not full green.
+- [x] DSR42eaa08a repaired full worker150/150 PASS after SAME invocation old
+  baseline149PASS/1knownFAIL. Coordinator transport24/24, admission18/18,
+  transport13/13, pin7/7, scanner5/5 PASS. All zeroignored. Same operator SDK
+  environment omission produces realfs24/1 before required compiler case;
+  full QA later in this controller UNRUN. Preserve failed whole receipt.
+- [x] Launch63003776 at06:58:38UTC on EXACT SAME repaired source, explicitly
+  supply complete original installed SDK (no trim). New controller8923B/
+  a6104dac; only fresh job, required SDK env/assertion and honest scope change.
+  Original3600s/jobs1/concurrency4/SBH20GiB/defaultprofiles unchanged. Repeat
+  live baseline, all component modules, ALL25realfs including actual retained
+  rustc compile/relocation, full workspace check/strictClippy/fmt. No skipped
+  ignored body or zero-run credit. Current run remains active/unqualified.
+- [ ] Finish63003776 and stage matching qualifier with exact dfa normal roles
+  and unchanged ordinary harness. Original native cases remain UNLAUNCHED;
+  earlier5f7/e3d controls are retained superseded, never marked executed.
+- [x] User-authorized MPDT coordination: inspect AgentMail4427/4486 and actual
+  private88240 pre-grant refusal log; observer0 plus missing namespace result
+  correctly refuses success. Fifteen-second deadline plus escalation is
+  consistent with observed16s, not proof of initializer phase. Current source
+  differs in line numbers; requested exact88240 source/manifest before causal
+  claim. Asked existing RCH owners for already-qualified route only; no new
+  build/dispatch/peer cancellation/global daemon/config/locks changed.
+
+**Earlier execution checkpoint, November5 at04:26UTC (retained):**
 
 - [x] Freeze committed dfa32f4c, ALL1747 files, archive63662080B/59bfbb66;
   no manual production overlay. Includes431 parallel verifier, e87 nonblocking
