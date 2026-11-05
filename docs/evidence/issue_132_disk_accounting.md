@@ -222,3 +222,130 @@ needed to bootstrap a warm pool; missing initial source evidence refuses before
 upload; large unproven sibling pools stay charged; changed inputs can exceed a
 warm allowance and stop without replay; and sampling does not provide filesystem
 quota containment between observations.
+
+## Follow-up: queue continuity, explicit retry intent, and Cargo cache coverage
+
+Implementation and regression commit:
+[`6943790888290c2a16e1de19bba0d1782e8393f3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6943790888290c2a16e1de19bba0d1782e8393f3),
+directly on `main`, based on `4d7927d327ca190c32b31127b4d0134b7f9b237a`.
+Concurrent source-ownership, RABS, and stale-capacity refresh changes were
+preserved.
+
+The follow-up extends the same issue correction in three places. Fresh
+capacity that proves a request fits alone now permits a durable wait behind
+competing reservations. It does not admit the request, discount another owner,
+or waive the post-completion probe. Existing waiters retain their original
+deadline across that probe gap; expired, missing, or superseded observations,
+genuine pressure, and requests that do not fit alone remain refusals.
+
+A positive configured headroom is now solely a minimum. Ordinary durable
+execution and preview can still use verified target credit. The exact
+prelaunch cold retry has separate client intent and omits warm capability even
+if concurrent learning increases the cold requirement. A later queued attempt
+binds its predecessor's completion receipt, so an old completed attempt no
+longer prevents a legitimate cold retry from waiting. Recovery, cancellation,
+receipt retention, and unrelated ownership publication preserve that binding.
+
+Dispatcher-managed Cargo execution now scans the worker-resolved durable Cargo
+home, supported literal absolute overrides, and physical destinations of known
+registry/Git redirects. It reserves and samples every resulting filesystem.
+Existing cache allocations remain unproven baseline; only the selected target
+has retained credit. Unknown cache scope refuses before execution and cannot
+produce a misleading complete learning sample. Non-Cargo commands retain their
+original classification through shell wrapping. Direct `rch-wkr execute`
+remains cold-only with its existing cache-volume probes; it has not gained the
+dispatcher's output attribution for cache allocations or command-local home
+overrides.
+
+### Executed paired follow-up benchmark
+
+The same reusable benchmark was extended with the actual worker-side cache
+resolver and rerun against the original monitor and final follow-up monitor.
+The existing raw JSON preserves the first run and stores this run under
+`followup_2026_11_05`. Candidate SHA-256:
+`ce914cd4dff8440850ffe23e76d064ccacc0e137afa090a0e8e37278120fb00a`.
+
+The new case starts with a 16 MiB target, frees that retained file, and then
+writes 8 MiB into the separate durable Cargo cache under a 4 MiB budget. These
+are real allocated files. Free space increased by 8 MiB, so net filesystem size
+could not expose the write. The fixture's largest observed combined allocation
+was 16,793,600 bytes including directory blocks; final allocation was 8,404,992
+bytes. The guard results were:
+
+| Accounting and declared roots | Observed growth charge | Output guard result |
+| --- | ---: | --- |
+| Original target-only accounting | 0 bytes | Allowed |
+| Corrected target and durable-cache accounting | 8,404,992 bytes | `growth` |
+
+The corrected new/modified allocation counter was 8,392,704 bytes; 12,288 bytes
+of unproven cache-directory baseline supplied the remaining charge. This
+executes the actual resolver and accounting methods with a synthetic observer
+identity. It does not launch or terminate a guarded remote build.
+
+The other physical cases also executed again: warm and cold output, cleanup,
+three overlapping child writers, a rewritten retained inode, and an unproven
+source/cache baseline. Small directory allocations differ from the first
+filesystem's results and are retained exactly in the JSON.
+
+| Same-invocation 2,048-file scan, 15 alternating runs | Median |
+| --- | ---: |
+| Original monitor | 6.710740 ms |
+| Follow-up monitor | 16.179687 ms |
+| Increase | 9.468947 ms, approximately 2.41x total scan time |
+
+This scan-only comparison measures the combined accounting correction against
+the original monitor. It does not isolate the cache resolver's incremental
+cost, and it establishes no end-to-end latency improvement. The available
+filesystem now had 22,658,437,120 bytes free and the 1 MiB floor probe correctly
+allowed it; unlike the first run, this was not an exhausted-volume condition.
+The separate cache regression executes a real distinct-device `statvfs` sample
+against a configured floor above its available bytes without filling the disk.
+Both monitors still rejected this facility's foreign process namespace, so
+live guardian/process qualification remains unavailable here.
+
+Eight focused Python cache regressions passed in 0.163 seconds. They cover
+cleanup-hidden growth, uncredited retained cache, cold footprint coverage,
+small warm downloads, explicit and redirected cache identities, bounded
+directory preparation, unresolved scope, and distinct-filesystem floor
+protection. Full daemon/client compilation and new Rust regression execution
+remain unestablished by these local Python and filesystem results.
+
+### Follow-up native validation status
+
+The pinned `nightly-2026-08-31` toolchain was installed and verified. A shallow
+fetch verified the exact locked asupersync commit
+`78b64636e99fea4ea2d868096576021dd3b8e519`; a subsequent ordinary
+`cargo fetch --locked --target x86_64-unknown-linux-gnu` completed in 9.283 seconds.
+Neither the manifest nor lockfile was changed to make the build easier.
+
+| Final check | Executed result |
+| --- | --- |
+| Focused Python cache regressions | 8 passed, 0 skipped, 0.163 s |
+| Paired production filesystem/accounting benchmark | Completed, including the new cache-growth case and all prior physical cases |
+| Changed Rust files, pinned formatting | Passed through targeted formatter checks; not a workspace Cargo-format pass |
+| `git diff --check` | Passed |
+| `cargo check --locked -p rch-common --lib` | Resource guard interrupted dependency compilation at Tokio after 49.588 s; changed crate source was not checked |
+| `cargo check --locked --workspace --all-targets` | Resource preflight blocked before Cargo, exit 125; 24,563,712 bytes estimated headroom |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | Resource preflight blocked before Cargo, exit 125; 873,316,352 bytes estimated headroom |
+| `cargo fmt --all --check` | Resource preflight blocked before Cargo, exit 125; 761,552,896 bytes estimated headroom |
+| New/expanded Rust regression filters | Not executed |
+| Live worker, full process guardian, and SSH latency qualification | Unavailable |
+
+The resource guard used one Cargo job, one compiler frontend thread, disabled
+incremental/debug output, a task-exclusive cache, and a 768 MiB stop threshold
+within the shared 8 GiB cgroup. Unrelated jobs repeatedly consumed the available
+memory. The final wrapper failures are resource refusals, not compiler
+diagnostics. No completed native source check or native regression pass is
+claimed for this follow-up. The complete recorded command statuses and source
+hashes are preserved under `followup_native_validation` in the JSON evidence.
+The prior native results earlier in this report belong to the first
+implementation and do not qualify this follow-up.
+
+The unexecuted Rust coverage includes the `disk_contention_` and
+`queued_retry_predecessor_` filters for admission, endpoint epochs, pressure,
+completion probes, queued cold retries, restart, cancellation, receipt pruning,
+and stale releases. Client regressions cover ordinary positive minima versus
+explicit cold retries and preview capability. The `cargo_disk_cache` filter
+covers original-command parsing, wrapper option values, preserved non-Cargo
+scope, and typed prestart refusal without a learning sample. These remain
+required host-side qualification before treating the changes as fully tested.

@@ -216,6 +216,58 @@ def benchmark(root, sources, pressure_probe):
         scope="Real target 16 MiB plus separate output root 4 MiB, then 1 MiB added. Production require_warm_pool uses a synthetic observer identity: this is an accounting proof fixture, not verified worker admission.",
     )
 
+    # The original transfer plan omitted the worker's durable Cargo home.
+    # Bind it through the candidate's actual worker-side resolver and compare
+    # both accounting paths on the same cleanup and cache-write sequence.
+    if hasattr(modules["candidate"], "prepare_cargo_cache_roots"):
+        target = root / "cargo-cache-cleanup" / "target"
+        base = target.parent / "worker-cache-base"
+        target.mkdir(parents=True)
+        base.mkdir()
+        plan = {"name": "rch-cargo-cache-benchmark", "additional_home": None,
+                "verified": True}
+        previous_base = os.environ.get("RCH_CH_BASE")
+        try:
+            os.environ["RCH_CH_BASE"] = str(base)
+            cache_roots, aliases = modules["candidate"].prepare_cargo_cache_roots(plan)
+        finally:
+            if previous_base is None:
+                os.environ.pop("RCH_CH_BASE", None)
+            else:
+                os.environ["RCH_CH_BASE"] = previous_base
+        allocate(target / "retained", 16 * MIB)
+        outputs = {"baseline": [target], "candidate": [target] + cache_roots}
+        values = {name: observer(name, target, 4 * MIB, outputs[name]) for name in sources}
+        candidate = values["candidate"]
+        candidate.require_warm_pool({
+            "cold_growth_bytes": 32 * MIB,
+            "pools": [candidate.baseline_pool] + [None] * 7,
+        })
+        free_before = modules["candidate"].filesystem_sample(outputs["candidate"])
+        allocate(target / "retained", 0)
+        allocate(base / plan["name"] / "registry" / "download", 8 * MIB)
+        modules["candidate"].verify_cargo_cache_bindings(aliases)
+        decisions = {}
+        for name, value in values.items():
+            try:
+                value.observe_output(scan(name, target, outputs[name], getattr(value, "baseline_records", None)))
+                decisions[name] = "allowed"
+            except modules[name].BudgetFailure as error:
+                decisions[name] = error.reason
+        free_after = modules["candidate"].filesystem_sample(outputs["candidate"])
+        results["cases"]["cargo_cache_cleanup"] = {
+            name: dict(metrics(name, value), output_guard_result=decisions[name])
+            for name, value in values.items()
+        }
+        results["cases"]["cargo_cache_cleanup"].update(
+            budget_bytes=4 * MIB,
+            cache_write_bytes=8 * MIB,
+            final_actual_allocated_bytes=scan("candidate", target, outputs["candidate"]).total,
+            measured_free_delta_bytes=sum(free_before[d] - free_after[d] for d in free_before),
+            cache_roots=cache_roots,
+            scope="Actual 16 MiB retained target is truncated and 8 MiB is written into a separate durable Cargo home under a 4 MiB budget. Original target-only accounting and candidate cache-root accounting observe the same files. Production cache resolver and output guard execute; observer identity remains synthetic and no guarded workload is launched.",
+        )
+
     # Observe the requested volume without writing to or filling it.
     actual = modules["candidate"].filesystem_sample([str(pressure_probe)])
     value = observer("candidate", root / "cold" / "target")
