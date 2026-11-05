@@ -785,7 +785,8 @@ for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
 if interrupted:
     sys.exit(128 + interrupted)
 try:
-    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
+    # Same descriptors as the file-backed path, including a pinned scope on fd 8.
+    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, close_fds=False,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     while True:
         chunk = child.stdout.read(8192)
