@@ -519,6 +519,307 @@ fn find_probe_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[test]
+fn publication_suitability_checks_real_payload_after_short_and_interrupted_writes() {
+    use std::cell::RefCell;
+    use std::os::unix::fs::FileExt;
+
+    let root = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let written = RefCell::new(Vec::new());
+    let mut calls = 0;
+    let mut synced = Vec::new();
+    publication_copy::probe_output_directory_with_io(
+        root.path(),
+        "short-writes",
+        rustix::process::geteuid().as_raw(),
+        |probe| {
+            assert_eq!(std::fs::read(probe)?, *written.borrow());
+            assert!(!written.borrow().is_empty());
+            Ok(())
+        },
+        |file, bytes, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            assert_eq!(offset as usize, written.borrow().len());
+            let count = file.write_at(&bytes[..bytes.len().min(257)], offset)?;
+            written.borrow_mut().extend_from_slice(&bytes[..count]);
+            Ok(count)
+        },
+        |file| {
+            let metadata = file.metadata()?;
+            synced.push(metadata.is_dir());
+            if metadata.is_file() {
+                assert_eq!(metadata.len() as usize, written.borrow().len());
+                assert_eq!(metadata.mode() & 0o7777, 0o600);
+            }
+            file.sync_all()
+        },
+    )
+    .unwrap();
+    assert!(calls > 2, "the probe must complete the short writes");
+    assert!(
+        written.borrow().len() >= 4096,
+        "probe actual data allocation"
+    );
+    assert_eq!(
+        synced,
+        [false, true],
+        "payload sync precedes directory sync"
+    );
+    assert!(find_probe_files(root.path()).is_empty());
+}
+
+#[test]
+fn publication_suitability_io_failures_clean_only_confirmed_owned_prefixes() {
+    use std::os::unix::fs::FileExt;
+
+    for failure in [
+        "write-zero",
+        "write",
+        "partial-write",
+        "file-sync",
+        "directory-sync",
+    ] {
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let sentinel = root.path().join("unowned-output");
+        std::fs::write(&sentinel, b"preserve caller output").unwrap();
+        let mut writes = 0;
+        let mut observed = false;
+        let error = publication_copy::probe_output_directory_with_io(
+            root.path(),
+            failure,
+            rustix::process::geteuid().as_raw(),
+            |_| {
+                observed = true;
+                Ok(())
+            },
+            |file, bytes, offset| {
+                writes += 1;
+                match failure {
+                    "write-zero" => Ok(0),
+                    "write" => Err(rustix::io::Errno::NOSPC.into()),
+                    "partial-write" if writes == 1 => file.write_at(&bytes[..4], offset),
+                    "partial-write" => Err(rustix::io::Errno::NOSPC.into()),
+                    _ => file.write_at(bytes, offset),
+                }
+            },
+            |file| {
+                let directory = file.metadata()?.is_dir();
+                if (failure == "file-sync" && !directory)
+                    || (failure == "directory-sync" && directory)
+                {
+                    Err(rustix::io::Errno::IO.into())
+                } else {
+                    file.sync_all()
+                }
+            },
+        )
+        .unwrap_err();
+        let expected = match failure {
+            "file-sync" => "sync publication suitability probe",
+            "directory-sync" => "sync publication destination directory",
+            _ => "write publication suitability probe",
+        };
+        assert!(error.to_string().contains(expected), "{failure}: {error:#}");
+        assert!(!observed, "failed I/O must not reach the success observer");
+        assert!(find_probe_files(root.path()).is_empty(), "{failure}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve caller output");
+        if failure == "partial-write" {
+            assert_eq!(writes, 2, "exercise cleanup after a real nonempty prefix");
+        }
+    }
+}
+
+#[test]
+fn publication_suitability_preserves_corrupted_readback_evidence() {
+    use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
+
+    let root = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let mut synced = Vec::new();
+    let changed_byte = Cell::new(0);
+    let error = publication_copy::probe_output_directory_with_io(
+        root.path(),
+        "changed-payload",
+        rustix::process::geteuid().as_raw(),
+        |_| panic!("corrupted readback must refuse before success"),
+        File::write_at,
+        |file| {
+            synced.push(file.metadata()?.is_dir());
+            let mut byte = [0];
+            file.read_exact_at(&mut byte, 0)?;
+            byte[0] ^= 0xff;
+            changed_byte.set(byte[0]);
+            file.write_all_at(&byte, 0)?;
+            file.sync_all()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("probe contents changed; evidence retained"),
+        "{error:#}"
+    );
+    assert_eq!(
+        synced,
+        [false],
+        "readback must reject before directory sync"
+    );
+    let probes = find_probe_files(root.path());
+    assert_eq!(probes.len(), 1);
+    let changed = std::fs::read(&probes[0]).unwrap();
+    assert!(changed.len() > 1);
+    assert_eq!(changed[0], changed_byte.get());
+}
+
+#[test]
+fn publication_suitability_sync_failure_preserves_replaced_probe_and_original() {
+    use std::os::unix::fs::FileExt;
+
+    let root = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let displaced = root.path().join("displaced-owned-probe");
+    let error = publication_copy::probe_output_directory_with_io(
+        root.path(),
+        "replaced-after-write",
+        rustix::process::geteuid().as_raw(),
+        |_| panic!("failed sync must refuse before success"),
+        File::write_at,
+        |file| {
+            assert!(file.metadata()?.is_file());
+            assert!(file.metadata()?.len() > 0);
+            let probes = find_probe_files(root.path());
+            assert_eq!(probes.len(), 1);
+            std::fs::rename(&probes[0], &displaced)?;
+            std::fs::write(&probes[0], b"unowned replacement")?;
+            Err(rustix::io::Errno::IO.into())
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sync publication suitability probe"),
+        "{error:#}"
+    );
+    let probes = find_probe_files(root.path());
+    assert_eq!(probes.len(), 1);
+    assert_eq!(std::fs::read(&probes[0]).unwrap(), b"unowned replacement");
+    assert!(!std::fs::read(displaced).unwrap().is_empty());
+}
+
+/// Real Linux write failures, not a quota/NFS simulation. The child inherits
+/// ignored SIGXFSZ so EFBIG must reach the preflight instead of killing it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn publication_suitability_refuses_real_payload_write_failures_before_execution() {
+    const CHILD: &str = "RCH_TEST_PUBLICATION_FSIZE_LIMIT";
+    let Some(limit) = std::env::var_os(CHILD) else {
+        for limit in [0, 8] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::process::Command::new("sh")
+                    .args(["-c", "trap '' XFSZ; exec \"$@\"", "rch-publication-limit-test"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "hook::transfer_orchestration::recovery::publication_runtime_tests::baseline_tests::publication_suitability_refuses_real_payload_write_failures_before_execution",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, limit.to_string())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("bounded publication-limit subprocess")
+            .unwrap();
+            assert_eq!(output.status.code(), Some(0), "limit {limit}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+        }
+        return;
+    };
+    let limit: u64 = limit.to_str().unwrap().parse().unwrap();
+    assert!(matches!(limit, 0 | 8));
+    let _guard = test_guard!();
+    let root = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let local = root.path().join("write-limited");
+    std::fs::create_dir_all(&local).unwrap();
+    let (_directory, mut session, _pipeline) = prepared_suitability_session(&local);
+    let before_recipe = serde_json::to_value(&session.recipe).unwrap();
+    let before_disk = std::fs::read(&session.writer.path).unwrap();
+
+    struct RestoreLimit(rustix::process::Rlimit);
+    impl Drop for RestoreLimit {
+        fn drop(&mut self) {
+            rustix::process::setrlimit(rustix::process::Resource::Fsize, self.0)
+                .expect("restore child file-size limit");
+        }
+    }
+    let original = rustix::process::getrlimit(rustix::process::Resource::Fsize);
+    let restore = RestoreLimit(original);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Fsize,
+        rustix::process::Rlimit {
+            current: Some(limit),
+            maximum: original.maximum,
+        },
+    )
+    .unwrap();
+    let empty = File::create(local.join("empty-create-still-works")).unwrap();
+    assert_eq!(empty.metadata().unwrap().len(), 0);
+    let outcome = session.verify_publication_suitability().await;
+    drop(restore);
+
+    let error = outcome.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("write publication suitability probe"),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|cause| cause.raw_os_error() == Some(rustix::io::Errno::FBIG.raw_os_error())),
+        "the actual write error must be preserved: {error:#}"
+    );
+    assert!(!session.recipe.execution_started);
+    assert_eq!(
+        serde_json::to_value(&session.recipe).unwrap(),
+        before_recipe
+    );
+    assert_eq!(std::fs::read(&session.writer.path).unwrap(), before_disk);
+    assert!(find_probe_files(&local).is_empty());
+    // No recipe was consumed: the same prepared invocation can enter execution
+    // once the filesystem accepts payloads. This filesystem/journal regression
+    // does not start a remote workload.
+    session.verify_publication_suitability().await.unwrap();
+    session.starting_execution().unwrap();
+    assert!(reload(&session).recipe.execution_started);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publication_suitability_allows_current_owner_and_preserves_full_publication_and_reopen() {
     let _guard = test_guard!();
@@ -873,7 +1174,8 @@ async fn publication_suitability_cancellation_and_consumed_session_guards_preser
 
     // Cooperative cancellation cleans up our owned probe and leaves the journal untouched.
     let error = session
-        .verify_publication_suitability_with(uid, |_| {
+        .verify_publication_suitability_with(uid, |probe| {
+            assert!(!std::fs::read(probe)?.is_empty());
             Err(publication_runtime::PublicationCancelled.into())
         })
         .await
@@ -888,8 +1190,10 @@ async fn publication_suitability_cancellation_and_consumed_session_guards_preser
     let (ready, started) = tokio::sync::oneshot::channel();
     let mut ready = Some(ready);
     {
-        let mut suitability =
-            Box::pin(session.verify_publication_suitability_with(uid, move |_| {
+        let mut suitability = Box::pin(session.verify_publication_suitability_with(
+            uid,
+            move |probe| {
+                assert!(!std::fs::read(probe)?.is_empty());
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -903,7 +1207,8 @@ async fn publication_suitability_cancellation_and_consumed_session_guards_preser
                     }
                 }
                 Ok(())
-            }));
+            },
+        ));
         tokio::select! {
             result = &mut suitability => panic!("suitability escaped cancellation gate: {result:?}"),
             started = started => started.unwrap(),
