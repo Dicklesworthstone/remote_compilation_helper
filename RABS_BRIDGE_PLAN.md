@@ -2,7 +2,40 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at23:07UTC:**
+**Active qualification checkpoint, November5 at23:34UTC:**
+
+- [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
+  route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
+  unchanged20GiB reservation asserted. Actual DSR API probe terminalSUCCESS0/
+  406s, ALL283/283/zeroignored, all1758 source/control4518B/4e066ea8 aftermatch.
+  New4a3f source differs3013 only inside API test module; production prefix and
+  other1757 files identical. Genuine3013 normalALL7 tools keep original labels.
+- [ ] Full4a3f compiler/ALL9 gate dispatched23:33UTC, original3600s/jobs1/
+  defaultprofiles/pins. Requires EVERY old and current test name, zeroignored;
+  expected1067 cases, count only actual terminal summaries. Control9844B/
+  8704ba6e publishes final proof atomically after every predicate/after-audit.
+- [ ] Fresh native4 plus genuineold-worker negative prepared, not dispatched:
+  control33063B/9aabe838. Start after new fmt/check/strictClippy pass; requires
+  full9-suite final proof before overall success. Join only atomically complete
+  report, retaining original3600s and all SDK/case/time/ownership assertions.
+- [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
+  3failed/zeroignored. Two literal route mismatches, one human-message assertion
+  contradicted existing typed busy/structured reserved-headroom contract.
+  Production protections unchanged. Prior3600s timeout retained separately.
+- [x] Preserve nativee83ba030 wrapper FAILURE despite all4 actual positives
+  and precise old-worker negative passing. Launcher polled mutable QA progress
+  while timeout results were preserved by rename; FileNotFound is our launcher
+  error, not an overall acceptance pass. Full source/SDK/tools aftermatch.
+  Fresh full execution required; no metadata-only promotion of failed run.
+- [ ] SharedTRJ still has peer work; no performance reservation or complete new
+  paired comparison/public6 yet. Original whole-project23% loss still stands.
+- [ ] M6 remains in progress: distinct-edge singleflight/authority/cancellation/
+  root permits and15-agent multi-host >=2x storm/no-swap acceptance unproven.
+- [ ] Beads merge refused ambiguous bases for bd-4x4qa/bd-p56r0/bd-satto.
+  Both versions retained; no forced export/resolution or peer graph overwrite.
+
+Earlier checkpoints below retain the failures and execution history. Their
+then-pending statuses are superseded by the active checkpoint above.
 
 - [x] Genuine oldB1-worker negative actual101/[0passed,1failed,0ignored]/165.3s,
   precise missing-productive-reconnect assertion; no observed owned residuals.
