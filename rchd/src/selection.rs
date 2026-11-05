@@ -2239,17 +2239,16 @@ impl WorkerSelector {
             .await
     }
 
-    /// One-shot stale-inventory recovery for the rustup-component gate
-    /// (issue #63(b)): when component filtering is about to exclude EVERY
-    /// candidate, live-probe the excluded workers' capabilities once
-    /// (`rch-wkr capabilities`, the same probe the periodic health loop
-    /// runs), store the fresh snapshots, and — if any worker now has the
-    /// component — re-run admission once. Returns whether a re-run is
-    /// warranted.
-    async fn refresh_component_capabilities(
+    /// Refresh stale disk capacity or missing rustup-component inventory once
+    /// through the same generation-fenced live probe as the health loop.
+    /// Component recovery additionally requires the requested component;
+    /// disk recovery always reruns the original accounting/freshness guard.
+    /// A successful probe warrants a complete admission rerun, never admission
+    /// by itself. Callers share one refresh allowance per eligibility round.
+    async fn refresh_capabilities_for_admission(
         &self,
-        request: &SelectionRequest,
-        component_excluded: &[Arc<WorkerState>],
+        component_request: Option<&SelectionRequest>,
+        excluded: &[Arc<WorkerState>],
     ) -> bool {
         // Probe only over the daemon's shared SSH pool (production always sets
         // one; see main.rs `set_ssh_pool`). A pool-less selector — unit tests,
@@ -2258,8 +2257,8 @@ impl WorkerSelector {
         if self.ssh_pool.is_none() {
             return false;
         }
-        let mut handles = Vec::with_capacity(component_excluded.len());
-        for worker in component_excluded {
+        let mut handles = Vec::with_capacity(excluded.len());
+        for worker in excluded {
             let worker = Arc::clone(worker);
             let ssh_pool = self.ssh_pool.clone();
             handles.push(tokio::spawn(async move {
@@ -2278,12 +2277,18 @@ impl WorkerSelector {
             let Ok(Some((worker, capabilities))) = handle.await else {
                 continue;
             };
-            if rustup_component_capability_mismatch(request, &capabilities).is_none() {
+            if component_request.is_none_or(|request| {
+                rustup_component_capability_mismatch(request, &capabilities).is_none()
+            }) {
                 let worker_id = worker.config.read().await.id.clone();
                 info!(
-                    "Worker {} capability inventory was stale: live probe shows the required \
-                     rustup component installed; re-running admission (issue #63)",
-                    worker_id
+                    "Worker {} capabilities refreshed after {}; re-running full admission",
+                    worker_id,
+                    if component_request.is_some() {
+                        "missing rustup component"
+                    } else {
+                        "stale build disk capacity"
+                    }
                 );
                 any_recovered = true;
             }
@@ -2296,7 +2301,7 @@ impl WorkerSelector {
         pool: &WorkerPool,
         request: &SelectionRequest,
         excluded_worker_ids: &HashSet<String>,
-        allow_component_refresh: bool,
+        allow_capability_refresh: bool,
     ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
         // Clear per-round admission verdict cache (bd-vvmd.4.4).
         if let Some(ref gate) = self.admission_gate {
@@ -2363,6 +2368,7 @@ impl WorkerSelector {
         // Workers excluded ONLY by the rustup-component gate, kept for the
         // one-shot stale-inventory capability refresh (issue #63(b)).
         let mut component_excluded: Vec<Arc<WorkerState>> = Vec::new();
+        let mut stale_disk_excluded: Vec<Arc<WorkerState>> = Vec::new();
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
         let mut filtered_by_os_gate = 0usize;
@@ -2457,6 +2463,9 @@ impl WorkerSelector {
                 .await
             {
                 debug!("Worker {} excluded: {}", worker_id, failure);
+                if failure == DiskHeadroomRejection::Stale {
+                    stale_disk_excluded.push(Arc::clone(&worker));
+                }
                 filtered_by_disk_headroom += 1;
                 filtered_by_hard_preflight += 1;
                 continue;
@@ -3099,6 +3108,25 @@ impl WorkerSelector {
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
         {
+            // Completion invalidates the previous capacity sample even if its
+            // age is small. Obtain real, generation-fenced observations ONCE,
+            // then rerun every admission gate. Unknown/insufficient capacity
+            // never triggers this refresh, and an unsuccessful probe or a
+            // still-stale result retains the original hard refusal.
+            if allow_capability_refresh
+                && !stale_disk_excluded.is_empty()
+                && self
+                    .refresh_capabilities_for_admission(None, &stale_disk_excluded)
+                    .await
+            {
+                return Box::pin(self.get_eligible_workers_with_refresh(
+                    pool,
+                    request,
+                    excluded_worker_ids,
+                    false,
+                ))
+                .await;
+            }
             return Err(SelectionReason::NoAdmissibleWorkers(format!(
                 "disk_headroom={filtered_by_disk_headroom}"
             )));
@@ -3122,10 +3150,10 @@ impl WorkerSelector {
                 // installed after the last periodic poll) otherwise
                 // fail-closes every worker and silently pushes an explicitly
                 // remote request into a local build.
-                if allow_component_refresh
+                if allow_capability_refresh
                     && !component_excluded.is_empty()
                     && self
-                        .refresh_component_capabilities(request, &component_excluded)
+                        .refresh_capabilities_for_admission(Some(request), &component_excluded)
                         .await
                 {
                     return Box::pin(self.get_eligible_workers_with_refresh(
@@ -8105,6 +8133,35 @@ mod tests {
                     .is_none()
             );
         }
+        // A real pool with no connection time left fails before dialing.
+        // Enter the automatic-refresh branch and prove an unsuccessful probe
+        // cannot turn released accounting into fresh free-space evidence.
+        selector.set_ssh_pool(Some(Arc::new(rch_common::SshPool::new(
+            rch_common::SshOptions {
+                connect_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+        ))));
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            selector.preview_with_exclusions(&pool, &request, &excluded),
+        )
+        .await
+        .expect("a failed capacity refresh must stay bounded");
+        assert!(refused.worker.is_none());
+        assert!(
+            refused
+                .diagnostics
+                .unwrap()
+                .workers
+                .iter()
+                .find(|entry| entry.worker_id.as_str() == "free-small")
+                .unwrap()
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "disk_headroom_stale")
+        );
+        selector.set_ssh_pool(None);
         // Completion releases accounting, not the files. A fresh real sample
         // still has to prove the requested free bytes actually remain.
         let mut current_capacity = old_capacity.clone();

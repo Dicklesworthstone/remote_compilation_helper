@@ -272,6 +272,8 @@ combine with remote/canonical mode. CARGO_RABS_ROOT_HELPER selects an explicit
 helper executable. See docs/rabs-cargo-root.md for setup and crash quarantine.
 
 New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
+New daemons also keep temporary staging under that private startup directory,
+so retiring a build's TMPDIR does not break later replay. Cargo keeps its TMPDIR.
 Daemon startup holds both state-directory and socket-endpoint lifetime locks.
 The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
 different state directories cannot start competing daemons for one endpoint.
@@ -1073,8 +1075,14 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
         try:
             if stale is not None and socket_identity(socket_path) != stale:
                 raise SetupError("RABS endpoint changed before daemon restart")
+            # A shared daemon outlives this Cargo invocation. RCH retires its
+            # source-owned TMPDIR after completion; replay scratch must instead
+            # live under the already verified, persistent private state owner.
+            # Change only the new daemon's environment, never Cargo's bindings
+            # or an attached daemon's policy.
+            child_env = dict(env, TMPDIR=lock.path)
             child = subprocess.Popen(
-                [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                [daemon], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=descriptor, close_fds=True, start_new_session=True,
                 pass_fds=lock.inherited_fds(),
             )

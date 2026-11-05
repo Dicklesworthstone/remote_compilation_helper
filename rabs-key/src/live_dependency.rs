@@ -79,7 +79,8 @@
 //! - **Environment (`dependency-env-v2`):** preserve the compiler's complete
 //!   environment and hash every value by default, including arbitrary
 //!   `env!`/`option_env!` inputs. Jobserver descriptors, wrapper controls,
-//!   shell bookkeeping and the RCH source stamp pass through unkeyed.
+//!   shell bookkeeping, host session/cache/temp placement and the RCH source
+//!   stamp pass through unkeyed, under a distinct live-environment policy.
 //!   A tracked read of any such control prevents publication, even when
 //!   the variable was absent. The executing process must use
 //!   [`DependencyActionPlan::execution_env`] verbatim; unknown variables
@@ -147,6 +148,10 @@ pub const CANONICAL_PACKAGE_PARENT: &str = "/__rabs/repos";
 pub const DOMAIN_LIVE_INVOCATION: &str = "rabs.live-dependency.invocation.v1";
 /// Working-directory component domain.
 pub const DOMAIN_LIVE_CWD: &str = "rabs.live-dependency.cwd.v1";
+/// Complete environment dataset under the named host-placement/read-veto policy.
+/// All live profiles use this domain, including when those names are absent:
+/// earlier publications cannot supply evidence for the expanded read veto.
+pub const DOMAIN_LIVE_ENVIRONMENT: &str = "rabs.live-dependency.environment.v1";
 /// Negative-dependency component domain.
 pub const DOMAIN_LIVE_NEGATIVE: &str = "rabs.live-dependency.negative.v1";
 /// Dependency-artifact component domain (inputs + name binding).
@@ -220,6 +225,21 @@ pub const EXECUTION_SEMANTICS: &str = "live-dependency-v2: rustc exit status 0 b
 /// identical dependency actions. A compiler's tracked read of any of these
 /// names, including an absent `option_env!` read, prevents publication.
 const SHELL_BOOKKEEPING_NAMES: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// RCH's per-job cache/temp directories and the SSH login session change even
+/// for identical rustc inputs. Rustc uses TMPDIR only for temporary placement;
+/// the other names do not configure it. Preserve exact execution bindings and
+/// veto publication on every tracked read, including an absent option_env!.
+/// These are exact names, never broad SSH_*, XDG_* or Go/RCH namespaces.
+const HOST_PLACEMENT_NAMES: &[&str] = &[
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+    "TMPDIR",
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "XDG_SESSION_ID",
+];
 
 /// Names whose presence takes the request out of this class.
 const REFUSED_NAMES: &[&str] = &[
@@ -876,6 +896,7 @@ fn env_role(name: &str) -> EnvRole {
     // an absent read. Never exempt broad RUST* or RCH_* namespaces.
     if DESCRIPTOR_AUTH_VARS.contains(&name.as_bytes())
         || SHELL_BOOKKEEPING_NAMES.contains(&name)
+        || HOST_PLACEMENT_NAMES.contains(&name)
         || name.starts_with("RABS_")
         || name.starts_with("CARGO_RABS_")
         || name == "RCH_BUILD_SOURCE"
@@ -1406,12 +1427,21 @@ fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, Liv
             variables.push((name.as_bytes().to_vec(), EnvDisposition::VolatileRefusal));
         }
     }
-    PresentedEnvironment {
+    let dataset = PresentedEnvironment {
         variables,
         path_manifest: Vec::new(),
     }
     .dataset_digest()
-    .map_err(|error| LiveRefusal::Facts(format!("{error:?}")))
+    .map_err(|error| LiveRefusal::Facts(format!("{error:?}")))?;
+    let mut policy = CanonicalEncoder::new();
+    policy
+        .str(dataset.domain)
+        .bytes(&dataset.bytes)
+        .str("exact execution; host placement tracked reads refuse publication, even absent");
+    for name in HOST_PLACEMENT_NAMES {
+        policy.str(name);
+    }
+    Ok(compute(DOMAIN_LIVE_ENVIRONMENT, &policy.finish()))
 }
 
 fn output_platform_component(plan: &DependencyActionPlan) -> TypedDigest {
@@ -3234,6 +3264,10 @@ mod tests {
             "RCH_BUILD_SOURCE_OTHER",
             "RUSTC_LOG",
             "RUST_FEATURE",
+            "GOPATH_OTHER",
+            "TMPDIR_OTHER",
+            "SSH_CONNECTION_OTHER",
+            "XDG_SESSION_ID_OTHER",
         ] {
             let changed = plan_for(OUT_A, &[], &[(name, "custom = exact value")]).unwrap();
             assert!(
@@ -3318,6 +3352,52 @@ mod tests {
     }
 
     #[test]
+    fn host_placement_preserves_execution_and_requires_fresh_environment_evidence() {
+        let base = plan_for(OUT_A, &[], &[]).unwrap();
+        let base_key =
+            live_dependency_key(&base, &toolchain(), &externs(&base, 20), &inputs(&base, 11))
+                .unwrap();
+        assert_eq!(
+            base_key.descriptor.environment.domain,
+            DOMAIN_LIVE_ENVIRONMENT
+        );
+        for &name in HOST_PLACEMENT_NAMES {
+            for value in ["", "/first/job", "/second/job"] {
+                let changed = plan_for(OUT_A, &[], &[(name, value)]).unwrap();
+                assert_eq!(key(&base), key(&changed), "{name}={value}");
+                assert!(
+                    changed
+                        .execution_env
+                        .contains(&(name.to_string(), value.into()))
+                );
+                assert!(!changed.keyed_env.iter().any(|(keyed, _)| keyed == name));
+            }
+        }
+        let legacy_environment = PresentedEnvironment {
+            variables: base
+                .keyed_env
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_bytes().to_vec(),
+                        EnvDisposition::SemanticHashed(value.as_bytes().to_vec()),
+                    )
+                })
+                .collect(),
+            path_manifest: Vec::new(),
+        }
+        .dataset_digest()
+        .unwrap();
+        assert_ne!(base_key.descriptor.environment, legacy_environment);
+        let mut old_descriptor = base_key.descriptor.clone();
+        old_descriptor.environment = legacy_environment;
+        assert_ne!(
+            base_key.action_key,
+            compute_action_key(&old_descriptor).final_key
+        );
+    }
+
+    #[test]
     fn unkeyed_control_reads_veto_publication_even_when_absent() {
         for name in [
             "MAKEFLAGS",
@@ -3330,7 +3410,10 @@ mod tests {
             "OLDPWD",
             "SHLVL",
             "_",
-        ] {
+        ]
+        .into_iter()
+        .chain(HOST_PLACEMENT_NAMES.iter().copied())
+        {
             let args = argv(OUT_A, &[]);
             let mut absent_env = env(&[]);
             absent_env.retain(|(present, _)| present != name);

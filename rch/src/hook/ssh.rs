@@ -190,6 +190,7 @@ const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const SOURCE_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
+const SOURCE_LOCK_SESSION_READY: &str = "RCH_SOURCE_LOCK_SESSION_READY";
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
 const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
 // Observe cancellation without publishing retirement or changing ownership.
@@ -2219,6 +2220,25 @@ async fn spawn_source_authority_lock(
     .await
 }
 
+async fn read_source_lock_frame(
+    stdout: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+    observed: &mut String,
+) -> std::io::Result<usize> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let read = stdout
+        .take((MAX_SOURCE_LOCK_READY_BYTES + 1) as u64)
+        .read_line(observed)
+        .await?;
+    if read > MAX_SOURCE_LOCK_READY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source-authority ready frame exceeded its byte limit",
+        ));
+    }
+    Ok(read)
+}
+
 async fn finish_source_authority_lock_acquisition(
     mut child: tokio::process::Child,
     worker_id: WorkerId,
@@ -2227,7 +2247,7 @@ async fn finish_source_authority_lock_acquisition(
     wait_timeout: Duration,
     heartbeat: bool,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     let stdin = child
         .stdin
@@ -2271,30 +2291,35 @@ async fn finish_source_authority_lock_acquisition(
                 pipe.write_all(bootstrap.as_bytes()).await?;
                 pipe.flush().await?;
             }
-            if heartbeat {
-                guard.heartbeat = Some(SourceLockHeartbeat::start(
-                    stdin.take().expect("bootstrap retains stdin"),
-                    SOURCE_LOCK_HEARTBEAT_INTERVAL,
-                ));
-            }
             Ok::<(), std::io::Error>(())
         };
-        let read_ready = async {
-            // Bound the read itself, not just the buffer after read_line has
-            // waited for an arbitrarily large or never-terminated frame.
-            let read = (&mut stdout)
-                .take((MAX_SOURCE_LOCK_READY_BYTES + 1) as u64)
-                .read_line(&mut observed)
-                .await?;
-            if read > MAX_SOURCE_LOCK_READY_BYTES {
+        let ((), mut read) = tokio::try_join!(
+            write_bootstrap,
+            read_source_lock_frame(&mut stdout, &mut observed)
+        )?;
+        if heartbeat {
+            // Until the monitor acknowledges control ownership, shell
+            // read-ahead can consume a prefix of the first heartbeat. This
+            // handoff grants no source authority: still require the separate
+            // exact ready marker within the original acquisition deadline.
+            if observed
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                != Some(SOURCE_LOCK_SESSION_READY)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "source-authority ready frame exceeded its byte limit",
+                    "source-authority control handoff was not acknowledged",
                 ));
             }
-            Ok(read)
-        };
-        tokio::try_join!(write_bootstrap, read_ready)
+            guard.heartbeat = Some(SourceLockHeartbeat::start(
+                stdin.take().expect("bootstrap retains stdin"),
+                SOURCE_LOCK_HEARTBEAT_INTERVAL,
+            ));
+            observed.clear();
+            read = read_source_lock_frame(&mut stdout, &mut observed).await?;
+        }
+        Ok::<((), usize), std::io::Error>(((), read))
     };
     let mut timed_out = false;
     let failure = match timeout(wait_timeout, acquisition).await {
@@ -3489,14 +3514,20 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
 
     #[cfg(target_os = "linux")]
     fn source_lock_test_dir() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
         // RCH places TMPDIR inside its exclusively held source snapshot.
         // These tests acquire real hierarchical source locks, so their
         // independent repositories must be outside that enclosing grant.
-        tempfile::Builder::new()
+        let directory = tempfile::Builder::new()
             .prefix("rch-source-lock-test-")
             .tempdir_in("/tmp")
             .unwrap()
-            .keep()
+            .keep();
+        // Custody rejects writable-by-others parents independently of the
+        // caller's umask. Positive fixtures must establish that contract.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
     }
 
     #[cfg(target_os = "linux")]
@@ -4025,6 +4056,7 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn terminal_cancellation_command_preserves_quoted_evidence_and_exact_control_result() {
+        use std::os::unix::fs::PermissionsExt as _;
         use tokio::io::AsyncWriteExt as _;
 
         let directory = tempfile::Builder::new()
@@ -4036,8 +4068,13 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
         let control = directory.path().join("control receipts");
         std::fs::create_dir(&registry).unwrap();
         std::fs::create_dir(&control).unwrap();
+        for path in [directory.path(), registry.as_path(), control.as_path()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         for name in ["released", "cancelled", "quarantine"] {
-            std::fs::create_dir(registry.join(name)).unwrap();
+            let path = registry.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let source = directory
             .path()
@@ -4050,6 +4087,7 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
             .join("cancelled")
             .join(format!("{identity}.{digest}.claim"));
         std::fs::write(&fence, &body).unwrap();
+        std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o600)).unwrap();
         for attempt in 0..5 {
             let discover = attempt == 0;
             let locate = attempt == 1;
@@ -4317,15 +4355,19 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_registry_repairs_empty_legacy_cancellation_as_unowned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = tempfile::tempdir().unwrap();
         let registry = directory.path().join("registry");
         std::fs::create_dir_all(&registry).unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
         let roots = vec![directory.path().join("source").display().to_string()];
         let (content, digest) = source_claim_roots(&roots).unwrap();
         // rch <= 2.1.16 left exactly this when its cancellation redirect hit
         // ENOSPC: the record was created and never written.
         let cancelling = registry.join(format!("ad02.{digest}.cancelling"));
         std::fs::write(&cancelling, b"").unwrap();
+        std::fs::set_permissions(&cancelling, std::fs::Permissions::from_mode(0o600)).unwrap();
         let acquire = test_source_intent(&registry, &roots, "ad02", "acquire").await;
         assert_eq!(acquire.status.code(), Some(73));
         assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
@@ -4345,10 +4387,30 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         let cancelled = registry
             .join("cancelled")
             .join(format!("ad02.{digest}.claim"));
-        assert_eq!(std::fs::read(cancelled).unwrap(), content.as_bytes());
-        assert!(!cancelling.exists());
+        assert_eq!(std::fs::read(&cancelled).unwrap(), content.as_bytes());
+        // Cancellation has retained a permanent, complete fence since
+        // 2070d439. Removing it would let receipt collection revive a delayed
+        // acquire. Repair must replace the empty legacy bytes, not the fence.
+        assert_eq!(std::fs::read(&cancelling).unwrap(), content.as_bytes());
+        assert!(!registry.join(format!("ad02.{digest}.claim")).exists());
+        assert!(!registry.join(format!("ad02.{digest}.pending")).exists());
+        assert!(!directory.path().join("source").exists());
         let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
         assert_eq!(late.status.code(), Some(73));
+        // Model receipt collection without deleting the evidence. The fence
+        // alone must still deny a delayed acquire and permit exact settlement.
+        std::fs::rename(
+            &cancelled,
+            directory.path().join("retired-cancellation-receipt"),
+        )
+        .unwrap();
+        let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(late.status.code(), Some(73));
+        let settled = test_source_intent(&registry, &roots, "ad02", "cancel").await;
+        assert!(settled.status.success(), "{settled:?}");
+        assert_eq!(settled.stdout, b"unowned");
+        assert_eq!(std::fs::read(&cancelled).unwrap(), content.as_bytes());
+        assert_eq!(std::fs::read(&cancelling).unwrap(), content.as_bytes());
     }
 
     #[cfg(target_os = "linux")]
@@ -5461,7 +5523,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_claim_does_not_mutate_source_before_full_grant() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let root = directory.join("not-yet-materialized");
         let lock = directory.join("pair.lock");
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -5500,7 +5562,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_serializes_until_retirement_and_explicit_release() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source with ' quotes");
         let lock = dir.join("pair.lock");
         let first = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5550,7 +5612,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_holder_loss_never_authorizes_another_writer() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source");
         let lock = dir.join("pair.lock");
         let first = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5576,7 +5638,7 @@ os.execv({python:?}, [{python:?}] + args)
     async fn source_pair_holder_loss_blocks_setup_capability_fallback() {
         use crate::transfer::{RemoteExecutionUnconfirmed, RemoteProcessSetupUnavailable};
 
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source");
         let lock = dir.join("pair.lock");
         let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5658,7 +5720,7 @@ os.execv({python:?}, [{python:?}] + args)
         use tokio::io::AsyncWriteExt as _;
 
         for exit_code in [255, -1] {
-            let dir = tempfile::tempdir().unwrap().keep();
+            let dir = source_lock_test_dir();
             let root = dir.join("source");
             let lock = dir.join("pair.lock");
             let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5694,16 +5756,60 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_rejects_empty_or_malformed_ownership_state() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = source_lock_test_dir();
         for (index, contents) in ["", "release", "released\noccupied", "unknown"]
             .iter()
             .enumerate()
         {
             let lock = dir.join(format!("pair-{index}.lock"));
             let root = dir.join(format!("source-{index}"));
-            std::fs::write(dir.join(format!("pair-{index}.lock.owner")), contents).unwrap();
-            assert!(claim_test_source_pair(&lock, &root).await.is_err());
+            let owner = dir.join(format!("pair-{index}.lock.owner"));
+            std::fs::write(&owner, contents).unwrap();
+            std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let error = match claim_test_source_pair(&lock, &root).await {
+                Ok(_) => panic!("malformed ownership must refuse source access"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("malformed release receipt"),
+                "{error:#}"
+            );
             assert!(!root.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_rejects_group_writable_parent_and_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for writable_parent in [true, false] {
+            let dir = source_lock_test_dir();
+            let root = dir.join("source");
+            let lock = dir.join("pair.lock");
+            let owner = dir.join("pair.lock.owner");
+            if writable_parent {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+            } else {
+                std::fs::write(&owner, b"released\n").unwrap();
+                std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o620)).unwrap();
+            }
+            let error = match claim_test_source_pair(&lock, &root).await {
+                Ok(_) => panic!("group-writable custody must refuse source access"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("unsafe source pair record"),
+                "{error:#}"
+            );
+            assert!(!root.exists());
+            if writable_parent {
+                assert!(!owner.exists());
+            } else {
+                assert_eq!(std::fs::read(&owner).unwrap(), b"released\n");
+            }
         }
     }
 
@@ -5817,6 +5923,85 @@ os.execv({python:?}, [{python:?}] + args)
             .spawn()
             .expect("spawn source lock transport");
         (child, bootstrap)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_control_handoff_preserves_heartbeat_at_shell_buffer_boundaries()
+    {
+        let leaf = "sleep 0.05; printf '%s\\n' HANDOFF_TEST_READY; \
+            IFS= read -r release; [ \"$release\" = RCH_SOURCE_AUTHORITY_RELEASE:abc ]; \
+            printf '%s\\n' \"$release\"";
+        for block in [8192, 16384] {
+            for remainder in [block - 15, block - 1, 0, 1] {
+                let base = source_authority_live_session_command(
+                    &format!("#\n{leaf}"),
+                    SOURCE_LOCK_HEARTBEAT_TIMEOUT,
+                );
+                let (_, bootstrap) = source_authority_lock_transport(WorkerPlatform::Posix, &base);
+                let padding = (remainder + block - bootstrap.unwrap().len() % block) % block;
+                let script = source_authority_live_session_command(
+                    &format!("#{}\n{leaf}", "x".repeat(padding)),
+                    SOURCE_LOCK_HEARTBEAT_TIMEOUT,
+                );
+                let (child, bootstrap) =
+                    local_source_lock_transport(WorkerPlatform::Posix, &script);
+                assert_eq!(bootstrap.as_ref().unwrap().len() % block, remainder);
+                let mut guard = finish_source_authority_lock_acquisition(
+                    child,
+                    WorkerId::new("handoff-boundary-test"),
+                    "HANDOFF_TEST_READY",
+                    bootstrap.as_deref(),
+                    Duration::from_secs(10),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("block={block}, remainder={remainder}: {error:#}"));
+                guard.release_request = Some("RCH_SOURCE_AUTHORITY_RELEASE:abc".into());
+                guard.ensure_held().unwrap();
+                guard.release().await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_control_handoff_never_substitutes_for_source_readiness() {
+        for (frames, reason) in [
+            (
+                "HANDOFF_TEST_READY\n",
+                "control handoff was not acknowledged",
+            ),
+            (
+                "RCH_SOURCE_LOCK_SESSION_READY\nWRONG_SOURCE_READY\n",
+                "invalid ready marker",
+            ),
+        ] {
+            let script = format!(
+                "printf '%s' {}; exec cat >/dev/null",
+                shell_escape::escape(frames.into())
+            );
+            let child = Command::new("sh")
+                .args(["-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let refused = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("handoff-refusal-test"),
+                "HANDOFF_TEST_READY",
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await
+            .err()
+            .expect("both control ownership and exact source readiness are required");
+            assert!(refused.to_string().contains(reason), "{refused:#}");
+        }
     }
 
     #[cfg(target_os = "linux")]

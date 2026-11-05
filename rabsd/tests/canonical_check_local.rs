@@ -5781,10 +5781,6 @@ fn workspace_dag_metadata_observations_with_fresh(
     workspace_dag_diagnostics(output, names)
 }
 
-fn closed_workspace_metadata_dag_files(target: &Path, output: &str) -> BTreeMap<String, Vec<u8>> {
-    workspace_dag_metadata_files(target, output, &WORKSPACE_DAG_NAMES)
-}
-
 fn workspace_dag_metadata_files(
     target: &Path,
     output: &str,

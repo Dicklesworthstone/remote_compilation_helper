@@ -89,6 +89,132 @@ fn build_chain(registry: &Path, out_dir: &Path) -> Compiled {
     }
 }
 
+/// The compiler, rather than a fabricated dep-info record, establishes the
+/// boundary: placement-only changes preserve metadata, but source reads of
+/// every projected name must refuse publication, whether present or absent.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn host_placement_changes_preserve_rustc_bytes_but_source_reads_refuse_caching() {
+    use rabs_key::live_dependency::dep_info_closure_violation;
+
+    const NAMES: [&str; 7] = [
+        "GOCACHE",
+        "GOMODCACHE",
+        "GOPATH",
+        "TMPDIR",
+        "SSH_CLIENT",
+        "SSH_CONNECTION",
+        "XDG_SESSION_ID",
+    ];
+    let scratch = tempfile::tempdir().unwrap();
+    let cargo_home = scratch.path().join("cargo");
+    let package = cargo_home.join("registry/src/placement-index/placement_fixture-1.0.0");
+    let out = scratch.path().join("out");
+    let first = scratch.path().join("first-job");
+    let second = scratch.path().join("second-job");
+    for directory in [&package, &out, &first, &second] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(sysroot.status.success());
+    let compiler =
+        Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim()).join("bin/rustc");
+    let identity = Command::new(&compiler).arg("-vV").output().unwrap();
+    assert!(identity.status.success());
+    let identity = String::from_utf8(identity.stdout).unwrap();
+    let host = identity
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let source = package.join("lib.rs");
+    let argv = vec![
+        compiler.to_str().unwrap().to_owned(),
+        source.to_str().unwrap().to_owned(),
+        "--crate-name=placement_fixture".into(),
+        "--crate-type=rlib".into(),
+        "--edition=2024".into(),
+        "--emit=metadata,dep-info".into(),
+        "--cap-lints=allow".into(),
+        "--error-format=json".into(),
+        format!("--out-dir={}", out.display()),
+    ];
+    let compile = |value: Option<&Path>| {
+        let mut environment = vec![
+            ("CARGO_HOME".into(), cargo_home.to_str().unwrap().to_owned()),
+            (
+                "CARGO_MANIFEST_DIR".into(),
+                package.to_str().unwrap().to_owned(),
+            ),
+            ("CARGO_PKG_NAME".into(), "placement_fixture".into()),
+        ];
+        if let Some(value) = value {
+            environment.extend(NAMES.map(|name| (name.into(), value.to_str().unwrap().into())));
+        }
+        let plan = plan_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package.to_str().unwrap(),
+                env: &environment,
+            },
+            host,
+        )
+        .unwrap();
+        let result = Command::new(&compiler)
+            .args(&argv[1..])
+            .current_dir(&package)
+            .env_clear()
+            .envs(plan.execution_env.iter().map(|(name, value)| (name, value)))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stdout.is_empty());
+        let dep_info = std::fs::read(out.join("placement_fixture.d")).unwrap();
+        let metadata = std::fs::read(out.join("libplacement_fixture.rmeta")).unwrap();
+        (plan, dep_info, metadata)
+    };
+    std::fs::write(&source, "pub const ANSWER: u32 = 42;\n").unwrap();
+    let baseline = compile(None);
+    for value in [&first, &second] {
+        let changed = compile(Some(value));
+        assert_eq!(baseline.2, changed.2, "only host placement changed");
+        assert_eq!(
+            dep_info_closure_violation(&changed.0, &changed.1, |_| true),
+            None
+        );
+    }
+    for name in NAMES {
+        std::fs::write(
+            &source,
+            format!("pub const OBSERVED: Option<&str> = option_env!({name:?});\n"),
+        )
+        .unwrap();
+        for value in [None, Some(first.as_path())] {
+            let (plan, dep_info, _) = compile(value);
+            let text = String::from_utf8_lossy(&dep_info);
+            assert!(
+                text.contains(&format!("# env-dep:{name}")),
+                "{name}: {text}"
+            );
+            assert_eq!(
+                dep_info_closure_violation(&plan, &dep_info, |_| true),
+                Some(format!("tracked read of unkeyed variable {name}")),
+                "{name}, present={}",
+                value.is_some()
+            );
+        }
+    }
+}
+
 #[test]
 fn library_bytes_ignore_the_out_dir_and_the_rest_canonicalizes_exactly() {
     let dir = tempfile::tempdir().unwrap();

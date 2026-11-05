@@ -179,6 +179,13 @@ try:
         child_read, child_write = 3, None
     else:
         child_read, child_write = os.pipe()
+        # The bootstrap shell can read ahead into its stdin. Do not let the
+        # caller append heartbeat bytes until this monitor owns that stream;
+        # otherwise a buffer boundary can leave only a heartbeat suffix here.
+        # This is control handoff, never a source-lock/claim readiness marker.
+        handoff = b"RCH_SOURCE_LOCK_SESSION_READY\n"
+        if os.write(1, handoff) != len(handoff):
+            raise ValueError("incomplete source control handoff")
     child = os.fork()
     if child == 0:
         os.close(receipt_write)

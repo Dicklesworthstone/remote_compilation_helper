@@ -402,6 +402,19 @@ impl DurableCache {
             ..ToolchainLimits::default()
         };
         let prepared = open_toolchain(&path.join("tree"), expected, &limits, stopped)?;
+        self.validate_reopened(&prepared, stopped)?;
+        Ok(Some(prepared))
+    }
+
+    /// Finish this reopen against the inventory that just hashed every byte.
+    /// Permission inspection must not refresh that inventory or authorize a
+    /// later acquisition: even restored bytes or namespace membership invalidate
+    /// its original mutation stamps. Later leases still perform fresh hashes.
+    fn validate_reopened(
+        &self,
+        prepared: &PreparedToolchain,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
         // Source inventories may contain hardlinks and writable installation
         // files. A persisted captured tree may not: no writable alias is granted
         // merely because the content identity matches again after a restart.
@@ -433,9 +446,13 @@ impl DurableCache {
                 }
             }
         }
-        prepared.verify(stopped)?;
+        // open_toolchain already completed this acquisition's full byte scan.
+        // Revalidate its exact original generation after inspecting permissions
+        // rather than reading the whole SDK twice in this same reopen. This
+        // includes the stronger final directory-membership and alias barriers.
+        prepared.verify_retained_generation(stopped)?;
         checkpoint(stopped)?;
-        Ok(Some(prepared))
+        Ok(())
     }
 
     /// Capture directly into the durable store, without a second toolchain copy.
