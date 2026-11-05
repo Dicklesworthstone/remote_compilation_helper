@@ -3492,13 +3492,16 @@ exec /bin/sh -c "$payload"
         std::fs::write(&path, "123\n").unwrap();
         // Execute the production shell source with only OS failures injected.
         // All kill calls are inert; sleep is shortened for deterministic faults.
+        // This legacy record proves no identity, so an unknown census refuses with
+        // 43 (87695314): unknown grants neither stop authority nor proof of death.
+        // The identified case below keeps the 44 observation fault covered.
         for (probe, expected) in [
-            ("exit 1", 44),
-            (":", 44),
-            ("printf 'not a process table\\n'", 44),
+            ("exit 1", 43),
+            (":", 43),
+            ("printf 'not a process table\\n'", 43),
             // The thread census is pid, lwp, pgid, stat, nlwp (be002dc0).
-            ("printf '10 10 10 S 1\\n'", 44),
-            ("printf '%s %s 123 S 1\\n' \"$OBS\" \"$OBS\"", 44),
+            ("printf '10 10 10 S 1\\n'", 43),
+            ("printf '%s %s 123 S 1\\n' \"$OBS\" \"$OBS\"", 43),
             (
                 "printf '%s %s 99 S 1\\n100 100 123 R 1\\n' \"$OBS\" \"$OBS\"",
                 43,
@@ -3559,6 +3562,17 @@ exec /bin/sh -c "$payload"
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
             assert_eq!(output.status.code(), Some(45), "{output:?}");
+            assert!(!remote_kill_confirmed(&output, 42));
+            assert!(is_process_alive(pgid));
+
+            // With identity established, a failed census stays an observation
+            // fault rather than the authority refusal the legacy record gets.
+            let prefix = format!(
+                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                fake_ps_on_path(&root, "exit 1")
+            );
+            let output = remote_cancel_probe_fixture(&path, &prefix).await;
+            assert_eq!(output.status.code(), Some(44), "{output:?}");
             assert!(!remote_kill_confirmed(&output, 42));
             assert!(is_process_alive(pgid));
         }
