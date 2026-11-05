@@ -2,7 +2,77 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at01:52UTC (November4 local):**
+**Latest execution checkpoint, November5 at02:38UTC (November4 local):**
+
+- [x] Qualify the actual full-SDK warm CLI on TS2, DSRb874727f (launched
+  02:30:46UTC; controller9239B/d04d1bd1). Sourcebf76 normal worker from the
+  explicitly retained partial/timeout producer; its FIVE warm implementation
+  inputs match the current TLS-repair source exactly. Independently match the
+  installed TS2 SDK against the original TRJ inventory: ALL5256entries/
+  4270files/1921340623bytes, no missing/extra entries,95.153s. Read input only
+  from root30; every job/cache/temp/report write stays on healthy guarded49.
+  First actual CLI warm raw0/147.600s; second independent process raw0/101.838s.
+  Both publish the exact fc53f78505ccb9172d4e33f1e8550e5996d954d51662a2d95ab685f5be6b7142
+  SDK identity. Independent complete byte/mode/symlink checks pass on each
+  published tree; all4270 files have independent source inodes, nlink1/no write
+  bits, and EVERY published inode is unchanged after second-process reopening.
+  Complete original source after-audit matches before; controller/worker match.
+  Terminal native overall0. This is genuine durable SDK preparation/reopen
+  proof on a different physical host/storage, not a code-speedup, TLS/Cargo,
+  native-worker restart, action-result-cache, fleet or signed-release pass.
+- [x] Current d157 integration full workspace/all-target check0/677.503s,
+  strictClippy-Dwarnings0/692.029s, fmt0/19.120s; transport13/13 and corrected
+  pin-profile7/7, zeroignore. The same-invocation old guard4pass1fail remains
+  separately required and retained. No gate/pin/profile change after freezing.
+- [ ] Finish56c normal SEVEN-role build (active at02:38), verify actual release
+  Rustls artifact retains BOTH providers; normal harness and four exact lists.
+  Then run the ORIGINAL fullSDK CHECK+BUILD within the original combined3600s,
+  plus the separate fullSDK-prewarmed three-request/idle-TLS/service-restart
+  case. Both controllers23638B/4728decb are staged on TS2, with exact original
+  SDK identity/root30 read-only and all writes49, but remain UNLAUNCHED until
+  producer terminal0 and matching normal seven tools/harness are installed in
+  the private input bank. No global install/service/fleet changes.
+
+**Earlier execution checkpoint,02:27UTC (retained):**
+
+- [x] Retain f2235581 TLS repair run FAIL:13/13 transport PASS, including
+  real-PKI fresh-process unset/preselected-AWS probes with BOTH backends;
+  feature-profile4/5 FAIL because its aggregate count still requires the
+  unused dev edge intentionally removed by41970726. Source/control after-audits
+  match. Full QA/seven-role build/native runtime were UNRUN in this attempt.
+- [x] Correct only that stale guard: exactly one production dependency per
+  consumer; exact version/revision/repository for every declaration;3..4 total.
+  Do not restore test-internals merely to satisfy a counter. New snapshot
+  9d78+d1576060/all1747/FOUR manual inputs, archivefa6ff624; DSR56c5601e
+  launched02:13:26UTC, control12820B/46b52bac, original3600s/jobs1/concurrency4.
+  SAME invocation runs unchanged baseline guard:4pass1fail/raw101 with identical
+  production pin lines; corrected guard7/7 PASS, transport13/13 PASS, zeroignore.
+  New negatives cover version/revision/repository drift in production/dev,
+  missing production and duplicate production. Previously admitted four-edge
+  valid configuration remains valid; current intentional three-edge state is
+  newly admitted; wrong pins, missing/duplicate production and>4 remain refused.
+  UBS guard raw0/0critical/30warning/10info; fmt0/19.12s. Human commit8e72e9c2
+  preserves the source repair and guard; root did not stage/commit/push.
+- [ ] Finish56c full workspace/all-target check (active at02:27), strictClippy,
+  ALL7 normal release roles retaining BOTH actual Rustls providers, ordinary
+  harness and all4 exact case lists. Then original fullSDK CHECK+BUILD and
+  separate prewarmed3-request/idle-TLS/service-restart native cases remain
+  mandatory; earlier e1a runtime staging stayed UNLAUNCHED after its guard fail.
+- [ ] Finish actual full-SDK CLI capture/reopen: c630127d launched02:05:06,
+  controller7968B/64c8c0b8. Full original input5256entries/4270regularfiles/
+  1921340623bytes verified around02:25; first real warm is running. Python
+  preflight was observed in Dstate on ZFS reads, not in RABS execution. Process
+  read counters are not verified SDK progress. No capture/reopen success yet.
+- [ ] Finish separate original-installed-SDK read-only topology CLI probe,
+  launched02:23:46UTC, controller9219B/efd1d204. Original Btrfs36 root SBH
+  FAILS unchanged14percent threshold (9.25percent free/97GB), so no build,
+  cache, temp or report output is directed there. Read its complete original
+  SDK under the same exact inventory checks; all writes remain private on
+  healthy ZFS54 under original20GiB SBH. Earlier retained-copy run remains
+  independent and active. No SDK trim, storage-policy/property change, fake
+  filesystem, cancellation, hardware/code speedup or TLS/Cargo/release claim.
+
+**Earlier execution checkpoint,01:52UTC (retained):**
 
 - [x] Consume the seven-role retry b7acde59 SUCCESS: normal build0/707.9s,
   six version probes and actual wrapper/compiler0; original native harness
