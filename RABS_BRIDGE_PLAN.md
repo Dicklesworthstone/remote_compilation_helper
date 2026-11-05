@@ -2,7 +2,45 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at22:23UTC:**
+**Active qualification checkpoint, November5 at22:39UTC:**
+
+- [x] New3013 prewarmed-service actualPASS1/1/zeroignored/166.1s, original full
+  SDK/three fresh compiler executions/pinned reuse/restart and stronger immediate
+  reconnect assertions. Native now2/4; CHECK/BUILD/old-worker negative pending.
+- [x] Bounded supported TRJ `workers probe --no-self-healing`0/statusok at22:46:
+  SSH/capabilities respond, root/current authority directories700/uid1000 and
+  no unexpected ACL. NOT scheduling readiness or a source-write qualification.
+  Authoritative scheduler stillunreachable/used6/active2; no reserve, enable,
+  policy edit, peer cancellation or global daemon change performed.
+
+- [x] New3013 cold-service real TLS case actualPASS1/1/zeroignored/228.1s,
+  no observed owned residuals. Stronger assertions require every THREE fresh
+  accepted/released compiler results exactly ONE delay0 productive reconnect;
+  unchanged frontiers keep nonzero jitter. Heartbeats/coordinator restart and
+  original compiled-output checks retained. Source-bound functional proof,
+  not a timed speed comparison. Prewarmed/CHECK/BUILD/old-worker negative pending.
+
+- [x] Current3013 strictClippy0/913.0s, following workspace/alltargets check0/
+  1165.7s and fmt0/20.5s. All three compiler gates green; selected ALL9 actual
+  inventories now executing/compiling, not yet counted as passed.
+- [ ] New native control entered, full source/SDK/tool/storage guards and role
+  versions0; original cold-service actual TLS test RUNNING. Worker source3013,
+  genuine harness9ce1 explicitly recorded; no outcome claimed yet.
+
+- [x] Corrected3013 normalALL7/BOTH TLS DSR668932c0 terminalSUCCESS0/2032s,
+  actual Cargo0/2008.93s, all1758/control4277B/68162b71 aftermatch. Actual all7
+  shipping roles normal optz/release, Rustls ring+aws_lc_rs. Receipt12524B/
+  c0a04bad. New worker4259248B/aa64b215; new rabsd8178704B/9a418cdd. No speed
+  claim from compile time; previous9ce1 E0425 failures retained.
+- [ ] New native repeat DISPATCHED22:38UTC via DSR, session5374. Controller
+ 31861B/b2efacf6/inode14130296/dev49 joins native and fullcompiler completion
+  inside original3600s; failed compiler command refuses, no compiler/test retry
+  or time-limit extension. Service-first original4/old-worker negative/complete
+  SDK unchanged. Genuine3013 production roles, genuine9ce1 closure-matched
+  harness/194 component proof, no retagging. Actual outcomes still pending.
+- [ ] Fullworkspace check0/1165.7s, fmt0/20.5s; strictClippy/ALL9 inventories
+  continue. New native success also requires full compiler/retained9-suite
+  proof; no overall repair qualification, useful-speed/fleet/release claim yet.
 
 - [x] Current3013 fullworkspace/alltargets Cargo check0/1165.7s; fmt0/20.5s.
   StrictClippy now RUNNING; ALL9 Rust inventories still pending. Actual normal
