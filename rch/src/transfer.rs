@@ -14168,7 +14168,7 @@ Number of files transferred: 42
         assert!(guarded.contains("\"cargo_cache\":null"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cargo_disk_cache_unresolved_scope_refuses_before_workload_and_learning() {
         let _guard = test_guard!();
