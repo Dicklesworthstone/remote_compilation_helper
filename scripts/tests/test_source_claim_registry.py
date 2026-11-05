@@ -110,6 +110,37 @@ class SourceClaimRegistryTests(unittest.TestCase):
             tool.chmod(0o700)
         return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
 
+    def python_fault_env(self, injection, tools=None):
+        # Run unchanged production Python with one syscall fault. The wrapper
+        # uses its own globals; production imports see the patched os module,
+        # but its program, arguments and stdin remain exactly the real ones.
+        wrapper = self.root / ("python-fault-" + str(len(list(self.root.glob("python-fault-*")))) + ".py")
+        wrapper.write_text("import errno, os, stat, sys\n"
+                           "arguments = sys.argv[1:]\n"
+                           "if arguments[:3] != ['-I', '-S', '-c']:\n"
+                           "    os.execv(sys.executable, [sys.executable, *arguments])\n"
+                           "program = arguments[3]\n"
+                           "sys.argv = ['-c', *arguments[4:]]\n"
+                           + injection + "\n"
+                           "exec(compile(program, '<production-python>', 'exec'), {'__name__': '__main__'})\n")
+        return self.tools_env({**(tools or {}), "python3":
+            "exec " + shlex.quote(sys.executable) + " -I -S " + shlex.quote(str(wrapper)) + ' "$@"'})
+
+    def deny_record_allocation_env(self):
+        return self.python_fault_env('''
+original_open = os.open
+def without_allocation(path, flags, mode=0o777, *, dir_fd=None):
+    if flags & os.O_TRUNC:
+        raise OSError(errno.ENOSPC, "injected record truncation failure", path)
+    if flags & os.O_CREAT:
+        try:
+            os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise OSError(errno.ENOSPC, "injected record allocation failure", path)
+    return original_open(path, flags, mode, dir_fd=dir_fd)
+os.open = without_allocation
+''', {"mktemp": 'printf "injected ENOSPC: private record allocation\\n" >&2\nexit 1'})
+
     def barrier_env(self, program):
         # The registry fsyncs each record and directory itself through a
         # `python3 -c` adapter, never the sync utility (GNU syncfs and uutils'
@@ -457,6 +488,255 @@ class SourceClaimRegistryTests(unittest.TestCase):
                 if frontier == "quarantine":
                     self.assertEqual((self.registry / "quarantine" / pending.name).read_bytes(),
                                      b"incomplete legacy write")
+
+    def test_owned_cancellation_reuses_claim_without_record_allocation(self):
+        for frontier in ("active", "pending"):
+            with self.subTest(frontier=frontier):
+                self.setUp()
+                roots = [self.root / "project"]
+                roots[0].mkdir()
+                sentinel = roots[0] / "retained-source"
+                sentinel.write_bytes(b"source bytes are not cancellation metadata")
+                pending = self.registry / ("aa." + digest(roots) + ".pending")
+                if frontier == "pending":
+                    self.assert_unconfirmed(self.transact("aa", roots, env=self.fail_sync_after_move(pending)))
+                    original = pending
+                else:
+                    self.assert_granted(self.transact("aa", roots))
+                    original = pending.with_suffix(".claim")
+                before = original.stat().st_ino, original.read_bytes()
+                private_before = set(self.registry.glob(".record-write.*"))
+                env = self.deny_record_allocation_env()
+                result = self.transact("aa", roots, "cancel", env=env)
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"owned")
+                active, fence = pending.with_suffix(".claim"), pending.with_suffix(".cancelling")
+                for record in (active, fence):
+                    self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                self.assertEqual(active.stat().st_nlink, 2)
+                self.assert_refused(self.transact("bb", roots))
+                self.assert_refused(self.transact("aa", roots, "recover", env=env))
+                self.assert_granted(self.transact("aa", roots, "finish-cancel", env=env))
+                receipt = self.registry / "cancelled" / active.name
+                self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+                self.assertFalse(active.exists())
+                self.assert_granted(self.transact("bb", roots))
+                self.assert_refused(self.transact("aa", roots, env=env))
+                self.assertEqual(sentinel.read_bytes(), b"source bytes are not cancellation metadata")
+                self.assertEqual(set(self.registry.glob(".record-write.*")), private_before)
+
+    def test_terminal_cancellation_reuses_exact_record_without_allocation(self):
+        for frontier, operation in (("marker", "settle-cancel"), ("marker", "cancel"),
+                                    ("receipt", "settle-cancel"), ("receipt", "cancel"),
+                                    ("receipt", "finish-cancel")):
+            with self.subTest(frontier=frontier, operation=operation):
+                self.setUp()
+                roots = [self.root / "project"]
+                fence = self.registry / ("aa." + digest(roots) + ".cancelling")
+                receipt = self.registry / "cancelled" / fence.with_suffix(".claim").name
+                existing = fence if frontier == "marker" else receipt
+                existing.write_bytes(body(roots))
+                before = existing.stat().st_ino, existing.read_bytes()
+                env = self.deny_record_allocation_env()
+                for _ in range(2):
+                    result = self.transact("aa", roots, operation, env=env)
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, {"settle-cancel": b"settled", "cancel": b"unowned",
+                                                     "finish-cancel": b""}[operation])
+                    for record in (fence, receipt):
+                        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                    self.assertEqual(existing.stat().st_nlink, 2)
+                self.assertFalse(list(self.registry.glob(".record-write.*")))
+                self.assert_refused(self.transact("aa", roots, env=env))
+                self.assert_refused(self.transact("aa", roots, "recover", env=env))
+                self.assert_granted(self.transact("bb", roots))
+
+    def test_cancellation_without_complete_record_cannot_bypass_allocation_failure(self):
+        for frontier in ("absent", "quarantine"):
+            with self.subTest(frontier=frontier):
+                self.setUp()
+                roots = [self.root / "project"]
+                if frontier == "quarantine":
+                    pending = self.record("aa", roots, "pending")
+                    pending.write_bytes(b"incomplete original write")
+                    self.assert_granted(self.transact("bb", [self.root / "other"]))
+                before = {str(path): (path.stat().st_ino, path.read_bytes())
+                          for path in self.registry.rglob("*")
+                          if path.is_file() and not path.name.endswith(".lock")}
+                result = self.transact("aa", roots, "cancel", env=self.deny_record_allocation_env())
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"injected ENOSPC", result.stderr)
+                self.assertEqual({str(path): (path.stat().st_ino, path.read_bytes())
+                                  for path in self.registry.rglob("*")
+                                  if path.is_file() and not path.name.endswith(".lock")}, before)
+                self.assertFalse(list((self.registry / "cancelled").glob("aa.*")))
+
+    def test_linked_cancellation_records_never_repair_corrupted_shared_bytes(self):
+        for corruption in ("replacement", "shared-inode"):
+            with self.subTest(corruption=corruption):
+                self.setUp()
+                roots = [self.root / "project"]
+                roots[0].mkdir()
+                sentinel = roots[0] / "retained-source"
+                sentinel.write_bytes(b"metadata refusal grants no cleanup authority")
+                self.assert_granted(self.transact("aa", roots))
+                self.assert_granted(self.transact("aa", roots, "cancel"))
+                self.assert_granted(self.transact("aa", roots, "finish-cancel"))
+                fence = self.registry / ("aa." + digest(roots) + ".cancelling")
+                receipt = self.registry / "cancelled" / fence.with_suffix(".claim").name
+                self.assertEqual(fence.stat().st_ino, receipt.stat().st_ino)
+                if corruption == "replacement":
+                    fence.rename(self.root / "retained-original-fence")
+                fence.write_bytes(b"/incomplete\n")
+                self.assertNotEqual(hashlib.sha256(fence.read_bytes()).hexdigest(), digest(roots))
+                if corruption == "shared-inode":
+                    self.assertEqual(receipt.read_bytes(), b"/incomplete\n")
+                    self.assertNotEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), digest(roots))
+                else:
+                    self.assertEqual(receipt.read_bytes(), body(roots))
+                before = {path: (path.stat().st_ino, path.read_bytes()) for path in (fence, receipt)}
+                for operation in ("cancel", "finish-cancel", "settle-cancel", "cancelled",
+                                  "cancellation-state", "recover", "acquire"):
+                    result = self.transact("aa", roots, operation)
+                    self.assert_refused(result)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual({path: (path.stat().st_ino, path.read_bytes()) for path in before}, before)
+                self.assertFalse(fence.with_suffix(".claim").exists())
+                self.assertFalse(fence.with_suffix(".pending").exists())
+                self.assertEqual(sentinel.read_bytes(), b"metadata refusal grants no cleanup authority")
+
+    def test_cancellation_link_does_not_clobber_raced_destination(self):
+        for destination_type in ("record", "symlink", "directory"):
+            with self.subTest(destination_type=destination_type):
+                self.setUp()
+                roots = [self.root / "project"]
+                self.assert_granted(self.transact("aa", roots))
+                active = self.registry / ("aa." + digest(roots) + ".claim")
+                before = active.stat().st_ino, active.read_bytes()
+                fence = active.with_suffix(".cancelling")
+                foreign = self.root / "foreign-record"
+                foreign.write_bytes(b"foreign bytes must survive")
+                injection = '''
+original_link = os.link
+def raced_link(source, destination, **arguments):
+    parent = arguments["dst_dir_fd"]
+    kind = %r
+    if kind == "directory":
+        os.mkdir(destination, dir_fd=parent)
+    elif kind == "symlink":
+        os.symlink(%r, destination, dir_fd=parent)
+    else:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+        os.write(fd, b"raced destination bytes")
+        os.close(fd)
+    return original_link(source, destination, **arguments)
+os.link = raced_link
+''' % (destination_type, str(foreign))
+                result = self.transact("aa", roots, "cancel", env=self.python_fault_env(injection))
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"RCH_SOURCE_CLAIM_LINK_FAILED", result.stderr)
+                self.assertEqual((active.stat().st_ino, active.read_bytes()), before)
+                self.assertEqual(foreign.read_bytes(), b"foreign bytes must survive")
+                if destination_type == "record":
+                    self.assertEqual(fence.read_bytes(), b"raced destination bytes")
+                elif destination_type == "directory":
+                    self.assertEqual(list(fence.iterdir()), [])
+                else:
+                    self.assertEqual(os.readlink(fence), str(foreign))
+
+    def test_cancellation_link_revalidates_source_and_directory_after_race(self):
+        for race in ("source", "registry"):
+            with self.subTest(race=race):
+                self.setUp()
+                roots = [self.root / "project"]
+                self.assert_granted(self.transact("aa", roots))
+                active = self.registry / ("aa." + digest(roots) + ".claim")
+                before = active.stat().st_ino, active.read_bytes()
+                saved = self.root / "retained-registry" if race == "registry" else self.registry / "retained-original"
+                injection = '''
+original_link = os.link
+def raced_link(source, destination, **arguments):
+    if %r == "source":
+        os.rename(source, "retained-original", src_dir_fd=arguments["src_dir_fd"],
+                  dst_dir_fd=arguments["src_dir_fd"])
+        fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                     dir_fd=arguments["src_dir_fd"])
+        os.write(fd, b"replacement cannot become authority")
+        os.close(fd)
+    else:
+        os.rename(%r, %r)
+        os.mkdir(%r, mode=0o700)
+    return original_link(source, destination, **arguments)
+os.link = raced_link
+''' % (race, str(self.registry), str(saved), str(self.registry))
+                result = self.transact("aa", roots, "cancel", env=self.python_fault_env(injection))
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"RCH_SOURCE_CLAIM_LINK_FAILED", result.stderr)
+                retained = saved / active.name if race == "registry" else saved
+                self.assertEqual((retained.stat().st_ino, retained.read_bytes()), before)
+                if race == "registry":
+                    self.assertEqual(list(self.registry.iterdir()), [])
+                else:
+                    self.assertEqual(active.read_bytes(), b"replacement cannot become authority")
+
+    def test_cancellation_link_failure_and_fsync_frontiers_remain_unconfirmed(self):
+        for failure in ("link", "before-file", "after-file", "terminal-directory", "registry-directory"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                roots = [self.root / "project"]
+                fence = self.record("aa", roots, "cancelling")
+                before = fence.stat().st_ino, fence.read_bytes()
+                receipt = self.registry / "cancelled" / fence.with_suffix(".claim").name
+                injection = '''
+failure = %r
+registry_identity = os.stat(%r).st_dev, os.stat(%r).st_ino
+linked = False
+original_link, original_fsync = os.link, os.fsync
+def failing_link(*arguments, **keywords):
+    global linked
+    if failure == "link":
+        raise OSError(errno.ENOSPC, "injected link metadata failure")
+    result = original_link(*arguments, **keywords)
+    linked = True
+    return result
+def failing_fsync(descriptor):
+    info = os.fstat(descriptor)
+    regular = stat.S_ISREG(info.st_mode)
+    directory = stat.S_ISDIR(info.st_mode)
+    registry = (info.st_dev, info.st_ino) == registry_identity
+    # Only the real link transaction, not preceding read-only confirmation.
+    if "os.link(" in program and (
+            (failure == "before-file" and regular and not linked)
+            or (failure == "after-file" and regular and linked)
+            or (failure == "terminal-directory" and directory and not registry and linked)
+            or (failure == "registry-directory" and directory and registry and linked)):
+        raise OSError(errno.ENOSPC, "injected cancellation durability failure")
+    return original_fsync(descriptor)
+os.link, os.fsync = failing_link, failing_fsync
+''' % (failure, str(self.registry), str(self.registry))
+                result = self.transact("aa", roots, "settle-cancel", env=self.python_fault_env(injection))
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"RCH_SOURCE_CLAIM_LINK_FAILED", result.stderr)
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+                if failure in ("link", "before-file"):
+                    self.assertFalse(receipt.exists())
+                else:
+                    self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                    failed_barrier = (receipt if failure == "after-file" else
+                                      receipt.parent if failure == "terminal-directory" else self.registry)
+                    env = self.barrier_env('if [ "$1" = ' + shlex.quote(str(failed_barrier)) +
+                                           ' ]; then exit 91; fi')
+                    self.assert_refused(self.transact("aa", roots, "settle-cancel", env=env))
+                resumed = self.transact("aa", roots, "settle-cancel", env=self.deny_record_allocation_env())
+                self.assert_granted(resumed)
+                self.assertEqual(resumed.stdout, b"settled")
+                self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
 
     def test_every_terminal_replay_sync_barrier_is_required_before_success(self):
         roots = [self.root / "project"]
@@ -1066,6 +1346,11 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
 
     def setUp(self):
         SourceClaimRegistryTests.setUp(self)
+        # These synthesized journals represent a previously admitted token.
+        # Production cancellation already retains both lock inodes; settlement
+        # must drain the existing activity lock, never manufacture that proof.
+        for name in ("metadata.lock", "aa.activity.lock"):
+            (self.registry / name).touch(mode=0o600)
         self.legacy = self.root / "legacy"
         self.roots = [self.root / "project", self.root / "project/.rch-target"]
         self.coordinator = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
@@ -1110,6 +1395,8 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.legacy.mkdir()
         for name in ("released", "cancelled", "quarantine"):
             (self.legacy / name).mkdir()
+        for name in ("metadata.lock", "aa.activity.lock"):
+            (self.legacy / name).touch(mode=0o600)
 
     def legacy_transaction(self, operation, token="aa", roots=None, env=None):
         roots = self.roots if roots is None else roots
@@ -1638,6 +1925,213 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
         self.assert_refused(result)
         self.assertFalse((self.root / "unrelated").exists())
         self.assertFalse(list((self.registry / "cancelled").glob("*.claim")))
+
+
+@unittest.skipUnless(FLOCK and REALPATH, "native flock and realpath required")
+class CancellationSettlementStorageTests(unittest.TestCase):
+    """Real coordinator/registry qualification, independent of SSH control.
+
+    This directly exercises the production coordinator and its real child
+    transaction. It makes no claim about the outer control transport or a
+    filesystem guaranteeing that hard-link metadata/fsync survives ENOSPC.
+    """
+
+    shell = "/bin/sh"
+    setUp = TerminalCancellationSettlementTests.setUp
+    record = SourceClaimRegistryTests.record
+    transact = SourceClaimRegistryTests.transact
+    command = SourceClaimRegistryTests.command
+    assert_granted = SourceClaimRegistryTests.assert_granted
+    assert_refused = SourceClaimRegistryTests.assert_refused
+    tools_env = SourceClaimRegistryTests.tools_env
+    python_fault_env = SourceClaimRegistryTests.python_fault_env
+    deny_record_allocation_env = SourceClaimRegistryTests.deny_record_allocation_env
+    make_legacy = TerminalCancellationSettlementTests.make_legacy
+    legacy_transaction = TerminalCancellationSettlementTests.legacy_transaction
+    assert_settled = TerminalCancellationSettlementTests.assert_settled
+    records = TerminalCancellationSettlementTests.records
+
+    def empty_legacy(self):
+        self.legacy.mkdir()
+        for name in ("released", "cancelled", "quarantine"):
+            (self.legacy / name).mkdir()
+        (self.legacy / "metadata.lock").touch(mode=0o600)
+
+    def start_settlement(self, *, expected="current", env=None, transaction=None,
+                         operation="settle-cancel"):
+        process = subprocess.Popen(
+            ["python3", "-I", "-S", "-c", self.coordinator,
+             str(self.registry), str(self.legacy), "aa", digest(self.roots),
+             transaction or self.script.read_text(), operation, expected],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env or self.env)
+        process.stdin.write(body(self.roots))
+        process.stdin.close()
+        process.stdin = None
+        return process
+
+    def settle(self, **arguments):
+        process = self.start_settlement(**arguments)
+        stdout, stderr = process.communicate(timeout=20)
+        return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+
+    def test_empty_peer_and_existing_records_settle_without_allocating_inodes(self):
+        for namespace in ("current", "legacy"):
+            for frontier in ("active-fenced", "marker", "receipt"):
+                with self.subTest(namespace=namespace, frontier=frontier):
+                    self.setUp()
+                    if namespace == "current":
+                        self.empty_legacy()
+                        selected, peer = self.registry, self.legacy
+                        transaction = lambda operation: self.transact("aa", self.roots, operation)
+                    else:
+                        self.make_legacy()
+                        (self.registry / "aa.activity.lock").rename(self.root / "retained-peer-activity.lock")
+                        selected, peer = self.legacy, self.registry
+                        transaction = self.legacy_transaction
+                    active = selected / ("aa." + digest(self.roots) + ".claim")
+                    fence = active.with_suffix(".cancelling")
+                    receipt = selected / "cancelled" / active.name
+                    if frontier == "active-fenced":
+                        self.assert_granted(transaction("acquire"))
+                        self.assert_granted(transaction("cancel"))
+                        existing = active
+                    else:
+                        existing = fence if frontier == "marker" else receipt
+                        existing.write_bytes(body(self.roots))
+                    before = existing.stat().st_ino, existing.read_bytes()
+                    locks = {path: path.stat().st_ino for path in
+                             (selected / "aa.activity.lock", selected / "metadata.lock", peer / "metadata.lock")}
+                    for _ in range(2):
+                        self.assert_settled(self.settle(expected=namespace, env=self.deny_record_allocation_env()))
+                        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                        self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+                        self.assertFalse(active.exists())
+                        self.assertFalse((peer / "aa.activity.lock").exists())
+                        self.assertEqual({path: path.stat().st_ino for path in locks}, locks)
+                    self.assert_refused(transaction("recover"))
+
+    def test_missing_selected_activity_lock_is_never_created_as_drain_proof(self):
+        for frontier in ("active-fenced", "marker", "receipt"):
+            with self.subTest(frontier=frontier):
+                self.setUp()
+                self.empty_legacy()
+                active = self.registry / ("aa." + digest(self.roots) + ".claim")
+                if frontier == "active-fenced":
+                    self.assert_granted(self.transact("aa", self.roots))
+                    self.assert_granted(self.transact("aa", self.roots, "cancel"))
+                elif frontier == "marker":
+                    self.record("aa", self.roots, "cancelling")
+                else:
+                    (self.registry / "cancelled" / active.name).write_bytes(body(self.roots))
+                (self.registry / "aa.activity.lock").rename(self.root / "retained-selected-activity.lock")
+                before = self.records()
+                result = self.settle(env=self.deny_record_allocation_env())
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"source cancellation activity lock is absent", result.stderr)
+                self.assertFalse((self.registry / "aa.activity.lock").exists())
+                self.assertEqual(self.records(), before)
+
+    def test_missing_metadata_lock_still_requires_real_serialization(self):
+        self.empty_legacy()
+        self.record("aa", self.roots, "cancelling")
+        (self.legacy / "metadata.lock").rename(self.root / "retained-peer-metadata.lock")
+        before = self.records()
+        result = self.settle(env=self.deny_record_allocation_env())
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"injected record allocation failure", result.stderr)
+        self.assertFalse((self.legacy / "metadata.lock").exists())
+        self.assertEqual(self.records(), before)
+
+    def test_peer_lock_or_claim_appearing_while_metadata_waits_is_not_ignored(self):
+        for appeared in ("activity", "claim"):
+            with self.subTest(appeared=appeared):
+                self.setUp()
+                self.empty_legacy()
+                self.record("aa", self.roots, "cancelling")
+                before = self.records()
+                observed = self.root / "metadata-contention-observed"
+                injection = '''
+import fcntl
+original_flock = fcntl.flock
+def observe_contention(descriptor, operation):
+    try:
+        return original_flock(descriptor, operation)
+    except BlockingIOError:
+        fd = os.open(%r, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        raise
+fcntl.flock = observe_contention
+''' % str(observed)
+                with (self.registry / "metadata.lock").open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    process = self.start_settlement(env=self.python_fault_env(injection))
+                    deadline = time.monotonic() + 5
+                    while not observed.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(observed.exists(), "coordinator did not reach the held metadata mutex")
+                    # Only now: its activity-lock observations are complete.
+                    if appeared == "activity":
+                        path = self.legacy / "aa.activity.lock"
+                        path.touch(mode=0o600)
+                    else:
+                        path = self.legacy / ("aa." + digest(self.roots) + ".claim")
+                        with (self.legacy / "metadata.lock").open("a") as peer_metadata:
+                            fcntl.flock(peer_metadata, fcntl.LOCK_EX)
+                            path.write_bytes(body(self.roots))
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                    stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                self.assertIn(b"activity lock appeared" if appeared == "activity" else b"2 registries contain identity",
+                              stderr)
+                self.assertTrue(path.exists())
+                for name, record in before.items():
+                    self.assertEqual(self.records()[name], record)
+                self.assertFalse(list((self.registry / "cancelled").glob("*.claim")))
+
+    def test_empty_peer_is_rechecked_after_the_real_settlement_transaction(self):
+        for appeared in ("activity", "claim", "unknown"):
+            with self.subTest(appeared=appeared):
+                self.setUp()
+                self.empty_legacy()
+                self.assert_granted(self.transact("aa", self.roots))
+                self.assert_granted(self.transact("aa", self.roots, "cancel"))
+                active = self.registry / ("aa." + digest(self.roots) + ".claim")
+                before = active.stat().st_ino, active.read_bytes()
+                suffix = "activity.lock" if appeared == "activity" else digest(self.roots) + "." + appeared
+                appeared_path = self.legacy / ("aa." + suffix)
+                # Execute the actual state machine first, then inject a peer
+                # change before its child exits. Its real result is not enough
+                # for coordinator acknowledgement without the final recheck.
+                transaction = (shlex.quote(self.shell) + " " + shlex.quote(str(self.script)) + ' "$@"\n'
+                               'status=$?\n[ "$status" -eq 0 ] || exit "$status"\n'
+                               "printf '%s' " + shlex.quote(body(self.roots).decode()) + " > " +
+                               shlex.quote(str(appeared_path)) + '\nexit "$status"\n')
+                result = self.settle(transaction=transaction)
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn({"activity": b"activity lock appeared", "claim": b"identity appeared",
+                               "unknown": b"unrecognized same-identity"}[appeared], result.stderr)
+                receipt = self.registry / "cancelled" / active.name
+                self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                self.assertEqual((active.with_suffix(".cancelling").stat().st_ino,
+                                  active.with_suffix(".cancelling").read_bytes()), before)
+                self.assertEqual(appeared_path.read_bytes(), body(self.roots))
+
+    def test_existing_empty_peer_activity_lock_must_still_drain(self):
+        self.make_legacy()
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        with (self.legacy / "aa.activity.lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            result = self.settle(env=self.deny_record_allocation_env())
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_SETTLEMENT_LOCK_BUSY", result.stderr)
+        self.assertEqual(self.records(), before)
+        self.assert_settled(self.settle(env=self.deny_record_allocation_env()))
 
 
 @unittest.skipUnless(FLOCK and REALPATH, "native flock and realpath required")
