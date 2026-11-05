@@ -1,0 +1,177 @@
+{
+  "scope": "Executed original/candidate accounting and scan microbenchmark on local files. Production functions loaded unmodified from captured source bytes. Observer identity is synthetic; this does not qualify process supervision, durable worker admission, SSH, or live remote Cargo admission.",
+  "sources": {
+    "baseline": {
+      "path": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper/rch-common/build_disk_monitor.py",
+      "sha256": "c2058c9f06c7f268c288f7d389f0d352c3252c7e3c238b583d08285ce2a94bb8"
+    },
+    "candidate": {
+      "path": "/dev/shm/rch-issue132-a57a6a5e1f3e/rch-common/build_disk_monitor.py",
+      "sha256": "ef184fb890c782d8a433cc0c3b8ec551ca4d10f6002ef8710724b1523e94b7ec"
+    }
+  },
+  "fixture_root": "/dev/rch132-final-benchmark/rch-accounting-bench-a_jhzbvu",
+  "cases": {
+    "warm": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 17825792,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 17825792,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 1048576,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "cold": {
+      "baseline": {
+        "starting_allocated_bytes": 0,
+        "peak_total_output_bytes": 1048576,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 0,
+        "peak_total_output_bytes": 1048576,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 1048576,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "cleanup": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 0
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 0,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": -15728640,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "overlap": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 19922944,
+        "peak_growth_bytes": 3145728
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 19922944,
+        "peak_growth_bytes": 3145728,
+        "peak_added_output_bytes": 3145728,
+        "peak_free_drop_bytes": 3149824,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 3149824,
+      "scope": "Three real child writers with overlapping lifetimes write to one shared target. Both observers cover all writers; no per-writer attribution claim."
+    },
+    "retained_modified": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 0
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 16777216,
+        "peak_added_output_bytes": 16777216,
+        "peak_free_drop_bytes": 0,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 0,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "unpooled_baseline": {
+      "baseline": {
+        "starting_allocated_bytes": 20971520,
+        "peak_total_output_bytes": 22020096,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 20971520,
+        "peak_total_output_bytes": 22020096,
+        "peak_growth_bytes": 5242880,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "proven_target_retained_bytes": 16777216,
+      "unproven_baseline_bytes": 4194304,
+      "scope": "Real target 16 MiB plus separate output root 4 MiB, then 1 MiB added. Production require_warm_pool uses a synthetic observer identity: this is an accounting proof fixture, not verified worker admission."
+    }
+  },
+  "scan_performance": {
+    "files": 2048,
+    "runs_per_variant": 15,
+    "raw_ms": {
+      "baseline": [
+        4.577801,
+        4.139774,
+        5.63914,
+        5.227701,
+        4.630499,
+        5.237285,
+        4.709595,
+        5.068335,
+        4.654124,
+        5.076038,
+        4.499615,
+        5.515526,
+        4.800489,
+        5.472753,
+        4.633623
+      ],
+      "candidate": [
+        14.377503,
+        15.113932,
+        26.99903,
+        15.60693,
+        13.600747,
+        14.597339,
+        13.326502,
+        13.867631,
+        13.290459,
+        14.561956,
+        13.172524,
+        15.516917,
+        13.668246,
+        14.788681,
+        13.640956
+      ]
+    },
+    "median_ms": {
+      "baseline": 4.800489,
+      "candidate": 14.377503
+    },
+    "scope": "One complete output scan including candidate signatures and hash. No end-to-end performance claim."
+  },
+  "actual_disk_pressure": {
+    "probe": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper/rch-common",
+    "available_bytes_by_device": {
+      "27": 0
+    },
+    "floor_bytes": 1048576,
+    "observed_guard_result": "free_floor",
+    "scope": "Production floor observation with actual statvfs; process launch excluded."
+  },
+  "process_facility": {
+    "baseline": "BudgetFailure: unverified process namespace",
+    "candidate": "BudgetFailure: unverified process namespace"
+  }
+}
