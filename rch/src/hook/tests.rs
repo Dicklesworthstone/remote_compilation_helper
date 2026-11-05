@@ -9454,7 +9454,15 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
         return;
     }
     use std::os::unix::fs::PermissionsExt as _;
-    let root = tempfile::tempdir().unwrap().keep();
+    // The clean-overlay guard below refuses a `.cargo/config*` in any ancestor
+    // of `source`. rch points TMPDIR inside the project it builds, and this
+    // repository has a `.cargo/config.toml`, so a default temp dir fails the
+    // guarded command with RCH-E413 when this test runs through rch.
+    let root = tempfile::Builder::new()
+        .prefix("rch-worker-cache-wrappers-")
+        .tempdir_in("/tmp")
+        .unwrap()
+        .keep();
     let bin = root.join("bin");
     let source = root.join("source");
     std::fs::create_dir(&bin).unwrap();
@@ -9495,6 +9503,8 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
         assert_eq!(output.stdout, b"cargo-body:check:--locked\n");
         assert_eq!(output.stderr, b"preparation-entered\n");
     }
+    // The tree is kept only for a failing run.
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
