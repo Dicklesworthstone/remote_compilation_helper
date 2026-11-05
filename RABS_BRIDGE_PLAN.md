@@ -4,6 +4,14 @@
 
 **Active qualification checkpoint, November5 at22:39UTC:**
 
+- [x] Full1758-file live comparison22:49 corrects earlier narrow Rust/TOML/Python
+  check: current main also differs in install.sh, remote_process.sh,
+  source_cancel_settlement.py, source_claim_registry.sh, ssh.rs and their tests.
+  Preserve all concurrent changes; frozen3013 does NOT qualify entire current
+  RCH main. Complete RABS/Cargo/config/toolchain inputs still match3013 exactly;
+  no RABS crate depends on rch-common. Native RABS proof remains source-bound;
+  latest RCH embedded shell/installer/SSH changes require their own qualification.
+
 - [x] New3013 prewarmed-service actualPASS1/1/zeroignored/166.1s, original full
   SDK/three fresh compiler executions/pinned reuse/restart and stronger immediate
   reconnect assertions. Native now2/4; CHECK/BUILD/old-worker negative pending.
