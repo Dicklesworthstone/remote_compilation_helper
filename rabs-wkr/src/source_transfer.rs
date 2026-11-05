@@ -592,6 +592,22 @@ impl SourceOwner {
         self.receiver.manifest()
     }
 
+    /// Only the exact admitted upload's explicit byte-reuse selection permits
+    /// retaining its produced library bytes for later input negotiation. The
+    /// source transfer's old cancellation/deadline owner is not carried into
+    /// execution; completion applies the execution owner's remaining budget.
+    pub(crate) fn produced_input_cache(&self, request_id: u64) -> Option<SourceCache> {
+        if self.request_id != request_id
+            || !self.execution_owned
+            || self.source_failed
+            || !self.allow_cached_files
+            || self.receiver.sealed_root().is_none()
+        {
+            return None;
+        }
+        self.cache_protection.clone()
+    }
+
     /// The transferred, verified package root for original-path dependency
     /// execution. Every other member must belong to an explicitly declared
     /// retained artifact or generated root; wire paths never select arbitrary
@@ -2183,6 +2199,92 @@ mod tests {
         }
         state.handle(&seal(&manifest, 91), true, false).unwrap();
         state.take_prepared(&request).unwrap().unwrap()
+    }
+
+    #[test]
+    fn produced_input_retention_requires_the_exact_opted_in_execution_owner() {
+        for (configured, enabled) in [(true, true), (true, false), (false, true)] {
+            let parent = tempfile::tempdir().unwrap();
+            let mut state = if configured {
+                cached_state(parent.path())
+            } else {
+                SourceTransferState::default()
+            };
+            let manifest = projection(&[("package/lib.rs", b"pub fn leaf() {}", false)]);
+            let request = json!({"request_id":37,"source_manifest":manifest});
+            let mut start = begin(&manifest, 37);
+            start["allow_cached_files"] = json!(enabled);
+            state.handle(&start, true, false).unwrap();
+            assert!(
+                state
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .produced_input_cache(37)
+                    .is_none()
+            );
+            upload(
+                &mut state,
+                &manifest,
+                37,
+                "package/lib.rs",
+                b"pub fn leaf() {}",
+            );
+            state.handle(&seal(&manifest, 37), true, false).unwrap();
+            assert!(
+                state
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .produced_input_cache(37)
+                    .is_none()
+            );
+            let mut owner = state.take_prepared(&request).unwrap().unwrap();
+            assert!(owner.produced_input_cache(38).is_none());
+            assert_eq!(
+                owner.produced_input_cache(37).is_some(),
+                configured && enabled
+            );
+
+            // Upload cancellation and its elapsed budget cannot cancel work
+            // already handed to an independently budgeted execution owner.
+            state.cancelled.store(true, Ordering::Release);
+            owner.deadline = Instant::now() - Duration::from_secs(1);
+            if let Some(cache) = owner.produced_input_cache(37) {
+                let bytes = b"produced metadata";
+                let output = SourceManifest::new(vec![SourceFile {
+                    path: "libleaf.rmeta".into(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: false,
+                }])
+                .unwrap();
+                assert_eq!(
+                    cache
+                        .remember_streamed(
+                            &output,
+                            Instant::now() + Duration::from_secs(30),
+                            |_, offset, count| {
+                                let offset = usize::try_from(offset).unwrap();
+                                Ok(bytes[offset..bytes.len().min(offset + count)].to_vec())
+                            },
+                        )
+                        .unwrap(),
+                    1
+                );
+                let mut next = cached_state(parent.path());
+                let next_manifest =
+                    projection(&[("dependencies/0000/libleaf.rmeta", bytes, false)]);
+                let ready = next
+                    .handle(&begin(&next_manifest, 38), true, false)
+                    .unwrap();
+                assert_eq!(ready["missing_files"], json!([]));
+                assert_eq!(ready["source_reused_bytes"], bytes.len());
+                assert_eq!(ready["sealed"], false);
+            }
+            owner.source_failed = true;
+            assert!(owner.produced_input_cache(37).is_none());
+        }
     }
 
     fn workspace_dependency_context(

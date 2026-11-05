@@ -120,6 +120,7 @@ pub struct ExecutionControl {
     output: Arc<Mutex<OutputCapture>>,
     artifacts: Arc<Mutex<ArtifactCapture>>,
     target_seed: Arc<Mutex<Option<crate::target_cache::PendingTargetSeed>>>,
+    artifact_input_cache: Arc<Mutex<Option<crate::source_transfer::SourceCache>>>,
     preview: Arc<LiveOutputPreview>,
     pub(crate) metadata_prefetch: Arc<crate::metadata_prefetch::MetadataPrefetch>,
 }
@@ -173,6 +174,7 @@ impl ExecutionControl {
             output: Arc::new(Mutex::new(OutputCapture::default())),
             artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
             target_seed: Arc::new(Mutex::new(None)),
+            artifact_input_cache: Arc::new(Mutex::new(None)),
             preview: Arc::new(LiveOutputPreview::default()),
             metadata_prefetch: Arc::new(crate::metadata_prefetch::MetadataPrefetch::default()),
         })
@@ -365,6 +367,26 @@ impl ExecutionControl {
         Ok(())
     }
 
+    /// Select the admitted source owner's optional byte cache. This retains
+    /// no output yet: complete_result must first validate the frozen successful
+    /// result, including its diagnostics, exact artifacts and process cleanup.
+    pub(crate) fn retain_artifact_input_cache(
+        &self,
+        cache: crate::source_transfer::SourceCache,
+    ) -> io::Result<()> {
+        let mut selected = self
+            .artifact_input_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if selected.is_some() || self.state.load(Ordering::Acquire) != RUNNING {
+            return Err(io::Error::other(
+                "artifact input reuse already fixed or completed",
+            ));
+        }
+        *selected = Some(cache);
+        Ok(())
+    }
+
     /// Freeze the result frontier, including interrupted executions. Retain
     /// the first stop reason while rejecting all later capture writes. Taking
     /// the capture locks in one fixed order makes the freeze atomic relative
@@ -373,6 +395,10 @@ impl ExecutionControl {
         let _output = self.output.lock().unwrap_or_else(|e| e.into_inner());
         let _artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
         let _target_seed = self.target_seed.lock().unwrap_or_else(|e| e.into_inner());
+        let _artifact_input_cache = self
+            .artifact_input_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.observe_reason(&mut lease, Instant::now());
         if let Some(lease) = lease.as_mut() {
@@ -410,6 +436,11 @@ fn complete_result(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take();
+    let artifact_input_cache = control
+        .artifact_input_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     // Process cleanup is a prerequisite for EVERY completion, including
     // digest-only requests, compiler failures and interrupted executions.
     // Otherwise a resumable result can outlive children that still mutate
@@ -442,7 +473,7 @@ fn complete_result(
     };
     let mut capture = control.artifacts.lock().unwrap_or_else(|e| e.into_inner());
     let captured = capture.result.take();
-    let artifacts = if capture.plan.is_some()
+    let mut artifacts = if capture.plan.is_some()
         && result.executed
         && result.exit_code == 0
         && stop_reason.is_none()
@@ -461,6 +492,31 @@ fn complete_result(
         None
     };
     drop(capture);
+    if result.executed
+        && result.exit_code == 0
+        && stop_reason.is_none()
+        && control.state.load(Ordering::Acquire) == FINISHED
+        && let (Some(cache), Some(artifacts)) = (artifact_input_cache, artifacts.as_mut())
+    {
+        // This runs on the existing blocking execution owner, after freezing
+        // cancellation and all successful-result checks. Cache failure remains
+        // optional: the original captured result is still delivered normally.
+        // A short optional-I/O budget, capped by the original execution
+        // deadline, bounds retention before the original result is delivered.
+        match artifacts.seed_source_cache(&cache, control.deadline) {
+            Ok(stored) if stored != 0 => eprintln!(
+                "{}",
+                serde_json::json!({"kind":"worker-artifact-inputs-retained",
+                    "request_id":result.request_id, "objects":stored}),
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "{}",
+                serde_json::json!({"kind":"worker-artifact-input-reuse-refused",
+                    "request_id":result.request_id, "error":error.to_string()}),
+            ),
+        }
+    }
     if result.executed
         && stop_reason.is_none()
         && control.state.load(Ordering::Acquire) == FINISHED
@@ -1132,6 +1188,201 @@ mod tests {
         let prepared = crate::artifacts::PreparedArtifacts::new(plan).unwrap();
         std::fs::write(prepared.backing().join("a"), b"compiled").unwrap();
         prepared.capture(|| false).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn produced_input_ready(cache: crate::source_transfer::SourceCache) -> serde_json::Value {
+        use crate::source_transfer::{SourceTransferState, hex};
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+        use sha2::{Digest, Sha256};
+        let bytes = b"compiled library";
+        let manifest = SourceManifest::new(vec![SourceFile {
+            path: "dependencies/0000/libleaf.rlib".into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        }])
+        .unwrap();
+        let mut next = SourceTransferState::default().with_cache(Some(cache));
+        next.handle(
+            &serde_json::json!({
+                "kind":"source-begin","request_id":93,"allow_cached_files":true,
+                "manifest":{"manifest_sha256":hex(&manifest.digest()),"files":[{
+                    "path":manifest.files()[0].path,"bytes":bytes.len(),
+                    "sha256":hex(&manifest.files()[0].sha256),"executable":false,
+                }]},
+            }),
+            true,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_valid_frozen_compiler_success_retains_produced_input_bytes() {
+        use crate::source_transfer::SourceCache;
+        use std::os::unix::fs::PermissionsExt;
+        for case in 0..8 {
+            let parent = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+            let selected = cache.clone();
+            let mut task = ExecutionTask::spawn_with_artifacts(
+                92,
+                Duration::from_secs(5),
+                artifact_plan("libleaf.rlib"),
+                move |control| {
+                    control.request_output_capture();
+                    control
+                        .retain_artifact_input_cache(selected.clone())
+                        .unwrap();
+                    assert!(control.retain_artifact_input_cache(selected).is_err());
+                    control
+                        .retain_outputs(Ok(outputs(if case == 4 {
+                            b"misbound"
+                        } else {
+                            b"output"
+                        })))
+                        .unwrap();
+                    if case == 7 {
+                        control
+                            .retain_artifacts(Err("artifact capture failed".into()))
+                            .unwrap();
+                    } else if case != 3 {
+                        let prepared =
+                            crate::artifacts::PreparedArtifacts::new(artifact_plan("libleaf.rlib"))
+                                .unwrap();
+                        std::fs::write(
+                            prepared.backing().join("libleaf.rlib"),
+                            b"compiled library",
+                        )
+                        .unwrap();
+                        control
+                            .retain_artifacts(Ok(prepared.capture(|| false).unwrap()))
+                            .unwrap();
+                    }
+                    let mut outcome = result(92);
+                    if case == 1 {
+                        outcome.exit_code = 1;
+                    }
+                    if case == 2 {
+                        control.cancel(StopReason::Cancelled);
+                    }
+                    if case == 5 {
+                        outcome.residual_group_members = 1;
+                    }
+                    if case == 6 {
+                        outcome.executed = false;
+                        outcome.exit_code = 1;
+                    }
+                    outcome
+                },
+            )
+            .unwrap();
+            let completed = wait(&mut task);
+            match case {
+                0 => {
+                    let mut completion = completed.unwrap();
+                    assert_eq!(completion.result.exit_code, 0);
+                    assert_eq!(completion.stop_reason, None);
+                    assert_eq!(
+                        completion
+                            .artifacts
+                            .as_mut()
+                            .unwrap()
+                            .read_chunk("libleaf.rlib", 0, 64)
+                            .unwrap(),
+                        b"compiled library"
+                    );
+                }
+                1 | 2 | 6 => {
+                    let completion = completed.unwrap();
+                    assert_ne!(completion.result.exit_code, 0);
+                    assert!(completion.artifacts.is_none());
+                }
+                _ => {
+                    assert!(
+                        completed.is_err(),
+                        "invalid completion case {case} succeeded"
+                    );
+                }
+            }
+            let ready = produced_input_ready(cache);
+            assert_eq!(ready["sealed"], false);
+            assert_eq!(
+                ready["source_reused_bytes"],
+                if case == 0 {
+                    b"compiled library".len()
+                } else {
+                    0
+                },
+                "case {case}"
+            );
+            assert_eq!(
+                ready["missing_files"].as_array().unwrap().len(),
+                usize::from(case != 0),
+                "case {case}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_output_cache_failure_keeps_the_original_completed_result() {
+        use crate::source_transfer::SourceCache;
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+        let foreign = parent.path().join("source-files-v1/foreign");
+        let mut task = ExecutionTask::spawn_with_artifacts(
+            94,
+            Duration::from_secs(5),
+            artifact_plan("libleaf.rlib"),
+            move |control| {
+                control.retain_artifact_input_cache(cache.clone()).unwrap();
+                let prepared =
+                    crate::artifacts::PreparedArtifacts::new(artifact_plan("libleaf.rlib"))
+                        .unwrap();
+                std::fs::write(prepared.backing().join("libleaf.rlib"), b"compiled library")
+                    .unwrap();
+                control
+                    .retain_artifacts(Ok(prepared.capture(|| false).unwrap()))
+                    .unwrap();
+                control.retain_outputs(Ok(outputs(b"output"))).unwrap();
+                // The private cache rejects unknown on-disk entries. This is
+                // an actual storage refusal, not a synthetic success callback.
+                std::fs::write(foreign, b"unexpected").unwrap();
+                assert_eq!(control.finish(), None);
+                assert!(control.retain_artifact_input_cache(cache).is_err());
+                result(94)
+            },
+        )
+        .unwrap();
+        let mut completed = wait(&mut task).unwrap();
+        assert_eq!(completed.result.exit_code, 0);
+        assert_eq!(completed.stop_reason, None);
+        assert_eq!(
+            completed
+                .outputs
+                .as_mut()
+                .unwrap()
+                .stdout
+                .read_chunk(0, 64)
+                .unwrap(),
+            b"output"
+        );
+        assert_eq!(
+            completed
+                .artifacts
+                .as_mut()
+                .unwrap()
+                .read_chunk("libleaf.rlib", 0, 64)
+                .unwrap(),
+            b"compiled library"
+        );
     }
 
     #[test]

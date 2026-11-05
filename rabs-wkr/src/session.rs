@@ -1214,6 +1214,12 @@ fn execute_canonical_inner(
         let _ = control.retain_outputs(Err(error));
         return exec_error(request.request_id);
     }
+    if let Some(cache) = source.and_then(|source| source.produced_input_cache(request.request_id))
+        && let Err(error) = control.retain_artifact_input_cache(cache)
+    {
+        let _ = control.retain_outputs(Err(format!("artifact input reuse selection: {error}")));
+        return exec_error(request.request_id);
+    }
     // Snapshot storage belongs to the same worker-selected filesystem as the
     // drain spools. Prepare it before execution, including fully resident output
     // that will never cause a drain to create its lazy per-attempt spill path.

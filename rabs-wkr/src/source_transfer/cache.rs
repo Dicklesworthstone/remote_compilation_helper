@@ -1,4 +1,4 @@
-//! Private, bounded reuse of uploaded source bytes, not action-cache authority.
+//! Private, bounded reuse of uploaded and produced bytes, not action-cache authority.
 //!
 //! Every hit is read and SHA-256 verified before it can populate a fresh source
 //! receiver. Executions never share writable inodes with this cache. Cache loss,
@@ -16,7 +16,7 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Retain one maximum-size source/dependency projection by default.
 pub const DEFAULT_SOURCE_CACHE_BYTES: u64 = MAX_SOURCE_BYTES;
@@ -31,6 +31,15 @@ const MAX_PROJECTION_MEMBERS: usize = 4 * MAX_FILES;
 const WRITER_FREE: u8 = 0;
 const WRITER_HELD: u8 = 1;
 const WRITER_POISONED: u8 = 2;
+// Post-completion optimization must not spend the executor's potentially
+// minutes-long remaining allowance before delivering its captured result.
+const PRODUCED_INPUT_BUDGET: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RememberSource {
+    SealedUpload,
+    CapturedOutput,
+}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -177,7 +186,7 @@ fn copy_verified(
     path: &Path,
     expected: &SourceFile,
     control: &CacheControl,
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
 ) -> Result<File, RememberError> {
     control.check()?;
     if expected.len > MAX_FILE_BYTES {
@@ -241,6 +250,44 @@ fn copy_verified(
         )));
     }
     Ok(input)
+}
+
+/// Read an immutable captured stream through its bounded range interface. The
+/// caller supplies no filesystem path to reopen. A digest/name claim cannot
+/// seed the cache without independently checking every byte and exact EOF.
+fn copy_verified_ranges(
+    expected: &SourceFile,
+    control: &CacheControl,
+    read: &mut impl FnMut(&str, u64, usize) -> io::Result<Vec<u8>>,
+    output: &mut dyn Write,
+) -> Result<(), RememberError> {
+    control.check()?;
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < expected.len {
+        control.check()?;
+        let count = (expected.len - offset).min(MAX_SOURCE_CHUNK as u64) as usize;
+        let bytes = read(&expected.path, offset, count).map_err(RememberError::Source)?;
+        if bytes.len() != count {
+            return Err(RememberError::Source(invalid(
+                "captured input range differs from its declared length",
+            )));
+        }
+        hash.update(&bytes);
+        output.write_all(&bytes)?;
+        offset += count as u64;
+    }
+    control.check()?;
+    if !read(&expected.path, expected.len, 1)
+        .map_err(RememberError::Source)?
+        .is_empty()
+        || <[u8; 32]>::from(hash.finalize()) != expected.sha256
+    {
+        return Err(RememberError::Source(invalid(
+            "captured input content verification failed",
+        )));
+    }
+    control.check().map_err(RememberError::Cache)
 }
 
 /// An anonymous, independently owned snapshot of a completely verified object.
@@ -877,6 +924,56 @@ impl SourceCache {
         let root = receiver
             .sealed_root()
             .ok_or_else(|| RememberError::Source(invalid("cannot cache unsealed source")))?;
+        self.remember_files(
+            receiver.manifest(),
+            RememberSource::SealedUpload,
+            |expected, output| {
+                copy_verified(&root.join(&expected.path), expected, &self.control, output).map(drop)
+            },
+        )
+    }
+
+    /// Reuse bytes already produced on this worker as a later request's inputs.
+    /// Only immutable captured-artifact readers call this production entry.
+    /// Existing source upload negotiation still selects the exact bytes, reads
+    /// them into a private receiver and requires its complete final seal.
+    ///
+    /// This is optional storage work on the blocking execution owner, after
+    /// successful completion. It shares the source cache's writer, capacity,
+    /// corruption handling and atomic admission. A short optional-I/O allowance
+    /// is additionally capped by the original execution deadline. It cannot
+    /// acquire compiler/publication authority or delay output delivery for the
+    /// execution owner's potentially much longer remaining allowance.
+    pub(crate) fn remember_streamed(
+        &self,
+        manifest: &SourceManifest,
+        deadline: Instant,
+        mut read: impl FnMut(&str, u64, usize) -> io::Result<Vec<u8>>,
+    ) -> io::Result<u64> {
+        let deadline = deadline.min(Instant::now() + PRODUCED_INPUT_BUDGET);
+        let cache = self.clone().before(deadline);
+        cache
+            .remember_files(
+                manifest,
+                RememberSource::CapturedOutput,
+                |expected, output| {
+                    copy_verified_ranges(expected, &cache.control, &mut read, output)
+                },
+            )
+            .map_err(|error| match error {
+                RememberError::Source(error) | RememberError::Cache(error) => error,
+            })
+    }
+
+    /// Both upload and captured-output admission use this one eviction and
+    /// publication path. The copy callback must verify its complete source;
+    /// no candidate becomes readable under its digest before that succeeds.
+    fn remember_files(
+        &self,
+        manifest: &SourceManifest,
+        source: RememberSource,
+        mut copy: impl FnMut(&SourceFile, &mut dyn Write) -> Result<(), RememberError>,
+    ) -> Result<u64, RememberError> {
         let Some(_lock) = self.writer()? else {
             return Ok(0);
         };
@@ -902,7 +999,7 @@ impl SourceCache {
         // Otherwise an early miss can evict a later hit just because source
         // paths sort that way. A filename alone is never protection evidence:
         // corrupt objects must remain evictable/repairable, not occupy credit.
-        for expected in receiver.manifest().files() {
+        for expected in manifest.files() {
             self.control.check()?;
             if expected.len == 0 || expected.len > MAX_FILE_BYTES || expected.len > self.max_bytes {
                 continue;
@@ -917,6 +1014,11 @@ impl SourceCache {
             sum.checked_add(*bytes)
                 .ok_or_else(|| invalid("source cache protected size overflow"))
         })?;
+        if source == RememberSource::CapturedOutput {
+            // SourceManifest canonicalizes path order. Restore metadata-first
+            // admission here, after existing hits have all been protected.
+            missing.sort_by_key(|expected| !expected.path.ends_with(".rmeta"));
+        }
         let mut stored = 0;
         for expected in missing {
             self.control.check()?;
@@ -935,14 +1037,14 @@ impl SourceCache {
                 .checked_add(expected.len)
                 .filter(|sum| *sum <= self.max_bytes && protected.len() < self.max_files);
             let Some(next_protected_bytes) = next_protected_bytes else {
-                // Capacity pressure must not hide mutation of a sealed source.
-                // Verify without allocating or writing an unnecessary spool.
-                copy_verified(
-                    &root.join(&expected.path),
-                    expected,
-                    &self.control,
-                    &mut io::sink(),
-                )?;
+                if source == RememberSource::SealedUpload {
+                    // Capacity pressure must not hide mutation of a sealed
+                    // execution input. Preserve original upload verification.
+                    copy(expected, &mut io::sink())?;
+                }
+                // Produced bytes are independently captured already. If this
+                // optional cache cannot retain them, do not reread a potentially
+                // large archive for no benefit before result delivery.
                 continue;
             };
             // One fixed scratch name plus the held process-shared lock bounds
@@ -957,12 +1059,7 @@ impl SourceCache {
                 options.mode(0o600);
             }
             let mut file = options.open(&scratch)?;
-            copy_verified(
-                &root.join(&expected.path),
-                expected,
-                &self.control,
-                &mut file,
-            )?;
+            copy(expected, &mut file)?;
             let mut permissions = file.metadata()?.permissions();
             permissions.set_readonly(true);
             file.set_permissions(permissions)?;
@@ -1049,6 +1146,275 @@ mod tests {
         }
         receiver.seal().unwrap();
         receiver
+    }
+
+    fn range(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
+        let offset = usize::try_from(offset).unwrap();
+        bytes[offset..bytes.len().min(offset + count)].to_vec()
+    }
+
+    fn remember_output(cache: &SourceCache, name: &str, bytes: &[u8]) -> io::Result<u64> {
+        let manifest = SourceManifest::new(vec![entry(name, bytes)]).unwrap();
+        cache.remember_streamed(
+            &manifest,
+            Instant::now() + std::time::Duration::from_secs(30),
+            |requested, offset, count| {
+                assert_eq!(requested, name);
+                assert!(count <= MAX_SOURCE_CHUNK);
+                Ok(range(bytes, offset, count))
+            },
+        )
+    }
+
+    #[test]
+    fn produced_library_bytes_reopen_as_renamed_private_inputs_without_upload() {
+        let parent = private();
+        let bytes = (0..MAX_SOURCE_CHUNK * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let output = entry("libleaf.rlib", &bytes);
+        let mut cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+        assert!(
+            cache.load(&output).is_none(),
+            "cold producer output is not an uploaded input"
+        );
+        assert_eq!(remember_output(&cache, &output.path, &bytes).unwrap(), 1);
+        let original = cache_inodes(&cache);
+        assert_eq!(remember_output(&cache, &output.path, &bytes).unwrap(), 0);
+        assert_eq!(
+            cache_inodes(&cache),
+            original,
+            "duplicate output rewrote the cache inode"
+        );
+        drop(cache);
+        cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+
+        let mut input = output.clone();
+        input.path = "dependencies/0003/libleaf-renamed.rlib".into();
+        let destination = private();
+        let mut receiver = SourceReceiver::create(
+            &destination.path().join("workspace"),
+            SourceManifest::new(vec![input.clone()]).unwrap(),
+        )
+        .unwrap();
+        cache.load(&input).unwrap().install(&mut receiver).unwrap();
+        assert!(
+            receiver.sealed_root().is_none(),
+            "byte reuse cannot skip the final seal"
+        );
+        let installed = receiver.seal().unwrap().join(&input.path);
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_ne!(
+            fs::metadata(&installed).unwrap().ino(),
+            fs::metadata(cache.root.join(object_name(&output.sha256)))
+                .unwrap()
+                .ino(),
+            "consumer input aliases the retained byte object"
+        );
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&installed, b"changed consumer").unwrap();
+        assert_eq!(cache.load(&output).unwrap().bytes(), bytes);
+    }
+
+    #[test]
+    fn malformed_output_ranges_never_publish_or_evict_verified_input_bytes() {
+        let bytes = vec![37; MAX_SOURCE_CHUNK + 19];
+        for case in 0..5 {
+            let parent = private();
+            let cache = SourceCache::open(parent.path(), bytes.len() as u64).unwrap();
+            let old = entry("old.rs", b"keep");
+            assert_eq!(remember_output(&cache, &old.path, b"keep").unwrap(), 1);
+            let before = cache_inodes(&cache);
+            let output = entry("libnew.rlib", &bytes);
+            let manifest = SourceManifest::new(vec![output.clone()]).unwrap();
+            let error = cache
+                .remember_streamed(
+                    &manifest,
+                    Instant::now() + std::time::Duration::from_secs(30),
+                    |_, offset, count| {
+                        let mut result = range(&bytes, offset, count);
+                        match case {
+                            0 if offset == 0 => result[0] ^= 1,
+                            1 if offset == 0 => {
+                                result.pop();
+                            }
+                            2 if offset == 0 => result.push(0),
+                            3 if offset == bytes.len() as u64 => result.push(0),
+                            4 if offset != 0 => {
+                                return Err(io::Error::other("captured range unavailable"));
+                            }
+                            _ => {}
+                        }
+                        Ok(result)
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::Other
+            ));
+            assert!(!cache.root.join(object_name(&output.sha256)).exists());
+            assert_eq!(cache.load(&old).unwrap().bytes(), b"keep");
+            assert_eq!(
+                cache_inodes(&cache),
+                before,
+                "invalid output evicted an existing input"
+            );
+            // A private partial scratch object cannot poison a subsequent
+            // complete import or permanently consume the bounded writer.
+            assert_eq!(remember_output(&cache, &output.path, &bytes).unwrap(), 1);
+            assert_eq!(cache.load(&output).unwrap().bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn produced_outputs_share_upload_capacity_and_skip_contended_writers() {
+        let parent = private();
+        let mut cache = SourceCache::open(parent.path(), 8).unwrap();
+        cache.max_files = 2;
+        let source = private();
+        let uploaded = staged(source.path(), &[("input.rs", b"aaaa")]);
+        assert_eq!(cache.remember(&uploaded).unwrap(), 1);
+        let output = entry("libone.rmeta", b"bbbb");
+        let manifest = SourceManifest::new(vec![output.clone()]).unwrap();
+        let writer = cache.writer().unwrap().unwrap();
+        assert_eq!(
+            cache
+                .remember_streamed(
+                    &manifest,
+                    Instant::now() + std::time::Duration::from_secs(30),
+                    |_, _, _| panic!("contended cache read produced bytes")
+                )
+                .unwrap(),
+            0
+        );
+        drop(writer);
+        assert_eq!(remember_output(&cache, &output.path, b"bbbb").unwrap(), 1);
+        assert_eq!(
+            cache
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<u64>(),
+            8
+        );
+
+        let oversized = entry("liblarge.rlib", b"cccccccc");
+        let mixed = SourceManifest::new(vec![oversized.clone(), output.clone()]).unwrap();
+        let before = cache_inodes(&cache);
+        assert_eq!(
+            cache
+                .remember_streamed(
+                    &mixed,
+                    Instant::now() + std::time::Duration::from_secs(30),
+                    |_, _, _| panic!("capacity-ineligible output was read without retaining it")
+                )
+                .unwrap(),
+            0,
+            "an oversized projection evicted its protected useful output"
+        );
+        assert_eq!(cache_inodes(&cache), before);
+        assert_eq!(
+            cache.load(&uploaded.manifest().files()[0]).unwrap().bytes(),
+            b"aaaa"
+        );
+        assert_eq!(cache.load(&output).unwrap().bytes(), b"bbbb");
+        assert!(cache.load(&oversized).is_none());
+    }
+
+    #[test]
+    fn produced_metadata_wins_bounded_admission_after_manifest_path_sorting() {
+        let parent = private();
+        let cache = SourceCache::open(parent.path(), 8).unwrap();
+        let archive = entry("libleaf.rlib", b"archive!");
+        let metadata = entry("libleaf.rmeta", b"meta");
+        let manifest = SourceManifest::new(vec![metadata.clone(), archive.clone()]).unwrap();
+        assert_eq!(manifest.files()[0].path, archive.path);
+        assert_eq!(
+            cache
+                .remember_streamed(
+                    &manifest,
+                    Instant::now() + Duration::from_secs(30),
+                    |name, offset, count| {
+                        assert_eq!(
+                            name, metadata.path,
+                            "archive consumed metadata admission credit"
+                        );
+                        Ok(range(b"meta", offset, count))
+                    },
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(cache.load(&metadata).unwrap().bytes(), b"meta");
+        assert!(cache.load(&archive).is_none());
+    }
+
+    #[test]
+    fn produced_retention_cannot_spend_the_remaining_execution_allowance() {
+        let parent = private();
+        let cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+        let bytes = vec![23; MAX_SOURCE_CHUNK + 1];
+        let output = entry("libslow.rlib", &bytes);
+        let manifest = SourceManifest::new(vec![output.clone()]).unwrap();
+        let error = cache
+            .remember_streamed(
+                &manifest,
+                Instant::now() + Duration::from_secs(30),
+                |_, offset, count| {
+                    assert_eq!(
+                        offset, 0,
+                        "optional budget expiration permitted another range"
+                    );
+                    std::thread::sleep(PRODUCED_INPUT_BUDGET + Duration::from_millis(10));
+                    Ok(range(&bytes, offset, count))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!cache.root.join(object_name(&output.sha256)).exists());
+        assert!(cache.load(&output).is_none());
+    }
+
+    #[test]
+    fn streamed_input_cache_checks_cancellation_and_deadline_before_publication() {
+        let bytes = vec![19; MAX_SOURCE_CHUNK + 1];
+        let output = entry("libcancel.rlib", &bytes);
+        let manifest = SourceManifest::new(vec![output.clone()]).unwrap();
+        let parent = private();
+        let cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+        assert_eq!(
+            cache
+                .remember_streamed(&manifest, Instant::now(), |_, _, _| panic!(
+                    "expired optional retention read bytes"
+                ))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(!cache.root.join(INCOMING).exists());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let controlled = cache.clone().with_cancellation(Arc::clone(&cancelled));
+        assert_eq!(
+            controlled
+                .remember_streamed(
+                    &manifest,
+                    Instant::now() + std::time::Duration::from_secs(30),
+                    |_, offset, count| {
+                        assert_eq!(offset, 0, "cancellation permitted another output read");
+                        cancelled.store(true, Ordering::Release);
+                        Ok(range(&bytes, offset, count))
+                    }
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!cache.root.join(object_name(&output.sha256)).exists());
+        assert!(cache.load(&output).is_none());
+        assert_eq!(remember_output(&cache, &output.path, &bytes).unwrap(), 1);
+        assert_eq!(cache.load(&output).unwrap().bytes(), bytes);
     }
 
     fn private() -> tempfile::TempDir {

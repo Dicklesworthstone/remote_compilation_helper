@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Maximum names in an exact declaration or a tree's minimum required set.
 pub const MAX_ARTIFACT_FILES: usize = 128;
@@ -739,6 +740,68 @@ impl CapturedArtifacts {
     pub(crate) fn file_names(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
     }
+
+    /// Populate only disposable input-byte storage, never an action result.
+    /// A following dependency request can then negotiate these exact bytes
+    /// without uploading the worker's own output back to it. Readers retain
+    /// the captured anonymous files; mutable compiler paths are never reopened.
+    pub(crate) fn seed_source_cache(
+        &mut self,
+        cache: &crate::source_transfer::SourceCache,
+        deadline: Instant,
+    ) -> io::Result<u64> {
+        use rabs_sandbox::source_transfer::{
+            MAX_SOURCE_BYTES, MAX_SOURCE_FILES, SourceFile, SourceManifest,
+        };
+
+        let mut files = Vec::new();
+        let mut identities = BTreeSet::new();
+        let mut total = 0_u64;
+        // Metadata is useful to both check and codegen consumers. Prefer it
+        // when selecting the bounded projection of eligible library outputs.
+        for suffix in [".rmeta", ".rlib"] {
+            for (name, artifact) in &self.files {
+                let basename = name.rsplit('/').next().unwrap_or(name);
+                let len = artifact.bytes.len();
+                if artifact.executable
+                    || !basename.starts_with("lib")
+                    || !basename.ends_with(suffix)
+                    || len == 0
+                    || len > MAX_SOURCE_BYTES
+                    || files.len() == MAX_SOURCE_FILES
+                    || len > MAX_SOURCE_BYTES - total
+                {
+                    continue;
+                }
+                let encoded = artifact.bytes.sha256();
+                if encoded.len() != 64 || !encoded.is_ascii() {
+                    return Err(invalid("captured artifact has an invalid digest"));
+                }
+                let mut sha256 = [0_u8; 32];
+                for (index, byte) in sha256.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                        .map_err(|_| invalid("captured artifact has an invalid digest"))?;
+                }
+                if !identities.insert((len, sha256)) {
+                    continue;
+                }
+                files.push(SourceFile {
+                    path: name.clone(),
+                    len,
+                    sha256,
+                    executable: false,
+                });
+                total += len;
+            }
+        }
+        if files.is_empty() {
+            return Ok(0);
+        }
+        let manifest = SourceManifest::new(files)?;
+        cache.remember_streamed(&manifest, deadline, |name, offset, count| {
+            self.read_chunk(name, offset, count)
+        })
+    }
 }
 
 /// Decode a request's optional artifact declaration without accepting any host
@@ -937,6 +1000,144 @@ mod tests {
 
     fn plan(paths: &[&str]) -> ArtifactPlan {
         ArtifactPlan::new("dep".into(), paths.iter().map(|s| (*s).into()).collect()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn produced_libraries_negotiate_as_private_inputs_without_a_return_upload() {
+        use crate::source_transfer::{SourceCache, SourceTransferState, hex};
+        use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceManifest};
+        use serde_json::json;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::Duration;
+
+        let archive = vec![37_u8; MAX_SOURCE_CHUNK * 2 + 19];
+        let files: [(&str, &[u8], bool); 6] = [
+            ("libleaf.rlib", &archive, false),
+            ("libalias.rlib", &archive, false),
+            ("libleaf.rmeta", b"produced metadata", false),
+            ("leaf.d", b"dependency diagnostics", false),
+            ("libexecutable.rlib", b"executable bytes", true),
+            ("unrelated.rmeta", b"unrelated bytes", false),
+        ];
+        let prepared = PreparedArtifacts::new(plan(&files.map(|(name, _, _)| name))).unwrap();
+        for (name, bytes, executable) in files {
+            let path = prepared.backing().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+            )
+            .unwrap();
+        }
+        let mut captured = prepared
+            .capture_with_cargo_output(None, &b""[..], || false)
+            .unwrap();
+        let original_manifest = captured.manifest();
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = SourceCache::open(parent.path(), 1024 * 1024).unwrap();
+        let manifest = SourceManifest::new(
+            files
+                .iter()
+                .map(|(name, bytes, executable)| SourceFile {
+                    path: format!("dependencies/0007/{name}"),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: *executable,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let wire = json!({"manifest_sha256":hex(&manifest.digest()),"files":manifest.files().iter().map(|file| json!({
+            "path":file.path,"bytes":file.len,"sha256":hex(&file.sha256),"executable":file.executable,
+        })).collect::<Vec<_>>()});
+        let begin = json!({"kind":"source-begin","request_id":71,"manifest":wire,"allow_cached_files":true});
+        let seal =
+            json!({"kind":"source-seal","request_id":71,"manifest_sha256":hex(&manifest.digest())});
+        let request = json!({"request_id":71,"source_manifest":wire});
+        let mut cold = SourceTransferState::default().with_cache(Some(cache.clone()));
+        let baseline = cold.handle(&begin, true, false).unwrap();
+        assert_eq!(
+            baseline["missing_files"].as_array().unwrap().len(),
+            files.len()
+        );
+        assert_eq!(baseline["source_reused_bytes"], 0);
+        drop(cold);
+
+        // Mutating the abandoned compiler paths cannot substitute bytes for
+        // capture's anonymous files, either for input reuse or result delivery.
+        for (name, _, _) in files {
+            std::fs::write(prepared.backing().join(name), b"changed after capture").unwrap();
+        }
+        assert_eq!(
+            captured
+                .seed_source_cache(&cache, Instant::now() + Duration::from_secs(30))
+                .unwrap(),
+            2
+        );
+        assert_eq!(captured.manifest(), original_manifest);
+        for (name, bytes, _) in files {
+            assert_eq!(
+                captured.read_chunk(name, 0, MAX_SOURCE_CHUNK).unwrap(),
+                bytes[..bytes.len().min(MAX_SOURCE_CHUNK)]
+            );
+        }
+
+        let mut warm = SourceTransferState::default().with_cache(Some(cache.clone()));
+        let ready = warm.handle(&begin, true, false).unwrap();
+        assert_eq!(
+            ready["missing_files"],
+            json!([
+                "dependencies/0007/leaf.d",
+                "dependencies/0007/libexecutable.rlib",
+                "dependencies/0007/unrelated.rmeta",
+            ])
+        );
+        assert_eq!(
+            ready["source_reused_bytes"],
+            2 * archive.len() + b"produced metadata".len()
+        );
+        assert_eq!(ready["sealed"], false);
+        assert!(warm.prepared_path(&request, true).is_err());
+        for (name, bytes, _) in files.iter().skip(3) {
+            warm.handle(
+                &json!({
+                    "kind":"source-chunk","request_id":71,"manifest_sha256":hex(&manifest.digest()),
+                    "path":format!("dependencies/0007/{name}"),"offset":0,"data_hex":hex(bytes),
+                    "chunk_sha256":hex(&Sha256::digest(bytes)),
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+        }
+        assert!(
+            warm.prepared_path(&request, true).is_err(),
+            "reused and uploaded bytes still require the final seal"
+        );
+        assert_eq!(warm.handle(&seal, true, false).unwrap()["sealed"], true);
+        let root = std::path::PathBuf::from(warm.prepared_path(&request, true).unwrap().unwrap());
+        let owner = warm.take_prepared(&request).unwrap().unwrap();
+        let installed = root.join("dependencies/0007/libleaf.rlib");
+        assert_eq!(std::fs::read(&installed).unwrap(), archive);
+        let cached = parent
+            .path()
+            .join("source-files-v1")
+            .join(format!("{}.src", hex(&Sha256::digest(&archive))));
+        assert_ne!(
+            std::fs::metadata(&installed).unwrap().ino(),
+            std::fs::metadata(cached).unwrap().ino()
+        );
+        drop(owner);
+
+        let mut opted_out = SourceTransferState::default().with_cache(Some(cache));
+        let mut disabled = begin;
+        disabled["allow_cached_files"] = json!(false);
+        let ready = opted_out.handle(&disabled, true, false).unwrap();
+        assert!(ready.get("missing_files").is_none());
+        assert!(opted_out.handle(&seal, true, false).is_err());
+        assert!(opted_out.prepared_path(&request, true).is_err());
     }
 
     /// Exercise the real transfer seal and source-owner handoff. The guard is
