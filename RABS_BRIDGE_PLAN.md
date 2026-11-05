@@ -2,7 +2,43 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at22:08UTC:**
+**Active qualification checkpoint, November5 at22:23UTC:**
+
+- [x] Current3013 fullworkspace/alltargets Cargo check0/1165.7s; fmt0/20.5s.
+  StrictClippy now RUNNING; ALL9 Rust inventories still pending. Actual normal
+  release rch executable compiled; ALL7 combined build not terminal yet.
+- [ ] Final native service-first controller31399B/82d10745/inode14131720/dev49
+  frozen/bound. Original4+old-worker negative/completeSDK/original3600s and every
+  final compiler/complete-inventory gate retained; added-test ceiling corrected
+  as below. UNRUN until normalALL7/BOTH TLS release terminal0.
+
+- [x] Main advanced via peer/user commits b1fac447 (our reconnect/import/TLS
+  assertions),26964bed (docs),6db3e9ea (Beads). Preserve ef0d2261/5d97a23e
+  recovery/installer test work. ALL current Rust/Cargo/TOML byte-identical to
+  frozen3013; TWO later Python test files differ and are not qualified by this
+  Rust/native gate. No root commit/push. Seven leases for five committed code/
+  docs paths released22:15; only active bridge TODO lease retained.
+- [x] Brief TS2 SSH drop recovered via existing configured LAN route; original
+  builds remain active, no restart/cancel. Host load158; actual vmstat second
+  sample swap-in1936KiB/s/out344KiB/s. Correctness runs, NOT throughput/no-swap
+  qualification. SharedTRJ still busy/unreachable with peerjobs; no reservation.
+- [ ] Native follow-up uses service-first control30356B/6caeeb7d/inode14089288/
+  dev49. Starts ONLY after authentic normalALL7/BOTH TLS and194 component pass;
+  runs independent native tests alongside fullworkspace QA. EVERY original
+  workspace checks/retained ALL9 coverage checked at final acceptance: missing/pending/
+  failed compiler receipt refuses overall success. No final predicate waived,
+  scope reduced, case dropped, deadline changed or earlier failure overwritten.
+  Complete SDK/originalfour cases/old-worker negative still required. UNRUN;
+  normalALL7 build and fullworkspace check continue under original3600s bounds.
+- [x] Detect stale native consumer exact164 selector ceiling before execution:
+  new disk_contention_selection_preserves_pressure_and_suitability_refusals is
+  absent in B5 but present in current source. Consumer now requires EVERY B5
+  name and exact zero-fail/zero-ignore execution of ALL unique current names,
+  matching full QA's existing inventory policy. Admits added passing coverage;
+  rejects missing old names, duplicate names, skipped/failing cases, missing
+  suites, wrong source/control and incomplete compiler gates. No product gate,
+  workload, failure, timing threshold, or prior test dropped. Final control
+  fingerprint replaces unused6cae; all unused controllers retained.
 
 - [x] New9ce1 worker gate DSR terminalSUCCESS0/728s: actual154worker+40SDK,
   zeroignored, all original names retained; stronger native harness compiled/
