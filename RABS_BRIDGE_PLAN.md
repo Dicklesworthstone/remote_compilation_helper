@@ -2,7 +2,58 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at15:44UTC (November5 local):**
+**Latest execution checkpoint, November5 at16:22UTC (November5 local):**
+
+- [x] RABS PUBLIC ORIGINAL cache4 genuinely PASSES, DSR e89442c3 terminal0:
+  ordinary-RCH stock7.0416s; RABS17.6119/13.1234/16.7058/8.1068s.
+  Exact original execute+commit, two execute+verify, then execute0/hit1/served1;
+  all5 ACK0/all4release,50420B/c94e3e58 stock metadata,3automatic refreshes,
+  private dispatcherquiet/exit0/source+tools unchanged. Rust e019 + launcher3f
+  provenance retained separately. Terminal215734B/3603d3b3. END4677/sharedhealthy0.
+- [x] Launcher quality3f DSR controlfix terminalSUCCESS:340/340 across SIX
+  suites/zero skipped, original-launcher negative raw1/expected1, full fmt0/
+  14.05s, workspace/alltargets check0/413.51s, strictClippy0/430.30s. All Rust
+  inputs match e019, whose actual normal ALL7/BOTH TLS/751 proof stays authentic.
+- [x] Preserve d2679a89 larger-probe COLLECTOR FAILURE: real stock0/18.810s,
+  ACK/all4release,11 actual fresh Cargo records plus successful build-finished
+  in RCH stderr; stdoutempty. ZERO candidates run. Restore sharedhealthy0/
+  END4713. Fix ONLY operator parser to read both streams and distinguish full
+  target identities; actual binary metadata is zero bytes and still counted.
+  Registry-library zero/missing output still refuses. ALL11/ALL8 retained.
+- [x] New SAME-invocation real FULL rabs-key workload FUNCTIONAL PASS:
+  TWO bracketing ordinary-RCH stock runs plus FOUR RABS runs, six independent
+ 1752-file source trees/targets. Every run reports ALL11 fresh compiler units
+  (8 registry libs,2 workspace libs,1 binary), all8 library metadata exactly
+  stock-equal, all6 jobs finished/ACK0/all4release. RABS r0execute8+commit8,
+  r1/r2execute8+verify8, r3execute0+hit8+served8.4automatic refreshes and ZERO
+  operator refreshes. Private dispatcher quiet/exit0; all after-audits match.
+  START4735/END4764, shared freshly restored healthy/used0/active0.
+- [x] Report PERFORMANCE LOSS separately: stock22.7476/22.7957s;
+  RABS96.8010/121.2769/105.6317/27.9816s. Warm/mean-stock1.22879,
+  about23% SLOWER despite8 genuine serves. No useful/speed/fleet/release claim.
+  This is one complete workload observation, not a percentile study.
+- [ ] Highest-priority next work: bounded source-bound overhead attribution
+  on this exact warmed public path before any optimization.
+  - [ ] Freeze scenario/output contract and retain the SAME workload/normal
+    binaries, exact source/tool/host/storage fingerprint; no kernel tuning.
+  - [ ] Inspect existing CPU/I/O/latency observability and available tools;
+    distinguish daemon work from Cargo/RCH/transfer and syscall wait.
+  - [ ] Run one bounded diagnostic with complete terminal/release evidence;
+    label profiler timing diagnostic, never a normal-profile speed result.
+  - [ ] Rank observed CPU/I/O/contention costs; falsify speculative explanations.
+  - [ ] Choose ONE measured high-return lever; preserve sampling, byte checks,
+    source authority, durability, memory/storage guards and original clocks.
+  - [ ] Requalify code and rerun live incumbent/candidate SAME invocation;
+    retain any loss without retuning gates. Statistical latency/tail claims
+    require their own repeated study; do not invent p95 from these samples.
+- [ ] Broader native worker150/151 preview failure remains OPEN; current-source
+  SDK40/harness/native4 HELD/UNRUN. Mac frontend still pending. M6/S7/M8 OPEN:
+  no distinct-host canonical compiler,15-agent storm/singleflight or >=2x win.
+- [x] Complete Python UBS scope:23critical/60warnings/402info versus untouched
+  two-file baseline23/59/400, raw1 both. No new critical finding or scanner-clean
+  claim. Extensionless launcher scanned via exact readonly .py byte copy.
+
+**Earlier execution checkpoint, November5 at15:44UTC (retained):**
 
 - [x] Core e01923f8 DSR5a75f4b8 terminalSUCCESS; independent normal ALL7
   prebuild7bda062b terminalSUCCESS.751 tests/fullfmt/check/strictClippy,
