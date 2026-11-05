@@ -410,7 +410,32 @@ fn run_with_stdin(
         .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(600),
-        "canonical compilation timed out"
+        "canonical compilation timed out (residual_group_members={}):\nstdout:\n{}\nstderr:\n{}",
+        output.residual_group_members,
+        {
+            // Diagnose only the failed predicate. Keep the original deadline
+            // and drain limits, and never replace a timeout with a read error.
+            let mut bytes = Vec::new();
+            match output
+                .stdout
+                .reader()
+                .and_then(|reader| reader.take(64 * 1024).read_to_end(&mut bytes))
+            {
+                Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => format!("unavailable: {error}"),
+            }
+        },
+        {
+            let mut bytes = Vec::new();
+            match output
+                .stderr
+                .reader()
+                .and_then(|reader| reader.take(64 * 1024).read_to_end(&mut bytes))
+            {
+                Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => format!("unavailable: {error}"),
+            }
+        }
     );
     assert_eq!(output.residual_group_members, 0);
     let mut stderr = String::new();
