@@ -548,7 +548,21 @@ impl ConfigWatcher {
                 }
             }
             Err(e) => {
-                error!("Configuration reload failed: {}", e);
+                // A failed snapshot load retains the current fleet. When that
+                // fleet is already empty — e.g., a pure build worker whose
+                // workers.toml is intentionally comment-only, with no
+                // `[[workers]]` — retaining it loses nothing, so this is
+                // expected reconciliation rather than an operator-visible fault.
+                // A dispatcher with real workers still logs the failure, since
+                // it is retaining a fleet the new snapshot could not describe.
+                if self.pool.is_empty() {
+                    debug!(
+                        "Configuration reload retained an already-empty fleet: {}",
+                        e
+                    );
+                } else {
+                    error!("Configuration reload failed: {}", e);
+                }
                 // Keep serving the last successfully loaded worker configuration.
             }
         }
