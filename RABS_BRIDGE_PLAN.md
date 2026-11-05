@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at23:34UTC:**
+**Active qualification checkpoint, November5 at23:44UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -14,10 +14,16 @@
   defaultprofiles/pins. Requires EVERY old and current test name, zeroignored;
   expected1067 cases, count only actual terminal summaries. Control9844B/
   8704ba6e publishes final proof atomically after every predicate/after-audit.
-- [ ] Fresh native4 plus genuineold-worker negative prepared, not dispatched:
-  control33063B/9aabe838. Start after new fmt/check/strictClippy pass; requires
-  full9-suite final proof before overall success. Join only atomically complete
-  report, retaining original3600s and all SDK/case/time/ownership assertions.
+- [ ] Fresh native5 plus genuineold-worker negative DISPATCHED23:44UTC:
+  control33793B/b5904972/inode14147202/dev49. ALL4 original cases retained;
+  ADD existing actual concurrent two-Cargo/one-TLS-producer/origin-cancel/
+  survivor-working-binary/fresh-later-verification case. No deadline extension.
+  Genuine3013 production gates and283API pass permit independent execution
+  alongside new4a3f workspace checks, replacing unnecessary scheduling wait.
+  EVERY full9-suite/compiler final predicate still mandatory for overall pass;
+  atomic terminal join, SDK and original per-case/ownership bounds unchanged.
+  Prior33063B/9aabe838 controller remains unused/preserved. Same-host sharing
+  proof would not close distinct-edge-host,15-agent,throughput/no-swap gates.
 - [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
   3failed/zeroignored. Two literal route mismatches, one human-message assertion
   contradicted existing typed busy/structured reserved-headroom contract.
