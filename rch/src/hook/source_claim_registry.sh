@@ -91,9 +91,9 @@ matches_request() {
     printf '%s\n' "$requested" | cmp -s - "$1" || refuse 'source claim roots changed'
 }
 
-# A visible rename is not a durable acknowledgment. An earlier transaction
-# may have moved this exact record and then lost its connection or failed its
-# final sync. Re-establish the barriers even on an otherwise read-only retry,
+# A visible link or rename is not a durable acknowledgment. An earlier
+# transaction may have published this exact record and then lost its connection
+# or failed its final sync. Re-establish the barriers on an otherwise read-only retry,
 # before emitting any authority/retirement verdict. Callers validate the record
 # and its state first; this helper never creates, moves or repairs a claim.
 confirm_durable_record() {
@@ -103,6 +103,108 @@ confirm_durable_record() {
     if [ "${1%/*}" != "$registry" ]; then
         sync -f "$registry" || refuse 'cannot confirm durable source transition'
     fi
+}
+
+# Cancellation records have the same immutable closure as their existing
+# claim, fence or receipt. Reuse those bytes without allocating another inode
+# or copying up to 32 MiB after a build has filled the worker. Linking can still
+# need filesystem metadata space; every failure remains unconfirmed. Keep the
+# source name, bind both directories and records without following symlinks,
+# and never overwrite an appeared destination. The caller has already checked
+# the complete identity state under the activity and metadata locks.
+link_cancellation_record() {
+    matches_request "$1"
+    printf '%s\n' "$requested" | python3 -I -S -c '
+import hashlib, os, stat, sys
+
+def identity(info):
+    return info.st_dev, info.st_ino
+
+def stamp(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
+def private(info, directory=False):
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError("unsafe cancellation record ownership or type")
+
+try:
+    registry, source, destination, token, digest = sys.argv[1:]
+    base = token + "." + digest
+    claim, fence, receipt = base + ".claim", base + ".cancelling", "cancelled/" + base + ".claim"
+    allowed = ((claim, fence), (receipt, fence), (fence, receipt))
+    routes = [(left, right) for left, right in allowed
+              if source == registry + "/" + left and destination == registry + "/" + right]
+    if len(routes) != 1:
+        raise ValueError("invalid cancellation record link")
+    expected = sys.stdin.buffer.read(33554433)
+    if not 0 < len(expected) <= 33554432 or hashlib.sha256(expected).hexdigest() != digest:
+        raise ValueError("cancellation closure changed")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    parent_path, registry_name = os.path.split(registry)
+    parent = os.open(parent_path, flags)
+    directory = os.open(registry_name, flags, dir_fd=parent)
+    bindings = [(None, parent_path, parent), (parent, registry_name, directory)]
+    directories = {"": directory}
+    if any("/" in name for name in routes[0]):
+        terminal = os.open("cancelled", flags, dir_fd=directory)
+        bindings.append((directory, "cancelled", terminal))
+        directories["cancelled"] = terminal
+
+    def verify_directories():
+        for owner, name, descriptor in bindings:
+            opened = os.fstat(descriptor)
+            private(opened, directory=True)
+            if identity(os.stat(name, dir_fd=owner, follow_symlinks=False)) != identity(opened):
+                raise ValueError("cancellation record directory changed")
+
+    source_parent, source_name = os.path.split(routes[0][0])
+    target_parent, target_name = os.path.split(routes[0][1])
+    source_directory, target_directory = directories[source_parent], directories[target_parent]
+    verify_directories()
+    descriptor = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=source_directory)
+
+    def verify_record():
+        before = os.fstat(descriptor)
+        private(before)
+        if before.st_size != len(expected) or before.st_nlink < 1:
+            raise ValueError("cancellation source record changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(len(expected) + 1)
+        after = os.fstat(descriptor)
+        named = os.stat(source_name, dir_fd=source_directory, follow_symlinks=False)
+        if content != expected or stamp(before) != stamp(after) or stamp(named) != stamp(after):
+            raise ValueError("cancellation source identity or bytes changed")
+        return after
+
+    before = verify_record()
+    os.fsync(descriptor)
+    verify_directories()
+    if stamp(os.stat(source_name, dir_fd=source_directory, follow_symlinks=False)) != stamp(before):
+        raise ValueError("cancellation source changed before link")
+    os.link(source_name, target_name, src_dir_fd=source_directory,
+            dst_dir_fd=target_directory, follow_symlinks=False)
+    target = os.open(target_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=target_directory)
+    if identity(os.fstat(target)) != identity(before):
+        raise ValueError("cancellation destination does not name the verified source")
+    os.fsync(descriptor)
+    os.fsync(target_directory)
+    if target_directory != directory:
+        os.fsync(directory)
+    verify_directories()
+    after = verify_record()
+    named = os.stat(target_name, dir_fd=target_directory, follow_symlinks=False)
+    if (stamp(after)[:-2] != stamp(before)[:-2] or after.st_nlink != before.st_nlink + 1
+            or stamp(os.fstat(target)) != stamp(after) or stamp(named) != stamp(after)):
+        raise ValueError("cancellation record changed after link")
+except (OSError, ValueError) as error:
+    print("RCH_SOURCE_CLAIM_LINK_FAILED " + str(error), file=sys.stderr)
+    sys.exit(1)
+' "$registry" "$1" "$2" "$token" "$digest"
 }
 
 # Call only after confirming the exact completed cancellation receipt. Older
@@ -116,7 +218,7 @@ confirm_cancellation_fence() {
         fi
     else
         rch_claim_stage=publication
-        rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" \
+        link_cancellation_record "$cancelled" "$cancelling" \
             || refuse 'cannot persist settled cancellation fence'
         matches_request "$cancelling"
     fi
@@ -736,7 +838,7 @@ if [ "$operation" = settle-cancel ]; then
         # activity. With activity drained and this caller's fully retired
         # journal, it is safe to acknowledge that denial (including after
         # receipt GC). This does not manufacture source or cleanup authority.
-        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" \
+        link_cancellation_record "$cancelling" "$cancelled" \
             || refuse 'cannot settle fenced unowned cancellation'
     fi
     confirm_durable_record "$cancelled"
@@ -792,7 +894,11 @@ RCH_CANCELLATION_ROOTS
         matches_request "$cancelling"
     else
         rch_claim_stage=publication
-        rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" || refuse 'cannot persist source cancellation'
+        if [ -e "$active" ]; then
+            link_cancellation_record "$active" "$cancelling" || refuse 'cannot persist source cancellation'
+        else
+            rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" || refuse 'cannot persist source cancellation'
+        fi
         matches_request "$cancelling"
     fi
     confirm_durable_record "$cancelling"
@@ -808,7 +914,7 @@ RCH_CANCELLATION_ROOTS
         # Keep that fence before the reply: the dispatcher can disappear before
         # settlement, and receipt retention must never revive its queued acquire.
         rch_claim_stage=publication
-        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" \
+        link_cancellation_record "$cancelling" "$cancelled" \
             || refuse 'cannot persist unowned source cancellation'
         matches_request "$cancelled"
         confirm_durable_record "$cancelled"

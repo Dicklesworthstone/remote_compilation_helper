@@ -4056,7 +4056,7 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn terminal_cancellation_command_preserves_quoted_evidence_and_exact_control_result() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use tokio::io::AsyncWriteExt as _;
 
         let directory = tempfile::Builder::new()
@@ -4081,6 +4081,17 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
             .join("source ' ; $(touch expanded-dollar) `touch expanded-backtick`");
         let roots = vec![source.display().to_string()];
         let identity = "ac03";
+        // A previously cancelled token retains its original mutex inodes.
+        // Settlement must drain these, never create a new activity-lock inode
+        // and mistake it for evidence that an old holder has finished.
+        for name in [
+            "metadata.lock".to_owned(),
+            format!("{identity}.activity.lock"),
+        ] {
+            let lock = registry.join(name);
+            std::fs::write(&lock, b"").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let (body, digest) = source_claim_roots(&roots).unwrap();
         let fence = registry.join(format!("{identity}.{digest}.cancelling"));
         let receipt = registry
@@ -4088,7 +4099,7 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
             .join(format!("{identity}.{digest}.claim"));
         std::fs::write(&fence, &body).unwrap();
         std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o600)).unwrap();
-        for attempt in 0..5 {
+        for attempt in 0..6 {
             let discover = attempt == 0;
             let locate = attempt == 1;
             let command = source_cancellation_settlement_command(
@@ -4121,8 +4132,32 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                 ),
             );
             if attempt == 4 {
+                // Replace just this name: the complete receipt and original
+                // immutable fence inode remain intact, and a contradictory
+                // replacement must not be repaired or acknowledged.
+                std::fs::rename(&fence, registry.join("retained-cancellation-fence")).unwrap();
                 std::fs::write(&fence, b"/incomplete\n").unwrap();
+            } else if attempt == 5 {
+                // Separately corrupt the shared immutable inode in place.
+                // Both names must now fail the roots digest; neither may be
+                // rewritten from caller-supplied roots to manufacture success.
+                std::fs::rename(&fence, registry.join("retained-invalid-fence")).unwrap();
+                std::fs::hard_link(&receipt, &fence).unwrap();
+                std::fs::write(&fence, b"/incomplete\n").unwrap();
+                assert_eq!(
+                    std::fs::metadata(&fence).unwrap().ino(),
+                    std::fs::metadata(&receipt).unwrap().ino()
+                );
+                assert_eq!(std::fs::read(&receipt).unwrap(), b"/incomplete\n");
             }
+            let refused_evidence = (attempt >= 4).then(|| {
+                [&fence, &receipt].map(|path| {
+                    (
+                        std::fs::metadata(path).unwrap().ino(),
+                        std::fs::read(path).unwrap(),
+                    )
+                })
+            });
             // Use the real generated upload, login-shell quoting and bounded
             // controller. The standalone Python qualification uses shlex and
             // cannot detect a regression in these Rust command boundaries.
@@ -4168,6 +4203,19 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                         .contains("RCH_SOURCE_CANCELLATION_UNSETTLED")
                 );
                 assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
+                for (path, (inode, bytes)) in [&fence, &receipt]
+                    .into_iter()
+                    .zip(refused_evidence.as_ref().unwrap())
+                {
+                    assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+                    assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                }
+                assert!(!registry.join(format!("{identity}.{digest}.claim")).exists());
+                assert!(
+                    !registry
+                        .join(format!("{identity}.{digest}.pending"))
+                        .exists()
+                );
             }
             if discover || locate {
                 assert!(
@@ -4175,7 +4223,14 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                     "namespace discovery published a cancellation receipt"
                 );
             } else {
-                assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+                assert_eq!(
+                    std::fs::read(&receipt).unwrap(),
+                    if attempt == 5 {
+                        b"/incomplete\n".as_slice()
+                    } else {
+                        body.as_bytes()
+                    }
+                );
             }
             assert!(!source.exists(), "metadata recovery created a source root");
             assert!(!directory.path().join("expanded-dollar").exists());

@@ -70,6 +70,7 @@ def main():
 
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
     registries, absent, locks = [], [], []
+    absent_activity, empty_peers, locked_activity = [], [], set()
     for path in (current, legacy):
         # Open the registry's immediate parent too: checking just its leaf
         # would follow a substituted rch-source-authority-locks symlink.
@@ -95,6 +96,31 @@ def main():
     if len({identity(os.fstat(row[2])) for row in registries}) != len(registries):
         refuse("registry namespaces alias the same directory")
 
+    def identity_evidence(directory):
+        found = False
+        for subdirectory in ("", "released", "cancelled", "quarantine"):
+            scan = directory
+            if subdirectory:
+                try:
+                    scan = os.open(subdirectory, flags, dir_fd=directory)
+                except FileNotFoundError:
+                    continue
+                private(os.fstat(scan), directory=True)
+            try:
+                for name in os.listdir(scan):
+                    if name == token + ".activity.lock" and not subdirectory:
+                        continue
+                    if name.startswith(token + "."):
+                        found = True
+                        suffixes = {"": "claim|pending|cancelling", "released": "claim",
+                                    "cancelled": "claim", "quarantine": "pending"}[subdirectory]
+                        if not re.fullmatch(re.escape(token) + r"\.[a-f0-9]{64}\.(" + suffixes + ")", name):
+                            refuse("unrecognized same-identity registry evidence")
+            finally:
+                if subdirectory:
+                    os.close(scan)
+        return found
+
     def verify():
         for path, parent in absent:
             parent_path = os.path.dirname(path)
@@ -118,16 +144,38 @@ def main():
             private(os.fstat(descriptor))
             if identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) != identity(os.fstat(descriptor)):
                 refuse("registry lock changed during settlement")
+        for directory, name in absent_activity:
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            refuse("registry activity lock appeared during settlement")
+        for directory in empty_peers:
+            if identity_evidence(directory):
+                refuse("source identity appeared in registry without an activity lock")
 
     # All activity locks precede all metadata locks. A cancelled identity has
     # no new normal activity; acquiring these drains any previously admitted
     # operation. Fixed ordering also serializes concurrent recovery clients.
+    # An empty peer namespace needs only its metadata mutex: do not allocate a
+    # new token lock there after a worker has filled its disk. Absence is checked
+    # again under both metadata locks and after the transaction. Settlement in
+    # the selected namespace still requires an EXISTING locked activity inode;
+    # creating one cannot prove that a previous activity holder has drained.
     started = time.monotonic()
     deadline = started + 5
     for name in (token + ".activity.lock", "metadata.lock"):
         for path, _, directory in registries:
-            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                 0o600, dir_fd=directory)
+            lock_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+            if name == "metadata.lock":
+                lock_flags |= os.O_CREAT
+            try:
+                descriptor = os.open(name, lock_flags, 0o600, dir_fd=directory)
+            except FileNotFoundError:
+                if name == "metadata.lock":
+                    raise
+                absent_activity.append((directory, name))
+                continue
             heal_group_writable_lock(descriptor)
             private(os.fstat(descriptor))
             if any(identity(os.fstat(item[2])) == identity(os.fstat(descriptor)) for item in locks):
@@ -137,6 +185,8 @@ def main():
                 verify()
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if name != "metadata.lock":
+                        locked_activity.add(path)
                     break
                 except OSError as error:
                     if error.errno not in (errno.EAGAIN, errno.EACCES):
@@ -149,30 +199,10 @@ def main():
 
     candidates = []
     for path, _, directory in registries:
-        found = False
-        for subdirectory in ("", "released", "cancelled", "quarantine"):
-            scan = directory
-            if subdirectory:
-                try:
-                    scan = os.open(subdirectory, flags, dir_fd=directory)
-                except FileNotFoundError:
-                    continue
-                private(os.fstat(scan), directory=True)
-            try:
-                for name in os.listdir(scan):
-                    if name == token + ".activity.lock" and not subdirectory:
-                        continue
-                    if name.startswith(token + "."):
-                        found = True
-                        suffixes = {"": "claim|pending|cancelling", "released": "claim",
-                                    "cancelled": "claim", "quarantine": "pending"}[subdirectory]
-                        if not re.fullmatch(re.escape(token) + r"\.[a-f0-9]{64}\.(" + suffixes + ")", name):
-                            refuse("unrecognized same-identity registry evidence")
-            finally:
-                if subdirectory:
-                    os.close(scan)
-        if found:
+        if identity_evidence(directory):
             candidates.append(path)
+        elif path not in locked_activity:
+            empty_peers.append(directory)
     if not candidates and operation == "discover":
         # This is an observation only: no source/cleanup access, cancellation
         # receipt, or retirement can be inferred from absent worker evidence.
@@ -184,6 +214,8 @@ def main():
     selected = "current" if candidates[0] == current else "legacy"
     if operation == "settle-cancel" and selected != expected:
         refuse("source authority namespace changed from recorded binding")
+    if operation == "settle-cancel" and candidates[0] not in locked_activity:
+        refuse("source cancellation activity lock is absent")
     verify()
     # The caller runs this program inside source_namespace_control's owned
     # process group. Its independent 15-second deadline kills ALL descendants
