@@ -2,7 +2,34 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at22:39UTC:**
+**Active qualification checkpoint, November5 at23:07UTC:**
+
+- [x] Genuine oldB1-worker negative actual101/[0passed,1failed,0ignored]/165.3s,
+  precise missing-productive-reconnect assertion; no observed owned residuals.
+  New3013 all4native positives passed same stronger harness. Not a setup/compile/
+  timeout negative. Native acceptance waits for identical fullQA retry; no gate
+  waiver. Cached retry fmt20.1/check3.3/strictClippy3.8s all0, no speed credit.
+
+- [x] New3013 BUILD actualPASS1/1/zeroignored/481.4s: original archive execution,
+  replay and working delivered program. ALL FOUR new native positives passed,
+  no observed owned residuals; genuine old-B1-worker negative now RUNNING.
+  Native overall qualification still pending that negative and fullcompiler QA.
+- [x] Preserve fullQA DSR2bd311b6 TIMEOUT at original3600s (native5/CLI6,
+  whole3608s). Compiler gates all0, actual768 passes across5completed suites
+  (82/501/4/165/16), metadata-replay only listed before interruption, remaining
+  suites incomplete. NOT a full pass. Full1758/control8295B/1cac7b68 after-audit
+  matched; no owned QA processes. Results/TMP renamed *-timeout-2bd311b6,
+  original failure retained. No native/peer process touched.
+- [ ] Identical fullQA source/control/version/jobs1/profiles/pins/3600s retry
+  DISPATCHED23:07UTC, session98631; normal Cargo cache, no qualification or speed
+  credit from cached compile time. Every ALL9 inventory/name still required.
+- [x] MPDT peer diagnostic5397: final hook log line29 retains exact exit74
+  RCH_GIT_ARCHIVE_CACHE_ERROR:writable directory namespace; initial contexts
+  shorten it but inner stderr was not lost from final failure chain. Read-only
+  TRJ census finds existing /data/tmp/rch/mpdt-dsr-ws0775; cache guard rejects
+  any ordinary group-writable ancestor. Parent/data/tmp1777root is supported,
+  rchparent0755. No chmod/delete/guard weakening/retry/policy change. Diagnosis
+  sent TurquoiseDog; supported isolated-config correction remains under study.
 
 - [x] New3013 original CHECK/replay/edit/relocation/invalidation/expected-failing-
   script case actualPASS1/1/zeroignored/576.8s. New native3/4; BUILD and genuine
