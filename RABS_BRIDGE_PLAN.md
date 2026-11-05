@@ -2,7 +2,39 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Latest execution checkpoint, November5 at04:16UTC (November4 local):**
+**Latest execution checkpoint, November5 at04:26UTC (November4 local):**
+
+- [x] Freeze committed dfa32f4c, ALL1747 files, archive63662080B/59bfbb66;
+  no manual production overlay. Includes431 parallel verifier, e87 nonblocking
+  pressure sampler and515 retained worker admission. DSR81e4b380 normal ALL7
+  plus harness and DSRb5637f2b full QA launched04:13:38UTC; controller8920B/
+  53e0b5c5, native3600s/jobs1/concurrency4/root20GiB unchanged. Full workspace
+  check0/557.9s and fmt0/15.27s; strict Clippy and normal build remain active.
+- [x] Run current real worker component suite: declared150,149PASS/1FAIL/
+  0ignored,35.9s. Concrete fixture defect: closed-metadata rejection test
+  advertises only ClosedMetadata but negotiates ordinary Metadata. Correct
+  production fail-fast guard refuses that unavailable session before reading
+  its malicious frame. No compiler/fleet pass, later component modules UNRUN.
+- [x] Repair ONLY that fixture's advertised capabilities to include its actual
+  Metadata negotiation alongside ClosedMetadata; preserve executor panic,
+  exact context-version error, unknown request status and unadvanced journal.
+  Production authorization and all clocks unchanged. Local fmt/diff PASS.
+  New frozen source dfa+52e901de has exactly ONE changed test file; all other
+  1746 files match the normal producer. Archive65761280B/aa900d63; original
+  failing source/binary retained privately (752071160B/55338b72).
+- [x] Launch same-invocation fixture qualification04:24:13UTC, control8576B/
+  4c5d008e, original native3600s/jobs1/concurrency4/SBH20GiB. Unchanged LIVE
+  old150-test binary reproduces149PASS/1knownFAIL/0ignored as required. Then
+  repaired full150, coordinator transport/admission, TLS13, pin7, scanner and
+  real-filesystem cases plus full workspace check/strictClippy/fmt are required.
+  Changed admissibility: valid ordinary Metadata session can reach its intended
+  closed-frame rejection test; unsupported selected modes remain refused by
+  unchanged production code. This is fixture repair, not product capability.
+- [ ] Finish normal producer and repaired-source qualification, then bind
+  production tools/harness to dfa and test-only repair qualifier separately.
+  Native launcher refuses anything except the exact single test-file delta.
+  Previously staged5f7 runtime controls remain UNLAUNCHED/superseded; fresh
+  controls preserve the original actual CHECK/BUILD and warm-service bodies.
 
 - [x] Finish DSR56c5601e: full workspace check and strict Clippy PASS, normal
   SEVEN release roles PASS, actual Rustls artifact retains BOTH ring/AWS-LC,
