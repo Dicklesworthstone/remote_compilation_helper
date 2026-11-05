@@ -1,6 +1,6 @@
 //! Real filesystem, dataset verifier and pool tests. Reopening models restart;
 //! these fixtures are not power-loss, TLS, compiler-execution or speedup proof.
-use super::super::{Slot, ToolchainPool, key};
+use super::super::{Slot, ToolchainPool, ToolchainReuseScope, key};
 use super::*;
 use rabs_sandbox::canonical_namespace::{Bind, CanonicalNamespaceSpec};
 use rabs_sandbox::toolchain_dataset::fingerprint_toolchain;
@@ -56,6 +56,97 @@ impl Fixture {
         paths.sort();
         paths
     }
+}
+
+#[test]
+fn explicit_warming_publishes_independent_bytes_for_verified_restart_lookup() {
+    let f = Fixture::new();
+    let original = fs::metadata(f.source.join("bin/compiler")).unwrap();
+    let scope = ToolchainReuseScope {
+        pool: Arc::new(f.pool()),
+    };
+    assert_eq!(
+        scope.warm_toolchain(&f.source, || false).unwrap(),
+        f.identity
+    );
+    let cached = fs::metadata(f.entry().join("tree/bin/compiler")).unwrap();
+    assert_ne!(
+        (original.dev(), original.ino()),
+        (cached.dev(), cached.ino())
+    );
+    assert_eq!(cached.nlink(), 1);
+    assert_eq!(cached.mode() & 0o777, 0o555);
+    drop(scope);
+
+    let restarted = f.pool();
+    let lease = restarted.lookup(&f.identity, || false).unwrap().unwrap();
+    lease.verify(|| false).unwrap();
+    assert_eq!(lease.identity(), &f.identity);
+    assert_eq!(fs::read(lease.root().join("bin/compiler")).unwrap(), BYTES);
+    assert_eq!(
+        fs::metadata(lease.root().join("bin/compiler"))
+            .unwrap()
+            .ino(),
+        cached.ino()
+    );
+    assert_eq!(fs::read(f.source.join("bin/compiler")).unwrap(), BYTES);
+    assert_eq!(
+        fs::metadata(f.source.join("bin/compiler")).unwrap().ino(),
+        original.ino()
+    );
+}
+
+#[test]
+fn warming_requires_durable_storage_and_never_reports_private_fallback_as_success() {
+    let f = Fixture::new();
+    let transient = ToolchainReuseScope {
+        pool: Arc::new(ToolchainPool::new(1024, 8).unwrap()),
+    };
+    assert!(transient.warm_toolchain(&f.source, || false).is_err());
+    let scope = ToolchainReuseScope {
+        pool: Arc::new(ToolchainPool::with_directory(f.identity.bytes, 1, Some(&f.cache)).unwrap()),
+    };
+    assert_eq!(
+        scope.warm_toolchain(&f.source, || false).unwrap(),
+        f.identity
+    );
+    let published = f.objects();
+    fs::write(f.source.join("bin/compiler"), b"other_sdk!").unwrap();
+    assert_eq!(
+        scope
+            .warm_toolchain(&f.source, || false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(f.objects(), published);
+    assert_eq!(
+        fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+        BYTES
+    );
+}
+
+#[test]
+fn warming_preserves_cancellation_and_refuses_corrupted_published_bytes() {
+    let f = Fixture::new();
+    let scope = ToolchainReuseScope {
+        pool: Arc::new(f.pool()),
+    };
+    assert_eq!(
+        scope.warm_toolchain(&f.source, || true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(f.objects().is_empty());
+    scope.warm_toolchain(&f.source, || false).unwrap();
+    let image = f.entry().join("tree/bin/compiler");
+    let inode = fs::metadata(&image).unwrap().ino();
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&image, b"bad_bytes!").unwrap();
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(scope.warm_toolchain(&f.source, || false).is_err());
+    assert_eq!(fs::metadata(&image).unwrap().ino(), inode);
+    assert_eq!(fs::read(&image).unwrap(), b"bad_bytes!");
+    assert_eq!(fs::read(f.source.join("bin/compiler")).unwrap(), BYTES);
 }
 
 #[test]

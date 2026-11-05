@@ -1181,6 +1181,36 @@ evicted. Prepared bundles still contain their own complete compiler tree and are
 verified locally before networking; cache reuse does not make a missing or
 corrupted local bundle executable.
 
+#### Warm a worker's installed SDK before starting it
+
+`rabs-wkr --warm-toolchain <absolute-source-directory>` fills the existing
+durable compiler-input pool from a locally installed SDK. Stop the worker
+owning that cache first; its exclusive lock prevents simultaneous warming.
+Use the same cache directory and byte budget when starting the worker:
+
+```bash
+export RABS_WORKER_TOOLCHAIN_CACHE_DIR=/absolute/private/rabs-toolchains
+export RABS_WORKER_TOOLCHAIN_CACHE_BYTES=4294967296
+rabs-wkr --warm-toolchain /absolute/path/to/installed/toolchain
+# Start the worker with these same two settings and its normal TLS settings.
+```
+
+Choose a budget that accommodates the complete SDK. Warming fingerprints the
+whole source, independently captures and verifies it, and publishes through the
+ordinary durable store. It preserves the existing 30-minute preparation bound.
+Missing durable configuration, an owned cache, insufficient capacity,
+corruption or cancellation refuses; a temporary private capture is never
+reported as a successful warm. It does not repair or evict existing entries.
+Successful stdout is one JSON `worker-toolchain-prewarmed` record with the
+dataset's SHA-256, file count and bytes. This records retained input bytes;
+it does not execute a compiler or publish a cached build result.
+
+An authenticated request can reuse this image only when the coordinator's
+complete SDK identity matches and the ordinary reuse capability is negotiated.
+The worker still performs its normal acquisition and execution checks. A
+different installation is a miss. Preparing the pool does not extend a build
+deadline or establish that the cold network-upload path meets that deadline.
+
 #### Recover completed SDK files after an interrupted upload
 
 To retain progress before an entire SDK has arrived, set

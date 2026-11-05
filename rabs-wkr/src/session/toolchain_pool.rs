@@ -825,6 +825,51 @@ pub struct ToolchainReuseScope {
 }
 
 impl ToolchainReuseScope {
+    /// Populate the explicitly configured durable input cache before worker
+    /// startup. The ordinary exclusive cache lock, capacity reservation, full
+    /// source capture and durable publication remain the only admission path.
+    /// A declined reservation is an error here: a private fallback would vanish
+    /// on exit and must never be reported as a successfully warmed cache.
+    /// This prepares compiler bytes, not an execution or an action-cache result.
+    ///
+    /// # Errors
+    /// Refuses missing durable configuration, exhausted capacity, invalid or
+    /// changed source/cache bytes, I/O failure and caller cancellation.
+    pub fn warm_toolchain(
+        &self,
+        source: &Path,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<ToolchainIdentity> {
+        checkpoint(&stopped)?;
+        let cache = self.pool.directory.1.as_ref().ok_or_else(|| {
+            invalid("toolchain warming requires RABS_WORKER_TOOLCHAIN_CACHE_DIR and a nonzero RABS_WORKER_TOOLCHAIN_CACHE_BYTES budget")
+        })?;
+        let limits = ToolchainLimits {
+            max_bytes: self
+                .pool
+                .max_bytes
+                .min(ToolchainLimits::default().max_bytes),
+            ..ToolchainLimits::default()
+        };
+        let identity =
+            rabs_sandbox::toolchain_dataset::fingerprint_toolchain(source, &limits, &stopped)?;
+        let prepared = cache.capture(source, &identity, &stopped)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "persistent toolchain cache is full or its writer is busy; no toolchain was warmed",
+            )
+        })?;
+        // Capture/load already verifies complete bytes and publication. Keep
+        // that retained owner until the final cancellation/identity check.
+        checkpoint(&stopped)?;
+        if prepared.identity() != &identity {
+            return Err(invalid(
+                "warmed toolchain differs from its captured identity",
+            ));
+        }
+        Ok(identity)
+    }
+
     /// Read worker-local configuration once, before starting its session loop.
     /// Zero/absence disables retained reuse. No request JSON can change limits.
     /// CACHE_DIR is an optional private persistent store, requiring a nonzero

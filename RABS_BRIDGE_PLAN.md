@@ -4,6 +4,85 @@
 
 **Latest execution checkpoint, November5 at00:03UTC (November4 local):**
 
+- [x] Retain normal-seven producer f904aaff FAILED: native timeout5/3604s,
+  overall6/3607s at the unchanged3600s limit, while compiling rchd. No complete
+  seven-role artifact bank or runtime pass. Read-only post-timeout source-CWD
+  probe sees no matching live processes;16 denied reads elsewhere limit the
+  global census. No peer job was signaled. Retry the SAME seven-role command
+  on genuine completed Cargo outputs, original profiles/features/jobs1/3600s:
+  DSRb7acde59, launched00:50:06UTC/PID41867, new controller4e3e3f78/7419B.
+  The failed first build remains a loss; no cold-build or speed claim.
+- [x] Wire an explicit rabs-wkr --warm-toolchain SOURCE operator mode into
+  the existing durable SDK capture/publish implementation. Require existing
+  CACHE_DIR and nonzero CACHE_BYTES configuration; retain its exclusive lock,
+  full source/content/generation checks, quota and publication. Refuse private
+  fallback as a successful warm. The mode has a fixed existing30-minute SDK
+  budget, preserves native source-path bytes, and creates no worker incarnation,
+  execution journal, compiler execution or action publication. Local fmt/diff0.
+  New positive/restart, full-cache, cancellation and corruption cases use the
+  actual filesystem/cache; no golden or success fixture is substituted.
+- [x] Add a separate actual installed-SDK native prewarm/service test. It
+  invokes the real worker warm CLI, then requires all original service checks:
+  authenticated idle heartbeats, three fresh Cargo requests/worker receipts,
+  service restart, ordinary300s clients and cleanup. Each worker acquisition
+  must be pinned/reused, including the FIRST one. The original cold service
+  case/default configuration and original full check/build gates remain intact.
+- [ ] Qualify this new warm feature before any operational claim: source
+  f67bf10d+bf76b73a/all1747, FIVE manual inputs, archive65669120B/SHA07ab7831.
+  DSRa4e95463 launched00:55:21UTC/PID54655, controller180c1c3b/10269B,
+  original3600s/jobs1/concurrency4. Require full workspace/all-target check,
+  strictClippy/fmt; all35 existing pool tests plus3 new =38; ordinary FOUR
+  release roles, actual version/compiler probes; CLI negatives raw2/2/1; ordinary
+  harness compile and exact4 native case lists. Listing/building is not runtime.
+  Earlier local3bcc archive stayed UNRUN, superseded before staging only to
+  include API error documentation. No dependency/profile/feature/gate changes.
+- [ ] Then run the matching new warm roles/harness against the COMPLETE
+  original1.921GB SDK and real TLS/Cargo on TRJ. Require actual persisted bytes,
+  exact input inventory before/after and all three fresh worker executions.
+  Keep prewarmed capability separate from the original cold pass/fail, from
+  original cache/archive delivery, public worker-cache0/4, fleet and release.
+  Read-only ZFS facts: TRJ bulk uses zstd-7/1M records, dedupoff/copies1/checksumon;
+  no storage property is changed. Next sampler separates user/system CPU to
+  investigate the observed SDK cost rather than guessing its cause.
+- [x] Preserve terminal receipts locally for current static QA (2766B,
+  SHA96c250fa), expanded components (44584B/SHAf5bbd0a5), and isolated04ffa
+  runtime failure (23983B/SHA99481818). M6 receives the exact pass/fail scopes;
+  no Bead closure. Later read-only samples show the worker still traversing its
+  own uploaded SDK at689s, after the coordinator's600s deadline; upload/seal/
+  publication is a stronger investigation lead than the open SQLite descriptors.
+  These samples do not establish which upload phase or syscall consumed time.
+  Process write counters reach about945MB, which is NOT a verified receiver
+  progress receipt. Read both exact pinned sources: SDK upload already allows
+  30 minutes (source upload5 minutes/enclosing input35 minutes); the separate
+  native Cargo300s and helper600s are shorter. Do not infer that the protocol's
+  upload deadline expired, or increase any bound to manufacture a pass.
+- [x] Run UBS on the two changed Rust files: raw0, three critical command-site
+  heuristics,2733 warnings/816 info. Inspect all three critical sites: existing
+  canonicalized selected worker and actual test-built/delivered executables at
+  canonical_check_local.rs987/4385/4821; unchanged from8e2e. They intentionally
+  exercise real executables, with fixed fixture/output-root checks and cleared
+  environments. No suppression, scanner setting change or fake fixed program;
+  this review is not a claim that every legacy warning has been resolved.
+- [x] Bind the concurrently committed5f4c005a diagnostics to exactly ONE test
+  file over frozen f9bf: snapshotb6d47e0c/all1747, archive65648640B/
+  SHA3ff15ba9. All production files are byte-identical. Stage new private inputs
+  without changing the running normal producer. Launch native DSRbf231ad5 at
+  00:12:47UTC/PID67189, controllerdb13cc11/6866B, original3600s/jobs1/
+  concurrency4. Ordinary harness compile plus full check/strictClippy/fmt are
+  REQUIRED; the three actual service/check/build cases are listed, not run here.
+- [ ] Consume terminal bf231ad5 and f904aaff results before the next native
+  runtime. Use their exact qualified harness and normal shipping roles, full SDK
+  and new private short scratch path on TRJ. Before launch, refine execution
+  order to reproduce the ORIGINAL full inline check/cache failure first, then
+  original archives/delivered executable42/43, BOTH within the original combined
+  3600s cap and original Cargo300s/helper600s limits. The earlier proposed extra
+  service-first case would consume that same cap and avoid the newly diagnosed
+  helper boundary; keep persistent service/idle TLS/three fresh checks/restart as
+  a separate REQUIRED gate, with its original startup/heartbeat/client clocks.
+  No original case is replaced or narrowed. Stop on a failed case and label
+  remaining cases UNRUN. Improve supplementary
+  sampling with bounded per-thread wait channels and explicit denied-read rows;
+  this still cannot replace native receipts/cleanup or independent census.
 - [x] Qualify the current integration after moving the test-only file-reuse
   constant import into worker_pool_tests, without suppressing warnings.
   Frozen source8e2e2618+f9bf1d26/all1747 files: native DSR0d483f93 SUCCESS,

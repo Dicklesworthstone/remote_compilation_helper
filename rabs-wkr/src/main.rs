@@ -628,6 +628,39 @@ fn main() {
         println!("{info}");
         return;
     }
+    // Preserve native path bytes for this operator mode. It owns no worker
+    // incarnation or execution journal, and cannot run beside a supervisor
+    // holding the configured durable cache's ordinary exclusive lock.
+    let mut native_args = std::env::args_os().skip(1);
+    if native_args
+        .next()
+        .is_some_and(|arg| arg == "--warm-toolchain")
+    {
+        let Some(source) = native_args.next().filter(|_| native_args.next().is_none()) else {
+            eprintln!("usage: rabs-wkr --warm-toolchain <absolute-source-directory>");
+            std::process::exit(2);
+        };
+        let started = Instant::now();
+        let outcome =
+            rabs_wkr::session::ToolchainReuseScope::from_environment().and_then(|scope| {
+                scope.warm_toolchain(&PathBuf::from(source), || {
+                    started.elapsed() >= rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET
+                })
+            });
+        match outcome {
+            Ok(identity) => println!(
+                "{}",
+                serde_json::json!({"kind":"worker-toolchain-prewarmed",
+                    "sha256":source_transfer::hex(&identity.sha256),
+                    "files":identity.files,"bytes":identity.bytes})
+            ),
+            Err(error) => {
+                eprintln!("toolchain warming failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {
@@ -638,6 +671,9 @@ fn main() {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
                  USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--source-cache-bytes N] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
+                 OR: rabs-wkr --warm-toolchain <absolute-source-directory>\n\
+                 Warm compiler inputs before startup using explicit RABS_WORKER_TOOLCHAIN_CACHE_DIR and nonzero RABS_WORKER_TOOLCHAIN_CACHE_BYTES; the cache must be unowned.\n\
+                 Warming retains full dataset verification, quotas and the existing 30-minute preparation bound; it neither executes a compiler nor caches a build result.\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\

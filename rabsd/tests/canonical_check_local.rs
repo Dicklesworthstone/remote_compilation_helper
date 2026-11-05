@@ -1083,6 +1083,16 @@ fn shared_remote_source(root: &Path, label: &str, value: u32) {
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; real idle TLS heartbeats, fresh Cargo checks and graceful service restart"]
 fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
+    exercise_shared_service_with_toolchain_cache(false);
+}
+
+#[test]
+#[ignore = "requires full Linux isolation, OpenSSL, matching normal RABS binaries and a complete installed SDK; explicitly warms durable compiler inputs before real TLS/Cargo/restart checks"]
+fn canonical_shared_service_uses_an_explicitly_prewarmed_sdk() {
+    exercise_shared_service_with_toolchain_cache(true);
+}
+
+fn exercise_shared_service_with_toolchain_cache(prewarm: bool) {
     fn heartbeat_count(worker: &NativeWorker) -> usize {
         worker
             .events()
@@ -1165,7 +1175,45 @@ fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
         .unwrap(),
     )
     .unwrap();
-    let (mut worker, environment) = NativeWorker::start(root);
+    let (mut worker, environment) = if prewarm {
+        let binary = fs::canonicalize(std::env::var_os("RABS_TEST_WORKER_BIN").unwrap()).unwrap();
+        let cache = root.join("durable-toolchains");
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", root)
+            .env("RABS_WORKER_TOOLCHAIN_CACHE_DIR", &cache)
+            .env(
+                "RABS_WORKER_TOOLCHAIN_CACHE_BYTES",
+                rabs_sandbox::toolchain_dataset::ToolchainLimits::default()
+                    .max_bytes
+                    .to_string(),
+            )
+            .arg("--warm-toolchain")
+            .arg(profile["toolchain_root"].as_str().unwrap());
+        let warm = SharedServiceChild::spawn(root, "toolchain-warm", command);
+        let stdout = warm.stdout.clone();
+        let (code, _, output) = warm.finish(
+            rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET,
+            false,
+        );
+        assert_eq!(code, 0, "{output}");
+        let warmed: Value = serde_json::from_slice(&read_bounded(&stdout)).unwrap();
+        assert_eq!(warmed["kind"], "worker-toolchain-prewarmed", "{output}");
+        assert!(warmed["files"].as_u64().unwrap() > 0, "{output}");
+        assert!(warmed["bytes"].as_u64().unwrap() > 0, "{output}");
+        let (coordinator, workers) = native_certificates(&root.join("credentials"), &["worker"]);
+        NativeWorker::start_with_identity(
+            root,
+            "canonical-dependency-worker",
+            &coordinator,
+            &workers[0],
+            Some(&cache),
+        )
+    } else {
+        NativeWorker::start(root)
+    };
     let address = &environment
         .iter()
         .find(|(name, _)| name == "RABS_DEPENDENCY_WORKER_LISTEN")
@@ -1289,6 +1337,20 @@ fn canonical_shared_service_keeps_worker_ready_between_real_cargo_requests() {
     let heartbeats = heartbeat_count(&worker);
     await_heartbeat(&mut worker, &mut service, heartbeats);
     stop_service(service, address);
+    if prewarm {
+        let events = worker.events();
+        let acquired = events
+            .iter()
+            .filter(|event| event["kind"] == "worker-toolchain-acquired")
+            .collect::<Vec<_>>();
+        assert_eq!(acquired.len(), 3, "{events:?}");
+        assert!(
+            acquired
+                .iter()
+                .all(|event| event["disposition"] == "reused" && event["pinned"] == true),
+            "every fresh check must use the previously warmed exact SDK: {events:?}"
+        );
+    }
     worker.finish();
     assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
 }
@@ -1348,7 +1410,7 @@ fn canonical_shared_service_selects_ready_worker_before_disconnected_first_endpo
         .create(&worker_root)
         .unwrap();
     let (mut worker, environment) =
-        NativeWorker::start_with_identity(&worker_root, READY, &coordinator, &identities[1]);
+        NativeWorker::start_with_identity(&worker_root, READY, &coordinator, &identities[1], None);
     let configured = |name| {
         environment
             .iter()
@@ -2318,12 +2380,14 @@ fn canonical_shared_remote_failover_preserves_generation_and_surviving_subscribe
         "failover-first",
         &coordinator,
         &identities[0],
+        None,
     );
     let (mut second_worker, second_environment) = NativeWorker::start_with_identity(
         &second_root,
         "failover-second",
         &coordinator,
         &identities[1],
+        None,
     );
     let pool = [first_environment.as_slice(), second_environment.as_slice()]
         .into_iter()
@@ -4334,7 +4398,7 @@ impl NativeWorker {
     fn start(root: &Path) -> (Self, Vec<(String, String)>) {
         const ID: &str = "canonical-dependency-worker";
         let (coordinator, workers) = native_certificates(&root.join("credentials"), &["worker"]);
-        Self::start_with_identity(root, ID, &coordinator, &workers[0])
+        Self::start_with_identity(root, ID, &coordinator, &workers[0], None)
     }
 
     fn start_with_identity(
@@ -4342,6 +4406,7 @@ impl NativeWorker {
         id: &str,
         coordinator: &TlsFiles,
         worker: &TlsFiles,
+        toolchain_cache: Option<&Path>,
     ) -> (Self, Vec<(String, String)>) {
         let binary = fs::canonicalize(
             std::env::var_os("RABS_TEST_WORKER_BIN")
@@ -4402,6 +4467,9 @@ impl NativeWorker {
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap());
+        if let Some(cache) = toolchain_cache {
+            command.env("RABS_WORKER_TOOLCHAIN_CACHE_DIR", cache);
+        }
         // A collision now fails authenticated admission; a foreign listener
         // cannot satisfy this freshly generated worker/coordinator identity.
         drop(reserved);
