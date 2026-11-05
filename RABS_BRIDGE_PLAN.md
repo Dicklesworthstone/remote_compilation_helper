@@ -4,6 +4,11 @@
 
 **Active qualification checkpoint, November5 at22:39UTC:**
 
+- [x] New3013 original CHECK/replay/edit/relocation/invalidation/expected-failing-
+  script case actualPASS1/1/zeroignored/576.8s. New native3/4; BUILD and genuine
+  old-worker negative pending. These elapsed times are correctness receipts,
+  NOT a same-invocation incumbent timing comparison or speedup claim.
+
 - [x] Full1758-file live comparison22:49 corrects earlier narrow Rust/TOML/Python
   check: current main also differs in install.sh, remote_process.sh,
   source_cancel_settlement.py, source_claim_registry.sh, ssh.rs and their tests.
