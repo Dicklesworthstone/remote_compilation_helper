@@ -6404,7 +6404,7 @@ mod tests {
             BuildHistory::new(100).with_persistence(tmp.path().join("history.jsonl")),
         );
         let ApiRequest::SelectWorker { mut request, .. } = parse_request(&format!(
-            "GET /select-worker/disk-owner?project=disk-owner&command=cargo%20check&cores=1&disk_headroom_gib=64&runtime=none&hook_pid={}",
+            "GET /select-worker/disk-budget?project=disk-owner&command=cargo%20check&cores=1&disk_headroom_gib=64&runtime=none&hook_pid={}",
             crate::history::observable_test_process_id(),
         )).unwrap() else { panic!("selection request expected") };
         let response = handle_select_worker_with_wrapper(
@@ -14115,9 +14115,23 @@ mod tests {
                 blocked.worker.is_none(),
                 "a spare CPU slot cannot spend reserved bytes"
             );
-            assert!(blocked.reason.to_string().contains("disk_headroom"));
+            assert_eq!(blocked.reason, SelectionReason::AllWorkersBusy);
+            assert!(
+                blocked
+                    .diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .workers
+                    .iter()
+                    .any(|entry| entry.worker_id.as_str() == "large-disk"
+                        && entry
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == "disk_headroom_reserved"))
+            );
             assert_eq!(ctx.history.active_builds().len(), 1);
             assert_eq!(worker.used_slots(), 1);
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("large-disk"), 20);
 
             // Actual exhaustion still closes readiness and retains ownership.
             worker.set_capabilities(capabilities(8.0)).await;
