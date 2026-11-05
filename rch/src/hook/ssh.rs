@@ -2693,7 +2693,9 @@ fn build_worker_projects_topology_cmd(
              case {canonical}/ in \"$alias_real\"/*) ;; *) \
                if [ -n \"$alias_real\" ]; then \
                  mkdir -p -- \"$(dirname -- {canonical})\" 2>/dev/null || true; \
-                 ln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; fi;; esac; \
+                 if command -v gln >/dev/null 2>&1; then \
+                   gln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; \
+                 else ln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; fi; fi;; esac; \
              if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
                printf 'RCH_TOPOLOGY_ERR_ALIAS_TARGET_CONFLICT:path=%s:target=%s:expected=%s\\n' {alias} \"$alias_real\" {canonical} >&2; exit 43; fi; \
            else \
