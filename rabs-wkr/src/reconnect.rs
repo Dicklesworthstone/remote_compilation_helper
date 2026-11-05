@@ -347,8 +347,10 @@ pub(super) fn run(
         if controller.is_shutting_down() {
             return shutdown_exit(&report, &journal);
         }
-        let completed_delivery =
-            outcome.is_ok() && before_delivery.advanced_to(DeliveryProgress::read(&journal));
+        // A later socket error does not undo a durably accepted result. The
+        // new journal frontier proves delivery and excludes stale ACKs,
+        // uncertain execution and results whose release did not persist.
+        let completed_delivery = before_delivery.advanced_to(DeliveryProgress::read(&journal));
         let delay = backoff.next(healthy_for, completed_delivery);
         eprintln!(
             "{}",

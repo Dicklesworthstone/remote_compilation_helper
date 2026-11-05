@@ -287,7 +287,7 @@ use rch_common::ssh_utils::{
 };
 use rch_common::{
     ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RemoteBuildJobs, RetryConfig,
-    ToolchainInfo, TransferConfig, WorkerConfig, normalize_project_path_with_policy,
+    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, normalize_project_path_with_policy,
     wrap_command_with_color, wrap_command_with_toolchain,
 };
 #[cfg(unix)]

@@ -1093,6 +1093,34 @@ fn canonical_shared_service_uses_an_explicitly_prewarmed_sdk() {
 }
 
 fn exercise_shared_service_with_toolchain_cache(prewarm: bool) {
+    fn assert_completed_reconnect(worker: &NativeWorker, request: u64) {
+        let events = worker.events();
+        let reconnects = events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "worker-reconnect-scheduled"
+                    && event["request_high_water"].as_u64() == Some(request)
+            })
+            .collect::<Vec<_>>();
+        let productive = reconnects
+            .iter()
+            .filter(|event| event["completed_delivery"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            productive.len(),
+            1,
+            "one newly accepted result must earn one productive reconnect: {reconnects:?}"
+        );
+        assert_eq!(productive[0]["delay_ms"], 0, "{reconnects:?}");
+        assert!(
+            reconnects
+                .iter()
+                .filter(|event| event["completed_delivery"] != true)
+                .all(|event| event["delay_ms"].as_u64().is_some_and(|delay| delay > 0)),
+            "an unchanged delivery frontier cannot earn another immediate reconnect: {reconnects:?}"
+        );
+    }
+
     fn heartbeat_count(worker: &NativeWorker) -> usize {
         worker
             .events()
@@ -1270,6 +1298,7 @@ fn exercise_shared_service_with_toolchain_cache(prewarm: bool) {
                 before,
                 "idle authentication and heartbeats must not change execution ownership"
             );
+            assert_completed_reconnect(&worker, last_request);
         }
         let value = 41 + number;
         write(&source, "src/value.rs", format!("{value}\n"));
@@ -1336,6 +1365,7 @@ fn exercise_shared_service_with_toolchain_cache(prewarm: bool) {
     // closes. This exercises the idle owner's explicit shutdown and join.
     let heartbeats = heartbeat_count(&worker);
     await_heartbeat(&mut worker, &mut service, heartbeats);
+    assert_completed_reconnect(&worker, last_request);
     stop_service(service, address);
     if prewarm {
         let events = worker.events();
