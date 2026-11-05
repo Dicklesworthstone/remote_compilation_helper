@@ -339,8 +339,10 @@ rch robot-docs guide
 RABS offers an experimental, opt-in worker-local dependency cache through
 `cargo rabs --rabs-remote check`. See the [setup and measured validation
 boundaries](docs/rabs-rch-worker-cache.md) before enabling it. Correct cache
-serving has passed real Cargo/SSH tests; practical acceleration remains under
-qualification.
+serving has passed real Cargo/SSH tests. Four native Linux scenarios also passed
+real compiler execution, replay, delivered binaries, and persistent worker/SDK
+reuse over authenticated loopback TLS. Practical acceleration remains under
+qualification; the measured whole-project warm run was slower than ordinary RCH.
 
 ### Named Cargo JSON for installer consumers
 

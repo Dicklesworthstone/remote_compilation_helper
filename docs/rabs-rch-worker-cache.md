@@ -198,8 +198,19 @@ These results use the qualified e019 Rust build and 3f launcher identified in
 751 Rust tests and 340 launcher/adapter tests, zero ignored/skipped, formatting,
 full workspace checks and strict Clippy. A newly built metadata installation
 optimization is still being qualified; these older results do not establish its
-performance. Multi-host acceleration, current full native qualification and
-native macOS dispatch remain open.
+performance.
+
+The metadata installation build also passed all four original native Linux
+scenarios: CHECK with replay, edits, relocation and an expected compiler failure;
+BUILD with archive replay and a working delivered binary; three fresh requests
+through a persistent worker across coordinator restart; and the same service
+with an explicitly prewarmed, complete SDK. These are real compiler runs over
+authenticated loopback TLS on one host. Source, tool and full SDK byte audits
+matched afterward, with no observed owned test processes remaining. The
+source-bound receipts are in [the execution plan](../RABS_BRIDGE_PLAN.md).
+This functional result does not establish a speed benefit. A subsequent worker
+reconnect repair still requires its own build and native qualification.
+Multi-host acceleration and native macOS dispatch remain open.
 
 Before claiming fleet acceleration, qualify rebuilt binaries with actual Cargo
 and daemon execution: confirm served decisions correspond to skipped compilers,

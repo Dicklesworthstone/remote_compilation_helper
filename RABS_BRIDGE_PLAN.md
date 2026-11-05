@@ -2,7 +2,107 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at20:45UTC:**
+**Active qualification checkpoint, November5 at22:08UTC:**
+
+- [x] New9ce1 worker gate DSR terminalSUCCESS0/728s: actual154worker+40SDK,
+  zeroignored, all original names retained; stronger native harness compiled/
+  original4 listed, NOT executed. ALL1758/control7074B/f1ed82c3 aftermatch.
+- [x] Preserve new9ce1 ALL7 release FAILURE DSR2192f88f/native101/CLI6/472s,
+  fullworkspace check FAILURE DSR042a585a/native1/CLI6/495s (actual Cargo101).
+  Both exposed missing production WorkerId import at rch/src/transfer.rs4085;
+  source/control aftermatch. Formatting0, no new fullQA or ALL7 pass claimed.
+- [x] Manual missing-import fix under lease2271, pinnedrustfmt0. Freeze new
+  source133b-overlay-301357fb5bbfc2ef770c3ef2d8922e040d42707dd963aec1f2a024abd8cacd8f,
+  ALL1758/tar64727040B. Complete RABS/Cargo/config/toolchain closure identical
+  to9ce1, so genuine9ce1 worker194/harness may be used with explicit original
+  identity; never retagged. Current source differs only docs/Beads/transfer import.
+- [ ] Replacement normalALL7/BOTH TLS DSR RUNNING control4277B/68162b71;
+  fullworkspace/ALL9 gate RUNNING control8295B/1cac7b68, same original3600s/
+  jobs1/defaultprofiles/pins. Full9ce1 source audit/no owned processes/retirement
+  before stable QA root reuse; no snapshot mutation or failure overwrite.
+- [ ] Native4+old-worker negative now bound to3013 release/fullQA and genuine
+  closure-matched9ce1 harness. Control29023B/c1003571/inode14093272/dev49,
+  UNRUN pending terminal prerequisites. Prior unused ce859 controller retained.
+- [x] UBS proper manifest-aware baseline4critical/2328warning/585info versus
+  new4/2334/587. Four existing test-executable findings unchanged. Delta exactly
+  THREE stronger assertions/THREE bounded indexes and TWO Vec-collection info
+  findings in TLS test helper; no suppressions/scanner-clean claim. Earlier
+  manifest-less baseline13 critical was misclassified integration-test panics,
+  retained, and is not the comparison used. Transfer import scan also performed.
+
+- [x] Original B1 native4 DSR terminalSUCCESS0/2042s: actual CHECK1/1/822.28s,
+  BUILD1/1/711.57s, cold-service1/1/247.26s, prewarmed-service1/1/170.86s,
+  ALLzeroignored/no unrun cases/no observed owned residuals. ALL1758 source,
+  control26460B/c75dc60c, ALL7 normal tools and complete original SDK5256entries/
+  4270files/1921340623B aftermatch. Native receipt169506B/553c3e2c. Same-host
+  authenticated loopback functionality ONLY; earlier whole-project loss stands.
+- [x] Freeze new reconnect repair plus stronger original TLS assertions:
+  source133b0a30-overlay-9ce1dee7150e6af022cb560e6ded906b33ce3f04f61bfd5fd406c6cd8df042ff,
+  ALL1758 files/tar64716800B. Separate immutable source; old native baseline kept.
+- [ ] DSR normalALL7/BOTH TLS rebuild RUNNING, control4285B/39d869be;
+  worker154/SDK40/harness RUNNING control7074B/f1ed82c3; fullworkspace fmt/check/
+  strictClippy/ALL9 inventories RUNNING control8286B/a1cdd873. Formatting0;
+  no completed latest-source compiler or component pass claimed yet. Original
+  3600s/jobs1/profiles/pins unchanged. Full B5 source1758 audit, no owned processes,
+  non-destructive retirement before stable QA path reuse; unchanged mtimes kept.
+- [ ] New native4+old-B1-worker negative PREPARED control28457B/ce859b0c/
+  inode14116772/dev49. Requires all three new qualification jobs terminal0;
+  complete originalSDK/bounds/guards retained. Same stronger real cold-service
+  test must reject old worker specifically for missing productive reconnect;
+  setup/compiler/deadline failure cannot satisfy negative. All4new positives
+  and negative remain UNRUN. No current-worker fix qualification yet.
+- [ ] Warm comparison ready but undispatched: sharedTRJ used6/active2 at21:55,
+  preserve peer jobs; no reservation/drain. Public6/cache4/break-even remain held.
+
+- [x] B5 retry DSR18363244 SUCCESS0/1659s: ALL1064 selected cases/zeroignored,
+  all nine inventories (82/501/4/164/16/9/6/1/281), fullfmt/check/strictClippy0,
+  ALL1758/control7547B/abc1f3cb aftermatch. Receipt110154B/1d130ff4.
+- [x] Producer contract DSR14918ff7 SUCCESS0/75s: actual7/7 preview tests,
+  including real held-mutex contention/gaps; source/control aftermatch.
+- [x] Preserve comparison DSRdf4b5b0e FAILURE6/487s. Seven Cargo checks0,
+  ALL11 fresh=false/ALL8metadata stockequal. Five actual8hit/8serve checks,
+  including THREE genuine newB1 checks, prove serving; final old traced restart
+  hit shared10s identity-probe deadline and fell back12shadow/0serve. Old-d and
+  finalstock UNRUN: NO complete timing verdict. Old daemon restored/idle,
+  allthreadsdetached/source+tools+control unchanged; sharedTRJ enabled fresh
+  healthy/used0/active0 at21:18, END5225. Both warm traces exceeded30s: partial,
+  so observed new0FICLONE is NOT complete syscall-absence evidence.
+- [x] Read actual probe policy: failed observations retry after30s; no latched
+  forever claim or product probe edit. Normal literal untraced sysroot/version
+  queries0/0.120s and0/0.097s. Dynamic Python probe command was DCG-blocked and
+  did not run; resolved with statically explicit read-only executable commands.
+- [ ] Warm comparison PREPARED, not dispatched: worker control18790B/cf8801d4/
+  inode25308/dev191; relay2069B/25bcd7f8/inode14098880/dev49. Add exactly one
+  untraced fresh-target prime per restart, ALL12 checks still require ALL11
+  fresh=false/ALL8stockequal and EVERY RABS prime/warm/measured8serve/0exec.
+  Same original cache, deadlines,30s samples, profiles/pins/sampling policy;
+  primary old/new/new/old measurements unchanged. Verify actual tracer ancestry/
+  allthreads before Cargo; record full-window versus partial coverage explicitly.
+- [x] Native B1 CHECK scenario PASS1/1/zeroignored,822.28s: real dependency
+  execution/cache replay/edit/relocation/invalidation/expected failing script.
+- [x] B1 native4 baseline completed all four as above. Original3600s overall/
+  Cargo300/helper600/fullSDK unchanged; no performance/fleet claim.
+- [x] Match live durable journal request1793914321153640738: compiler0,
+  executedtrue/residual0/stopnull/retained-result acknowledged+released. SAME-ID
+  reconnect nevertheless says completed_deliveryfalse/delay24123ms/session-error.
+  A later transport failure was incorrectly gated by outcome.is_ok() despite
+  the existing stricter durable advancing-frontier proof. Preserve snapshot in
+  native results/live-worker-requests-2132.json and held worker stderr.
+- [ ] UNQUALIFIED runtime repair under lease2240: use existing advancing durable
+  delivery proof for reconnect classification; preserve every ACK/release,
+  request identity, anti-replay, cancellation/uncertainty and persistence check.
+  Error remains logged; no deadline, jitter ceiling, execution/replay authority,
+  hash, sampling or source/target guard changed. This is a separate lever from
+  B1metadata copy policy; do not attribute B1 timing to the newer worker.
+- [ ] Strengthen existing real TLS cold/prewarmed service scenarios under2244:
+  each of THREE actual fresh result receipts must earn exactly ONE zero-delay
+  completed reconnect; unchanged frontiers must have nonzero jitter. Existing
+  heartbeat/owner-byte/restart/compiled-output checks and waits retained.
+  Local pinnedrustfmt0. Require fresh normal build/full compiler gates, worker
+  inventory and native replay, plus old-binary negative before closure.
+- [ ] Compile and run this new worker repair; preserve current baseline and
+  peer commits81d54e78/133b0a30. Public cache4/same-invocation ordinaryRCH and
+  population-cost/break-even remain unrun for B1; native baseline still running.
 
 - [x] Preserve B5 DSR38bda00e TIMEOUT at original3600s: workspace/alltargets
   check0/1409.17s, fmt0/16.09s, strictClippy0/1437.87s; CLI test executable
@@ -10,9 +110,9 @@
   ALL1758/control7547B/abc1f3cb unchanged, owned source/job/TMP processes absent.
   Results/TMP preserved by rename to *-timeout-38bda00e; local receipt
   terminal-metadata-privatecopy-b5-timeout.json/cc589fb5. No threshold changed.
-- [ ] SAME B5 full9 gate retry RUNNING, same source/control/version/3600s,
+- [x] SAME B5 full9 gate retry PASS, same source/control/version/3600s,
   normal Cargo cache. Retry fmt0/20.89s, workspacecheck0/2.73s, strictClippy0/
-  2.64s; CLI test executable compiling. Cached QA speed earns no RABS win.
+  2.64s; ALL1064 cases passed as above. Cached QA speed earns no RABS win.
 - [x] Stage genuine B1 candidate privately at worker bin-metadata-privatecopy/
   rabsd:8178704B/a362888a,0500,uid1000/single-link and release receipt checked.
   NOT started. Exact B5quality receipt and terminal DSR success still required
@@ -49,7 +149,7 @@
   cases compiled/listed, ZERO native scenarios executed. Normal3600s/profiles/
   pins/jobs1. Local collected components_linux_amd64.json28350B/907fadf5;
   genuine harness760638200B/7d21f895. This is component proof, not useful RABS.
-- [ ] Native4 consumer PREPARED, NOT dispatched: control26460B/c75dc60c/
+- [x] Native4 consumer DISPATCHED and all4PASS as above: control26460B/c75dc60c/
   inode14095288/dev49, original four CHECK/BUILD/cold/persistent-service cases,
   normal genuine B1ALL7/bothTLS tools and matching7be1 harness. Complete original
   SDK5256entries/4270files/1921340623B, original Cargo300s/helper600s/SDK30min/
