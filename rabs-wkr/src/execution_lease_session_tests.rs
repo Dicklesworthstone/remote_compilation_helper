@@ -186,8 +186,8 @@ fn report() -> rabs_wkr::session::CapabilityReport {
 
 fn pressure() -> rabs_wkr::session::PressureSample {
     rabs_wkr::session::PressureSample {
-        load_x100: 0,
-        free_disk_mib: 100,
+        load_x100: Some(0),
+        free_disk_mib: Some(100),
     }
 }
 
@@ -422,6 +422,120 @@ fn mismatched_request_and_missing_authenticated_lease_never_reach_journal_admiss
             before
         );
     }
+}
+
+#[test]
+fn stalled_pressure_probe_allows_heartbeats_renewal_cancel_and_owned_shutdown() {
+    let root = private_root();
+    let mut journal =
+        WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
+    let selected = selection(&journal, &request());
+    let evidence = ChildEvidence::default();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let worker_probes = Arc::clone(&probes);
+    let probe_completed = Arc::new(AtomicBool::new(false));
+    let worker_completed = Arc::clone(&probe_completed);
+    let (entered, entering) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let sampler = PressureSampler::spawn(
+        move || {
+            worker_probes.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            // Model an uninterruptible statvfs, with a test-only escape bound.
+            // The control path must finish below while this gate stays closed.
+            released.recv_timeout(Duration::from_secs(20)).unwrap();
+            worker_completed.store(true, Ordering::Release);
+            pressure()
+        },
+        PRESSURE_SAMPLE_INTERVAL,
+    )
+    .unwrap();
+    let monitor = sampler.monitor();
+    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut wire = Wire::default();
+    let peer = wire.clone();
+    peer.frame(request());
+    let report = report();
+    let mut driver = Box::pin(drive_session_with_sources(
+        &mut wire,
+        &report,
+        false,
+        Some(&mut journal),
+        false,
+        false,
+        &selected,
+        |request, timeout, artifacts, source, lease| {
+            launch(
+                root.path(),
+                request,
+                timeout,
+                artifacts,
+                source,
+                lease,
+                evidence.clone(),
+            )
+        },
+        || monitor.snapshot(),
+    ));
+    pump_until(driver.as_mut(), || evidence.started.load(Ordering::Acquire));
+    for _ in 0..16 {
+        peer.frame(json!({"kind":"ping"}));
+    }
+    peer.frame(renewal(1));
+    pump_until(driver.as_mut(), || peer.replies().len() >= 17);
+    let replies = peer.replies();
+    for heartbeat in &replies[..16] {
+        assert_eq!(heartbeat["kind"], "heartbeat");
+        assert_eq!(heartbeat["active_request_id"], REQUEST);
+        assert!(heartbeat["load_x100"].is_null());
+        assert!(heartbeat["free_disk_mib"].is_null());
+    }
+    assert_eq!(replies[16]["kind"], "execution-lease-renewed");
+    assert_eq!(replies[16]["accepted"], true);
+    assert!(!probe_completed.load(Ordering::Acquire));
+    assert!(!evidence.cleaned.load(Ordering::Acquire));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+    peer.frame(json!({"kind":"cancel", "request_id":REQUEST}));
+    pump_until(driver.as_mut(), || terminal(&peer).is_some());
+    let result = terminal(&peer).unwrap();
+    assert_eq!(result["stop_reason"], "cancelled");
+    assert_eq!(result["residual_group_members"], 0);
+    assert!(evidence.cleaned.load(Ordering::Acquire));
+    assert_eq!(evidence.launches.load(Ordering::SeqCst), 1);
+    peer.close();
+    wait(driver).unwrap();
+    assert!(!probe_completed.load(Ordering::Acquire));
+
+    // The session can drain while the sampler is blocked; its supervisor owner
+    // still must join that exact probe before process exit. A surviving monitor
+    // neither owns the thread nor exposes a late sample after shutdown starts.
+    let (done, joined) = std::sync::mpsc::sync_channel(1);
+    let shutdown = std::thread::spawn(move || {
+        drop(sampler);
+        done.send(()).unwrap();
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while !monitor.shared.state.lock().unwrap().stopped {
+        assert!(
+            Instant::now() < until,
+            "pressure shutdown was not requested"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        joined.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+    ));
+    assert_eq!(monitor.snapshot(), PressureSample::default());
+    release.send(()).unwrap();
+    let completed = joined.recv_timeout(Duration::from_secs(5));
+    shutdown.join().unwrap();
+    completed.expect("pressure sampler did not join after the probe was released");
+    assert!(probe_completed.load(Ordering::Acquire));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert_eq!(monitor.snapshot(), PressureSample::default());
 }
 
 #[test]

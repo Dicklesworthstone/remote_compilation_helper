@@ -2136,7 +2136,7 @@ fn dependency_host_requirement_preserves_native_mode_and_context_admission() {
     }
     let root = private_root();
     let journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
-    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false)).unwrap();
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false, None)).unwrap();
     assert_eq!(
         hello["dependency_execution_hosts"],
         json!([native.as_str()])
@@ -2413,7 +2413,8 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
     );
     assert_eq!(replies[1]["status"], "unknown");
     assert_eq!(journal.high_water(), None);
-    let hello: Value = serde_json::from_str(&worker_hello(&report(), &journal, false)).unwrap();
+    let hello: Value =
+        serde_json::from_str(&worker_hello(&report(), &journal, false, None)).unwrap();
     assert_eq!(
         hello["dependency_contexts"],
         json!([
@@ -2451,7 +2452,7 @@ fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
     let mut report = report();
     report.canonical_namespace = false;
     report.dependency_modes = vec![DependencyExecutionMode::Rlib];
-    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false)).unwrap();
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false, None)).unwrap();
     assert_eq!(hello["canonical"], false);
     assert_eq!(hello["dependency_execution_modes"], json!(["rlib"]));
     let mut wire = Wire::default();
