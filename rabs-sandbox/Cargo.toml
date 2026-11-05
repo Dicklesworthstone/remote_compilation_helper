@@ -20,6 +20,8 @@ doctest = false
 # in the unsafe-boundary ledger (bead A011).
 [dependencies]
 memchr = { workspace = true }
+# Bounded structural validation of native payloads embedded in compiler archives.
+object = { version = "=0.40.0", default-features = false, features = ["read", "std"] }
 rabs-protocol = { path = "../rabs-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }

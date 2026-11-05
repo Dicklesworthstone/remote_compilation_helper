@@ -1501,6 +1501,12 @@ mod tests {
         bytes: &[u8],
     ) -> KnownOutput {
         let path = paths.physical(&Path::new(OUTPUT).join(name)).unwrap();
+        // Match WorkspaceLineageFixture's explicit synthetic archive container;
+        // the caller's marker remains part of the exact installed byte identity.
+        let archive = name
+            .ends_with(".rlib")
+            .then(|| crate::test_util::closed_rlib_fixture(bytes));
+        let bytes = archive.as_deref().unwrap_or(bytes);
         std::fs::write(&path, bytes).unwrap();
         let output = committed_output(&offer.manifest, &path).unwrap();
         known_installed_output(&path, &output.object.0).unwrap()
@@ -3228,7 +3234,8 @@ mod tests {
                 .dependencies()
                 .iter()
                 .any(|input| input.role == OutputRole::Materializable
-                    && input.object.0 == object_id(ARCHIVE).unwrap())
+                    && input.object.0
+                        == object_id(&crate::test_util::closed_rlib_fixture(ARCHIVE)).unwrap())
         );
         std::fs::write(
             paths

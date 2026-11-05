@@ -5,7 +5,9 @@ use super::super::{CapturePins, LIVE_TRANSCRIPT_RECEIPT, object_id, put_bytes};
 use super::*;
 use crate::coord::live::ExpectedOutputs;
 use crate::janitor::store::{LiveCas, mount_and_reconcile};
-use rabs_cas::metadata_store::{QuarantineScope, RabsMetadataStore, SqlValue, digest_key};
+use rabs_cas::metadata_store::{
+    QuarantineScope, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlValue, digest_key,
+};
 use rabs_cas::publication::OfferPreparedActionResult;
 use rabs_cas::test_support::{offer_serving_object, sample_evidence};
 use rabs_protocol::generation::AttemptId;
@@ -15,7 +17,9 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 
-const ARTIFACT: &[u8] = b"fresh request-owned compiler output";
+static ARTIFACT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    crate::test_util::closed_rlib_fixture(b"fresh request-owned compiler output")
+});
 const METADATA: &[u8] = b"fresh request-owned compiler metadata";
 const DEP_INFO: &[u8] = b"/__rabs/out/lib.rmeta:\n";
 const CLUSTER: &str = "request-owned-install-tests";
@@ -36,7 +40,10 @@ impl Fixture {
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
         let authority = coord.acquire_boot_authority(CLUSTER).unwrap();
         coord.mark_up();
-        let (offer, _) = offer_serving_object(&authority, &ObjectId(object_id(ARTIFACT).unwrap()));
+        let (offer, _) = offer_serving_object(
+            &authority,
+            &ObjectId(object_id(ARTIFACT.as_slice()).unwrap()),
+        );
         Self {
             root,
             cas,
@@ -49,13 +56,21 @@ impl Fixture {
 
     pub(super) fn capture(&self) -> RequestOwnedResult {
         let authority = self.coord.authority().unwrap();
-        let object = ObjectId(object_id(ARTIFACT).unwrap());
+        let object = ObjectId(object_id(ARTIFACT.as_slice()).unwrap());
         let (mut offer, bytes) = offer_serving_object(&authority, &object);
         let attempt = self.next_attempt.get();
         self.next_attempt.set(attempt + 1);
         offer.authority.attempt_id = AttemptId(attempt);
         let mut pins = CapturePins::new(Arc::clone(&self.cas), &offer.authority);
-        assert_eq!(put_bytes(&self.cas, ARTIFACT, &mut pins).unwrap(), object);
+        assert_eq!(
+            put_bytes(&self.cas, ARTIFACT.as_slice(), &mut pins).unwrap(),
+            object
+        );
+        crate::test_util::record_rlib_fixture_closure(
+            &mut *self.cas.store().lock().unwrap(),
+            &object.0,
+            ARTIFACT.as_slice(),
+        );
         assert_eq!(
             put_bytes(&self.cas, &bytes, &mut pins).unwrap(),
             offer.manifest_id
@@ -217,6 +232,48 @@ impl Fixture {
             .unwrap()
             .len()
     }
+
+    fn expire_archive_closure(&self) {
+        let _store = self.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&self.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(
+            engine
+                .execute(
+                    "UPDATE decision_receipts SET kind = ?1 \
+                     WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                    &[
+                        SqlValue::Text("native-rlib-closure-v0".into()),
+                        SqlValue::Text("native-rlib-closure-v1".into()),
+                        SqlValue::Text(digest_key(&object_id(ARTIFACT.as_slice()).unwrap())),
+                    ],
+                )
+                .unwrap(),
+            1,
+            "the fixture fault must remove the exact archive's current closure proof"
+        );
+    }
+}
+
+#[test]
+fn request_owned_archive_without_current_closure_cannot_expose_metadata() {
+    let fixture = Fixture::new();
+    let destination = fixture.root.path().join("old-native-closure");
+    let owner = fixture.capture_with_metadata(true);
+    fixture.expire_archive_closure();
+    let mut calls = 0;
+    let result = fixture.install_with_metadata(owner, &destination, || Ok(()), &mut |_| {
+        calls += 1;
+        Ok(())
+    });
+    assert!(matches!(
+        result,
+        Err(RequestOwnedInstallError::Declined(reason))
+            if reason.contains("native archive closure")
+    ));
+    assert_eq!(calls, 0);
+    assert!(!destination.exists());
+    assert_eq!(fixture.active_capture_pins(), 0);
+    fixture.assert_unpublished();
 }
 
 #[test]
@@ -243,7 +300,7 @@ fn fresh_request_installs_only_declared_files_without_publication_or_replay() {
         "revalidate again after expensive private staging"
     );
     assert_eq!(files, vec![destination.join("out/lib.rlib")]);
-    assert_eq!(std::fs::read(&files[0]).unwrap(), ARTIFACT);
+    assert_eq!(std::fs::read(&files[0]).unwrap(), ARTIFACT.as_slice());
     assert_eq!(
         std::fs::read(destination.join("unrelated.rmeta")).unwrap(),
         b"another unit"
@@ -279,7 +336,7 @@ fn separately_owned_equal_outputs_remain_private_and_inode_isolated() {
         .unwrap();
     assert_eq!(
         std::fs::read(second.join("out/lib.rlib")).unwrap(),
-        ARTIFACT
+        ARTIFACT.as_slice()
     );
     fixture.assert_unpublished();
     assert_eq!(fixture.active_capture_pins(), 0);
@@ -376,7 +433,7 @@ fn object_quarantine_after_staging_still_prevents_fresh_result_installation() {
                 .unwrap()
                 .add_quarantine(
                     QuarantineScope::LogicalObject,
-                    &digest_key(&object_id(ARTIFACT).unwrap()),
+                    &digest_key(&object_id(ARTIFACT.as_slice()).unwrap()),
                     "fixture object quarantined after private staging",
                 )
                 .unwrap();
@@ -480,7 +537,7 @@ fn request_owned_metadata_precedes_archive_and_keeps_pins_and_destination_owners
     assert_eq!(files.len(), 3);
     assert_eq!(
         std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-        ARTIFACT
+        ARTIFACT.as_slice()
     );
     assert_eq!(fixture.active_capture_pins(), 0);
     fixture.assert_unpublished();
@@ -516,8 +573,13 @@ fn request_owned_metadata_callback_failure_is_exposed_and_leaves_tail_private() 
 }
 
 #[test]
-fn request_owned_metadata_ack_rechecks_input_and_coordinator_ownership() {
-    for fault in ["inputs", "coordinator-down", "coordinator-replaced"] {
+fn request_owned_metadata_ack_rechecks_inputs_owner_and_archive_closure() {
+    for fault in [
+        "inputs",
+        "coordinator-down",
+        "coordinator-replaced",
+        "native-closure",
+    ] {
         let fixture = Fixture::new();
         let destination = fixture.root.path().join(fault);
         let input_changed = Cell::new(false);
@@ -540,6 +602,7 @@ fn request_owned_metadata_ack_rechecks_input_and_coordinator_ownership() {
                         replacement.acquire_boot_authority(CLUSTER).unwrap();
                         replacement.mark_up();
                     }
+                    "native-closure" => fixture.expire_archive_closure(),
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -657,7 +720,7 @@ fn request_owned_metadata_tail_corruption_fails_after_head_exposure() {
                 .store()
                 .lock()
                 .unwrap()
-                .object_locations(&object_id(ARTIFACT).unwrap())
+                .object_locations(&object_id(ARTIFACT.as_slice()).unwrap())
                 .unwrap()[0]
                 .0
                 .clone();
@@ -696,7 +759,7 @@ fn request_owned_metadata_tail_quarantine_prevents_installation_after_ack() {
                 .unwrap()
                 .add_quarantine(
                     QuarantineScope::LogicalObject,
-                    &digest_key(&object_id(ARTIFACT).unwrap()),
+                    &digest_key(&object_id(ARTIFACT.as_slice()).unwrap()),
                     "tail quarantined while the metadata ACK was in flight",
                 )
                 .unwrap();

@@ -190,6 +190,7 @@ impl CoordLive {
             return Err("immutable leaf differs from its retained remote action".into());
         }
         validate_immutable_library_manifest(&manifest, proof.output_class())?;
+        crate::coord::native_archives::require_manifest(&mut *store, &manifest)?;
         if !store
             .list_provisional_ancestors(&action_key)
             .map_err(store_error)?
@@ -748,6 +749,15 @@ fn verify_graph(
                 check.producer
             ));
         }
+        // A retained target seed or a transitive committed producer can bypass
+        // a new output-install request. Its complete publication must carry the
+        // same current archive proof, even when this edge consumes only rmeta.
+        crate::coord::native_archives::require_manifest(store, &manifest).map_err(|reason| {
+            format!(
+                "workspace producer {} native archive is unsafe: {reason}",
+                check.producer
+            )
+        })?;
         // Validate every edge even if its producer was visited before; only the
         // expansion is shared. An active producer detects cycles, including a
         // corrupt self-reference to the consumer currently being checked.
@@ -1025,10 +1035,26 @@ pub(crate) mod tests {
             assert!(!outputs.is_empty());
             let logical_outputs: Vec<_> = outputs
                 .iter()
-                .map(|(name, role, bytes)| LogicalOutput {
-                    role: *role,
-                    virtual_path: RawBytes::from(*name),
-                    object: self.put(bytes),
+                .map(|(name, role, marker)| {
+                    // Rust archive arguments are model-test markers, retained
+                    // byte-exact inside a structurally closed ELF/ar fixture.
+                    let archive = name
+                        .ends_with(".rlib")
+                        .then(|| crate::test_util::closed_rlib_fixture(marker));
+                    let bytes = archive.as_deref().unwrap_or(marker);
+                    let object = self.put(bytes);
+                    if archive.is_some() {
+                        crate::test_util::record_rlib_fixture_closure(
+                            &mut *self.cas.store().lock().unwrap(),
+                            &object.0,
+                            bytes,
+                        );
+                    }
+                    LogicalOutput {
+                        role: *role,
+                        virtual_path: RawBytes::from(*name),
+                        object,
+                    }
                 })
                 .collect();
             let (base, _) =
@@ -1160,6 +1186,35 @@ pub(crate) mod tests {
                     "explicit producer quarantine during lineage test",
                 )
                 .unwrap();
+        }
+
+        pub(crate) fn expire_archive_closure(&self, offer: &OfferPreparedActionResult) {
+            let object = &offer
+                .manifest
+                .logical_outputs
+                .iter()
+                .find(|output| output.virtual_path.as_bytes().ends_with(b".rlib"))
+                .unwrap()
+                .object
+                .0;
+            let _store = self.cas.store().lock().unwrap();
+            let mut engine =
+                RusqliteEngine::open(&self.cas.cas_root().join("meta.sqlite")).unwrap();
+            assert_eq!(
+                engine
+                    .execute(
+                        "UPDATE decision_receipts SET kind = ?1 \
+                         WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                        &[
+                            SqlValue::Text("native-rlib-closure-v0".into()),
+                            SqlValue::Text("native-rlib-closure-v1".into()),
+                            SqlValue::Text(digest_key(object)),
+                        ],
+                    )
+                    .unwrap(),
+                1,
+                "expire only the selected producer archive's current proof"
+            );
         }
 
         fn compare_twice(&self, offer: &OfferPreparedActionResult) {
@@ -1758,7 +1813,7 @@ pub(crate) mod tests {
             if !metadata {
                 assert_eq!(
                     std::fs::read(destination.join("libc.rlib")).unwrap(),
-                    b"mixed archive C"
+                    crate::test_util::closed_rlib_fixture(b"mixed archive C")
                 );
             }
             fixture.assert_unsampled(&a);
@@ -2008,6 +2063,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn metadata_selected_dag_edges_require_every_producers_current_archive_closure() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, _b, _c, d] = immutable_dag_chain(&fixture, false);
+        let selected = witness(&d);
+        assert_eq!(selected.role, OutputRole::ProvisionalMetadata);
+        fixture
+            .coord
+            .verify_committed_dependencies(
+                std::slice::from_ref(&selected),
+                CommittedDependencyPolicy::WorkspaceDagRlib,
+            )
+            .unwrap();
+        fixture.compare_twice(&d);
+        let healthy = fixture.root.path().join("current-archive-closure");
+        assert!(matches!(
+            fixture.replay(&d, &healthy, None).unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+
+        // Only the immutable root archive's receipt changes. Its metadata,
+        // every downstream manifest/object and ordinary serving gates remain
+        // valid; a metadata-selected edge must still recheck the whole producer.
+        fixture.expire_archive_closure(&a);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(&[selected], CommittedDependencyPolicy::WorkspaceDagRlib)
+            .unwrap_err();
+        assert!(reason.contains("native archive"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&a.manifest.action_key)),
+            "{reason}"
+        );
+
+        let refused = fixture.root.path().join("expired-ancestor-closure");
+        let mut calls = 0;
+        let mut ready = |_: &[PathBuf]| {
+            calls += 1;
+            Ok(())
+        };
+        assert!(matches!(
+            fixture.replay(&d, &refused, Some(&mut ready)).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("native archive")
+                    && reason.contains(&digest_key(&a.manifest.action_key))
+        ));
+        assert_eq!(calls, 0);
+        assert!(!refused.exists());
+    }
+
+    #[test]
     fn immutable_dag_replay_requires_own_samples_and_current_transitive_producers() {
         for metadata in [false, true] {
             let fixture = WorkspaceLineageFixture::new();
@@ -2077,7 +2182,7 @@ pub(crate) mod tests {
             if !metadata {
                 assert_eq!(
                     std::fs::read(destination.join("libd.rlib")).unwrap(),
-                    b"metadata D"
+                    crate::test_util::closed_rlib_fixture(b"metadata D")
                 );
             }
             for producer in [&a, &b, &c] {
@@ -2374,7 +2479,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             std::fs::read(destination.join("libc.rlib")).unwrap(),
-            b"actual CAS archive C"
+            crate::test_util::closed_rlib_fixture(b"actual CAS archive C")
         );
         fixture.assert_unsampled(&a);
         fixture.assert_unsampled(&b);

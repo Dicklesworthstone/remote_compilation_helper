@@ -5150,6 +5150,7 @@ name = "rabs-sandbox"
 version = "2.1.35"
 dependencies = [
  "memchr",
+ "object 0.40.0",
  "rabs-protocol",
  "rustix",
  "serde",

@@ -15,6 +15,9 @@
 //! wrong build, not a slow one.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
@@ -73,6 +76,7 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8], verified: boo
             DurabilityPolicy::FULL,
         )
         .expect("put artifact");
+        test_util::record_rlib_fixture_closure(&mut *store, &declared, artifact);
         ObjectId(declared)
     };
     let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
@@ -185,9 +189,10 @@ fn round_trip(stream: &mut UnixStream, line: &str) -> String {
 
 #[test]
 fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let state_dir = dir.path().to_path_buf();
-    let artifact = b"the committed rlib, served over the wire".repeat(32);
+    let artifact =
+        test_util::closed_rlib_fixture(&b"the committed rlib, served over the wire".repeat(32));
     commit_one_action(&state_dir, &artifact, true);
 
     let mut daemon = spawn_daemon(&state_dir);
@@ -300,9 +305,10 @@ fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
 
 #[test]
 fn the_running_daemon_refuses_an_unverified_commit_until_the_verification_floor_is_met() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let state_dir = dir.path().to_path_buf();
-    let artifact = b"single unverified commit must not serve".repeat(16);
+    let artifact =
+        test_util::closed_rlib_fixture(&b"single unverified commit must not serve".repeat(16));
     commit_one_action(&state_dir, &artifact, false);
 
     let mut daemon = spawn_daemon(&state_dir);

@@ -137,6 +137,31 @@ impl StagedOutput {
         }
         Ok(())
     }
+
+    /// Inspect the same retained generation that supplied the content digest.
+    /// A successful compiler can pack a thin archive or linker script without
+    /// opening its external inputs, including through source `#[link]` attributes.
+    /// Filename/argv admission is therefore not evidence of native closure.
+    fn validate_native_archive(&self) -> io::Result<bool> {
+        if self
+            .source
+            .extension()
+            .is_none_or(|extension| extension != "rlib")
+        {
+            return Ok(false);
+        }
+        self.verify()?;
+        let file = open_observed(&self.stage, self.stage_sig, self.stage_sig.size())?;
+        rabs_sandbox::native_archive::validate_rlib_native_closure_file(&file)
+            .map_err(io::Error::other)?;
+        if regular_signature(&file.metadata()?)? != self.stage_sig {
+            return Err(io::Error::other(
+                "private compiler archive changed during validation",
+            ));
+        }
+        self.verify()?;
+        Ok(true)
+    }
 }
 
 /// Stage one native output without retaining its bytes in memory or holding
@@ -151,6 +176,12 @@ pub(super) fn put_output(
 ) -> Result<KnownOutput, String> {
     let staged = StagedOutput::capture(&cas.layout().root().join("staging"), source, maximum)
         .map_err(|error| format!("output capture {}: {error}", source.display()))?;
+    // Validate outside the shared metadata lock, before any CAS location or
+    // closure receipt is created. This is bounded inspection of the private
+    // copy, never a second lookup of a worker-controlled compiler output.
+    let native_archive = staged
+        .validate_native_archive()
+        .map_err(|error| format!("output native closure {}: {error}", source.display()))?;
     // Verification repeats commonly ingest the same large rlib/rmeta. Hash
     // that possible duplicate before taking the ONE shared metadata lock.
     // Retry at most twice if another publisher/GC changed the destination;
@@ -163,14 +194,18 @@ pub(super) fn put_output(
             let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
             staged.verify().map_err(|error| error.to_string())?;
             pins.protect(&mut *store, &staged.digest)?;
-            publish_staged_with_observation(
+            let published = publish_staged_with_observation(
                 cas.layout(),
                 &mut *store,
                 &staged.digest,
                 &staged.stage,
                 DurabilityPolicy::FULL,
                 &observation,
-            )
+            );
+            if published.is_ok() && native_archive {
+                crate::coord::native_archives::record_validated(&mut *store, &staged.digest)?;
+            }
+            published
         };
         match result {
             Ok(_) => break,

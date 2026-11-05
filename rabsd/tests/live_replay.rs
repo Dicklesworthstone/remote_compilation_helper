@@ -5,6 +5,9 @@
 //! an authenticated remote compile or that a Cargo wrapper skipped rustc.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -60,27 +63,29 @@ fn replay_budget_fixture() -> (
     Arc<CoordLive>,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord
         .acquire_boot_authority("replay-budget-fixture")
         .unwrap();
     coord.mark_up();
+    let artifact = test_util::closed_rlib_fixture(REPLAY_ARTIFACT);
     let object = {
         let mut store = cas.store().lock().unwrap();
-        let digest = digest_set(REPLAY_ARTIFACT, DigestRequest::default(), None)
+        let digest = digest_set(&artifact, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id;
         put_if_absent(
             cas.layout(),
             &mut *store,
             &digest,
-            &mut &REPLAY_ARTIFACT[..],
+            &mut &artifact[..],
             PutLimits::default(),
             DurabilityPolicy::FULL,
         )
         .unwrap();
+        test_util::record_rlib_fixture_closure(&mut *store, &digest, &artifact);
         install_admission_world(&mut *store, &authority);
         store
             .record_decision_receipt(
@@ -192,7 +197,7 @@ fn live_replay_budget_survives_restart_and_only_new_comparisons_renew_it() {
         ));
         assert_eq!(
             std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-            REPLAY_ARTIFACT
+            test_util::closed_rlib_fixture(REPLAY_ARTIFACT)
         );
     }
     let refused = dir.path().join("needs-fresh-comparison");
@@ -313,7 +318,7 @@ fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
                 served += 1;
                 assert_eq!(
                     std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-                    REPLAY_ARTIFACT
+                    test_util::closed_rlib_fixture(REPLAY_ARTIFACT)
                 );
             }
             ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired) => {
@@ -373,7 +378,7 @@ fn historical_samples_without_live_comparison_cannot_start_a_replay_budget() {
     ));
     assert_eq!(
         std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-        REPLAY_ARTIFACT
+        test_util::closed_rlib_fixture(REPLAY_ARTIFACT)
     );
 }
 
@@ -385,16 +390,17 @@ fn live_edge_replay_uses_completed_comparisons_and_blocks_divergence() {
     use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
     use rabsd::coord::live::{ReplayRefusal, ServeError};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord.acquire_boot_authority("live-replay-fixture").unwrap();
     coord.mark_up();
     let edge = coord.edge_subscriber();
-    let artifact = b"real bytes behind a verified dependency result";
+    let artifact =
+        test_util::closed_rlib_fixture(b"real bytes behind a verified dependency result");
     let object = {
         let mut store = cas.store().lock().unwrap();
-        let digest = digest_set(artifact, DigestRequest::default(), None)
+        let digest = digest_set(&artifact, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id;
         put_if_absent(
@@ -406,6 +412,7 @@ fn live_edge_replay_uses_completed_comparisons_and_blocks_divergence() {
             DurabilityPolicy::FULL,
         )
         .unwrap();
+        test_util::record_rlib_fixture_closure(&mut *store, &digest, &artifact);
         ObjectId(digest)
     };
     let (offer, bytes) = offer_serving_object(&authority, &object);
@@ -603,7 +610,7 @@ fn live_manifest_fixture() -> (
     CoordLive,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord.acquire_boot_authority("manifest-fixture").unwrap();

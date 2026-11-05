@@ -2,6 +2,9 @@
 //! Admission/class evidence is synthetic; no test claims automatic Cargo reuse.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -51,10 +54,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(rows: &[(OutputRole, &str, &[u8])]) -> Self {
-        // macOS's default temporary directory can contain a /var symlink.
-        // The actual serving root deliberately requires a canonical ancestor.
-        let temporary_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let dir = tempfile::tempdir_in(temporary_root).unwrap();
+        let dir = test_util::private_tempdir();
         std::fs::create_dir_all(dir.path().join("workspace/src")).unwrap();
         std::fs::write(
             dir.path().join("workspace/src/lib.rs"),
@@ -69,10 +69,24 @@ impl Fixture {
         coord.mark_up();
         let outputs: Vec<_> = rows
             .iter()
-            .map(|(role, name, bytes)| LogicalOutput {
-                role: *role,
-                virtual_path: RawBytes::from(*name),
-                object: put(&cas, bytes),
+            .map(|(role, name, bytes)| {
+                let archive = name
+                    .ends_with(".rlib")
+                    .then(|| test_util::closed_rlib_fixture(bytes));
+                let bytes = archive.as_deref().unwrap_or(bytes);
+                let object = put(&cas, bytes);
+                if archive.is_some() {
+                    test_util::record_rlib_fixture_closure(
+                        &mut *cas.store().lock().unwrap(),
+                        &object.0,
+                        bytes,
+                    );
+                }
+                LogicalOutput {
+                    role: *role,
+                    virtual_path: RawBytes::from(*name),
+                    object,
+                }
             })
             .collect();
         let declared: Vec<_> = outputs
@@ -244,7 +258,7 @@ fn two_subscribers_receive_metadata_library_and_correct_private_dep_info() {
         );
         assert_eq!(
             std::fs::read(root.join("libunit.rlib")).unwrap(),
-            b"library\0\xff"
+            test_util::closed_rlib_fixture(b"library\0\xff")
         );
         assert_eq!(
             std::fs::read(root.join("libunit.rmeta")).unwrap(),
@@ -498,7 +512,7 @@ fn relative_dep_info_serves_two_worktrees_without_mutating_the_shared_cas_object
         assert_eq!(files[0], root.join("libunit.rmeta"));
         assert_eq!(
             std::fs::read(root.join("libunit.rlib")).unwrap(),
-            b"library\0\xff"
+            test_util::closed_rlib_fixture(b"library\0\xff")
         );
         assert_eq!(
             std::fs::read(root.join("libunit.rmeta")).unwrap(),

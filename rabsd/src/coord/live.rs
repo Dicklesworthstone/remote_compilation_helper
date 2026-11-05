@@ -253,6 +253,9 @@ pub enum ReplayRefusal {
     /// A workspace result's committed producer closure is unavailable or has
     /// been revoked. This is not permission to reuse the consumer's old bytes.
     CommittedDependency(String),
+    /// One of the result's Rust archives has no current, digest-bound proof
+    /// that its packed native payloads contain no deferred external inputs.
+    NativeArchive(String),
 }
 
 /// The answer to a serve request that is not a fault.
@@ -4519,6 +4522,16 @@ impl CoordLive {
                 ReplayRefusal::FreshVerificationRequired,
             ));
         }
+        // Old results can predate native-payload validation, and source-level
+        // link attributes are absent from argv. Require the complete result's
+        // digest-bound proofs before granting even a preview or exposing its
+        // metadata head; archive-tail staging may happen only after the ACK.
+        if let Err(reason) = crate::coord::native_archives::require_manifest(&mut *store, &manifest)
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::NativeArchive(reason),
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -4607,6 +4620,7 @@ impl CoordLive {
         let context = metadata_replay::InstallContext {
             action: action_key,
             manifest_key: &manifest_key,
+            manifest: &manifest,
             authority: replay_authority.as_ref(),
             now_unix_micros,
             now_epoch,
