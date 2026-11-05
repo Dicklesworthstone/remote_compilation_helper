@@ -415,6 +415,13 @@ pub enum DependencySourceKind {
     /// leaf-library metadata check. Its explicit closed metadata worker context
     /// excludes procfs and entropy devices; ordinary metadata is not authority.
     WorkspaceClosedMetadata,
+    /// A closed ordinary leaf-library archive with the complete own OUT_DIR
+    /// tree and exact completed Cargo build-script record as retained inputs.
+    /// Build-script execution itself never receives cache authority.
+    WorkspaceGeneratedRlib,
+    /// A closed leaf-library metadata check with complete generated inputs.
+    /// Its separate class still requires the strict closed metadata namespace.
+    WorkspaceGeneratedMetadata,
     /// Closed canonical workspace archive whose entire retained Rust candidate
     /// inventory comes from verified, already committed workspace producers.
     WorkspaceCommittedRlib,
@@ -446,6 +453,8 @@ impl DependencySourceKind {
             Self::WorkspaceExecutionOnly => "canonical-workspace-execution-only",
             Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v2",
             Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v2",
+            Self::WorkspaceGeneratedRlib => "canonical-workspace-generated-rlib-v1",
+            Self::WorkspaceGeneratedMetadata => "canonical-workspace-generated-metadata-v1",
             Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v2",
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v2",
             Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v2",
@@ -463,6 +472,8 @@ impl DependencySourceKind {
             Self::WorkspaceExecutionOnly
                 | Self::WorkspaceClosedRlib
                 | Self::WorkspaceClosedMetadata
+                | Self::WorkspaceGeneratedRlib
+                | Self::WorkspaceGeneratedMetadata
                 | Self::WorkspaceCommittedRlib
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
@@ -1560,6 +1571,8 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceExecutionOnly
                             | DependencySourceKind::WorkspaceClosedRlib
                             | DependencySourceKind::WorkspaceClosedMetadata
+                            | DependencySourceKind::WorkspaceGeneratedRlib
+                            | DependencySourceKind::WorkspaceGeneratedMetadata
                             | DependencySourceKind::WorkspaceCommittedRlib
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
@@ -1628,6 +1641,8 @@ fn captured_action_key(
             DependencySourceKind::WorkspaceExecutionOnly
             | DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
@@ -1719,6 +1734,12 @@ fn captured_action_key(
                 DependencySourceKind::WorkspaceClosedRlib => workspace_cache::ISOLATION_PROFILE,
                 DependencySourceKind::WorkspaceClosedMetadata => {
                     workspace_cache::METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedRlib => {
+                    workspace_cache::GENERATED_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedMetadata => {
+                    workspace_cache::GENERATED_METADATA_ISOLATION_PROFILE
                 }
                 DependencySourceKind::WorkspaceCommittedRlib => {
                     workspace_dependency_cache::ISOLATION_PROFILE

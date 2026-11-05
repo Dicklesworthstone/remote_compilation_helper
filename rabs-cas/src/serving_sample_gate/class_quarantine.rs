@@ -21,6 +21,8 @@ const CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
 const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
+const WORKSPACE_GENERATED_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
+const WORKSPACE_GENERATED_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
 const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
 const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
 const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
@@ -97,6 +99,12 @@ pub(super) fn refusal(
             [SqlValue::Text(class)] if class == WORKSPACE_RLIB_CLASS => WORKSPACE_RLIB_CLASS,
             [SqlValue::Text(class)] if class == WORKSPACE_METADATA_CLASS => {
                 WORKSPACE_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_GENERATED_RLIB_CLASS => {
+                WORKSPACE_GENERATED_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == WORKSPACE_GENERATED_METADATA_CLASS => {
+                WORKSPACE_GENERATED_METADATA_CLASS
             }
             [SqlValue::Text(class)] if class == WORKSPACE_COMMITTED_RLIB_CLASS => {
                 WORKSPACE_COMMITTED_RLIB_CLASS
@@ -623,8 +631,16 @@ mod tests {
     }
 
     #[test]
-    fn committed_workspace_classes_keep_independent_samples_and_holds() {
+    fn expanded_workspace_classes_keep_independent_samples_and_holds() {
         for (class, risk) in [
+            (
+                WORKSPACE_GENERATED_RLIB_CLASS,
+                ActionClassRisk::GeneratedWorkspaceRlib,
+            ),
+            (
+                WORKSPACE_GENERATED_METADATA_CLASS,
+                ActionClassRisk::GeneratedWorkspaceMetadata,
+            ),
             (
                 WORKSPACE_COMMITTED_RLIB_CLASS,
                 ActionClassRisk::CommittedWorkspaceRlib,
@@ -669,6 +685,8 @@ mod tests {
             let unrelated: Vec<_> = [
                 WORKSPACE_RLIB_CLASS,
                 WORKSPACE_METADATA_CLASS,
+                WORKSPACE_GENERATED_RLIB_CLASS,
+                WORKSPACE_GENERATED_METADATA_CLASS,
                 DEPENDENCY_CLASS,
                 WORKSPACE_COMMITTED_RLIB_CLASS,
                 WORKSPACE_COMMITTED_METADATA_CLASS,

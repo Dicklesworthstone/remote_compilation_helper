@@ -477,6 +477,10 @@ const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
 // Local completion remains untrusted for the entire operation.
 const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
 const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
+// Generated-input leaves bind their own complete OUT_DIR and Cargo output
+// record. They earn independent evidence without retiring existing pure keys.
+const LIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
+const LIVE_GENERATED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
 const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
 const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
 const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
@@ -543,6 +547,10 @@ fn record_descriptor_class(
         match class {
             ClosedWorkspaceLibraryClass::Rlib => LIVE_WORKSPACE_RLIB_CLASS,
             ClosedWorkspaceLibraryClass::Metadata => LIVE_WORKSPACE_METADATA_CLASS,
+            ClosedWorkspaceLibraryClass::GeneratedRlib => LIVE_GENERATED_WORKSPACE_RLIB_CLASS,
+            ClosedWorkspaceLibraryClass::GeneratedMetadata => {
+                LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+            }
         }
     } else if uses_committed_dependency_namespace(descriptor)
         || uses_closed_workspace_library_namespace(descriptor)
@@ -585,6 +593,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::ClosedWorkspaceMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_RLIB_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceRlib)
@@ -5599,7 +5613,10 @@ mod tests {
 
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
-        let descriptor = |emit: &str, policy: Option<CommittedDependencyPolicy>| {
+        let descriptor_with_generated = |emit: &str,
+                                         policy: Option<CommittedDependencyPolicy>,
+                                         generated: bool| {
+            assert!(!generated || policy.is_none());
             let terminal = matches!(
                 policy,
                 Some(
@@ -5646,7 +5663,7 @@ mod tests {
                     "--extern=upstream=/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
                 );
             }
-            let env = [
+            let mut env = [
                 ("CARGO_MANIFEST_DIR", source_root),
                 ("CARGO_PKG_NAME", "leaf"),
                 ("CARGO_PRIMARY_PACKAGE", "1"),
@@ -5657,6 +5674,12 @@ mod tests {
             .filter(|(name, _)| !immutable || *name != "CARGO_PRIMARY_PACKAGE")
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect::<Vec<_>>();
+            if generated {
+                env.push((
+                    "OUT_DIR".into(),
+                    "/__rabs/out/cargo/debug/build/leaf-generated/out".into(),
+                ));
+            }
             let request = LiveRustcRequest {
                 argv: &argv,
                 env: &env,
@@ -5694,7 +5717,7 @@ mod tests {
             .unwrap();
             let identity =
                 rabs_key::typed_digest::compute("rabs.closed-workspace-class-test.v1", b"fixture");
-            let inputs = ActionInputManifest {
+            let mut inputs = ActionInputManifest {
                 schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
                 inputs: vec![PositiveInput {
                     virtual_path: RawBytes::new(plan.input_virtual_path("src.rs").into_bytes()),
@@ -5713,6 +5736,21 @@ mod tests {
                 },
                 ..ActionInputManifest::default()
             };
+            if generated {
+                inputs.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("config.rs").into_bytes(),
+                    ),
+                    object: ObjectId(identity.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: vec![],
+                });
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: vec![RawBytes::from("config.rs")],
+                });
+            }
             let toolchain = ToolchainFacts {
                 compiler_binary_digest: identity.clone(),
                 verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
@@ -5807,7 +5845,7 @@ mod tests {
                     &toolchain,
                     &[],
                     &inputs,
-                    None,
+                    generated.then_some(b"".as_slice()),
                     "/__rabs/toolchain",
                     &[39; 32],
                     &runtime,
@@ -5816,6 +5854,7 @@ mod tests {
             .unwrap()
             .descriptor
         };
+        let descriptor = |emit, policy| descriptor_with_generated(emit, policy, false);
         let descriptors = [
             (
                 descriptor("--emit=dep-info,metadata,link", None),
@@ -5824,6 +5863,14 @@ mod tests {
             (
                 descriptor("--emit=dep-info,metadata", None),
                 ActionClassRisk::ClosedWorkspaceMetadata,
+            ),
+            (
+                descriptor_with_generated("--emit=dep-info,metadata,link", None, true),
+                ActionClassRisk::GeneratedWorkspaceRlib,
+            ),
+            (
+                descriptor_with_generated("--emit=dep-info,metadata", None, true),
+                ActionClassRisk::GeneratedWorkspaceMetadata,
             ),
             (
                 descriptor(
@@ -5898,7 +5945,7 @@ mod tests {
         ];
         for ((descriptor, _), expected_epoch) in descriptors
             .iter()
-            .zip([16, 17, 18, 19, 20, 21, 10, 11, 22, 23, 24, 25])
+            .zip([16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 24, 25])
         {
             assert_eq!(descriptor.key_epoch, expected_epoch);
         }
@@ -5917,11 +5964,20 @@ mod tests {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
                 record_descriptor_class(&mut *store, &authority, descriptor).unwrap();
-                let committed = !matches!(descriptor.key_epoch, 16 | 17);
-                for mutation in [0, 1, 2, 3, 5].into_iter().chain(committed.then_some(4)) {
+                let typed_provenance = !matches!(descriptor.key_epoch, 16 | 17);
+                for mutation in [0, 1, 2, 3, 5]
+                    .into_iter()
+                    .chain(typed_provenance.then_some(4))
+                {
                     let mut changed = descriptor.clone();
                     match mutation {
-                        0 => changed.key_epoch = if committed { 1 } else { changed.key_epoch + 1 },
+                        0 => {
+                            changed.key_epoch = if typed_provenance {
+                                1
+                            } else {
+                                changed.key_epoch + 1
+                            }
+                        }
                         1 => changed.projection_epoch += 1,
                         2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
                         3 => changed.execution_semantics.bytes[0] ^= 1,
