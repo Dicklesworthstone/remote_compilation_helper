@@ -14758,11 +14758,14 @@ Number of files transferred: 42
                 std::os::unix::fs::symlink(format!("/bin/{tool}"), bin.join(tool)).unwrap();
             }
             let pipeline = disk_budget_test_pipeline(&directory, build_id, 15);
+            let script = directory.join("command.sh");
+            std::fs::write(
+                &script,
+                pipeline.build_remote_command("printf started > workload-started", None),
+            )
+            .unwrap();
             let output = std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    &pipeline.build_remote_command("printf started > workload-started", None),
-                ])
+                .arg(&script)
                 .env_clear()
                 .env("HOME", &directory)
                 .env("PATH", &bin)
@@ -14910,10 +14913,13 @@ Number of files transferred: 42
     async fn run_external_timeout_fixture(directory: &Path, command: &str) -> std::process::Output {
         // These are actual stock shell/timeout processes, never Cargo/compiler
         // invocations. Keep fixtures and the exact generated command for review.
-        std::fs::write(directory.join("command.sh"), command).unwrap();
+        let script = directory.join("command.sh");
+        std::fs::write(&script, command).unwrap();
         let mut child = Command::new("/bin/sh");
+        // A file operand, not -c: the composed wrapper exceeds Linux's per-argument
+        // limit, which is why production feeds it to `sh -s` over stdin.
         child
-            .args(["-c", command])
+            .arg(&script)
             .current_dir(directory)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
