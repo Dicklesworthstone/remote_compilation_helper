@@ -2223,15 +2223,31 @@ setup_launchd_service() {
 
     info "Setting up launchd service..."
 
+    # An already loaded job owns a running (or restarting) daemon. Unloading
+    # it here bypasses the client's admission barrier, including on installs
+    # that never reach the easy-mode restart below. Leave that job and its
+    # definition alone; only the peer-verified CLI maintenance path may stop it.
+    local jobs
+    if ! jobs="$(launchctl list 2>&1)"; then
+        warn "Cannot inspect launchd jobs; daemon service setup is unconfirmed: $jobs"
+        return 1
+    fi
+    if ! printf '%s\n' "$jobs" | awk '
+        NR == 1 { if ($1 != "PID" || $2 != "Status" || $3 != "Label" || NF != 3) exit 1; next }
+        NF != 3 || ($1 != "-" && $1 !~ /^[0-9]+$/) || $2 !~ /^-?[0-9]+$/ { exit 1 }
+        END { if (NR == 0) exit 1 }
+    '; then
+        warn "Cannot interpret launchd job ownership; leaving the daemon unchanged"
+        return 1
+    fi
+    if printf '%s\n' "$jobs" | awk '$3 == "com.rch.daemon" { found = 1 } END { exit !found }'; then
+        info "Existing launchd daemon retained; apply updates with 'rch daemon restart --drain'"
+        return 0
+    fi
+
     local plist_file="$HOME/Library/LaunchAgents/com.rch.daemon.plist"
     mkdir -p "$(dirname "$plist_file")"
     mkdir -p "$CONFIG_DIR/logs"
-
-    # Unload existing service if present
-    if launchctl list 2>/dev/null | grep -q "com.rch.daemon"; then
-        info "Unloading existing service..."
-        launchctl unload "$plist_file" 2>/dev/null || true
-    fi
 
     cat > "$plist_file" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2580,34 +2596,22 @@ restart_daemon_if_needed() {
 
     local rch_bin="$INSTALL_DIR/$HOOK_BIN"
     if [[ ! -x "$rch_bin" ]]; then
-        warn "Cannot restart daemon: rch binary not found"
-        return 0
+        warn "Cannot confirm daemon upgrade: rch binary not found at $rch_bin"
+        return 1
     fi
 
-    info "Restarting rchd to apply updates..."
-    if "$rch_bin" daemon restart 2>&1; then
+    info "Draining rchd before applying updates (up to 300 seconds)..."
+    if "$rch_bin" daemon restart --drain --drain-timeout 300 2>&1; then
         success "rchd restarted"
         return 0
     fi
 
-    warn "rch daemon restart failed; trying service manager fallback"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user restart rchd.service 2>/dev/null && {
-            success "rchd restarted via systemd"
-            return 0
-        }
-    fi
-    if command -v launchctl >/dev/null 2>&1; then
-        local plist="$HOME/Library/LaunchAgents/com.rch.daemon.plist"
-        if [[ -f "$plist" ]]; then
-            launchctl unload "$plist" 2>/dev/null || true
-            if launchctl load "$plist" 2>/dev/null; then
-                success "rchd restarted via launchctl"
-                return 0
-            fi
-        fi
-    fi
-    warn "Could not restart rchd automatically"
+    # A timeout, old protocol, lost connection or ownership refusal is not
+    # evidence of an idle daemon. In particular, do not replace this failure
+    # with systemctl restart or launchctl unload/load: both can kill builds.
+    warn "Daemon upgrade is unconfirmed; no service-manager restart was attempted"
+    warn "Binaries may already be installed. Resolve the client diagnostic, then retry: $rch_bin daemon restart --drain --drain-timeout 300"
+    return 1
 }
 
 harmonize_workers() {
@@ -3277,7 +3281,7 @@ main() {
         install_skill
         maybe_prompt_service
         setup_systemd_service
-        setup_launchd_service
+        setup_launchd_service || die "Daemon service setup is unconfirmed; installation stopped before daemon restart or worker sync"
     fi
 
     setup_path
@@ -3289,7 +3293,7 @@ main() {
     # Easy mode extras
     if [[ "$EASY_MODE" == "true" ]]; then
         detect_agents
-        restart_daemon_if_needed
+        restart_daemon_if_needed || die "Daemon upgrade is unconfirmed; installation stopped before worker sync"
         harmonize_workers
         run_doctor
     fi
