@@ -960,6 +960,70 @@ mod tests {
     }
 
     #[test]
+    fn source_namespace_restores_absent_canonical_name_beside_a_real_alias() {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let physical = root.join("data/projects");
+        let alias = root.join("dp");
+        let registry = root.join("registry");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(physical.join("keep"), b"source contents").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let run = |canonical: &std::path::Path| {
+            let policy = PathTopologyPolicy::new(canonical.to_path_buf(), alias.clone());
+            let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", CONTROL])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(command.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // The parent is absent too, as on a worker whose home was never populated.
+        let canonical = root.join("Users/test/projects");
+        for _ in 0..2 {
+            let output = run(&canonical);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"RCH_TOPOLOGY_OK\n");
+            assert_eq!(std::fs::read_link(&canonical).unwrap(), physical);
+        }
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+        assert_eq!(
+            std::fs::read(canonical.join("keep")).unwrap(),
+            b"source contents"
+        );
+
+        // A link that cannot be made stays the permanent refusal it always was,
+        // and leaves no second tree behind.
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"a file, not a directory").unwrap();
+        let output = run(&blocked.join("projects"));
+        assert_eq!(output.status.code(), Some(73));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base")
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"a file, not a directory");
+    }
+
+    #[test]
     fn source_namespace_metadata_busy_requires_status_and_explicit_lock_verdict() {
         let worker = WorkerConfig {
             id: rch_common::WorkerId::new("metadata-worker"),

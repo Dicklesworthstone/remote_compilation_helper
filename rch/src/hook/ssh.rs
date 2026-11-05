@@ -2673,6 +2673,9 @@ pub(super) fn build_worker_projects_topology_probe_cmd(
     )
 }
 
+// A missing canonical root beside an alias that already names a real directory
+// is restored as a link. A `mkdir` there would mint a second physical tree and
+// make the mapping a permanent alias conflict (bd-r2gcc).
 fn build_worker_projects_topology_cmd(
     topology_policy: &PathTopologyPolicy,
     allow_initialization: bool,
@@ -2685,7 +2688,16 @@ fn build_worker_projects_topology_cmd(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
            if [ {allow_initialization} != true ]; then printf 'RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED:path=%s\\n' {canonical} >&2; exit 48; fi; \
-           mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; \
+           if [ -d {alias} ]; then \
+             alias_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+             case {canonical}/ in \"$alias_real\"/*) ;; *) \
+               if [ -n \"$alias_real\" ]; then \
+                 mkdir -p -- \"$(dirname -- {canonical})\" 2>/dev/null || true; \
+                 ln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; fi;; esac; \
+             if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
+               printf 'RCH_TOPOLOGY_ERR_ALIAS_TARGET_CONFLICT:path=%s:target=%s:expected=%s\\n' {alias} \"$alias_real\" {canonical} >&2; exit 43; fi; \
+           else \
+             mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; fi; \
          if [ ! -d {canonical} ]; then printf 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path=%s\\n' {canonical} >&2; exit 41; fi; \
          canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
          ensure_alias_symlink() {{ \
@@ -6773,6 +6785,57 @@ os.execv({python:?}, [{python:?}] + args)
         let healthy = run(build_worker_projects_topology_cmd(&policy, false));
         assert!(healthy.status.success());
         assert_eq!(healthy.stdout, b"RCH_TOPOLOGY_OK\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topology_preflight_links_an_absent_canonical_to_the_existing_alias_target() {
+        let _guard = test_guard!();
+        let raw = tempfile::tempdir().unwrap().keep();
+        let directory = std::fs::canonicalize(raw).unwrap();
+        let physical = directory.join("data/projects");
+        let alias = directory.join("dp");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(physical.join("input"), b"mirror\n").unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let canonical = directory.join("Users/test/projects");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        let run = |policy: &PathTopologyPolicy, allow: bool| {
+            std::process::Command::new("sh")
+                .args(["-c", &build_worker_projects_topology_cmd(policy, allow)])
+                .output()
+                .unwrap()
+        };
+
+        let denied = run(&policy, false);
+        assert_eq!(denied.status.code(), Some(48));
+        assert!(!canonical.exists() && !canonical.is_symlink());
+
+        let initialized = run(&policy, true);
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        assert_eq!(initialized.stdout, b"RCH_TOPOLOGY_OK\n");
+        assert_eq!(std::fs::read_link(&canonical).unwrap(), physical);
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+        let healthy = run(&policy, false);
+        assert!(healthy.status.success());
+        assert_eq!(std::fs::read(canonical.join("input")).unwrap(), b"mirror\n");
+
+        // When the link cannot be made, refuse without minting a second tree:
+        // a real directory here would turn this into a permanent conflict.
+        let blocked = directory.join("blocked");
+        std::fs::write(&blocked, b"a file, not a directory").unwrap();
+        let policy = PathTopologyPolicy::new(blocked.join("projects"), alias.clone());
+        let refused = run(&policy, true);
+        assert_eq!(refused.status.code(), Some(43));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("RCH_TOPOLOGY_ERR_ALIAS_TARGET_CONFLICT")
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"a file, not a directory");
     }
 
     #[cfg(unix)]
