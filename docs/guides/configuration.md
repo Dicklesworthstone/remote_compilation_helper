@@ -62,8 +62,12 @@ Sections and fields:
   coverage output. Use `rch config show` to see the full effective list.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
-- `ssh_control_persist_secs` (u64, optional) — Sets `ssh -o ControlPersist=<N>s` for
-  remote execution (ControlMaster). Use `0` to disable persistence (`ControlPersist=no`).
+- `ssh_control_persist_secs` (u64, optional) — Positive values opt Unix dispatches
+  into one supervised foreground SSH connection, shared by preparation, transfers,
+  execution and cleanup. The active dispatch pins the connection until cleanup;
+  a completed dispatch reaps it instead of leaving a background ControlPersist
+  process. Unset or `0` keeps one-shot transports. Windows workers and automatic
+  recovery also retain their one-shot transports.
 - `sync_timeout_ms` (u64, optional; `1000..=3600000`) — Per-attempt timeout for
   uploading source to the worker. When unset, RCH uses a payload-aware default:
   30 seconds plus one second per MiB at a conservative 1 MiB/s floor, capped at

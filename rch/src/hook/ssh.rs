@@ -59,6 +59,29 @@ tokio::task_local! {
     static OFFLOAD_SSH_TRANSPORT: Option<OffloadSshTransport>;
 }
 
+/// Configure explicitly requested connection reuse within one dispatch.
+/// Unset and zero retain the one-shot transport; only a positive idle window
+/// opts into the existing owned foreground connection on Unix workers.
+fn owned_offload_ssh_options(
+    worker: &WorkerConfig,
+    transfer: &TransferConfig,
+) -> Option<rch_common::ssh::SshOptions> {
+    let idle = transfer
+        .ssh_control_persist_secs
+        .filter(|seconds| *seconds > 0)?;
+    if WorkerPlatform::from_worker(worker).is_windows() {
+        return None;
+    }
+    Some(rch_common::ssh::SshOptions {
+        control_master: true,
+        control_persist_idle: Some(Duration::from_secs(idle)),
+        server_alive_interval: Some(Duration::from_secs(
+            transfer.ssh_server_alive_interval_secs.unwrap_or(15),
+        )),
+        ..Default::default()
+    })
+}
+
 /// Reuse one supervised foreground connection for an explicitly opted-in Unix
 /// dispatch. The client and active-use guard outlive every control/transfer/build
 /// channel and the dispatch's cancellation cleanup. No persistent background
@@ -68,22 +91,15 @@ pub(super) async fn with_owned_offload_ssh<T>(
     transfer: &TransferConfig,
     operation: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    if !transfer
-        .ssh_control_persist_secs
-        .is_some_and(|secs| secs > 0)
-        || WorkerPlatform::from_worker(&worker).is_windows()
-        || crate::transfer::use_mock_transport(&worker)
+    let options = if crate::transfer::use_mock_transport(&worker)
         || !crate::commands::jobs::automatic_recovery_ssh_options().is_empty()
     {
+        None
+    } else {
+        owned_offload_ssh_options(&worker, transfer)
+    };
+    let Some(options) = options else {
         return OFFLOAD_SSH_TRANSPORT.scope(None, operation).await;
-    }
-    let options = rch_common::ssh::SshOptions {
-        control_master: true,
-        control_persist_idle: transfer.ssh_control_persist_secs.map(Duration::from_secs),
-        server_alive_interval: Some(Duration::from_secs(
-            transfer.ssh_server_alive_interval_secs.unwrap_or(15),
-        )),
-        ..Default::default()
     };
     let mut client = rch_common::ssh::SshClient::new(worker.clone(), options);
     client
@@ -2483,7 +2499,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
     crate::transfer::source_content_barrier::configure_ssh_command(cmd.as_std_mut());
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
-        timeout_duration.as_secs().max(1)
+        // A large closure or a batch of bounded operations may legitimately
+        // run for minutes. It must not also wait minutes to authenticate an
+        // unreachable endpoint before the first operation can start.
+        timeout_duration.as_secs().clamp(1, 20)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -2640,7 +2659,9 @@ pub(super) fn remote_preflight_topology_policy(
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 
-fn build_worker_projects_topology_probe_cmd(topology_policy: &PathTopologyPolicy) -> String {
+pub(super) fn build_worker_projects_topology_probe_cmd(
+    topology_policy: &PathTopologyPolicy,
+) -> String {
     format!(
         "set -eu; \
          if {{ [ ! -e {canonical} ] && [ ! -L {canonical} ]; }} \
@@ -2650,39 +2671,6 @@ fn build_worker_projects_topology_probe_cmd(topology_policy: &PathTopologyPolicy
         canonical = shell_escape::escape(topology_policy.canonical_root().to_string_lossy()),
         alias = shell_escape::escape(topology_policy.alias_root().to_string_lossy()),
     )
-}
-
-/// Probe without changing paths so initialization can be included in the exact
-/// durable grant before any topology or source mutation. The later preflight
-/// refuses creation if this observation becomes stale in the other direction.
-pub(super) async fn worker_projects_topology_requires_initialization(
-    worker: &WorkerConfig,
-    topology_policy: &PathTopologyPolicy,
-) -> anyhow::Result<bool> {
-    let command = build_worker_projects_topology_probe_cmd(topology_policy);
-    let output = run_offload_ssh_command_with_stdin(
-        worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(20),
-    )
-    .await?;
-    anyhow::ensure!(
-        output.status.success(),
-        "remote topology initialization probe failed on {} (status {:?}): {}",
-        worker.id,
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-    match output.stdout.as_slice() {
-        b"RCH_TOPOLOGY_INITIALIZATION_REQUIRED\n" => Ok(true),
-        b"RCH_TOPOLOGY_PATHS_PRESENT\n" => Ok(false),
-        other => anyhow::bail!(
-            "unrecognized topology initialization probe response from {}: {:?}",
-            worker.id,
-            String::from_utf8_lossy(other),
-        ),
-    }
 }
 
 fn build_worker_projects_topology_cmd(
@@ -2722,7 +2710,7 @@ fn build_worker_projects_topology_cmd(
            printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; return 44; \
          fi; \
          }}; \
-         ensure_alias_symlink; \
+         ensure_alias_symlink || exit $?; \
          echo RCH_TOPOLOGY_OK",
         canonical = shell_escape::escape(canonical_display.into()),
         canonical_slash = shell_escape::escape(canonical_slash_display.into()),
@@ -2882,6 +2870,49 @@ pub(crate) async fn probe_worker_mirror_ownership(
     }
 }
 
+/// Verify topology, then repair only this dispatch's source roots on the same
+/// SSH channel. Each activity retains its own admission check, deadline and
+/// descendant teardown; a failed topology check cannot start a repair.
+fn worker_mirror_preflight_command(
+    worker: &WorkerConfig,
+    topology_policy: &PathTopologyPolicy,
+    dispatch_closure_roots: &[PathBuf],
+    source_identity: Option<&str>,
+    allow_initialization: bool,
+) -> anyhow::Result<(String, Duration)> {
+    let topology_timeout = Duration::from_secs(20);
+    let repair_timeout = Duration::from_secs(600);
+    let activity = source_identity
+        .map(source_authority_activity_prefix)
+        .transpose()?;
+    let bounded = |script: String, deadline| match &activity {
+        Some(prefix) => crate::transfer::source_activity_bounded_script(prefix, &script, deadline),
+        None => script,
+    };
+    let topology = bounded(
+        build_worker_projects_topology_cmd(topology_policy, allow_initialization),
+        topology_timeout,
+    );
+    // Root already owns its receiver writes; its sweep would count everything
+    // as drift and then fail because chown-to-root changes nothing (bd-gc0ze).
+    if worker.user == "root" {
+        return Ok((topology, topology_timeout));
+    }
+    let roots = if dispatch_closure_roots.is_empty() {
+        vec![topology_policy.canonical_root().to_path_buf()]
+    } else {
+        dispatch_closure_roots.to_vec()
+    };
+    let repair = bounded(
+        build_worker_ownership_repair_cmd(&roots, &worker.user),
+        repair_timeout,
+    );
+    Ok((
+        format!("(\n{topology}\n) || exit $?\n(\n{repair}\n)"),
+        topology_timeout + repair_timeout,
+    ))
+}
+
 pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
@@ -2905,22 +2936,31 @@ pub(super) async fn ensure_worker_projects_topology(
 
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
-    let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
-    let timeout = Duration::from_secs(20);
-    let topology_cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_bounded_script(
-            &source_authority_activity_prefix(identity)?,
-            &topology_cmd,
-            timeout,
-        ),
-        None => topology_cmd,
-    };
+    let (script, timeout) = worker_mirror_preflight_command(
+        worker,
+        topology_policy,
+        dispatch_closure_roots,
+        source_identity,
+        allow_initialization,
+    )?;
+    // The closure-sized program stays off argv (#71); one channel owns both
+    // finite activities and is reaped on cancellation or the combined bound.
     let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", topology_cmd.as_bytes(), timeout)
-            .await?;
+        run_offload_ssh_command_with_stdin(worker, "sh -s", script.as_bytes(), timeout).await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.lines().any(|line| line == "RCH_TOPOLOGY_OK") {
+            anyhow::bail!(
+                "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
+                 root-owned entries under the dispatch closure block rsync-as-{} (bd-8iwkm)",
+                worker.id,
+                output.status.code(),
+                stdout.trim(),
+                stderr,
+                worker.user,
+            );
+        }
         // A non-symlink alias that does NOT resolve to the canonical root is a
         // path_topology *policy* problem, not a worker fault — every worker will
         // refuse it identically. Name the config sources so operators fix the
@@ -2940,7 +2980,7 @@ pub(super) async fn ensure_worker_projects_topology(
             "remote topology preflight failed on {} (status {:?}): stdout='{}' stderr='{}'{}",
             worker.id,
             output.status.code(),
-            stdout,
+            stdout.trim(),
             stderr,
             policy_hint
         );
@@ -2949,102 +2989,16 @@ pub(super) async fn ensure_worker_projects_topology(
         "[RCH] topology preflight ok on {} ({} -> {} enforced)",
         worker.id, alias_display, canonical_display
     ));
-    // bd-8iwkm: root-owned entries inside the canonical mirror tree make
-    // rsync-as-ssh-user fail exit 23 on replace/unlink even when topology is
-    // healthy. Repair them before sync so the failure window closes here
-    // instead of mid-transfer.
-    // bd-gc0ze follow-up: scope the ownership sweep to THIS dispatch's closure
-    // roots instead of the whole canonical mirror. A global scan walks every
-    // mirrored repo (13GB+ franken_engine mirrors included) on every dispatch,
-    // which blew the fixed SSH budget and failed closed on E104 before any
-    // rsync started. The drift that breaks THIS transfer can only live under
-    // the remote roots THIS transfer writes into.
-    let ownership_scan_roots: Vec<PathBuf> = if dispatch_closure_roots.is_empty() {
-        vec![topology_policy.canonical_root().to_path_buf()]
-    } else {
-        dispatch_closure_roots.to_vec()
-    };
-    let repaired =
-        repair_worker_mirror_ownership(worker, reporter, &ownership_scan_roots, source_identity)
-            .await?;
-    if repaired > 0 {
+    if let Some(repaired) = stdout.lines().find_map(|line| {
+        line.strip_prefix("RCH_OWNERSHIP_REPAIRED:count=")
+            .and_then(|value| value.parse::<u64>().ok())
+    }) {
         reporter.summary(&format!(
             "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
             worker.id, worker.user
         ));
     }
     Ok(())
-}
-
-/// bd-8iwkm: detect and repair root-owned entries under the dispatch's closure
-/// roots on the worker's canonical mirror. Returns the number of repaired
-/// entries; zero means either no drift or a fail-open check-unavailable (never
-/// blocks dispatch). Scoped to the closure roots (see caller) so cost tracks
-/// the trees about to be rsynced rather than the entire mirror.
-async fn repair_worker_mirror_ownership(
-    worker: &WorkerConfig,
-    reporter: &HookReporter,
-    roots: &[PathBuf],
-    source_identity: Option<&str>,
-) -> anyhow::Result<u64> {
-    if should_skip_remote_preflight(worker) {
-        reporter.verbose("[RCH] ownership preflight skipped in mock mode");
-        return Ok(0);
-    }
-    if crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
-        reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
-        return Ok(0);
-    }
-    // bd-8iwkm/bd-gc0ze: when the SSH user IS root, rsync already runs as
-    // root and root-owned entries cannot block replace/unlink. Counting them
-    // would flag the entire mirror as drift while the repair chown is a
-    // no-op, so the sweep would report RCH_OWNERSHIP_PARTIAL forever and
-    // fail-closed every dispatch on root-login workers.
-    if worker.user == "root" {
-        reporter.verbose("[RCH] ownership preflight skipped for root-login worker");
-        return Ok(0);
-    }
-    let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
-    let timeout = Duration::from_secs(600);
-    let cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_bounded_script(
-            &source_authority_activity_prefix(identity)?,
-            &cmd,
-            timeout,
-        ),
-        None => cmd,
-    };
-    // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
-    // pathological trees without failing every dispatch the way the old fixed
-    // 60s budget did once mirrors grew past multi-GB.
-    // rch#71: keep the closure-sized script off argv. The existing stdin
-    // executor retains the timeout, concurrent output drains and kill-on-drop.
-    let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", cmd.as_bytes(), timeout).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
-             root-owned entries under the dispatch closure block rsync-as-{} (bd-8iwkm)",
-            worker.id,
-            output.status.code(),
-            stdout,
-            stderr,
-            worker.user
-        );
-    }
-    if let Some(count) = stdout
-        .strip_prefix("RCH_OWNERSHIP_REPAIRED:count=")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        reporter.verbose(&format!(
-            "[RCH] ownership drift repaired on {}: {count} entries chowned to {}",
-            worker.id, worker.user
-        ));
-        return Ok(count);
-    }
-    Ok(0)
 }
 
 #[cfg(test)]
@@ -3118,6 +3072,18 @@ mod tests {
                         let mut command = std::process::Command::new("ssh");
                         configure_offload_ssh_transport(&mut command, &worker);
                         assert_eq!(command.get_args().count(), 0);
+                        for setting in [None, Some(60)] {
+                            let transfer = TransferConfig {
+                                ssh_control_persist_secs: setting,
+                                ..TransferConfig::default()
+                            };
+                            with_owned_offload_ssh(worker.clone(), &transfer, async {
+                                assert!(offload_ssh_transport_arguments(&worker).is_none());
+                                Ok(())
+                            })
+                            .await
+                            .expect("automatic recovery must not create a reusable connection");
+                        }
                     },
                 )
                 .await
@@ -3128,8 +3094,48 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn owned_offload_reuse_requires_positive_opt_in_and_unix_worker() {
+        let worker = WorkerConfig::default();
+        for seconds in [1, 60] {
+            let transfer = TransferConfig {
+                ssh_control_persist_secs: Some(seconds),
+                ..TransferConfig::default()
+            };
+            let options = owned_offload_ssh_options(&worker, &transfer)
+                .expect("positive settings opt into an owned Unix connection");
+            assert!(options.control_master);
+            assert_eq!(
+                options.control_persist_idle,
+                Some(Duration::from_secs(seconds))
+            );
+            assert_eq!(options.server_alive_interval, Some(Duration::from_secs(15)));
+        }
+        for setting in [None, Some(0)] {
+            let disabled = TransferConfig {
+                ssh_control_persist_secs: setting,
+                ..TransferConfig::default()
+            };
+            assert!(owned_offload_ssh_options(&worker, &disabled).is_none());
+        }
+        let configured = TransferConfig {
+            ssh_control_persist_secs: Some(60),
+            ssh_server_alive_interval_secs: Some(30),
+            ..TransferConfig::default()
+        };
+        assert_eq!(
+            owned_offload_ssh_options(&worker, &configured)
+                .unwrap()
+                .server_alive_interval,
+            Some(Duration::from_secs(30))
+        );
+        let mut windows = worker;
+        windows.tags = vec!["os:windows".into()];
+        assert!(owned_offload_ssh_options(&windows, &configured).is_none());
+    }
+
     #[tokio::test]
-    async fn owned_offload_reuse_requires_positive_opt_in_and_unix_worker() {
+    async fn owned_offload_reuse_exclusions_do_not_connect() {
         let worker = WorkerConfig {
             host: "must-not-connect.invalid".into(),
             ..WorkerConfig::default()
@@ -3147,18 +3153,24 @@ mod tests {
             .unwrap();
             assert_eq!(value, 42);
         }
-        let mut windows = worker;
+        let mut windows = worker.clone();
         windows.tags = vec!["os:windows".into()];
-        let transfer = TransferConfig {
-            ssh_control_persist_secs: Some(60),
-            ..TransferConfig::default()
-        };
-        with_owned_offload_ssh(windows.clone(), &transfer, async {
-            assert!(offload_ssh_transport_arguments(&windows).is_none());
-            Ok(())
-        })
-        .await
-        .unwrap();
+        let mut mock = worker;
+        mock.host = "mock://dispatch".into();
+        for excluded in [windows, mock] {
+            for setting in [None, Some(0), Some(60)] {
+                let transfer = TransferConfig {
+                    ssh_control_persist_secs: setting,
+                    ..TransferConfig::default()
+                };
+                with_owned_offload_ssh(excluded.clone(), &transfer, async {
+                    assert!(offload_ssh_transport_arguments(&excluded).is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -3218,22 +3230,24 @@ mod tests {
             // An existing, shell-sensitive root at the end also proves that
             // the large payload was not truncated or its roots reinterpreted.
             roots.push(PathBuf::from(std::env::var_os(ROOT_ENV).unwrap()));
-            let script = build_worker_ownership_repair_cmd(&roots, &worker.user);
+            let topology = dir.join("topology");
+            std::fs::create_dir(&topology).unwrap();
+            let policy = PathTopologyPolicy::new(topology.clone(), topology);
+            let (script, _) =
+                worker_mirror_preflight_command(&worker, &policy, &roots, None, false).unwrap();
             assert!(script.len() > 128 * 1024);
 
-            for (mode, count, error, calls) in [
-                ("healthy", 0, None, "detect\n"),
-                ("repair", 1, None, "detect\nrepair\ndetect\n"),
-                ("check-unavailable", 0, None, "detect\n"),
+            for (mode, error, calls) in [
+                ("healthy", None, "detect\n"),
+                ("repair", None, "detect\nrepair\ndetect\n"),
+                ("check-unavailable", None, "detect\n"),
                 (
                     "unavailable",
-                    0,
                     Some((46, "RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=1")),
                     "detect\nrepair\n",
                 ),
                 (
                     "partial",
-                    0,
                     Some((47, "RCH_OWNERSHIP_PARTIAL:remaining=1")),
                     "detect\nrepair\ndetect\n",
                 ),
@@ -3241,9 +3255,12 @@ mod tests {
                 std::fs::write(dir.join("mode"), mode).unwrap();
                 std::fs::write(dir.join("state"), "pending").unwrap();
                 std::fs::write(dir.join("calls"), "").unwrap();
+                std::fs::write(dir.join("ssh_calls"), "").unwrap();
                 let result = timeout(
                     Duration::from_secs(20),
-                    repair_worker_mirror_ownership(&worker, &reporter, &roots, None),
+                    ensure_worker_projects_topology(
+                        &worker, &reporter, &policy, &roots, None, false,
+                    ),
                 )
                 .await
                 .expect("ownership repair must not hang on stdin/EOF");
@@ -3252,14 +3269,76 @@ mod tests {
                     assert!(error.contains(&format!("status Some({code})")), "{error}");
                     assert!(error.contains(marker), "{error}");
                 } else {
-                    assert_eq!(result.expect(mode), count, "{mode}");
+                    result.expect(mode);
                 }
                 assert_eq!(
                     std::fs::read(dir.join("payload")).unwrap(),
                     script.as_bytes()
                 );
                 assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), calls);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                    "request\n",
+                    "topology and ownership must share one remote round trip",
+                );
             }
+            std::fs::write(dir.join("calls"), "").unwrap();
+            std::fs::write(dir.join("ssh_calls"), "").unwrap();
+            let missing = dir.join("missing topology");
+            let unavailable = PathTopologyPolicy::new(missing.clone(), missing.clone());
+            let error = ensure_worker_projects_topology(
+                &worker,
+                &reporter,
+                &unavailable,
+                &roots,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED")
+            );
+            assert!(!missing.exists());
+            assert!(
+                std::fs::read(dir.join("calls")).unwrap().is_empty(),
+                "topology failure must prevent every ownership operation"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                "request\n"
+            );
+            // A function's nonzero return is different from an explicit
+            // shell exit. The batching caller must not suppress errexit and
+            // let an alias conflict fall through to ownership repair.
+            std::fs::write(dir.join("ssh_calls"), "").unwrap();
+            let conflict = dir.join("conflicting alias");
+            std::fs::create_dir(&conflict).unwrap();
+            let conflicting =
+                PathTopologyPolicy::new(policy.canonical_root().to_path_buf(), conflict.clone());
+            let error = ensure_worker_projects_topology(
+                &worker,
+                &reporter,
+                &conflicting,
+                &roots,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK")
+            );
+            assert!(conflict.is_dir() && !conflict.is_symlink());
+            assert!(std::fs::read(dir.join("calls")).unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                "request\n"
+            );
             std::fs::write(dir.join("finished"), "ok").unwrap();
             return;
         }
@@ -3278,11 +3357,15 @@ set -eu
 LC_ALL=C
 export LC_ALL
 remote=''
+connect_timeout=''
 for arg; do
     [ "${#arg}" -lt 131072 ] || exit 90
+    case "$arg" in ConnectTimeout=*) connect_timeout=$arg ;; esac
     remote=$arg
 done
 [ "$remote" = "sh -lc 'sh -s'" ] || exit 91
+[ "$connect_timeout" = ConnectTimeout=20 ] || exit 99
+echo request >> "$RCH_OWNERSHIP_TEST_DIR/ssh_calls"
 cat > "$RCH_OWNERSHIP_TEST_DIR/payload"
 # Execute the real remote wrapper and script, replacing only privileged work.
 {

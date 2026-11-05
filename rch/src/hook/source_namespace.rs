@@ -14,6 +14,7 @@ use super::{PathTopologyPolicy, SyncClosurePlanEntry, WorkerConfig};
 use anyhow::Context as _;
 use rch_common::WorkerId;
 use sha2::{Digest as _, Sha256};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
@@ -297,25 +298,70 @@ fn namespace_command(
     ))
 }
 
+/// Batch the read-only destination guards and topology observation with the
+/// initializer. They still run before registry setup or any namespace write;
+/// the registry transaction independently rechecks the physical mapping under
+/// its mutex. Keeping this on one bounded channel saves two SSH round trips
+/// without caching an observation or granting any source authority.
+fn namespace_preflight_command(
+    policy: &PathTopologyPolicy,
+    identity: &str,
+    registry: &str,
+    source_roots: &[PathBuf],
+) -> anyhow::Result<String> {
+    let initializer = namespace_command(policy, identity, registry)?;
+    let mut guard = String::from("set -eu\n");
+    for root in source_roots {
+        let root = root.to_str().context("source destination is not UTF-8")?;
+        guard.push_str(&crate::transfer::live_checkout_sync_guard(root));
+        guard.push_str(" || exit 73\n");
+    }
+    // The controller accepts only the final topology acknowledgment on stdout.
+    // This observation is diagnostic, never permission to skip initialization.
+    guard.push_str(&format!(
+        "({}) >&2\n",
+        super::ssh::build_worker_projects_topology_probe_cmd(policy),
+    ));
+    // Keep the guard's original 30-second allowance separate from the
+    // namespace controller's 15-second mutation deadline. This finite RPC has
+    // no source grant yet and owns only its read-only guard process group.
+    let guard =
+        crate::transfer::source_activity_bounded_script("", &guard, Duration::from_secs(30));
+    let controller = shell_escape::escape(CONTROL.into());
+    let mut delimiter = format!("RCH_NAMESPACE_{}", uuid::Uuid::new_v4().simple());
+    while initializer.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    // Parse the entire compound before running either operation. A truncated
+    // stdin upload cannot launch a partially received initializer.
+    Ok(format!(
+        "{{\n(\n{guard}\n) || exit $?\nsh -c {controller} <<'{delimiter}'\n{initializer}\n{delimiter}\n}}\n",
+    ))
+}
+
 pub(super) async fn initialize_worker_namespace(
     worker: &WorkerConfig,
     policy: &PathTopologyPolicy,
     identity: &str,
-) -> anyhow::Result<()> {
-    let script = namespace_command(policy, identity, REGISTRY)?;
+    source_roots: &[PathBuf],
+) -> anyhow::Result<bool> {
+    let script = namespace_preflight_command(policy, identity, REGISTRY, source_roots)?;
     // Bound the worker as well as the SSH client. Killing only the local SSH
     // process can leave a queued initializer or a pipe-holding descendant on
     // the worker, retaining the registry mutex after this future has failed.
-    // CONTROL owns only pre-intent namespace setup, never a source/build grant.
+    // Both controllers own only pre-intent setup, never a source/build grant.
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        CONTROL,
+        "sh -s",
         script.as_bytes(),
-        Duration::from_secs(20),
+        Duration::from_secs(50),
     )
     .await?;
     if output.status.success() && output.stdout.as_slice() == b"RCH_TOPOLOGY_OK\n" {
-        return Ok(());
+        return Ok(output
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == b"RCH_TOPOLOGY_INITIALIZATION_REQUIRED"));
     }
     Err(namespace_refusal(
         worker,
@@ -373,11 +419,12 @@ fn namespace_refusal(
         || detail.escape_debug().to_string(),
         |verdict| topology_refusal_detail(verdict, detail, &topology),
     );
-    let error = anyhow::anyhow!(
-        "worker source namespace initialization refused on {} (status {:?}): {}",
-        worker.id,
-        status,
-        rendered_detail,
+    let error = crate::transfer::destination_check_refusal(
+        format!(
+            "worker source namespace initialization refused on {} (status {:?}): {}",
+            worker.id, status, rendered_detail,
+        ),
+        detail,
     );
     if permanent_mapping.is_some() {
         error.context(SourceTopologyIncompatible {
@@ -486,10 +533,20 @@ mod tests {
         let alias = temp.path().join("alias");
         let registry = temp.path().join("registry");
         let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
-        let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
-        for _ in 0..2 {
+        let source = canonical.join("repository");
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        for observation in [
+            "RCH_TOPOLOGY_INITIALIZATION_REQUIRED",
+            "RCH_TOPOLOGY_PATHS_PRESENT",
+        ] {
             let mut child = std::process::Command::new("sh")
-                .args(["-c", CONTROL])
+                .arg("-s")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -508,7 +565,13 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(output.stdout, b"RCH_TOPOLOGY_OK\n");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == observation)
+            );
             assert_eq!(std::fs::canonicalize(&alias).unwrap(), canonical);
+            assert!(!source.exists(), "preflight must not create source trees");
             assert!(std::fs::read_dir(&registry).unwrap().all(|entry| {
                 let path = entry.unwrap().path();
                 !matches!(
@@ -516,6 +579,114 @@ mod tests {
                     Some("claim" | "pending")
                 )
             }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_preflight_checks_every_destination_before_any_mutation() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("projects");
+        let alias = temp.path().join("alias");
+        let registry = temp.path().join("registry");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        // A valid first root must not cause the initializer to run before
+        // checking the later unsafe root. Even registry setup is forbidden.
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            &[canonical.join("safe repository"), PathBuf::from("/")],
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(command.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(!canonical.exists() && !alias.exists() && !registry.exists());
+        let worker = WorkerConfig::default();
+        let error = namespace_refusal(&worker, &policy, output.status.code(), &output.stderr);
+        assert!(
+            error.is::<crate::transfer::LiveCheckoutRefused>(),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_preflight_truncated_upload_never_starts_a_program_or_mutates_paths() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("projects with ' quotes");
+        let alias = temp.path().join("alias");
+        let registry = temp.path().join("registry");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        let source = canonical.join("repository");
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert!(command.ends_with("}\n"));
+        let outer_heredoc_end = command.rfind("\nRCH_NAMESPACE_").unwrap();
+        // A complete heredoc alone is insufficient: the outer compound must
+        // also arrive before even the read-only guards or observation run.
+        for (name, end) in [
+            ("mid_program", command.len() / 2),
+            ("missing_final_heredoc", outer_heredoc_end),
+            ("missing_outer_brace", command.len() - 2),
+        ] {
+            let mut child = std::process::Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&command.as_bytes()[..end])
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{name} accepted a truncated command"
+            );
+            assert!(output.stdout.is_empty(), "{name}");
+            assert!(
+                !diagnostic.contains("RCH_TOPOLOGY_"),
+                "{name}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED"),
+                "{name}: {diagnostic}"
+            );
+            assert!(!canonical.exists(), "{name}");
+            assert!(std::fs::symlink_metadata(&alias).is_err(), "{name}");
+            assert!(!registry.exists(), "{name}");
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0, "{name}");
         }
     }
 

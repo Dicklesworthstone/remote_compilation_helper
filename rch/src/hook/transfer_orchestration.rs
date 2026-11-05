@@ -57,7 +57,7 @@ use super::source_fidelity::{
 };
 use super::ssh::{
     acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
-    remote_preflight_topology_policy, worker_projects_topology_requires_initialization,
+    remote_preflight_topology_policy,
 };
 use super::*;
 
@@ -1623,39 +1623,6 @@ async fn execute_remote_compilation_inner(
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
-    // bd-fbtws: reject live checkouts before ownership repair or repo-updater
-    // convergence can mutate them, not merely when rsync starts. The receiver
-    // repeats the guard immediately before pruning/upload under its grant.
-    if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
-        let guard = sync_plan
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{} || exit 73;\n",
-                    crate::transfer::live_checkout_sync_guard(&entry.remote_root)
-                )
-            })
-            .collect::<String>();
-        let output = super::ssh::run_offload_ssh_command_with_stdin(
-            &worker_config,
-            "sh -s",
-            guard.as_bytes(),
-            Duration::from_secs(30),
-        )
-        .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::transfer::destination_check_refusal(
-                format!(
-                    "source destination safety check refused on {} (status {:?}): {}",
-                    worker_config.id,
-                    output.status.code(),
-                    stderr.trim(),
-                ),
-                &stderr,
-            ));
-        }
-    }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -1761,27 +1728,16 @@ async fn execute_remote_compilation_inner(
         let writer = durable_lease.context(
             "remote source ownership requires an admitted durable job lease; use rch exec",
         )?;
-        if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
-            .await
-            .map_err(|error| {
-                writer.source_namespace_preflight_failed(
-                    &worker_config.id,
-                    build_id,
-                    local_wrapper_id,
-                    SourceNamespacePreflightStage::TopologyProbe,
-                    error,
-                )
-            })?
-        {
-            reporter
-                .verbose("[RCH] initializing shared path translation without claiming its bases");
-        }
         // Confirm the durable postcondition even when both paths already
         // exist: a prior initializer may have lost its final acknowledgment.
-        source_namespace::initialize_worker_namespace(
+        // The same RPC rejects live checkouts BEFORE any namespace write,
+        // ownership repair or repo convergence (bd-fbtws). Receivers repeat
+        // that guard under their grant immediately before pruning/upload.
+        let initialized = source_namespace::initialize_worker_namespace(
             &worker_config,
             &remote_topology_policy,
             &recovery_identity,
+            &ownership_scan_roots,
         )
         .await
         .map_err(|error| {
@@ -1793,6 +1749,10 @@ async fn execute_remote_compilation_inner(
                 error,
             )
         })?;
+        if initialized {
+            reporter
+                .verbose("[RCH] initialized shared path translation without claiming its bases");
+        }
     }
     let source_target_root = sync_plan
         .iter()

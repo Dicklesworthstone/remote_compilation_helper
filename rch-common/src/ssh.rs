@@ -3464,6 +3464,31 @@ exec sleep 30
     }
 
     #[tokio::test]
+    async fn external_transport_without_idle_timer_is_reaped_on_dispatch_drop() {
+        // Clients can own a connection without an idle timer. Dropping either
+        // the client or its active-use guard must still stop and reap it;
+        // cleanup cannot depend on a later idle expiration.
+        for owner_first in [false, true] {
+            let fake = FakeSsh::new("ready");
+            let mut client = fake.client(Duration::from_secs(3), true);
+            assert!(client.options.control_persist_idle.is_none());
+            fake.connect(&mut client).await.unwrap();
+            let transport = client.external_transport().unwrap();
+            assert!(transport.arguments().is_ok());
+            if owner_first {
+                drop(client);
+                assert!(transport.arguments().is_err());
+                drop(transport);
+            } else {
+                drop(transport);
+                assert!(client.external_transport().is_err());
+                drop(client);
+            }
+            fake.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
     async fn external_transport_holds_activity_until_explicit_completion() {
         let fake = FakeSsh::new("ready");
         let mut client = fake.client(Duration::from_secs(3), true);

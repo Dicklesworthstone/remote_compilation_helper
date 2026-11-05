@@ -356,7 +356,6 @@ enum RemotePipelineFailurePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceNamespacePreflightStage {
-    TopologyProbe,
     NamespaceInitialization,
 }
 
@@ -2417,8 +2416,8 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
-    /// The two namespace preflight RPCs run before RecoverySession::begin,
-    /// source/pair acquisition, transfer or execution. Record their failed
+    /// The combined namespace preflight RPC runs before RecoverySession::begin,
+    /// source/pair acquisition, transfer or execution. Record its failed
     /// phase before daemon release, without inventing source cleanup or a
     /// terminal result that could conflict with a concurrent daemon cancellation.
     /// Only this durable, identity-checked transition permits the typed retry
