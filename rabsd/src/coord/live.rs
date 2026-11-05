@@ -489,6 +489,9 @@ const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-
 const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
 const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
 const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
+const LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
+const LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
+    "rustc-workspace-generated-dag-metadata-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
@@ -536,6 +539,12 @@ fn record_descriptor_class(
             CommittedDependencyPolicy::ImmutableDagMetadata => LIVE_IMMUTABLE_DAG_METADATA_CLASS,
             CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
             CommittedDependencyPolicy::WorkspaceDagMetadata => LIVE_WORKSPACE_DAG_METADATA_CLASS,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
             }
@@ -623,6 +632,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceDagRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceDagMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -5600,9 +5615,9 @@ mod tests {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
-            plan_mixed_workspace_library, plan_terminal_workspace_metadata,
-            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
-            remote_committed_workspace_rlib_key,
+            plan_generated_workspace_dag_library, plan_mixed_workspace_library,
+            plan_terminal_workspace_metadata, remote_committed_dependency_key,
+            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
@@ -5616,7 +5631,17 @@ mod tests {
         let descriptor_with_generated = |emit: &str,
                                          policy: Option<CommittedDependencyPolicy>,
                                          generated: bool| {
-            assert!(!generated || policy.is_none());
+            assert!(
+                !generated
+                    || policy.is_none()
+                    || matches!(
+                        policy,
+                        Some(
+                            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                                | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                        )
+                    )
+            );
             let terminal = matches!(
                 policy,
                 Some(
@@ -5699,6 +5724,10 @@ mod tests {
                 Some(CommittedDependencyPolicy::WorkspaceMetadata) => {
                     plan_committed_workspace_metadata(&execution)
                 }
+                Some(
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                ) => plan_generated_workspace_dag_library(&execution),
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                     | CommittedDependencyPolicy::WorkspaceTerminalMetadata,
@@ -5835,7 +5864,7 @@ mod tests {
                     &directories,
                     &dependencies,
                     &inputs,
-                    None,
+                    generated.then_some(b"".as_slice()),
                     "/__rabs/toolchain",
                     &[39; 32],
                     &runtime,
@@ -5929,6 +5958,22 @@ mod tests {
                 ActionClassRisk::WorkspaceDagMetadata,
             ),
             (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceDagRlib),
+                    true,
+                ),
+                ActionClassRisk::GeneratedWorkspaceDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata),
+                    true,
+                ),
+                ActionClassRisk::GeneratedWorkspaceDagMetadata,
+            ),
+            (
                 descriptor(
                     "--emit=dep-info,metadata",
                     Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata),
@@ -5943,10 +5988,9 @@ mod tests {
                 ActionClassRisk::WorkspaceTerminalMetadata,
             ),
         ];
-        for ((descriptor, _), expected_epoch) in descriptors
-            .iter()
-            .zip([16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 24, 25])
-        {
+        for ((descriptor, _), expected_epoch) in descriptors.iter().zip([
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 24, 25,
+        ]) {
             assert_eq!(descriptor.key_epoch, expected_epoch);
         }
         for (index, (descriptor, _)) in descriptors.iter().enumerate() {

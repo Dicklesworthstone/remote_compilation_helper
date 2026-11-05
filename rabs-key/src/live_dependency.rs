@@ -422,6 +422,13 @@ pub enum DependencySourceKind {
     /// A closed leaf-library metadata check with complete generated inputs.
     /// Its separate class still requires the strict closed metadata namespace.
     WorkspaceGeneratedMetadata,
+    /// A closed library archive with a complete own OUT_DIR and an exact
+    /// committed workspace/immutable producer DAG. Its retained dependency
+    /// capability is mandatory; generated leaf evidence cannot authorize it.
+    WorkspaceGeneratedDagRlib,
+    /// The separately qualified closed metadata form of a generated-input
+    /// workspace library with complete committed producer ancestry.
+    WorkspaceGeneratedDagMetadata,
     /// Closed canonical workspace archive whose entire retained Rust candidate
     /// inventory comes from verified, already committed workspace producers.
     WorkspaceCommittedRlib,
@@ -455,6 +462,8 @@ impl DependencySourceKind {
             Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v2",
             Self::WorkspaceGeneratedRlib => "canonical-workspace-generated-rlib-v1",
             Self::WorkspaceGeneratedMetadata => "canonical-workspace-generated-metadata-v1",
+            Self::WorkspaceGeneratedDagRlib => "canonical-workspace-generated-dag-rlib-v1",
+            Self::WorkspaceGeneratedDagMetadata => "canonical-workspace-generated-dag-metadata-v1",
             Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v2",
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v2",
             Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v2",
@@ -474,6 +483,8 @@ impl DependencySourceKind {
                 | Self::WorkspaceClosedMetadata
                 | Self::WorkspaceGeneratedRlib
                 | Self::WorkspaceGeneratedMetadata
+                | Self::WorkspaceGeneratedDagRlib
+                | Self::WorkspaceGeneratedDagMetadata
                 | Self::WorkspaceCommittedRlib
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
@@ -1573,6 +1584,8 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceClosedMetadata
                             | DependencySourceKind::WorkspaceGeneratedRlib
                             | DependencySourceKind::WorkspaceGeneratedMetadata
+                            | DependencySourceKind::WorkspaceGeneratedDagRlib
+                            | DependencySourceKind::WorkspaceGeneratedDagMetadata
                             | DependencySourceKind::WorkspaceCommittedRlib
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
@@ -1643,6 +1656,8 @@ fn captured_action_key(
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
@@ -1740,6 +1755,12 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspaceGeneratedMetadata => {
                     workspace_cache::GENERATED_METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedDagRlib => {
+                    workspace_dependency_cache::GENERATED_DAG_RLIB_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedDagMetadata => {
+                    workspace_dependency_cache::GENERATED_DAG_METADATA_ISOLATION_PROFILE
                 }
                 DependencySourceKind::WorkspaceCommittedRlib => {
                     workspace_dependency_cache::ISOLATION_PROFILE

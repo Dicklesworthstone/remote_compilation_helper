@@ -2462,9 +2462,10 @@ mod tests {
             }
         }
 
-        fn workspace(mut self, archive: bool) -> Self {
+        fn workspace(mut self, archive: bool, dag: bool) -> Self {
             use rabs_key::live_dependency::plan_canonical_workspace_execution;
             use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+            use rabs_key::live_dependency::workspace_dependency_cache::plan_generated_workspace_dag_library;
             use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
 
             let package = "/__rabs/workspace/app";
@@ -2480,7 +2481,7 @@ mod tests {
                 b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
             )
             .unwrap();
-            let argv = vec![
+            let mut argv = vec![
                 "/__rabs/toolchain/bin/rustc".into(),
                 "--crate-name=generated".into(),
                 "--crate-type=lib".into(),
@@ -2494,6 +2495,15 @@ mod tests {
                 format!("--out-dir={}", self.plan.out_dir),
                 "app/lib.rs".into(),
             ];
+            if dag {
+                // This selected-unit/retained-tree fixture does not mint the
+                // separate committed installation capability for this extern.
+                // Real store-backed producer witnesses are tested in committed.rs.
+                argv.push(format!(
+                    "--extern=upstream={}/libupstream.rmeta",
+                    self.plan.out_dir
+                ));
+            }
             let mut env = self.plan.execution_env.clone();
             for (name, value) in &mut env {
                 if name == "CARGO_MANIFEST_DIR" {
@@ -2533,7 +2543,12 @@ mod tests {
                 .unwrap()
                 .require_closed_dependency_execution()
                 .unwrap();
-            self.plan = plan_closed_workspace_library(&fresh).unwrap();
+            self.plan = if dag {
+                plan_generated_workspace_dag_library(&fresh)
+            } else {
+                plan_closed_workspace_library(&fresh)
+            }
+            .unwrap();
             self.physical = self.paths.project_plan(&self.plan).unwrap();
             self.binding = self
                 .paths
@@ -2553,11 +2568,11 @@ mod tests {
     }
 
     #[test]
-    fn generated_workspace_leaves_retain_original_tree_and_cargo_record_generations() {
+    fn generated_workspace_profiles_retain_original_tree_and_cargo_record_generations() {
         use crate::edge::live_facts::LiveFacts;
         use rabs_key::live_dependency::DependencySourceKind;
 
-        for archive in [false, true] {
+        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
             for mutation in [
                 "generated-bytes",
                 "same-byte-file",
@@ -2569,19 +2584,37 @@ mod tests {
                 "root-output",
                 "output-alias",
             ] {
-                let fixture = GeneratedFixture::new(true, archive).workspace(archive);
+                let fixture = GeneratedFixture::new(true, archive).workspace(archive, dag);
                 assert_eq!(
                     fixture.plan.source_kind,
-                    if archive {
-                        DependencySourceKind::WorkspaceGeneratedRlib
-                    } else {
-                        DependencySourceKind::WorkspaceGeneratedMetadata
+                    match (archive, dag) {
+                        (true, false) => DependencySourceKind::WorkspaceGeneratedRlib,
+                        (false, false) => DependencySourceKind::WorkspaceGeneratedMetadata,
+                        (true, true) => DependencySourceKind::WorkspaceGeneratedDagRlib,
+                        (false, true) => DependencySourceKind::WorkspaceGeneratedDagMetadata,
                     }
                 );
-                fixture
-                    .paths
-                    .require_workspace_closed_library(&fixture.plan)
-                    .unwrap();
+                if dag {
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(
+                            &fixture.plan,
+                            CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert!(
+                        fixture
+                            .paths
+                            .require_workspace_closed_library(&fixture.plan)
+                            .is_err()
+                    );
+                } else {
+                    fixture
+                        .paths
+                        .require_workspace_closed_library(&fixture.plan)
+                        .unwrap();
+                }
                 assert!(fixture.paths.require_local_capture().is_err());
                 let facts = LiveFacts::new();
                 let captured = fixture.capture(&facts).unwrap();
@@ -2654,7 +2687,7 @@ mod tests {
                     captured
                         .verify_unchanged(Path::new(&fixture.physical.source_root))
                         .is_err(),
-                    "archive={archive}, {mutation}: original generated proof refreshed itself"
+                    "archive={archive}, dag={dag}, {mutation}: original generated proof refreshed itself"
                 );
                 if mutation == "output-alias" {
                     assert!(
@@ -2666,6 +2699,69 @@ mod tests {
                 if mutation == "root-output" {
                     assert!(fixture.capture(&facts).is_err());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_workspace_dags_keep_selected_units_native_exclusions_and_local_refusal() {
+        for archive in [false, true] {
+            let fixture = GeneratedFixture::new(true, archive).workspace(archive, true);
+            let policy =
+                CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind).unwrap();
+            fixture
+                .paths
+                .require_committed_dependency_library(&fixture.plan, policy)
+                .unwrap();
+            assert!(fixture.paths.require_local_capture().is_err());
+            for other in [
+                CommittedDependencyPolicy::WorkspaceRlib,
+                CommittedDependencyPolicy::WorkspaceMetadata,
+                CommittedDependencyPolicy::WorkspaceDagRlib,
+                CommittedDependencyPolicy::WorkspaceDagMetadata,
+                if archive {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                } else {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                },
+            ] {
+                assert!(
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(&fixture.plan, other)
+                        .is_err()
+                );
+            }
+            for mutation in 0..8 {
+                let mut other = fixture.plan.clone();
+                match mutation {
+                    0 => other.invocation.crate_name = Some("unselected".into()),
+                    1 => other.invocation.features.push("unselected-feature".into()),
+                    2 => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+                    3 => other.package_root = "/__rabs/workspace/other".into(),
+                    4 => {
+                        other.invocation.source = Some(rabs_key::invocation::SourceInput::Path(
+                            "other/lib.rs".into(),
+                        ))
+                    }
+                    5 => other.invocation.passthrough.push("--test".into()),
+                    6 => other
+                        .invocation
+                        .lib_search
+                        .push(format!("native={}", other.generated_root.as_ref().unwrap())),
+                    _ => {
+                        other.generated_root = None;
+                        other.execution_env.retain(|(name, _)| name != "OUT_DIR");
+                        other.keyed_env = other.execution_env.clone();
+                    }
+                }
+                assert!(
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(&other, policy)
+                        .is_err(),
+                    "archive={archive}, mutation={mutation}"
+                );
             }
         }
     }

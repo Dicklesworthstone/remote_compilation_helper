@@ -102,6 +102,13 @@ pub enum ActionClassRisk {
     /// Workspace checks whose committed producer graph may include separately
     /// qualified immutable dependency DAGs. Requires its own class evidence.
     WorkspaceDagMetadata,
+    /// Workspace archives with complete generated inputs and committed Rust
+    /// producer ancestry. Their own Cargo run record and generated tree are
+    /// independently qualified from pure DAGs and generated leaves.
+    GeneratedWorkspaceDagRlib,
+    /// Closed metadata checks with complete generated inputs and committed
+    /// ancestry. Archive or pure-workspace evidence cannot enroll this class.
+    GeneratedWorkspaceDagMetadata,
     /// Exact selected binary/example or harness metadata checks with a proven
     /// empty candidate inventory. Terminal outputs never authorize consumers.
     WorkspaceTerminalLeafMetadata,

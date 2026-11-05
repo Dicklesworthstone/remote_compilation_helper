@@ -1041,6 +1041,21 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if matches!(
+        plan.source_kind,
+        DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
+    ) {
+        let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
+            .ok_or("generated workspace DAG lost its committed-input policy")?;
+        policy
+            .validate_plan(plan)
+            .map_err(|error| error.to_string())?;
+        return Ok(match policy.output_class() {
+            RemoteDependencyOutputClass::Rlib => DependencyExecutionMode::Rlib,
+            RemoteDependencyOutputClass::Metadata => DependencyExecutionMode::ClosedMetadata,
+        });
+    }
     if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
         validate_terminal_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
         return Ok(DependencyExecutionMode::ClosedMetadata);
@@ -5019,9 +5034,12 @@ mod execution_resource_tests {
     }
 
     #[test]
-    fn generated_workspace_leaves_require_the_exact_generated_context_and_cache_contract() {
+    fn generated_workspace_profiles_require_exact_context_contract_and_committed_capability() {
         use rabs_key::live_dependency::plan_canonical_workspace_execution;
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_generated_workspace_dag_library,
+        };
         use rabs_protocol::input_evidence::{DirectoryEnumeration, InputFileType, PositiveInput};
         use rabs_protocol::raw_bytes::RawBytes;
         use rabs_protocol::result_identity::ObjectId;
@@ -5029,9 +5047,15 @@ mod execution_resource_tests {
         // This boundary exercises actual request/key/policy assemblers. Real
         // retained trees and record generations are tested in canonical.rs;
         // these inventory facts do not assert compiler or TLS execution.
-        for archive in [false, true] {
+        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
             let root = "/__rabs/out/cargo/debug/build/workspace_app-123/out";
             let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+            let dependency_path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
+            if dag {
+                fixture
+                    .argv
+                    .push(format!("--extern=upstream={dependency_path}"));
+            }
             if archive {
                 *fixture
                     .argv
@@ -5053,7 +5077,14 @@ mod execution_resource_tests {
                 &fixture.plan.host_triple,
             )
             .unwrap();
-            fixture.plan = plan_closed_workspace_library(&fresh).unwrap();
+            fixture.plan = if dag {
+                plan_generated_workspace_dag_library(&fresh)
+            } else {
+                plan_closed_workspace_library(&fresh)
+            }
+            .unwrap();
+            let policy = CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind);
+            assert_eq!(policy.is_some(), dag);
             let mode = if archive {
                 DependencyExecutionMode::Rlib
             } else {
@@ -5071,7 +5102,14 @@ mod execution_resource_tests {
                 fixture.plan.out_dir.clone(),
                 fixture.plan.dependency_dirs.clone(),
                 Vec::new(),
-                Vec::new(),
+                if dag {
+                    vec![DependencyArtifactRoot {
+                        path: fixture.plan.out_dir.clone(),
+                        prefix: "dependencies/0000".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
                 Some(root.into()),
                 fixture.context.source_directories().to_vec(),
                 vec!["empty".into(), "nested".into()],
@@ -5102,6 +5140,14 @@ mod execution_resource_tests {
                 request["artifacts"]["files"],
                 json!(fixture.plan.output_names())
             );
+            assert_eq!(
+                request["dependency_context"]["artifact_roots"],
+                if dag {
+                    json!([{"path":fixture.plan.out_dir,"prefix":"dependencies/0000"}])
+                } else {
+                    json!([])
+                },
+            );
             let exact = fixture.context.clone();
             let other_root = "/__rabs/out/cargo/debug/build/workspace_app-456/out";
             let mut other_env = fixture.plan.execution_env.clone();
@@ -5116,7 +5162,7 @@ mod execution_resource_tests {
                 fixture.plan.out_dir.clone(),
                 fixture.plan.dependency_dirs.clone(),
                 Vec::new(),
-                Vec::new(),
+                exact.artifact_roots().to_vec(),
                 Some(other_root.into()),
                 exact.source_directories().to_vec(),
                 exact.generated_directories().to_vec(),
@@ -5131,12 +5177,37 @@ mod execution_resource_tests {
             fixture.context = exact;
 
             let plan = &fixture.plan;
+            let digest = |bytes: &[u8]| {
+                rabs_key::typed_digest::compute("rabs.test.generated-dag-mode.v1", bytes)
+            };
+            let dependencies = if dag {
+                vec![CommittedWorkspaceDependency {
+                    path: dependency_path.clone(),
+                    producer_action: digest(b"committed producer action"),
+                    producer_descriptor: digest(b"committed producer descriptor"),
+                    producer_manifest: digest(b"committed producer manifest"),
+                    role: OutputRole::ProvisionalMetadata,
+                    virtual_path: RawBytes::from("libupstream.rmeta"),
+                    object: ObjectId(digest(b"complete producer metadata bytes")),
+                }]
+            } else {
+                Vec::new()
+            };
             let directories = plan
                 .dependency_dirs
                 .iter()
                 .map(|path| DependencyDirectoryFact {
                     path: path.clone(),
-                    artifacts: Vec::new(),
+                    artifacts: dependencies
+                        .iter()
+                        .filter(|dependency| {
+                            Path::new(&dependency.path).parent() == Some(Path::new(path))
+                        })
+                        .map(|dependency| rabs_key::live_dependency::ExternFact {
+                            path: dependency.path.clone(),
+                            content_digest: dependency.object.0.clone(),
+                        })
+                        .collect(),
                 })
                 .collect::<Vec<_>>();
             let (mut inputs, toolchain) = workspace_metadata_key_facts(plan);
@@ -5168,23 +5239,59 @@ mod execution_resource_tests {
                     entries: entries.into_iter().map(RawBytes::from).collect(),
                 }),
             );
-            let key = remote_closed_workspace_library_key(
-                plan,
-                &toolchain,
-                &directories,
-                &inputs,
-                Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n"),
-                "/__rabs/toolchain",
-                &fixture.toolchain.sha256,
-                &rabs_key::typed_digest::compute(
-                    rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
-                    b"runtime",
-                ),
-            )
+            let runtime = rabs_key::typed_digest::compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            );
+            let key = if let Some(policy) = policy {
+                remote_committed_dependency_key(
+                    plan,
+                    policy,
+                    &toolchain,
+                    &directories,
+                    &dependencies,
+                    &inputs,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n"),
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+            } else {
+                remote_closed_workspace_library_key(
+                    plan,
+                    &toolchain,
+                    &directories,
+                    &inputs,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n"),
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+            }
             .unwrap();
-            assert_eq!(key.descriptor.key_epoch, if archive { 26 } else { 27 });
-            verify_execution_policy(plan, &key, mode, None).unwrap();
-            assert!(verify_execution_policy(&fresh, &key, mode, None).is_err());
+            assert_eq!(
+                key.descriptor.key_epoch,
+                match (archive, dag) {
+                    (true, false) => 26,
+                    (false, false) => 27,
+                    (true, true) => 28,
+                    (false, true) => 29,
+                }
+            );
+            verify_execution_policy(plan, &key, mode, policy).unwrap();
+            assert!(verify_execution_policy(&fresh, &key, mode, policy).is_err());
+            if dag {
+                assert!(
+                    verify_execution_policy(plan, &key, mode, None).is_err(),
+                    "a generated DAG descriptor replaced its installed-input capability"
+                );
+                for other in [
+                    CommittedDependencyPolicy::WorkspaceDagRlib,
+                    CommittedDependencyPolicy::WorkspaceDagMetadata,
+                ] {
+                    assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());
+                }
+            }
             for mutation in 0..3 {
                 let mut changed = key.clone();
                 match mutation {
@@ -5200,7 +5307,7 @@ mod execution_resource_tests {
                 changed.descriptor_digest = rabs_key::hit_verification::descriptor_digest(
                     &rabs_key::hit_verification::descriptor_canonical_bytes(&changed.descriptor),
                 );
-                assert!(verify_execution_policy(plan, &changed, mode, None).is_err());
+                assert!(verify_execution_policy(plan, &changed, mode, policy).is_err());
             }
             for other in [
                 DependencyExecutionMode::Metadata,
@@ -5208,7 +5315,7 @@ mod execution_resource_tests {
                 DependencyExecutionMode::ClosedMetadata,
             ] {
                 if other != mode {
-                    assert!(verify_execution_policy(plan, &key, other, None).is_err());
+                    assert!(verify_execution_policy(plan, &key, other, policy).is_err());
                     let exact = fixture.context.clone();
                     fixture.context = exact.clone().with_execution_mode(other);
                     assert!(fixture.request().is_err());

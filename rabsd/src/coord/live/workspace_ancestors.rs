@@ -54,8 +54,14 @@ impl ProducerPolicy {
             }
             CommittedDependencyPolicy::ImmutableDagRlib => (false, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
-            CommittedDependencyPolicy::WorkspaceDagRlib => (false, ProducerDomain::WorkspaceDag),
-            CommittedDependencyPolicy::WorkspaceDagMetadata => (true, ProducerDomain::WorkspaceDag),
+            CommittedDependencyPolicy::WorkspaceDagRlib
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                (false, ProducerDomain::WorkspaceDag)
+            }
+            CommittedDependencyPolicy::WorkspaceDagMetadata
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                (true, ProducerDomain::WorkspaceDag)
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
             | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                 (true, ProducerDomain::WorkspaceDag)
@@ -84,6 +90,12 @@ impl ProducerPolicy {
             ActionClassRisk::WorkspaceDagRlib => CommittedDependencyPolicy::WorkspaceDagRlib,
             ActionClassRisk::WorkspaceDagMetadata => {
                 CommittedDependencyPolicy::WorkspaceDagMetadata
+            }
+            ActionClassRisk::GeneratedWorkspaceDagRlib => {
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+            }
+            ActionClassRisk::GeneratedWorkspaceDagMetadata => {
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
             }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
@@ -118,8 +130,11 @@ impl ProducerPolicy {
             ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
             ActionClassRisk::ImmutableDagRlib => immutable_dag,
             ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
-            ActionClassRisk::WorkspaceDagRlib => self.domain == ProducerDomain::WorkspaceDag,
-            ActionClassRisk::WorkspaceDagMetadata => {
+            ActionClassRisk::WorkspaceDagRlib | ActionClassRisk::GeneratedWorkspaceDagRlib => {
+                self.domain == ProducerDomain::WorkspaceDag
+            }
+            ActionClassRisk::WorkspaceDagMetadata
+            | ActionClassRisk::GeneratedWorkspaceDagMetadata => {
                 self.domain == ProducerDomain::WorkspaceDag && self.metadata_allowed
             }
             // A successful terminal check never supplies a Rust dependency,
@@ -733,6 +748,7 @@ fn verify_graph(
                 | ActionClassRisk::MixedWorkspaceMetadata
                 | ActionClassRisk::ImmutableDagMetadata
                 | ActionClassRisk::WorkspaceDagMetadata
+                | ActionClassRisk::GeneratedWorkspaceDagMetadata
         ) || immutable_leaf == Some(RemoteDependencyOutputClass::Metadata);
         if !(policy.admits_class(risk)
             || immutable_leaf.is_some_and(|class| {
@@ -814,6 +830,8 @@ fn verify_graph(
                     | ActionClassRisk::ImmutableDagMetadata
                     | ActionClassRisk::WorkspaceDagRlib
                     | ActionClassRisk::WorkspaceDagMetadata
+                    | ActionClassRisk::GeneratedWorkspaceDagRlib
+                    | ActionClassRisk::GeneratedWorkspaceDagMetadata
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -1030,6 +1048,25 @@ pub(crate) mod tests {
             )
         }
 
+        pub(crate) fn prepare_generated_dag(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            self.prepare_dag(
+                tag,
+                parents,
+                outputs,
+                if metadata {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                } else {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                },
+            )
+        }
+
         pub(crate) fn prepare_dag(
             &self,
             tag: u8,
@@ -1046,6 +1083,12 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
                 CommittedDependencyPolicy::WorkspaceDagMetadata => {
                     LIVE_WORKSPACE_DAG_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                    LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                    LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
                 }
                 _ => panic!("DAG fixture requires an independently keyed DAG policy"),
             };
@@ -1123,6 +1166,8 @@ pub(crate) mod tests {
             manifest.key_epoch = key_epoch.unwrap_or(match class {
                 LIVE_GENERATED_WORKSPACE_RLIB_CLASS => 26,
                 LIVE_GENERATED_WORKSPACE_METADATA_CLASS => 27,
+                LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => 28,
+                LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 29,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 _ => manifest.key_epoch,
@@ -2486,6 +2531,209 @@ pub(crate) mod tests {
             );
             fixture.assert_unpublished(&later);
         }
+    }
+
+    #[test]
+    fn generated_dag_replay_and_ordinary_consumers_recheck_transitive_producers() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, _b, _c, d] = immutable_dag_chain(&fixture, metadata);
+            let outputs = |metadata_name, archive_name, bytes| {
+                let mut outputs = vec![(metadata_name, OutputRole::ProvisionalMetadata, bytes)];
+                if !metadata {
+                    outputs.push((archive_name, OutputRole::Materializable, bytes));
+                }
+                outputs
+            };
+            let generated = fixture.prepare_generated_dag(
+                111,
+                vec![consumes(&d)],
+                &outputs("libe.rmeta", "libe.rlib", b"generated E".as_slice()),
+                metadata,
+            );
+            fixture.commit(&generated);
+            let dependent = fixture.prepare_generated_dag(
+                112,
+                vec![consumes(&generated), consumes(&d)],
+                &outputs("libf.rmeta", "libf.rlib", b"generated F".as_slice()),
+                metadata,
+            );
+            fixture.commit(&dependent);
+            let workspace_policy = if metadata {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            } else {
+                CommittedDependencyPolicy::WorkspaceDagRlib
+            };
+            let ordinary = fixture.prepare_dag(
+                113,
+                vec![consumes(&dependent), consumes(&generated), consumes(&d)],
+                &outputs("libg.rmeta", "libg.rlib", b"ordinary G".as_slice()),
+                workspace_policy,
+            );
+            fixture.commit(&ordinary);
+            for producer in [&generated, &dependent] {
+                for policy in [
+                    CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                ] {
+                    fixture
+                        .coord
+                        .verify_committed_dependencies(&[witness(producer)], policy)
+                        .unwrap();
+                }
+                for policy in [
+                    CommittedDependencyPolicy::WorkspaceRlib,
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                    CommittedDependencyPolicy::MixedWorkspaceRlib,
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                    CommittedDependencyPolicy::ImmutableDagRlib,
+                    CommittedDependencyPolicy::ImmutableDagMetadata,
+                ] {
+                    assert!(
+                        fixture
+                            .coord
+                            .verify_committed_dependencies(&[witness(producer)], policy)
+                            .is_err()
+                    );
+                }
+            }
+            let unsampled = fixture.root.path().join("generated-dag-unsampled");
+            assert!(matches!(
+                fixture.replay(&dependent, &unsampled, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                ))
+            ));
+            assert!(!unsampled.exists());
+            for (offer, name, bytes) in [
+                (&dependent, "libf.rmeta", b"generated F".as_slice()),
+                (&ordinary, "libg.rmeta", b"ordinary G".as_slice()),
+            ] {
+                fixture.compare_twice(offer);
+                let destination = fixture.root.path().join(name);
+                assert!(matches!(fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::Served { files }
+                        if files.len() == if metadata { 1 } else { 2 }));
+                assert_eq!(std::fs::read(destination.join(name)).unwrap(), bytes);
+            }
+            fixture.assert_unsampled(&generated);
+            fixture.assert_unsampled(&d);
+
+            fixture.quarantine(&a.manifest.action_key);
+            for (offer, name) in [
+                (&dependent, "generated-revoked"),
+                (&ordinary, "ordinary-revoked"),
+            ] {
+                let refused = fixture.root.path().join(name);
+                assert!(matches!(fixture.replay(offer, &refused, None).unwrap(),
+                    ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                        if reason.contains(&digest_key(&a.manifest.action_key))));
+                assert!(!refused.exists());
+            }
+            let later = fixture.prepare_generated_dag(
+                114,
+                vec![consumes(&ordinary)],
+                &outputs("liblater.rmeta", "liblater.rlib", b"later".as_slice()),
+                metadata,
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&later, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key))
+            ));
+            fixture.assert_unpublished(&later);
+        }
+    }
+
+    #[test]
+    fn generated_dag_classes_require_parents_and_preserve_metadata_only_authority() {
+        let fixture = WorkspaceLineageFixture::new();
+        for (tag, class) in [
+            (115, LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS),
+            (116, LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS),
+        ] {
+            let orphan = fixture.prepare_class(
+                tag,
+                Vec::new(),
+                &[(
+                    "liborphan.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"orphan",
+                )],
+                class,
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&orphan, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains("lacks bounded producer ancestry")
+            ));
+            fixture.assert_unpublished(&orphan);
+        }
+
+        let [_a, _b, _c, d] = immutable_dag_chain(&fixture, true);
+        let generated = fixture.prepare_generated_dag(
+            117,
+            vec![consumes(&d)],
+            &[(
+                "libe.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated E",
+            )],
+            true,
+        );
+        fixture.commit(&generated);
+        for policy in [
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+        ] {
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(&generated)], policy)
+                    .is_err()
+            );
+        }
+        let consumer = fixture.prepare_generated_dag(
+            118,
+            vec![consumes(&generated)],
+            &[(
+                "libf.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated F",
+            )],
+            true,
+        );
+        fixture.commit(&consumer);
+        fixture.compare_twice(&consumer);
+        // A stale class receipt must not conceal a missing generated producer
+        // graph, even when the consumer has already earned replay samples.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE provisional_ancestry SET consumer_action_key = ?1 WHERE consumer_action_key = ?2",
+            &[
+                SqlValue::Text("explicit-generated-test-orphan".into()),
+                SqlValue::Text(digest_key(&generated.manifest.action_key)),
+            ],
+        ).unwrap(), 1);
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&generated)],
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("inconsistent class ancestry"), "{reason}");
+        let refused = fixture.root.path().join("generated-dag-without-ancestry");
+        assert!(matches!(fixture.replay(&consumer, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("inconsistent class ancestry")));
+        assert!(!refused.exists());
     }
 
     #[test]

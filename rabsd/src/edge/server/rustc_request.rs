@@ -693,6 +693,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
         ] {
             let candidate = match policy {
                 CommittedDependencyPolicy::WorkspaceRlib => {
@@ -700,6 +702,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 }
                 CommittedDependencyPolicy::WorkspaceMetadata => {
                     workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                    workspace_dependency_cache::plan_generated_workspace_dag_library(&plan)
                 }
                 CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                 | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {

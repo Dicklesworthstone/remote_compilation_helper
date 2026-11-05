@@ -10,6 +10,15 @@
 //! Workspace V2 contracts qualify each isolated compiler action independently
 //! of other project executors in its Cargo operation. Their local completion
 //! claims remain untrusted; immutable dependency DAG contracts are unchanged.
+//! Separately versioned generated workspace DAG classes additionally retain
+//! the complete own OUT_DIR and exact completed Cargo build-script record.
+
+mod generated;
+
+pub use generated::plan_generated_workspace_dag_library;
+pub(super) use generated::{
+    GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
+};
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
 use super::workspace_cache::validate_pure_workspace_rlib;
@@ -222,12 +231,19 @@ pub enum CommittedDependencyPolicy {
     /// Selected terminal check with complete committed producer ancestry,
     /// never a producer for another action, epoch 25.
     WorkspaceTerminalMetadata,
+    /// Workspace archive with complete own generated inputs and an exact
+    /// committed workspace/immutable producer DAG, epoch 28.
+    GeneratedWorkspaceDagRlib,
+    /// Closed workspace metadata with complete own generated inputs and an
+    /// exact committed workspace/immutable producer DAG, epoch 29.
+    GeneratedWorkspaceDagMetadata,
 }
 
 impl CommittedDependencyPolicy {
-    /// Original policy for existing committed workspace source classes. New
-    /// DAG policies require an explicit retained capability; a source kind
-    /// alone never selects them.
+    /// Required policy for source classes with a unique committed-input
+    /// contract. Pure workspace DAGs still share the older mixed source scope
+    /// and need an explicit policy capability. Identifying any expected policy,
+    /// including a generated DAG, never supplies that retained capability.
     #[must_use]
     pub const fn from_source_kind(kind: DependencySourceKind) -> Option<Self> {
         match kind {
@@ -235,6 +251,12 @@ impl CommittedDependencyPolicy {
             DependencySourceKind::WorkspaceCommittedMetadata => Some(Self::WorkspaceMetadata),
             DependencySourceKind::WorkspaceMixedRlib => Some(Self::MixedWorkspaceRlib),
             DependencySourceKind::WorkspaceMixedMetadata => Some(Self::MixedWorkspaceMetadata),
+            DependencySourceKind::WorkspaceGeneratedDagRlib => {
+                Some(Self::GeneratedWorkspaceDagRlib)
+            }
+            DependencySourceKind::WorkspaceGeneratedDagMetadata => {
+                Some(Self::GeneratedWorkspaceDagMetadata)
+            }
             // The source kind requires a retained policy capability. Only that
             // capability may select the separately qualified empty-input class.
             DependencySourceKind::WorkspaceTerminalMetadata => {
@@ -252,13 +274,15 @@ impl CommittedDependencyPolicy {
             Self::WorkspaceRlib
             | Self::MixedWorkspaceRlib
             | Self::ImmutableDagRlib
-            | Self::WorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
+            | Self::WorkspaceDagRlib
+            | Self::GeneratedWorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
             Self::WorkspaceMetadata
             | Self::MixedWorkspaceMetadata
             | Self::ImmutableDagMetadata
             | Self::WorkspaceDagMetadata
             | Self::WorkspaceTerminalLeafMetadata
-            | Self::WorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
+            | Self::WorkspaceTerminalMetadata
+            | Self::GeneratedWorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
@@ -269,6 +293,9 @@ impl CommittedDependencyPolicy {
     /// A different source/mode, noncanonical layout, or unsupported inputs.
     pub fn validate_plan(self, plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
         match self {
+            Self::GeneratedWorkspaceDagRlib | Self::GeneratedWorkspaceDagMetadata => {
+                generated::validate_plan(plan, self)
+            }
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
             Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
@@ -393,6 +420,8 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
             Some(&WORKSPACE_TERMINAL_LEAF_METADATA)
         }
         CommittedDependencyPolicy::WorkspaceTerminalMetadata => Some(&WORKSPACE_TERMINAL_METADATA),
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => Some(&generated::RLIB),
+        CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => Some(&generated::METADATA),
         _ => None,
     }
 }
@@ -747,6 +776,10 @@ pub fn remote_committed_dependency_shape(
 ) -> Result<(), RemoteDependencyRefusal> {
     policy.validate_plan(plan)?;
     match policy {
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+            generated::shape(plan, policy, directories, dependencies, toolchain_root)
+        }
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
         | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
             remote::remote_execution_shape(plan, directories, toolchain_root)?;
@@ -978,6 +1011,8 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::WorkspaceDagMetadata,
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
         CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -999,12 +1034,13 @@ pub fn committed_dependency_descriptor_policy(
 /// invalid or predates the current workspace policy. Coordinators use this
 /// after exact classification so retired V1 evidence cannot fall through to
 /// generic immutable-dependency authority after an epoch or class alteration.
-/// Closed workspace leaf epochs 16/17 have no producer capability and are
-/// deliberately handled by their separate exact leaf-profile recognizer.
+/// Closed workspace leaf epochs 16/17 and generated leaf epochs 26/27 have no
+/// producer capability and are handled by their separate exact recognizer.
 #[must_use]
 pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> bool {
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
+        || (28..=29).contains(&descriptor.key_epoch)
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1021,6 +1057,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
                 "rabs.canonical-workspace-committed-dag-metadata.",
                 "rabs.canonical-workspace-terminal-leaf-metadata.",
                 "rabs.canonical-workspace-terminal-metadata.",
+                "rabs.canonical-workspace-generated-dag-rlib.",
+                "rabs.canonical-workspace-generated-dag-metadata.",
             ]
             .into_iter()
             .any(|prefix| domain.starts_with(prefix))
@@ -1032,6 +1070,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
             &WORKSPACE_DAG_METADATA,
             &WORKSPACE_TERMINAL_LEAF_METADATA,
             &WORKSPACE_TERMINAL_METADATA,
+            &generated::RLIB,
+            &generated::METADATA,
         ]
         .into_iter()
         .any(|contract| {
@@ -1173,6 +1213,24 @@ pub fn remote_committed_dependency_key(
     retained_toolchain_sha256: &[u8; 32],
     runtime: &TypedDigest,
 ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+    if matches!(
+        policy,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+    ) {
+        return generated::key(
+            plan,
+            policy,
+            toolchain,
+            directories,
+            dependencies,
+            inputs,
+            build_script_output,
+            toolchain_root,
+            retained_toolchain_sha256,
+            runtime,
+        );
+    }
     remote_committed_dependency_shape(plan, policy, directories, dependencies, toolchain_root)?;
     if matches!(
         policy,

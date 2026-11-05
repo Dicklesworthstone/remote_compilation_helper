@@ -1107,6 +1107,8 @@ impl CanonicalPaths {
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -2574,17 +2576,22 @@ mod tests {
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let archive = matches!(
                 policy,
                 CommittedDependencyPolicy::ImmutableDagRlib
                     | CommittedDependencyPolicy::WorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             );
             let workspace = matches!(
                 policy,
                 CommittedDependencyPolicy::WorkspaceDagMetadata
                     | CommittedDependencyPolicy::WorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             );
             let mut parent_outputs =
                 vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
@@ -2610,8 +2617,20 @@ mod tests {
             );
             fixture.commit(&immutable);
             let offer = if workspace {
-                let offer =
-                    fixture.prepare_dag(82, vec![parent_dependency(&immutable)], &outputs, policy);
+                let offer = if matches!(
+                    policy,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                ) {
+                    fixture.prepare_generated_dag(
+                        82,
+                        vec![parent_dependency(&immutable)],
+                        &outputs,
+                        !archive,
+                    )
+                } else {
+                    fixture.prepare_dag(82, vec![parent_dependency(&immutable)], &outputs, policy)
+                };
                 fixture.commit(&offer);
                 offer
             } else {
@@ -2656,6 +2675,26 @@ mod tests {
                 .capture_committed_inputs(&restarted, Arc::clone(&candidates), policy)
                 .unwrap();
             inputs.verify_for_policy(policy).unwrap();
+            if matches!(
+                policy,
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+            ) {
+                let ordinary = if archive {
+                    CommittedDependencyPolicy::WorkspaceDagRlib
+                } else {
+                    CommittedDependencyPolicy::WorkspaceDagMetadata
+                };
+                restored
+                    .capture_committed_inputs(&restarted, Arc::clone(&candidates), ordinary)
+                    .unwrap()
+                    .verify_original()
+                    .unwrap();
+                assert!(
+                    inputs.verify_for_policy(ordinary).is_err(),
+                    "a generated consumer capability changed classes after restoration"
+                );
+            }
             for legacy in [
                 CommittedDependencyPolicy::WorkspaceRlib,
                 CommittedDependencyPolicy::WorkspaceMetadata,
@@ -3351,6 +3390,7 @@ mod tests {
         for producer_policy in [
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let parent = fixture.commit_immutable_leaf(
@@ -3361,25 +3401,34 @@ mod tests {
                 ],
                 false,
             );
-            let offer = fixture.prepare_dag(
-                63,
-                vec![parent_dependency(&parent)],
-                &[
-                    (
-                        "libupstream.rmeta",
-                        OutputRole::ProvisionalMetadata,
-                        METADATA,
-                    ),
-                    ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
-                ],
-                producer_policy,
-            );
-            fixture.commit(&offer);
+            let outputs = [
+                (
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                ),
+                ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
+            ];
+            let offer = if producer_policy == CommittedDependencyPolicy::GeneratedWorkspaceDagRlib {
+                fixture.prepare_generated_dag(63, vec![parent_dependency(&parent)], &outputs, false)
+            } else {
+                fixture.prepare_dag(
+                    63,
+                    vec![parent_dependency(&parent)],
+                    &outputs,
+                    producer_policy,
+                )
+            };
             let original = paths().require_closed_dependency_execution().unwrap();
             assert!(original.require_local_capture().is_err());
             let metadata = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
             let metadata_path = metadata.path.clone();
             let generation = metadata.sig;
+            assert!(
+                register(&original, &fixture, &offer, std::slice::from_ref(&metadata)).is_err()
+            );
+            assert!(original.committed_outputs.0.lock().unwrap().is_empty());
+            fixture.commit(&offer);
             register(&original, &fixture, &offer, &[metadata]).unwrap();
             let head = original
                 .capture_committed_inputs(
@@ -3403,7 +3452,7 @@ mod tests {
                     "existing policy {policy:?} must not silently admit a new DAG producer"
                 );
             }
-            if producer_policy == CommittedDependencyPolicy::WorkspaceDagRlib {
+            if producer_policy != CommittedDependencyPolicy::ImmutableDagRlib {
                 for policy in [
                     CommittedDependencyPolicy::ImmutableDagRlib,
                     CommittedDependencyPolicy::ImmutableDagMetadata,

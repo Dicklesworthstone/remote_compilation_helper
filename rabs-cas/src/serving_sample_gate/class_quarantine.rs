@@ -31,6 +31,8 @@ const IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
 const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
 const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
+const GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
+const GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-generated-dag-metadata-v1";
 const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v2";
 const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 
@@ -129,6 +131,12 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == WORKSPACE_DAG_METADATA_CLASS => {
                 WORKSPACE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
+                GENERATED_WORKSPACE_DAG_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
+                GENERATED_WORKSPACE_DAG_METADATA_CLASS
             }
             [SqlValue::Text(class)] if class == WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
@@ -668,6 +676,14 @@ mod tests {
                 ActionClassRisk::WorkspaceDagMetadata,
             ),
             (
+                GENERATED_WORKSPACE_DAG_RLIB_CLASS,
+                ActionClassRisk::GeneratedWorkspaceDagRlib,
+            ),
+            (
+                GENERATED_WORKSPACE_DAG_METADATA_CLASS,
+                ActionClassRisk::GeneratedWorkspaceDagMetadata,
+            ),
+            (
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 ActionClassRisk::WorkspaceTerminalLeafMetadata,
             ),
@@ -696,6 +712,8 @@ mod tests {
                 IMMUTABLE_DAG_METADATA_CLASS,
                 WORKSPACE_DAG_RLIB_CLASS,
                 WORKSPACE_DAG_METADATA_CLASS,
+                GENERATED_WORKSPACE_DAG_RLIB_CLASS,
+                GENERATED_WORKSPACE_DAG_METADATA_CLASS,
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 WORKSPACE_TERMINAL_METADATA_CLASS,
             ]
