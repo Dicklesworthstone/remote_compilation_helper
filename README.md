@@ -336,6 +336,12 @@ rch capabilities --json
 rch robot-docs guide
 ```
 
+RABS offers an experimental, opt-in worker-local dependency cache through
+`cargo rabs --rabs-remote check`. See the [setup and measured validation
+boundaries](docs/rabs-rch-worker-cache.md) before enabling it. Correct cache
+serving has passed real Cargo/SSH tests; practical acceleration remains under
+qualification.
+
 ### Named Cargo JSON for installer consumers
 
 An installer selecting explicit binary targets can request caller-visible

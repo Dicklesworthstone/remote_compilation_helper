@@ -2,6 +2,186 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
+**Active qualification checkpoint, November5 at19:47UTC:**
+
+- [x] Retain ad13d607 FAILURE: all783 core/RABS/regression tests pass, API
+  277/280pass/3fail/0ignored,266.15s; all1758 source/control aftermatch.
+  All3 failures are unchanged history-reaping ownership guard refusing
+  fixture0664 under observedumask0002 (15 retained matching fixtures audited).
+  No assumption that these were environmental or an optimization failure.
+- [x] Observe API test using actual shared job-leases, then finishing naturally.
+  Identity-fenced cancellation found PID already absent BEFORE opening pidfd:
+  NO signal sent. No shared-history loss established. Preserve failed receipts.
+- [x] Manual repair: valid journal fixtures explicit0600; census directory
+  bound to DaemonContext at launch using SAME default resolution; test contexts
+  get private roots. New real two-context/fresh-journal/malformed isolation test.
+  No reaping/inode/bytes/permission/retention/assertion predicate relaxed.
+- [x] Freeze B5source b5dba07c,1758files/tar66375680B. RABS dependency closure
+  EXACT genuine b1bc production inputs; additional differences are only
+  rch hook tests plus rchd api/main/cancellation. Normal ALL7/bothTLS b1bc
+  artifact stays authentic, never relabeled current RCH production.
+- [x] Retire failed bcd source non-destructively after ALL1758 hashes/process
+  quiescence: source-metadata-privatecopy-apifmt-20261105-retired-ad13d607.
+  Reuse canonical build pathname for B5; preserve unchanged bytes/mtimes and
+  advance changed-file mtimes so Cargo honestly rebuilds. Retirement receipt
+  in job-metadata-privatecopy-lease-quality-20261105/source-retirement.json.
+- [ ] B5 full quality RUNNING, control7547B/abc1f3cb, source b5dba07c.
+  Fmt actual0/16.09s; fullworkspacecheck in progress. SAME original3600s,
+  normal profiles/pins/jobs1, ALL9 inventories/zeroignored and compiler gates.
+  Runner also uses private RCH/XDG/socket state, never a substituted HOME.
+- [ ] Local per-context scan-permit follow-up is NOT qualified yet. Context
+  clones share the same one-scan quota; independent daemon contexts do not
+  interfere. Extend the same isolation regression with held-permit refusal
+  through a clone and independent-context progress. It changes only RCHd,
+  outside b1bc RABS dependency closure. Full latest-source gates remain required
+  before committing/pushing this follow-up; no current-head green claim.
+- [ ] After B5terminal0, run genuine b1bc RABS comparison/public probes using
+  exact B5proof. Preserve RABS and unrelated RCH qualification boundaries.
+  Comparator now16980B/97062a25/inode26183/dev191; public29208B/5107f556/
+  inode14105346/dev49. Older UNUSED controls preserved via rename.
+- [x] Refresh UNUSED relay: canonical SSH rename timed out; dependent copy
+  correctly refused existing0400 file. Preserve old08b9 via confirmed rename,
+  then copy/verify new2053B/2f284974/0400 sequentially. It expects comparator
+  97062a25/inode26183. Public config now pins29208B/5107f556/inode14105346.
+  No workload executed; all readiness/performance/ownership gates unchanged.
+- [ ] Real SAME-invocation old/new/stock, exact8serves/all11fresh/all8bytes,
+  complete trace coverage, then PUBLIC exact8commit/2x8verify/8serve plus
+  ALL6 ACK/all4release. Fresh reservation only AFTER qualification; no peer
+  cancellation/timeout/policy changes. Include population cost/break-even.
+- [ ] Qualify latest scan-permit follow-up, review final UBS vs baseline,
+  fresh ownership guards, commit only owned changes, push main and legacy mirror.
+  M6/fleet/native/Mac acceptance remains open; no closes or wins claimed.
+
+**Build/check checkpoint, November5 at17:49UTC (work ongoing):**
+
+- [x] Genuine normal combined ALL7/BOTH TLS prebuild b1bc: DSRb3ba3c4a
+  success0/1346s (Cargo1339s). All1758 inputs/control aftermatch. Candidate
+  rabsd8178704B/a362888a; optz/LTO/strip and ring+aws_lc_rs unchanged.
+- [x] Preserve original current-head E0716 failure DSRdfcb2894. Manual
+  tests.rs lifetime binding keeps every existing assertion; cfg(test)-only.
+- [x] Corrected846 quality DSRd6654e8e FAIL: fmt0/14.657s, fullworkspace
+  alltargets check0/551.487s, strictClippy101/104.634s. Existing current-head
+  ApiRequest ReleaseWorker520B exceeded enum variant lint; zero tests ran
+  after failfast. All1758 inputs/control aftermatch; never report green.
+- [x] Manual api.rs repair under lease1928: box ReleaseWorker at parser,
+  unbox before unchanged handler/tests. No lint allow, protocol/assertion,
+  ownership/release/refusal gate or RABS dependency change.
+- [x] Freeze1758-file9a7e9ead source/control6625B/b28c4afb, preserving actual
+  b1bc production provenance. Only additional differences tests.rs/api.rs;
+  rabsd dependency closure still exact. Do not relabel b1bc rchd API-fixed.
+- [x] Preserve9a DSR3926fa72 fmtFAIL1/17.15s: two API line wraps; no
+  compiler/tests ran. Apply exact rustfmt line wraps manually, freeze bcdcd250
+  (same1758files). Fullquality control6625B/fdca5f1f; original9a retained.
+- [x] Fullbcd compiler gates PASS: fmt0/16.44s, workspace/alltargets check0/
+  666.88s and strictClippy0/679.03s. No lint suppression or threshold change.
+- [x] Preserve DSR25750882 TIMEOUT at unchanged3600s: first CLI test executable
+  cold build2021.44s, then82SSH0/84.40s,501key0/3.78s,4realrustc0/2.57s.
+  Exactly587 tests/zero ignored passed; selector was compiling, six suites
+  remain UNRUN. This is NOT whole qualification success. Post-timeout audit
+  confirms all1758 inputs/control unchanged and no owned processes active.
+  Preserve results/TMP by rename to *-timeout-25750882; no deletion/overwrite.
+- [ ] SAME frozenbcd source/control/full9-suites gate retry RUNNING, SAME
+  original3600s deadline/normal profiles/pins/flags/jobs1; reuse normal Cargo
+  artifacts, rerun ALL compiler gates and all tests. Count repeated tests ONCE
+  in eventual successful invocation. No gate relaxed or result relabeled.
+  Retry now passes fmt16.25s/check1.80s/strictClippy1.93s and ALL751 core
+  tests (82/501/4/164, zero ignored). Selector cold executable502.86s,
+  actual164tests2.27s. RABS adapter/regression/API inventories still pending.
+- [x] UBS source+test raw1:4critical/3497warning/2114info, EXACT unchanged
+  HEAD-baseline counts; all4 are existing shell fixture calls. API scan and
+  baseline both0critical/1991warning/656info. No scanner-clean claim/suppression.
+- [ ] After quality0, privately install genuine candidate and freeze old/new
+  balanced live comparison with ordinary Cargo incumbent in SAME invocation.
+  Require all9 fresh targets, all11 units/8 registry bytes, actual8serves,
+  old FICLONE positive/new zero; fenced own-daemon lifecycle and full after-audit.
+  Check trace coverage/positive activity against each warmup duration before
+  inferring that zero observed calls covers its complete materialization.
+- [ ] Then public RCH cache4/full-project stock comparison with ACK/all4release.
+  Prior23% loss remains; no useful/fleet/native-M6/release qualification yet.
+- [ ] From that SAME-invocation public result, report first-three-round
+  population/verification cost and whole-workload warm-run break-even against
+  ordinary RCH. A warm-only win cannot establish practical net benefit.
+- [x] README exposes opt-in profile; revise existing worker-cache guide to
+  replace stale unavailable-Rust/GitHub-workflow claims with observed DSR
+  functional proof AND23% performance loss. Current optimization stays pending.
+- [x] Read-only Mac attribution: old NFS stage has Cargo package-cache and Git
+  checkout state, without registry/src or target artifacts. Investigate dependency
+  preparation rather than infer Cargo never ran from absent compiler output.
+- [x] Check configured alternate mminiold: reachable, pinned08-31 installed,
+  32GiB RAM/51%free/no build processes. Its configured ExtData mount is absent.
+  Existing APFS image passes SBH20G, but physical USB backing FAILS unchanged
+  threshold14% (7.488%free/1.198TB). Do not use child image to hide physical
+  pressure; no Mac build/threshold/config/deletion action taken.
+
+**Measured lever and active builds, November5 at17:14UTC:**
+
+- [x] Worker/Cargo diagnostic DSR96bd70a4 completed0/63s: six Cargo0,
+  all11fresh/all8stock-equal; FOUR candidates each8hit8serve/execute0.
+  Stock5.9758/5.9264s, candidates10.4337(traced)/8.9332/9.6835/8.8828s.
+  Still a performance LOSS. Daemon-only trace omitted relevant syscalls;
+  do not mistake overlapping Cargo-family wait totals for wall time.
+- [x] Request/reply DSR66efb23e completed0/48s: three Cargo0, exact8serves,
+  all11fresh/all8equal/inputs+tools unchanged/every daemonthread detached.
+  Locate the wait AFTER hit acceptance and BEFORE metadata notification.
+- [x] Full syscall DSR4d688c05 completed0/57s: three Cargo0, exact8serves,
+  all11fresh/all8equal/inputs+tools unchanged/every daemonthread detached.
+  Actual FICLONE request0x40049409:32calls/4.764249s/max0.595589s;
+  remaining17ioctls0.000260s. fsync32/0.880734s;statx42204/0.773054s.
+  Byte-pointer-only traces retain no frame/environment payloads. This proves
+  a CoW materialization bottleneck; SQLite/runtime speculation is unproved.
+  Original16:54+30min reservation ended4858; sharedfreshhealthy/used0/active0.
+- [x] ONE manual runtime edit under lease1922: output_install.rs selects the
+  EXISTING verified PrivateCopy path for metadata/dep-info-only output sets.
+  Sets containing archive payloads keep verified CoW. No threshold, cached
+  probe, assertion, hashing, authority, custody, sampling or durability change.
+  Ordering/tie-breaking/RNG stay exact; every private staged byte is still
+  hashed and the same input/installation guards apply. Expected byte identity
+  must still be proved by the live comparison. Impact4*confidence5/effort1=20;
+  score is prioritization only, not a speed result. UBSraw0/critical0/warnings190.
+- [x] Freeze CURRENT committed4d7927d3 plus that ONE code overlay:1758files,
+  tar66375680B/b1bc1700; output_install50893B/d39c0705. RABS/Cargo/toolchain/
+  config dependency closure compared byte-for-byte to prior3f: ONLY that file
+  differs. Existing e019 daemon remains authentic incumbent, not relabeled.
+- [ ] DSR normal combined ALL7/BOTH TLS prebuild RUNNING (control4398B/cd190c5e).
+- [ ] DSR full quality RUNNING (control5484B/ba102bec): fmt already actual0/
+  15.10s; full workspace/alltargets check, strictClippy, >=751 prior core tests
+  plus existing output-install/metadata-replay/handshake inventories pending.
+- [ ] After BOTH terminal0 and source/control/tool after-audits, install candidate
+  privately and run old/new in SAME comparison invocation. Keep the same cache
+  origin and real mandatory verification evidence; stop only verified own idle
+  daemons via process identity fencing. Record startup/warmup separately, include
+  all costs in evidence, fresh targets/all11/all8byte checks/actual8serves.
+- [ ] Rerun genuine public cache4 and full-project live-stock comparison; require
+  every ACK/all4release. No useful/fleet/release/M6 closure before its evidence.
+
+**Attribution checkpoint, November5 at16:48UTC (work ongoing):**
+
+- [x] Full public functional-pass/performance-loss receipt pinned:
+  DSR682dd5d8 completed0;9635892B/f65bae60. Prior23% loss remains a loss.
+- [x] Preserve DSRb597592b public profiling FAILURE: ordinary-RCH stock sync
+  hit unchanged81000ms limit, CLI103/job30096584700067841 terminal1/ACK/
+  all4release/execution_started=false. ZERO RABS/trace runs. Source/tool/control
+  aftermatch, privatequiet/exit0, END4803/sharedfreshhealthy0. No timeout change.
+- [x] Preserve worker-local diagnostic failures: DSR122422ba operator quoting
+  SyntaxError before workload; corrected relay DSRb61186d7 correctly FAILS its
+  warm-cache premise. Stock7.579s; actual candidate103.448s/execute8+commit8,
+  served0. ALL11fresh/ALL8metadata stockequal/source+tools unchanged. Daemon
+  CPU1.37s over103.47s, insufficient to identify the waiting cause. INT/I1
+  collector emitted attach lines without a summary; all daemonthreads freshly
+  proved TracerPid0. END4822/sharedfreshhealthy0. No optimization credit.
+- [x] Collector control: TERM/I2/explicit output produces actual syscall
+  summary on own idle daemon and proves every thread detached. Read upstream
+  SQLite WAL/FULL durability documentation and actual bundled SQLite3.53.2;
+  production code/storage/policy unchanged. Do not infer the bottleneck yet.
+- [ ] DSR worker-cache-profile-cont (START4828) follows the eight ACTUAL new
+  commitments, with two mandatory8/8 verification rounds before two8/8 serves,
+  both live stock comparators, six fresh targets/ALL11fresh/ALL8byte equality.
+  First verification95.157s actual; second pending. Trace only real serves,
+  summary-only wall-time I/O, original300s Cargo/SBH20G/30min cutoff. Worker-side
+  diagnostic scope is distinct from public RCH qualification and utility wins.
+- [ ] Obtain ranked syscall evidence, then choose ONE measured lever; full
+  durability, sampling, input/source authority and compiler gates stay binding.
+
 **Latest execution checkpoint, November5 at16:22UTC (November5 local):**
 
 - [x] RABS PUBLIC ORIGINAL cache4 genuinely PASSES, DSR e89442c3 terminal0:

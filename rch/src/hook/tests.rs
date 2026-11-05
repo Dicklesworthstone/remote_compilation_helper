@@ -9263,7 +9263,8 @@ fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
     assert_eq!(cold_disk_retry_gib(&error, &worker, true, false), Some(105));
     assert_eq!(cold_disk_retry_gib(&error, &worker, false, false), None);
     assert_eq!(cold_disk_retry_gib(&error, &worker, true, true), None);
-    let faults = remote_release_faults(&Err(anyhow::Error::new(refusal.clone())), &worker.id);
+    let result = Err(anyhow::Error::new(refusal.clone()));
+    let faults = remote_release_faults(&result, &worker.id);
     assert!(
         !faults.worker_fault,
         "a changed pool is not an unhealthy worker"

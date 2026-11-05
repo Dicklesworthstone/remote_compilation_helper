@@ -520,13 +520,22 @@ pub(super) fn select_for_install(
     store: &mut dyn RabsMetadataStore,
     plan: &PreparedOutputs,
 ) -> Result<SelectedActionOutputs, ServeError> {
-    SelectedActionOutputs::select(
-        store,
-        &plan.outputs,
-        MaterializationMode::VerifiedCowReflink,
-        plan.freshness,
-    )
-    .map_err(ServeError::Materialize)
+    // Metadata-only results need prompt delivery. Probing CoW isolation and
+    // cloning each metadata file can cost more than copying its bytes.
+    // PrivateCopy still hashes every staged byte and retains the same guards.
+    // Keep verified CoW available for output sets containing archive payloads.
+    let mode = if plan.outputs.iter().all(|output| {
+        matches!(
+            output.role,
+            OutputRole::ProvisionalMetadata | OutputRole::DepInfo
+        )
+    }) {
+        MaterializationMode::PrivateCopy
+    } else {
+        MaterializationMode::VerifiedCowReflink
+    };
+    SelectedActionOutputs::select(store, &plan.outputs, mode, plan.freshness)
+        .map_err(ServeError::Materialize)
 }
 
 #[allow(clippy::result_large_err)]

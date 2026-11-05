@@ -21,9 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::RestartAdmissionResponse;
 use rch_common::job_identity::journal::{JobJournalGate, read_lease_bytes};
-use rch_common::job_identity::{
-    DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
-};
+use rch_common::job_identity::{DurableJobLease, LOCAL_WRAPPER_ID_PREFIX};
 use rch_common::process_identity::{OwnerPresence, ProcessIdentity, owner_presence};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
@@ -124,7 +122,7 @@ enum ApiRequest {
         /// Resume only an identity-matched durable queue row from a prior daemon.
         resume_queued: bool,
     },
-    ReleaseWorker(ReleaseRequest),
+    ReleaseWorker(Box<ReleaseRequest>),
     RecordBuild {
         worker_id: WorkerId,
         project: String,
@@ -848,7 +846,8 @@ async fn handle_connection_with_metrics(
             };
             (selection_response_json(&response)?, "application/json")
         }
-        Ok(ApiRequest::ReleaseWorker(mut request)) => {
+        Ok(ApiRequest::ReleaseWorker(request)) => {
+            let mut request = *request;
             metrics::inc_requests("release-worker");
             // Read optional JSON body line for timing breakdown
             // Use a short timeout to avoid blocking when no body is sent
@@ -1819,7 +1818,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             }),
             "Disk observation requires a valid peak and explicit release exit code"
         );
-        return Ok(ApiRequest::ReleaseWorker(ReleaseRequest {
+        return Ok(ApiRequest::ReleaseWorker(Box::new(ReleaseRequest {
             worker_id: rch_common::WorkerId::new(worker_id),
             slots,
             build_id,
@@ -1836,7 +1835,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_live_checkout_refused,
             worker_source_busy,
             worker_source_topology_mismatch,
-        }));
+        })));
     }
 
     if let Some(query) = query_for_exact_route(path, "/record-build") {
@@ -3621,15 +3620,16 @@ pub(crate) async fn recover_restart_admission(ctx: &DaemonContext) {
     }
 }
 
-async fn bounded_client_lease_scan() -> Result<Vec<String>> {
+async fn bounded_client_lease_scan(ctx: &DaemonContext) -> Result<Vec<String>> {
     // Retain the permit inside the blocking task even if a caller times out.
     // A stuck filesystem therefore cannot create an unbounded pile of scans.
-    static SCANS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
-        std::sync::OnceLock::new();
-    let scans = SCANS
-        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone();
-    run_bounded_client_lease_scan(scans, Duration::from_secs(3), nonterminal_client_lease_ids).await
+    let lease_dir = ctx.client_lease_dir.clone();
+    run_bounded_client_lease_scan(
+        ctx.client_lease_scans.clone(),
+        Duration::from_secs(3),
+        move || scan_client_leases(&lease_dir),
+    )
+    .await
 }
 
 async fn run_bounded_client_lease_scan(
@@ -3658,7 +3658,7 @@ async fn admission_response(
     include_leases: bool,
 ) -> RestartAdmissionResponse {
     let scan = if include_leases {
-        bounded_client_lease_scan().await
+        bounded_client_lease_scan(ctx).await
     } else {
         Ok(Vec::new())
     };
@@ -3867,12 +3867,6 @@ async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionRespon
 /// acknowledged by the daemon.  A malformed directory entry fails closed: a
 /// restart cannot claim a zero-state snapshot when durable evidence is
 /// unreadable.
-fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
-    scan_client_leases(&default_job_lease_directory())
-}
-
-/// The scan behind [`nonterminal_client_lease_ids`], parameterized on the
-/// directory so tests exercise it against a temp dir without env games.
 fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
     scan_client_leases_with(lease_dir, |_| Ok(()))
 }
@@ -5729,6 +5723,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: crate::test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(tokio::sync::RwLock::new(RestartAdmissionState::default())),
         }
     }
@@ -6742,7 +6738,7 @@ mod tests {
             };
             assert_eq!(receipt.disk_observation, Some(observation));
             assert!(parse_request(&format!("{line}&disk_observation={encoded}")).is_err());
-            handle_release_worker(&ctx, receipt).await.unwrap();
+            handle_release_worker(&ctx, *receipt).await.unwrap();
         }
         // The old total requires 102 + 10 GiB. A matched warm proof permits
         // 3 + 10 GiB on this fresh low-capacity observation instead.
@@ -6872,14 +6868,14 @@ mod tests {
             };
             let mut wrong_owner = receipt.clone();
             wrong_owner.local_wrapper_id = Some("rchw-other-owner".into());
-            assert!(handle_release_worker(&ctx, wrong_owner).await.is_err());
+            assert!(handle_release_worker(&ctx, *wrong_owner).await.is_err());
             assert_eq!(
                 ctx.history
                     .learned_footprint_gib(project, "cargo test --workspace"),
                 None,
             );
             assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 40);
-            handle_release_worker(&ctx, receipt).await.unwrap();
+            handle_release_worker(&ctx, *receipt).await.unwrap();
             assert_eq!(ctx.history.reserved_disk_headroom_gib("spare"), 0);
             assert_eq!(
                 ctx.history
@@ -8201,6 +8197,19 @@ mod tests {
         lease
     }
 
+    fn write_private_test_journal(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
     #[test]
     fn scan_reaps_only_nonblocking_stale_leases_and_reports_blockers() {
         let directory = tempfile::Builder::new()
@@ -8211,7 +8220,7 @@ mod tests {
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
         let write = |lease: &DurableJobLease| {
             let path = dir.join(format!("{}.json", lease.identity.local_wrapper_id));
-            std::fs::write(&path, serde_json::to_vec(lease).unwrap()).unwrap();
+            write_private_test_journal(&path, &serde_json::to_vec(lease).unwrap());
             path
         };
 
@@ -8436,13 +8445,13 @@ mod tests {
             };
             let path = directory.path().join(format!("{stem}.json"));
             let bytes = serde_json::to_vec(&lease).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
+            write_private_test_journal(&path, &bytes);
             let mut ordinary = make_test_lease(stale, 1);
             ordinary.acknowledge_terminal(stale);
             let ordinary_path = directory
                 .path()
                 .join(format!("{}.json", ordinary.identity.local_wrapper_id));
-            std::fs::write(&ordinary_path, serde_json::to_vec(&ordinary).unwrap()).unwrap();
+            write_private_test_journal(&ordinary_path, &serde_json::to_vec(&ordinary).unwrap());
 
             assert!(scan_client_leases(directory.path()).unwrap().is_empty());
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "{case}");
@@ -8528,7 +8537,7 @@ mod tests {
         let path = directory
             .path()
             .join(format!("{}.json", lease.identity.local_wrapper_id));
-        std::fs::write(&path, &bytes).unwrap();
+        write_private_test_journal(&path, &bytes);
         let gate = JobJournalGate::try_acquire(&path).unwrap().unwrap();
         let inode = gate.lock_metadata().unwrap().ino();
         assert!(scan_client_leases(directory.path()).unwrap().is_empty());
@@ -8733,6 +8742,59 @@ mod tests {
         assert!(!lease.terminal_acknowledged);
         assert!(!lease_blocks_restart(&lease, now, || OwnerPresence::Absent));
         assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Live));
+    }
+
+    #[tokio::test]
+    async fn restart_admission_scans_only_the_contexts_client_lease_directory() {
+        let first = make_test_context(WorkerPool::new());
+        let second = make_test_context(WorkerPool::new());
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let lease = make_test_lease(now, std::process::id());
+        let path = first
+            .client_lease_dir
+            .join(format!("{}.json", lease.identity.local_wrapper_id));
+        write_private_test_journal(&path, &serde_json::to_vec(&lease).unwrap());
+        let held = first
+            .client_lease_scans
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        assert!(
+            restart_admission_snapshot(&first.clone(), true)
+                .await
+                .client_lease_scan_error
+                .is_some_and(|error| error.contains("already in progress"))
+        );
+        assert!(
+            restart_admission_snapshot(&second, true)
+                .await
+                .client_lease_scan_error
+                .is_none()
+        );
+        drop(held);
+        assert_eq!(
+            restart_admission_snapshot(&first, true)
+                .await
+                .client_lease_ids,
+            vec![lease.identity.local_wrapper_id.clone()]
+        );
+        let isolated = restart_admission_snapshot(&second, true).await;
+        assert!(isolated.client_lease_ids.is_empty());
+        assert!(isolated.client_lease_scan_error.is_none());
+
+        write_private_test_journal(&first.client_lease_dir.join("broken.json"), b"{");
+        assert!(
+            restart_admission_snapshot(&first, true)
+                .await
+                .client_lease_scan_error
+                .is_some()
+        );
+        assert!(
+            restart_admission_snapshot(&second, true)
+                .await
+                .client_lease_scan_error
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -10425,8 +10487,10 @@ mod tests {
         else {
             panic!("release request expected")
         };
-        handle_release_worker(&ctx, request.clone()).await.unwrap();
-        handle_release_worker(&ctx, request).await.unwrap();
+        handle_release_worker(&ctx, (*request).clone())
+            .await
+            .unwrap();
+        handle_release_worker(&ctx, *request).await.unwrap();
         assert_eq!(worker.used_slots(), 0);
         assert!(ctx.history.active_build(build_id).is_none());
         assert!(ctx.history.has_terminal_build(build_id));
@@ -11564,7 +11628,7 @@ mod tests {
             };
             assert_eq!(request.worker_disk_full, flag);
             assert_eq!(request.worker_disk_roots, ["/build-volume/rch"]);
-            let result = handle_release_worker(&ctx, request.clone()).await;
+            let result = handle_release_worker(&ctx, (*request).clone()).await;
             let owned = request_worker == "worker1" && wrapper == "owner";
             assert_eq!(result.is_ok(), owned, "{request:?}: {result:?}");
             assert_eq!(worker.used_slots(), if owned { 0 } else { 2 });
@@ -11597,7 +11661,7 @@ mod tests {
                     !handle_ready(&ctx).await.workers_available,
                     "quarantined free slots must not advertise ready capacity"
                 );
-                handle_release_worker(&ctx, request).await.unwrap();
+                handle_release_worker(&ctx, *request).await.unwrap();
                 assert_eq!(
                     store.lock().await.get("worker1"),
                     Some(&before),
@@ -11668,7 +11732,7 @@ mod tests {
                 panic!("release request expected")
             };
             assert_eq!(request.worker_live_checkout_refused, flag);
-            let result = handle_release_worker(&ctx, request).await;
+            let result = handle_release_worker(&ctx, *request).await;
             assert_eq!(result.is_ok(), wrapper == "owner", "{result:?}");
             // A refused release keeps the build active, which excludes the
             // worker on its own; the fence is what outlives completion.
@@ -11721,7 +11785,7 @@ mod tests {
             };
             assert_eq!(request.worker_source_busy, flag);
             assert!(!request.worker_live_checkout_refused);
-            handle_release_worker(&ctx, request).await.unwrap();
+            handle_release_worker(&ctx, *request).await.unwrap();
             assert_eq!(
                 project_excluded_workers(&ctx, "held-project").contains("worker1"),
                 fenced
@@ -11831,6 +11895,7 @@ mod tests {
             urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
         )).unwrap() else { panic!("release expected"); };
 
+        let release = *release;
         let mut wrong_owner = release.clone();
         wrong_owner.local_wrapper_id = Some("wrong-owner".into());
         assert!(handle_release_worker(&ctx, wrong_owner).await.is_err());
@@ -12108,10 +12173,13 @@ mod tests {
                 "POST /release-worker?worker=worker1&build_id={first_id}&local_wrapper_id={first_wrapper}&exit_code=1&worker_source_topology_mismatch={}",
                 urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
             )).unwrap() else { panic!("release expected"); };
-            tokio::time::timeout(Duration::from_secs(5), handle_release_worker(&ctx, release))
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_release_worker(&ctx, *release),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             if add_compatible_peer {
                 pool.add_worker(make_test_worker("worker2", 8)).await;
                 set_test_build_disk(&pool, "worker2", 100.0).await;
@@ -12242,6 +12310,7 @@ mod tests {
                 "POST /release-worker?worker=worker1&build_id={build_id}&local_wrapper_id={wrapper}&exit_code=1&worker_source_topology_mismatch={}",
                 urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
             )).unwrap() else { panic!("release expected"); };
+            let release = *release;
             handle_release_worker(&ctx, release.clone()).await.unwrap();
             assert_eq!(worker.used_slots(), 0);
             assert!(ctx.history.active_builds().is_empty());
@@ -12316,6 +12385,7 @@ mod tests {
             "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id={wrapper}&exit_code=1&worker_source_topology_mismatch={}",
             old.id, urlencoding_encode(&serde_json::to_string(&mismatch).unwrap()),
         )).unwrap() else { panic!("release expected"); };
+            let release = *release;
             ctx.history
                 .record_source_topology_mismatch(old.id, "worker1", Some(&wrapper), &mismatch)
                 .unwrap();
@@ -14061,7 +14131,7 @@ mod tests {
             let ApiRequest::ReleaseWorker(release) = parse_request(&format!(
                 "POST /release-worker?worker=large-disk&build_id={build_id}&local_wrapper_id=rchw-large-disk-owner&exit_code=0",
             )).unwrap() else { panic!("expected release") };
-            handle_release_worker(&ctx, release).await.unwrap();
+            handle_release_worker(&ctx, *release).await.unwrap();
             assert_eq!(worker.used_slots(), 0);
 
             // Only a new post-completion observation can fund another build.

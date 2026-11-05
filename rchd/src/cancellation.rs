@@ -1706,6 +1706,8 @@ wait
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: crate::test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(tokio::sync::RwLock::new(
                 crate::restart_admission::RestartAdmissionState::default(),
             )),

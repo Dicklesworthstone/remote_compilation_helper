@@ -166,9 +166,8 @@ RCH program in these tests is an explicit fixture. Three tests continue through
 the production `worker_cache.py` and imported preparation API, proving
 shared fixture-daemon setup, worker-side cache refusal and jobserver custody.
 They still do not run the Rust RCH backend, SSH, real remote Cargo, source receipts
-or cache hits. The existing workflow already executes this whole test file;
-no permission changes are needed. Native macOS and full fleet acceptance remain
-separate checks.
+or cache hits. Run this whole test file through DSR with the other native suites.
+Native macOS and full fleet acceptance remain separate checks.
 
 `tests/test_rabs_worker_cache_diagnostics.py` adds sixteen adapter regressions
 with real filled/broken pipes, raw diagnostic bytes, regular-file offsets,
@@ -179,12 +178,28 @@ timed-out setup both wedge against the exact prior adapter when stderr is full;
 the repaired adapter passes the same tests without draining that pipe. All 68
 launcher tests and all 16 diagnostic tests passed during this integration.
 
-Both native suites passed during implementation. Rust compilation, those Rust
-unit tests, Clippy, formatting, real Cargo cache-hit parity and fleet acceptance
-were not run in the implementation environment because Cargo/Rust tooling was
-unavailable. The RABS Binaries workflow now includes the native suites on its
-x86-64 and AArch64 runners and the Rust assembly tests, retaining all previous
-runtime gates. Workflow configuration is not a passing CI result.
+CI and release qualification use DSR exclusively. The original fixture-suite
+results above establish their stated process and adapter behavior.
+
+Real Linux qualification on November 5, 2026 also passed the original four-round
+public cache ladder through RCH/SSH: execute and commit, two verification
+executions, then a served hit with no compiler execution for that dependency.
+A full `cargo check --locked -j1 -p rabs-key` run repeated this for all eight
+eligible registry dependencies. Every invocation used a fresh Cargo target;
+all eleven Cargo compiler units reported `fresh=false`, all eight registry
+metadata outputs matched stock bytes, and all six remote jobs had terminal
+acknowledgements and complete source/target release records.
+
+That full-project test was functionally correct but slower: ordinary RCH took
+22.75 and 22.80 seconds, while the warm RABS run took 27.98 seconds. Cache
+population and the two verification runs took 96.80, 121.28 and 105.63 seconds.
+These results use the qualified e019 Rust build and 3f launcher identified in
+[the execution plan](../RABS_BRIDGE_PLAN.md). Their qualification includes
+751 Rust tests and 340 launcher/adapter tests, zero ignored/skipped, formatting,
+full workspace checks and strict Clippy. A newly built metadata installation
+optimization is still being qualified; these older results do not establish its
+performance. Multi-host acceleration, current full native qualification and
+native macOS dispatch remain open.
 
 Before claiming fleet acceleration, qualify rebuilt binaries with actual Cargo
 and daemon execution: confirm served decisions correspond to skipped compilers,

@@ -192,6 +192,18 @@ fn daemon_worker_selector(
     selector
 }
 
+/// An isolated journal root so test contexts never inspect operator state.
+#[cfg(test)]
+pub(crate) fn test_client_lease_directory() -> std::path::PathBuf {
+    tempfile::Builder::new()
+        .prefix("rch-test-client-leases-")
+        .disable_cleanup(true)
+        .tempdir()
+        .expect("create isolated client lease directory")
+        .path()
+        .to_owned()
+}
+
 /// A minimal `DaemonContext` for unit tests in other modules (the tailnet API
 /// router tests in `http_api`). Mirrors `api::tests::make_test_context`.
 #[cfg(test)]
@@ -247,6 +259,8 @@ pub(crate) fn test_daemon_context(pool: workers::WorkerPool) -> DaemonContext {
         bypass_store: None,
         admin_disable_store: None,
         workers_config_path: None,
+        client_lease_dir: test_client_lease_directory(),
+        client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
         admission_barrier: Arc::new(tokio::sync::RwLock::new(
             restart_admission::RestartAdmissionState::default(),
         )),
@@ -307,6 +321,10 @@ pub struct DaemonContext {
     /// silently ignored). `None` means "resolve the default", exactly as at
     /// startup.
     pub workers_config_path: Option<std::path::PathBuf>,
+    /// Client journal root resolved at daemon launch; clones retain this binding.
+    pub client_lease_dir: std::path::PathBuf,
+    /// One census per daemon; clones share the permit through scan completion.
+    pub client_lease_scans: Arc<tokio::sync::Semaphore>,
     /// Stops new worker selection while a restart remediator proves quiescence.
     /// This is shared with the socket API so check-and-close admission occurs
     /// in the daemon rather than in a racy CLI preflight.
@@ -1601,6 +1619,8 @@ async fn main() -> Result<()> {
         bypass_store: Some(bypass_store.clone()),
         admin_disable_store: Some(admin_disable_store.clone()),
         workers_config_path: cli.workers_config.clone(),
+        client_lease_dir: rch_common::job_identity::default_job_lease_directory(),
+        client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
         admission_barrier: Arc::new(RwLock::new(
             restart_admission::RestartAdmissionState::default(),
         )),
@@ -2926,6 +2946,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
@@ -2983,6 +3005,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
@@ -3041,6 +3065,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
@@ -3082,6 +3108,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
@@ -3143,6 +3171,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
@@ -3202,6 +3232,8 @@ mod tests {
             bypass_store: None,
             admin_disable_store: None,
             workers_config_path: None,
+            client_lease_dir: test_client_lease_directory(),
+            client_lease_scans: Arc::new(tokio::sync::Semaphore::new(1)),
             admission_barrier: Arc::new(RwLock::new(
                 restart_admission::RestartAdmissionState::default(),
             )),
