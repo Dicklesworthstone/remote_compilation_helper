@@ -2,7 +2,64 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at04:02UTC:**
+**Active qualification checkpoint, November6 at04:39UTC:**
+
+- [x] Normal production operator CLI DSR a611cac1 terminalSUCCESS0/238s on TS2.
+  CHECK41=139.45s, CHECK42=33.89s, BUILD43=18.49s, all exit0. Actual remote
+  executed events2/2/1, advancing durable executed/released worker receipts,
+  residual0. Returned4534792B program16695bb4 actually printed43 with empty
+  stderr. All3 clients/service/worker exit0, no forced shutdown. Worker clean
+  receipt matches final request1793939804118170579. Final9668B/7a2f2811.
+  BUILD offloaded eligible metadata; codegen outside its closed-input eligibility
+  remains on the edge and is explicitly reported as shadow/codegen-read-closure.
+  This demonstrates actual normal-CLI operation, not full remote codegen or speed.
+  Fixed
+  sequence CHECK41, CHECK42, BUILD43 requires three advancing durable worker
+  executed/released receipts, fresh remote-executed events, and an actually
+  returned program printing43. Original Cargo300 and existing production client
+  allowance4*300+600=1800 retained, wholeDSR3600. This separately tests the normal
+  entrypoint; it cannot satisfy the failed integration helper300/native5 gate.
+  Exact control15510B/9cf0d01b/dev49/inode14201914; genuine d4 ALL7, complete
+  original1.9GB SDK and1758 source audited before/after. New owner-only runtime
+  rcx and initially empty durable worker SDK cache. No preseed or local fallback
+  accepted. Real TLS and ordinary CLI operations, no timing or fleet claim.
+- [ ] Fixed remaining-four native coverage dispatched on TS2, control36562B/
+  fbdd3ae4/dev49/inode14207420, new private runtime rr. All original source,
+  component226, compiler1067, ALL7/BOTH TLS, completeSDK and artifact guards
+  retained. Each case runs once. Ordinary failures do not suppress later cases
+  once observed owned roles have settled. Prior cold055ecbe1 remains failed,
+  full_native_gate_passed=false, no retry-to-green or combined full-native claim.
+  - [ ] Explicitly prewarmed SDK service, three fresh real requests, reconnect
+    frontier and coordinator restart, durable cache reused for all three.
+  - [ ] CHECK dependency sampling, committed replay, relocated target and
+    original source/input invalidation assertions.
+  - [ ] BUILD archive sampling/replay and actual delivered working binary.
+  - [ ] Shared remote flight, origin cancellation, surviving consumer and
+    actual working survivor binary, later fresh verification.
+  - [ ] Final full1758/SDK/ALL7/harness/control audit and observed-role drain.
+  - [ ] Exact old-worker negative and two-worker failover remain held behind
+    their original full-native prerequisite. Remaining-four results cannot
+    satisfy that prerequisite or close M6.
+- [x] TRJ d4 native5 DSR2b6c0825 settledFAILURE/native101/CLI6/555s. First cold
+  service0/1/zeroignored/330.7s hit original client300 plus shutdown30 while
+  uploading SDK. No compiler-admission/execution receipt, journal highwaternull.
+  Worker11 standby heartbeats and service12 warming events do not satisfy
+  execution. All1758/fullSDK/ALL7/control35926B/1d92ee1c aftermatch, clean worker
+  shutdown and no observed owned residuals. Remaining4/oldnegative/failover UNRUN.
+  Final61964B/b639ea7b retained. TS2's separate ELF5s failure remains unresolved.
+- [x] MPDT peer reports export2/2 exit0/ACK/all4release at e724ba37. Subsequent
+  intake11225 at0d6f20fa failed with monitor_unavailable/output scan deadline,
+  not a test result. Supported same-ID recovery returned255/ACK/all4release;
+  earlier daemon130 disagreement preserved. No root reexecution or peer-job
+  changes. Installed81aa scans actual outputs under30s, so newer e371 cache
+  exclusion has no demonstrated applicability and is not adopted as a fix.
+  Peer measured TRJ load95 and IOpressure. No new RABS runtime is added there.
+  Staged TRJ operator controller remains UNRUN. Omarchy copy completed and
+  remains preserved; its explicit disabled setting still excludes runtime use.
+- [ ] Source-monitor investigation must retain full output accounting, original
+  growth/floor/deadline and host admission. No demonstrated scope-preserving
+  repair yet. Installed Mac client remains81aa. Existing private receipt adapter
+  has parser/argv proof only; peer owns actual source-qualified adapter/run.
 
 - [x] Source-entry fix actual DSR terminalSUCCESS0/1508s. BOTH exact-old-
   production planted regressions101/[0,1,0], repaired ALL112/112/zeroignored.
@@ -24,8 +81,8 @@
   private stream custody checked, both gracefully settled by held-pidfd SIGTERM
   within0.863s, no KILL. Cleanup receipt retained. Corrected sampler records
   procfs ownership/redaction; future tracing controller also joins child at exit.
-- [ ] Genuine d4 native5/oldnegative DSR2b6c0825 RUNNING on existing configured
-  TRJ, session78934. Control35926B/1d92ee1c/dev54/inode69460446. ALL7/harness
+- [x] Genuine d4 native5/oldnegative DSR2b6c0825 ran on existing configured
+  TRJ and failed as recorded above. Control35926B/1d92ee1c/dev54/inode69460446. ALL7/harness
   retain original TS2 build provenance and exact hashes; full originalSDK and
   source1758 independently copied and audited on TRJ. All original Cargo300/
   helper600/GNU5/SDK30min/DSR3600/jobs1/concurrency4 and every positive/negative
@@ -36,7 +93,7 @@
   percentage observation is CRITICAL at8.99% and explicitly retained. All
   payload/runtime/Cargo-home/results/DSR scratch writes use independent /bulk.
   Normal DSR admission accepted; physical/source/SDK/runtime storage guards and
-  all tool/native version probes passed. Cold-service case actually running.
+  all tool/native version probes passed. Cold-service case actually executed.
   This is single-host loopback correctness on TRJ, no speed/storm/fleet claim.
 - [x] Alternative-host checks measured real namespace support but root storage
   refusal on hz1/hz2/hz3/hz4/ts1/ovh-a/vmi1149989/vmi1152480. Omarchy passes
@@ -57,7 +114,7 @@
   frozen d4 and paired source-entry snapshots. No whole-current-main claim.
   M6 stays in progress. JSONL merge conflict remains, no forced export.
 
-These 04:02 results supersede the earlier pending markers below.
+These 04:39 results supersede the earlier pending markers below.
 
 - [x] Corrected d4 normalALL7/BOTH TLS DSR5fee2740 terminalSUCCESS0/1819s,
   actualCargo1785.5s. Full1758/control5616B/07d1116b aftermatch. Genuine new
