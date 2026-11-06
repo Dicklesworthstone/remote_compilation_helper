@@ -227,8 +227,17 @@ class Holder:
             preexec_fn=_ignored_sighup if ignore_hup else _default_sighup,
         )
         self.buffer = b""
+        self.awaiting_handoff = session_idle is not None
 
     def line(self, timeout=5):
+        line = self.next_line(timeout)
+        # The session monitor hands stdin control over before any owner output.
+        first, self.awaiting_handoff = self.awaiting_handoff, False
+        if first and line == b"RCH_SOURCE_LOCK_SESSION_READY":
+            return self.next_line(timeout)
+        return line
+
+    def next_line(self, timeout):
         deadline = time.monotonic() + timeout
         while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
