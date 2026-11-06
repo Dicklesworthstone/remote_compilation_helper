@@ -1683,8 +1683,9 @@ fn exit_with_local_run(
 // `compilation.allow_local_fallback` so the orchestrator is not flooded.
 // ---------------------------------------------------------------------------
 
-/// Env override for the maximum number of remote workers to try for one build
-/// (the first attempt plus capacity-ranked retries). Clamped to at least 1.
+/// Env override for the maximum number of remote build attempts
+/// (the first attempt plus capacity-ranked retries). Confirmed topology-only
+/// refusals do not consume an attempt. Clamped to at least 1.
 const RCH_MAX_REMOTE_ATTEMPTS_ENV: &str = "RCH_MAX_REMOTE_ATTEMPTS";
 /// Default cap on remote attempts per build (first worker + up to two retries).
 const DEFAULT_MAX_REMOTE_ATTEMPTS: u32 = 3;
@@ -1828,6 +1829,34 @@ struct RetryableRemoteFault {
     on_exhaust: RemoteFaultExhaustAction,
 }
 
+/// Topology preflight can reject a worker without granting source ownership or
+/// starting the command. Keep that execution attempt available for another
+/// worker; `tried_workers` still bounds relocation to distinct eligible workers.
+struct RemoteRetryBudget {
+    attempt: u32,
+    max_attempts: u32,
+    source_content_receipt: bool,
+}
+
+impl RemoteRetryBudget {
+    fn next_attempt(&self, fault: &RetryableRemoteFault) -> Option<u32> {
+        // Receipt mode is tied to one worker and root set, independently of
+        // whether that worker reached command execution.
+        if self.source_content_receipt {
+            return None;
+        }
+        if matches!(
+            &fault.on_exhaust,
+            RemoteFaultExhaustAction::RefuseSourceTopology { .. }
+        ) {
+            return Some(self.attempt);
+        }
+        self.attempt
+            .checked_add(1)
+            .filter(|attempt| *attempt <= self.max_attempts)
+    }
+}
+
 /// Terminal action taken once capacity-aware retries are exhausted.
 enum RemoteFaultExhaustAction {
     /// No source or execution grant was issued, and this worker cannot satisfy
@@ -1874,6 +1903,8 @@ enum RetryWorkerSelection {
 /// permanent refusal on one worker cannot hide a recoverable alternative.
 #[allow(clippy::too_many_arguments)]
 async fn try_retry_on_bigger_worker(
+    budget: &mut RemoteRetryBudget,
+    fault: &RetryableRemoteFault,
     socket_path: &str,
     project: &str,
     estimated_cores: u32,
@@ -1891,6 +1922,9 @@ async fn try_retry_on_bigger_worker(
     release_acknowledged: bool,
     reporter: &HookReporter,
 ) -> anyhow::Result<RetryWorkerSelection> {
+    let Some(next_attempt) = budget.next_attempt(fault) else {
+        return Ok(RetryWorkerSelection::Exhausted);
+    };
     let status = match crate::status_display::query_daemon_full_status_at_socket(socket_path).await
     {
         Ok(status) => status,
@@ -1935,6 +1969,7 @@ async fn try_retry_on_bigger_worker(
             Some(response)
                 if response.worker.is_some() || selection_cancelled_before_start(&response) =>
             {
+                budget.attempt = next_attempt;
                 return Ok(RetryWorkerSelection::Selected {
                     response: Box::new(response),
                     worker_id: chosen,
@@ -5420,10 +5455,14 @@ pub async fn run_exec(
     // A source-content receipt is bound to one selected worker and one remote
     // root set. Retrying on another worker would emit multiple competing proof
     // envelopes for one invocation, so proof mode is deliberately single-shot.
-    let max_attempts = if source_content_receipt {
-        1
-    } else {
-        max_remote_attempts()
+    let mut retry_budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: if source_content_receipt {
+            1
+        } else {
+            max_remote_attempts()
+        },
+        source_content_receipt,
     };
     let mut tried_workers: Vec<WorkerId> = Vec::new();
     let mut cold_disk_retried = false;
@@ -5431,7 +5470,6 @@ pub async fn run_exec(
     // operator's env pin (`RCH_WORKER(S)`); each retry pins the chosen bigger
     // worker so the daemon reserves exactly it.
     let mut current_query_preferred = preferred_workers.clone();
-    let mut attempt: u32 = 1;
     let mut response = response;
 
     // bd-5pmwm: the barrier can close after the pre-check, or while this build
@@ -5656,8 +5694,11 @@ pub async fn run_exec(
             worker.host,
             worker.slots_available,
             worker.speed_score,
-            if attempt > 1 {
-                format!(" [remote retry {attempt}/{max_attempts}]")
+            if retry_budget.attempt > 1 {
+                format!(
+                    " [remote retry {}/{}]",
+                    retry_budget.attempt, retry_budget.max_attempts
+                )
             } else {
                 String::new()
             }
@@ -6432,42 +6473,47 @@ pub async fn run_exec(
             .ensure_released_for_retry()
             .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
-        let retry_selection = if attempt < max_attempts {
-            try_retry_on_bigger_worker(
-                &config.general.socket_path,
-                &selection_project,
-                estimated_cores,
-                config.compilation.disk_headroom_gib,
-                &remote_command,
-                toolchain.as_ref(),
-                required_runtime,
-                command_priority,
-                &tried_workers,
-                &preferred_workers,
-                classification.kind == Some(CompilationKind::Job),
-                &required_tools,
-                &source_topology,
-                &durable_lease,
-                release_acknowledged,
-                &reporter,
-            )
-            .await?
-        } else {
-            RetryWorkerSelection::Exhausted
-        };
+        let retry_selection = try_retry_on_bigger_worker(
+            &mut retry_budget,
+            &fault,
+            &config.general.socket_path,
+            &selection_project,
+            estimated_cores,
+            config.compilation.disk_headroom_gib,
+            &remote_command,
+            toolchain.as_ref(),
+            required_runtime,
+            command_priority,
+            &tried_workers,
+            &preferred_workers,
+            classification.kind == Some(CompilationKind::Job),
+            &required_tools,
+            &source_topology,
+            &durable_lease,
+            release_acknowledged,
+            &reporter,
+        )
+        .await?;
         match retry_selection {
             RetryWorkerSelection::Selected {
                 response: next_response,
                 worker_id: next_worker,
             } => {
-                attempt += 1;
                 warn!(
                     "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
-                    fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
+                    fault.log_reason,
+                    fault.failed_worker,
+                    next_worker,
+                    retry_budget.attempt,
+                    retry_budget.max_attempts
                 );
                 reporter.summary(&format!(
                     "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
-                    next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
+                    next_worker,
+                    retry_budget.attempt,
+                    retry_budget.max_attempts,
+                    fault.log_reason,
+                    fault.failed_worker
                 ));
                 current_query_preferred = vec![next_worker];
                 response = *next_response;
@@ -6542,7 +6588,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed and no higher-capacity worker was available after {} attempt(s); surfacing exit {}",
-                    tried_workers.len(),
+                    retry_budget.attempt,
                     code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the
@@ -6581,7 +6627,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed (worker environment) and no other worker was available after {} attempt(s); surfacing exit {}",
-                    tried_workers.len(),
+                    retry_budget.attempt,
                     code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the

@@ -181,6 +181,12 @@ JSON reports `outcome: "refused"`,
 the initialization failure identifies the worker and the configured/physical
 paths. No compiler exit is invented for a command that never started.
 
+These confirmed preflight refusals do not spend the execution retry budget
+(`RCH_MAX_REMOTE_ATTEMPTS`, default `3`). Each rejected worker is excluded from
+the invocation, so relocation remains bounded by the eligible worker set.
+Actual execution and other pipeline failures still consume attempts, and
+`--source-content-receipt` remains restricted to its single selected worker.
+
 The daemon saves namespace-initialization refusals across restarts. It excludes only the
 recorded endpoint/mapping pair: another worker, or a different compatible mapping
 on the same worker, remains eligible. Last-success affinity cannot override this

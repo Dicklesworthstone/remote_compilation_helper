@@ -6038,8 +6038,16 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             output.shutdown().await.unwrap();
         }
     };
+    let mut budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: 3,
+        source_content_receipt: false,
+    };
+    let fault = retry_budget_test_fault("previous-worker", false);
     let client = async {
         try_retry_on_bigger_worker(
+            &mut budget,
+            &fault,
             socket.to_str().unwrap(),
             "job-project",
             3,
@@ -6073,7 +6081,260 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     };
     assert!(selection_cancelled_before_start(&response));
     assert_eq!(worker_id, WorkerId::new("next-worker"));
+    assert_eq!(budget.attempt, 2);
     assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
+}
+
+fn retry_budget_test_fault(worker: &str, topology_refusal: bool) -> RetryableRemoteFault {
+    RetryableRemoteFault {
+        log_reason: "fixture worker refusal".into(),
+        failed_worker: WorkerId::new(worker),
+        on_exhaust: if topology_refusal {
+            RemoteFaultExhaustAction::RefuseSourceTopology {
+                summary: "fixture topology mismatch".into(),
+            }
+        } else {
+            RemoteFaultExhaustAction::ExitWithCode {
+                code: 137,
+                summary: "fixture worker failure".into(),
+                error_code: None,
+            }
+        },
+    }
+}
+
+#[test]
+fn topology_retry_budget_preserves_remaining_attempts_after_real_failures() {
+    let mut budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: 3,
+        source_content_receipt: false,
+    };
+    for (topology, expected) in [
+        (true, Some(1)),
+        (false, Some(2)),
+        (true, Some(2)),
+        (true, Some(2)),
+        (false, Some(3)),
+        (true, Some(3)),
+        (false, None),
+    ] {
+        let next = budget.next_attempt(&retry_budget_test_fault("worker", topology));
+        assert_eq!(next, expected);
+        if let Some(next) = next {
+            budget.attempt = next;
+        }
+    }
+    budget.attempt = u32::MAX;
+    budget.max_attempts = u32::MAX;
+    assert!(
+        budget
+            .next_attempt(&retry_budget_test_fault("worker", false))
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+fn retry_budget_test_status(socket: &Path, workers: &[&str]) -> serde_json::Value {
+    let workers: Vec<_> = workers
+        .iter()
+        .map(|id| {
+            serde_json::json!({"id": id, "host": "unused.invalid", "user": "test",
+                "status": "healthy", "circuit_state": "closed", "used_slots": 0,
+                "total_slots": 16, "speed_score": 90.0, "last_error": null})
+        })
+        .collect();
+    serde_json::json!({
+        "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-budget", "socket_path": socket,
+            "started_at": "2026-10-07T00:00:00Z", "workers_total": workers.len(),
+            "workers_healthy": workers.len(), "slots_total": 16 * workers.len(),
+            "slots_available": 16 * workers.len()},
+        "workers": workers, "active_builds": [], "recent_builds": [], "issues": [],
+        "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
+            "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_is_exhausted() {
+    let _guard = test_guard!();
+    let directory = tempfile::Builder::new()
+        .prefix("rch-retry-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let socket = directory.join("budget.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker_ids = ["alias-1", "alias-2", "alias-3", "compatible"];
+    let status = retry_budget_test_status(&socket, &worker_ids);
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
+    let server_writer = writer.clone();
+    let server = async move {
+        // Four relocations, then one exhausted inventory and one pinned
+        // inventory. Neither terminal inventory may send a selection query.
+        for exchange in 0..10 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut output) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let body = if exchange >= 8 || exchange % 2 == 0 {
+                assert_eq!(request, "GET /status\n");
+                status.to_string()
+            } else {
+                let index = exchange / 2;
+                let worker_id = worker_ids[index];
+                assert!(request.starts_with("GET /select-worker?"), "{request}");
+                assert!(request.contains(&format!("&worker={worker_id}")));
+                assert_eq!(read_retry_lease(&server_writer).phase, "selection_pending");
+                serde_json::to_string(&SelectionResponse {
+                    worker: Some(rch_common::SelectedWorker {
+                        id: WorkerId::new(worker_id),
+                        host: "not-contacted.invalid".into(),
+                        user: "test".into(),
+                        identity_file: "/unused/key".into(),
+                        slots_available: 16,
+                        speed_score: 90.0,
+                        declared_os: None,
+                        project_lane: 0,
+                        disk_budget: None,
+                    }),
+                    build_id: Some(42 + u64::try_from(index).unwrap()),
+                    reason: SelectionReason::Success,
+                    diagnostics: None,
+                })
+                .unwrap()
+            };
+            output
+                .write_all(format!("HTTP/1.0 200 OK\r\n\r\n{body}").as_bytes())
+                .await
+                .unwrap();
+            output.shutdown().await.unwrap();
+        }
+    };
+    let client = async {
+        let mut budget = RemoteRetryBudget {
+            attempt: 1,
+            max_attempts: 1,
+            source_content_receipt: false,
+        };
+        let mut tried = vec![WorkerId::new("previous-worker")];
+        for expected in worker_ids {
+            let fault = retry_budget_test_fault(tried.last().unwrap().as_str(), true);
+            let result = try_retry_on_bigger_worker(
+                &mut budget,
+                &fault,
+                socket.to_str().unwrap(),
+                "project",
+                1,
+                0,
+                "true",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                &tried,
+                &[],
+                true,
+                &[],
+                &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                &writer,
+                true,
+                &HookReporter::new(OutputVisibility::None),
+            )
+            .await
+            .unwrap();
+            let RetryWorkerSelection::Selected {
+                response,
+                worker_id,
+            } = result
+            else {
+                panic!("topology refusals spent the build budget before {expected}");
+            };
+            assert_eq!(worker_id.as_str(), expected);
+            assert!(!tried.contains(&worker_id));
+            assert_eq!(budget.attempt, 1);
+            writer
+                .admit(response.build_id.unwrap(), &worker_id)
+                .unwrap();
+            // Supplied settled outcomes exercise real journal/selection I/O,
+            // not remote execution or a real worker filesystem verdict.
+            writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+            tried.push(worker_id);
+        }
+        for (tried, pinned) in [
+            (tried.clone(), Vec::new()),
+            (
+                vec![WorkerId::new("alias-1")],
+                vec![WorkerId::new("alias-1")],
+            ),
+        ] {
+            let previous = writer.snapshot();
+            let result = try_retry_on_bigger_worker(
+                &mut budget,
+                &retry_budget_test_fault("compatible", true),
+                socket.to_str().unwrap(),
+                "project",
+                1,
+                0,
+                "true",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                &tried,
+                &pinned,
+                true,
+                &[],
+                &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                &writer,
+                true,
+                &HookReporter::new(OutputVisibility::None),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RetryWorkerSelection::Exhausted));
+            assert_eq!(budget.attempt, 1);
+            assert_eq!(writer.snapshot(), previous);
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_budget_exhaustion_and_receipt_mode_do_not_query_the_daemon() {
+    let _guard = test_guard!();
+    let directory = tempfile::tempdir().unwrap().keep();
+    let socket = directory.join("no-dispatch.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
+    let topology = rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default());
+    let reporter = HookReporter::new(OutputVisibility::None);
+    for (topology_refusal, receipt) in [(false, false), (false, true), (true, true)] {
+        let mut budget = RemoteRetryBudget {
+            attempt: 1,
+            max_attempts: 1,
+            source_content_receipt: receipt,
+        };
+        let fault = retry_budget_test_fault("previous-worker", topology_refusal);
+        let previous = writer.snapshot();
+        let result = tokio::select! {
+            result = try_retry_on_bigger_worker(
+                &mut budget, &fault, socket.to_str().unwrap(), "project", 1, 0,
+                "true", None, RequiredRuntime::None, CommandPriority::Normal,
+                &[], &[], true, &[],
+                &topology, &writer, true, &reporter,
+            ) => result.unwrap(),
+            _ = listener.accept() => panic!("exhausted or single-shot retry contacted the daemon"),
+        };
+        assert!(matches!(result, RetryWorkerSelection::Exhausted));
+        assert_eq!(budget.attempt, 1);
+        assert_eq!(writer.snapshot(), previous);
+    }
 }
 
 #[tokio::test]
