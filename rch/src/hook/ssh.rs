@@ -2688,7 +2688,7 @@ fn build_worker_projects_topology_cmd(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
            if [ {allow_initialization} != true ]; then printf 'RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED:path=%s\\n' {canonical} >&2; exit 48; fi; \
-           if [ -d {alias} ]; then \
+           if [ -L {alias} ] && [ -d {alias} ]; then \
              alias_real=$(readlink -f -- {alias} 2>/dev/null || true); \
              case {canonical}/ in \"$alias_real\"/*) ;; *) \
                if [ -n \"$alias_real\" ]; then \
@@ -6825,6 +6825,18 @@ os.execv({python:?}, [{python:?}] + args)
         let healthy = run(&policy, false);
         assert!(healthy.status.success());
         assert_eq!(std::fs::read(canonical.join("input")).unwrap(), b"mirror\n");
+
+        // A real directory at the alias may hold other work: it is never a
+        // link target, and its contents stay untouched.
+        let real_alias = directory.join("real-alias");
+        std::fs::create_dir(&real_alias).unwrap();
+        std::fs::write(real_alias.join("keep"), b"unfinished\n").unwrap();
+        let elsewhere = directory.join("elsewhere/projects");
+        let policy = PathTopologyPolicy::new(elsewhere.clone(), real_alias.clone());
+        let refused = run(&policy, true);
+        assert_eq!(refused.status.code(), Some(42));
+        assert!(!elsewhere.is_symlink());
+        assert_eq!(std::fs::read(real_alias.join("keep")).unwrap(), b"unfinished\n");
 
         // When the link cannot be made, refuse without minting a second tree:
         // a real directory here would turn this into a permanent conflict.

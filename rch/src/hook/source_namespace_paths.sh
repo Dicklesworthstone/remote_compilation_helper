@@ -114,12 +114,13 @@ sys.exit(0 if outcome == "compatible" else 2 if outcome == "unavailable" else 1)
 ' "$canonical" "$alias" "$canonical_physical" "$alias_physical" "$namespace_status"
 fi
 
-# A wholly absent canonical base beside an alias that already names a real
-# directory is one namespace with a name missing. Restore that name as a link.
-# Creating a directory here would mint a second physical tree and turn a
-# repairable gap into a permanent conflict. Best effort and create-only: when
-# the link cannot be made, the conflict check below refuses as it always has.
-if [ ! -e "$canonical" ] && [ ! -L "$canonical" ] && [ -d "$alias" ]; then
+# A wholly absent canonical base beside an alias symlink to a real directory is
+# one namespace with a name missing. Restore that name as a link. Creating a
+# directory here would mint a second physical tree and turn a repairable gap
+# into a permanent conflict. A real directory at the alias is not that case: it
+# may hold other work and is never a link target. Best effort and create-only:
+# when the link cannot be made, the conflict check below refuses as it always has.
+if [ ! -e "$canonical" ] && [ ! -L "$canonical" ] && [ -L "$alias" ] && [ -d "$alias" ]; then
     alias_physical=$(namespace_realpath "$alias") || namespace_refuse 'unresolvable alias base'
     case "$canonical/" in
         "$alias_physical"/*) ;;
