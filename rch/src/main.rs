@@ -4513,6 +4513,7 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
 /// that CREATE the dirs rather than from a second hand-maintained list.
 struct ReapSurfaceConfig {
     roots: rch_common::gc_roots::GcRootSet,
+    windows_roots: rch_common::gc_roots::GcRootSet,
     policy: rch_common::stale_target_reap::GcPolicy,
     idle_hours: u32,
     pooled_idle_hours: u32,
@@ -4521,24 +4522,53 @@ struct ReapSurfaceConfig {
     max_cache_kb: Option<u64>,
 }
 
+impl ReapSurfaceConfig {
+    fn roots_for(&self, worker: &rch_common::WorkerConfig) -> &rch_common::gc_roots::GcRootSet {
+        if transfer::WorkerPlatform::from_worker(worker).is_windows() {
+            &self.windows_roots
+        } else {
+            &self.roots
+        }
+    }
+
+    fn fleet_roots(
+        &self,
+        workers: &[rch_common::WorkerConfig],
+    ) -> Vec<rch_common::gc_roots::GcRoot> {
+        let mut roots = Vec::new();
+        for worker in workers {
+            for root in &self.roots_for(worker).roots {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        roots
+    }
+
+    fn fleet_rejections(
+        &self,
+        workers: &[rch_common::WorkerConfig],
+    ) -> Vec<rch_common::gc_roots::GcRootRejection> {
+        let mut rejected = Vec::new();
+        for worker in workers {
+            for root in &self.roots_for(worker).rejected {
+                if !rejected.contains(root) {
+                    rejected.push(root.clone());
+                }
+            }
+        }
+        rejected
+    }
+}
+
 fn reap_surface_config(cli_roots: &[String]) -> Result<ReapSurfaceConfig> {
     use rch_common::stale_target_reap as reap;
 
     let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
     let pooled = &rch_config.remediation.pooled_target;
     let roots = rch_common::gc_roots::derive_gc_roots(pooled, cli_roots);
-    if roots.scan_bases().is_empty() {
-        let detail = roots
-            .rejected
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!(
-            "no usable gc scan root: every candidate failed the reap safety validation, so \
-             nothing may be embedded in a remote shell command ({detail})"
-        );
-    }
+    let windows_roots = rch_common::gc_roots::derive_windows_gc_roots(pooled, cli_roots);
 
     let idle_hours = pooled.reaper_idle_hours;
     let pooled_idle_hours = pooled.reaper_pooled_idle_hours;
@@ -4550,6 +4580,7 @@ fn reap_surface_config(cli_roots: &[String]) -> Result<ReapSurfaceConfig> {
     };
     Ok(ReapSurfaceConfig {
         roots,
+        windows_roots,
         policy,
         idle_hours,
         pooled_idle_hours,
@@ -4666,7 +4697,14 @@ fn gc_progress(report: &serde_json::Value) -> String {
 fn gc_ssh_command(
     worker: &rch_common::WorkerConfig,
     remote_command: &str,
-) -> tokio::process::Command {
+) -> (tokio::process::Command, Option<String>) {
+    // Preserve the POSIX shell invocation, but keep its contents out of a
+    // Windows OpenSSH login shell. cmd.exe must see only the fixed stdin
+    // reader; the shared SSH builder quotes the complete script in its input.
+    let shell = rch_common::ssh::remote_shell_command(
+        worker,
+        &format!("sh -c {}", shell_escape::escape(remote_command.into())),
+    );
     let mut command = tokio::process::Command::new("ssh");
     command.env("LC_ALL", "C").env("LANG", "C");
     command.args([
@@ -4698,11 +4736,8 @@ fn gc_ssh_command(
     }
     command
         .arg(format!("{}@{}", worker.user, worker.host))
-        .arg(format!(
-            "sh -c {}",
-            shell_escape::escape(remote_command.into())
-        ));
-    command
+        .arg(shell.command);
+    (command, shell.stdin_script)
 }
 
 #[cfg(unix)]
@@ -4726,6 +4761,7 @@ async fn gc_read_output(
 #[cfg(unix)]
 async fn run_gc_process(
     mut command: tokio::process::Command,
+    stdin_script: Option<&str>,
     deadline: tokio::time::Instant,
     output_budget: u64,
 ) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
@@ -4746,7 +4782,11 @@ async fn run_gc_process(
     }
     let started = std::time::Instant::now();
     let child = command
-        .stdin(Stdio::null())
+        .stdin(if stdin_script.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -4756,29 +4796,45 @@ async fn run_gc_process(
             timed_out: false,
             command_started: false,
         })?;
-    finish_gc_process(child, deadline, output_budget, started).await
+    finish_gc_process(child, stdin_script, deadline, output_budget, started).await
 }
 
 #[cfg(unix)]
 async fn finish_gc_process(
     mut child: tokio::process::Child,
+    stdin_script: Option<&str>,
     deadline: tokio::time::Instant,
     output_budget: u64,
     started: std::time::Instant,
 ) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    use tokio::io::AsyncWriteExt;
+
     // Both pipes were explicitly requested above.
     let stdout = child.stdout.take().expect("piped SSH stdout");
     let stderr = child.stderr.take().expect("piped SSH stderr");
+    let stdin = child.stdin.take();
+    let write_script = async move {
+        if let Some(script) = stdin_script {
+            let mut stdin = stdin.expect("piped SSH script input");
+            // Draining both outputs concurrently is essential: SSH may fill
+            // either pipe before the remote shell has consumed our script.
+            // An incomplete write cannot authorize a successful GC inventory.
+            stdin.write_all(script.as_bytes()).await?;
+            stdin.shutdown().await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
     let outcome = tokio::time::timeout_at(deadline, async {
         tokio::try_join!(
             child.wait(),
             gc_read_output(stdout, output_budget),
-            gc_read_output(stderr, output_budget)
+            gc_read_output(stderr, output_budget),
+            write_script
         )
     })
     .await;
     let mut error = match outcome {
-        Ok(Ok((status, stdout, stderr))) => {
+        Ok(Ok((status, stdout, stderr, ()))) => {
             if stdout.len() as u64 + stderr.len() as u64 > output_budget {
                 return Err(GcCommandError {
                     message: format!(
@@ -4813,7 +4869,7 @@ async fn finish_gc_process(
             });
         }
         Ok(Err(error)) => GcCommandError {
-            message: format!("read/wait SSH: {error}"),
+            message: format!("write/read/wait SSH: {error}"),
             timed_out: false,
             command_started: true,
         },
@@ -4843,16 +4899,18 @@ async fn run_gc_surface_command(
     deadline: tokio::time::Instant,
     output_budget: &mut u64,
 ) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
-    run_gc_budgeted_process(gc_ssh_command(worker, command), deadline, output_budget).await
+    let (command, stdin_script) = gc_ssh_command(worker, command);
+    run_gc_budgeted_process(command, stdin_script.as_deref(), deadline, output_budget).await
 }
 
 #[cfg(unix)]
 async fn run_gc_budgeted_process(
     command: tokio::process::Command,
+    stdin_script: Option<&str>,
     deadline: tokio::time::Instant,
     output_budget: &mut u64,
 ) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
-    let result = run_gc_process(command, deadline, *output_budget).await?;
+    let result = run_gc_process(command, stdin_script, deadline, *output_budget).await?;
     *output_budget -= result.stdout.len() as u64 + result.stderr.len() as u64;
     Ok(result)
 }
@@ -4913,7 +4971,13 @@ async fn handle_gc(
     let style = ctx.theme();
     let surface = reap_surface_config(&cli_roots)?;
     let workers = selected_reap_workers(&worker_filter)?;
-    let bases = surface.roots.scan_bases();
+    let fleet_roots = surface.fleet_roots(&workers);
+    let fleet_rejections = surface.fleet_rejections(&workers);
+    let bases: Vec<_> = fleet_roots
+        .iter()
+        .filter(|root| !root.is_worker_resolved())
+        .map(|root| root.path.clone())
+        .collect();
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4921,11 +4985,19 @@ async fn handle_gc(
 
     // Validate before launching any worker; all futures start in this sweep.
     let deadline = gc_deadline(worker_timeout)?;
-    let bases_ref = &bases;
     let surface_ref = &surface;
     let tasks = workers.iter().map(|worker| async move {
-        let bases = bases_ref;
         let surface = surface_ref;
+        let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
+        let roots = surface.roots_for(worker);
+        let bases = roots.scan_bases();
+        if bases.is_empty() {
+            return serde_json::json!({
+                "id": worker.id.as_str(), "ok": false, "phase": "roots",
+                "error": "no usable gc scan root for this worker's platform",
+                "rejected_roots": roots.rejected.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            });
+        }
         let mut output_budget = GC_OUTPUT_LIMIT;
         // ── enumerate every root (read-only) ───────────────────────────────
         let mut stdout = String::new();
@@ -4947,8 +5019,17 @@ async fn handle_gc(
         // yields dirs whose paths never start with the configured string, and
         // every one of them would otherwise be filed under the wrong root.
         let mut attribution: Vec<(String, String)> = Vec::new();
-        for base in bases {
-            let command = reap::enumerate_targets_command(base);
+        for base in &bases {
+            let command = if windows {
+                match reap::enumerate_windows_targets_command(base) {
+                    Ok(command) => command,
+                    Err(error) => return serde_json::json!({
+                        "id": worker.id.as_str(), "ok": false, "phase": "roots", "error": error,
+                    }),
+                }
+            } else {
+                reap::enumerate_targets_command(base)
+            };
             match run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
                 Ok(result) if result.success() => {
                     let seen = reap::parse_scan_roots(&result.stdout);
@@ -5015,10 +5096,16 @@ async fn handle_gc(
             .collect();
         let mut verdicts: Vec<reap::GcVerdict> = entries
             .iter()
-            .map(|e| reap::evaluate_gc_candidate(e, now_unix, &surface.policy))
+            .map(|e| {
+                if windows {
+                    reap::evaluate_windows_gc_candidate(e)
+                } else {
+                    reap::evaluate_gc_candidate(e, now_unix, &surface.policy)
+                }
+            })
             .collect();
         let mut triggers: Vec<&'static str> = entries.iter().map(|e| e.class().trigger()).collect();
-        let mut windows: Vec<u64> = entries
+        let mut idle_windows: Vec<u64> = entries
             .iter()
             .map(|e| {
                 surface
@@ -5029,14 +5116,14 @@ async fn handle_gc(
             .collect();
         // Byte-cap eviction, held to the SHORT active-build floor and the same
         // liveness gates as the TTL passes.
-        if let Some(cap_kb) = surface.max_cache_kb {
+        if let Some(cap_kb) = surface.max_cache_kb.filter(|_| !windows) {
             let short_window = reap::idle_minutes_from_hours(surface.idle_hours);
             for idx in
                 reap::select_cap_evictions(&entries, &verdicts, now_unix, &surface.policy, cap_kb)
             {
                 verdicts[idx] = reap::GcVerdict::Collect;
                 triggers[idx] = "cap";
-                windows[idx] = short_window;
+                idle_windows[idx] = short_window;
             }
         }
 
@@ -5054,7 +5141,7 @@ async fn handle_gc(
             .into_iter()
             .zip(verdicts)
             .zip(triggers)
-            .zip(windows)
+            .zip(idle_windows)
             .map(|(((entry, verdict), trigger), idle_minutes)| {
                 let root = attribution
                     .iter()
@@ -5092,7 +5179,9 @@ async fn handle_gc(
         let mut removed_paths: Vec<serde_json::Value> = Vec::new();
         let mut rm_errors: Vec<serde_json::Value> = Vec::new();
         let mut skipped: Vec<serde_json::Value> = Vec::new();
-        let mut apply_error: Option<String> = None;
+        let mut apply_error = (apply && windows).then(|| {
+            "Windows collection is unavailable without native process/handle and durable ownership checks; inventory was read only".to_string()
+        });
         let mut timed_out = false;
         let mut unknown_batch_paths: Vec<String> = Vec::new();
         // One target that cannot be embedded in a remote command (a space in an
@@ -5175,7 +5264,12 @@ async fn handle_gc(
 
         // Stranded GC reservations fence their tree for every build (bd-gyehj).
         // Their scan never fails the worker's dir report; its error is shown.
-        let gc_claims = match run_gc_surface_command(
+        let gc_claims = if windows {
+            serde_json::json!({
+                "status": "unsupported-platform", "claims": [],
+                "reason": "Windows native process/handle and durable ownership exclusion is unavailable; inventory only",
+            })
+        } else { match run_gc_surface_command(
             worker,
             &reap::abandoned_gc_claims_command(apply),
             deadline,
@@ -5207,15 +5301,19 @@ async fn handle_gc(
                 "error": format!("claims scan: {e}"),
                 "claims": [],
             }),
-        };
+        }};
 
         // Read-only retained `source-content-pair-*.retained-*` census (bd-psywj).
         // Never deletes source directories even with `--apply`.
-        let retained_sources = if retained {
+        let retained_sources = if retained && windows {
+            serde_json::json!({
+                "status": "unsupported-platform", "trees": [], "total_kb": 0, "unclaimed_kb": 0,
+            })
+        } else if retained {
             let mut retained_entries = Vec::new();
             let mut retained_seen = std::collections::HashSet::new();
             let mut retained_error: Option<String> = None;
-            for base in bases {
+            for base in &bases {
                 match run_gc_surface_command(
                     worker,
                     &reap::retained_source_trees_census_command(base),
@@ -5312,6 +5410,11 @@ async fn handle_gc(
 
         serde_json::json!({
             "id": worker.id.as_str(),
+            "inventory_only": windows,
+            "scan_bases": bases,
+            "rejected_roots": roots.rejected.iter().map(|root| serde_json::json!({
+                "path": root.path, "source": root.source.as_str(), "reason": root.reason,
+            })).collect::<Vec<_>>(),
             "ok": apply_error.is_none(),
             "error": apply_error,
             "timed_out": timed_out,
@@ -5359,15 +5462,11 @@ async fn handle_gc(
         "applied": apply,
         "remote_base": bases.first().cloned().unwrap_or_default(),
         "scan_bases": bases,
-        "roots": surface
-            .roots
-            .roots
+        "roots": fleet_roots
             .iter()
             .map(|r| serde_json::json!({ "path": r.path, "source": r.source.as_str() }))
             .collect::<Vec<_>>(),
-        "rejected_roots": surface
-            .roots
-            .rejected
+        "rejected_roots": fleet_rejections
             .iter()
             .map(|r| serde_json::json!({
                 "path": r.path, "source": r.source.as_str(), "reason": r.reason,
@@ -5412,10 +5511,10 @@ async fn handle_gc(
             },
         );
         println!("  roots:");
-        for root in &surface.roots.roots {
+        for root in &fleet_roots {
             println!("    {}  [{}]", root.path, root.source);
         }
-        for rejection in &surface.roots.rejected {
+        for rejection in &fleet_rejections {
             println!("    {} {rejection}", style.muted("✗"));
         }
         println!();
@@ -5448,7 +5547,9 @@ async fn handle_gc(
                         }
                     }
                 }
-                continue;
+                if report["inventory_only"] != true || !report["dirs"].is_array() {
+                    continue;
+                }
             }
             let handles_ok = report["gates"]["open_descriptors"].as_bool() == Some(true);
             let procs_ok = report["gates"]["processes"].as_bool() == Some(true);
@@ -5457,6 +5558,11 @@ async fn handle_gc(
                 if handles_ok { "ok" } else { "UNAVAILABLE" },
                 if procs_ok { "ok" } else { "UNAVAILABLE" },
             );
+            if report["inventory_only"] == true {
+                println!(
+                    "    Windows inventory only; native ownership checks are unavailable, so every directory is kept"
+                );
+            }
             if !handles_ok || !procs_ok {
                 println!(
                     "    {} a gate that cannot be evaluated counts as in-use: pooled and \
@@ -5675,29 +5781,56 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
     // Same roots and same per-class windows `rch gc` uses: status must show the
     // verdict gc would actually reach, not a second opinion.
     let surface = reap_surface_config(&[])?;
-    let bases = surface.roots.scan_bases();
     let idle_hours = surface.idle_hours;
     let pooled_idle_hours = surface.pooled_idle_hours;
     let workers = selected_reap_workers(&worker_filter)?;
+    let bases: Vec<_> = surface
+        .fleet_roots(&workers)
+        .into_iter()
+        .filter(|root| !root.is_worker_resolved())
+        .map(|root| root.path)
+        .collect();
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let commands: Vec<(String, String)> = bases
-        .iter()
-        .map(|base| (base.clone(), reap::enumerate_targets_command(base)))
-        .collect();
-
     let mut worker_reports = Vec::new();
     let mut any_ok = false;
     for worker in &workers {
+        let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
+        let roots = surface.roots_for(worker);
+        let worker_bases = roots.scan_bases();
         // One enumeration per scan root; a dir reachable from two roots is
         // listed once (the paths are absolute and de-duplicated below).
         let mut stdout = String::new();
-        let mut failure: Option<serde_json::Value> = None;
-        for (base, command) in &commands {
-            match run_reap_surface_command(worker, command).await {
+        let mut scanned_roots = Vec::new();
+        let mut failure = worker_bases.is_empty().then(|| {
+            serde_json::json!({
+                "id": worker.id.as_str(), "ok": false,
+                "error": "no usable cache scan root for this worker's platform",
+            })
+        });
+        for base in &worker_bases {
+            let command = if windows {
+                match reap::enumerate_windows_targets_command(base) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        failure = Some(serde_json::json!({
+                            "id": worker.id.as_str(), "ok": false, "error": error,
+                        }));
+                        break;
+                    }
+                }
+            } else {
+                reap::enumerate_targets_command(base)
+            };
+            match run_reap_surface_command(worker, &command).await {
                 Ok(result) if result.success() => {
+                    let seen = reap::parse_scan_roots(&result.stdout);
+                    scanned_roots.push(serde_json::json!({
+                        "requested": base, "resolved": seen.resolved,
+                        "worker_temp_base": seen.temp_base, "skipped": seen.skipped,
+                    }));
                     stdout.push_str(&result.stdout);
                 }
                 Ok(result) => {
@@ -5732,7 +5865,11 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                     .map(|e| {
                         // The SHARED verdict function, so `rch cache status`
                         // and `rch gc` can never disagree about one dir.
-                        let verdict = reap::evaluate_gc_candidate(&e, now_unix, &surface.policy);
+                        let verdict = if windows {
+                            reap::evaluate_windows_gc_candidate(&e)
+                        } else {
+                            reap::evaluate_gc_candidate(&e, now_unix, &surface.policy)
+                        };
                         let reason = match &verdict {
                             reap::GcVerdict::Collect => None,
                             reap::GcVerdict::Keep(r) => Some(r.to_string()),
@@ -5759,6 +5896,10 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                 serde_json::json!({
                     "id": worker.id.as_str(),
                     "ok": true,
+                    "inventory_only": windows,
+                    "scan_bases": worker_bases,
+                    "scanned_roots": scanned_roots,
+                    "rejected_roots": roots.rejected.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "entries": entries,
                     "total_kb": total_kb,
                     "reapable_kb": reapable_kb,
@@ -5832,6 +5973,29 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                 report["total_kb"].as_u64().unwrap_or(0) / 1024,
                 report["reapable_kb"].as_u64().unwrap_or(0) / 1024,
             );
+            println!(
+                "    bases: {}",
+                report["scan_bases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if report["inventory_only"] == true {
+                println!(
+                    "    Windows inventory only; every directory is kept until native ownership checks are available"
+                );
+            }
+            for root in report["scanned_roots"].as_array().into_iter().flatten() {
+                if let Some(reason) = root["skipped"].as_str() {
+                    println!(
+                        "    root {} not scanned: {reason}",
+                        root["requested"].as_str().unwrap_or("?")
+                    );
+                }
+            }
             for e in &entries {
                 let verdict = if e["reapable"].as_bool() == Some(true) {
                     "REAPABLE"
@@ -5847,6 +6011,9 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                     verdict,
                     e["path"].as_str().unwrap_or("?"),
                 );
+                if let Some(reason) = e["kept_because"].as_str() {
+                    println!("      {reason}");
+                }
             }
         }
     }
@@ -7061,7 +7228,8 @@ mod tests {
             ..Default::default()
         };
         let script = "printf '%s\\n' 'a; b'";
-        let command = gc_ssh_command(&worker, script);
+        let (command, stdin_script) = gc_ssh_command(&worker, script);
+        assert!(stdin_script.is_none());
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -7092,26 +7260,173 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn gc_windows_shell_uses_stdin_and_preserves_script_semantics() {
+        let worker = rch_common::WorkerConfig {
+            host: "windows.example".to_string(),
+            user: "builder".to_string(),
+            tags: vec![rch_common::types::os_tag("Windows")],
+            ..Default::default()
+        };
+        // Real POSIX shells verify the stdin protocol and quoting. Native
+        // Windows OpenSSH execution needs separate worker qualification.
+        for script in [
+            "printf '%s\\n' 'C:/rch/build space' '%PATH% !x! ^ & | < >' \"quote's\"; printf 'diagnostic\\n' >&2; exit 29",
+            "cat; read missing || printf 'stdin-closed\\n'; printf '%s\\n' '$() `literal`'",
+            "cat <<'RCH_END'\nquoted \" %PATH% &\nRCH_END\nprintf done",
+        ] {
+            let (ssh, input) = gc_ssh_command(&worker, script);
+            let args: Vec<_> = ssh.as_std().get_args().collect();
+            assert_eq!(args.last().unwrap(), &std::ffi::OsStr::new("sh -s"));
+            assert!(input.is_some());
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains(script))
+            );
+
+            let expected = tokio::process::Command::new("sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+                .unwrap();
+            let mut reader = tokio::process::Command::new("sh");
+            reader.arg("-s");
+            let observed = run_gc_process(
+                reader,
+                input.as_deref(),
+                gc_deadline(5).unwrap(),
+                GC_OUTPUT_LIMIT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(observed.exit_code, expected.status.code().unwrap());
+            assert_eq!(observed.stdout.as_bytes(), expected.stdout);
+            assert_eq!(observed.stderr.as_bytes(), expected.stderr);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_script_write_drains_both_outputs_and_closes_stdin() {
+        // All three streams exceed a pipe's capacity. A writer awaited before
+        // the output readers deadlocks: the child fills stdout before reading
+        // input, then fills stderr before waiting for the input's closing EOF.
+        let mut command = tokio::process::Command::new("python3");
+        command.args([
+            "-I",
+            "-S",
+            "-c",
+            "import sys\nsys.stdout.write('O' * 262144)\nsys.stdout.flush()\nsys.stderr.write('E' * 262144)\nsys.stderr.flush()\ndata = sys.stdin.buffer.read()\nprint('INPUT:' + str(len(data)))\n",
+        ]);
+        let input = "x".repeat(1024 * 1024);
+        let mut budget = GC_OUTPUT_LIMIT;
+        let observed =
+            run_gc_budgeted_process(command, Some(&input), gc_deadline(10).unwrap(), &mut budget)
+                .await
+                .unwrap();
+        assert!(observed.success());
+        assert_eq!(
+            observed.stdout,
+            format!("{}INPUT:1048576\n", "O".repeat(262144))
+        );
+        assert_eq!(observed.stderr, "E".repeat(262144));
+        assert_eq!(
+            budget,
+            GC_OUTPUT_LIMIT - observed.stdout.len() as u64 - observed.stderr.len() as u64
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gc_script_write_failure_is_an_error_and_reaps_owned_child() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exec 0<&-; exec sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let input = "x".repeat(1024 * 1024);
+        let error = finish_gc_process(
+            child,
+            Some(&input),
+            gc_deadline(5).unwrap(),
+            GC_OUTPUT_LIMIT,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.command_started && !error.timed_out, "{error}");
+        assert!(error.message.contains("write/read/wait SSH"), "{error}");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child {pid} was not reaped: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gc_cancelled_script_write_reaps_the_owned_child() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let input = "x".repeat(1024 * 1024);
+            let _ = entered.send(());
+            finish_gc_process(
+                child,
+                Some(&input),
+                gc_deadline(20).unwrap(),
+                GC_OUTPUT_LIMIT,
+                std::time::Instant::now(),
+            )
+            .await
+        });
+        started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(GC_REAP_TIMEOUT, async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled SSH child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn gc_shared_deadline_is_not_reset_between_commands() {
         let deadline = gc_deadline(1).unwrap();
         let mut budget = GC_OUTPUT_LIMIT;
         let mut first = tokio::process::Command::new("sleep");
         first.arg("0.6");
         assert!(
-            run_gc_budgeted_process(first, deadline, &mut budget)
+            run_gc_budgeted_process(first, None, deadline, &mut budget)
                 .await
                 .unwrap()
                 .success()
         );
         let mut second = tokio::process::Command::new("sleep");
         second.arg("0.6");
-        let error = run_gc_budgeted_process(second, deadline, &mut budget)
+        let error = run_gc_budgeted_process(second, None, deadline, &mut budget)
             .await
             .unwrap_err();
         assert!(error.timed_out && error.command_started, "{error}");
         // After expiry even a nonexistent executable must not be spawned.
         let error = run_gc_budgeted_process(
             tokio::process::Command::new("rch-gc-nonexistent-command"),
+            None,
             deadline,
             &mut budget,
         )
@@ -7128,7 +7443,7 @@ mod tests {
         let mut first = tokio::process::Command::new("printf");
         first.arg("abcd");
         assert_eq!(
-            run_gc_budgeted_process(first, deadline, &mut budget)
+            run_gc_budgeted_process(first, None, deadline, &mut budget)
                 .await
                 .unwrap()
                 .stdout,
@@ -7137,17 +7452,20 @@ mod tests {
         assert_eq!(budget, 3);
         let mut second = tokio::process::Command::new("printf");
         second.arg("efgh");
-        let error = run_gc_budgeted_process(second, deadline, &mut budget)
+        let error = run_gc_budgeted_process(second, None, deadline, &mut budget)
             .await
             .unwrap_err();
         assert!(!error.timed_out && error.command_started);
         assert!(error.message.contains("exceeded"), "{error}");
         let mut combined = tokio::process::Command::new("sh");
         combined.args(["-c", "printf ab; printf cd >&2"]);
-        let error = run_gc_process(combined, deadline, 3).await.unwrap_err();
+        let error = run_gc_process(combined, None, deadline, 3)
+            .await
+            .unwrap_err();
         assert!(error.message.contains("combined SSH output"), "{error}");
         let error = run_gc_process(
             tokio::process::Command::new("rch-gc-nonexistent-command"),
+            None,
             deadline,
             0,
         )
@@ -7160,21 +7478,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gc_timeout_and_output_overflow_reap_the_owned_child() {
-        for overflow in [false, true] {
+        for (overflow, scripted) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut command = tokio::process::Command::new(if overflow { "yes" } else { "sleep" });
             if !overflow {
                 command.arg("10");
             }
             let child = command
-                .stdin(std::process::Stdio::null())
+                .stdin(if scripted {
+                    std::process::Stdio::piped()
+                } else {
+                    std::process::Stdio::null()
+                })
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
             let pid = child.id().unwrap();
+            let input = scripted.then(|| "x".repeat(1024 * 1024));
             let result = finish_gc_process(
                 child,
+                input.as_deref(),
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
                 32,
                 std::time::Instant::now(),

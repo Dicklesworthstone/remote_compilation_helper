@@ -343,7 +343,7 @@ impl WorkerPlatform {
 /// POSIX `sh` (`mkdir`/`cd`) and `cargo.exe` (`CARGO_TARGET_DIR`) both accept
 /// this form, and it sidesteps rsync's `C:`-as-host parsing (Windows uses the
 /// tar transport instead). Empirically validated on a real Surface build host.
-pub(crate) const WINDOWS_DEFAULT_REMOTE_BASE: &str = "C:/rch";
+pub(crate) use rch_common::gc_roots::WINDOWS_REMOTE_BASE as WINDOWS_DEFAULT_REMOTE_BASE;
 
 /// Whether `path` is a Windows drive-letter absolute path like `C:/rch` or
 /// `C:\rch`. Windows workers use these as remote build roots, so a remote-path

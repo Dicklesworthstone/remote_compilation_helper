@@ -1379,6 +1379,105 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
     )
 }
 
+/// Read Windows target/cache sizes through the same Git POSIX shell used by
+/// the tar transport. MSYS `/proc` and `ps` do not cover native processes, so
+/// neither can authorize collection. This script never reads or mutates the
+/// POSIX source registry and reports both exclusion gates as unavailable.
+/// Every discovery/metadata traversal is checked; partial scans fail instead
+/// of being reported as an empty or completely measured worker.
+pub fn enumerate_windows_targets_command(base: &str) -> Result<String, String> {
+    if !crate::gc_roots::is_safe_windows_gc_base(base) {
+        return Err("unsafe Windows inventory root".to_string());
+    }
+    let names = find_name_alternatives(&[
+        ".rch-target-*-job-*",
+        ".rch-target-*-pid-*",
+        ".rch-target-*-pool-*",
+        DEFAULT_TARGET_NAME,
+        CARGO_CACHE_GLOB,
+        "rch_target_*",
+    ]);
+    Ok(format!(
+        r#"set -u
+base="{base}"
+__lf='
+'
+__cr=$(printf '\r')
+printf 'RCH_GC_ROOT base %s\n' "$base"
+__rt=""
+if [ -d "$base" ]; then
+    __rt=$(cd "$base" && pwd -P && printf '.') || exit 1
+    __rt=${{__rt%.}}
+    __rt=${{__rt%"$__lf"}}
+    case "$__rt" in ''|/|[a-zA-Z]:/|/[a-zA-Z]|/cygdrive/[a-zA-Z]|*"$__lf"*|*"$__cr"*) exit 1;; esac
+    printf 'RCH_GC_ROOT resolved %s\n' "$__rt"
+else
+    printf 'RCH_GC_ROOT_SKIPPED %s missing\n' "$base"
+fi
+{temp_base}
+__tmpbase="${{{temp_var}}}"
+__tmpscan=$(cd "$__tmpbase" && pwd -P && printf '.') || exit 1
+__tmpscan=${{__tmpscan%.}}
+__tmpscan=${{__tmpscan%"$__lf"}}
+case "$__tmpscan" in ''|/|[a-zA-Z]:/|/[a-zA-Z]|/cygdrive/[a-zA-Z]|*"$__lf"*|*"$__cr"*) exit 1;; esac
+printf 'RCH_GC_ROOT tmp %s\n' "$__tmpscan"
+printf 'RCH_GC_GATES handles=0 handles_source=unsupported procs=0\n'
+__all=$(mktemp) || exit 1
+__unique=$(mktemp) || {{ rm -f "$__all"; exit 1; }}
+trap 'rm -f "$__all" "$__unique"' EXIT
+trap 'exit 1' HUP INT TERM
+# Check complete argv paths before entering the line-oriented report protocol.
+# A newline in a directory name must never forge a second inventory entry.
+__discover='__cr=$(printf "\r")
+for candidate do
+    case "$candidate" in *"
+"*|*"$__cr"*) printf "RCH_WINDOWS_INVENTORY_INVALID_PATH\n" >&2; exit 1;; esac
+    printf "%s\n" "$candidate" || exit 1
+done'
+if [ -n "$__rt" ]; then
+    if ! find "$__rt" -maxdepth 8 -type d \( {names} \) -prune -exec sh -c "$__discover" sh {{}} + > "$__all"; then
+        printf 'RCH_WINDOWS_INVENTORY_INCOMPLETE %s\n' "$__rt" >&2
+        exit 1
+    fi
+fi
+if [ "$__tmpscan" != "$__rt" ]; then
+    if ! find "$__tmpscan" -maxdepth {TMPBASE_MAXDEPTH} -type d \( {names} \) -prune -exec sh -c "$__discover" sh {{}} + >> "$__all"; then
+        printf 'RCH_WINDOWS_INVENTORY_INCOMPLETE %s\n' "$__tmpscan" >&2
+        exit 1
+    fi
+fi
+LC_ALL=C sort -u "$__all" > "$__unique" || exit 1
+{metadata}
+while IFS= read -r d; do
+    [ -d "$d" ] && [ ! -L "$d" ] || {{
+        printf 'RCH_TARGET_METADATA_ERR %s\n' "$d" >&2
+        exit 1
+    }}
+    __meta=$(__gc_enumerate_metadata "$d") || {{
+        printf 'RCH_TARGET_METADATA_ERR %s\n' "$d" >&2
+        exit 1
+    }}
+    set -- $__meta
+    [ "$#" -eq 2 ] || exit 1
+    printf 'RCH_TARGET_ENTRY %s %s unknown unknown %s\n' "$1" "$2" "$d"
+done < "$__unique"
+"#,
+        temp_base = crate::gc_roots::remote_cargo_home_base_prelude(),
+        temp_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR,
+        metadata = ENUMERATE_METADATA_FRAGMENT,
+    ))
+}
+
+/// Windows inventory is useful even while native process/handle and durable
+/// ownership exclusion are unavailable. Keep *all* classes, including old
+/// per-job trees, and do not feed these entries to byte-cap eviction.
+#[must_use]
+pub fn evaluate_windows_gc_candidate(_entry: &RemoteTargetEntry) -> GcVerdict {
+    GcVerdict::Keep(GcKeepReason::GateUnavailable(
+        "Windows process/handle ownership",
+    ))
+}
+
 /// One enumerated remote target dir from [`enumerate_targets_command`] output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTargetEntry {
@@ -2362,6 +2461,277 @@ mod tests {
 
     const POOL: &str = "/data/projects/repo/.rch-target-hz2-pool-deadbeef";
     const CACHE: &str = "/data/tmp/rch-cargo-cache-hz2";
+
+    #[test]
+    fn windows_inventory_keeps_every_class_without_native_exclusion_evidence() {
+        for name in [
+            ".rch-target-worker-job-1",
+            ".rch-target-worker-pid-2",
+            ".rch-target-worker-pool-key",
+            DEFAULT_TARGET_NAME,
+            "rch-cargo-cache-worker",
+            "rch_target_legacy",
+            "unrecognized",
+        ] {
+            // Even apparently free evidence from the MSYS process view cannot
+            // authorize deleting a directory used by a native Windows process.
+            let candidate = entry(&format!("C:/rch/project/{name}"), 100 * DAY, FREE);
+            assert!(matches!(
+                evaluate_windows_gc_candidate(&candidate),
+                GcVerdict::Keep(GcKeepReason::GateUnavailable(_))
+            ));
+        }
+        for root in ["C:/", "C:/../outside", "C:/rch;exit 0", "C:/rch\nforged"] {
+            assert!(enumerate_windows_targets_command(root).is_err(), "{root:?}");
+        }
+    }
+
+    // Git-sh-equivalent execution against real Linux directories whose `C:`
+    // component exercises the literal drive path. These are filesystem/script
+    // regressions, not native Windows process/handle qualification.
+    #[cfg(target_os = "linux")]
+    fn windows_inventory_fixture_output(
+        directory: &std::path::Path,
+        temp: &std::path::Path,
+        prefix: &str,
+        find_wrapper: Option<&str>,
+    ) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "{prefix}\n{}",
+            enumerate_windows_targets_command("C:/rch").unwrap()
+        );
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", &script])
+            .current_dir(directory)
+            .env("TMPDIR", temp)
+            .env("LC_ALL", "C");
+        if let Some(wrapper) = find_wrapper {
+            let tools = directory.join("tools");
+            std::fs::create_dir_all(&tools).unwrap();
+            let find = tools.join("find");
+            std::fs::write(&find, wrapper).unwrap();
+            std::fs::set_permissions(&find, std::fs::Permissions::from_mode(0o755)).unwrap();
+            command.env("PATH", format!("{}:/usr/bin:/bin", tools.display()));
+        }
+        command
+            .output()
+            .expect("run Windows inventory POSIX script")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inventory_tree_bytes(path: &std::path::Path) -> u64 {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let mut total = metadata.len();
+        if metadata.is_dir() {
+            for child in std::fs::read_dir(path).unwrap() {
+                total += inventory_tree_bytes(&child.unwrap().path());
+            }
+        }
+        total
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_measures_worktrees_and_drive_temp_caches_without_following_symlinks() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::Path;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let mut expected = std::collections::BTreeMap::new();
+        for relative in [
+            "C:/rch/worktree/hash/.rch-target-worker-job-1",
+            "C:/rch/worktree/hash/.rch-target-worker-pid-2",
+            "C:/rch/worktree/hash/.rch-target-worker-pool-key",
+            "C:/rch/other-worktree/hash/.rch-target",
+            "D:/worker-temp/rch-cargo-cache-worker",
+            "D:/worker-temp/rch_target_legacy",
+        ] {
+            let directory = root.join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("artifact"), vec![42; 8193]).unwrap();
+            expected.insert(directory, 0);
+        }
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("unrelated"), vec![7; 65_536]).unwrap();
+        let pool = root.join("C:/rch/worktree/hash/.rch-target-worker-pool-key");
+        symlink(&outside, pool.join("outside-link")).unwrap();
+        symlink(
+            &outside,
+            root.join("C:/rch/worktree/hash/.rch-target-worker-job-symlink"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("C:/rch/worktree/hash/target")).unwrap();
+        for (path, size) in &mut expected {
+            *size = inventory_tree_bytes(path) / 1024;
+        }
+        let _open_artifact = fs::File::open(pool.join("artifact")).unwrap();
+
+        let output = windows_inventory_fixture_output(&root, Path::new("D:/worker-temp"), "", None);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let entries = parse_target_entries(&stdout);
+        let actual: std::collections::BTreeMap<_, _> = entries
+            .iter()
+            .map(|candidate| (std::path::PathBuf::from(&candidate.path), candidate.kb))
+            .collect();
+        assert_eq!(actual, expected, "{stdout}");
+        assert_eq!(entries.len(), expected.len(), "duplicate candidates");
+        assert!(!parse_gate_availability(&stdout).both());
+        for candidate in entries {
+            assert_eq!(candidate.open_handles, GateEvidence::Unknown);
+            assert_eq!(candidate.live_process, GateEvidence::Unknown);
+            assert!(!evaluate_windows_gc_candidate(&candidate).is_collect());
+            assert!(Path::new(&candidate.path).is_dir());
+        }
+        assert_eq!(
+            fs::read(outside.join("unrelated")).unwrap(),
+            vec![7; 65_536]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_scans_temp_cache_when_the_transfer_root_is_missing() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = fixture.path().join("D:/worker-temp/rch-cargo-cache-worker");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("registry-data"), vec![1; 4096]).unwrap();
+        let output = windows_inventory_fixture_output(
+            fixture.path(),
+            std::path::Path::new("D:/worker-temp"),
+            "",
+            None,
+        );
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("RCH_GC_ROOT_SKIPPED C:/rch missing"));
+        let entries = parse_target_entries(&stdout);
+        assert_eq!(entries.len(), 1, "{stdout}");
+        assert_eq!(
+            entries[0].path,
+            std::fs::canonicalize(cache).unwrap().to_str().unwrap()
+        );
+        assert!(!evaluate_windows_gc_candidate(&entries[0]).is_collect());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_refuses_partial_discovery_and_partial_metadata() {
+        for wrapper in [
+            "#!/bin/sh\n/usr/bin/find \"$@\"\nexit 9\n",
+            r#"#!/bin/sh
+for argument do
+    if [ "$argument" = '%T@ %s\n' ]; then
+        printf '1000000000 8192\n'
+        exit 9
+    fi
+done
+exec /usr/bin/find "$@"
+"#,
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let target = fixture
+                .path()
+                .join("C:/rch/worktree/.rch-target-worker-job-1");
+            let temp = fixture.path().join("worker-temp");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(&temp).unwrap();
+            std::fs::write(target.join("artifact"), b"complete data").unwrap();
+            let output = windows_inventory_fixture_output(fixture.path(), &temp, "", Some(wrapper));
+            assert!(!output.status.success(), "{output:?}");
+            assert!(parse_target_entries(&String::from_utf8_lossy(&output.stdout)).is_empty());
+            assert_eq!(
+                std::fs::read(target.join("artifact")).unwrap(),
+                b"complete data"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_refuses_protocol_newlines_and_physical_drive_roots() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        for separator in ['\n', '\r'] {
+            for placement in ["candidate", "temp", "resolved"] {
+                let fixture = tempfile::tempdir().unwrap();
+                let root = fixture.path();
+                let forged = format!("name{separator}RCH_TARGET_ENTRY 1 999999 free free forged");
+                let mut temp = root.join("worker-temp");
+                match placement {
+                    "candidate" => {
+                        fs::create_dir_all(
+                            root.join(format!("C:/rch/.rch-target-worker-job-{forged}")),
+                        )
+                        .unwrap();
+                    }
+                    "temp" => {
+                        fs::create_dir_all(root.join("C:/rch")).unwrap();
+                        temp = root.join(&forged);
+                    }
+                    _ => {
+                        fs::create_dir_all(root.join("C:")).unwrap();
+                        let destination = root.join(&forged);
+                        fs::create_dir_all(&destination).unwrap();
+                        symlink(destination, root.join("C:/rch")).unwrap();
+                    }
+                }
+                fs::create_dir_all(&temp).unwrap();
+                let output = windows_inventory_fixture_output(root, &temp, "", None);
+                assert!(
+                    !output.status.success(),
+                    "{placement} {separator:?}: {output:?}"
+                );
+                assert!(parse_target_entries(&String::from_utf8_lossy(&output.stdout)).is_empty());
+            }
+        }
+        for resolved in ["/c", "/cygdrive/c", "C:/"] {
+            let fixture = tempfile::tempdir().unwrap();
+            fs::create_dir_all(fixture.path().join("C:/rch")).unwrap();
+            let temp = fixture.path().join("worker-temp");
+            fs::create_dir(&temp).unwrap();
+            let prefix = format!("pwd() {{ printf '%s\\n' '{resolved}'; }}");
+            let output = windows_inventory_fixture_output(fixture.path(), &temp, &prefix, None);
+            assert!(!output.status.success(), "{resolved}: {output:?}");
+            assert!(parse_target_entries(&String::from_utf8_lossy(&output.stdout)).is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_does_not_trim_a_trailing_newline_into_another_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        for placement in ["resolved", "temp"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            let normal = root.join("physical");
+            let with_newline = root.join("physical\n");
+            fs::create_dir_all(normal.join("rch-cargo-cache-wrong-root")).unwrap();
+            fs::create_dir(&with_newline).unwrap();
+            let temp = if placement == "resolved" {
+                fs::create_dir(root.join("C:")).unwrap();
+                symlink(&with_newline, root.join("C:/rch")).unwrap();
+                let temp = root.join("worker-temp");
+                fs::create_dir(&temp).unwrap();
+                temp
+            } else {
+                fs::create_dir_all(root.join("C:/rch")).unwrap();
+                with_newline
+            };
+            let output = windows_inventory_fixture_output(root, &temp, "", None);
+            assert!(!output.status.success(), "{placement}: {output:?}");
+            assert!(parse_target_entries(&String::from_utf8_lossy(&output.stdout)).is_empty());
+        }
+    }
 
     /// The glob gc enumerates with must stay welded to the prefix the creator
     /// uses; a rename on one side is exactly how these dirs went unscanned.

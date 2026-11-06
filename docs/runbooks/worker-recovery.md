@@ -370,6 +370,33 @@ do not kill unrelated compiler processes. Retain the failed log and target cache
 A retry can reuse completed dependencies, but the timed-out attempt is not a test
 pass and its absence from the dispatcher queue does not prove remote termination.
 
+### Inspecting Windows build and Cargo caches
+
+For a worker declared as Windows, both commands inspect the tar transport's
+`C:/rch` build base and the worker's resolved temporary/cache base:
+
+```bash
+rch cache status --workers wsurf
+rch gc --dry-run --workers wsurf --json
+```
+
+Additional Windows roots can be configured through `gc_extra_roots` or passed
+to GC with, for example, `--root 'D:/build cache'`. The report lists rejected
+roots and missing build roots; a missing `C:/rch` does not hide Cargo caches
+in the worker's temporary directory. Directory sizes use apparent bytes,
+rounded up to KiB. An incomplete directory or metadata scan fails the worker
+report instead of reporting a complete inventory with missing entries.
+
+Windows inventory is read-only: native process/handle ownership cannot yet be
+established by the Git POSIX shell. Every directory class is kept, including
+old per-job trees, and neither age nor a byte cap authorizes deletion.
+`rch gc --apply` reports that Windows collection is unavailable and retains
+the inventory; it does not invoke POSIX claim cleanup or retained-source scans.
+A Windows-only `--apply` invocation exits unsuccessfully. Use the inventory
+to diagnose space usage, and establish native ownership before any manual
+cleanup. Local shell regression tests do not constitute native Windows
+qualification.
+
 ## Recovery procedures by scenario
 
 ### Scenario: worker VM rebooted
