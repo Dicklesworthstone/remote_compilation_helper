@@ -672,14 +672,20 @@ def event(phase, status):
         stream.write(json.dumps(dict(worker=worker, phase=phase, status=status)) + '\n')
 first = sys.stdin.buffer.readline()
 if first == b'{\n':
-    # A source holder keeps stdin open for heartbeat/release frames. Identify
-    # its actual transport header without waiting for EOF or issuing a grant.
-    header = (sys.stdin.buffer.readline(), sys.stdin.buffer.readline())
-    assert header == (b'set -eu\n', b"exec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n"), header
-    event('source_admission_boundary', 73)
-    print('RCH fixture stopped after namespace: source admission intentionally unavailable', file=sys.stderr)
-    sys.exit(73)
+    second = sys.stdin.buffer.readline()
+    if second != b'(\n':
+        # A source holder keeps stdin open for heartbeat/release frames. Identify
+        # its actual transport header without waiting for EOF or issuing a grant.
+        header = (second, sys.stdin.buffer.readline())
+        assert header == (b'set -eu\n', b"exec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n"), header
+        event('source_admission_boundary', 73)
+        print('RCH fixture stopped after namespace: source admission intentionally unavailable', file=sys.stderr)
+        sys.exit(73)
+    # The namespace RPC batches its live-checkout guard into one compound.
+    first += second
 payload = first.decode() + sys.stdin.buffer.read().decode()
+if first == b'{\n(\n':
+    assert payload.count('RCH_SYNC_LIVE_CHECKOUT_REFUSED:') == 1, 'namespace RPC lost its guard'
 if payload.startswith('(set -eu\nrch_destination='):
     # Execute the production read-only guard against the worker's mapped
     # fixture root and host marker, rather than accepting every control RPC.
