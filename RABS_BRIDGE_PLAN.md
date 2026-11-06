@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at00:21UTC:**
+**Active qualification checkpoint, November6 at00:39UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -10,13 +10,10 @@
   406s, ALL283/283/zeroignored, all1758 source/control4518B/4e066ea8 aftermatch.
   New4a3f source differs3013 only inside API test module; production prefix and
   other1757 files identical. Genuine3013 normalALL7 tools keep original labels.
-- [ ] Full4a3f compiler/ALL9 gate dispatched23:33UTC, original3600s/jobs1/
-  defaultprofiles/pins. Requires EVERY old and current test name, zeroignored;
-  expected1067 cases, count only actual terminal summaries. Control9844B/
-  8704ba6e publishes final proof atomically after every predicate/after-audit.
-  Actual fmt0/21.6s, workspace-alltargets check0/1021.2s, strictClippy0/977.6s.
-  Nine suites still compiling/executing. This predecessor cannot qualify new
-  loader source5007 below; its frozen source and outcome remain preserved.
+- [x] Full4a3f DSR8020b04b terminalSUCCESS0/3495s: ALL1067/1067/zeroignored
+  across9 inventories82/501/4/165/16/9/6/1/283; fmt0/21.6s, workspace-alltargets
+  check0/1021.2s, strictClippy0/977.6s. Full1758/control9844B/8704ba6e aftermatch;
+  atomic final report110241B/28164e69. Source4a3f proof only, not new5007.
 - [x] Native5 DSR08029b0b terminalFAILURE/native101/CLI6/909s: cold1/1/218.1s,
   prewarm1/1/158.5s, CHECK0/1/463.4s. Worker compiler actually0/releasedtrue/
   residual0; edge ELF runtime revalidation failed/exceeded original5s deadline.
@@ -37,13 +34,27 @@
   gate, kernel, global utility, or policy change. Four actual-process tests:
   fast0/7 streams; empty/spawnerror; both-lane overflow; live/exited leader
   with pipe-holding descendants must time out and settle.
-- [ ] New source5007 DSR components RUNNING, control8359B/1218eb50/dev49/
-  inode14140858. First execute ALL runtime_cohort cases/four new regressions,
-  then retain worker154/SDK40 and compile/list ALL5 native scenarios. Changed
-  RABS dependency closure requires genuinely rebuilt harness/tools/194 cases;
-  no prior9ce1/3013 retag. NormalALL7 rebuild prepared, not dispatched until
-  first runtime cohort pass; fullnew QA and native5+oldnegative still required.
-  Raw targeted UBS0critical/282warning/138info; compiler/lint/native pass pending.
+- [x] New5007 components DSR0084fe67 terminalSUCCESS0/912s: ALL226 cases
+  (runtime32/worker154/SDK40), zeroignored. Genuine5007 harness compiled/listed
+  ALL5 native scenarios ONLY; no actual native result yet. Full1758/control
+  8359B/1218eb50 aftermatch; receipt33591B/265fa617. Code committed42950473 by
+  user/peer; root did not commit/push. Raw UBS0critical/282warning/138info.
+- [ ] New5007 normalALL7/BOTH TLS DSR RUNNING since00:22UTC, control4824B/
+  cb8274db/dev49/inode14105198; normal profiles/pins/jobs1/3600s. ChangedRABS
+  closure requires genuinely rebuilt roles; no prior9ce1/3013/4a3f retag.
+- [ ] New5007 fullworkspace/ALL9 DSR dispatched00:37UTC, control9489B/48f07c59/
+  dev49/inode14138448; actualfmt0/21.4s, check/strictClippy/ALL1067 pending.
+  Full1758 predecessor audit, zeroownedprocesses, non-destructive retirement
+  to *-retired-4a3f-1067pass and full new5007 source audit before canonical
+  source-root reuse. Retired4a3f and every failure retained. Originalgates,
+  inventories/time/profile/identity and atomic terminal publication preserved.
+- [ ] Fresh5007 native5+oldnegative PREPARED34338B/f4df2add/dev49/inode14100838,
+  not dispatched. Requires COMPLETE newfullQA +normalALL7 +226/harness before
+  runtime; retain final fullgate checks and original3600s/SDK/case bounds.
+  Service/CHECK/BUILD/sharing all must pass, oldB1 must fail precise reconnect
+  assertion; setup/loader/timeout failure cannot satisfy that negative. This
+  sequential schedule removes our own compiler contention without claiming
+  no peer load or absent swap. Codelease2533 released; only Planlease1771 held.
 - [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
   3failed/zeroignored. Two literal route mismatches, one human-message assertion
   contradicted existing typed busy/structured reserved-headroom contract.
