@@ -1098,7 +1098,7 @@ mod linux {
         }
     }
 
-    fn capture_probe(command: &mut Command, budget: Duration) -> io::Result<Output> {
+    fn capture_probe_process(command: &mut Command, budget: Duration) -> io::Result<Output> {
         use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
         command
@@ -1176,10 +1176,62 @@ mod linux {
         })
     }
 
+    fn capture_probe(command: &mut Command, budget: Duration) -> io::Result<Output> {
+        let started = Instant::now();
+        let watchdog = if Path::new("/usr/bin/gnutimeout").try_exists()? {
+            "/usr/bin/gnutimeout"
+        } else {
+            "/usr/bin/timeout"
+        };
+        let mut version = Command::new(watchdog);
+        version
+            .arg("--version")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("LANG", "C");
+        let identity = capture_probe_process(&mut version, budget)?;
+        if !identity.status.success()
+            || !identity.stderr.is_empty()
+            || !identity.stdout.starts_with(b"timeout (GNU coreutils)")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ELF runtime probes require GNU Coreutils timeout (gnutimeout or timeout)",
+            ));
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ELF loader probe exceeded its deadline",
+            ));
+        }
+        // This independent watchdog survives an abrupt death of its Rust
+        // owner. Native draining alone cannot enforce a deadline after SIGKILL.
+        // Its budget shares the original deadline with capability discovery.
+        let mut watched = Command::new(watchdog);
+        watched
+            .arg("--signal=KILL")
+            .arg(format!("{}s", remaining.as_secs_f64()))
+            .arg(command.get_program())
+            .args(command.get_args())
+            .env_clear();
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                watched.env(name, value);
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            watched.current_dir(directory);
+        }
+        capture_probe_process(&mut watched, remaining)
+    }
+
     fn probe(targets: &[PathBuf], search: &[PathBuf]) -> Result<Vec<u8>, RuntimeCohortError> {
         // Fixed tool and clean environment: daemon PATH/LD_* never select the
-        // probe or change resolution. Own the process group and original five
-        // second deadline directly; /usr/bin/timeout need not be GNU timeout.
+        // probe or change resolution. Own bounded draining and retain a GNU
+        // watchdog for parent death, all under the original five-second budget.
         let mut command = Command::new("/usr/bin/ldd");
         command
             .arg("--")
@@ -2120,7 +2172,15 @@ mod linux {
             assert!(output.status.success());
             assert!(output.stdout.is_empty());
             assert!(output.stderr.is_empty());
-            let error = capture_probe(
+            let missing = capture_probe(
+                &mut Command::new("/nonexistent-rabs-loader-probe"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(missing.status.code(), Some(127));
+            assert!(missing.stdout.is_empty());
+            assert!(!missing.stderr.is_empty());
+            let error = capture_probe_process(
                 &mut Command::new("/nonexistent-rabs-loader-probe"),
                 Duration::from_secs(5),
             )
