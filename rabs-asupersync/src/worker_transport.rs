@@ -1139,7 +1139,7 @@ mod tests {
             let address = address_receiver
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
-            let connected = run(async {
+            let connected = run(async move {
                 let mut peer = match client_protocol {
                     PeerProtocol::Worker => connect_peer(&address, "localhost", client).await?,
                     PeerProtocol::EdgeCoordinator => {
