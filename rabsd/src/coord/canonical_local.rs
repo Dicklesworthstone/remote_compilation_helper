@@ -1243,23 +1243,25 @@ fn run_operation(
                 .acquire(&profile.toolchain_root, timeout, cancelled)
         })
         .transpose()?;
-    let (owner, source, captured_toolchain, request) = match prepared_inputs {
+    // Runtime sockets and writable output always use the configured operation
+    // root, even when uploaded source/SDK custody lives on another volume.
+    let owner = Arc::new(
+        tempfile::Builder::new()
+            .prefix("rabs-compile-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(&profile.operation_root)?,
+    );
+    let (source, captured_toolchain, request, input_owner) = match prepared_inputs {
         Some(inputs) => {
             inputs.verify_for_profile(&profile, &cancelled)?;
             (
-                inputs.owner,
                 inputs.source,
                 Some(inputs.toolchain),
                 inputs.request,
+                Some(inputs.owner),
             )
         }
         None => {
-            let owner = Arc::new(
-                tempfile::Builder::new()
-                    .prefix("rabs-compile-")
-                    .permissions(fs::Permissions::from_mode(0o700))
-                    .tempdir_in(&profile.operation_root)?,
-            );
             let bundle = owner.path().join("bundle");
             let prepared = super::source_delivery::prepare_local_bundle_controlled(
                 &profile.source_root,
@@ -1273,8 +1275,25 @@ fn run_operation(
                 super::worker_delivery::MAX_FRAME_BYTES as u64,
             )?;
             let request: Value = serde_json::from_slice(&request_bytes)?;
-            (owner, prepared.source, prepared.toolchain, request)
+            (prepared.source, prepared.toolchain, request, None)
         }
+    };
+    let retain_paths = |mappings| {
+        let paths = match &input_owner {
+            Some(inputs) => CanonicalPaths::new_with_input_owner(
+                Arc::clone(&owner),
+                Arc::clone(inputs),
+                mappings,
+            ),
+            None => CanonicalPaths::new_with_retained_toolchain(
+                Arc::clone(&owner),
+                mappings,
+                retained_toolchain.clone(),
+            ),
+        };
+        paths
+            .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
+            .map_err(io::Error::other)
     };
     let source_root = source
         .sealed_root()
@@ -1369,19 +1388,13 @@ fn run_operation(
     // bind obscure its protection in the namespace builder's mount ordering.
     make_read_only(&mut spec, "/__rabs/workspace")?;
     make_read_only(&mut spec, "/__rabs/home")?;
-    let paths = CanonicalPaths::new_with_retained_toolchain(
-        owner.clone(),
-        vec![
-            ("/__rabs/workspace".into(), workspace.clone()),
-            ("/__rabs/cargo-home".into(), cargo_root.clone()),
-            ("/__rabs/toolchain".into(), toolchain.clone()),
-            (TARGET.into(), target_root.clone()),
-            ("/__rabs/home".into(), home_root.clone()),
-        ],
-        retained_toolchain.clone(),
-    )
-    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
-    .map_err(io::Error::other)?;
+    let paths = retain_paths(vec![
+        ("/__rabs/workspace".into(), workspace.clone()),
+        ("/__rabs/cargo-home".into(), cargo_root.clone()),
+        ("/__rabs/toolchain".into(), toolchain.clone()),
+        (TARGET.into(), target_root.clone()),
+        ("/__rabs/home".into(), home_root.clone()),
+    ])?;
     if profile.command == CompilationCommand::Clippy {
         for program in [CARGO_CLIPPY, CLIPPY_DRIVER] {
             let physical = paths
@@ -1564,19 +1577,13 @@ fn run_operation(
     preparation.checkpoint()?;
     // A failed restore remains in unmounted private staging. The live endpoint
     // receives only the completely selected target's retained inode capability.
-    let paths = CanonicalPaths::new_with_retained_toolchain(
-        owner.clone(),
-        vec![
-            ("/__rabs/workspace".into(), workspace),
-            ("/__rabs/cargo-home".into(), cargo_root),
-            ("/__rabs/toolchain".into(), toolchain),
-            (TARGET.into(), target_root.clone()),
-            ("/__rabs/home".into(), home_root.clone()),
-        ],
-        retained_toolchain.clone(),
-    )
-    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
-    .map_err(io::Error::other)?;
+    let paths = retain_paths(vec![
+        ("/__rabs/workspace".into(), workspace),
+        ("/__rabs/cargo-home".into(), cargo_root),
+        ("/__rabs/toolchain".into(), toolchain),
+        (TARGET.into(), target_root.clone()),
+        ("/__rabs/home".into(), home_root.clone()),
+    ])?;
     let paths = paths
         .with_workspace_units(graph.workspace_units(), profile.selection.as_ref())
         .map_err(io::Error::other)?;
@@ -1819,7 +1826,7 @@ fn run_operation(
                     == target_root,
                 "completed target differs from its retained canonical mount",
             )?;
-            // Remote targets remain under the uploaded operation's owner until
+            // Remote targets remain under their runtime operation owner until
             // verified transfer and its final acknowledgment release custody.
             let parent = if remote_operation {
                 owner.path()

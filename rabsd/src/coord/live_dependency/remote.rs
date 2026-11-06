@@ -1556,7 +1556,7 @@ impl RemoteDependencies {
                 guard: guard.clone(),
                 backing: RetainedToolchainBacking::CanonicalCaptured {
                     image: Arc::clone(image),
-                    _owner: Arc::clone(paths.operation_owner()),
+                    _owner: Arc::clone(paths.captured_toolchain_owner()?),
                 },
             });
             retained
@@ -2873,6 +2873,80 @@ mod worker_pool_tests {
                 .contains("toolchain destination parent must be private")
         );
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn captured_compiler_lease_keeps_uploaded_sdk_after_runtime_paths_drop() {
+        use std::fs;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let source = crate::test_util::private_tempdir();
+        fs::create_dir(source.path().join("bin")).unwrap();
+        let bytes = b"retained dataset bytes; never executed";
+        fs::write(source.path().join("bin/rustc"), bytes).unwrap();
+        fs::set_permissions(
+            source.path().join("bin/rustc"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let inputs = Arc::new(crate::test_util::private_tempdir());
+        let runtime = Arc::new(crate::test_util::private_tempdir());
+        let input_root = inputs.path().to_path_buf();
+        let runtime_root = runtime.path().to_path_buf();
+        let image = Arc::new(
+            capture_toolchain(
+                source.path(),
+                &input_root.join("toolchain"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let mappings = [
+            ("/__rabs/workspace", input_root.join("source")),
+            ("/__rabs/toolchain", image.root().to_path_buf()),
+            ("/__rabs/cargo-home", runtime_root.join("cargo-home")),
+            ("/__rabs/out/cargo", runtime_root.join("target")),
+            ("/__rabs/home", runtime_root.join("home")),
+        ]
+        .into_iter()
+        .map(|(logical, backing)| {
+            if logical != "/__rabs/toolchain" {
+                fs::DirBuilder::new().mode(0o700).create(&backing).unwrap();
+            }
+            (PathBuf::from(logical), backing)
+        })
+        .collect();
+        let paths = CanonicalPaths::new_with_input_owner(
+            Arc::clone(&runtime),
+            Arc::clone(&inputs),
+            mappings,
+        )
+        .unwrap()
+        .with_captured_toolchain(Some(Arc::clone(&image)))
+        .unwrap();
+        assert!(Arc::ptr_eq(paths.operation_owner(), &runtime));
+        assert!(Arc::ptr_eq(
+            paths.captured_toolchain_owner().unwrap(),
+            &inputs
+        ));
+        let lease = RetainedToolchainBacking::CanonicalCaptured {
+            image: Arc::clone(paths.captured_toolchain().unwrap()),
+            _owner: Arc::clone(paths.captured_toolchain_owner().unwrap()),
+        };
+        drop((paths, runtime, inputs, image));
+        assert!(!runtime_root.exists());
+        assert_eq!(
+            fs::read(input_root.join("toolchain/bin/rustc")).unwrap(),
+            bytes
+        );
+        let RetainedToolchainBacking::CanonicalCaptured { image, .. } = &lease else {
+            unreachable!()
+        };
+        image.verify_retained_generation(|| false).unwrap();
+        drop(lease);
+        assert!(!input_root.exists());
     }
 
     fn endpoint(index: u16) -> Value {

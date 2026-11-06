@@ -50,6 +50,7 @@ struct Mount {
 pub struct CanonicalPaths {
     // Close captured filesystem descriptors before the operation directory.
     captured_toolchain: Option<Arc<PreparedToolchain>>,
+    input_owner: Option<Arc<tempfile::TempDir>>,
     _owner: Arc<tempfile::TempDir>,
     shared_toolchain: Option<Arc<RetainedToolchain>>,
     mounts: Vec<Mount>,
@@ -149,6 +150,26 @@ impl CanonicalPaths {
         mappings: Vec<(PathBuf, PathBuf)>,
         shared_toolchain: Option<Arc<RetainedToolchain>>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_owned(owner, mappings, shared_toolchain, None)
+    }
+
+    /// A remote operation retains uploaded inputs separately from its short
+    /// runtime root. Only read-only source/compiler mounts may use that owner;
+    /// writable HOME, Cargo home and targets remain under the runtime owner.
+    pub(crate) fn new_with_input_owner(
+        owner: Arc<tempfile::TempDir>,
+        input_owner: Arc<tempfile::TempDir>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_owned(owner, mappings, None, Some(input_owner))
+    }
+
+    fn new_owned(
+        owner: Arc<tempfile::TempDir>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+        shared_toolchain: Option<Arc<RetainedToolchain>>,
+        input_owner: Option<Arc<tempfile::TempDir>>,
+    ) -> Result<Arc<Self>, String> {
         let owned = owner.path();
         if !ordinary_absolute(owned) {
             return Err("canonical operation root is not an ordinary absolute path".into());
@@ -159,6 +180,21 @@ impl CanonicalPaths {
             || root.mode() & 0o077 != 0
         {
             return Err("canonical operation root must be an owned private directory".into());
+        }
+        if let Some(inputs) = &input_owner {
+            let path = inputs.path();
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !ordinary_absolute(path)
+                || !metadata.is_dir()
+                || metadata.uid() != root.uid()
+                || metadata.mode() & 0o077 != 0
+                || path.starts_with(owned)
+                || owned.starts_with(path)
+            {
+                return Err(
+                    "canonical input owner must be a disjoint owned private directory".into(),
+                );
+            }
         }
         if let Some(toolchain) = &shared_toolchain {
             let parent = toolchain.owner_path();
@@ -187,7 +223,15 @@ impl CanonicalPaths {
                     }
                     toolchain.owner_path()
                 }
-                _ => owned,
+                _ => input_owner
+                    .as_ref()
+                    .filter(|inputs| {
+                        matches!(
+                            logical.to_str(),
+                            Some("/__rabs/workspace" | "/__rabs/toolchain")
+                        ) && backing.starts_with(inputs.path())
+                    })
+                    .map_or(owned, |inputs| inputs.path()),
             };
             if !ROOTS.iter().any(|root| logical == Path::new(root))
                 || !visible.insert(logical.clone())
@@ -229,6 +273,7 @@ impl CanonicalPaths {
         }
         Ok(Arc::new(Self {
             _owner: owner,
+            input_owner,
             shared_toolchain,
             captured_toolchain: None,
             mounts,
@@ -245,8 +290,8 @@ impl CanonicalPaths {
         self.shared_toolchain.as_ref()
     }
 
-    /// Reuse the standalone driver's already captured compiler tree. The
-    /// ordinary mount checks above keep this image under the operation owner;
+    /// Reuse the driver's already captured compiler tree. The ordinary mount
+    /// checks keep this image under the operation or retained input owner;
     /// neither a wrapper path nor a second capture can select its generation.
     pub(crate) fn with_captured_toolchain(
         mut self: Arc<Self>,
@@ -258,7 +303,11 @@ impl CanonicalPaths {
         if self.shared_toolchain.is_some()
             || self.captured_toolchain.is_some()
             || self.physical(Path::new("/__rabs/toolchain"))? != toolchain.root()
-            || !toolchain.root().starts_with(self._owner.path())
+            || !(toolchain.root().starts_with(self._owner.path())
+                || self
+                    .input_owner
+                    .as_ref()
+                    .is_some_and(|owner| toolchain.root().starts_with(owner.path())))
         {
             return Err("captured compiler differs from its owned canonical mount".into());
         }
@@ -273,6 +322,28 @@ impl CanonicalPaths {
 
     pub(crate) fn captured_toolchain(&self) -> Option<&Arc<PreparedToolchain>> {
         self.captured_toolchain.as_ref()
+    }
+
+    /// A compiler-only lease can outlive this operation's paths. Retain the
+    /// actual validated SDK mount owner, independently of operation identity.
+    pub(super) fn captured_toolchain_owner(&self) -> Result<&Arc<tempfile::TempDir>, String> {
+        let image = self
+            .captured_toolchain
+            .as_ref()
+            .ok_or("canonical operation has no captured compiler owner")?;
+        let backing = self.physical(Path::new("/__rabs/toolchain"))?;
+        if backing != image.root() {
+            return Err("captured compiler differs from its owned canonical mount".into());
+        }
+        if let Some(inputs) = &self.input_owner
+            && backing.starts_with(inputs.path())
+        {
+            return Ok(inputs);
+        }
+        if backing.starts_with(self._owner.path()) {
+            return Ok(&self._owner);
+        }
+        Err("captured compiler lost its retained directory owner".into())
     }
 
     /// Original operation identity retained by remote keying. This owner is
@@ -2366,6 +2437,106 @@ mod tests {
         assert!(CanonicalPaths::new(Arc::clone(&owner), mappings.clone()).is_err());
         mappings[1].1 = std::env::temp_dir();
         assert!(CanonicalPaths::new(owner, mappings).is_err());
+    }
+
+    #[test]
+    fn separate_input_owner_only_authorizes_source_and_compiler_mounts() {
+        let (owner, _) = fixture();
+        let (inputs, _) = fixture();
+        let (foreign, _) = fixture();
+        let mappings: Vec<_> = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let parent = if matches!(index, 0 | 2) {
+                    inputs.path()
+                } else {
+                    owner.path()
+                };
+                (PathBuf::from(logical), parent.join(index.to_string()))
+            })
+            .collect();
+        let paths = CanonicalPaths::new_with_input_owner(
+            Arc::clone(&owner),
+            Arc::clone(&inputs),
+            mappings.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(paths.operation_owner(), &owner));
+        assert_eq!(
+            paths.physical(Path::new("/__rabs/workspace")).unwrap(),
+            inputs.path().join("0")
+        );
+        for index in [1, 3, 4] {
+            let mut forged = mappings.clone();
+            forged[index].1 = inputs.path().join(index.to_string());
+            assert!(
+                CanonicalPaths::new_with_input_owner(
+                    Arc::clone(&owner),
+                    Arc::clone(&inputs),
+                    forged,
+                )
+                .is_err(),
+                "writable {} escaped the runtime owner",
+                ROOTS[index]
+            );
+        }
+        for index in [0, 2] {
+            let mut forged = mappings.clone();
+            forged[index].1 = foreign.path().join(index.to_string());
+            assert!(
+                CanonicalPaths::new_with_input_owner(
+                    Arc::clone(&owner),
+                    Arc::clone(&inputs),
+                    forged,
+                )
+                .is_err(),
+                "unowned {} was accepted",
+                ROOTS[index]
+            );
+        }
+        // Cargo-home projection may independently copy the workspace into
+        // runtime storage while the captured compiler stays under uploads.
+        let mut projected = mappings;
+        projected[0].1 = owner.path().join("0");
+        let projected =
+            CanonicalPaths::new_with_input_owner(Arc::clone(&owner), inputs, projected).unwrap();
+        assert_eq!(
+            projected.physical(Path::new("/__rabs/workspace")).unwrap(),
+            owner.path().join("0")
+        );
+    }
+
+    #[test]
+    fn separate_input_owner_refuses_equal_nested_and_nonprivate_custody() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (owner, _) = fixture();
+        let nested = Arc::new(
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(owner.path())
+                .unwrap(),
+        );
+        for (runtime, inputs) in [
+            (Arc::clone(&owner), Arc::clone(&owner)),
+            (Arc::clone(&owner), Arc::clone(&nested)),
+            (Arc::clone(&nested), Arc::clone(&owner)),
+        ] {
+            let error =
+                CanonicalPaths::new_with_input_owner(runtime, inputs, Vec::new()).unwrap_err();
+            assert!(
+                error.contains("disjoint owned private directory"),
+                "{error}"
+            );
+        }
+        let (inputs, _) = fixture();
+        std::fs::set_permissions(inputs.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = CanonicalPaths::new_with_input_owner(owner, inputs, Vec::new()).unwrap_err();
+        assert!(
+            error.contains("disjoint owned private directory"),
+            "{error}"
+        );
     }
 
     struct GeneratedFixture {

@@ -468,7 +468,10 @@ mod tests {
     }
 
     fn fixture() -> RemoteOperationInputs {
-        let owner = Arc::new(tempfile::tempdir().unwrap());
+        fixture_with_owner(Arc::new(crate::test_util::private_tempdir()))
+    }
+
+    fn fixture_with_owner(owner: Arc<tempfile::TempDir>) -> RemoteOperationInputs {
         let compiler_source = tempfile::tempdir().unwrap();
         fs::write(
             compiler_source.path().join("compiler-data"),
@@ -518,7 +521,7 @@ mod tests {
     #[test]
     fn remote_inputs_refuse_unowned_stale_and_mismatched_captures() {
         let inputs = fixture();
-        let foreign = Arc::new(tempfile::tempdir().unwrap());
+        let foreign = Arc::new(crate::test_util::private_tempdir());
         assert!(
             RemoteOperationInputs::new(
                 foreign,
@@ -577,36 +580,115 @@ mod tests {
     #[test]
     fn canonical_producer_owner_retains_uploaded_inputs_after_request_drop() {
         let inputs = fixture();
-        let root = inputs.owner.path().to_path_buf();
+        let input_root = inputs.owner.path().to_path_buf();
+        let runtime = Arc::new(crate::test_util::private_tempdir());
+        let runtime_root = runtime.path().to_path_buf();
+        let paths = remote_paths(&inputs, &runtime);
+        drop(inputs);
+        drop(runtime);
+        let subscriber = Arc::clone(&paths);
+        drop(paths);
+        assert!(runtime_root.join("target").is_dir());
+        assert!(input_root.join("source/Cargo.toml").is_file());
+        subscriber
+            .captured_toolchain()
+            .unwrap()
+            .verify_retained_generation(|| false)
+            .unwrap();
+        drop(subscriber);
+        assert!(!runtime_root.exists());
+        assert!(!input_root.exists());
+    }
+
+    fn remote_paths(
+        inputs: &RemoteOperationInputs,
+        runtime: &Arc<tempfile::TempDir>,
+    ) -> Arc<super::super::CanonicalPaths> {
+        let root = runtime.path();
         for child in ["cargo-home", "target", "home"] {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .create(root.join(child))
                 .unwrap();
         }
-        let paths = super::super::CanonicalPaths::new_with_retained_toolchain(
+        super::super::CanonicalPaths::new_with_input_owner(
+            Arc::clone(runtime),
             Arc::clone(&inputs.owner),
             vec![
-                ("/__rabs/workspace".into(), root.join("source")),
+                (
+                    "/__rabs/workspace".into(),
+                    inputs.source.sealed_root().unwrap().to_path_buf(),
+                ),
                 ("/__rabs/cargo-home".into(), root.join("cargo-home")),
-                ("/__rabs/toolchain".into(), root.join("toolchain")),
+                (
+                    "/__rabs/toolchain".into(),
+                    inputs.toolchain.root().to_path_buf(),
+                ),
                 (super::super::TARGET.into(), root.join("target")),
                 ("/__rabs/home".into(), root.join("home")),
             ],
-            None,
         )
         .unwrap()
         .with_captured_toolchain(Some(Arc::clone(&inputs.toolchain)))
-        .unwrap();
-        drop(inputs);
-        assert!(root.join("source/Cargo.toml").is_file());
-        paths
-            .captured_toolchain()
-            .unwrap()
-            .verify_retained_generation(|| false)
+        .unwrap()
+    }
+
+    #[test]
+    fn long_upload_directory_keeps_the_real_unix_socket_under_the_short_runtime_root() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let parent = tempfile::Builder::new()
+            .prefix("rabs-r-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
             .unwrap();
-        drop(paths);
-        assert!(!root.exists());
+        let input_owner = Arc::new(
+            tempfile::Builder::new()
+                .prefix(&"uploaded-inputs-".repeat(10))
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent.path())
+                .unwrap(),
+        );
+        let inputs = fixture_with_owner(input_owner);
+        assert!(
+            inputs
+                .owner
+                .path()
+                .join("home/control/rustc.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                >= 108
+        );
+        let runtime = Arc::new(
+            tempfile::Builder::new()
+                .prefix("rabs-compile-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent.path())
+                .unwrap(),
+        );
+        let paths = remote_paths(&inputs, &runtime);
+        let control = paths
+            .physical(Path::new("/__rabs/home"))
+            .unwrap()
+            .join("control");
+        fs::DirBuilder::new().mode(0o700).create(&control).unwrap();
+        let socket = control.join("rustc.sock");
+        assert!(socket.starts_with(runtime.path()));
+        assert!(!socket.starts_with(inputs.owner.path()));
+        assert!(socket.as_os_str().as_encoded_bytes().len() < 108);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = UnixStream::connect(&socket).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop((client, server, listener));
+        assert_eq!(
+            paths.physical(Path::new("/__rabs/workspace")).unwrap(),
+            inputs.source.sealed_root().unwrap()
+        );
+        assert_eq!(
+            paths.physical(Path::new("/__rabs/toolchain")).unwrap(),
+            inputs.toolchain.root()
+        );
     }
 
     #[test]
