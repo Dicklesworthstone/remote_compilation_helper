@@ -43,6 +43,13 @@ connects captured Cargo checks and builds to the external-dependency cache, with
 isolated worker execution for eligible Rust archives. Its commands and narrower
 graph requirements are described below.
 
+For clients on separate hosts, the native
+[`--canonical-compile-remote` frontend](#submit-from-separate-hosts-to-the-shared-coordinator)
+uploads captured inputs to one pinned, mutually authenticated coordinator. Cargo
+runs at that coordinator, and eligible dependency compilations from independent
+clients share its existing worker pool and action ownership. Each client receives
+its own verified output tree.
+
 ## Profile and prerequisites
 
 Linux is required on the preparing host and worker. Install matching `cargo-rabs`
@@ -2312,6 +2319,245 @@ bound cancels and drains that operation; this interface does not create a detach
 recoverable background job. Service shutdown stops admission, cancels and joins
 its active operations and shared remote executions, then releases coordinator
 authority.
+
+### Submit from separate hosts to the shared coordinator
+
+The installed native commands expose the shared canonical runtime to explicitly
+enrolled clients over pinned mutual TLS:
+
+```sh
+rabsd --canonical-compile-remote-service ./remote-service.json
+rabsd --canonical-compile-remote ./remote-build.json
+```
+
+Run the first command on the coordinator and the second on a client. Each client
+captures its approved source/dependency closure and complete toolchain, then
+uploads those exact bytes. The coordinator allocates private input and operation
+directories and runs the existing canonical Cargo driver. Cargo plans at the
+same stable paths used by local canonical operations. Eligible concurrent
+dependency requests from different clients can join one shared execution, while
+each operation keeps its own source observations, Cargo process, target,
+wrapper endpoint and cancellation owner. Results are installed independently at
+each client's explicit output destination.
+
+Install matching `rabsd` builds on the clients and coordinator, and a matching
+`rabs-wrap` on the coordinator. Both sides require Linux. The coordinator must
+pass the complete production namespace probe, and the captured toolchain must
+support nightly Cargo unit-graph planning and run on that coordinator. The
+existing source, dependency, environment and execution-host restrictions still
+apply. Configure dependency workers on the coordinator using
+[the existing pinned worker setup](#send-canonical-dependency-compilations-to-workers)
+to share eligible remote metadata and archive compilations. Worker identities,
+credentials and listeners are selected by the service operator.
+
+#### Enroll client and coordinator certificates
+
+Provision a trusted CA, a coordinator server certificate, and a separate client
+certificate/key for each enrolled edge host. The coordinator certificate must
+cover the client's configured `server_name`. Certificate-chain validation and
+explicit SPKI SHA-256 pins are both required: the client pins the coordinator,
+and the service accepts only its enrolled client keys.
+
+Obtain each pin from the corresponding trusted certificate:
+
+```sh
+openssl x509 -in /credentials/coordinator.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+
+openssl x509 -in /credentials/edge-a.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+```
+
+Copy only the resulting 64 lowercase hexadecimal characters, without the
+OpenSSL label, into the appropriate profile. Replace all example addresses,
+paths and pin placeholders below. Keep certificate private keys outside captured
+source and toolchain roots. The profile's `tls` fields configure this dedicated
+client-to-coordinator transport; dependency-worker TLS remains separately
+configured through `RABS_COORD_TLS_CA`, `RABS_COORD_TLS_CERT` and
+`RABS_COORD_TLS_KEY` on the coordinator.
+
+#### Start the coordinator
+
+Create three pairwise disjoint, owned private directories. Existing directories
+must already have mode 0700; the service does not repair their permissions.
+Keep the operation root short enough for its operation-scoped Unix sockets:
+
+```sh
+mkdir -m 700 /home/builder/rabs-remote-state \
+  /home/builder/rabs-remote-inputs /tmp/rabs-remote-ops
+```
+
+Save the complete service profile as `remote-service.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-service-v1",
+  "listen": "192.0.2.10:45300",
+  "state_root": "/home/builder/rabs-remote-state",
+  "input_root": "/home/builder/rabs-remote-inputs",
+  "operation_root": "/tmp/rabs-remote-ops",
+  "wrapper": "/usr/local/bin/rabs-wrap",
+  "tls": {
+    "ca": "/credentials/ca.pem",
+    "certificate": "/credentials/coordinator.pem",
+    "private_key": "/credentials/coordinator.key"
+  },
+  "allowed_edge_pins": [
+    "REPLACE_WITH_EDGE_A_64_LOWERCASE_HEX_DIGITS"
+  ],
+  "max_roots": 4,
+  "jobs_per_root": 2
+}
+```
+
+`listen` is an IP address and port bound on the coordinator. The three storage
+roots must have ordinary absolute paths and no symlink ancestry. The wrapper
+must be an ordinary executable outside those mutable roots. `allowed_edge_pins`
+accepts 1–256 distinct nonzero client-key pins. `max_roots` accepts 1–32 and
+`jobs_per_root` accepts 1–4096, with at most 4096 aggregate jobs. A session slot
+covers authentication, input transfer, execution and final delivery, bounding
+the number of simultaneous operations even while inputs are uploading.
+
+Set the coordinator's dependency-worker environment before starting the service.
+For example, a single worker uses its own listener, separate from the remote
+client listener above:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/worker-ca.pem \
+RABS_COORD_TLS_CERT=/credentials/worker-coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/worker-coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_64_LOWERCASE_HEX_DIGITS \
+  rabsd --canonical-compile-remote-service ./remote-service.json
+```
+
+The worker must run its normal outward connection loop against the dependency
+listener. A pool uses `RABS_DEPENDENCY_WORKERS_JSON` in place of the three
+singleton worker fields. The service owns that configuration and its shared
+coordinator authority for its whole lifetime. Client requests cannot choose
+worker endpoints, coordinator storage paths, wrapper executables or mount rules.
+
+#### Submit a captured client operation
+
+On the client, create a private staging root and a separate private output
+parent outside the source, toolchain and optional Cargo-cache roots. The final
+output destination must be absent; do not create it in advance:
+
+```sh
+mkdir -m 700 /home/dev/rabs-remote-staging /home/dev/rabs-remote-results
+```
+
+Save this complete client profile as `remote-build.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-v1",
+  "coordinator": "192.0.2.10:45300",
+  "server_name": "rabs-coordinator.internal",
+  "coordinator_pin": "REPLACE_WITH_COORDINATOR_64_LOWERCASE_HEX_DIGITS",
+  "tls": {
+    "ca": "/home/dev/credentials/ca.pem",
+    "certificate": "/home/dev/credentials/edge-a.pem",
+    "private_key": "/home/dev/credentials/edge-a.key"
+  },
+  "source_root": "/home/dev/projects/approved-anchor",
+  "toolchain_root": "/opt/rust/native-nightly-toolchain",
+  "staging_root": "/home/dev/rabs-remote-staging",
+  "output_destination": "/home/dev/rabs-remote-results/build-001",
+  "cargo_home_source": "/home/dev/.cargo",
+  "settings": {
+    "command": "build",
+    "manifest": "app/Cargo.toml",
+    "source_selection": "cargo-unit-graph-v1",
+    "selection": {
+      "workspace": true
+    },
+    "jobs": 2,
+    "timeout_seconds": 1800,
+    "env": {
+      "APP_VERSION": "2026.11"
+    }
+  }
+}
+```
+
+Invoke the installed client:
+
+```sh
+rabsd --canonical-compile-remote ./remote-build.json
+```
+
+`coordinator` selects the remote host and port. `server_name` is checked against
+the coordinator certificate even when connecting by IP. All filesystem paths
+in the client profile are absolute and refer to that client. The captured source
+and toolchain are transferred as sealed datasets; the coordinator does not need
+access to those original host paths. The required `output_destination` names a
+new directory whose immediate parent is owned and private.
+
+`settings` uses the same logical command, manifest, selection and literal
+environment contract as the canonical local profile. Defaults are `check`,
+`Cargo.toml`, one job and 1800 seconds. Jobs must fit the service's per-root
+grant. Omitting `selection` for Check retains its library-only default; an
+explicit empty selection uses Cargo's ordinary default members and targets.
+The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
+compilation with `"no_run": true`. Run and executing Bench require inherited
+stdin and are refused by this protocol, including when stdin is redirected.
+Test bodies still execute for each request and retain their actual exit status.
+
+For a vendored source graph, omit `cargo_home_source` and `source_selection`,
+then add `"vendor": "vendor"` inside `settings`. For an entirely local graph,
+omit both dependency-source choices. The
+[selected source-preparation rules](#select-native-source-preparation) apply
+when `source_selection` is enabled. The entire approved source anchor remains
+the capture boundary. Client application environment is supplied only through
+`settings.env`; worker, loader and canonical execution controls remain reserved.
+
+#### Results, ownership and current limits
+
+The client preserves Cargo's numeric exit status and separate stdout/stderr
+streams. A successful Build or Doc, or Test/Bench with `no_run`, transfers the
+completed ordinary-file target tree and installs it at `output_destination`.
+Successful Check, Clippy and executing Test return their status and diagnostics
+without materializing that destination. The destination field remains required
+for every profile, and an existing destination refuses instead of being merged
+or overwritten. Choose a fresh destination for each intentional new operation.
+
+Artifact delivery is limited to **512 MiB and 4096 regular files**. The complete
+file set, lengths, executable identities and hashes are verified before atomic
+publication. Symlinks, special files, external hardlinks, ambiguous paths and
+oversized trees refuse delivery; the service never substitutes a successful
+partial tree. Internal hardlink aliases become independent files. Files arrive
+read-only, with mode 0444 or 0555 according to their executable bit, inside a
+private 0700 target root. Empty directories, timestamps and hardlink topology
+are not transported. These are detached build artifacts; this format does not
+grant reusable Cargo target-state or action-cache authority on the client.
+
+Client disconnection cancels and drains that operation. It removes only that
+operation's interest in a shared dependency execution; another client's retained
+subscription can continue. Losing the last subscriber cancels the shared
+producer through the existing ownership path. Service shutdown stops admission
+and joins operations and shared executions before releasing coordinator
+authority. The service verifies the same installed build identity as the client
+and cannot downgrade a client's required release-authorization policy.
+
+This first remote protocol has no detached-job resume or automatic operation
+retry after admission. A transport failure after acceptance can leave execution
+or final delivery uncertain. An interruption after the local atomic rename can
+leave the requested output already installed even when the client reports an
+error. Preserve that result and inspect it; do not automatically submit another
+operation or fall back to a local compiler because an acknowledgment was lost.
+Failed receive staging is retained privately.
+
+Cargo and each operation's rustc endpoint run at the coordinator. The client
+does not run an independent local Cargo driver against a distributed action
+coordinator. This route extends the existing shared dependency runtime across
+authenticated client hosts; complete M6 fleet scheduling, a measured multi-host
+build storm and its performance targets still require their own qualification.
+The native commands above are the entry points for this profile; the current
+`cargo-rabs` launcher profile formats remain unchanged.
 
 ### Persistent reuse and command results
 

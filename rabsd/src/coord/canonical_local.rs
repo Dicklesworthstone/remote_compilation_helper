@@ -14,6 +14,9 @@
 //! unsupported rustc invocations compile normally in the namespace. Workspace
 //! results never gain action-cache publication or replay authority.
 
+mod remote_artifacts;
+pub(super) mod remote_operation;
+pub mod remote_service;
 pub mod service;
 mod target_state;
 pub(crate) use target_state::RestoredTargetProvenance;
@@ -47,9 +50,9 @@ use rabs_sandbox::cargo_check::{
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
 use rabs_sandbox::process_context::CommandContext;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest, SourceReceiver};
 use rabs_sandbox::toolchain_cache::{CAPACITY as TOOLCHAIN_CAPACITY, ToolchainPool};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -75,7 +78,7 @@ const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
 enum SourceSelection {
     #[default]
     #[serde(skip)]
@@ -697,7 +700,7 @@ impl OperationOutput {
 }
 
 impl Profile {
-    fn validate(&self) -> io::Result<()> {
+    fn validate_logical(&self) -> io::Result<()> {
         require(
             self.version == PROFILE_VERSION,
             "unsupported canonical compilation profile version",
@@ -736,6 +739,11 @@ impl Profile {
                 "vendor must be an ordinary relative path",
             )?;
         }
+        Ok(())
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.validate_logical()?;
         ordinary_directory(&self.source_root)?;
         ordinary_directory(&self.toolchain_root)?;
         private_directory(&self.state_root)?;
@@ -1114,7 +1122,9 @@ pub fn run_profile_with_release(
         None,
         Arc::new(AtomicBool::new(false)),
         OperationOutput::Inherit,
+        None,
     )
+    .map(|outcome| outcome.exit_code)
 }
 
 pub(super) fn run_shared_profile(
@@ -1154,7 +1164,26 @@ pub(super) fn run_shared_profile(
         Some(runtime),
         stopped,
         output,
+        None,
     )
+    .map(|outcome| outcome.exit_code)
+}
+
+/// Exact live provenance survives private target retention. Remote delivery
+/// keeps this owner until its final acknowledgment; local callers drop it
+/// after the ordinary synchronous completion barrier.
+struct OperationProvenance {
+    // Close the sealed source descriptor before dropping its directory owner
+    // through CanonicalPaths. Shared dependency producers retain their own Arc.
+    _source: SourceReceiver,
+    paths: Arc<CanonicalPaths>,
+    coord: Arc<CoordLive>,
+}
+
+struct OperationOutcome {
+    exit_code: i32,
+    retained_target: Option<PathBuf>,
+    provenance: OperationProvenance,
 }
 
 fn run_operation(
@@ -1164,7 +1193,9 @@ fn run_operation(
     shared: Option<Arc<SharedRuntime>>,
     stopped: Arc<AtomicBool>,
     mut output: OperationOutput,
-) -> io::Result<i32> {
+    prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
+) -> io::Result<OperationOutcome> {
+    let remote_operation = prepared_inputs.is_some();
     let timeout = Duration::from_secs(profile.timeout_seconds);
     let cancelled = || {
         stopped.load(Ordering::Acquire) || shared.as_ref().is_some_and(|runtime| !runtime.healthy())
@@ -1205,33 +1236,46 @@ fn run_operation(
     // then executes the exact retained image even if that source later changes.
     let retained_toolchain = shared
         .as_ref()
+        .filter(|_| !remote_operation)
         .map(|runtime| {
             runtime
                 .toolchains
                 .acquire(&profile.toolchain_root, timeout, cancelled)
         })
         .transpose()?;
-    let owner = Arc::new(
-        tempfile::Builder::new()
-            .prefix("rabs-compile-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(&profile.operation_root)?,
-    );
-    let bundle = owner.path().join("bundle");
-    let prepared = super::source_delivery::prepare_local_bundle_controlled(
-        &profile.source_root,
-        &profile.source_specification()?,
-        &bundle,
-        retained_toolchain.clone(),
-        &preparation,
-    )?;
-    let source = prepared.source;
-    let captured_toolchain = prepared.toolchain;
-    let (_, request_bytes) = read_stable(
-        &bundle.join("request.json"),
-        super::worker_delivery::MAX_FRAME_BYTES as u64,
-    )?;
-    let request: Value = serde_json::from_slice(&request_bytes)?;
+    let (owner, source, captured_toolchain, request) = match prepared_inputs {
+        Some(inputs) => {
+            inputs.verify_for_profile(&profile, &cancelled)?;
+            (
+                inputs.owner,
+                inputs.source,
+                Some(inputs.toolchain),
+                inputs.request,
+            )
+        }
+        None => {
+            let owner = Arc::new(
+                tempfile::Builder::new()
+                    .prefix("rabs-compile-")
+                    .permissions(fs::Permissions::from_mode(0o700))
+                    .tempdir_in(&profile.operation_root)?,
+            );
+            let bundle = owner.path().join("bundle");
+            let prepared = super::source_delivery::prepare_local_bundle_controlled(
+                &profile.source_root,
+                &profile.source_specification()?,
+                &bundle,
+                retained_toolchain.clone(),
+                &preparation,
+            )?;
+            let (_, request_bytes) = read_stable(
+                &bundle.join("request.json"),
+                super::worker_delivery::MAX_FRAME_BYTES as u64,
+            )?;
+            let request: Value = serde_json::from_slice(&request_bytes)?;
+            (owner, prepared.source, prepared.toolchain, request)
+        }
+    };
     let source_root = source
         .sealed_root()
         .ok_or_else(|| invalid("source was not sealed"))?;
@@ -1303,10 +1347,15 @@ fn run_operation(
         create_private(&path)?;
         path
     };
-    let toolchain = retained_toolchain.as_ref().map_or_else(
-        || bundle.join("toolchain"),
-        |retained| retained.root().to_path_buf(),
-    );
+    let toolchain = match (&retained_toolchain, &captured_toolchain) {
+        (Some(retained), None) => retained.root().to_path_buf(),
+        (None, Some(captured)) => captured.root().to_path_buf(),
+        _ => {
+            return Err(invalid(
+                "canonical operation requires one retained compiler owner",
+            ));
+        }
+    };
     let mut plan = CanonicalMountPlan::new(&toolchain, &workspace, &cargo_root, &home_root);
     plan.out_units.push(UnitMount {
         unit: "cargo".into(),
@@ -1770,7 +1819,14 @@ fn run_operation(
                     == target_root,
                 "completed target differs from its retained canonical mount",
             )?;
-            Some(retain_build_target(&profile.operation_root, &target_root)?)
+            // Remote targets remain under the uploaded operation's owner until
+            // verified transfer and its final acknowledgment release custody.
+            let parent = if remote_operation {
+                owner.path()
+            } else {
+                &profile.operation_root
+            };
+            Some(retain_build_target(parent, &target_root)?)
         } else {
             None
         };
@@ -1798,7 +1854,7 @@ fn run_operation(
         // I/O above. Standalone writers have cleanly joined under StateOwner.
         paths.verify_completed_producers(&coord, &cancelled)?;
     }
-    if let Some(delivered) = delivered {
+    if let Some(delivered) = &delivered {
         output.event(
             json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
                 "command":profile.command.as_str(), "tests_executed":false,
@@ -1806,10 +1862,18 @@ fn run_operation(
         )?;
     }
     use std::os::unix::process::ExitStatusExt;
-    Ok(compiled
-        .status
-        .code()
-        .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)))
+    Ok(OperationOutcome {
+        exit_code: compiled
+            .status
+            .code()
+            .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)),
+        retained_target: delivered,
+        provenance: OperationProvenance {
+            _source: source,
+            paths,
+            coord,
+        },
+    })
 }
 
 /// Only private Cargo freshness uses this compatibility family. Every command
