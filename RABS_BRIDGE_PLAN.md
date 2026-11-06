@@ -2,7 +2,53 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at01:47UTC:**
+**Active qualification checkpoint, November6 at03:01UTC:**
+
+- [x] Corrected d4 normalALL7/BOTH TLS DSR5fee2740 terminalSUCCESS0/1819s,
+  actualCargo1785.5s. Full1758/control5616B/07d1116b aftermatch. Genuine new
+  production artifacts retain d4 source identity; no old tools relabeled.
+- [x] Fresh d4 fullQA DSR terminalSUCCESS0/1776s, ALL1067/1067/zeroignored
+  across9 retained inventories82/501/4/165/16/9/6/1/283. Actualfmt0/24.1s,
+  workspace-alltargets check0/6.8s/strictClippy0/6.5s. Full1758/control10168B/
+  930dc83a before/aftermatch, complete report atomically published. Cached
+  compiler gates receive no performance credit.
+- [x] Preserve interrupted d4 QA fb269769. Chat/tool interruption ended its
+  local driver, remote owned controller/compiler processes subsequently absent.
+  Actualfmt0/check0/Clippy0, ALL9 suites UNRUN, native exit UNKNOWN. Full1758/
+  control afteraudit matched. Results and scratch preserved by same-FS rename
+  *-interrupted-fb269769. Supported same-ID resume refused source/output identity
+  after peer HEAD advanced. Fresh hot invocation above retains identical d4
+  inputs, original3600s/jobs1/profiles/pins and every original predicate.
+- [ ] d4 native5/precise old-worker negative DISPATCHED03:00UTC, session30327,
+  version2.1.35-reconnect-watchdog-native.d4ec1bb8, control35227B/7676d69e.
+  ALL7,226components,positive owner-death and complete1067 gates finished first.
+  No own compiler job remains active. Peer host load remains possible.
+- [ ] Run the existing real two-worker failover/surviving-subscriber case AFTER
+  native5/oldnegative pass. Prepared control9520B/3e5e8d35, original bounds;
+  retain source/SDK/tool audits, same generation and distinct attempt/lease,
+  exactly one retry execution, delivered working binary and final release.
+- [x] High-value RCH source-entry repair d9c7d323 skips ordinary regular files
+  during workspace wildcard expansion in BOTH filesystem and selected-tree
+  validators. Explicit files and matched directories missing Cargo.toml remain
+  errors. Two existing tests extended, including actual offline Cargo metadata
+  oracle. Production change is two type predicates, no filename exception.
+  Paired immutable red/green1758 snapshots differ from d4 only in that source
+  file, all694 RABS/Cargo/toolchain closure inputs unchanged. Root did not commit.
+- [ ] Qualify source-entry fix with BOTH planted red failures using exact old
+  production prefix, ALL cargo_path_deps cases, workspacefmt/check/strictClippy.
+  First DSR6276a015 FAILED setup before tests, isolated PATH omitted sbh.
+  Preserve failure; correct absolute guard path, run after native5 settles.
+  No installed-client or RABS qualification credit from this source edit yet.
+- [x] MPDT private transfer namespace guard actual publish/restore probe passed
+  at owner-only TRJ /data/tmp/rch-mpdt-private-20261106. Original0775 namespace
+  untouched. First own0664 archive correctly refused, retained; fresh0600 probe
+  passed with exact10240B payload. Synthetic tar receipt qualifies cache guard
+  only. Effective private config changes only transfer.remote_base; global
+  config/workers/budgets/policy unchanged. Authorized AgentMail handoff5942
+  received by TurquoiseDog. Peer owns its real Cargo run and ACK/releases.
+
+The older 01:47 status entries below retain their original execution history.
+The completed and dispatched statuses above supersede their pending markers.
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
