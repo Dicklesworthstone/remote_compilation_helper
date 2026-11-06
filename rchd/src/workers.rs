@@ -2863,7 +2863,9 @@ fn source_topology_revalidation_command(fences: &[crate::history::SourceTopology
     // every previously refused mapping.
     let mut command = format!(
         "set -eu\nrch_source_topology_matches() (\nset -- check \"$1\" \"$2\"\n{}\n)\n",
-        include_str!("../../rch/src/hook/source_namespace_paths.sh"),
+        // rchd's own copy, so the published package builds; the hook's file
+        // stays canonical and a test below fails when the two drift.
+        include_str!("source_namespace_paths.sh"),
     );
     for (index, fence) in fences.iter().enumerate() {
         let topology = &fence.mismatch.topology;
@@ -3381,6 +3383,15 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_packaged_topology_predicate_matches_the_hook_script() {
+        assert!(
+            include_str!("source_namespace_paths.sh")
+                == include_str!("../../rch/src/hook/source_namespace_paths.sh"),
+            "rchd/src/source_namespace_paths.sh is stale: copy rch/src/hook/source_namespace_paths.sh over it"
+        );
+    }
 
     #[test]
     fn source_topology_revalidation_batches_bound_ssh_arguments_and_keep_exact_indices() {

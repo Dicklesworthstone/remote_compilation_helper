@@ -253,7 +253,11 @@ use crate::schema_registry::REGISTRY as SCHEMA_REGISTRY;
 
 /// Compiled-in handbook containing the incident runbooks and Section 173
 /// required documentation set (`docs/rabs-incident-runbooks.md`).
-pub const COMPILED_RABS_HANDBOOK: &str = include_str!("../../docs/rabs-incident-runbooks.md");
+///
+/// Read from the crate's own copy: a published package cannot reach the
+/// workspace `docs/` directory. The workspace doc stays canonical, and
+/// `the_packaged_handbook_matches_the_workspace_doc` fails when they drift.
+pub const COMPILED_RABS_HANDBOOK: &str = include_str!("../rabs-incident-runbooks.md");
 
 /// Schema fingerprint recorded in [`COMPILED_RABS_HANDBOOK`] (bead R013).
 pub const DOCUMENTED_SCHEMA_FINGERPRINT: u64 = 0x1a61_e5bd_8ad2_cfb5;
@@ -855,6 +859,14 @@ mod tests {
     use crate::schema_registry::registry_fingerprint;
 
     const RUNBOOKS: &str = COMPILED_RABS_HANDBOOK;
+
+    #[test]
+    fn the_packaged_handbook_matches_the_workspace_doc() {
+        assert!(
+            COMPILED_RABS_HANDBOOK == include_str!("../../docs/rabs-incident-runbooks.md"),
+            "rabs-protocol/rabs-incident-runbooks.md is stale: copy docs/rabs-incident-runbooks.md over it"
+        );
+    }
 
     #[test]
     fn the_registry_is_closed_with_all_six_facets_per_class() {
