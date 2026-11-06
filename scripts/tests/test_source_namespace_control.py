@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Real subprocess tests of the namespace control boundary, not live SSH.
 
-The actual production shell runs GNU timeout and real flock/FIFO descriptors.
-A PATH double shortens only the timer's duration (and checks the production
-execution and observer phase policies); it does not substitute locking, signaling, or output handling.
+The actual production shell runs real processes and flock descriptors. A PATH
+double shortens only the topology timer duration (and checks its execution and
+observer phase policies); finite metadata uses its actual independent guardian
+and native process census. Neither path substitutes locking or signaling.
 Owned fixtures are retained for inspection. The Rust target supplies compiled
 CONTROL bytes and otherwise runs these same tests.
 """
@@ -215,12 +216,18 @@ class SourceNamespaceControlTests(unittest.TestCase):
         script = ("set -- " + shlex.quote(contract) + "\n" if contract else "") + self.script
         result = subprocess.run([SHELL, "-c", script], input=program.encode(),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=self.env, timeout=5, check=False)
-        self.assertLess(time.monotonic() - started, 3, result.stderr)
-        calls = self.calls.read_text().splitlines()
-        self.assertEqual(calls[:2], ["1 mktemp", "15 sh"])
-        self.assertEqual(calls[-1], "1 sh")
-        self.assertIn(calls[2:-1], ([], ["2 sh"]))
+                                env=self.env, timeout=20 if contract else 5, check=False)
+        if contract:
+            # Metadata no longer allocates scratch or uses the shortened GNU
+            # timer double. Exercise its real 15s execution + 1s KILL window.
+            self.assertLess(time.monotonic() - started, 18, result.stderr)
+            self.assertFalse(self.calls.exists())
+        else:
+            self.assertLess(time.monotonic() - started, 3, result.stderr)
+            calls = self.calls.read_text().splitlines()
+            self.assertEqual(calls[:2], ["1 mktemp", "15 sh"])
+            self.assertEqual(calls[-1], "1 sh")
+            self.assertIn(calls[2:-1], ([], ["2 sh"]))
         return result
 
     def assert_no_control_processes(self, root=None):

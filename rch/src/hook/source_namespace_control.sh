@@ -3,6 +3,7 @@
 # Every result requires settled descendant teardown, including empty replies.
 set -eu
 rch_control_ready=${1:-RCH_TOPOLOGY_OK}
+rch_control_contract=$rch_control_ready
 rch_control_alternate=
 rch_control_third=
 rch_control_format='%s\n'
@@ -27,6 +28,465 @@ case "$rch_control_ready" in
         rch_control_ready=; rch_control_format='%s' ;;
     *) printf '%s\n' 'RCH: invalid metadata control result marker' >&2; exit 73 ;;
 esac
+# Finite metadata must remain callable after a build fills the worker disk.
+# Its transport owns no files: keep bounded replies in memory and leave all
+# claim persistence/durability decisions to the uploaded registry transaction.
+# Topology/bootstrap retains its existing controller below. Python already is
+# required by metadata ownership and settlement, even on GNU-timeout workers.
+if [ "$rch_control_contract" != RCH_TOPOLOGY_OK ]; then
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' 'RCH_SOURCE_NAMESPACE_OBSERVER_UNAVAILABLE Python 3 is required' >&2
+        exit 73
+    }
+    exec python3 -I -S -B -c '
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+# A guardian is the unreaped direct child and the private group leader. It
+# stays alive after the program exits, independently enforcing the deadline
+# and watching a pipe held ONLY by this observer. Observer death therefore
+# cannot leave an unbounded lock waiter, even if all output pipes were closed.
+# The guardian never passes its control/status descriptors to the program.
+timer = None
+changed = False
+interrupted = 0
+
+def child_changed(_signum, _frame):
+    global changed
+    changed = True
+
+def interrupt(signum, _frame):
+    global interrupted
+    interrupted = interrupted or signum
+
+def close(descriptor):
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+def guardian(owner, report, stdout, stderr, descriptors, started):
+    owned = False
+    try:
+        os.setsid()
+        owned = os.getpgrp() == os.getpid()
+        if not owned:
+            os._exit(73)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, interrupt)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        for descriptor in descriptors:
+            if descriptor not in (owner, report, stdout, stderr):
+                close(descriptor)
+        # Do not retain the SSH output pipes if its observer is killed.
+        close(1)
+        close(2)
+        os.set_blocking(owner, False)
+        os.set_blocking(report, False)
+        # EOF before launch means the observer already disappeared.
+        if select.select([owner], [], [], 0)[0]:
+            os._exit(73)
+        program = os.fork()
+        if program == 0:
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM,
+                           signal.SIGCHLD, signal.SIGPIPE):
+                signal.signal(signum, signal.SIG_DFL)
+            os.dup2(stdout, 1)
+            os.dup2(stderr, 2)
+            for descriptor in (owner, report, stdout, stderr):
+                close(descriptor)
+            try:
+                # stdin is the actual uploaded program, not an unbounded
+                # in-memory copy or a disk-backed temporary shell script.
+                os.execvp("sh", ["sh", "-s"])
+            except OSError:
+                os._exit(127)
+        close(0)
+        close(stdout)
+        close(stderr)
+        deadline = started + 15
+        terminating = False
+        while True:
+            now = time.monotonic()
+            if not terminating and (interrupted or now >= deadline):
+                terminating = True
+                deadline = min(now + 1, started + 16)
+                os.killpg(os.getpid(), signal.SIGTERM)
+            if terminating:
+                if now >= deadline:
+                    os.killpg(os.getpid(), signal.SIGKILL)
+            elif program is not None:
+                waited, status = os.waitpid(program, os.WNOHANG)
+                if waited:
+                    program = None
+                    if os.WIFEXITED(status):
+                        code = os.WEXITSTATUS(status)
+                    elif os.WIFSIGNALED(status):
+                        code = 128 + os.WTERMSIG(status)
+                    else:
+                        raise ValueError("invalid program status")
+                    if os.write(report, b"S" + bytes((code,))) != 2:
+                        raise ValueError("incomplete program status")
+            readable = select.select([owner], [], [], min(0.02, max(0, deadline - now)))[0]
+            if readable:
+                request = os.read(owner, 2)
+                if (request == b"F" and program is None and not terminating
+                        and not interrupted and time.monotonic() < deadline):
+                    # This marker acknowledges an observer-requested stop,
+                    # never an ordinary exit(137) or an external timer kill.
+                    if os.write(report, b"D") != 1:
+                        raise ValueError("incomplete teardown status")
+                    os.killpg(os.getpid(), signal.SIGKILL)
+                # Parent death, unexpected data and late finish requests all
+                # revoke the session. No completion marker is produced.
+                os.killpg(os.getpid(), signal.SIGKILL)
+    except BaseException:
+        if owned:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        os._exit(73)
+
+def linux_record(path):
+    with open(path, "rb") as stream:
+        raw = stream.read(8193)
+    if len(raw) > 8192:
+        raise ValueError("oversized process record")
+    head, separator, tail = raw.rpartition(b") ")
+    fields = tail.split()
+    if (not separator or len(fields) < 20 or not head.split(b" ", 1)[0].isdigit()
+            or fields[0] not in (b"R", b"S", b"D", b"T", b"t", b"K", b"W",
+                                 b"P", b"I", b"X", b"Z", b"x")
+            or not all(fields[index].isdigit() for index in (2, 3, 17, 19))):
+        raise ValueError("invalid process record")
+    record = (int(head.split(b" ", 1)[0]), fields[0], int(fields[2]),
+              int(fields[3]), int(fields[17]), int(fields[19]))
+    if record[0] <= 0 or record[4] <= 0:
+        raise ValueError("invalid task identity or count")
+    return record
+
+def linux_view():
+    with open("/proc/self/status", encoding="ascii") as stream:
+        namespace = [line.split()[1:] for line in stream if line.startswith("NSpid:")]
+    # A host-mounted procfs in a nested PID namespace cannot prove absence.
+    # Never translate those foreign numeric IDs into signal authority.
+    if namespace != [[str(os.getpid())]]:
+        raise ValueError("unverified process namespace")
+    observer = linux_record("/proc/self/stat")
+    if (observer[0], observer[2], observer[3]) != (os.getpid(), os.getpgrp(), os.getsid(0)):
+        raise ValueError("foreign process observation")
+
+def session_empty(group):
+    # The unreaped guardian pins its group/session identity during this whole
+    # census. Metadata helpers stay in that private session; checking session
+    # membership also refuses acknowledgement for a child which changed its
+    # group: the original killpg does not clean up that escaped group. As with
+    # the existing namespace boundary, this is not a sandbox for arbitrary
+    # workloads which deliberately detach with setsid.
+    seen_owner = False
+    if sys.platform == "linux":
+        linux_view()
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    record = linux_record(entry.path + "/stat")
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if record[0] != int(entry.name):
+                    raise ValueError("process census changed identity")
+                if record[0] == group:
+                    seen_owner = record[2:4] == (group, group)
+                if record[2] != group and record[3] != group:
+                    continue
+                if record[1] not in (b"Z", b"X", b"x"):
+                    return False
+                # A zombie main thread may still have live siblings. Require
+                # a complete, stable task census, not merely a dead leader.
+                count = 0
+                try:
+                    with os.scandir(entry.path + "/task") as tasks:
+                        for task in tasks:
+                            if not task.name.isdecimal():
+                                raise ValueError("invalid task census")
+                            thread = linux_record(task.path + "/stat")
+                            count += 1
+                            if thread[0] != int(task.name) or thread[2:4] != record[2:4]:
+                                raise ValueError("task census changed identity")
+                            if thread[1] not in (b"Z", b"X", b"x"):
+                                return False
+                    if count != record[4] or linux_record(entry.path + "/stat") != record:
+                        return False
+                except (FileNotFoundError, ProcessLookupError):
+                    return False
+        linux_view()
+    else:
+        # Darwin has one PID view, and a zombie task has no executing sibling
+        # threads. The checker has its own alarm and private group: a blocked
+        # ps/exec or inherited pipe holder cannot outlive this census budget.
+        process = subprocess.Popen(["ps", "-axo", "pid=,pgid=,stat="],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = process.stdout.read(1048577)
+        if len(output) > 1048576 or process.wait() != 0:
+            raise ValueError("unavailable process census")
+        seen_observer = False
+        seen = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if (len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit()
+                    or not fields[2] or fields[2][:1] not in b"RSDTIUZE"):
+                raise ValueError("invalid process census")
+            pid, pgid, state = int(fields[0]), int(fields[1]), fields[2][:1]
+            if pid in seen:
+                raise ValueError("duplicate census entry")
+            seen.add(pid)
+            if pid == os.getpid():
+                seen_observer = pgid == os.getpgrp() and pgid != group
+            if pid == group:
+                seen_owner = pgid == group
+            if pid == process.pid:
+                continue
+            try:
+                session = os.getsid(pid)
+            except ProcessLookupError:
+                continue
+            if (pgid == group or session == group) and state != b"Z":
+                return False
+        if not seen_observer:
+            raise ValueError("census omitted observer")
+    return seen_owner
+
+def quiescent(group, deadline):
+    # Run procfs/ps reads outside the observer. Its own alarm survives observer
+    # death; the observer also caps collection and kills the exact unreaped
+    # checker group. Unavailable or incomplete evidence never becomes success.
+    read_end, write_end = os.pipe()
+    checker = None
+    received = bytearray()
+    try:
+        checker = os.fork()
+        if checker == 0:
+            owned = False
+            try:
+                os.setsid()
+                owned = os.getpgrp() == os.getpid()
+                if not owned:
+                    os._exit(73)
+                def expire(_signum, _frame):
+                    os.killpg(os.getpid(), signal.SIGKILL)
+                for signum in (signal.SIGALRM, signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                    signal.signal(signum, expire)
+                signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+                signal.pthread_sigmask(signal.SIG_UNBLOCK,
+                                       {signal.SIGALRM, signal.SIGHUP, signal.SIGINT, signal.SIGTERM})
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
+                os.dup2(write_end, 3, inheritable=False)
+                os.closerange(4, os.sysconf("SC_OPEN_MAX"))
+                close(0)
+                close(1)
+                close(2)
+                consecutive = 0
+                while time.monotonic() < deadline:
+                    consecutive = consecutive + 1 if session_empty(group) else 0
+                    if consecutive == 2:
+                        os.write(3, b"E")
+                        os._exit(0)
+                    time.sleep(0.01)
+            except BaseException:
+                pass
+            if owned:
+                os.killpg(os.getpid(), signal.SIGKILL)
+            os._exit(73)
+        close(write_end)
+        os.set_blocking(read_end, False)
+        while not interrupted and time.monotonic() < deadline:
+            if not select.select([read_end], [], [], max(0, deadline - time.monotonic()))[0]:
+                break
+            chunk = os.read(read_end, 2 - len(received))
+            if not chunk:
+                break
+            received.extend(chunk)
+            if len(received) > 1:
+                break
+    finally:
+        close(read_end)
+        close(write_end)
+        if checker is not None and checker > 0:
+            # A normal exit is retained by waitpid even if our kill races its
+            # last instruction. A killed/partial checker never grants absence.
+            try:
+                os.kill(checker, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.killpg(checker, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if sys.platform != "darwin":
+                    raise
+            _, status = os.waitpid(checker, 0)
+    return (received == b"E" and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+            and not interrupted and time.monotonic() < deadline)
+
+def teardown(child, deadline=None):
+    # Do not reap before signalling. Fork plus non-reaping pins this exact
+    # group ID even if the guardian died or stopped before establishing it.
+    try:
+        os.kill(child, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.killpg(child, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin may return EPERM for a group containing only zombies.
+        if sys.platform != "darwin":
+            raise
+    empty = False
+    try:
+        empty = deadline is None or quiescent(child, deadline)
+    finally:
+        _, status = os.waitpid(child, 0)
+    return empty and os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+
+def deliver(stderr, stdout, status):
+    # No writers survive execution teardown. Nonblocking writes and one
+    # shared delivery deadline prevent a stalled SSH reader from stranding
+    # this observer; diagnostics must finish before any readiness is sent.
+    deadline = time.monotonic() + 2
+    for descriptor, content in ((2, stderr), (1, stdout if status == 0 else b"")):
+        if not content:
+            continue
+        os.set_blocking(descriptor, False)
+        offset = 0
+        while offset < len(content):
+            remaining = deadline - time.monotonic()
+            if interrupted or remaining <= 0:
+                return 73
+            if not select.select([], [descriptor], [], remaining)[1]:
+                return 73
+            try:
+                count = os.write(descriptor, content[offset:])
+            except BlockingIOError:
+                continue
+            if count <= 0:
+                return 73
+            offset += count
+    return status if not interrupted else 73
+
+descriptors = []
+buffers = {}
+finished = False
+settled = False
+failure = b"RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED cause=execution-or-process-settlement-unconfirmed\n"
+code = 73
+try:
+    if sys.platform not in ("linux", "darwin") or not hasattr(signal, "pthread_sigmask"):
+        raise ValueError("native process supervision is unavailable")
+    # Clear inherited auto-reaping/blocked notifications. SIGCHLD is only an
+    # interruption notice here; waitpid is reserved for final group teardown.
+    signal.signal(signal.SIGCHLD, child_changed)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, interrupt)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD, signal.SIGHUP,
+                                             signal.SIGINT, signal.SIGTERM})
+    replies = [sys.argv[1].encode()]
+    if sys.argv[2]:
+        replies.append(sys.argv[2].encode())
+    if sys.argv[3]:
+        replies.append(sys.argv[3].encode())
+    if sys.argv[4] != "%s":
+        replies = [reply + b"\n" for reply in replies]
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    status_read, status_write = os.pipe()
+    owner_read, owner_write = os.pipe()
+    descriptors = [stdout_read, stdout_write, stderr_read, stderr_write,
+                   status_read, status_write, owner_read, owner_write]
+    started = time.monotonic()
+    timer = os.fork()
+    if timer == 0:
+        guardian(owner_read, status_write, stdout_write, stderr_write, descriptors, started)
+        os._exit(73)
+    close(0)
+    for descriptor in (stdout_write, stderr_write, status_write, owner_read):
+        close(descriptor)
+    os.set_blocking(owner_write, False)
+    limits = {stdout_read: 4096, stderr_read: 65536, status_read: 3}
+    buffers = {descriptor: bytearray() for descriptor in limits}
+    opened = set(limits)
+    for descriptor in opened:
+        os.set_blocking(descriptor, False)
+    while not changed and not interrupted and time.monotonic() < started + 16:
+        for descriptor in select.select(list(opened), [], [], 0.02)[0]:
+            chunk = os.read(descriptor, min(8192, limits[descriptor] + 1 - len(buffers[descriptor])))
+            if not chunk:
+                opened.remove(descriptor)
+            else:
+                buffers[descriptor].extend(chunk)
+                if len(buffers[descriptor]) > limits[descriptor]:
+                    failure = b"RCH: namespace control output exceeded its byte bound\n"
+                    raise ValueError("control output overflow")
+        status = bytes(buffers[status_read])
+        if status and (status[:1] != b"S" or (len(status) == 3 and status[2:] != b"D")):
+            raise ValueError("invalid guardian response")
+        if (not finished and len(status) >= 2
+                and stdout_read not in opened and stderr_read not in opened):
+            code = status[1]
+            if code == 0 and bytes(buffers[stdout_read]) not in replies:
+                failure = b"RCH: namespace control returned invalid readiness\n"
+                raise ValueError("invalid metadata response")
+            if os.write(owner_write, b"F") != 1:
+                raise ValueError("incomplete teardown request")
+            finished = True
+    owned_timer = timer
+    timer = None
+    settled = teardown(owned_timer, started + 16 if finished else None)
+    # The guardian writes at most three bytes before dying. Drain that pipe
+    # after reaping too: SIGCHLD can arrive before select reports its last byte.
+    while len(buffers[status_read]) <= 3:
+        chunk = os.read(status_read, 4 - len(buffers[status_read]))
+        if not chunk:
+            break
+        buffers[status_read].extend(chunk)
+    settled = (settled and finished and not interrupted
+               and time.monotonic() < started + 16
+               and bytes(buffers[status_read]) == b"S" + bytes((code,)) + b"D")
+except BaseException:
+    settled = False
+finally:
+    if timer is not None and timer > 0:
+        owned_timer = timer
+        timer = None
+        try:
+            teardown(owned_timer)
+        except BaseException:
+            settled = False
+    for descriptor in descriptors:
+        close(descriptor)
+
+try:
+    if not settled:
+        os._exit(deliver(failure, b"", 73))
+    stderr = bytes(buffers[stderr_read])
+    if code >= 128:
+        detail = ("RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED status={} signal={} signal_origin=unknown\n"
+                  .format(code, code - 128)).encode()
+        if len(stderr) + len(detail) > 65536:
+            os._exit(deliver(b"RCH: namespace control output exceeded its byte bound\n", b"", 73))
+        stderr += detail
+    os._exit(deliver(stderr, bytes(buffers[stdout_read]), code))
+except BaseException:
+    os._exit(73)
+' "$rch_control_ready" "$rch_control_alternate" "$rch_control_third" "$rch_control_format"
+fi
 # Native fallback for workers without GNU coreutils (including stock macOS).
 # This implements only the fixed timer ABI below, not arbitrary timeout flags.
 # The timer itself leads a new session/group and stays alive through escalation:

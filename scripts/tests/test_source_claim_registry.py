@@ -1929,11 +1929,12 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
 
 @unittest.skipUnless(FLOCK and REALPATH, "native flock and realpath required")
 class CancellationSettlementStorageTests(unittest.TestCase):
-    """Real coordinator/registry qualification, independent of SSH control.
+    """Real coordinator/registry qualification, including metadata transport.
 
-    This directly exercises the production coordinator and its real child
-    transaction. It makes no claim about the outer control transport or a
-    filesystem guaranteeing that hard-link metadata/fsync survives ENOSPC.
+    Direct tests isolate the coordinator and its real child transaction;
+    the controller composition tests additionally exercise actual control
+    supervision with unavailable scratch. None claims live SSH acceptance or
+    a filesystem guaranteeing that hard-link metadata/fsync survives ENOSPC.
     """
 
     shell = "/bin/sh"
@@ -1974,6 +1975,68 @@ class CancellationSettlementStorageTests(unittest.TestCase):
         process = self.start_settlement(**arguments)
         stdout, stderr = process.communicate(timeout=20)
         return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+
+    def require_native_control_view(self):
+        if sys.platform == "linux":
+            with open("/proc/self/status", encoding="ascii") as stream:
+                namespace = [line.split()[1:] for line in stream if line.startswith("NSpid:")]
+            if namespace != [[str(os.getpid())]]:
+                self.skipTest("controller settlement requires the actual native PID/procfs view")
+
+    def controlled_settle(self, **arguments):
+        # Intentionally bypass this class method which isolates the inner
+        # coordinator. Run the same outer transport used by production SSH.
+        process = TerminalCancellationSettlementTests.start_settlement(self, **arguments)
+        stdout, stderr = process.communicate(timeout=20)
+        return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
+
+    def test_controller_and_real_settlement_work_without_scratch_or_record_allocation(self):
+        self.require_native_control_view()
+        self.empty_legacy()
+        self.assert_granted(self.transact("aa", self.roots, "acquire"))
+        self.assertEqual(self.transact("aa", self.roots, "cancel").stdout, b"owned")
+        active = self.registry / ("aa." + digest(self.roots) + ".claim")
+        fence = active.with_suffix(".cancelling")
+        receipt = self.registry / "cancelled" / active.name
+        original = active.stat().st_ino, active.read_bytes()
+        locks = {path: path.stat().st_ino for path in
+                 (self.registry / "aa.activity.lock", self.registry / "metadata.lock",
+                  self.legacy / "metadata.lock")}
+        scratch = self.root / "unavailable-scratch"
+        scratch.write_bytes(b"preserve storage sentinel\n")
+        env = {**self.deny_record_allocation_env(), "TMPDIR": str(scratch)}
+        for _ in range(2):
+            result = self.controlled_settle(env=env)
+            self.assert_settled(result)
+            self.assertEqual(result.stderr, b"")
+            self.assertFalse(active.exists())
+            self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), original)
+            self.assertEqual((fence.stat().st_ino, fence.read_bytes()), original)
+            self.assertEqual({path: path.stat().st_ino for path in locks}, locks)
+            self.assertEqual(scratch.read_bytes(), b"preserve storage sentinel\n")
+            self.assertFalse((self.legacy / "aa.activity.lock").exists())
+        self.assert_refused(self.transact("aa", self.roots, "recover"))
+        self.assert_granted(self.transact("bb", self.roots, "acquire"))
+
+    def test_diskless_controller_cannot_waive_real_settlement_durability_failure(self):
+        self.require_native_control_view()
+        self.empty_legacy()
+        self.assert_granted(self.transact("aa", self.roots, "acquire"))
+        self.assert_granted(self.transact("aa", self.roots, "cancel"))
+        before = self.records()
+        scratch = self.root / "unavailable-scratch"
+        scratch.write_bytes(b"preserve storage sentinel\n")
+        env = self.python_fault_env('''
+def failed_fsync(descriptor):
+    raise OSError(errno.ENOSPC, "injected settlement fsync failure")
+os.fsync = failed_fsync
+''', {"mktemp": 'printf "injected ENOSPC: control allocation\\n" >&2\nexit 1'})
+        result = self.controlled_settle(env={**env, "TMPDIR": str(scratch)})
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"injected settlement fsync failure", result.stderr)
+        self.assertEqual(self.records(), before)
+        self.assertEqual(scratch.read_bytes(), b"preserve storage sentinel\n")
 
     def test_empty_peer_and_existing_records_settle_without_allocating_inodes(self):
         for namespace in ("current", "legacy"):
