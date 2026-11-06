@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.35` (2026-11-04).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.36` (2026-11-05).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,84 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.36 — 2026-11-05
+
+A short release, about 95 commits after 2.1.35, that fixes what that version's fleet rollout exposed. Builds were
+failing after they had already succeeded, clean-overlay jobs died before Cargo on most workers, locks and leases left behind
+by older versions could strand a worker or block a restart, and cancellation failed on full disks.
+
+**Operational change:** the default 5% critical-disk rule now has a 25 GiB absolute cap (`bd-lnbuz`). A worker with a large
+disk no longer counts as critical at 45 GiB free on a 900 GiB volume, so expect such workers to take jobs they used to
+refuse. The absolute floor, per-build storage admission and explicit `disk_critical_ratio_cap_gb` settings are unchanged.
+
+- **A finished build no longer fails on an old directory mode.** Artifact staging runs after the remote build, and 2.1.35
+  refused a default retrieval directory that an older client had left group-writable. The caller saw "completion is
+  unconfirmed" with exit 1 although Cargo had succeeded, and only a later recovery delivered the artifacts. Journals show 82
+  such jobs in the 48 hours before the fix. rch now repairs its own directory. A writable `transfer.retrieval_staging_dir`
+  chosen by an operator keeps its mode and is refused by name, before anything is created under it
+  ([`1d404d0e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1d404d0e4f390463e45b22d330d6fe69459f27bb)).
+- **Clean-overlay jobs reach Cargo again.** The Git archive cache in 2.1.35 refused any parent directory it could not fully
+  trust, and the transfer treated that refusal as fatal. That covered a group-writable `/data/tmp/rch` and a root login under
+  a directory owned by another user, so 4 of 4 sampled workers failed before Cargo started. Reuse is optional, so the job now
+  skips the cache and uses the ordinary upload
+  ([`d7d5f595`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d7d5f595d63e2bf49885a54497651421b4263df4)).
+- **Old locks and leases no longer strand a worker** (`bd-8xuus`, `bd-byuxs`). Cancel locks that an older version left
+  group-writable are healed, and a separate explicit-owner migration, dry-run by default, clears the same bits through
+  verified descriptors. An empty lease journal left by an old disk-full event no longer makes restart readiness permanently
+  unknown, which had blocked every drained restart. Neither path deletes anything
+  ([`d133ae12`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d133ae1257a0e549a92865b2e56f3ca60b1d9e19),
+  [`be6af239`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be6af2398a7e11a585237b536cb196b4af2b4655)).
+- **Upgrades drain with the client that speaks the running daemon's protocol** (`bd-306ep`). The installer places the new
+  daemon and worker first, drains with the installed client, then replaces the client, and it stops if the drain fails. It
+  also checks a release archive is complete before changing any installed binary
+  ([`1f21cff0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1f21cff0501f66a2af6d739e75b96f141b87e094),
+  [`5d97a23e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5d97a23ec0fee1aa5eaab96873737f292a60b562),
+  [`2a7224d3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a7224d34dd4264e9725d37543ad2c4dc2627db5)).
+- **Cancellation works on a full disk** (`bd-fwc2h`). Control capture stays in memory when Python is available, and
+  cancellation reuses durable records instead of allocating new ones. Commands run through that in-memory path see the
+  same inherited descriptors as the file-backed one
+  ([`ef0d2261`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ef0d226131b228ec88d34049db37fdf17380396d),
+  [`8a8f58b8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8a8f58b84ee33de3085af0e0264610ca64d37cbb),
+  [`8f2c13c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8f2c13c77d3f33e413e60cf10cba0e727a5f423d)).
+- **A missing project root is restored, not doubled** (`bd-r2gcc`). When a worker's canonical root is gone but its alias is
+  still a symlink to the real tree, the name comes back as a link. Before, preflight created a second real directory, and
+  the worker then refused that project permanently until someone repaired it by hand. A real directory at the alias keeps
+  its old refusal and is never linked to. macOS workers need GNU `ln` (`gln`) for this repair; without it they refuse as
+  before
+  ([`3d50a044`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3d50a044c2cf71629e52ac82518b77d0c3e17acb),
+  [`6000c2af`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6000c2afe3ec9992655c6b4be9d5b9cc0e4d2bf6),
+  [`93bf8e11`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/93bf8e11cf55a8e90b9e314832e2a9cc420830b7)).
+- **`rch workers probe` and `rch doctor` check the dispatcher's real source namespace** (`bd-r2gcc`). They report the exact
+  canonical and alias roots this dispatcher uses
+  ([`f78a856e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f78a856ecbfd0dc0d866c737ca042843c2a32a02)).
+- **An incompatible worker no longer uses up a build's retries** (`bd-r2gcc`). A source-topology refusal stays on the current
+  attempt, so the build can still reach a compatible worker
+  ([`44ef74bb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/44ef74bbd4f29355e3dc6ac781783fe1c3a76d8a)).
+- **Disk admission is stricter about stale evidence and kinder to warm builds** (`bd-lnbuz`, #132). Capacity from before a
+  transport failure is revoked, verified warm Cargo pools are admitted on their additional space, and feasible requests
+  queue behind owned reservations instead of failing. Cargo cache writes now count toward a build, except that a shared cache
+  past 25,000 entries stays out of each build's two-second output walk: it keeps reservation and floor protection, and
+  downloads into it are bounded by the free-space floor rather than the growth budget
+  ([`d2339e33`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d2339e336b15886919dbb52052f2a76ec37ea312),
+  [`d8f2a060`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d8f2a060e8b4573d989759e4f213fa8bed35d087),
+  [`69437908`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6943790888290c2a16e1de19bba0d1782e8393f3),
+  [`e371a687`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e371a6876c8748a082906376e4257403f69bb735)).
+- **Output directories are proven writable before remote work starts** (`bd-0xuvl`). The probe now writes, syncs and reads
+  back real data instead of creating an empty file
+  ([`f6b30954`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f6b30954607c9f6924c71fd749a9ae9d633a1371)).
+- **Fewer SSH round trips per job** (#132). Preflight checks share one bounded channel, empty artifact pulls are skipped, and
+  completion probes no longer block progress
+  ([`9f0302f2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f0302f2647094292c85b7af6eba289b4104d1f1),
+  [`366f4a89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/366f4a89004dfccc605d5d0b4fe40fa3ef046911)).
+- **Pure workers stop logging a reload ERROR at startup** (`bd-madif`)
+  ([`27074221`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/270742214c90ec9190d2465585ac99eb37e676a2)).
+
+RABS remains opt-in; this release carries its ongoing work and changes nothing unless you enable it.
+
+**Known issues:** none of the Darwin-worker limitations noted in earlier releases were retested end to end for this one.
+
+Scope window: `v2.1.35..v2.1.36`.
 
 ## 2.1.35 — 2026-11-04
 
