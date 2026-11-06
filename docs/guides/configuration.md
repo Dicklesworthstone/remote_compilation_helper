@@ -67,7 +67,13 @@ Sections and fields:
   execution and cleanup. The active dispatch pins the connection until cleanup;
   a completed dispatch reaps it instead of leaving a background ControlPersist
   process. Unset or `0` keeps one-shot transports. Windows workers and automatic
-  recovery also retain their one-shot transports.
+  recovery also retain their one-shot transports. Enable it for high-latency
+  workers. A dispatch makes many short SSH requests, and without it each one
+  pays a fresh handshake: several seconds per request on an intercontinental
+  link, against about half a second on a reused connection. One such setup
+  (#132) cut the fixed per-`rch exec` overhead from about 60 s to about 24 s.
+  The connection still lasts for one dispatch only, so each `rch exec` pays one
+  handshake.
 - `sync_timeout_ms` (u64, optional; `1000..=3600000`) — Per-attempt timeout for
   uploading source to the worker. When unset, RCH uses a payload-aware default:
   30 seconds plus one second per MiB at a conservative 1 MiB/s floor, capped at

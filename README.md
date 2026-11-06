@@ -788,7 +788,8 @@ remote_base = "/data/tmp/rch"
 # The foreground master is reaped when the dispatch and its cleanup finish;
 # it does not leave a background ControlPersist process between invocations.
 # Unset or zero keeps the existing one-shot exec paths. Windows workers and
-# automatic recovery do not use this dispatch connection.
+# automatic recovery do not use this dispatch connection. Enable it for
+# high-latency workers: without it every SSH step pays a fresh handshake.
 # ssh_control_persist_secs = 60
 adaptive_compression = true
 verify_artifacts = false
