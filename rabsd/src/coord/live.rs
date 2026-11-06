@@ -4000,10 +4000,11 @@ impl CoordLive {
     /// Boot semantics (plan §10.8, V1): fresh incarnation every start and
     /// a durably advanced term. A row left behind by a previous boot of
     /// THIS store belongs to a dead incarnation — we hold the store's
-    /// exclusive mount, which is the local fence — so it is released and
-    /// superseded at `term + 1`. A row from a different cluster is NOT
-    /// superseded: that is a misconfiguration, and it refuses loudly.
-    /// Cross-host election is M6.
+    /// exclusive mount, which is the local fence — so it is atomically
+    /// superseded above the highest retained term. Released rows remain
+    /// fences too, including after an older binary died between release and
+    /// acquisition. Foreign or mixed cluster history is never superseded.
+    /// Cross-host election and operator-reset authority are separate.
     ///
     /// # Errors
     /// A string reason if no store is mounted or the store refuses.
@@ -4011,25 +4012,13 @@ impl CoordLive {
         let cas = self.cas.as_ref().ok_or("no rabs-cas store mounted")?;
         let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
         declare_coordinator_domains(&mut *store);
-        let prior = store
-            .active_authority()
-            .map_err(|e| format!("active authority: {e:?}"))?;
-        let term = match &prior {
-            Some(row) if row.cluster_id != cluster_id => {
-                return Err(format!(
-                    "store is held by cluster {:?} but this coordinator claims {cluster_id:?} — \
-                     refusing to supersede another cluster's authority",
-                    row.cluster_id
-                ));
-            }
-            Some(row) => {
-                store
-                    .release_authority(&row.digest)
-                    .map_err(|e| format!("release prior authority: {e:?}"))?;
-                row.term.saturating_add(1)
-            }
-            None => 1,
-        };
+        let previous_term = store
+            .authority_term_high_water(cluster_id)
+            .map_err(|e| format!("authority history: {e:?}"))?;
+        let term = previous_term
+            .checked_add(1)
+            .filter(|term| i64::try_from(*term).is_ok())
+            .ok_or("coordinator authority term exhausted")?;
         let authority = CoordinatorAuthority {
             cluster_id: ClusterId(cluster_id.to_owned()),
             // Credential rotation (S013) is not wired yet; generation 1
@@ -4040,7 +4029,7 @@ impl CoordLive {
         };
         let digest = authority_digest(&authority);
         store
-            .acquire_authority(&AuthorityRow {
+            .replace_authority_for_boot(&AuthorityRow {
                 digest: digest.clone(),
                 cluster_id: cluster_id.to_owned(),
                 incarnation: u128::from(self.boot_nonce),

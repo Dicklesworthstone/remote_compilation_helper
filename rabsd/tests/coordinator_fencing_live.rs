@@ -36,8 +36,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
-use rabs_cas::metadata_store::RabsMetadataStore;
-use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
+use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore};
+use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome, authority_digest};
 use rabs_cas::test_support::{
     FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
     install_offer_closure, offer_with_manifest_bytes, offer_with_manifest_bytes_with_ids,
@@ -215,6 +215,139 @@ fn coordinator_dies_after_prepare_before_commit() {
         "expected the offer-door stale-authority refusal, got {refusal:?}"
     );
     assert_nothing_published(&cas);
+}
+
+#[test]
+fn coordinator_recovers_released_authority_without_reusing_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas_root = dir.path().join("cas");
+    {
+        let cas = Arc::new(mount_and_reconcile(&cas_root).unwrap());
+        let coord = CoordLive::with_cas(cas);
+        assert_eq!(coord.acquire_boot_authority(&cluster_id()).unwrap().term, 1);
+    }
+    let stale_offer = {
+        let cas = Arc::new(mount_and_reconcile(&cas_root).unwrap());
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let authority = coord.acquire_boot_authority(&cluster_id()).unwrap();
+        assert_eq!(authority.term, 2);
+        let (offer, bytes) = offer_with_manifest_bytes(&authority);
+        install_admission_world(&mut *cas.store().lock().unwrap(), &authority);
+        store_manifest_object(&cas, &offer, &bytes);
+        // Reproduce the exact durable crash gap in the previous boot path:
+        // release committed, replacement acquisition never happened.
+        let mut store = cas.store().lock().unwrap();
+        store
+            .release_authority(&authority_digest(&authority))
+            .unwrap();
+        assert!(store.active_authority().unwrap().is_none());
+        offer
+    };
+
+    // A shipped daemon process must recover from released-only history at
+    // term 3, not restart at 1. A subsequent reopen must retain that advance.
+    let booted = boot_binary(dir.path(), "800");
+    assert!(
+        booted.status.success(),
+        "reboot failed:\nSTDOUT:{}\nSTDERR:{}",
+        String::from_utf8_lossy(&booted.stdout),
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    let cas = Arc::new(mount_and_reconcile(&cas_root).unwrap());
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord.acquire_boot_authority(&cluster_id()).unwrap();
+    assert_eq!(authority.term, 4);
+    assert_eq!(
+        coord.commit_offer(&stale_offer, &sample_expected_descriptor()),
+        Err(CommitRefusal::StaleAuthority {
+            offered_term: 2,
+            active_term: 4,
+        })
+    );
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .generation_state(11)
+            .unwrap()
+            .unwrap()
+            .tombstoned
+    );
+    assert_nothing_published(&cas);
+}
+
+#[test]
+fn released_authority_keeps_its_cluster_after_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let authority = coord.acquire_boot_authority("original-cluster").unwrap();
+        cas.store()
+            .lock()
+            .unwrap()
+            .release_authority(&authority_digest(&authority))
+            .unwrap();
+    }
+    let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let refused = coord
+        .acquire_boot_authority("different-cluster")
+        .unwrap_err();
+    assert!(refused.contains("AuthorityClusterMismatch"), "{refused}");
+    assert!(coord.authority().is_none());
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .active_authority()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        coord
+            .acquire_boot_authority("original-cluster")
+            .unwrap()
+            .term,
+        2
+    );
+}
+
+#[test]
+fn exhausted_boot_term_does_not_release_the_active_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let previous = {
+        let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let mut authority = coord.acquire_boot_authority(&cluster_id()).unwrap();
+        let mut store = cas.store().lock().unwrap();
+        store
+            .release_authority(&authority_digest(&authority))
+            .unwrap();
+        authority.term = i64::MAX as u64;
+        let row = AuthorityRow {
+            digest: authority_digest(&authority),
+            cluster_id: authority.cluster_id.0,
+            incarnation: authority.incarnation_id.0,
+            term: authority.term,
+            acquired_seq: 2,
+        };
+        store.acquire_authority(&row).unwrap();
+        row
+    };
+    let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    assert_eq!(
+        coord.acquire_boot_authority(&cluster_id()),
+        Err("coordinator authority term exhausted".into())
+    );
+    assert!(coord.authority().is_none());
+    // Declaring domains is part of the failed boot, so the historical row
+    // still round-trips normally and still owns the slot.
+    assert_eq!(
+        cas.store().lock().unwrap().active_authority().unwrap(),
+        Some(previous)
+    );
 }
 
 #[test]

@@ -567,6 +567,16 @@ pub enum StoreError {
         /// Digest key of the current holder.
         holder: String,
     },
+    /// Boot cannot repurpose a store previously owned by another cluster,
+    /// including when that cluster's authority was already released.
+    AuthorityClusterMismatch {
+        /// Cluster retained in the authority history.
+        recorded: String,
+        /// Cluster requested by this boot.
+        requested: String,
+    },
+    /// A replacement boot must advance beyond every retained authority term.
+    AuthorityTermNotAboveHighWater,
     /// The presented authority is not the active one.
     NotActiveAuthority,
     /// Generation id at or below the high-water mark (ids are NEVER
@@ -1223,6 +1233,16 @@ pub trait RabsMetadataStore {
 
     /// The active (unreleased) authority, if any.
     fn active_authority(&mut self) -> Result<Option<AuthorityRow>, StoreError>;
+
+    /// Highest retained coordinator term, including released incarnations.
+    /// An empty store returns zero; mixed or foreign cluster history refuses.
+    fn authority_term_high_water(&mut self, cluster_id: &str) -> Result<u64, StoreError>;
+
+    /// Atomically replace the prior boot authority with a strictly newer term
+    /// belonging to the same historical cluster. The caller must hold the
+    /// store's exclusive process lock; this is not cross-host election or an
+    /// operator-reset bypass. Any refusal leaves the prior authority intact.
+    fn replace_authority_for_boot(&mut self, row: &AuthorityRow) -> Result<(), StoreError>;
 
     /// Insert or update an action entry.
     fn upsert_action_entry(&mut self, row: &ActionEntryRow) -> Result<(), StoreError>;
@@ -2553,6 +2573,56 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         }
     }
 
+    fn retained_authority_term(engine: &mut E, cluster_id: &str) -> Result<u64, StoreError> {
+        // INTEGER affinity does not exclude REAL values. MIN/MAX alone can
+        // hide a corrupt fractional term between two valid integer endpoints.
+        if !engine
+            .query(
+                "SELECT 1 FROM coordinator_authorities \
+                 WHERE typeof(term) != 'integer' OR term <= 0 LIMIT 1",
+                &[],
+            )?
+            .is_empty()
+        {
+            return Err(StoreError::Corruption(
+                "invalid authority history term".into(),
+            ));
+        }
+        // Keep the returned allocation bounded even if corrupt history names
+        // many clusters. All history counts: a released row is still a fence.
+        let rows = engine.query(
+            "SELECT cluster_id, MIN(term), MAX(term) FROM coordinator_authorities \
+             GROUP BY cluster_id LIMIT 2",
+            &[],
+        )?;
+        let row = match rows.as_slice() {
+            [] => return Ok(0),
+            [row] => row,
+            _ => {
+                return Err(StoreError::Corruption(
+                    "more than one recorded coordinator cluster".into(),
+                ));
+            }
+        };
+        let [SqlValue::Text(recorded), minimum, maximum] = row.as_slice() else {
+            return Err(StoreError::Corruption("authority history shape".into()));
+        };
+        if recorded != cluster_id {
+            return Err(StoreError::AuthorityClusterMismatch {
+                recorded: recorded.clone(),
+                requested: cluster_id.to_owned(),
+            });
+        }
+        let minimum = expect_u64(minimum, "minimum authority term")?;
+        let maximum = expect_u64(maximum, "maximum authority term")?;
+        if minimum == 0 || minimum > maximum {
+            return Err(StoreError::Corruption(
+                "authority term history range".into(),
+            ));
+        }
+        Ok(maximum)
+    }
+
     fn require_active(engine: &mut E, authority: &TypedDigest) -> Result<(), StoreError> {
         match Self::active_authority_key(engine)? {
             Some(active) if active == digest_key(authority) => Ok(()),
@@ -3232,6 +3302,53 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             term: expect_u64(term, "term")?,
             acquired_seq: expect_u64(acquired, "acquired_seq")?,
         }))
+    }
+
+    fn authority_term_high_water(&mut self, cluster_id: &str) -> Result<u64, StoreError> {
+        Self::retained_authority_term(&mut self.engine, cluster_id)
+    }
+
+    fn replace_authority_for_boot(&mut self, row: &AuthorityRow) -> Result<(), StoreError> {
+        // Preserve the active row's ordinary shape/domain checks before any
+        // replacement. The transaction rechecks slot cardinality and history.
+        self.active_authority()?;
+        self.intern(row.digest.domain);
+        let key = digest_key(&row.digest);
+        let [algo, domain, bytes] = Self::digest_params(&row.digest);
+        let term = to_seq(row.term, "authority term")?;
+        let acquired = to_seq(row.acquired_seq, "authority acquired_seq")?;
+        let cluster = row.cluster_id.clone();
+        let incarnation = u128_blob(row.incarnation);
+        self.in_txn(move |engine| {
+            let prior = Self::active_authority_key(engine)?;
+            if row.term <= Self::retained_authority_term(engine, &cluster)? {
+                return Err(StoreError::AuthorityTermNotAboveHighWater);
+            }
+            if let Some(prior) = prior {
+                engine.execute(
+                    "UPDATE coordinator_authorities SET released = 1 WHERE key = ?1",
+                    &[SqlValue::Text(prior)],
+                )?;
+            }
+            // Never overwrite history, even if a caller reuses a digest. An
+            // insertion or commit failure rolls back the prior release too.
+            engine.execute(
+                "INSERT INTO coordinator_authorities \
+                 (key, algo, domain, bytes, cluster_id, incarnation, term, acquired_seq, released) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                &[
+                    SqlValue::Text(key),
+                    algo,
+                    domain,
+                    bytes,
+                    SqlValue::Text(cluster),
+                    SqlValue::Blob(incarnation),
+                    SqlValue::Int(term),
+                    SqlValue::Int(acquired),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn upsert_action_entry(&mut self, row: &ActionEntryRow) -> Result<(), StoreError> {
@@ -8982,6 +9099,175 @@ mod tests {
             ),
             Err(StoreError::GenerationIdNotAboveHighWater)
         );
+    }
+
+    fn boot_authority_recovery<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        let path = fresh_path(tag);
+        {
+            let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+            assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 0);
+            store.replace_authority_for_boot(&authority(7)).unwrap();
+            // This is the durable state left by the old boot path if it died
+            // after releasing its predecessor but before acquiring a new term.
+            store.release_authority(&authority(7).digest).unwrap();
+        }
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        store.intern_domain("rabs.authority.sha256.v1");
+        assert!(store.active_authority().unwrap().is_none());
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 7);
+        assert_eq!(
+            store.replace_authority_for_boot(&authority(1)),
+            Err(StoreError::AuthorityTermNotAboveHighWater)
+        );
+        let mut foreign = authority(8);
+        foreign.cluster_id = "cluster-b".into();
+        assert_eq!(
+            store.replace_authority_for_boot(&foreign),
+            Err(StoreError::AuthorityClusterMismatch {
+                recorded: "cluster-a".into(),
+                requested: "cluster-b".into(),
+            })
+        );
+        assert!(store.active_authority().unwrap().is_none());
+        // Recover an already-reset legacy active term too: active state is
+        // not a substitute for the higher term retained in released history.
+        store.acquire_authority(&authority(1)).unwrap();
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 7);
+        store.replace_authority_for_boot(&authority(8)).unwrap();
+        let before = store.differential_snapshot().unwrap();
+
+        // A real uniqueness failure happens AFTER the old authority is marked
+        // released. The database transaction must restore that ownership.
+        let mut duplicate_digest = authority(9);
+        duplicate_digest.digest = authority(7).digest;
+        assert!(matches!(
+            store.replace_authority_for_boot(&duplicate_digest),
+            Err(StoreError::Backend(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(authority(8)));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+
+        let mut out_of_range = authority(9);
+        out_of_range.term = i64::MAX as u64 + 1;
+        assert!(matches!(
+            store.replace_authority_for_boot(&out_of_range),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        out_of_range.term = 9;
+        out_of_range.acquired_seq = i64::MAX as u64 + 1;
+        assert!(matches!(
+            store.replace_authority_for_boot(&out_of_range),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        drop(store);
+
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        store.intern_domain("rabs.authority.sha256.v1");
+        assert_eq!(store.active_authority().unwrap(), Some(authority(8)));
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 8);
+        store.replace_authority_for_boot(&authority(9)).unwrap();
+        assert_eq!(store.active_authority().unwrap(), Some(authority(9)));
+
+        // Previously released history cannot silently change cluster even
+        // when an older acquisition path left a different active cluster.
+        store.release_authority(&authority(9).digest).unwrap();
+        foreign.term = 10;
+        store.acquire_authority(&foreign).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        let mut requested = authority(11);
+        requested.cluster_id = "cluster-b".into();
+        assert!(matches!(
+            store.replace_authority_for_boot(&requested),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(foreign));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn boot_authority_recovery_reference() {
+        boot_authority_recovery(RusqliteEngine::open, "boot-authority-reference");
+    }
+
+    #[test]
+    fn boot_authority_recovery_frankensqlite() {
+        boot_authority_recovery(FsqliteEngine::open, "boot-authority-frankensqlite");
+    }
+
+    fn boot_authority_corrupt_history<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        for malformed in [
+            SqlValue::Int(-1),
+            SqlValue::Int(0),
+            SqlValue::Text("bad".into()),
+        ] {
+            let mut store = SqlMetadataStore::open(open(&fresh_path(tag)).unwrap()).unwrap();
+            let old = authority(1);
+            store.acquire_authority(&old).unwrap();
+            store.release_authority(&old.digest).unwrap();
+            store.acquire_authority(&authority(2)).unwrap();
+            store
+                .engine_mut()
+                .execute(
+                    "UPDATE coordinator_authorities SET term = ?1 WHERE key = ?2",
+                    &[malformed, SqlValue::Text(digest_key(&old.digest))],
+                )
+                .unwrap();
+            let before = store.differential_snapshot().unwrap();
+            assert!(matches!(
+                store.replace_authority_for_boot(&authority(3)),
+                Err(StoreError::Corruption(_))
+            ));
+            assert_eq!(store.active_authority().unwrap(), Some(authority(2)));
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
+
+        let mut store = SqlMetadataStore::open(open(&fresh_path(tag)).unwrap()).unwrap();
+        for tag in 1..=3 {
+            if tag > 1 {
+                store.release_authority(&authority(tag - 1).digest).unwrap();
+            }
+            store.acquire_authority(&authority(tag)).unwrap();
+        }
+        // Real SQLite accepts this fractional value in the INTEGER-affinity
+        // column. Both aggregate extrema remain valid integers (1 and 3).
+        store
+            .engine_mut()
+            .execute(
+                "UPDATE coordinator_authorities SET term = 1.5 WHERE key = ?1",
+                &[SqlValue::Text(digest_key(&authority(2).digest))],
+            )
+            .unwrap();
+        let history = "SELECT key, typeof(term), CAST(term AS TEXT), released \
+                       FROM coordinator_authorities ORDER BY key";
+        let before = store.query(history, &[]).unwrap();
+        assert!(matches!(
+            store.authority_term_high_water("cluster-a"),
+            Err(StoreError::Corruption(_))
+        ));
+        assert!(matches!(
+            store.replace_authority_for_boot(&authority(4)),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(authority(3)));
+        assert_eq!(store.query(history, &[]).unwrap(), before);
+    }
+
+    #[test]
+    fn boot_authority_corrupt_history_reference() {
+        boot_authority_corrupt_history(RusqliteEngine::open, "boot-authority-corrupt-reference");
+    }
+
+    #[test]
+    fn boot_authority_corrupt_history_frankensqlite() {
+        boot_authority_corrupt_history(FsqliteEngine::open, "boot-authority-corrupt-frankensqlite");
     }
 
     fn allocation_behavior<E: SqlEngine>(store: &mut SqlMetadataStore<E>) {
