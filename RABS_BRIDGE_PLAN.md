@@ -2,7 +2,45 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at04:39UTC:**
+**Active qualification checkpoint, November6 at05:12UTC:**
+
+- [x] PROFILE QUALIFICATION CORRECTION. Root's earlier ALL7 producers used
+  generic cargo --release, all opt-level=z/panic=abort. These are genuine
+  generic-release-profile functional results. Calling those artifacts normal
+  shipping-profile tools was too broad. Existing Cargo.toml/install.sh and
+  scripts/install-rabs select wrapper-release (unwind/LTOoff) and daemon-release
+  (opt3/thinLTO/unwind). Source/runtime receipts remain unchanged, while shipping
+  profile, panic containment, performance and complete-current-main claims stay
+  open. This correction supersedes every broader historical profile label below.
+- [ ] Corrected SAME-d4 shipping-profile ALL7 producer prepared, control7114B/
+  301f30ec/dev49/inode14186202. Actual installer package/profile mapping,
+  original manifest/pins/features/jobs1/DSR3600 retained. Require real Cargo
+  artifacts from their respective profile directories and BOTH TLS backends in
+  daemon roles. Existing generic outputs remain preserved. Serial dispatch after
+  the current diagnostic settles, then actual normal CLI with these new tools.
+  Frozen source isolates the profile change; latest main changes stay separate.
+
+- [ ] One predeclared process/signal/close_range syscall trace of the existing
+  cold-service case dispatched through DSR on TS2. Control9838B/80d08790,
+  original d4/source1758/fullSDK/ALL7/harness and all original clocks retained.
+  Timing-perturbing diagnostic only. A passing traced case cannot repair or
+  supersede the failed055ecbe1 native gate. No kernel/utility/profile changes.
+
+- [x] MPDT peer11302 exact same-ID recovery completed through installed81aa,
+  original60s bound, started05:00:02/terminal05:00:47. Delivered137 versus
+  earlier daemon130 retained. Independent supported jobs read confirms finished,
+  ACKtrue, all4 release/retirement flags true, wrapper absent/dead, journal
+  errors empty. Zero test results. Earlier E504/unsettled-control failure remains
+  recorded. No compilation replay, manual lock/namespace changes or peer signals.
+- [x] Fresh Mac capacity check finds local and configured mac-mini-old system
+  roots below original20GiB floor,16.55GB/15.94GB. Mounted FTRCH sparsebundle
+  child denominators pass, but actual backing TRJ/data and Mac system-root
+  admission remain separate. Retained bootstrap RCH2.1.34/earlier child120 is
+  not a qualified updated client. No new Mac build/install was attempted.
+- [ ] New main57b59315 loader-path isolation and bc535921 wrapper panic fence
+  are outside frozen d4/source-entry qualification. Loader ABI contamination
+  regression is distinct from the still-unresolved intermittent ELF5s timeout.
+  Peer qualification coordination sent, no root whole-current-main claim.
 
 - [x] Normal production operator CLI DSR a611cac1 terminalSUCCESS0/238s on TS2.
   CHECK41=139.45s, CHECK42=33.89s, BUILD43=18.49s, all exit0. Actual remote
@@ -23,20 +61,24 @@
   original1.9GB SDK and1758 source audited before/after. New owner-only runtime
   rcx and initially empty durable worker SDK cache. No preseed or local fallback
   accepted. Real TLS and ordinary CLI operations, no timing or fleet claim.
-- [ ] Fixed remaining-four native coverage dispatched on TS2, control36562B/
+- [x] Fixed remaining-four native coverage DSR3043a09c terminalSUCCESS0/1401s
+  on TS2, control36562B/
   fbdd3ae4/dev49/inode14207420, new private runtime rr. All original source,
   component226, compiler1067, ALL7/BOTH TLS, completeSDK and artifact guards
   retained. Each case runs once. Ordinary failures do not suppress later cases
   once observed owned roles have settled. Prior cold055ecbe1 remains failed,
   full_native_gate_passed=false, no retry-to-green or combined full-native claim.
-  - [ ] Explicitly prewarmed SDK service, three fresh real requests, reconnect
-    frontier and coordinator restart, durable cache reused for all three.
-  - [ ] CHECK dependency sampling, committed replay, relocated target and
-    original source/input invalidation assertions.
-  - [ ] BUILD archive sampling/replay and actual delivered working binary.
-  - [ ] Shared remote flight, origin cancellation, surviving consumer and
-    actual working survivor binary, later fresh verification.
-  - [ ] Final full1758/SDK/ALL7/harness/control audit and observed-role drain.
+  - [x] Explicitly prewarmed SDK service1/1/zeroignored/149.8s, three fresh
+    real requests, reconnect frontier/coordinator restart, SDK reused all three.
+  - [x] CHECK dependency sampling/replay/relocation and original invalidation
+    assertions1/1/zeroignored/468.9s, no observed owned residuals.
+  - [x] BUILD archive sampling/replay and actual delivered working binary
+    1/1/zeroignored/506.6s, no observed owned residuals.
+  - [x] Shared remote flight, origin cancellation, surviving consumer and
+    actual working survivor binary, later fresh verification1/1/zeroignored/
+    209.1s, no observed owned residuals.
+  - [x] Final full1758/SDK/ALL7/harness/control audit and observed-role drain
+    matched. Complete final report174018B/b793b004. Compiler gate complete.
   - [ ] Exact old-worker negative and two-worker failover remain held behind
     their original full-native prerequisite. Remaining-four results cannot
     satisfy that prerequisite or close M6.
@@ -114,7 +156,7 @@
   frozen d4 and paired source-entry snapshots. No whole-current-main claim.
   M6 stays in progress. JSONL merge conflict remains, no forced export.
 
-These 04:39 results supersede the earlier pending markers below.
+These 05:12 results supersede the earlier pending markers below.
 
 - [x] Corrected d4 normalALL7/BOTH TLS DSR5fee2740 terminalSUCCESS0/1819s,
   actualCargo1785.5s. Full1758/control5616B/07d1116b aftermatch. Genuine new
