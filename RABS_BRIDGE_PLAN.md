@@ -19,10 +19,20 @@
   *-interrupted-fb269769. Supported same-ID resume refused source/output identity
   after peer HEAD advanced. Fresh hot invocation above retains identical d4
   inputs, original3600s/jobs1/profiles/pins and every original predicate.
-- [ ] d4 native5/precise old-worker negative DISPATCHED03:00UTC, session30327,
-  version2.1.35-reconnect-watchdog-native.d4ec1bb8, control35227B/7676d69e.
-  ALL7,226components,positive owner-death and complete1067 gates finished first.
-  No own compiler job remains active. Peer host load remains possible.
+- [x] d4 native DSR055ecbe1 terminalFAILURE/native101/CLI6/405s. First cold
+  service0/1/zeroignored/317.3s at prior-receipt assertion. Retained logs identify
+  second request edge ELF revalidation exceeding original5s, followed by local
+  canonical fallback/Cargo0. First request actually remoteexecuted/released,
+  second request did not acquire fresh worker ownership. Strong test correctly
+  refuses fallback. ALL1758/fullSDK/tools/control35227B/7676d69e aftermatch,
+  no observed owned residuals. Other4native/oldnegative/failover UNRUN. GNU
+  watchdog fixes owner-death cleanup but original loader deadline remains a
+  real operational blocker. No specific uutils causal claim.
+- [ ] ONE-case syscall diagnostic DSR launched03:18UTC, control9247B/733bc09a.
+  Same d4 genuine tools/harness/fullSDK/original bounds. Existing process samples
+  show GNUwatchdog waiting, ldd pipewait and a descendant accumulating kernelCPU.
+  Ancestor-bound procfs syscall/status samples may distinguish the blocked call.
+  No tracing/signaling/global changes or retry-to-green acceptance credit.
 - [ ] Run the existing real two-worker failover/surviving-subscriber case AFTER
   native5/oldnegative pass. Prepared control9520B/3e5e8d35, original bounds;
   retain source/SDK/tool audits, same generation and distinct attempt/lease,
@@ -37,7 +47,11 @@
 - [ ] Qualify source-entry fix with BOTH planted red failures using exact old
   production prefix, ALL cargo_path_deps cases, workspacefmt/check/strictClippy.
   First DSR6276a015 FAILED setup before tests, isolated PATH omitted sbh.
-  Preserve failure; correct absolute guard path, run after native5 settles.
+  Absolute-sbh DSR761783c3 BOTHactual red cases101/[0,1,0]; first names .DS_Store
+  and README, second names README/Cargo.toml. Launcher incorrectly required
+  .DS_Store specifically in BOTH, so wrapperFAILED. Correct error-kind/file-kind
+  predicate retains both planted fixtures and every positive/module/compiler
+  condition. New control queued after syscall diagnostic, no source edit.
   No installed-client or RABS qualification credit from this source edit yet.
 - [x] MPDT private transfer namespace guard actual publish/restore probe passed
   at owner-only TRJ /data/tmp/rch-mpdt-private-20261106. Original0775 namespace
