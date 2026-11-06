@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November5 at23:44UTC:**
+**Active qualification checkpoint, November6 at00:21UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -14,16 +14,36 @@
   defaultprofiles/pins. Requires EVERY old and current test name, zeroignored;
   expected1067 cases, count only actual terminal summaries. Control9844B/
   8704ba6e publishes final proof atomically after every predicate/after-audit.
-- [ ] Fresh native5 plus genuineold-worker negative DISPATCHED23:44UTC:
-  control33793B/b5904972/inode14147202/dev49. ALL4 original cases retained;
-  ADD existing actual concurrent two-Cargo/one-TLS-producer/origin-cancel/
-  survivor-working-binary/fresh-later-verification case. No deadline extension.
-  Genuine3013 production gates and283API pass permit independent execution
-  alongside new4a3f workspace checks, replacing unnecessary scheduling wait.
-  EVERY full9-suite/compiler final predicate still mandatory for overall pass;
-  atomic terminal join, SDK and original per-case/ownership bounds unchanged.
-  Prior33063B/9aabe838 controller remains unused/preserved. Same-host sharing
-  proof would not close distinct-edge-host,15-agent,throughput/no-swap gates.
+  Actual fmt0/21.6s, workspace-alltargets check0/1021.2s, strictClippy0/977.6s.
+  Nine suites still compiling/executing. This predecessor cannot qualify new
+  loader source5007 below; its frozen source and outcome remain preserved.
+- [x] Native5 DSR08029b0b terminalFAILURE/native101/CLI6/909s: cold1/1/218.1s,
+  prewarm1/1/158.5s, CHECK0/1/463.4s. Worker compiler actually0/releasedtrue/
+  residual0; edge ELF runtime revalidation failed/exceeded original5s deadline.
+  BUILD/sharing/oldnegative UNRUN. No observed owned residuals; ALL1758/fullSDK
+  5256entries4270files1921340623B/tools/control33793B/b5904972 aftermatch.
+  Receipt72667B/dc425b7f. This is a real acceptance failure, not a pass.
+- [x] DSR55d12826 readiness refusal before any native execution: Tailscale SSH
+  timed out. Isolated LAN config changes only ssh_host to existing same-host
+  alias; full source/control/hostidentity and original20GiB admission retained.
+- [x] Loader diagnostic: fixed10 original5s probes produced ONE124/6.116s with
+  2492 stdout bytes. Host timeout is uutils0.2.2; code assumed GNU. Subsequent
+  fixed10 paired old/GNU probes ALL20passed; process/signal-traced50 ALLpassed.
+  Specific uutils defect is UNPROVEN; no retry-to-green/native qualification.
+- [ ] New immutable500755cc source: parent4a3f plus ONLY manually edited
+  runtime_cohort.rs, all1758 files/tar64737280B. Direct owned ldd group,
+  unreaped leader pins signal identity, nonblocking capped pipes, both EOFs
+  inside unchanged5s, distinct actual nonzero/timeout errors. No dependency,
+  gate, kernel, global utility, or policy change. Four actual-process tests:
+  fast0/7 streams; empty/spawnerror; both-lane overflow; live/exited leader
+  with pipe-holding descendants must time out and settle.
+- [ ] New source5007 DSR components RUNNING, control8359B/1218eb50/dev49/
+  inode14140858. First execute ALL runtime_cohort cases/four new regressions,
+  then retain worker154/SDK40 and compile/list ALL5 native scenarios. Changed
+  RABS dependency closure requires genuinely rebuilt harness/tools/194 cases;
+  no prior9ce1/3013 retag. NormalALL7 rebuild prepared, not dispatched until
+  first runtime cohort pass; fullnew QA and native5+oldnegative still required.
+  Raw targeted UBS0critical/282warning/138info; compiler/lint/native pass pending.
 - [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
   3failed/zeroignored. Two literal route mismatches, one human-message assertion
   contradicted existing typed busy/structured reserved-headroom contract.
