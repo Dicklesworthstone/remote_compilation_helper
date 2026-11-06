@@ -106,6 +106,13 @@ namespace smoke test are insufficient. A host that cannot construct the complete
 base namespace does not advertise canonical execution or receive those builds;
 the worker does not substitute a broader mount view or weaker isolation.
 
+ELF runtime discovery requires GNU Coreutils `timeout`. The probe prefers
+`/usr/bin/gnutimeout` when installed, otherwise it checks `/usr/bin/timeout`;
+a different implementation is refused explicitly. The independent watchdog
+survives an abrupt owner death, while native supervision also bounds both
+output streams and group cleanup. Capability discovery and loader execution
+share the existing five-second budget. This does not change host utilities.
+
 Create an operation parent outside the source/toolchain trees, owned by the user
 and mode 0700. Existing directories are not silently chmodded. Use this profile:
 
