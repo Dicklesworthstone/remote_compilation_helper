@@ -62,9 +62,10 @@ refuse. The absolute floor, per-build storage admission and explicit `disk_criti
   ([`1f21cff0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1f21cff0501f66a2af6d739e75b96f141b87e094),
   [`5d97a23e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5d97a23ec0fee1aa5eaab96873737f292a60b562),
   [`2a7224d3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a7224d34dd4264e9725d37543ad2c4dc2627db5)).
-- **Cancellation works on a full disk** (`bd-fwc2h`). Control capture stays in memory when Python is available, and
+- **Cancellation needs far less disk** (`bd-fwc2h`). Control capture stays in memory when Python is available, and
   cancellation reuses durable records instead of allocating new ones. Commands run through that in-memory path see the
-  same inherited descriptors as the file-backed one
+  same inherited descriptors as the file-backed one. Source-ownership calls in this release still create a scratch
+  directory under `TMPDIR`, so a worker with no room left there can still refuse them until some space is freed
   ([`ef0d2261`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ef0d226131b228ec88d34049db37fdf17380396d),
   [`8a8f58b8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8a8f58b84ee33de3085af0e0264610ca64d37cbb),
   [`8f2c13c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8f2c13c77d3f33e413e60cf10cba0e727a5f423d)).
