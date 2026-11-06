@@ -4819,10 +4819,23 @@ async fn finish_gc_process(
             // Draining both outputs concurrently is essential: SSH may fill
             // either pipe before the remote shell has consumed our script.
             // An incomplete write cannot authorize a successful GC inventory.
-            stdin.write_all(script.as_bytes()).await?;
-            stdin.shutdown().await?;
+            let delivery = async {
+                stdin.write_all(script.as_bytes()).await?;
+                stdin.shutdown().await
+            }
+            .await;
+            match delivery {
+                Ok(()) => {}
+                // An SSH refusal can close stdin before a large script is
+                // sent. Keep its authoritative exit/stderr, but never accept
+                // exit 0 after incomplete delivery.
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                    return Ok(Some(error));
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok::<_, std::io::Error>(())
+        Ok::<Option<std::io::Error>, std::io::Error>(None)
     };
     let outcome = tokio::time::timeout_at(deadline, async {
         tokio::try_join!(
@@ -4834,7 +4847,7 @@ async fn finish_gc_process(
     })
     .await;
     let mut error = match outcome {
-        Ok(Ok((status, stdout, stderr, ()))) => {
+        Ok(Ok((status, stdout, stderr, delivery_error))) => {
             if stdout.len() as u64 + stderr.len() as u64 > output_budget {
                 return Err(GcCommandError {
                     message: format!(
@@ -4858,6 +4871,18 @@ async fn finish_gc_process(
                 return Err(GcCommandError {
                     message: stderr.trim().to_string(),
                     timed_out: true,
+                    command_started: true,
+                });
+            }
+            if status.success()
+                && let Some(error) = delivery_error
+            {
+                return Err(GcCommandError {
+                    message: format!(
+                        "SSH exited successfully before the full GC script was delivered: {error}; stderr: {}",
+                        stderr.trim()
+                    ),
+                    timed_out: false,
                     command_started: true,
                 });
             }
@@ -7339,7 +7364,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn gc_script_write_failure_is_an_error_and_reaps_owned_child() {
+    async fn gc_closed_script_pipe_keeps_deadline_and_reaps_owned_child() {
         let child = tokio::process::Command::new("sh")
             .args(["-c", "exec 0<&-; exec sleep 30"])
             .stdin(std::process::Stdio::piped())
@@ -7353,18 +7378,50 @@ mod tests {
         let error = finish_gc_process(
             child,
             Some(&input),
-            gc_deadline(5).unwrap(),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(100),
             GC_OUTPUT_LIMIT,
             std::time::Instant::now(),
         )
         .await
         .unwrap_err();
-        assert!(error.command_started && !error.timed_out, "{error}");
-        assert!(error.message.contains("write/read/wait SSH"), "{error}");
+        assert!(error.command_started && error.timed_out, "{error}");
+        assert!(error.message.contains("worker deadline expired"), "{error}");
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "owned child {pid} was not reaped: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_early_stdin_close_preserves_refusal_but_rejects_success() {
+        for exit_code in [23, 0] {
+            let mut command = tokio::process::Command::new("sh");
+            command.args([
+                "-c",
+                &format!("exec 0<&-; printf '%s\\n' 'authentication denied' >&2; exit {exit_code}"),
+            ]);
+            // Larger than a pipe buffer, so early closure must interrupt the
+            // actual write instead of allowing the whole script to queue.
+            let input = "x".repeat(1024 * 1024);
+            let result = run_gc_process(command, Some(&input), gc_deadline(5).unwrap(), 4096).await;
+            if exit_code != 0 {
+                let refused = result.unwrap();
+                assert_eq!(refused.exit_code, exit_code);
+                assert_eq!(refused.stderr, "authentication denied\n");
+                assert!(!refused.success());
+            } else {
+                let error = result.unwrap_err();
+                assert!(!error.timed_out && error.command_started, "{error}");
+                assert!(
+                    error
+                        .message
+                        .contains("before the full GC script was delivered"),
+                    "{error}"
+                );
+                assert!(error.message.contains("authentication denied"), "{error}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
