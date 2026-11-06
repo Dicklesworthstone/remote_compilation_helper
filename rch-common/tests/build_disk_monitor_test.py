@@ -1061,7 +1061,9 @@ m.Monitor.observe_output=observed"""
             warm_policy=policy,
         )
         self.wait_file(ready)
-        os.kill(process.pid, signal.SIGTERM)
+        # Cancellation signals the group. The guardian alone never reaches the
+        # supervisor that writes this receipt, and only fences the group.
+        os.killpg(process.pid, signal.SIGTERM)
         status, _, _ = self.complete(process)
         self.assertNotEqual(status, 0)
         self.assertTrue(self.failure(receipt)["started"])
