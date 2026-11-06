@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at01:24UTC:**
+**Active qualification checkpoint, November6 at01:47UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -59,9 +59,11 @@
   preferred; original total5s includes discovery, native64KiB/bothEOF retained.
   No dependency, installed utility, kernel, global policy, deadline change.
   User/peer commits383e8323/8d17703e; root did not stage/commit/push.
-- [x] Newd4 component actual226/226/zeroignored (32runtime/154worker/40SDK);
-  genuine new5-case harness compilation/listing still RUNNING through DSR.
-- [x] Actual d4 owner-death POSITIVE DSR terminalSUCCESS0/35s: owning libtest
+- [x] Newd4 components DSR76096f3c terminalSUCCESS0/1078s: actual226/226/
+  zeroignored (32runtime/154worker/40SDK); genuine new5-case harness compiled
+  and ALL5 listed. Harness760511704B/89a2e3ea, full1758/control8946B/df321829
+  aftermatch. Compilation/listing is not native execution.
+- [x] Actual d4 owner-death POSITIVE DSR196917ea terminalSUCCESS0/34s: owning libtest
   actuallySIGKILL/-9, allTHREE watchdog/shell/sleep heldpidfds exited without
   manual cleanup, observed upperbound2.014s <original5s (hash afterkill can
   delay observation, so this is not an exact exit timestamp). Full1758/control
@@ -74,19 +76,23 @@
   afterward. Same source/test/timebound, first failure retained.
 - [ ] Genuine d4 normalALL7/BOTH TLS DSR RUNNING since01:22, control5616B/
   07d1116b/dev49/inode14165904, original3600s/jobs1/profiles/pins.
-- [ ] Fullworkspace/ALL9 d4 prepared10168B/930dc83a/dev49/inode14142290; requires
-  completed226/harness gate. Cancelled5007 full1758/control afteraudit matched,
+- [ ] Fullworkspace/ALL9 d4 DSR RUNNING since01:28, control10168B/930dc83a/
+  dev49/inode14142290; actualfmt0/21.3s and workspace-alltargets check0/793.5s.
+  StrictClippy running; ALL9 retained inventories still UNRUN. New226/harness
+  gate settled before dispatch. Cancelled5007 full1758/control afteraudit matched,
   zeroowned processes, canonicalroot preserved by non-destructive rename to
   *-retired-5007-crash-superseded. Fullnew1758 installed/audited; unchanged1756
   mtimes reused only after bytes/hash/mode equality. No oldproofs relabeled.
-- [ ] Fresh d4 native5/oldnegative remains required; old5007/3013/4a3f tools and
-  results will not be relabeled.
+- [ ] Fresh d4 native5/oldnegative prepared35227B/7676d69e/dev49/inode14174304;
+  requires allcurrent gates, old5007/3013/4a3f results will not be relabeled.
   Native requires COMPLETE newfullQA +normalALL7 +226/harness +positivecrash;
   retain final fullgate checks and original3600s/SDK/case bounds.
   Service/CHECK/BUILD/sharing all must pass, oldB1 must fail precise reconnect
   assertion; setup/loader/timeout failure cannot satisfy that negative. This
   sequential schedule removes our own compiler contention without claiming
-  no peer load or absent swap. Plan/runtime/docs leases1771/2601/2602 held.
+  no peer load or absent swap. Runtime/docs leases2601/2602 released01:28;
+  Planlease1771 remains held. Existing failover native test reviewed as possible
+  next functional probe after required5; no new source or runtime claim from review.
 - [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
   3failed/zeroignored. Two literal route mismatches, one human-message assertion
   contradicted existing typed busy/structured reserved-headroom contract.
@@ -96,8 +102,18 @@
   while timeout results were preserved by rename; FileNotFound is our launcher
   error, not an overall acceptance pass. Full source/SDK/tools aftermatch.
   Fresh full execution required; no metadata-only promotion of failed run.
-- [ ] SharedTRJ still has peer work; no performance reservation or complete new
-  paired comparison/public6 yet. Original whole-project23% loss still stands.
+- [ ] SharedTRJ changed to0used/active[] but unreachable/stuck_detector; ordinary
+  directSSH/toolchain probes succeed while automatic recovery remains quarantined
+  for process_observation/SSH. Fresh01:36 recovery failedSSH, nextdue01:51UTC.
+  Peerjobs30096150186950820/838 completion/ACK/release remains unconfirmed;
+  root did not cancel peers. No drain/reservation or comparison/public6 run.
+  Original whole-project23% loss stands. Existing12-run old/new/new/old plus
+  same-invocation stock comparison remains prepared/unmodified; sourceB1 only,
+  not d4. IsolatedLAN DSR config is only a TS2 transport change, not TRJ rejoin.
+  Fresh Mac internal-volume SBH20GiB still FAILScritical at26.7GB/0.67%free;
+  network /Volumes/trj-data has429.7GB and passes its own guard. No gates changed,
+  storage deleted or claim of Mac qualification. Installed81aa already includes
+  recovery-component-skip114812e3; missing that fix is not an established cause.
 - [ ] M6 remains in progress: distinct-edge singleflight/authority/cancellation/
   root permits and15-agent multi-host >=2x storm/no-swap acceptance unproven.
 - [ ] Beads merge refused ambiguous bases for bd-4x4qa/bd-p56r0/bd-satto.
