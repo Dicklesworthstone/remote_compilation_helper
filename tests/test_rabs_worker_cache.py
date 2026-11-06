@@ -271,8 +271,9 @@ class WorkerCacheTests(unittest.TestCase):
 
     def test_oversized_launcher_is_refused_before_any_source_executes(self):
         marker = self.root / "must-not-run-large-script"
+        bound = int(re.search(r"^MAX_LAUNCHER_BYTES = (\d+) \* 1024$", PROGRAM, re.M)[1]) * 1024
         self.replace_launcher("RCH_WORKER_PREPARATION_API = 1\nfrom pathlib import Path\n"
-                              "Path({!r}).touch()\n#".format(str(marker)) + "x" * (128 * 1024))
+                              "Path({!r}).touch()\n#".format(str(marker)) + "x" * bound)
         completed, _ = self.run_worker(["build"])
         self.result(completed)
         self.assertFalse(marker.exists())
