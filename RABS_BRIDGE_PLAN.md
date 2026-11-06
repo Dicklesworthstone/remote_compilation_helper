@@ -12,19 +12,26 @@
   (opt3/thinLTO/unwind). Source/runtime receipts remain unchanged, while shipping
   profile, panic containment, performance and complete-current-main claims stay
   open. This correction supersedes every broader historical profile label below.
-- [ ] Corrected SAME-d4 shipping-profile ALL7 producer prepared, control7114B/
+- [ ] Corrected SAME-d4 shipping-profile ALL7 DSR623a9408 RUNNING since05:12,
+  control7114B/
   301f30ec/dev49/inode14186202. Actual installer package/profile mapping,
   original manifest/pins/features/jobs1/DSR3600 retained. Require real Cargo
   artifacts from their respective profile directories and BOTH TLS backends in
-  daemon roles. Existing generic outputs remain preserved. Serial dispatch after
-  the current diagnostic settles, then actual normal CLI with these new tools.
+  daemon roles. Existing generic outputs remain preserved. Wrapper compilation
+  is progressing at05:32, followed by daemon profile and actual normal CLI with
+  these new tools. Original combined3600s bound remains unchanged.
   Frozen source isolates the profile change; latest main changes stay separate.
 
-- [ ] One predeclared process/signal/close_range syscall trace of the existing
-  cold-service case dispatched through DSR on TS2. Control9838B/80d08790,
+- [x] One predeclared process/signal/close_range syscall trace settled through
+  DSR on TS2. ObserverSUCCESS0/396s, actual cold Rust caseFAILED101/0passed/
+  1failed/zeroignored/336.7s at original client300 during SDK transfer, worker
+  highwaternull/no execution. Control9838B/80d08790,
   original d4/source1758/fullSDK/ALL7/harness and all original clocks retained.
   Timing-perturbing diagnostic only. A passing traced case cannot repair or
   supersede the failed055ecbe1 native gate. No kernel/utility/profile changes.
+  Fullsource/SDK/ALL7/harness/control aftermatch, no observed owned residuals.
+  Final1894B/90b962af; trace4727057B/a9581fc1 retained. ELF5s stall was not
+  reproduced. This adds no corrected-defect or native acceptance claim.
 
 - [x] MPDT peer11302 exact same-ID recovery completed through installed81aa,
   original60s bound, started05:00:02/terminal05:00:47. Delivered137 versus
