@@ -12278,7 +12278,10 @@ esac
             escape(Cow::Borrowed(&opaque)),
         );
         let receipt = root.join("completion");
+        // Production records the cache scope from the original argv; the
+        // monitor rightly refuses an opaque Cargo command without one.
         let pipeline = disk_budget_test_pipeline(&root, Some(901), 15)
+            .with_cargo_disk_cache(&workload, &WorkerId::new("rabs-bootstrap"))
             .with_recovery_completion(receipt.to_str().unwrap().into(), "rabs".into());
         let wrapped = wrap_command_with_toolchain(&workload, None);
         assert!(
