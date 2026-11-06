@@ -2390,6 +2390,30 @@ impl RecoverySession {
             .join(index.to_string())
     }
 
+    /// Ownership evidence demands a base nobody else can write. `DirBuilder`
+    /// applies its private mode only to a directory it creates, so the default
+    /// base keeps whatever mode an older client's umask gave it, and staging
+    /// runs after the remote build: refusing it there fails a finished job.
+    /// That directory belongs to rch, so clear those bits here. An operator
+    /// may point `retrieval_staging_dir` at a shared directory, whose mode is
+    /// not ours to change: refuse it before creating anything beneath it.
+    #[cfg(unix)]
+    fn ensure_private_staging_base(&self, base: &File, path: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = base.metadata()?;
+        if metadata.mode() & 0o022 == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.recipe.transfer.retrieval_staging_dir.is_none()
+                && metadata.uid() == rustix::process::geteuid().as_raw(),
+            "retrieval staging base must be owned by this user and not writable by group or others: {}",
+            path.display()
+        );
+        base.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o7755))?;
+        Ok(())
+    }
+
     /// Acquire reclamation evidence only for a directory that this call just
     /// created. An existing legacy tree remains usable, but is never promoted
     /// into deletion authority from its current path, contents or permissions.
@@ -2425,6 +2449,7 @@ impl RecoverySession {
                     HeldRetrievalStage::directory_flags(),
                     Mode::empty(),
                 )?);
+                self.ensure_private_staging_base(&base, base_path)?;
                 match rustix::fs::mkdirat(
                     &base,
                     self.recipe.identity.as_str(),
@@ -10376,6 +10401,99 @@ mod tests {
         assert!(!session.recipe.tree_retired);
         assert_eq!(std::fs::read(&writer.path).unwrap(), before);
         assert!(writer.ensure_released_for_retry().is_err());
+    }
+
+    #[cfg(unix)]
+    fn staging_base_session() -> (PathBuf, RecoverySession) {
+        let (directory, writer, _worker) = retained_preparation_fixture();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer,
+        };
+        session.recipe.phases.push(RecoveryPhase {
+            name: "project".into(),
+            local: directory.join("caller"),
+            remote: "/data/tmp/rch/staging-base".into(),
+            patterns: Vec::new(),
+            result_dir: None,
+            custom_target: false,
+            output_gate: false,
+            cargo_outputs: None,
+            native_outputs: None,
+            baseline: BTreeMap::new(),
+            published: BTreeMap::new(),
+            pending: None,
+            complete: false,
+            missing_result: None,
+        });
+        (directory, session)
+    }
+
+    /// The default base comes from the process environment, which concurrent
+    /// tests also read, so this runs in a child of the test binary.
+    #[cfg(unix)]
+    #[test]
+    fn default_staging_base_loses_group_write_so_a_finished_job_can_stage() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const CHILD: &str = "RCH_TEST_STAGING_BASE_CHILD";
+        const PATH: &str = concat!(
+            module_path!(),
+            "::default_staging_base_loses_group_write_so_a_finished_job_can_stage"
+        );
+        let _guard = test_guard!();
+        if std::env::var_os(CHILD).is_none() {
+            let state = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", PATH.split_once("::").unwrap().1, "--nocapture"])
+                .env(CHILD, "1")
+                .env("RCH_STATE_HOME", state.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let base = default_job_lease_directory().join("retrieval");
+        assert!(base.starts_with(std::env::var_os("RCH_STATE_HOME").unwrap()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let (_directory, mut session) = staging_base_session();
+        assert!(session.recipe.transfer.retrieval_staging_dir.is_none());
+
+        session.prepare_staging(0).unwrap();
+
+        assert_eq!(std::fs::metadata(&base).unwrap().mode() & 0o7777, 0o755);
+        let evidence = session.recipe.staging_ownership.clone().unwrap();
+        assert_eq!(evidence.base, base);
+        assert!(session.stage(0).is_dir());
+        // Retirement reopens the stage through this exact check.
+        HeldRetrievalStage::open(&session.recipe, &evidence).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_staging_base_is_refused_with_its_mode_and_contents_unchanged() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _guard = test_guard!();
+        let (directory, mut session) = staging_base_session();
+        let shared = directory.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        session.recipe.transfer.retrieval_staging_dir = Some(shared.clone());
+
+        let error = session.prepare_staging(0).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("not writable by group or others"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::metadata(&shared).unwrap().mode() & 0o7777, 0o775);
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+        assert!(session.recipe.staging_ownership.is_none());
     }
 
     #[cfg(unix)]
