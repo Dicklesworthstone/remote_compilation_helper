@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at01:19UTC:**
+**Active qualification checkpoint, November6 at01:24UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -59,17 +59,28 @@
   preferred; original total5s includes discovery, native64KiB/bothEOF retained.
   No dependency, installed utility, kernel, global policy, deadline change.
   User/peer commits383e8323/8d17703e; root did not stage/commit/push.
-- [x] Newd4 runtime-cohort actual32/32/zeroignored,17.8s; entire194 worker/SDK
-  and genuine new5-case harness qualification still RUNNING through DSR.
-- [ ] Actual d4 owner-death POSITIVE required before expensive builds. First
+- [x] Newd4 component actual226/226/zeroignored (32runtime/154worker/40SDK);
+  genuine new5-case harness compilation/listing still RUNNING through DSR.
+- [x] Actual d4 owner-death POSITIVE DSR terminalSUCCESS0/35s: owning libtest
+  actuallySIGKILL/-9, allTHREE watchdog/shell/sleep heldpidfds exited without
+  manual cleanup, observed upperbound2.014s <original5s (hash afterkill can
+  delay observation, so this is not an exact exit timestamp). Full1758/control
+  7622B/901ba62b/bin129662240B/e5660f67 aftermatch. Interrupted Rust test is NOT
+  counted as a passing unit test; crash diagnostic only. First
   diagnostic DSR81a17912 failed setup: hashing129MB parent executable consumed
   original1s unit pause; owner was NOT killed, actual test settled1/1. Full
   source/control/bin aftermatch; no crash proof claimed. Corrected controller
   pins exact owned executable inode before SIGKILL and hashes its held handle
-  afterward; allTHREE watchdog/shell/sleep pidfds must exit without manual
-  cleanup within original5s. Same source/test/timebound, first failure retained.
-- [ ] Genuine d4 normalALL7/BOTH TLS +fullworkspace/ALL9 +fresh native5/oldnegative
-  remain required; old5007/3013/4a3f tools and results will not be relabeled.
+  afterward. Same source/test/timebound, first failure retained.
+- [ ] Genuine d4 normalALL7/BOTH TLS DSR RUNNING since01:22, control5616B/
+  07d1116b/dev49/inode14165904, original3600s/jobs1/profiles/pins.
+- [ ] Fullworkspace/ALL9 d4 prepared10168B/930dc83a/dev49/inode14142290; requires
+  completed226/harness gate. Cancelled5007 full1758/control afteraudit matched,
+  zeroowned processes, canonicalroot preserved by non-destructive rename to
+  *-retired-5007-crash-superseded. Fullnew1758 installed/audited; unchanged1756
+  mtimes reused only after bytes/hash/mode equality. No oldproofs relabeled.
+- [ ] Fresh d4 native5/oldnegative remains required; old5007/3013/4a3f tools and
+  results will not be relabeled.
   Native requires COMPLETE newfullQA +normalALL7 +226/harness +positivecrash;
   retain final fullgate checks and original3600s/SDK/case bounds.
   Service/CHECK/BUILD/sharing all must pass, oldB1 must fail precise reconnect
