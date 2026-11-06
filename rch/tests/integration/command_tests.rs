@@ -684,7 +684,8 @@ if first == b'{\n':
     # The namespace RPC batches its live-checkout guard into one compound.
     first += second
 payload = first.decode() + sys.stdin.buffer.read().decode()
-if first == b'{\n(\n':
+batched = first == b'{\n(\n'
+if batched:
     assert payload.count('RCH_SYNC_LIVE_CHECKOUT_REFUSED:') == 1, 'namespace RPC lost its guard'
 if payload.startswith('(set -eu\nrch_destination='):
     # Execute the production read-only guard against the worker's mapped
@@ -703,9 +704,12 @@ if payload.startswith('(set -eu\nrch_destination='):
     sys.exit(result.returncode)
 if 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED' in payload:
     present = all(os.path.lexists(path) for path in (canonical, alias))
-    print('RCH_TOPOLOGY_PATHS_PRESENT' if present else 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED')
+    print('RCH_TOPOLOGY_PATHS_PRESENT' if present else 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED',
+          file=sys.stderr if batched else sys.stdout)
     event('probe', 0)
-    sys.exit(0)
+    # Batched, the observation is a diagnostic: the initializer still runs.
+    if not batched:
+        sys.exit(0)
 if 'RCH_NAMESPACE_SCOPE' not in payload:
     event('unexpected_control_command', 73)
     sys.exit('unexpected fixture SSH control command')
