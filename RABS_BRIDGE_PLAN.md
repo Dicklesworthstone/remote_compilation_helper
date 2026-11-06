@@ -2,7 +2,62 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at03:01UTC:**
+**Active qualification checkpoint, November6 at04:02UTC:**
+
+- [x] Source-entry fix actual DSR terminalSUCCESS0/1508s. BOTH exact-old-
+  production planted regressions101/[0,1,0], repaired ALL112/112/zeroignored.
+  Real offline Cargo oracle retained. Workspacefmt0/17.0s, check-alltargets0/
+  642.1s, strictClippy0/662.2s. Full paired1758-source/control9457B/025c823d
+  before/aftermatch and atomic final report. d9c7d323 file matches repaired
+  source15088273 exactly. Installed81aa and newer main boot-authority/release
+  changes retain separate qualification scope. No new production edit.
+- [x] Corrected syscall-census DSR terminalSUCCESS0/306s, actual cold-service
+  1/1/zeroignored/228.3s. Full1758/completeSDK/tools/control9398B/f30d9dc7
+  aftermatch, no observed owned residuals. It DID NOT reproduce the earlier
+  loader stall and does NOT turn native055ecbe1 into a pass. Prepared process/
+  signal strace diagnostic remains UNRUN while configured-host runtime takes
+  priority. TS2 loader deadline cause remains unresolved.
+- [x] Preserve syscall diagnostic setup failures.6c6aa579 refused existing
+  scratch rd before any test.204aa9f4 sampler incorrectly asserted procfs UID
+  through a nested loader exec transition, aborted controller and left2own
+  worker/service roles orphaned. Exact boot/PIDns/UID/birth/executable hashes/
+  private stream custody checked, both gracefully settled by held-pidfd SIGTERM
+  within0.863s, no KILL. Cleanup receipt retained. Corrected sampler records
+  procfs ownership/redaction; future tracing controller also joins child at exit.
+- [ ] Genuine d4 native5/oldnegative DSR2b6c0825 RUNNING on existing configured
+  TRJ, session78934. Control35926B/1d92ee1c/dev54/inode69460446. ALL7/harness
+  retain original TS2 build provenance and exact hashes; full originalSDK and
+  source1758 independently copied and audited on TRJ. All original Cargo300/
+  helper600/GNU5/SDK30min/DSR3600/jobs1/concurrency4 and every positive/negative
+  assertion retained. New private /bulk/rabs-lilacshore-native-20261106 and
+  /bulk/rl6/n; actual parent /bulk SBH20GiB passes with4.8TB/31.6%free. Existing
+  ZFSzstd7/syncstandard observed, no dataset/policy changes. DSR's existing
+  configured20GiB system-root floor passes with94GB, while separate root SBH
+  percentage observation is CRITICAL at8.99% and explicitly retained. All
+  payload/runtime/Cargo-home/results/DSR scratch writes use independent /bulk.
+  Normal DSR admission accepted; physical/source/SDK/runtime storage guards and
+  all tool/native version probes passed. Cold-service case actually running.
+  This is single-host loopback correctness on TRJ, no speed/storm/fleet claim.
+- [x] Alternative-host checks measured real namespace support but root storage
+  refusal on hz1/hz2/hz3/hz4/ts1/ovh-a/vmi1149989/vmi1152480. Omarchy passes
+  storage/namespaces but existing JE-approved disabled Surface/battery setting
+  excludes runtime execution. Its copy-only staging is settling and preserved;
+  no DSR host added or worker enabled. TRJ staging was retained when root
+  percentage warning prompted this check. Existing configured DSR trj floor
+  and isolated physical-volume admission determine the current run. Further9
+  opaque inline probes were DCG-refused, UNRUN; literal TRJ/Omarchy probes were
+  permitted. No allowlist, guard or global worker change.
+- [ ] After native5/precise oldnegative genuinely pass, adapt and execute the
+  existing two-worker failover case on the same admitted host, retaining its
+  same-generation/distinct-attempt+lease/one-retry/working-binary/final-drain
+  assertions. Preserve TS2 failure and diagnose it separately. Performance12
+  and public6 remain gated on their own supported shared reservation, source
+  lineage and live incumbent. Original whole-project23% loss still stands.
+- [ ] Current main00963db3 boot-authority and2.1.36 Cargo edits differ from
+  frozen d4 and paired source-entry snapshots. No whole-current-main claim.
+  M6 stays in progress. JSONL merge conflict remains, no forced export.
+
+These 04:02 results supersede the earlier pending markers below.
 
 - [x] Corrected d4 normalALL7/BOTH TLS DSR5fee2740 terminalSUCCESS0/1819s,
   actualCargo1785.5s. Full1758/control5616B/07d1116b aftermatch. Genuine new
