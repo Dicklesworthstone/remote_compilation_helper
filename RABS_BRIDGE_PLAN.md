@@ -2,7 +2,174 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at05:12UTC:**
+**Active qualification checkpoint, November6 at09:55UTC:**
+
+- [x] Repaired current-source native qualification DSRb63bc7b7 terminalSUCCESS0/
+  2033s. Frozen f851-overlay-7ce350fd, full1769 tracked inputs. Actual
+  wrapper-release production wrapper620360B/9d326cba, test binary1900888B/
+  63a705a5; ALL121 wrapper cases121/121/zeroignored/5.09s, including all six
+  substantive panic parents and their native socket/exec/unwind paths.
+  Native transport binary440489800B/067da0a8, ALL17 worker_transport cases
+  17/17/zeroignored/0.61s, including real loopback mutualTLS enrollment,
+  wrong-role pins, cross-ALPN and untrusted-CA rejection. Combined Rustls
+  artifact actually contains AWS-LC+Ring features. Test identities/protocol
+  doubles retain their explicit unit-fixture class. Whole workspace fmt0/
+  16.83s/check-alltargets0/647.98s/strictClippy-Dwarnings0/742.26s. Full1769/
+  compiler/control14016B/10fd0fa9/all3 binaries before-after match. Every
+  observed process census untruncated and drained. Final28260B/236c9a40.
+  Fresh self-verification checked every predicate and current worktree's1768
+  non-Plan files match the qualified snapshot exactly. Self-verification is
+  recorded separately from independent release sign-off. Current source edit
+  is one-word async ownership repair in an existing test helper. Originalf1
+  compiler failure staysfailed, originalshipping CHECK ELF5s staysfailed,
+  current full-daemon/all7/native5/fleet/performance/deployment remain open.
+
+- [x] Actual shipping-profile user entrypoint DSR terminalSUCCESS0/189s.
+  Captured Cargo invokes cargo rabs --rabs-canonical-local PROFILE -- check /
+  check / build --bins through the exact frozen138461B/2da418fe launcher.
+  ALL3 exit0,93.30/29.90/18.55s, fresh remote executions2/2/1 and advancing
+  durable executed/released receipts, residual0. Returned4534792B/16695bb4
+  program actually printed43, empty stderr. All3 clients/service/worker exit0,
+  no forced shutdown. Clean worker final request1793951509579423605. Source1758,
+  complete SDK5256/4270/1921340623B, ALL7/launcher/control20088B/6c1d99ac
+  before/after match. Final21273B/5815a20e, producer19345B/c3c4a70b. Same-host
+  private advisory-mode Linux proof, eligible metadata offloaded and other
+  codegen explicitly local. No installation, latest-main or performance claim.
+- [ ] Matching shipping-profile original native5 plus precise old-B1 negative
+  FAILED, DSR a81b8962/native101/CLI6/798s, control37728B/b721429a,
+  private runtime rv. Same source d4, matching
+  original harness, source1067/component226/ALL7/compiler prerequisites and
+  every original test assertion/clock preserved. Each candidate case once.
+  - [x] Cold shared service1/1/zeroignored/186.2s, no observed owned residuals.
+  - [x] Prewarmed service/restart1/1/zeroignored/182.4s, no observed residuals.
+  - [ ] CHECK FAILED0/1/zeroignored/347.0s at every-eligible-unit assertion,
+    remote3 versus required4. canonical_leaf edge ELF loader probe exceeded
+    original5s and fell back locally while the other3 units executed remotely.
+    Cargo0 does not qualify this case. This reproduces the intermittent loader
+    blocker with the actual shipping profiles as well as generic release.
+  - [ ] BUILD archive sampling/replay and actual delivered working binary UNRUN.
+  - [ ] Shared flight/origin cancellation/surviving consumer binary UNRUN.
+  - [ ] Precise old-worker productive-reconnect negative UNRUN after failure.
+  - [x] Full1758/SDK5256/ALL7/harness/control after-audit matched. Clean worker
+    journal final1793953472069155251 executed0/released/residual0; no observed
+    owned processes remained. Compiler1067 prerequisite exists but the native
+    controller did not reach its final joined compiler gate, field remainsfalse.
+  - [ ] Inspect same-case ancestor-bound syscall samples to identify the loader
+    boundary. Prior failing sample shows ldd descendant837021 accumulating
+    kernelCPU58 to471ticks over4.14s, parent on anon_pipe_read and GNUwatchdog
+    waiting. That is a lead, not a proven syscall or product repair. Preserve
+    every original clock and the failed result. No unchanged retry earns green.
+  Earlier generic-release dual-provider055ecbe1 remains FAILED. New explicit
+  shipping-profile result cannot establish the cause or repair of its ELF5s
+  stall, qualify a dual-provider daemon, latest main, fleet or performance.
+- [x] Shipping CHECK syscall diagnostic98c712e1 settled DSR SUCCESS0/470s,
+  actual original case1/1/zeroignored/408.9s. Control9747B/84d45877, source1758,
+  fullSDK5256/tools/harness before-after match, no observed residuals.541 procfs
+  samples/369669B/a0bd4d6f did not reproduce the high-kernel-CPU stall. Final
+  report1631B/88fd719f. This diagnostic does NOT supersede the a81b8962 failure,
+  prove a defect fixed or count as full native acceptance. A supplemental
+  read-only stack observer settled with0 matching slow probes and made0
+  privileged reads. No syscall cause established or new product fix claimed.
+- [x] The TWO original previously UNRUN shipping native cases BUILD and
+  sharing/origin-cancel settled DSR6f5d2cc8 SUCCESS0/630s, control38960B/5d883fa2,
+  private runtime rvr. Each runs once, fail-fast, same source/harness/profiles/
+  fullSDK/original assertions/clocks. The source-bound full1067 compiler gate
+  joined only for this explicit subset. BUILD1/1/zeroignored/411.8s includes
+  original archive replay/bytes and working delivered executable. Sharing1/1/
+  zeroignored/149.5s includes original origin-cancel/survivor working executable.
+  Both worker final receipts executed0/released/residual0, no observed owned
+  roles. Original frozen1758/SDK5256/tools/harness/
+  control aftermatch, compiler1067 joined. Final161231B/6cc1c016. Scoped subset
+  passedtrue, full shipping_native_gate_passed
+  remainsFALSE whatever this subset outcome; old-negative/failover remainheld.
+  No failed case is resampled. Supplemental ancestry/birth/exact-owned-binary
+  validated read-only observer settled with0 matching slow probes and0
+  privileged reads. It added no test, signal, policy change or acceptance credit.
+- [x] Preserve original f851 wrapper qualification DSRf1afc613
+  FAILED/native1/CLI6/772s, control10782B/486542d2. Full1769 tracked files including
+  Plan overlay, archive65341440B/aeba571c, separate immutable current-source root.
+  This contains peer bc535921 containment, previously four socket-dependent
+  tests blocked by executorEPERM. Build real production wrapper-release wrapper,
+  then same-profile cfg(test) binary. Execute ALL existing wrapper binary unit
+  cases including all six substantive panic tests and their driver, original
+  assertions/clocks, no skip. Protocol/compiler doubles remain explicitly such;
+  native Unix sockets/process exec/unwind proof is separate from real Cargo/TLS.
+  - [x] Actual production wrapper-release build0/32.92s, test compile0/47.81s.
+  - [x] ALL121 wrapper binary unit tests121/121/zeroignored/5.14s, including
+    all six substantive panic parents and helper driver. Four formerly
+    socket-EPERM-blocked cases executed on native Linux. Explicit protocol/
+    compiler doubles, native sockets/exec/unwind. Driver alone earns no credit.
+  - [x] Full current workspace fmt0/20.18s.
+  - [ ] Workspace alltargets checkFAILED101/642.90s, new native TLS helper
+    worker_transport.rs:1142 E0373, async block borrows inner-scope address.
+    StrictClippy UNRUN after failure. Original compiler failure preserved.
+  - [x] Full1769/compiler/control/tools afteraudit matched, observed residual0,
+    observer never truncated. Failed report20302B/b607d4b0 retained.
+  No old d4 receipts retagged, latest-main whole-system/daemon/fleet/speed/
+  installation/release claims remain open, shipping CHECK failure remainsred.
+- [x] Apply minimal one-word owned capture, run(async move {...}), to the
+  existing native TLS client helper. Source lease3360, compiler diagnostic is
+  the planted red. Preserve every original TLS assertion, enrollment/pin/CA/
+  ALPN positive and negative, original15s exchange budget and all production
+  transport code. Paired original native/compiler gates passed above.
+- [x] Paired native DSR rabs_wrapper_tls_capture SUCCESS, full1769/archive
+  65341440B/7ce350fd. Only worker_transport.rs and Plan differ from prioraeba,
+  other1767 source/config/manifest inputs exact. Control14016B/10fd0fa9,
+  private runtime rwt. Rebuild actual wrapper-release production/test binaries,
+  rerun ALL121 original wrapper tests, then ALL worker_transport tests including
+  real TCP mutualTLS with three native role-pin/ALPN/untrusted-CA tests and
+  fresh-process BOTH-provider checks. Test CA/identities remain explicit fixtures.
+  - [x] New wrapper production0/18.95s, test compile0/24.74s, identical121-name
+    inventory and actual121/121/zeroignored/5.09s, observed residual0.
+  - [x] Native transport test binary compile0/556.77s, unique complete17-name
+    worker_transport inventory and actual17/17/zeroignored/0.61s.
+  - [x] Full workspace fmt0/16.83s/check-alltargets0/647.98s/strictClippy0/
+    742.26s on repaired snapshot, -Dwarnings preserved.
+  - [x] Full1769/compiler/control/all3 binaries afteraudit, observed drain and
+    fresh self-verification. Qualified report28260B/236c9a40 collected by DSR.
+  UBS source-file scan0/0critical/159warnings/34info, including existing test
+  assertions/unwraps and heuristic stream-lifecycle/string-allocation findings.
+  This is a raw scanner success, not a warnings-clean or compiler pass.
+- [x] Read-only exact-ID additive Beads reconciliation plan examined. It refuses
+  12 conflicts, including ten comment-relation differences and two equal-time
+  scalar drifts. Canonical M6 currently250 comments versus local263, so a
+  source-authoritative relation replacement would lose13 local comments.
+  No mutation/applied plan/forced export. Original ambiguous-base conflict
+  remains unresolved and current comments stay local until a lossless merge.
+- [x] Corrected actual split-profile ALL7 producer terminalSUCCESS0/24s,
+  full1758/compiler/control10028B/682a9ec3 before/after match. Actual Cargo
+  wrapper2.80s/daemon1.38s are cached maintenance. Seven native artifacts have
+  exact expected wrapper(z/unwind/LTOoff) or daemon(3/unwind/thinLTO) profiles.
+  Observed TLS graph is AWS-LC in wrapper profile and Ring in daemon profile.
+- [x] Preserve eb55e52d attempt2 qualifierFAILED1/CLI6/498s even though BOTH
+  Cargo commands actually0,4.804s/477.044s. Source/compiler/control afteraudit
+  matched. Root's qualifier incorrectly required BOTH providers inside the
+  daemon graph. The canonical installer profile split emits AWS-LC wrapper and
+  Ring daemon graphs. Corrected gate accepts that exact observed split, rejects
+  six missing/wrong/mixed-provider variants; one formerly admitted dual-daemon
+  variant is now outside this exact shipping class. These are Cargo-record
+  counterexamples, no additional TLS runtime tests. Original generic combined-
+  provider runtime proofs remain separate. No product assertion, profile,
+  feature, source, runtime clock or release policy changed to pass this check.
+
+- [x] Shipping producer eb55e52d supported SAME-ID resume accepted, attempt2
+  settled as recorded above. Its attempt1 timed out at the original3600s native deadline,
+  CLI6/target5/3611s. Wrapper0/3.278s; daemon emitted actual rchd/rch-wkr/
+  rabs-wkr/rabs-cargo-root artifacts, rabsd still missing, whole Cargo daemon
+  exitUNKNOWN. No partial set was used for runtime. Full1758/control afteraudit
+  matched and no observed process retained the exact owned cwd/TMPDIR. Logs
+  preserved with -timeout-eb55e52d-attempt1 suffix and stable hashes/inodes;
+  scratch likewise renamed on the same filesystem. Source/config/control/
+  profiles/features/argv/jobs1 and per-native-attempt3600s remain identical.
+  The logical build spans multiple attempts; no build-within-one-hour or speed
+  claim. Every runtime Cargo300/helper600/loader5/SDK30min gate remains separate.
+- [x] Reviewed existing scripts/test_rabs_live.py uniform-profile contract.
+  Default daemon-release also applies to its Cargo-built wrapper. Its existing
+  Rust consumer requires that exact CARGO_BIN_EXE identity. Keep that contract
+  and its source/hash/jobserver/failure guards. Actual split shipping profiles
+  are covered by the separate producer and real cargo-rabs user-entry run above.
+  An additional runner mode is optional and would add orchestration complexity;
+  inspection earns no code or acceptance credit. No runner rewrite is planned.
 
 - [x] PROFILE QUALIFICATION CORRECTION. Root's earlier ALL7 producers used
   generic cargo --release, all opt-level=z/panic=abort. These are genuine
@@ -12,15 +179,30 @@
   (opt3/thinLTO/unwind). Source/runtime receipts remain unchanged, while shipping
   profile, panic containment, performance and complete-current-main claims stay
   open. This correction supersedes every broader historical profile label below.
-- [ ] Corrected SAME-d4 shipping-profile ALL7 DSR623a9408 RUNNING since05:12,
+- [x] Corrected SAME-d4 shipping-profile ALL7 compile chain settled after
+  cold623a9408 and eb55e52d attempt1 timed out,
   control7114B/
   301f30ec/dev49/inode14186202. Actual installer package/profile mapping,
   original manifest/pins/features/jobs1/DSR3600 retained. Require real Cargo
-  artifacts from their respective profile directories and BOTH TLS backends in
-  daemon roles. Existing generic outputs remain preserved. Wrapper compilation
-  is progressing at05:32, followed by daemon profile and actual normal CLI with
-  these new tools. Original combined3600s bound remains unchanged.
+  artifacts from their respective profile directories and exact observed
+  AWS-LC wrapper / Ring daemon split. The earlier BOTH-inside-daemon qualifier
+  was defective as corrected explicitly above. Existing generic outputs remain
+  preserved. Actual cargo-rabs front-door CHECK/CHECK/BUILD proof completed,
+  retaining every original
+  metadata/receipt/working-program predicate and complete SDK. Original combined
+  3600s build bound remains unchanged for the fresh invocation.
   Frozen source isolates the profile change; latest main changes stay separate.
+- [x] Preserve cold shipping-profile DSR623a9408 timeout, CLI6/target5/3611s.
+  Wrapper Cargo actually0/2763.2s, daemon unfinished/exitUNKNOWN, no complete
+  shipping report. No runtime dispatched from partial artifacts. Full1758 and
+  control7114B/301f30ec independently after-audited, no live process in prior
+  owned group2714548. Supported same-ID resumeCLI4 refused changed checkout
+  commit/output identity. Only own logs and scratch renamed on the same
+  filesystem to *.timeout-623a9408 and *-timeout-623a9408, original inodes and
+  file hashes retained. New invocation uses identical source/control/config/
+  commands/profiles/features/SDK/jobs1/3600 and existing Cargo cache. Cached
+  compilation gets no performance credit. One local recovery command had a
+  shell-quoting parse failure before any action; corrected heredoc executed.
 
 - [x] One predeclared process/signal/close_range syscall trace settled through
   DSR on TS2. ObserverSUCCESS0/396s, actual cold Rust caseFAILED101/0passed/
@@ -163,7 +345,7 @@
   frozen d4 and paired source-entry snapshots. No whole-current-main claim.
   M6 stays in progress. JSONL merge conflict remains, no forced export.
 
-These 05:12 results supersede the earlier pending markers below.
+These 08:24 results supersede the earlier pending markers below.
 
 - [x] Corrected d4 normalALL7/BOTH TLS DSR5fee2740 terminalSUCCESS0/1819s,
   actualCargo1785.5s. Full1758/control5616B/07d1116b aftermatch. Genuine new
