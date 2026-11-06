@@ -6836,7 +6836,10 @@ os.execv({python:?}, [{python:?}] + args)
         let refused = run(&policy, true);
         assert_eq!(refused.status.code(), Some(42));
         assert!(!elsewhere.is_symlink());
-        assert_eq!(std::fs::read(real_alias.join("keep")).unwrap(), b"unfinished\n");
+        assert_eq!(
+            std::fs::read(real_alias.join("keep")).unwrap(),
+            b"unfinished\n"
+        );
 
         // When the link cannot be made, refuse without minting a second tree:
         // a real directory here would turn this into a permanent conflict.

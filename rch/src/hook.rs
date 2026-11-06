@@ -6588,8 +6588,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed and no higher-capacity worker was available after {} attempt(s); surfacing exit {}",
-                    retry_budget.attempt,
-                    code
+                    retry_budget.attempt, code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
@@ -6627,8 +6626,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed (worker environment) and no other worker was available after {} attempt(s); surfacing exit {}",
-                    retry_budget.attempt,
-                    code
+                    retry_budget.attempt, code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
