@@ -2,7 +2,7 @@
 
 ## Reality check and execution order — updated November 4, 2026
 
-**Active qualification checkpoint, November6 at00:39UTC:**
+**Active qualification checkpoint, November6 at01:19UTC:**
 
 - [x] API repair committed as2d073769: only cfg(test), canonical disk-budget
   route and typed AllWorkersBusy plus exact disk_headroom_reserved diagnostic;
@@ -27,7 +27,7 @@
   2492 stdout bytes. Host timeout is uutils0.2.2; code assumed GNU. Subsequent
   fixed10 paired old/GNU probes ALL20passed; process/signal-traced50 ALLpassed.
   Specific uutils defect is UNPROVEN; no retry-to-green/native qualification.
-- [ ] New immutable500755cc source: parent4a3f plus ONLY manually edited
+- [x] Superseded immutable500755cc source: parent4a3f plus ONLY manually edited
   runtime_cohort.rs, all1758 files/tar64737280B. Direct owned ldd group,
   unreaped leader pins signal identity, nonblocking capped pipes, both EOFs
   inside unchanged5s, distinct actual nonzero/timeout errors. No dependency,
@@ -39,22 +39,43 @@
   ALL5 native scenarios ONLY; no actual native result yet. Full1758/control
   8359B/1218eb50 aftermatch; receipt33591B/265fa617. Code committed42950473 by
   user/peer; root did not commit/push. Raw UBS0critical/282warning/138info.
-- [ ] New5007 normalALL7/BOTH TLS DSR RUNNING since00:22UTC, control4824B/
-  cb8274db/dev49/inode14105198; normal profiles/pins/jobs1/3600s. ChangedRABS
-  closure requires genuinely rebuilt roles; no prior9ce1/3013/4a3f retag.
-- [ ] New5007 fullworkspace/ALL9 DSR dispatched00:37UTC, control9489B/48f07c59/
-  dev49/inode14138448; actualfmt0/21.4s, check/strictClippy/ALL1067 pending.
-  Full1758 predecessor audit, zeroownedprocesses, non-destructive retirement
-  to *-retired-4a3f-1067pass and full new5007 source audit before canonical
-  source-root reuse. Retired4a3f and every failure retained. Originalgates,
-  inventories/time/profile/identity and atomic terminal publication preserved.
-- [ ] Fresh5007 native5+oldnegative PREPARED34338B/f4df2add/dev49/inode14100838,
-  not dispatched. Requires COMPLETE newfullQA +normalALL7 +226/harness before
-  runtime; retain final fullgate checks and original3600s/SDK/case bounds.
+- [x] Superseded5007 normalALL7/BOTH TLS DSR SUCCESS0/1827s, actualCargo1812.2s,
+  control4824B/cb8274db/full1758 aftermatch. Compiler success does NOT overcome
+  the actual crash regression below. Do not deploy or retag these tools.
+- [x] Actual5007 owner-death diagnostic falsified that draft: both helpers
+  alive5.515s after owning Rust test SIGKILL. Only owned processes interrupted;
+  descendants cleaned via their held pidfds, all settled. Full1758/control/
+  genuine compiled libtest aftermatch. DSR0 is expected-negative diagnostic,
+  NOT a passing Rust test or product acceptance. Regression is root's own work.
+- [x] Cancelled only own superseded5007 QA through existing DSR supervisor
+  handler at01:05:44UTC: DSR169e3f33 terminal143/CLI6/1689s. Actualfmt0/21.4s,
+  workspacecheck0/916.5s/strictClippy0/716.5s; ALL9 suites UNRUN. Preserve all
+  logs and cancellation identity receipt. No peer signal or gate change.
+- [x] Withheld5007 native5+oldnegative (prepared34338B/f4df2add); NEVER dispatched
+  because owner-death regression disqualifies it. Earlier proofs remain scoped.
+- [x] Corrected immutable d4ec1bb8 source, all1758/tar64737280B: ONLY two files
+  differ from5007, runtime_cohort.rs and GNU prerequisite documentation.
+  Independent capability-checked GNU watchdog restored, existing gnutimeout
+  preferred; original total5s includes discovery, native64KiB/bothEOF retained.
+  No dependency, installed utility, kernel, global policy, deadline change.
+  User/peer commits383e8323/8d17703e; root did not stage/commit/push.
+- [x] Newd4 runtime-cohort actual32/32/zeroignored,17.8s; entire194 worker/SDK
+  and genuine new5-case harness qualification still RUNNING through DSR.
+- [ ] Actual d4 owner-death POSITIVE required before expensive builds. First
+  diagnostic DSR81a17912 failed setup: hashing129MB parent executable consumed
+  original1s unit pause; owner was NOT killed, actual test settled1/1. Full
+  source/control/bin aftermatch; no crash proof claimed. Corrected controller
+  pins exact owned executable inode before SIGKILL and hashes its held handle
+  afterward; allTHREE watchdog/shell/sleep pidfds must exit without manual
+  cleanup within original5s. Same source/test/timebound, first failure retained.
+- [ ] Genuine d4 normalALL7/BOTH TLS +fullworkspace/ALL9 +fresh native5/oldnegative
+  remain required; old5007/3013/4a3f tools and results will not be relabeled.
+  Native requires COMPLETE newfullQA +normalALL7 +226/harness +positivecrash;
+  retain final fullgate checks and original3600s/SDK/case bounds.
   Service/CHECK/BUILD/sharing all must pass, oldB1 must fail precise reconnect
   assertion; setup/loader/timeout failure cannot satisfy that negative. This
   sequential schedule removes our own compiler contention without claiming
-  no peer load or absent swap. Codelease2533 released; only Planlease1771 held.
+  no peer load or absent swap. Plan/runtime/docs leases1771/2601/2602 held.
 - [x] Preserve prior fullQA143565f7 FAILURE: first8 suites784/784; API280passed/
   3failed/zeroignored. Two literal route mismatches, one human-message assertion
   contradicted existing typed busy/structured reserved-headroom contract.
