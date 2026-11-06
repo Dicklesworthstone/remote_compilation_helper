@@ -35,6 +35,12 @@ MAX_RECEIPT_BYTES = 8192
 # scan. Oversized or changing trees still receive the ordinary disk guards;
 # they simply cannot attest a smaller, pool-dependent reservation.
 MAX_INCREMENTAL_ENTRIES = 100_000
+# A worker's shared Cargo cache can hold 600,000 entries, and one cold walk took
+# 30 seconds on an idle worker. Every build walks its outputs each SCAN_INTERVAL
+# under SCAN_DEADLINE, so walking a cache that size stops builds on a busy worker
+# and exhausts the entries above. Past this bound the cache keeps its reservation
+# and floor protection, but its existing and new bytes are not charged to a build.
+MAX_WALKED_CACHE_ENTRIES = 25_000
 DISK_MARKER_SUFFIX = "_DISK_BUDGET:"
 
 
@@ -301,6 +307,25 @@ def prepare_cargo_cache_roots(plan):
     return list(dict.fromkeys(aliases.values())), aliases
 
 
+def cache_walk_is_bounded(roots):
+    """Stop counting at the bound, so a large cache costs one small walk per build."""
+    entries, visited, pending = 0, set(), list(roots)
+    while pending:
+        path = pending.pop()
+        # Roots nest, and each directory's entries count only once.
+        if path in visited:
+            continue
+        visited.add(path)
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError), os.scandir(path) as listing:
+            for entry in listing:
+                entries += 1
+                if entries > MAX_WALKED_CACHE_ENTRIES:
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+    return True
+
+
 def verify_cargo_cache_bindings(aliases):
     for logical, physical in aliases.items():
         if os.path.realpath(logical) != physical:
@@ -529,10 +554,11 @@ class Monitor:
         self.target = target
         self.boot, self.group = boot_identity(), os.getpgrp()
         cache_outputs, self.cargo_cache_bindings = prepare_cargo_cache_roots(cargo_cache)
-        self.outputs = list(dict.fromkeys([target] + (outputs or []) + cache_outputs))
+        walked_cache = cache_outputs if cache_walk_is_bounded(cache_outputs) else []
+        self.outputs = list(dict.fromkeys([target] + (outputs or []) + walked_cache))
         # Every managed output volume needs both a reservation and ongoing
         # floor protection, even when a caller omitted it from its probe list.
-        self.paths = list(dict.fromkeys(paths + [target] + self.outputs))
+        self.paths = list(dict.fromkeys(paths + [target] + self.outputs + cache_outputs))
         self.bindings = output_bindings(self.outputs)
         if self.group <= 1:
             raise BudgetFailure("monitor_unavailable", detail="build has no isolated process group")

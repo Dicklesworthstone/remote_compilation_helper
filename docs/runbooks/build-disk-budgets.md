@@ -257,6 +257,15 @@ learning receipt; a larger cold allowance cannot resolve an unknown output
 scope. Cache preparation creates only the bounded home/registry/git
 directories; their parent trees must already exist.
 
+Each build walks its outputs every two seconds, and a walk that outlives its
+30-second deadline stops the build. A shared cache past 25,000 entries is
+therefore left out of that walk: one holding 600,000 entries took 30 seconds to
+walk cold on an idle worker. Such a cache still participates in reservation and
+floor checks, and its redirects are still verified, but its bytes are neither
+charged to the build nor held against a warm admission. New downloads into it
+are bounded by the free-space floor rather than by the growth budget, and a
+usage receipt's peak growth omits them.
+
 Direct `rch-wkr execute` remains cold-only and rejects conditional warm
 budgets. Its existing inherited Cargo/Rustup home probes protect filesystem
 floors, but do not provide the dispatcher's cache-output attribution or resolve

@@ -261,6 +261,47 @@ class DiskMonitorTests(unittest.TestCase):
         self.assertLess(value.peak_growth, 3 * MIB)
         self.assertIsNotNone(value.admitted_pool)
 
+    def cargo_cache_monitor(self, budget):
+        base = self.root / "worker cache base"
+        plan = {"name": "rch-cargo-cache-worker", "additional_home": None, "verified": True}
+        with patch.dict(os.environ, {"RCH_CH_BASE": str(base)}):
+            return monitor.Monitor(budget, MIB, str(self.target), [str(self.target)], cargo_cache=plan)
+
+    def test_cargo_cache_beyond_the_walk_bound_is_protected_but_not_walked(self):
+        (self.target / "retained").write_bytes(os.urandom(4 * MIB))
+        cache, roots, _ = self.cargo_cache_roots()
+        for index in range(6):
+            (cache / "registry" / str(index)).write_bytes(os.urandom(MIB))
+        with patch.object(monitor, "MAX_WALKED_CACHE_ENTRIES", 5):
+            value = self.cargo_cache_monitor(4 * MIB)
+        self.assertEqual(value.outputs, [str(self.target)])
+        self.assertLessEqual(set(roots), set(value.paths))
+        self.assertLess(value.baseline, 5 * MIB)
+        # Walked, these 6 MiB would force cold readmission of a 4 MiB budget.
+        value.require_warm_pool(self.measured_policy(value))
+        self.assertIsNotNone(value.admitted_pool)
+
+    def test_cargo_cache_within_the_walk_bound_is_charged_to_the_build(self):
+        (self.target / "retained").write_bytes(os.urandom(4 * MIB))
+        cache, roots, _ = self.cargo_cache_roots()
+        (cache / "registry" / "retained").write_bytes(os.urandom(5 * MIB))
+        value = self.cargo_cache_monitor(4 * MIB)
+        self.assertLessEqual(set(roots), set(value.outputs))
+        self.assertGreaterEqual(value.baseline, 5 * MIB)
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            value.require_warm_pool(self.measured_policy(value))
+        self.assertEqual(caught.exception.reason, "cold_required")
+
+    def test_cargo_cache_walk_bound_counts_entries_under_nested_roots_once(self):
+        cache, roots, _ = self.cargo_cache_roots()
+        for index in range(3):
+            (cache / "registry" / str(index)).write_bytes(b"x")
+        # registry, git, and three files, although three roots overlap.
+        with patch.object(monitor, "MAX_WALKED_CACHE_ENTRIES", 5):
+            self.assertTrue(monitor.cache_walk_is_bounded(roots))
+        with patch.object(monitor, "MAX_WALKED_CACHE_ENTRIES", 4):
+            self.assertFalse(monitor.cache_walk_is_bounded(roots))
+
     def test_cargo_cache_explicit_home_and_registry_git_redirects_are_bound(self):
         base = self.root / "worker cache base"
         cache = base / "rch-cargo-cache-worker"
