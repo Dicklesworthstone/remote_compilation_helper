@@ -313,6 +313,18 @@ a remote collection batch finished: an interrupted `--apply` batch is reported
 as having an unknown outcome, alongside confirmed earlier batches. The default
 invocation remains a preview.
 
+`rch cache status` also scans workers concurrently, with one 15-minute deadline
+and a 10 MiB output budget per worker across all roots. Set
+`rch cache status --worker-timeout=120` to shorten the deadline. Completed
+workers and roots remain in the report if another scan fails; a timeout exits
+nonzero, with one final JSON/TOON error response retaining those results.
+
+Windows cache status and GC inspect the same `C:/rch` base as the tar transport,
+plus the worker's resolved Cargo cache root. Every Windows directory remains
+kept until native process/handle ownership checks are available; `--apply`
+reports an explicit refusal. See [Windows cache inventory](docs/runbooks/worker-recovery.md#inspecting-windows-build-and-cargo-caches)
+for additional roots and incomplete-scan behavior.
+
 Capability refreshes skip duplicate requests for a worker while its probe is
 running. Workers reuse verified Rustup inventory across requests and invalidate
 entries when installed toolchains or component metadata change. Inventory runs
