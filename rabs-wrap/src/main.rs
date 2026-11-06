@@ -1161,7 +1161,6 @@ fn forward_compiler_bytes(sink: &mut impl Write, bytes: &[u8]) -> io::Result<()>
     }
 }
 
-const COMPILER_POLL: Duration = Duration::from_millis(20);
 /// This starts only AFTER the supervised compiler has stopped. It does not
 /// impose a new runtime limit on a healthy, still-executing compiler.
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
@@ -1215,6 +1214,7 @@ fn collect_compiler_output(
     let mut drain_deadline = None;
     let mut out = None;
     let mut err = None;
+    let started = Instant::now();
     loop {
         if !owned() {
             return Err(io::Error::other("original compiler caller disappeared"));
@@ -1250,8 +1250,9 @@ fn collect_compiler_output(
                 });
             }
         }
-        let pause = drain_deadline.map_or(COMPILER_POLL, |deadline| {
-            COMPILER_POLL.min(deadline.saturating_duration_since(Instant::now()))
+        let poll = supervision::poll_interval(started.elapsed());
+        let pause = drain_deadline.map_or(poll, |deadline| {
+            poll.min(deadline.saturating_duration_since(Instant::now()))
         });
         std::thread::sleep(pause);
     }
