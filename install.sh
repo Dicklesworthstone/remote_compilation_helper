@@ -653,11 +653,45 @@ create_directories() {
     success "Directories created"
 }
 
+validate_binary_source() {
+    local source_path="$1"
+    if [[ ! -f "$source_path" || -L "$source_path" || ! -s "$source_path" ||
+          ! -r "$source_path" || ! -x "$source_path" ]]; then
+        error "Unusable binary $source_path: expected a nonempty, readable executable regular file, not a symlink"
+        return 1
+    fi
+}
+
+# Validate the entire selected toolset before replacing the daemon, worker or
+# client, or activating an optional RABS generation. A malformed release must
+# not leave a newer daemon beside the old client that still needs to drain it.
+validate_archive_binaries() {
+    local archive_dir="$1"
+    local binary source_path
+    local binaries=("$WORKER_BIN")
+    if [[ "$MODE" != "worker" ]]; then
+        binaries=("$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN")
+    fi
+    for binary in "${binaries[@]}"; do
+        source_path="$archive_dir/$binary"
+        if [[ "$MODE" != "worker" && "$binary" == "$WORKER_BIN" &&
+              "${RCH_SKIP_FLEET_SYNC:-}" == "1" &&
+              ! -e "$source_path" && ! -L "$source_path" ]]; then
+            continue
+        fi
+        if ! validate_binary_source "$source_path"; then
+            error "RCH archive validation failed for $binary; installation refused before replacing binaries"
+            return 1
+        fi
+    done
+}
+
 install_binary_file() {
     local source_path="$1"
     local dest_path="$2"
     local temp_path="${dest_path}.tmp.$$"
 
+    validate_binary_source "$source_path" || return 1
     install -m 755 "$source_path" "$temp_path" || return 1
 
     if [[ "$dest_path" == "$INSTALL_DIR/$HOOK_BIN" &&
@@ -1013,6 +1047,7 @@ download_binaries() {
         fi
     fi
 
+    validate_archive_binaries "$TEMP_DIR" || return 1
     install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$TEMP_DIR/$asset_name"
 
     if [[ "$MODE" == "worker" ]]; then
@@ -1031,12 +1066,11 @@ download_binaries() {
             if [[ -f "$TEMP_DIR/$binary" ]]; then
                 install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary" || return 1
                 success "Installed $binary"
+            elif [[ "$binary" == "$WORKER_BIN" && "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
+                warn "Worker binary not in release (fleet sync disabled)"
             else
-                warn "$binary not in release"
-                info "Falling back to building from source..."
-                rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-                clone_and_build_from_source
-                return
+                error "Validated binary disappeared from release: $binary; installation stopped"
+                return 1
             fi
         done
     fi
@@ -1820,12 +1854,19 @@ install_from_tarball() {
 
     # Extract tarball
     if $USE_GUM; then
-        spin "Extracting tarball..." tar -xzf "$tarball" -C "$TEMP_DIR"
+        if ! spin "Extracting tarball..." tar -xzf "$tarball" -C "$TEMP_DIR"; then
+            error "Offline tarball extraction failed; existing binaries were not replaced"
+            return 1
+        fi
     else
         info "Extracting tarball..."
-        tar -xzf "$tarball" -C "$TEMP_DIR"
+        if ! tar -xzf "$tarball" -C "$TEMP_DIR"; then
+            error "Offline tarball extraction failed; existing binaries were not replaced"
+            return 1
+        fi
     fi
 
+    validate_archive_binaries "$TEMP_DIR" || return 1
     install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$tarball"
 
     # Install binaries from tarball
@@ -1848,7 +1889,8 @@ install_from_tarball() {
                     die "Worker binary not found in tarball (required for fleet deploy)"
                 fi
             else
-                warn "$binary not found in tarball"
+                error "Validated binary disappeared from tarball: $binary; installation stopped"
+                return 1
             fi
         done
     fi

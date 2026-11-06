@@ -7,6 +7,7 @@ manager, worker, download, installed binary, or user home is modified.
 """
 
 import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -231,6 +232,202 @@ class InstallerDaemonUpgradeTests(unittest.TestCase):
                 destination.write_bytes((self.bundle / name).read_bytes())
                 destination.chmod(0o755)
         self.env["CARGO_TARGET_DIR"] = str(target)
+
+    def preserve_installed_binaries(self):
+        for name in ("rchd", "rch-wkr"):
+            path = self.case / name
+            path.write_bytes(f"existing {name}\n".encode())
+            path.chmod(0o755)
+        return {name: ((self.case / name).stat().st_ino,
+                       (self.case / name).read_bytes())
+                for name in ("rch", "rchd", "rch-wkr")}
+
+    def assert_installed_binaries_preserved(self, original):
+        for name, identity in original.items():
+            self.assertEqual(((self.case / name).stat().st_ino,
+                              (self.case / name).read_bytes()), identity, name)
+        self.assertEqual(self.generation.read_text(), "legacy\n")
+        self.assertFalse(any("rch daemon " in event for event in self.events()))
+        self.assert_no_supervisor_mutation()
+
+    def archive_case(self, label, omit=(), replacement=None):
+        # Every case gets a fresh extraction directory. Retaining the prior
+        # case must not accidentally supply a member absent from this archive.
+        extract = self.case / f"extracted-{label}"
+        extract.mkdir()
+        self.env["RCH_TEST_EXTRACT"] = str(extract)
+        archive = self.case / f"release-{label}.tar.gz"
+        with tarfile.open(archive, "w:gz") as output:
+            for path in self.bundle.iterdir():
+                if (path.name not in omit
+                        and (replacement is None or path.name != replacement[0].name)):
+                    output.add(path, arcname=path.name)
+            if replacement is not None:
+                member, payload = replacement
+                output.addfile(member, io.BytesIO(payload))
+        return archive
+
+    def test_incomplete_offline_archive_preserves_every_installed_binary(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        for name in ("rch", "rchd", "rch-wkr"):
+            with self.subTest(missing=name):
+                archive = self.archive_case(f"missing-{name}", omit=(name,))
+                result = self.run_installer(
+                    REAL_INSTALL_HELPERS + '\n'
+                    'install_rabs_toolset() { trace UNEXPECTED-rabs-install; }\n'
+                    'install_from_tarball "$RCH_TEST_ARCHIVE"\n',
+                    RCH_TEST_ARCHIVE=str(archive),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stderr)
+                self.assertNotIn("Offline installation complete", result.stdout)
+                self.assert_installed_binaries_preserved(original)
+
+    def test_unusable_archive_member_is_refused_before_any_binary_replacement(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        outside = self.case / "outside-executable"
+        outside.write_bytes(b"outside archive; must remain unchanged\n")
+        outside.chmod(0o755)
+        for kind in ("symlink", "directory", "fifo", "empty", "not-executable"):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo("rch")
+                member.mode = 0o755
+                payload = b""
+                if kind == "symlink":
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = str(outside)
+                elif kind == "directory":
+                    member.type = tarfile.DIRTYPE
+                elif kind == "fifo":
+                    member.type = tarfile.FIFOTYPE
+                elif kind == "not-executable":
+                    payload = (self.bundle / "rch").read_bytes()
+                    member.size = len(payload)
+                    member.mode = 0o644
+                archive = self.archive_case(kind, replacement=(member, payload))
+                result = self.run_installer(
+                    REAL_INSTALL_HELPERS + '\n'
+                    'install_rabs_toolset() { trace UNEXPECTED-rabs-install; }\n'
+                    'install_from_tarball "$RCH_TEST_ARCHIVE"\n',
+                    RCH_TEST_ARCHIVE=str(archive),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("rch", result.stderr)
+                self.assert_installed_binaries_preserved(original)
+                self.assertEqual(outside.read_bytes(), b"outside archive; must remain unchanged\n")
+
+    def test_failed_extraction_cannot_install_when_caller_checks_the_result(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        corrupt = self.case / "truncated.tar.gz"
+        # Lose the gzip trailer after all members, so extraction can leave a
+        # complete-looking directory while still reporting a real read error.
+        corrupt.write_bytes(self.tarball.read_bytes()[:-8])
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\n'
+            'install_rabs_toolset() { trace UNEXPECTED-rabs-install; }\n'
+            'if install_from_tarball "$RCH_TEST_ARCHIVE"; then\n'
+            '  trace UNEXPECTED-install-success\n'
+            'else\n'
+            '  trace extraction-refused\n'
+            'fi\n',
+            RCH_TEST_ARCHIVE=str(corrupt),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("extraction-refused", self.events())
+        self.assert_installed_binaries_preserved(original)
+
+    def test_offline_local_install_allows_absent_worker_only_with_fleet_skip(self):
+        self.prepare_upgrade()
+        worker = self.case / "rch-wkr"
+        worker.write_bytes(b"existing worker must remain available\n")
+        worker.chmod(0o755)
+        archive = self.archive_case("no-worker", omit=("rch-wkr",))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n'
+            'restart_daemon_if_needed\n',
+            RCH_TEST_ARCHIVE=str(archive), RCH_SKIP_FLEET_SYNC="1",
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+        self.assertEqual(worker.read_bytes(), b"existing worker must remain available\n")
+
+    def test_worker_install_still_requires_worker_when_fleet_sync_is_disabled(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        archive = self.archive_case("worker-missing", omit=("rch-wkr",))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\nMODE=worker\n'
+            'install_rabs_toolset() { trace UNEXPECTED-rabs-install; }\n'
+            'install_from_tarball "$RCH_TEST_ARCHIVE"\n',
+            RCH_TEST_ARCHIVE=str(archive), RCH_SKIP_FLEET_SYNC="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rch-wkr", result.stderr)
+        self.assert_installed_binaries_preserved(original)
+
+    def test_fleet_skip_does_not_admit_an_invalid_worker_member(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        member = tarfile.TarInfo("rch-wkr")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "missing-worker-target"
+        archive = self.archive_case("dangling-worker", replacement=(member, b""))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ninstall_from_tarball "$RCH_TEST_ARCHIVE"\n',
+            RCH_TEST_ARCHIVE=str(archive), RCH_SKIP_FLEET_SYNC="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rch-wkr", result.stderr)
+        self.assert_installed_binaries_preserved(original)
+
+    def test_worker_only_archive_does_not_require_or_replace_dispatcher_binaries(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        archive = self.archive_case("worker-only", omit=("rch", "rchd"))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\nMODE=worker\n'
+            'install_from_tarball "$RCH_TEST_ARCHIVE"\n',
+            RCH_TEST_ARCHIVE=str(archive),
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual((self.case / "rch-wkr").read_bytes(),
+                         (self.bundle / "rch-wkr").read_bytes())
+        self.assert_installed_binaries_preserved(
+            {name: identity for name, identity in original.items() if name != "rch-wkr"})
+
+    def test_incomplete_download_refuses_before_replacement_or_source_fallback(self):
+        self.prepare_upgrade()
+        original = self.preserve_installed_binaries()
+        archive = self.archive_case("download-no-hook", omit=("rch",))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + r'''
+VERSION=2.1.35
+RELEASE_ARCHIVE_EXT=tar.gz
+RELEASE_TARGETS=(fixture-linux)
+TARGET=fixture-linux
+install_rabs_toolset() { trace UNEXPECTED-rabs-install; }
+clone_and_build_from_source() { trace UNEXPECTED-source-fallback; return 1; }
+curl() {
+    [[ $# == 4 && "$1" == -fsSL && "$3" == -o ]] || return 97
+    case "$2" in
+        */rch-v2.1.35-fixture-linux.tar.gz)
+            cp "$RCH_TEST_ARCHIVE" "$4" ;;
+        */rch-v2.1.35-fixture-linux.tar.gz.sha256)
+            printf '%s  %s\n' "$RCH_TEST_CHECKSUM" rch-v2.1.35-fixture-linux.tar.gz > "$4" ;;
+        *) return 96 ;;
+    esac
+}
+download_binaries
+''',
+            RCH_TEST_ARCHIVE=str(archive),
+            RCH_TEST_CHECKSUM=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rch", result.stderr)
+        self.assert_installed_binaries_preserved(original)
 
     def test_offline_upgrade_uses_existing_client_before_replacing_it(self):
         self.prepare_upgrade()
