@@ -119,11 +119,16 @@ pub(super) fn outcome(
         "{{\"kind\":\"rustc-remote-accept\",\"remote_protocol\":1,\"action_key\":{}}}\n",
         json_string(key),
     );
+    // Private remote execution is already an external effect. A panic cannot
+    // infer that it stopped merely because this subscriber's socket unwound.
+    reader.get_ref().panic_fence.forbid_retry();
     if singleflight::write_owned(&mut reader, accepted.as_bytes(), deadline, owned).is_err() {
         return Ok(Live::FailClosed(
             "RABS remote execution acceptance is uncertain".into(),
         ));
     }
+    #[cfg(test)]
+    panic_fixture("remote-consent");
     let line =
         match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned) {
             Ok(line) => line,
@@ -467,6 +472,7 @@ mod tests {
         let reader = BufReader::new(ConsultStream {
             stream: client,
             deadline: Instant::now() + Duration::from_secs(5),
+            panic_fence: PanicFence::default(),
         });
         let result = outcome(&offer, reader, &|| true).unwrap();
         (result, daemon.join().unwrap())

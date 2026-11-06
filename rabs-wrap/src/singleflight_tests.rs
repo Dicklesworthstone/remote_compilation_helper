@@ -24,6 +24,7 @@ fn reader(stream: UnixStream) -> BufReader<ConsultStream> {
     BufReader::new(ConsultStream {
         stream,
         deadline: Instant::now() + Duration::from_secs(2),
+        panic_fence: PanicFence::default(),
     })
 }
 
@@ -724,8 +725,10 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
     let mut settings = policy(70);
     settings.budget = Duration::from_secs(8);
     settings.preparation_budget = Duration::from_secs(8);
+    let first = reader(client);
+    let panic_fence = first.get_ref().panic_fence.clone();
     let result = read_with_policy(
-        reader(client),
+        first,
         "original bytes",
         Duration::from_secs(1),
         true,
@@ -734,5 +737,10 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         &|| true,
     );
     assert!(matches!(result, Ok(Live::Execute { .. })));
+    assert_eq!(
+        panic_fence.state.load(Ordering::SeqCst),
+        PanicFence::RETRY_FORBIDDEN,
+        "execution accepted on the replacement socket must fence the original invocation"
+    );
     daemon.join().unwrap();
 }

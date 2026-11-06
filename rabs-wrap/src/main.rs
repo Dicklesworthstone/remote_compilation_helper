@@ -47,7 +47,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// Minimal JSON string encoder (quotes + escapes; no serde by design).
@@ -517,6 +520,72 @@ const HELLO: &str = "{\"kind\":\"hello\",\
 /// to grow the wrapper's allocation indefinitely before sending one.
 const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
+/// An unwind must not turn accepted work into an unrelated compiler retry.
+/// This fence belongs to the whole wrapper invocation, including reconnects
+/// and breaker bookkeeping after a response. Once set, it never reopens.
+/// Explicit, successfully parsed writer-return/settlement replies retain their
+/// existing normal fallback path; an unexpected panic gains no such authority.
+#[derive(Clone, Default)]
+struct PanicFence {
+    state: Arc<AtomicU8>,
+}
+
+impl PanicFence {
+    const RETRY_FORBIDDEN: u8 = 1;
+    const PANIC_RECORDED: u8 = 2;
+
+    fn forbid_retry(&self) {
+        self.state.fetch_or(Self::RETRY_FORBIDDEN, Ordering::SeqCst);
+    }
+
+    fn install_recording_hook(&self) {
+        let state = Arc::clone(&self.state);
+        // The hook also covers relay threads. Recording one bounded fact
+        // requires no allocation, lock or Cargo-visible write during a panic.
+        // A failed relay still disconnects its completion channel normally.
+        std::panic::set_hook(Box::new(move |_| {
+            state.fetch_or(Self::PANIC_RECORDED, Ordering::SeqCst);
+        }));
+    }
+
+    fn permits_panic_retry(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == Self::PANIC_RECORDED
+    }
+}
+
+// Fault injection exists only in the Rust test executable. Shipping wrappers
+// do not recognize a fault environment or expose an injection command.
+#[cfg(test)]
+std::thread_local! {
+    static PANIC_FIXTURE_SITE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static PANIC_FIXTURE_CALLER_LOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn panic_fixture_selected(site: &str) -> bool {
+    PANIC_FIXTURE_SITE.with(|selected| selected.get() == Some(site))
+}
+
+#[cfg(test)]
+fn inject_panic_fixture(site: &str) -> ! {
+    let marker = std::env::var_os("RABS_PANIC_FAULT_MARKER").expect("fault marker configured");
+    std::fs::write(marker, site).expect("fault site recorded");
+    panic!("explicit wrapper panic fixture at {site}");
+}
+
+#[cfg(test)]
+fn panic_fixture(site: &str) {
+    if site == "before-consult" && panic_fixture_selected("caller-lost") {
+        // This is an explicit lost-caller oracle, not evidence of real procfs
+        // identity support on the host executing the regression.
+        PANIC_FIXTURE_CALLER_LOST.set(true);
+        inject_panic_fixture("caller-lost");
+    }
+    if panic_fixture_selected(site) {
+        inject_panic_fixture(site);
+    }
+}
+
 /// A socket timeout is an idle timeout for ONE system call. A peer that
 /// trickles bytes can therefore keep `read_line`/`write_all` alive forever
 /// if each call gets the original budget. Both handshake and decision,
@@ -524,6 +593,7 @@ const MAX_REPLY_BYTES: u64 = 64 * 1024;
 struct ConsultStream {
     stream: UnixStream,
     deadline: Instant,
+    panic_fence: PanicFence,
 }
 
 impl ConsultStream {
@@ -642,6 +712,10 @@ fn live_decision_timeout_ms(breaker_budget_ms: u32) -> u32 {
 /// caller was captured, however, losing that exact birth identity is terminal.
 /// Never recapture a reparented wrapper as a new, apparently healthy request.
 fn caller_still_owned(owner: Option<supervision::Owner>) -> bool {
+    #[cfg(test)]
+    if PANIC_FIXTURE_CALLER_LOST.get() {
+        return false;
+    }
     owner.is_none_or(supervision::Owner::can_acknowledge_capture)
 }
 
@@ -684,6 +758,8 @@ fn live_outcome(
             "original compiler caller disappeared".into(),
         ));
     }
+    #[cfg(test)]
+    panic_fixture("before-decision");
     match reply.get("decision").and_then(reply_json::Value::as_str) {
         Some("pass-through") => Ok(Live::PassThrough),
         Some("execute") => {
@@ -705,6 +781,9 @@ fn live_outcome(
                 })
                 .collect::<Option<Vec<_>>>()
                 .ok_or(())?;
+            reader.get_ref().panic_fence.forbid_retry();
+            #[cfg(test)]
+            panic_fixture("local-execute-grant");
             Ok(Live::Execute {
                 session: Box::new(reader),
                 attempt: attempt.to_owned(),
@@ -810,6 +889,7 @@ fn consult(
     decision_timeout_ms: u32,
     args: &[String],
     owned: &impl Fn() -> bool,
+    panic_fence: &PanicFence,
 ) -> Result<Live, ()> {
     if !owned() {
         return Err(());
@@ -833,7 +913,11 @@ fn consult(
         decision_timeout_ms
     }));
     let deadline = Instant::now().checked_add(budget).ok_or(())?;
-    let mut reader = BufReader::new(ConsultStream { stream, deadline });
+    let mut reader = BufReader::new(ConsultStream {
+        stream,
+        deadline,
+        panic_fence: panic_fence.clone(),
+    });
 
     singleflight::write_owned(&mut reader, HELLO.as_bytes(), deadline, owned).map_err(|_| ())?;
     singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
@@ -914,6 +998,7 @@ fn observe_with_breaker(
     path: &str,
     args: &[String],
     owner: Option<supervision::Owner>,
+    panic_fence: &PanicFence,
 ) -> Live {
     let owned = || caller_still_owned(owner);
     if !owned() {
@@ -968,7 +1053,10 @@ fn observe_with_breaker(
         decision_timeout_ms,
         args,
         &owned,
+        panic_fence,
     );
+    #[cfg(test)]
+    panic_fixture("after-consult");
     // A metadata writer can still be blocked on Cargo's stderr pipe. Neither
     // cancellation reporting nor breaker bookkeeping may turn this into a
     // fresh stderr write or a compiler retry.
@@ -1220,6 +1308,9 @@ fn run_attempt(
     env: &[(String, String)],
     owner: supervision::Owner,
 ) -> ! {
+    // This stays set even if spawn fails: only the explicit, known-unstarted
+    // error branch below may choose the original compiler after admission.
+    session.get_ref().panic_fence.forbid_retry();
     let mut child = match supervision::spawn(real_rustc, argv0, args, env, owner) {
         Ok(child) => child,
         Err(_) => {
@@ -1319,11 +1410,60 @@ fn main() {
         std::process::exit(2);
     };
     let args: Vec<OsString> = argv.collect();
+    run_wrapper(&real_rustc, &args);
+}
+
+/// Keep optional wrapper failures out of Cargo's diagnostic stream. The real
+/// compiler invocation is retained outside the unwind boundary byte-for-byte;
+/// a panic before any authority/exposure runs that exact original chain. An
+/// accepted operation, lost original caller, or uncertain ownership check
+/// instead exits silently, including when a relay still holds stderr's lock.
+fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
+    if is_probe(args) {
+        exec_compiler(real_rustc, real_rustc, args);
+    }
+    let panic_fence = PanicFence::default();
+    panic_fence.install_recording_hook();
+    // Capture once, before optional work. An incomplete capture is distinct
+    // from a completed, unsupported capture: a panic cannot adopt a new
+    // parent or treat uncertainty as permission to run another compiler.
+    let original_owner = std::cell::Cell::new(None);
+    let outcome: Result<(), _> = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        panic_fixture("owner-capture");
+        let owner = supervision::Owner::capture().ok();
+        original_owner.set(Some(owner));
+        run_wrapper_inner(real_rustc, args, owner, &panic_fence);
+    }));
+    let ownership = if outcome.is_err() && panic_fence.permits_panic_retry() {
+        original_owner
+            .get()
+            .map(|owner| catch_unwind(AssertUnwindSafe(|| caller_still_owned(owner))))
+    } else {
+        None
+    };
+    if matches!(ownership.as_ref(), Some(Ok(true))) {
+        exec_compiler(real_rustc, real_rustc, args);
+    }
+    // Do not print, join relays, or drop an arbitrary panic payload here.
+    // Process exit releases the socket and lets the existing compiler guard
+    // settle any owned group; it never starts a replacement compiler.
+    std::process::exit(1);
+}
+
+fn run_wrapper_inner(
+    real_rustc: &OsStr,
+    args: &[OsString],
+    owner: Option<supervision::Owner>,
+    panic_fence: &PanicFence,
+) -> ! {
+    #[cfg(test)]
+    panic_fixture("before-consult");
 
     // Probes and unrepresentable argv: no state, no socket, no consult.
-    let observation = shadow_argv(&real_rustc, &args).and_then(|mut argv| {
+    let observation = shadow_argv(real_rustc, args).and_then(|mut argv| {
         let selected = compiler_for_observation(
-            &real_rustc,
+            real_rustc,
             std::env::var_os("PATH").as_deref(),
             &std::env::current_dir().ok()?,
         )?;
@@ -1331,14 +1471,19 @@ fn main() {
         Some((selected, argv))
     });
     if let Some((selected, consult_argv)) = observation {
-        let owner = supervision::Owner::capture().ok();
         stop_if_caller_lost(owner);
         // Name the selected executable before every original rustc argument.
         // The daemon stats this absolute path for toolchain identity. The
         // guard separately preserves Cargo's original argv[0] when executing
         // that selected file. Sending only the rustc arguments would leave
         // the daemon statting `--crate-name` and mislabeling receipts.
-        let decision = observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv, owner);
+        let decision = observe_with_breaker(
+            &socket_path(),
+            &breaker_path(),
+            &consult_argv,
+            owner,
+            panic_fence,
+        );
         if matches!(decision, Live::FailClosedSilently) {
             std::process::exit(1);
         }
@@ -1348,6 +1493,7 @@ fn main() {
         match decision {
             Live::PassThrough => {}
             Live::Served(stderr) => {
+                panic_fence.forbid_retry();
                 // The daemon installed and verified every declared output;
                 // this is the compiler's exact transcript for this out-dir.
                 let mut sink = io::stderr();
@@ -1362,10 +1508,11 @@ fn main() {
                 env,
             } => {
                 if let Some(owner) = owner {
+                    panic_fence.forbid_retry();
                     run_attempt(
                         selected.as_os_str(),
-                        &real_rustc,
-                        &args,
+                        real_rustc,
+                        args,
                         *session,
                         &attempt,
                         &env,
@@ -1376,6 +1523,7 @@ fn main() {
                 // normally. Never claim to have supervised or published it.
             }
             Live::FailClosed(reason) => {
+                panic_fence.forbid_retry();
                 eprintln!(
                     "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree"
                 );
@@ -1388,7 +1536,7 @@ fn main() {
 
     // Become the compiler. On success this never returns; exit codes,
     // signals, and stdio semantics are the real chain's, exactly.
-    exec_compiler(&real_rustc, &real_rustc, &args);
+    exec_compiler(real_rustc, real_rustc, args);
 }
 
 #[cfg(test)]
@@ -1699,6 +1847,7 @@ mod tests {
             let reader = BufReader::new(ConsultStream {
                 stream,
                 deadline: Instant::now() + Duration::from_secs(2),
+                panic_fence: PanicFence::default(),
             });
             assert!(matches!(
                 live_outcome(&reply, reader, &|| false),
@@ -1824,6 +1973,7 @@ mod tests {
         let mut reader = BufReader::new(ConsultStream {
             stream,
             deadline: Instant::now() + Duration::from_secs(2),
+            panic_fence: PanicFence::default(),
         });
         let result = read_reply(&mut reader);
         drop(reader);
@@ -1889,6 +2039,7 @@ mod tests {
         let mut reader = BufReader::new(ConsultStream {
             stream,
             deadline: start + Duration::from_millis(100),
+            panic_fence: PanicFence::default(),
         });
         let error = read_reply(&mut reader).unwrap_err();
         drop(reader);
@@ -1910,6 +2061,7 @@ mod tests {
         let mut reader = BufReader::new(ConsultStream {
             stream,
             deadline: Instant::now() + Duration::from_secs(2),
+            panic_fence: PanicFence::default(),
         });
         assert_eq!(read_reply(&mut reader).unwrap(), "first\n");
         // Expire the SAME attempt between protocol stages, without a
@@ -1927,6 +2079,7 @@ mod tests {
         let mut stream = ConsultStream {
             stream,
             deadline: Instant::now(),
+            panic_fence: PanicFence::default(),
         };
         assert_eq!(
             stream.write_all(b"consult\n").unwrap_err().kind(),
@@ -2138,6 +2291,7 @@ mod tests {
                 &wrapper_path,
                 &["/tc/bin/rustc".to_owned()],
                 None,
+                &PanicFence::default(),
             )
         });
         mid_consult
@@ -2166,7 +2320,13 @@ mod tests {
         };
         store_state(path, &state).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
+        observe_with_breaker(
+            socket.to_str().unwrap(),
+            path,
+            &[],
+            None,
+            &PanicFence::default(),
+        );
 
         assert_eq!(load_state(path), state);
         assert_eq!(
@@ -2200,7 +2360,13 @@ mod tests {
             // No outcome publication: model an owner lost mid-consult.
         }
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
+        observe_with_breaker(
+            socket.to_str().unwrap(),
+            path,
+            &[],
+            None,
+            &PanicFence::default(),
+        );
 
         assert_eq!(load_state(path), probing);
         assert_eq!(
@@ -2219,7 +2385,13 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path.to_str().unwrap(), &[], None);
+        observe_with_breaker(
+            socket.to_str().unwrap(),
+            path.to_str().unwrap(),
+            &[],
+            None,
+            &PanicFence::default(),
+        );
 
         assert_eq!(std::fs::read(parent).unwrap(), b"preserve me");
         assert_eq!(
@@ -2283,12 +2455,351 @@ mod tests {
     #[test]
     fn consult_against_nothing_fails_within_budget() {
         let start = std::time::Instant::now();
-        let result = consult("/nonexistent/rabsd.sock", 25, 50, &[], &|| true);
+        let result = consult(
+            "/nonexistent/rabsd.sock",
+            25,
+            50,
+            &[],
+            &|| true,
+            &PanicFence::default(),
+        );
         assert!(result.is_err());
         assert!(
             start.elapsed() < Duration::from_millis(200),
             "daemon-dead consult must fail fast: {:?}",
             start.elapsed()
         );
+    }
+
+    /// This subprocess enters the same containment and dispatch functions as
+    /// the installed wrapper. Only fault selection and its reachability marker
+    /// are test-only; neither is recognized by a shipping binary.
+    #[test]
+    fn panic_containment_child() {
+        let Ok(site) = std::env::var("RABS_PANIC_CASE") else {
+            return;
+        };
+        let site = match site.as_str() {
+            "before-consult" => "before-consult",
+            "owner-capture" => "owner-capture",
+            "before-decision" => "before-decision",
+            "local-execute-grant" => "local-execute-grant",
+            "remote-consent" => "remote-consent",
+            "install-consent" => "install-consent",
+            "metadata-delivered" => "metadata-delivered",
+            "metadata-relay" => "metadata-relay",
+            "after-consult" => "after-consult",
+            "caller-lost" => "caller-lost",
+            "no-panic" => "no-panic",
+            other => panic!("unknown panic fixture {other}"),
+        };
+        PANIC_FIXTURE_SITE.set(Some(site));
+        let compiler = std::env::var_os("RABS_PANIC_COMPILER").unwrap();
+        run_wrapper(&compiler, &panic_compiler_arguments());
+    }
+
+    fn panic_compiler_arguments() -> Vec<OsString> {
+        [
+            "--crate-name",
+            "demo",
+            "source with spaces.rs",
+            "literal$()`",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    enum PanicPeer {
+        PassThrough,
+        Execute,
+        Remote,
+        Hit,
+        Metadata,
+        Served,
+        WriterReturned,
+        RemoteFailed,
+    }
+
+    const PANIC_METADATA: &[u8] =
+        b"{\"$message_type\":\"artifact\",\"artifact\":\"/fixture/libdemo.rmeta\"}\n";
+
+    /// Peer messages and the compiler are explicit protocol doubles. These
+    /// tests exercise native exec, sockets, writes and unwind behavior; they
+    /// do not claim real Cargo compilation or host procfs qualification.
+    fn panic_containment_case(
+        site: &str,
+        script: Option<PanicPeer>,
+        runs_compiler: bool,
+        stderr: &[u8],
+    ) -> Vec<serde_json::Value> {
+        use serde_json::{Value, json};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let compiler = root.path().join("compiler");
+        let marker = root.path().join("compiler-arguments");
+        let fault = root.path().join("fault-reached");
+        let socket = root.path().join("edge.sock");
+        std::fs::write(
+            &compiler,
+            b"#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" \"$PRESERVED_VALUE\" >> \"$COMPILER_MARKER\"\nprintf 'compiler stdout\\n'\nprintf 'compiler stderr\\n' >&2\nexit 37\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let daemon = script.map(|script| {
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < until, "wrapper never connected");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut peer = BufReader::new(stream);
+                let read = |peer: &mut BufReader<UnixStream>| -> Option<Value> {
+                    let mut line = String::new();
+                    (peer.read_line(&mut line).unwrap() != 0)
+                        .then(|| serde_json::from_str(&line).unwrap())
+                };
+                let send = |peer: &mut BufReader<UnixStream>, value: Value| {
+                    writeln!(peer.get_mut(), "{value}").unwrap();
+                };
+                assert_eq!(read(&mut peer).unwrap()["kind"], "hello");
+                send(&mut peer, json!({"kind":"hello-ok"}));
+                assert_eq!(read(&mut peer).unwrap()["kind"], "rustc-request");
+                let mut offer = json!({
+                    "kind":"rustc-decision", "decision":"hit", "capture_protocol":1,
+                    "action_key":"action", "compiler_skip_authorized":false,
+                });
+                match script {
+                    PanicPeer::PassThrough => offer["decision"] = json!("pass-through"),
+                    PanicPeer::Execute => {
+                        offer["decision"] = json!("execute");
+                        offer["attempt"] = json!("attempt");
+                        offer["env"] = json!([]);
+                    }
+                    PanicPeer::Remote | PanicPeer::RemoteFailed => {
+                        offer["decision"] = json!("remote");
+                        offer["remote_protocol"] = json!(1);
+                    }
+                    PanicPeer::Metadata => {
+                        offer["metadata_protocol"] = json!(1);
+                        offer["manifest_key"] = json!("manifest");
+                    }
+                    PanicPeer::Hit | PanicPeer::Served | PanicPeer::WriterReturned => {}
+                }
+                send(&mut peer, offer);
+                let mut received = Vec::new();
+                while let Some(frame) = read(&mut peer) {
+                    if frame["kind"] == "rustc-accept" {
+                        match script {
+                            PanicPeer::Metadata => send(
+                                &mut peer,
+                                json!({
+                                    "kind":"rustc-metadata", "metadata_protocol":1,
+                                    "action_key":"action", "manifest_key":"manifest",
+                                    "sequence":1, "stderr_hex":hex_encode(PANIC_METADATA),
+                                }),
+                            ),
+                            PanicPeer::Served => send(
+                                &mut peer,
+                                json!({
+                                    "kind":"rustc-decision", "decision":"served",
+                                    "compiler_skip_authorized":true, "stderr_hex":"6361636865640a",
+                                }),
+                            ),
+                            PanicPeer::WriterReturned => send(
+                                &mut peer,
+                                json!({
+                                    "kind":"rustc-decision", "decision":"serve-failed",
+                                    "writer_returned":true, "metadata_exposed":false,
+                                }),
+                            ),
+                            _ => {}
+                        }
+                    } else if frame["kind"] == "rustc-remote-accept"
+                        && matches!(script, PanicPeer::RemoteFailed)
+                    {
+                        send(
+                            &mut peer,
+                            json!({
+                                "kind":"rustc-decision", "decision":"remote-failed",
+                                "remote_protocol":1, "action_key":"action",
+                                "execution_finished":true, "writer_returned":true,
+                                "compiler_skip_authorized":false, "metadata_exposed":false,
+                            }),
+                        );
+                    }
+                    received.push(frame);
+                }
+                received
+            })
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::panic_containment_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RABS_PANIC_CASE", site)
+            .env("RABS_PANIC_COMPILER", &compiler)
+            .env("RABS_PANIC_FAULT_MARKER", &fault)
+            .env("COMPILER_MARKER", &marker)
+            .env("PRESERVED_VALUE", "literal environment $()` value")
+            .env("RABS_SOCKET_PATH", &socket)
+            .env("RABS_BREAKER_FILE", root.path().join("breaker"))
+            .env("RABS_LIVE_DECISION_MS", "2000")
+            .env("RABS_REMOTE_WAIT_MS", "1000")
+            .env("RABS_INSTALL_WAIT_MS", "1000")
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("RABS_WRAP_TRACE")
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        let received = daemon.map_or_else(Vec::new, |daemon| daemon.join().unwrap());
+        if site == "no-panic" {
+            assert!(
+                !fault.exists(),
+                "ordinary settlement must not inject a panic"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(&fault).unwrap(),
+                site.as_bytes(),
+                "fault was reached"
+            );
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(if runs_compiler { 37 } else { 1 })
+        );
+        assert_eq!(
+            output.stderr, stderr,
+            "no wrapper panic diagnostic may reach Cargo"
+        );
+        if runs_compiler {
+            let mut expected = Vec::new();
+            for argument in std::iter::once(compiler.into_os_string())
+                .chain(panic_compiler_arguments())
+                .chain(std::iter::once(OsString::from(
+                    "literal environment $()` value",
+                )))
+            {
+                expected.extend_from_slice(argument.as_bytes());
+                expected.push(0);
+            }
+            assert_eq!(
+                std::fs::read(marker).unwrap(),
+                expected,
+                "exactly one original exec"
+            );
+            // libtest writes its own banner before the child enters the real
+            // wrapper path; the exec'd compiler then writes directly to stdout.
+            assert!(output.stdout.ends_with(b"compiler stdout\n"));
+        } else {
+            assert!(!marker.exists(), "panic started a replacement compiler");
+            assert!(!output.stdout.ends_with(b"compiler stdout\n"));
+        }
+        received
+    }
+
+    #[test]
+    fn panic_containment_before_authority_execs_the_exact_original_compiler() {
+        assert!(
+            panic_containment_case("before-consult", None, true, b"compiler stderr\n").is_empty()
+        );
+        assert!(
+            panic_containment_case(
+                "before-decision",
+                Some(PanicPeer::Hit),
+                true,
+                b"compiler stderr\n",
+            )
+            .is_empty()
+        );
+        assert!(
+            panic_containment_case(
+                "after-consult",
+                Some(PanicPeer::PassThrough),
+                true,
+                b"compiler stderr\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn panic_containment_never_restarts_accepted_execution_or_installation() {
+        assert!(
+            panic_containment_case("local-execute-grant", Some(PanicPeer::Execute), false, b"",)
+                .is_empty()
+        );
+        for (site, peer, kind) in [
+            ("remote-consent", PanicPeer::Remote, "rustc-remote-accept"),
+            ("install-consent", PanicPeer::Hit, "rustc-accept"),
+            ("after-consult", PanicPeer::Served, "rustc-accept"),
+        ] {
+            let received = panic_containment_case(site, Some(peer), false, b"");
+            assert_eq!(received.len(), 1, "no second consent or completion");
+            assert_eq!(received[0]["kind"], kind);
+        }
+    }
+
+    #[test]
+    fn panic_containment_preserves_metadata_exposure_and_relay_failure() {
+        for (site, expected) in [
+            ("metadata-delivered", PANIC_METADATA),
+            ("metadata-relay", b"".as_slice()),
+        ] {
+            let received = panic_containment_case(site, Some(PanicPeer::Metadata), false, expected);
+            assert_eq!(
+                received.len(),
+                1,
+                "panicked delivery cannot acknowledge metadata"
+            );
+            assert_eq!(received[0]["kind"], "rustc-accept");
+        }
+    }
+
+    #[test]
+    fn panic_containment_refuses_fallback_after_caller_loss() {
+        assert!(panic_containment_case("caller-lost", None, false, b"").is_empty());
+    }
+
+    #[test]
+    fn panic_containment_refuses_fallback_when_owner_capture_panics() {
+        assert!(panic_containment_case("owner-capture", None, false, b"").is_empty());
+    }
+
+    #[test]
+    fn panic_containment_preserves_explicit_settlement_without_reopening_the_panic_fence() {
+        for (peer, kind) in [
+            (PanicPeer::WriterReturned, "rustc-accept"),
+            (PanicPeer::RemoteFailed, "rustc-remote-accept"),
+        ] {
+            let received =
+                panic_containment_case("no-panic", Some(peer), true, b"compiler stderr\n");
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0]["kind"], kind);
+            let received = panic_containment_case("after-consult", Some(peer), false, b"");
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0]["kind"], kind);
+        }
     }
 }

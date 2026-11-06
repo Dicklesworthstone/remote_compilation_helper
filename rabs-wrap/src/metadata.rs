@@ -141,9 +141,15 @@ fn deliver_prefix(
 ) -> io::Result<()> {
     check_live(deadline, owned)?;
     let (sender, receiver) = mpsc::sync_channel(1);
+    #[cfg(test)]
+    let panic_relay = super::panic_fixture_selected("metadata-relay");
     std::thread::Builder::new()
         .name("rabs-metadata-stderr".into())
         .spawn(move || {
+            #[cfg(test)]
+            if panic_relay {
+                super::inject_panic_fixture("metadata-relay");
+            }
             let result = sink.write_all(&bytes).and_then(|()| sink.flush());
             let _ = sender.send(result);
         })?;
@@ -254,12 +260,17 @@ fn accept_and_receive(
     complete: impl Fn(&str) -> Live,
     description: &str,
 ) -> Live {
+    // Consent may reach the daemon even when its write or later bookkeeping
+    // unwinds. Preserve this fact outside every nested catch and socket owner.
+    reader.get_ref().panic_fence.forbid_retry();
     catch_unwind(AssertUnwindSafe(|| {
         if singleflight::write_owned(&mut reader, accepted.as_bytes(), deadline, owned).is_err() {
             return Live::FailClosed(format!(
                 "RABS {description} installation acceptance is uncertain"
             ));
         }
+        #[cfg(test)]
+        super::panic_fixture("install-consent");
         receive(&mut reader, identity, deadline, owned, complete)
     }))
     .unwrap_or(Live::FailClosedSilently)
@@ -300,6 +311,8 @@ fn receive(
             if deliver_prefix(io::stderr(), prefix, deadline, owned).is_err() {
                 return Live::FailClosedSilently;
             }
+            #[cfg(test)]
+            super::panic_fixture("metadata-delivered");
             let ack = identity.frame("rustc-metadata-ack", true);
             if singleflight::write_owned(reader, ack.as_bytes(), deadline, owned).is_err() {
                 return Live::FailClosedSilently;
@@ -432,6 +445,7 @@ mod tests {
         let reader = BufReader::new(ConsultStream {
             stream,
             deadline: Instant::now() + Duration::from_secs(2),
+            panic_fence: super::super::PanicFence::default(),
         });
         let outcome = outcome(&offer, reader, &|| {
             assert!(
