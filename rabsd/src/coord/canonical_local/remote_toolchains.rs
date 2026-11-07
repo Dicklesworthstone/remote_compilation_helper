@@ -2120,6 +2120,7 @@ mod tests {
             let owner = Arc::new(
                 tempfile::Builder::new()
                     .prefix("received-sdk-")
+                    .permissions(fs::Permissions::from_mode(0o700))
                     .tempdir_in(parent.path())
                     .unwrap(),
             );

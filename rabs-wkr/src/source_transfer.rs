@@ -1764,7 +1764,10 @@ impl SourceTransferState {
                     // receiver write. Large archives use a fixed-size buffer,
                     // and later cache corruption cannot change this snapshot.
                     snapshot
-                        .install(&mut receiver)
+                        .install_with_cloner(
+                            &mut receiver,
+                            rabs_cas::materialization::try_verified_reflink,
+                        )
                         .map_err(|error| error.to_string())?;
                     reused_bytes += file.len;
                 } else {
