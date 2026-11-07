@@ -737,7 +737,10 @@ where
             return false;
         };
         let failure = match outcome {
-            Ok(Ok(telemetry)) => {
+            Ok(Ok(telemetry))
+                if started.elapsed() < attempt_timeout
+                    && poll_started.elapsed() < retry_budget =>
+            {
                 debug!(
                     worker = worker_id.as_str(),
                     attempt = attempts,
@@ -749,6 +752,15 @@ where
                 record_poll_command_outcome(&worker, worker_id, true, &config.circuit).await;
                 return true;
             }
+            // A ready collector can win Tokio's poll order after the timer
+            // expires. Lock contention before publication consumes the same
+            // budget; late data must not refresh a worker or clear failures.
+            Ok(Ok(_)) => PollAttemptFailure {
+                attempt: attempts,
+                transport,
+                elapsed: started.elapsed(),
+                error: format!("telemetry completed after {attempt_timeout:?} deadline"),
+            },
             Ok(Err(e)) => PollAttemptFailure {
                 attempt: attempts,
                 transport,
@@ -1282,6 +1294,82 @@ mod tests {
         );
         assert_eq!(poll_hard_timeout(Duration::MAX), Duration::MAX);
         assert_eq!(poll_retry_budget(Duration::MAX), Duration::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_at_deadline_never_refreshes_or_clears_failure_evidence() {
+        for ssh_timeout in [Duration::from_secs(20), Duration::MAX] {
+            let worker = Arc::new(WorkerState::new(create_worker_config("late-poll")));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let config = TelemetryPollerConfig {
+                ssh_timeout,
+                ..TelemetryPollerConfig::default()
+            };
+            let per_attempt = scale_duration(poll_hard_timeout(ssh_timeout));
+            let budget = scale_duration(poll_retry_budget(ssh_timeout));
+            let started = tokio::time::Instant::now();
+            let success = poll_worker_with(
+                worker.clone(),
+                store.clone(),
+                config,
+                "late-test-transport",
+                |endpoint| async move {
+                    tokio::time::sleep(per_attempt).await;
+                    Ok(make_telemetry(endpoint.id.as_str(), 90.0, 90.0))
+                },
+            )
+            .await;
+            assert!(!success, "a deadline-boundary result was published");
+            assert_eq!(started.elapsed(), budget);
+            assert!(store.latest("late-poll").is_none());
+            assert!(store.last_received_at("late-poll").is_none());
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1,
+                "the exhausted poll must retain command-failure evidence"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_can_recover_with_timely_evidence_after_a_late_attempt() {
+        let worker = Arc::new(WorkerState::new(create_worker_config("late-then-ready")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let config = TelemetryPollerConfig::default();
+        let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
+        let budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let success = poll_worker_with(
+            worker.clone(),
+            store.clone(),
+            config,
+            "recovered-test-transport",
+            |endpoint| {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt == 1 {
+                        tokio::time::sleep(per_attempt).await;
+                    }
+                    Ok(make_telemetry(
+                        endpoint.id.as_str(),
+                        if attempt == 1 { 90.0 } else { 10.0 },
+                        20.0,
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(success);
+        assert_eq!(attempts, 2, "late data must not end the poll successfully");
+        assert!(started.elapsed() < budget);
+        let received = store.latest("late-then-ready").unwrap();
+        assert!((received.telemetry.cpu.overall_percent - 10.0).abs() < f64::EPSILON);
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]

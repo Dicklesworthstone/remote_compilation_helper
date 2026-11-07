@@ -203,6 +203,22 @@ pub(crate) async fn with_offload_ssh_arguments_for_test<F: std::future::Future>(
         .await
 }
 
+/// Control evidence is valid only while its original deadline is open.
+/// Tokio polls an operation before its timer, so a ready or non-yielding
+/// operation also needs an elapsed-time check after it returns.
+async fn control_timeout_at<T>(
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(());
+    }
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(result) if tokio::time::Instant::now() < deadline => Ok(result),
+        _ => Err(()),
+    }
+}
+
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
@@ -770,13 +786,17 @@ impl RemoteSourceAuthorityLock {
 
     /// Release the locks after Cargo exits and prove the holder stayed healthy.
     pub(super) async fn release(self) -> anyhow::Result<()> {
-        self.release_with_timeout(Duration::from_secs(15)).await
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(15));
+        self.release_with_timeout(budget).await
     }
 
     async fn release_with_timeout(mut self, budget: Duration) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
-        let deadline = tokio::time::Instant::now() + budget;
+        let budget = budget.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget)
+            .context("source-authority release deadline exceeds the clock range")?;
         let collect = async {
             if let Some(heartbeat) = self.heartbeat.as_mut() {
                 heartbeat.release(self.release_request.clone()).await?;
@@ -822,7 +842,7 @@ impl RemoteSourceAuthorityLock {
         };
         // A successful wait() does not imply EOF: descendants can retain the
         // pipes. The same deadline must cover the write, wait and BOTH drains.
-        match tokio::time::timeout_at(deadline, collect).await {
+        match control_timeout_at(deadline, collect).await {
             Ok(result) => result,
             Err(_) => anyhow::bail!(
                 "timed out releasing remote source-authority lock on {}",
@@ -2201,6 +2221,10 @@ async fn spawn_source_authority_lock(
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use anyhow::Context as _;
+    let wait_timeout = wait_timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(wait_timeout)
+        .context("source-authority acquisition deadline exceeds the clock range")?;
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
     let mut cmd = Command::new("ssh");
@@ -2234,15 +2258,23 @@ async fn spawn_source_authority_lock(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    if tokio::time::Instant::now() >= deadline {
+        return Err(anyhow::Error::new(crate::transfer::SourceAuthorityBusy(
+            format!(
+                "timed out waiting {:?} for source-authority locks on {}",
+                wait_timeout, worker.id
+            ),
+        )));
+    }
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to start source-authority lock on {destination}"))?;
-    finish_source_authority_lock_acquisition(
+    finish_source_authority_lock_acquisition_until(
         child,
         worker.id.clone(),
         ready_marker,
         stdin_bootstrap.as_deref(),
-        wait_timeout,
+        deadline,
         heartbeat,
     )
     .await
@@ -2267,16 +2299,43 @@ async fn read_source_lock_frame(
     Ok(read)
 }
 
+// Existing local fixtures supply a duration. Production captures its absolute
+// deadline before building and spawning SSH, and passes it to the same body.
+#[cfg(test)]
 async fn finish_source_authority_lock_acquisition(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     worker_id: WorkerId,
     ready_marker: &str,
     stdin_bootstrap: Option<&str>,
     wait_timeout: Duration,
     heartbeat: bool,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    let wait_timeout = wait_timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(wait_timeout)
+        .context("source-authority acquisition deadline exceeds the clock range")?;
+    finish_source_authority_lock_acquisition_until(
+        child,
+        worker_id,
+        ready_marker,
+        stdin_bootstrap,
+        deadline,
+        heartbeat,
+    )
+    .await
+}
+
+async fn finish_source_authority_lock_acquisition_until(
+    mut child: tokio::process::Child,
+    worker_id: WorkerId,
+    ready_marker: &str,
+    stdin_bootstrap: Option<&str>,
+    deadline: tokio::time::Instant,
+    heartbeat: bool,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use tokio::io::AsyncWriteExt as _;
 
+    let wait_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
     let stdin = child
         .stdin
         .take()
@@ -2350,7 +2409,7 @@ async fn finish_source_authority_lock_acquisition(
         Ok::<((), usize), std::io::Error>(((), read))
     };
     let mut timed_out = false;
-    let failure = match timeout(wait_timeout, acquisition).await {
+    let failure = match control_timeout_at(deadline, acquisition).await {
         Ok(Ok(((), 0))) => Some(format!(
             "source-authority lock on {} exited before acquisition",
             guard.worker_id
@@ -2498,6 +2557,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
     stdin_payload: Option<&[u8]>,
     timeout_duration: Duration,
 ) -> anyhow::Result<Output> {
+    let timeout_duration = timeout_duration.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout_duration)
+        .context("SSH command deadline exceeds the clock range")?;
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
 
@@ -2547,6 +2610,11 @@ async fn run_offload_ssh_command_with_optional_stdin(
     use anyhow::Context as _;
     use tokio::io::AsyncWriteExt as _;
 
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "SSH command timed out after {:?}",
+        timeout_duration
+    );
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
@@ -2593,7 +2661,7 @@ async fn run_offload_ssh_command_with_optional_stdin(
         })
     };
 
-    match timeout(timeout_duration, collect).await {
+    match control_timeout_at(deadline, collect).await {
         Ok(result) => result.context("Failed to collect ssh output"),
         Err(_) => {
             // collect future is dropped here; with kill_on_drop=true the
@@ -3034,6 +3102,94 @@ pub(super) async fn ensure_worker_projects_topology(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_path_control_deadline_checks_before_and_after_polling() {
+        let polled = std::cell::Cell::new(false);
+        let result = control_timeout_at(tokio::time::Instant::now(), async {
+            polled.set(true);
+            "READY"
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!polled.get(), "an expired budget must not start control work");
+
+        let budget = Duration::from_secs(10);
+        for (delay, expected) in [(Duration::from_secs(9), true), (budget, false)] {
+            let deadline = tokio::time::Instant::now() + budget;
+            let result = control_timeout_at(deadline, async {
+                tokio::time::sleep(delay).await;
+                "READY"
+            })
+            .await;
+            assert_eq!(result.is_ok(), expected, "delay={delay:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_path_control_deadline_drops_pending_operation() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = Dropped(dropped.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let result = control_timeout_at(deadline, async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn slow_path_control_deadline_rejects_non_yielding_success() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let result = control_timeout_at(deadline, async {
+            std::thread::sleep(Duration::from_millis(30));
+            "READY"
+        })
+        .await;
+        assert!(result.is_err(), "late ready evidence must not beat the timer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn slow_path_source_acquisition_keeps_expired_deadline_and_reaps_child() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let result = timeout(
+            Duration::from_secs(2),
+            finish_source_authority_lock_acquisition_until(
+                child,
+                WorkerId::new("expired-source-acquisition"),
+                "READY",
+                None,
+                tokio::time::Instant::now(),
+                false,
+            ),
+        )
+        .await
+        .expect("acquisition reset an expired deadline after spawning");
+        let error = match result {
+            Ok(_) => panic!("expired acquisition authorized source ownership"),
+            Err(error) => error,
+        };
+        assert!(crate::transfer::source_authority_busy(&error));
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
 
     #[tokio::test]
     async fn owned_offload_socket_is_bound_to_endpoint_and_task() {
@@ -7386,6 +7542,144 @@ exec /bin/ln \"$@\"\n",
                 .await
                 .expect("release detached an output reader")
                 .expect("reader drop notification lost");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_rejects_completed_drains_after_deadline() {
+        let (guard, writers, notices) = source_lock_pending_release_fixture().await;
+        tokio::time::pause();
+        let budget = Duration::from_secs(15);
+        let mut release = Box::pin(guard.release_with_timeout(budget));
+        assert!(futures::poll!(release.as_mut()).is_pending());
+
+        // Make both collectors ready without polling their waiting owner.
+        // Tokio then polls a ready collect future before its expired timer.
+        drop(writers);
+        source_lock_assert_readers_dropped(notices).await;
+        tokio::time::advance(budget).await;
+        let error = release.await.unwrap_err();
+        assert!(error.to_string().contains("timed out releasing"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_caps_supplied_budget_and_drops_readers() {
+        let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let error = guard.release_with_timeout(Duration::MAX).await.unwrap_err();
+        assert!(error.to_string().contains("timed out releasing"));
+        let cap = rch_common::timing::MAX_CONTROL_TIMEOUT;
+        assert!(started.elapsed() >= cap);
+        assert!(started.elapsed() < cap + Duration::from_secs(1));
+        // Writers remain alive: only aborting the owned readers can notify us.
+        source_lock_assert_readers_dropped(notices).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_scales_waiting_and_preserves_receipts() {
+        const SCALE_ENV: &str = "RCH_TEST_SOURCE_RELEASE_SCALE";
+        const FINISHED: &str = "RCH_TEST_SOURCE_RELEASE_SCALE_OK";
+        if let Ok(value) = std::env::var(SCALE_ENV) {
+            let scale: rch_common::timing::TimingScale = value.parse().unwrap();
+            rch_common::timing::install(scale);
+            let budget = scale.duration(Duration::from_secs(15));
+
+            let (guard, writers, notices) = source_lock_pending_release_fixture().await;
+            tokio::time::pause();
+            let close = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                drop(writers);
+            });
+            let started = tokio::time::Instant::now();
+            let result = guard.release().await;
+            let expected_success = value != "1";
+            assert_eq!(result.is_ok(), expected_success, "scale={value}: {result:?}");
+            let expected_elapsed = if expected_success {
+                Duration::from_secs(20)
+            } else {
+                budget
+            };
+            assert!(started.elapsed() >= expected_elapsed);
+            assert!(started.elapsed() < expected_elapsed + Duration::from_secs(1));
+            close.abort();
+            let _ = close.await;
+            source_lock_assert_readers_dropped(notices).await;
+            tokio::time::resume();
+
+            // Extra time cannot substitute for the complete identity-bound
+            // acknowledgment, even when the holder exits successfully.
+            let child = Command::new("sh")
+                .args([
+                    "-c",
+                    "printf 'READY\n'; IFS= read -r request; printf '%s' \"$request\"",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut guard = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("scaled-release-ack"),
+                "READY",
+                None,
+                Duration::from_secs(2),
+                false,
+            )
+            .await
+            .unwrap();
+            guard.release_request = Some("RELEASE".to_owned());
+            let error = timeout(Duration::from_secs(5), guard.release())
+                .await
+                .expect("incomplete acknowledgment waited for the scaled deadline")
+                .unwrap_err();
+            assert!(error.to_string().contains("acknowledgment missing"));
+
+            let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let error = guard.release().await.unwrap_err();
+            assert!(error.to_string().contains("timed out releasing"));
+            assert!(started.elapsed() >= budget);
+            assert!(started.elapsed() < budget + Duration::from_secs(1));
+            source_lock_assert_readers_dropped(notices).await;
+            tokio::time::resume();
+            println!("{FINISHED}");
+            return;
+        }
+
+        // The installed policy is process-wide. Isolate each policy case from
+        // other tests instead of changing their concurrent remote budgets.
+        let _guard = test_guard!();
+        let test_name = concat!(
+            module_path!(),
+            "::slow_path_source_release_scales_waiting_and_preserves_receipts"
+        );
+        let test_name = test_name.split_once("::").unwrap().1;
+        for scale in ["1", "2.5", "10"] {
+            let output = timeout(
+                Duration::from_secs(30),
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(SCALE_ENV, scale)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("isolated source release regression timed out")
+            .expect("start isolated source release regression");
+            assert!(
+                output.status.success(),
+                "scale={scale}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(FINISHED));
         }
     }
 
