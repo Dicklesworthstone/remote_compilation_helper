@@ -483,7 +483,7 @@ impl<'a> ToolchainAdmission<'a> {
             stopped.load(Ordering::Acquire) || !healthy() || Instant::now() >= deadline
         };
         loop {
-            match self.cache.acquire(self.edge_pin, &self.identity, &cancelled)? {
+            match self.cache.acquire(self.edge_pin, &self.identity, cancelled)? {
                 ToolchainAcquisition::Ready(lease) => {
                     return Ok((ToolchainInput::Reuse(lease), None));
                 }
@@ -515,7 +515,7 @@ impl<'a> ToolchainAdmission<'a> {
                     ));
                 }
                 ToolchainAcquisition::Wait(waiter) => loop {
-                    match waiter.poll(&cancelled)? {
+                    match waiter.poll(cancelled)? {
                         UploadPoll::Ready(lease) => {
                             return Ok((ToolchainInput::Reuse(lease), None));
                         }
@@ -626,13 +626,13 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     let (source, toolchain) =
         receive_inputs(wire, source, toolchain, stopped, input_deadline).await?;
     let toolchain = match disposition {
-        ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, &cancelled)?,
+        ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, cancelled)?,
         ToolchainDisposition::Reuse => toolchain,
     };
     if let Some(publisher) = publisher {
         // Only the exact sealed SDK crosses this handoff. The publisher leaves
         // the pending registry before existing waiters receive its lease.
-        publisher.publish(Arc::clone(&toolchain), &cancelled)?;
+        publisher.publish(Arc::clone(&toolchain), cancelled)?;
     }
     let inputs = RemoteOperationInputs::new(
         Arc::clone(&owner),
@@ -809,7 +809,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 window.record()?;
                 if !source_finished {
-                    source.seal_cancellable(&cancelled)?;
+                    source.seal_cancellable(cancelled)?;
                     source_finished = true;
                 }
                 receiver.entry(entry.native())?;
@@ -842,7 +842,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                     )?;
                     // A hit skips only the SDK transfer. Source still crosses
                     // the same complete manifest/byte sealing boundary.
-                    source.seal_cancellable(&cancelled)?;
+                    source.seal_cancellable(cancelled)?;
                 }
                 break;
             }
@@ -855,13 +855,13 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             owner,
         } => Arc::new(ReceivedToolchain::new(
             owner,
-            Arc::new(receiver.seal(&cancelled)?),
-            &cancelled,
+            Arc::new(receiver.seal(cancelled)?),
+            cancelled,
         )?),
         ToolchainInput::Reuse(lease) => {
             // Recheck the exact owner pinned before Ready. Corruption or
             // cancellation cannot trigger a hidden upload or a different hit.
-            lease.verify(&cancelled)?;
+            lease.verify(cancelled)?;
             lease
         }
     };

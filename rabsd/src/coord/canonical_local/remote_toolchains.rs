@@ -1040,21 +1040,21 @@ mod tests {
                     scope.spawn(move || -> io::Result<Arc<ReceivedToolchain>> {
                         let deadline = Instant::now() + Duration::from_secs(5);
                         let stopped = || Instant::now() >= deadline;
-                        match cache.acquire(EDGE_A, sdk.identity(), &stopped)? {
+                        match cache.acquire(EDGE_A, sdk.identity(), stopped)? {
                             ToolchainAcquisition::Upload(owner) => {
                                 entered_tx.send(true).unwrap();
                                 while !release.load(Ordering::Acquire) {
                                     checkpoint(&stopped)?;
                                     thread::yield_now();
                                 }
-                                let lease = cache.adopt(EDGE_A, sdk, &stopped)?;
-                                owner.publish(Arc::clone(&lease), &stopped)?;
+                                let lease = cache.adopt(EDGE_A, sdk, stopped)?;
+                                owner.publish(Arc::clone(&lease), stopped)?;
                                 Ok(lease)
                             }
                             ToolchainAcquisition::Wait(waiter) => {
                                 entered_tx.send(false).unwrap();
                                 loop {
-                                    match waiter.poll(&stopped)? {
+                                    match waiter.poll(stopped)? {
                                         UploadPoll::Pending => thread::yield_now(),
                                         UploadPoll::Abandoned => {
                                             return Err(invalid("fixture upload was abandoned"));
