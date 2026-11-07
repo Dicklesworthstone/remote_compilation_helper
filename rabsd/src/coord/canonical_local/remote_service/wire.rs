@@ -24,6 +24,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v2";
 pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
@@ -274,6 +275,15 @@ pub(super) struct Output {
     pub(super) bytes: String,
 }
 
+/// The authenticated coordinator owns any reused SDK for this operation.
+/// Reuse changes only which input bytes are sent, never their declared identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum ToolchainDisposition {
+    Upload,
+    Reuse,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum Message {
@@ -287,7 +297,9 @@ pub(super) enum Message {
         cargo_home: Option<CargoHome>,
     },
     Queued,
-    Ready,
+    Ready {
+        toolchain: ToolchainDisposition,
+    },
     SourceChunk {
         chunk: Chunk,
     },
@@ -697,7 +709,9 @@ mod tests {
     #[test]
     fn fragmented_and_coalesced_records_keep_the_exact_next_phase() {
         let mut bytes = record(&Message::Queued);
-        bytes.extend(record(&Message::Ready));
+        bytes.extend(record(&Message::Ready {
+            toolchain: ToolchainDisposition::Reuse,
+        }));
         bytes.extend(record(&Message::Window { count: 4 }));
         bytes.extend(record(&Message::Complete { exit_code: 0 }));
         for quantum in [1, 3, 16 * 1024] {
@@ -709,7 +723,9 @@ mod tests {
             ));
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
-                Message::Ready
+                Message::Ready {
+                    toolchain: ToolchainDisposition::Reuse
+                }
             ));
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
@@ -908,7 +924,9 @@ mod tests {
                     // not let generic Failure reporting flush the stale Commit.
                     stopped.store(false, Ordering::Release);
                     gate.store(true, Ordering::Release);
-                    wire.stream.input = record(&Message::Ready);
+                    wire.stream.input = record(&Message::Ready {
+                        toolchain: ToolchainDisposition::Upload,
+                    });
                     wire.stream.offset = 0;
                     wire.stream.eof = true;
                     let deadline = Instant::now() + Duration::from_secs(1);
@@ -948,7 +966,9 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(1);
                 assert!(wire.receive_until(&stopped, deadline).await.is_err());
                 let reads = wire.stream.reads.load(Ordering::Relaxed);
-                wire.stream.input = record(&Message::Ready);
+                wire.stream.input = record(&Message::Ready {
+                    toolchain: ToolchainDisposition::Upload,
+                });
                 wire.stream.offset = 0;
                 assert!(wire.receive_until(&stopped, deadline).await.is_err());
                 assert!(wire.send(&Message::Poll, &stopped, deadline).await.is_err());
@@ -964,6 +984,10 @@ mod tests {
             br#"{"kind":"poll","extra":1}"#.as_slice(),
             br#"{"kind":"queued","position":1}"#,
             br#"{"kind":"queued","kind":"ready"}"#,
+            br#"{"kind":"ready"}"#,
+            br#"{"kind":"ready","toolchain":"unknown"}"#,
+            br#"{"kind":"ready","toolchain":"reuse","toolchain":"upload"}"#,
+            br#"{"kind":"ready","toolchain":"reuse","toolchain_root":"/server/sdk"}"#,
             br#"{"kind":"window","count":1,"count":2}"#,
             br#"{"kind":"source-chunk","chunk":{"path":"x","offset":0,"sha256":"","bytes":"","source_root":"/"}}"#,
         ] {
@@ -971,6 +995,28 @@ mod tests {
         }
         let settings = json!({"state_root":"/server/state"});
         assert!(serde_json::from_value::<RemoteOperationSettings>(settings).is_err());
+    }
+
+    #[test]
+    fn ready_contract_carries_exact_upload_or_reuse_disposition() {
+        for (spelling, expected) in [
+            ("upload", ToolchainDisposition::Upload),
+            ("reuse", ToolchainDisposition::Reuse),
+        ] {
+            let bytes = serde_json::to_vec(&json!({
+                "kind": "ready", "toolchain": spelling
+            }))
+            .unwrap();
+            let Message::Ready { toolchain } = serde_json::from_slice::<Message>(&bytes).unwrap()
+            else {
+                panic!("expected explicit SDK admission");
+            };
+            assert_eq!(toolchain, expected);
+            assert_eq!(
+                serde_json::to_value(Message::Ready { toolchain }).unwrap(),
+                json!({"kind": "ready", "toolchain": spelling})
+            );
+        }
     }
 
     #[test]

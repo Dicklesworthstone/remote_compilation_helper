@@ -17,6 +17,7 @@
 mod remote_artifacts;
 pub(super) mod remote_operation;
 pub mod remote_service;
+pub(crate) mod remote_toolchains;
 pub mod service;
 mod target_state;
 pub(crate) use target_state::RestoredTargetProvenance;
@@ -1251,14 +1252,15 @@ fn run_operation(
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&profile.operation_root)?,
     );
-    let (source, captured_toolchain, request, input_owner) = match prepared_inputs {
+    let (source, captured_toolchain, request, input_owner, received_toolchain) = match prepared_inputs {
         Some(inputs) => {
             inputs.verify_for_profile(&profile, &cancelled)?;
             (
                 inputs.source,
-                Some(inputs.toolchain),
+                Some(Arc::clone(inputs.toolchain.image())),
                 inputs.request,
                 Some(inputs.owner),
+                Some(inputs.toolchain),
             )
         }
         None => {
@@ -1275,21 +1277,23 @@ fn run_operation(
                 super::worker_delivery::MAX_FRAME_BYTES as u64,
             )?;
             let request: Value = serde_json::from_slice(&request_bytes)?;
-            (prepared.source, prepared.toolchain, request, None)
+            (prepared.source, prepared.toolchain, request, None, None)
         }
     };
     let retain_paths = |mappings| {
-        let paths = match &input_owner {
-            Some(inputs) => CanonicalPaths::new_with_input_owner(
+        let paths = match (&input_owner, &received_toolchain) {
+            (Some(inputs), Some(toolchain)) => CanonicalPaths::new_with_received_toolchain(
                 Arc::clone(&owner),
                 Arc::clone(inputs),
+                Arc::clone(toolchain),
                 mappings,
             ),
-            None => CanonicalPaths::new_with_retained_toolchain(
+            (None, None) => CanonicalPaths::new_with_retained_toolchain(
                 Arc::clone(&owner),
                 mappings,
                 retained_toolchain.clone(),
             ),
+            _ => Err("remote source and compiler custody must be retained together".into()),
         };
         paths
             .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
@@ -1421,9 +1425,7 @@ fn run_operation(
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
     }
-    if let Some(captured) = &captured_toolchain {
-        captured.verify_retained_generation(cancelled)?;
-    }
+    paths.verify_captured_toolchain(&cancelled)?;
     let compilation_args = profile.compilation_args()?;
     // Ask the captured Cargo for the exact units this command would compile.
     // Metadata's package list includes inactive optional/dev targets and cannot
@@ -1772,9 +1774,7 @@ fn run_operation(
         if let Some(retained) = &retained_toolchain {
             retained.image().verify_retained_generation(cancelled)?;
         }
-        if let Some(captured) = &captured_toolchain {
-            captured.verify_retained_generation(cancelled)?;
-        }
+        paths.verify_captured_toolchain(&cancelled)?;
         if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
             return Err(io::Error::other(format!(
                 "completed target provenance is no longer valid: {reason}"

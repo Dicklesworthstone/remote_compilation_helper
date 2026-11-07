@@ -4,8 +4,8 @@ use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, CargoHome, Chunk, Entry, Manifest, Message, Output,
-    Toolchain, VERSION, Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid,
-    require,
+    Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
+    controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -219,7 +219,7 @@ pub fn run_client_profile(
         .as_ref()
         .ok_or_else(|| invalid("remote canonical capture did not retain its compiler"))?;
     let hello = Message::Hello {
-        version: VERSION.into(),
+        version: WIRE_VERSION.into(),
         build_identity,
         require_release: release_mode == ReleaseAuthorizationMode::Required,
         settings: Box::new(config.settings.clone()),
@@ -243,13 +243,14 @@ pub fn run_client_profile(
         let mut wire = Wire::new(peer.stream);
         let admission_deadline = Instant::now() + ADMISSION_BUDGET;
         wire.send(&hello, stopped, admission_deadline).await?;
-        let input_deadline =
+        let (input_deadline, toolchain_disposition) =
             await_input_admission(&mut wire, stopped, &config.coordinator, admission_deadline)
                 .await?;
         upload_inputs(
             &mut wire,
             &mut bundle,
             owner.path(),
+            toolchain_disposition,
             stopped,
             input_deadline,
         )
@@ -280,11 +281,13 @@ async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
     stopped: &AtomicBool,
     coordinator: &str,
     admission_deadline: Instant,
-) -> io::Result<Instant> {
+) -> io::Result<(Instant, ToolchainDisposition)> {
     let mut reported_queue = false;
     loop {
         match wire.receive_until(stopped, admission_deadline).await? {
-            Message::Ready => return Ok(Instant::now() + TOOLCHAIN_INPUT_BUDGET),
+            Message::Ready { toolchain } => {
+                return Ok((Instant::now() + TOOLCHAIN_INPUT_BUDGET, toolchain));
+            }
             Message::Queued => {
                 if !reported_queue {
                     eprintln!(
@@ -352,6 +355,7 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     bundle: &mut PreparedLocalBundle,
     scratch: &Path,
+    toolchain_disposition: ToolchainDisposition,
     stopped: &AtomicBool,
     deadline: Instant,
 ) -> io::Result<()> {
@@ -399,46 +403,50 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
         .toolchain
         .as_ref()
         .ok_or_else(|| invalid("captured compiler owner disappeared"))?;
-    for entry in toolchain.entries()? {
-        checkpoint(stopped, deadline)?;
-        let file = match &entry.kind {
-            ToolchainEntryKind::File { bytes, .. } => Some((entry.path.clone(), *bytes)),
-            _ => None,
-        };
-        upload_message(
-            wire,
-            &mut window,
-            Message::ToolchainEntry {
-                entry: Entry::from_native(entry),
-            },
-            stopped,
-            deadline,
-        )
-        .await?;
-        if let Some((path, length)) = file {
-            let mut offset = 0;
-            while offset < length {
-                checkpoint(stopped, deadline)?;
-                let bytes = toolchain.read_chunk(&path, offset, MAX_SOURCE_CHUNK, cancelled)?;
-                require(
-                    !bytes.is_empty(),
-                    "captured compiler file ended before its declaration",
-                )?;
-                upload_message(
-                    wire,
-                    &mut window,
-                    Message::ToolchainChunk {
-                        chunk: Chunk::new(&path, offset, &bytes)?,
-                    },
-                    stopped,
-                    deadline,
-                )
-                .await?;
-                offset += bytes.len() as u64;
+    if toolchain_disposition == ToolchainDisposition::Upload {
+        for entry in toolchain.entries()? {
+            checkpoint(stopped, deadline)?;
+            let file = match &entry.kind {
+                ToolchainEntryKind::File { bytes, .. } => Some((entry.path.clone(), *bytes)),
+                _ => None,
+            };
+            upload_message(
+                wire,
+                &mut window,
+                Message::ToolchainEntry {
+                    entry: Entry::from_native(entry),
+                },
+                stopped,
+                deadline,
+            )
+            .await?;
+            if let Some((path, length)) = file {
+                let mut offset = 0;
+                while offset < length {
+                    checkpoint(stopped, deadline)?;
+                    let bytes = toolchain.read_chunk(&path, offset, MAX_SOURCE_CHUNK, cancelled)?;
+                    require(
+                        !bytes.is_empty(),
+                        "captured compiler file ended before its declaration",
+                    )?;
+                    upload_message(
+                        wire,
+                        &mut window,
+                        Message::ToolchainChunk {
+                            chunk: Chunk::new(&path, offset, &bytes)?,
+                        },
+                        stopped,
+                        deadline,
+                    )
+                    .await?;
+                    offset += bytes.len() as u64;
+                }
             }
         }
     }
     flush_window(wire, &mut window, stopped, deadline).await?;
+    // A server cache hit does not waive custody of the SDK that this client
+    // captured and declared. Mutation still refuses InputsDone and execution.
     toolchain.verify_retained_generation(cancelled)?;
     checkpoint(stopped, deadline)
 }
@@ -624,6 +632,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ToolchainInput;
     use super::super::wire;
     use super::*;
     use asupersync::io::ReadBuf;
@@ -661,6 +670,7 @@ mod tests {
     struct AdmissionStream {
         input: Vec<u8>,
         offset: usize,
+        quantum: usize,
         repeat: bool,
         output: Arc<Mutex<Vec<u8>>>,
         ready_offset: Option<usize>,
@@ -673,7 +683,7 @@ mod tests {
             let mut input = Vec::new();
             let mut ready_offset = None;
             for message in messages {
-                if matches!(message, Message::Ready) && ready_offset.is_none() {
+                if matches!(message, Message::Ready { .. }) && ready_offset.is_none() {
                     ready_offset = Some(input.len());
                 }
                 input.extend(serde_json::to_vec(message).unwrap());
@@ -682,6 +692,7 @@ mod tests {
             Self {
                 input,
                 offset: 0,
+                quantum: 3,
                 repeat,
                 output: Arc::new(Mutex::new(Vec::new())),
                 ready_offset,
@@ -706,7 +717,7 @@ mod tests {
             }
             let count = output
                 .remaining()
-                .min(3)
+                .min(stream.quantum)
                 .min(stream.input.len() - stream.offset);
             if stream
                 .ready_offset
@@ -726,7 +737,7 @@ mod tests {
             _: &mut Context<'_>,
             bytes: &[u8],
         ) -> Poll<io::Result<usize>> {
-            let count = bytes.len().min(3);
+            let count = bytes.len().min(self.quantum);
             self.output
                 .lock()
                 .unwrap()
@@ -760,7 +771,9 @@ mod tests {
                 &[
                     Message::Queued,
                     Message::Queued,
-                    Message::Ready,
+                    Message::Ready {
+                        toolchain: ToolchainDisposition::Upload,
+                    },
                     Message::Accepted,
                 ],
                 false,
@@ -771,10 +784,11 @@ mod tests {
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
             let admission_deadline = started + Duration::from_secs(5);
-            let input_deadline =
+            let (input_deadline, toolchain_disposition) =
                 await_input_admission(&mut wire, &stopped, "fixture", admission_deadline)
                     .await
                     .unwrap();
+            assert_eq!(toolchain_disposition, ToolchainDisposition::Upload);
             // Waiting does not subtract from or reset the upload phase's budget.
             assert!(input_deadline >= ready_seen.lock().unwrap().unwrap() + TOOLCHAIN_INPUT_BUDGET);
             assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
@@ -795,15 +809,21 @@ mod tests {
     #[test]
     fn admission_ready_does_not_poll_and_only_then_allows_input_bytes() {
         native(async {
-            let stream = AdmissionStream::new(&[Message::Ready], false);
+            let stream = AdmissionStream::new(
+                &[Message::Ready {
+                    toolchain: ToolchainDisposition::Reuse,
+                }],
+                false,
+            );
             let output = Arc::clone(&stream.output);
             let mut wire = Wire::new(stream);
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
-            let input_deadline =
+            let (input_deadline, toolchain_disposition) =
                 await_input_admission(&mut wire, &stopped, "fixture", started + ADMISSION_BUDGET)
                     .await
                     .unwrap();
+            assert_eq!(toolchain_disposition, ToolchainDisposition::Reuse);
             assert!(input_deadline >= started + TOOLCHAIN_INPUT_BUDGET);
             assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
             assert!(output.lock().unwrap().is_empty());
@@ -1030,20 +1050,296 @@ mod tests {
             }
         }
 
-        fn receivers(&self, parent: &Path) -> (SourceReceiver, ToolchainReceiver) {
+        fn receivers(
+            &self,
+            source_parent: &Path,
+            sdk_parent: &Path,
+        ) -> (SourceReceiver, ToolchainReceiver) {
             (
                 SourceReceiver::create(
-                    &parent.join("source"),
+                    &source_parent.join("source"),
                     self.bundle.source.manifest().clone(),
                 )
                 .unwrap(),
                 ToolchainReceiver::create(
-                    &parent.join("toolchain"),
+                    &sdk_parent.join("toolchain"),
                     *self.bundle.toolchain.as_ref().unwrap().identity(),
                     ToolchainLimits::default(),
                 )
                 .unwrap(),
             )
+        }
+
+        fn upload_peer(&self, disposition: ToolchainDisposition) -> AdmissionStream {
+            let mut frames: u64 = self
+                .bundle
+                .source
+                .manifest()
+                .files()
+                .iter()
+                .map(|file| file.len.div_ceil(MAX_SOURCE_CHUNK as u64))
+                .sum();
+            if disposition == ToolchainDisposition::Upload {
+                for entry in self.bundle.toolchain.as_ref().unwrap().entries().unwrap() {
+                    frames += 1;
+                    if let ToolchainEntryKind::File { bytes, .. } = entry.kind {
+                        frames += bytes.div_ceil(MAX_SOURCE_CHUNK as u64);
+                    }
+                }
+            }
+            let mut replies = vec![Message::Ready {
+                toolchain: disposition,
+            }];
+            while frames != 0 {
+                let count = frames.min(wire::WINDOW);
+                replies.push(Message::Window { count });
+                frames -= count;
+            }
+            let mut peer = AdmissionStream::new(&replies, false);
+            peer.quantum = MAX_JSON_RECORD;
+            peer
+        }
+    }
+
+    #[test]
+    fn sdk_reuse_omits_only_sdk_frames_and_preserves_exact_source_transfer() {
+        // Both paths run the production uploader over bounded in-memory wire
+        // records and seal the resulting bytes with real filesystem receivers.
+        // This proves byte transfer behavior, not TLS or remote Cargo execution.
+        for disposition in [ToolchainDisposition::Upload, ToolchainDisposition::Reuse] {
+            let mut fixture = InputFixture::new();
+            let expected_sdk = *fixture.bundle.toolchain.as_ref().unwrap().identity();
+            let peer = fixture.upload_peer(disposition);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let stopped = AtomicBool::new(false);
+            native(async {
+                let (deadline, selected) = await_input_admission(
+                    &mut wire,
+                    &stopped,
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+                assert_eq!(selected, disposition);
+                assert!(output.lock().unwrap().is_empty());
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &fixture.owner.path().join("scratch"),
+                    selected,
+                    &stopped,
+                    deadline,
+                )
+                .await
+                .unwrap();
+                wire.send(&Message::InputsDone, &stopped, deadline)
+                    .await
+                    .unwrap();
+            });
+            let destination = private();
+            let sdk_destination = private();
+            let (mut source, mut sdk) =
+                fixture.receivers(destination.path(), sdk_destination.path());
+            let mut source_bytes = 0_u64;
+            let mut sdk_bytes = 0_u64;
+            let mut sdk_entries = 0_usize;
+            let mut frames = 0_u64;
+            let mut completed = false;
+            for record in admission_messages(&output) {
+                assert!(!completed, "no frames may follow InputsDone");
+                match serde_json::from_value::<Message>(record).unwrap() {
+                    Message::SourceChunk { chunk } => {
+                        let (bytes, sha256) = chunk.verified_bytes().unwrap();
+                        source
+                            .write_chunk(&chunk.path, chunk.offset, &bytes, sha256)
+                            .unwrap();
+                        source_bytes += bytes.len() as u64;
+                        frames += 1;
+                    }
+                    Message::ToolchainEntry { entry } => {
+                        assert_eq!(disposition, ToolchainDisposition::Upload);
+                        sdk.entry(entry.native()).unwrap();
+                        sdk_entries += 1;
+                        frames += 1;
+                    }
+                    Message::ToolchainChunk { chunk } => {
+                        assert_eq!(disposition, ToolchainDisposition::Upload);
+                        let (bytes, sha256) = chunk.verified_bytes().unwrap();
+                        sdk.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)
+                            .unwrap();
+                        sdk_bytes += bytes.len() as u64;
+                        frames += 1;
+                    }
+                    Message::WindowEnd { count } => {
+                        assert_eq!(count, frames);
+                        assert!((1..=wire::WINDOW).contains(&count));
+                        frames = 0;
+                    }
+                    Message::InputsDone => {
+                        assert_eq!(frames, 0);
+                        completed = true;
+                    }
+                    message => panic!("unexpected upload message: {message:?}"),
+                }
+                assert!(frames <= wire::WINDOW);
+            }
+            assert!(completed);
+            source.seal().unwrap();
+            assert_eq!(source.manifest(), fixture.bundle.source.manifest());
+            let source_root = source.sealed_root().unwrap();
+            assert_eq!(
+                fs::read(source_root.join("a-binary")).unwrap(),
+                fixture.source_bytes
+            );
+            assert!(fs::read(source_root.join("b-empty")).unwrap().is_empty());
+            assert_eq!(
+                fs::read(source_root.join("c-executable")).unwrap(),
+                b"#!/bin/sh\nexit 0\n"
+            );
+            assert_eq!(
+                fs::metadata(source_root.join("c-executable")).unwrap().mode() & 0o7777,
+                0o555
+            );
+            assert_eq!(
+                source_bytes,
+                (fixture.source_bytes.len() + b"#!/bin/sh\nexit 0\n".len()) as u64
+            );
+            if disposition == ToolchainDisposition::Upload {
+                let received_sdk = sdk.seal(|| false).unwrap();
+                assert_eq!(received_sdk.identity(), &expected_sdk);
+                assert_eq!(sdk_bytes, expected_sdk.bytes);
+                assert!(sdk_entries > 0);
+                assert_eq!(
+                    fs::read(received_sdk.root().join("lib/runtime")).unwrap(),
+                    fixture.runtime_bytes
+                );
+            } else {
+                assert_eq!((sdk_bytes, sdk_entries), (0, 0));
+                assert_eq!(sdk.entry_count(), 0);
+            }
+            assert_eq!(
+                fs::read_dir(fixture.owner.path().join("scratch"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_reuse_still_refuses_mutated_source_or_retained_sdk_before_inputs_done() {
+        for mutate_sdk in [false, true] {
+            let mut fixture = InputFixture::new();
+            let peer = fixture.upload_peer(ToolchainDisposition::Reuse);
+            let path = if mutate_sdk {
+                fixture
+                    .bundle
+                    .toolchain
+                    .as_ref()
+                    .unwrap()
+                    .root()
+                    .join("lib/runtime")
+            } else {
+                fixture
+                    .bundle
+                    .source
+                    .sealed_root()
+                    .unwrap()
+                    .join("a-binary")
+            };
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(path, b"changed retained input").unwrap();
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let stopped = AtomicBool::new(false);
+            let result = native(async {
+                let (deadline, disposition) = await_input_admission(
+                    &mut wire,
+                    &stopped,
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await?;
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &fixture.owner.path().join("scratch"),
+                    disposition,
+                    &stopped,
+                    deadline,
+                )
+                .await?;
+                wire.send(&Message::InputsDone, &stopped, deadline).await
+            });
+            assert!(result.is_err(), "changed retained inputs cannot execute");
+            for message in admission_messages(&output) {
+                assert!(matches!(
+                    message["kind"].as_str(),
+                    Some("source-chunk" | "window-end")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_reuse_failure_or_second_disposition_never_restarts_the_upload() {
+        for (reply, expected) in [
+            (
+                Some(Message::Ready {
+                    toolchain: ToolchainDisposition::Upload,
+                }),
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                Some(Message::Failure {
+                    message: "cached SDK became unavailable".into(),
+                }),
+                io::ErrorKind::InvalidData,
+            ),
+            (Some(Message::Cancel), io::ErrorKind::Interrupted),
+            (None, io::ErrorKind::UnexpectedEof),
+        ] {
+            let mut fixture = InputFixture::new();
+            let mut replies = vec![Message::Ready {
+                toolchain: ToolchainDisposition::Reuse,
+            }];
+            replies.extend(reply);
+            let mut peer = AdmissionStream::new(&replies, false);
+            peer.quantum = MAX_JSON_RECORD;
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let stopped = AtomicBool::new(false);
+            let result = native(async {
+                let (deadline, disposition) = await_input_admission(
+                    &mut wire,
+                    &stopped,
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await?;
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &fixture.owner.path().join("scratch"),
+                    disposition,
+                    &stopped,
+                    deadline,
+                )
+                .await?;
+                wire.send(&Message::InputsDone, &stopped, deadline).await
+            });
+            assert_eq!(result.unwrap_err().kind(), expected);
+            let messages = admission_messages(&output);
+            assert_eq!(messages.len(), wire::WINDOW as usize + 1);
+            assert!(messages[..wire::WINDOW as usize]
+                .iter()
+                .all(|message| message["kind"] == "source-chunk"));
+            assert_eq!(
+                messages.last().unwrap(),
+                &json!({"kind":"window-end", "count":wire::WINDOW})
+            );
         }
     }
 
@@ -1103,7 +1399,9 @@ mod tests {
         // real Rust compiler; plaintext ATP is confined to test loopback.
         let mut fixture = InputFixture::new();
         let destination = private();
-        let (source, toolchain) = fixture.receivers(destination.path());
+        let sdk_destination = Arc::new(private());
+        let (source, toolchain) =
+            fixture.receivers(destination.path(), sdk_destination.path());
         let expected_source = fixture.bundle.source.manifest().clone();
         let expected_sdk = *fixture.bundle.toolchain.as_ref().unwrap().identity();
         assert!(fixture.source_bytes.len() > MAX_SOURCE_CHUNK * wire::WINDOW as usize);
@@ -1120,7 +1418,14 @@ mod tests {
                     let stopped = AtomicBool::new(false);
                     let deadline = Instant::now() + Duration::from_secs(25);
                     let sealed = super::super::receive_inputs(
-                        &mut wire, source, toolchain, &stopped, deadline,
+                        &mut wire,
+                        source,
+                        ToolchainInput::Upload {
+                            receiver: Box::new(toolchain),
+                            owner: sdk_destination,
+                        },
+                        &stopped,
+                        deadline,
                     )
                     .await?;
                     wire.send(&Message::Accepted, &stopped, deadline).await?;
@@ -1133,7 +1438,15 @@ mod tests {
                 let mut wire = Wire::new(JsonAtpStream::new(stream));
                 let stopped = AtomicBool::new(false);
                 let deadline = Instant::now() + Duration::from_secs(25);
-                upload_inputs(&mut wire, &mut fixture.bundle, &scratch, &stopped, deadline).await?;
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &scratch,
+                    ToolchainDisposition::Upload,
+                    &stopped,
+                    deadline,
+                )
+                .await?;
                 wire.send(&Message::InputsDone, &stopped, deadline).await?;
                 require(
                     matches!(
@@ -1184,7 +1497,7 @@ mod tests {
                 & 0o7777,
             0o555
         );
-        sdk.verify_retained_generation(|| false).unwrap();
+        sdk.image().verify_retained_generation(|| false).unwrap();
         assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
     }
 
@@ -1193,7 +1506,10 @@ mod tests {
         for cancel in [true, false] {
             let mut fixture = InputFixture::new();
             let destination = private();
-            let (mut source, toolchain) = fixture.receivers(destination.path());
+            let sdk_destination = Arc::new(private());
+            let sdk_root = sdk_destination.path().join("toolchain");
+            let (mut source, toolchain) =
+                fixture.receivers(destination.path(), sdk_destination.path());
             let client_stop = Arc::new(AtomicBool::new(false));
             let disconnect = Arc::new(AtomicBool::new(false));
             let accepted = Arc::new(AtomicBool::new(false));
@@ -1239,7 +1555,14 @@ mod tests {
                         // The production receiver retains the real prefix.
                         // Neither EOF nor cancellation can return sealed owners.
                         let received = super::super::receive_inputs(
-                            &mut wire, source, toolchain, &stopped, deadline,
+                            &mut wire,
+                            source,
+                            ToolchainInput::Upload {
+                                receiver: Box::new(toolchain),
+                                owner: sdk_destination,
+                            },
+                            &stopped,
+                            deadline,
                         )
                         .await;
                         match received {
@@ -1262,6 +1585,7 @@ mod tests {
                             &mut wire,
                             &mut fixture.bundle,
                             &scratch,
+                            ToolchainDisposition::Upload,
                             &client_stop,
                             deadline,
                         ));
@@ -1300,7 +1624,7 @@ mod tests {
             let prefix = fs::read(destination.path().join("source/a-binary")).unwrap();
             assert_eq!(prefix.len(), MAX_SOURCE_CHUNK * wire::WINDOW as usize);
             assert_eq!(prefix, fixture.source_bytes[..prefix.len()]);
-            assert!(!destination.path().join("toolchain/bin/compiler").exists());
+            assert!(!sdk_root.join("bin/compiler").exists());
         }
     }
 }

@@ -4,6 +4,7 @@
 //! sealed source and compiler owners, injects every physical path, and keeps
 //! the same coordinator publication provenance through final artifact delivery.
 
+use super::remote_toolchains::ReceivedToolchain;
 use super::{
     CompilationCommand, CompilationSelection, OperationOutput, OperationProvenance, Profile,
     SharedRuntime, SourceSelection, default_jobs, default_manifest, default_timeout, invalid,
@@ -14,7 +15,6 @@ use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_sandbox::artifact_tree::TreeInventory;
 use rabs_sandbox::cargo_target::state::SourceTimestamps;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceReceiver};
-use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -108,7 +108,7 @@ impl RemoteOperationSettings {
 pub(super) struct RemoteOperationInputs {
     // Close receiver/compiler handles before releasing their private parent.
     pub(super) source: SourceReceiver,
-    pub(super) toolchain: Arc<PreparedToolchain>,
+    pub(super) toolchain: Arc<ReceivedToolchain>,
     pub(super) owner: Arc<tempfile::TempDir>,
     pub(super) request: Value,
 }
@@ -117,7 +117,7 @@ impl RemoteOperationInputs {
     pub(super) fn new(
         owner: Arc<tempfile::TempDir>,
         source: SourceReceiver,
-        toolchain: Arc<PreparedToolchain>,
+        toolchain: Arc<ReceivedToolchain>,
         request: Value,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Self> {
@@ -141,13 +141,10 @@ impl RemoteOperationInputs {
         require(
             source != self.owner.path()
                 && source.starts_with(self.owner.path())
-                && self.toolchain.root() != self.owner.path()
-                && self.toolchain.root().starts_with(self.owner.path())
-                && !overlap(source, self.toolchain.root()),
-            "remote source and compiler must have disjoint backing under their retained owner",
+                && !overlap(self.owner.path(), self.toolchain.owner().path()),
+            "remote source and compiler must have disjoint retained owners",
         )?;
         private_directory(source)?;
-        super::ordinary_directory(self.toolchain.root())?;
         let allowed = [
             "kind",
             "request_id",
@@ -180,11 +177,11 @@ impl RemoteOperationInputs {
         )?;
         require(
             worker_delivery::toolchain_identity(&self.request)?.as_ref()
-                == Some(self.toolchain.identity()),
+                == Some(self.toolchain.image().identity()),
             "remote compiler owner differs from the prepared request identity",
         )?;
         verify_source(&self.source, stopped)?;
-        self.toolchain.verify_retained_generation(stopped)?;
+        self.toolchain.verify(stopped)?;
         checkpoint(stopped)
     }
 
@@ -266,9 +263,7 @@ impl RemoteOperationOutcome {
             self.provenance.coord.authority().as_ref() == Some(&self.authority),
             "remote completion lost its original coordinator authority",
         )?;
-        if let Some(toolchain) = self.provenance.paths.captured_toolchain() {
-            toolchain.verify_retained_generation(cancelled)?;
-        }
+        self.provenance.paths.verify_captured_toolchain(&cancelled)?;
         verify_source(&self.provenance._source, &cancelled)?;
         self.provenance
             .paths
@@ -473,6 +468,8 @@ mod tests {
 
     fn fixture_with_owner(owner: Arc<tempfile::TempDir>) -> RemoteOperationInputs {
         let compiler_source = tempfile::tempdir().unwrap();
+        let sdk_owner = Arc::new(crate::test_util::private_tempdir());
+        fs::create_dir(compiler_source.path().join("lib")).unwrap();
         fs::write(
             compiler_source.path().join("compiler-data"),
             b"fixture dataset",
@@ -481,13 +478,14 @@ mod tests {
         let toolchain = Arc::new(
             capture_toolchain(
                 compiler_source.path(),
-                &owner.path().join("toolchain"),
+                &sdk_owner.path().join("toolchain"),
                 None,
                 &ToolchainLimits::default(),
                 || false,
             )
             .unwrap(),
         );
+        let toolchain = Arc::new(ReceivedToolchain::new(sdk_owner, toolchain, || false).unwrap());
         let bytes = b"[package]\nname = 'input-owner-fixture'\nversion = '0.1.0'\n";
         let manifest = SourceManifest::new(vec![SourceFile {
             path: "Cargo.toml".into(),
@@ -581,6 +579,7 @@ mod tests {
     fn canonical_producer_owner_retains_uploaded_inputs_after_request_drop() {
         let inputs = fixture();
         let input_root = inputs.owner.path().to_path_buf();
+        let sdk_root = inputs.toolchain.owner().path().to_path_buf();
         let runtime = Arc::new(crate::test_util::private_tempdir());
         let runtime_root = runtime.path().to_path_buf();
         let paths = remote_paths(&inputs, &runtime);
@@ -590,6 +589,7 @@ mod tests {
         drop(paths);
         assert!(runtime_root.join("target").is_dir());
         assert!(input_root.join("source/Cargo.toml").is_file());
+        assert!(sdk_root.join("toolchain/compiler-data").is_file());
         subscriber
             .captured_toolchain()
             .unwrap()
@@ -598,6 +598,108 @@ mod tests {
         drop(subscriber);
         assert!(!runtime_root.exists());
         assert!(!input_root.exists());
+        assert!(!sdk_root.exists());
+    }
+
+    #[test]
+    fn shared_sdk_does_not_retain_another_operations_source_or_runtime() {
+        let first = fixture();
+        let mut second = fixture();
+        second.toolchain = Arc::clone(&first.toolchain);
+        second.verify(&|| false).unwrap();
+        let first_source = first.owner.path().to_path_buf();
+        let second_source = second.owner.path().to_path_buf();
+        let sdk_root = first.toolchain.owner().path().to_path_buf();
+        let first_runtime = Arc::new(crate::test_util::private_tempdir());
+        let second_runtime = Arc::new(crate::test_util::private_tempdir());
+        let first_runtime_path = first_runtime.path().to_path_buf();
+        let second_runtime_path = second_runtime.path().to_path_buf();
+        let first_paths = remote_paths(&first, &first_runtime);
+        let second_paths = remote_paths(&second, &second_runtime);
+        assert!(Arc::ptr_eq(
+            first_paths.captured_toolchain().unwrap(),
+            second_paths.captured_toolchain().unwrap(),
+        ));
+        drop((first, first_runtime, first_paths));
+        assert!(!first_source.exists());
+        assert!(!first_runtime_path.exists());
+        assert!(second_source.join("source/Cargo.toml").is_file());
+        assert!(sdk_root.join("toolchain/compiler-data").is_file());
+        second_paths.verify_captured_toolchain(&|| false).unwrap();
+        // A downstream upload can keep only the SDK image and its actual
+        // owner after the canonical operation and source have drained.
+        let image = Arc::clone(second_paths.captured_toolchain().unwrap());
+        let sdk_owner = Arc::clone(second.toolchain.owner());
+        drop((second, second_runtime, second_paths));
+        assert!(!second_source.exists());
+        assert!(!second_runtime_path.exists());
+        image.verify_retained_generation(|| false).unwrap();
+        assert_eq!(sdk_owner.path(), sdk_root);
+        drop(image);
+        drop(sdk_owner);
+        assert!(!sdk_root.exists());
+    }
+
+    #[test]
+    fn received_sdk_only_authorizes_its_exact_readonly_compiler_mount() {
+        let inputs = fixture();
+        let runtime = Arc::new(crate::test_util::private_tempdir());
+        let paths = remote_paths(&inputs, &runtime);
+        let logical_roots = [
+            "/__rabs/workspace",
+            "/__rabs/cargo-home",
+            "/__rabs/toolchain",
+            "/__rabs/out/cargo",
+            "/__rabs/home",
+        ];
+        let mappings = logical_roots
+            .iter()
+            .map(|root| (PathBuf::from(root), paths.physical(Path::new(root)).unwrap()))
+            .collect::<Vec<_>>();
+        // A legitimate captured subdirectory keeps lease verification valid;
+        // the refusal must come from the mount capability, not corrupt data.
+        let unrelated_sdk_directory = inputs.toolchain.root().join("lib");
+        inputs.toolchain.verify(|| false).unwrap();
+        for index in 0..logical_roots.len() {
+            let mut forged = mappings.clone();
+            forged[index].1 = unrelated_sdk_directory.clone();
+            assert!(
+                super::super::CanonicalPaths::new_with_received_toolchain(
+                    Arc::clone(&runtime),
+                    Arc::clone(&inputs.owner),
+                    Arc::clone(&inputs.toolchain),
+                    forged,
+                )
+                .is_err(),
+                "received SDK custody authorized {} outside its declared mount",
+                logical_roots[index],
+            );
+        }
+        let foreign = fixture();
+        assert!(
+            super::super::CanonicalPaths::new_with_received_toolchain(
+                runtime,
+                Arc::clone(&inputs.owner),
+                Arc::clone(&foreign.toolchain),
+                mappings,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_sdk_mutation_invalidates_every_retained_operation() {
+        let first = fixture();
+        let mut second = fixture();
+        second.toolchain = Arc::clone(&first.toolchain);
+        let runtime = Arc::new(crate::test_util::private_tempdir());
+        let paths = remote_paths(&first, &runtime);
+        let compiler = first.toolchain.root().join("compiler-data");
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&compiler, b"changed dataset").unwrap();
+        assert!(first.verify(&|| false).is_err());
+        assert!(second.verify(&|| false).is_err());
+        assert!(paths.verify_captured_toolchain(&|| false).is_err());
     }
 
     fn remote_paths(
@@ -611,9 +713,10 @@ mod tests {
                 .create(root.join(child))
                 .unwrap();
         }
-        super::super::CanonicalPaths::new_with_input_owner(
+        super::super::CanonicalPaths::new_with_received_toolchain(
             Arc::clone(runtime),
             Arc::clone(&inputs.owner),
+            Arc::clone(&inputs.toolchain),
             vec![
                 (
                     "/__rabs/workspace".into(),
@@ -629,7 +732,7 @@ mod tests {
             ],
         )
         .unwrap()
-        .with_captured_toolchain(Some(Arc::clone(&inputs.toolchain)))
+        .with_captured_toolchain(Some(Arc::clone(inputs.toolchain.image())))
         .unwrap()
     }
 

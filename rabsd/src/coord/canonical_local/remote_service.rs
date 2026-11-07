@@ -12,6 +12,7 @@ pub use client::run_client_profile;
 
 use super::remote_artifacts::CapturedTarget;
 use super::remote_operation::{self, RemoteOperationInputs, RemoteOperationOutcome};
+use super::remote_toolchains::{ReceivedToolchain, RemoteToolchainCache};
 use super::service::{AdmittedOperation, OperationAdmissions};
 use super::{SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory};
 use crate::coord::{source_manifest, worker_delivery};
@@ -25,7 +26,7 @@ use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_tran
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceReceiver};
-use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits};
+use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
     TOOLCHAIN_INPUT_BUDGET, TOOLCHAIN_TRANSFER_VERSION, ToolchainReceiver,
 };
@@ -41,7 +42,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wire::{
-    Chunk, Manifest, Message, Output, VERSION, Window, Wire, checkpoint, digest, invalid, require,
+    Chunk, Manifest, Message, Output, ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint,
+    digest, invalid, require,
 };
 
 const SERVICE_VERSION: &str = "canonical-compile-remote-service-v1";
@@ -92,11 +94,20 @@ struct ServiceProfile {
     max_queued_roots: usize,
     #[serde(default = "default_queue_timeout_seconds")]
     queue_timeout_seconds: u64,
+    /// Retain only verified SDKs, independently of each operation's source.
+    #[serde(default)]
+    toolchain_cache_bytes: u64,
+    #[serde(default = "default_toolchain_cache_entries")]
+    toolchain_cache_entries: usize,
     jobs_per_root: u32,
 }
 
 fn default_queue_timeout_seconds() -> u64 {
     300
+}
+
+fn default_toolchain_cache_entries() -> usize {
+    4
 }
 
 impl ServiceProfile {
@@ -118,6 +129,11 @@ impl ServiceProfile {
         require(
             (1..=wire::ADMISSION_BUDGET.as_secs()).contains(&self.queue_timeout_seconds),
             "remote service queue_timeout_seconds must be between 1 and 1800",
+        )?;
+        require(
+            self.toolchain_cache_bytes <= 64 * 1024 * 1024 * 1024
+                && (1..=32).contains(&self.toolchain_cache_entries),
+            "remote toolchain cache must be at most 64 GiB and between 1 and 32 entries",
         )?;
         let roots = [&self.state_root, &self.input_root, &self.operation_root];
         for (index, root) in roots.iter().enumerate() {
@@ -257,6 +273,10 @@ pub fn run_service_profile(
         config.jobs_per_root,
     )?;
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
+    let toolchains = Arc::new(RemoteToolchainCache::new(
+        config.toolchain_cache_bytes,
+        config.toolchain_cache_entries,
+    )?);
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
@@ -267,6 +287,8 @@ pub fn run_service_profile(
         "address":listener.local_addr()?.to_string(), "max_roots":config.max_roots,
         "max_queued_roots":config.max_queued_roots,
         "queue_timeout_seconds":config.queue_timeout_seconds,
+        "toolchain_cache_bytes":config.toolchain_cache_bytes,
+        "toolchain_cache_entries":config.toolchain_cache_entries,
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
         "transport":"mutual-tls-atp", "cargo_location":"coordinator"})
@@ -299,6 +321,7 @@ pub fn run_service_profile(
         let child_config = Arc::clone(&config);
         let child_runtime = Arc::clone(&runtime);
         let child_admissions = Arc::clone(&admissions);
+        let child_toolchains = Arc::clone(&toolchains);
         let child_acceptor = Arc::clone(&acceptor);
         let child_pins = Arc::clone(&pins);
         // The accepted socket has not been polled. Its first I/O registration
@@ -313,12 +336,17 @@ pub fn run_service_profile(
                     let peer = accept_edge_peer(&child_acceptor, stream, &child_pins)
                         .await
                         .map_err(io::Error::other)?;
+                    // Namespace reuse by the key actually authenticated and
+                    // enrolled by TLS, never a client-supplied Hello field.
+                    let edge_pin = peer.identity.peer_id;
                     let mut wire = Wire::new(peer.stream);
                     let result = handle_session(
                         &mut wire,
                         child_runtime,
                         &child_config,
                         &child_admissions,
+                        &child_toolchains,
+                        edge_pin,
                         &child_stop,
                     )
                     .await;
@@ -402,11 +430,68 @@ fn prepared_request(
     Ok(request)
 }
 
+/// A transfer decision retains its exact SDK custody through source upload.
+/// Announcing reuse cannot later select a receiver or another cached image.
+enum ToolchainInput {
+    Upload {
+        receiver: Box<ToolchainReceiver>,
+        owner: Arc<tempfile::TempDir>,
+    },
+    Reuse(Arc<ReceivedToolchain>),
+}
+
+impl ToolchainInput {
+    fn disposition(&self) -> ToolchainDisposition {
+        match self {
+            Self::Upload { .. } => ToolchainDisposition::Upload,
+            Self::Reuse(_) => ToolchainDisposition::Reuse,
+        }
+    }
+}
+
+fn prepare_toolchain_input(
+    cache: &RemoteToolchainCache,
+    edge_pin: [u8; 32],
+    identity: ToolchainIdentity,
+    input_root: &Path,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<ToolchainInput> {
+    if let Some(lease) = cache.lookup(edge_pin, &identity, &cancelled)? {
+        return Ok(ToolchainInput::Reuse(lease));
+    }
+    // Keep SDK custody separate from source and diagnostics. Retaining a
+    // compiler must never retain an earlier client's complete workspace.
+    let owner = Arc::new(
+        tempfile::Builder::new()
+            .prefix("canonical-remote-sdk-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(input_root)?,
+    );
+    let receiver = ToolchainReceiver::create(
+        &owner.path().join("toolchain"),
+        identity,
+        ToolchainLimits::default(),
+    )?;
+    Ok(ToolchainInput::Upload {
+        receiver: Box::new(receiver),
+        owner,
+    })
+}
+
+fn require_wire_identity(version: &str, build_identity: &str, expected: &str) -> io::Result<()> {
+    require(
+        version == WIRE_VERSION && build_identity == expected,
+        "remote client and service protocol/build identities differ",
+    )
+}
+
 async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     runtime: Arc<SharedRuntime>,
     config: &ServiceProfile,
     admissions: &Arc<OperationAdmissions>,
+    toolchains: &RemoteToolchainCache,
+    edge_pin: [u8; 32],
     stopped: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let declaration_deadline = Instant::now() + wire::IO_BUDGET;
@@ -422,10 +507,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     else {
         return Err(invalid("remote operation must begin with hello"));
     };
-    require(
-        version == VERSION && build_identity == runtime.build_identity,
-        "remote client and service protocol/build identities differ",
-    )?;
+    require_wire_identity(&version, &build_identity, &runtime.build_identity)?;
     require(
         !require_release || runtime.release_mode == ReleaseAuthorizationMode::Required,
         "remote service cannot downgrade required release authorization",
@@ -455,6 +537,19 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         acquire_operation(wire, admissions, stopped, queue_deadline, || runtime.healthy())
             .await?;
     let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
+    let cancelled = || {
+        stopped.load(Ordering::Acquire)
+            || !runtime.healthy()
+            || Instant::now() >= input_deadline
+    };
+    let toolchain = prepare_toolchain_input(
+        toolchains,
+        edge_pin,
+        identity,
+        &config.input_root,
+        &cancelled,
+    )?;
+    let disposition = toolchain.disposition();
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("canonical-remote-input-")
@@ -462,18 +557,22 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             .tempdir_in(&config.input_root)?,
     );
     let source = SourceReceiver::create(&owner.path().join("source"), manifest)?;
-    let toolchain = ToolchainReceiver::create(
-        &owner.path().join("toolchain"),
-        identity,
-        ToolchainLimits::default(),
-    )?;
-    wire.send(&Message::Ready, stopped, input_deadline).await?;
+    wire.send(
+        &Message::Ready {
+            toolchain: disposition,
+        },
+        stopped,
+        input_deadline,
+    )
+    .await?;
     let (source, toolchain) =
         receive_inputs(wire, source, toolchain, stopped, input_deadline).await?;
+    let toolchain = match disposition {
+        ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, &cancelled)?,
+        ToolchainDisposition::Reuse => toolchain,
+    };
     let inputs =
-        RemoteOperationInputs::new(Arc::clone(&owner), source, toolchain, request, &|| {
-            stopped.load(Ordering::Acquire) || Instant::now() >= input_deadline
-        })?;
+        RemoteOperationInputs::new(Arc::clone(&owner), source, toolchain, request, &cancelled)?;
     checkpoint(stopped, input_deadline)?;
     let stdout = output_file(owner.path(), "stdout")?;
     let stderr = output_file(owner.path(), "stderr")?;
@@ -612,12 +711,13 @@ async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
 async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     mut source: SourceReceiver,
-    mut toolchain: ToolchainReceiver,
+    mut toolchain: ToolchainInput,
     stopped: &AtomicBool,
     input_deadline: Instant,
-) -> io::Result<(SourceReceiver, Arc<PreparedToolchain>)> {
+) -> io::Result<(SourceReceiver, Arc<ReceivedToolchain>)> {
     let mut window = Window::default();
     let mut source_finished = false;
+    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= input_deadline;
     loop {
         checkpoint(stopped, input_deadline)?;
         let message = wire.receive_until(stopped, input_deadline).await?;
@@ -632,20 +732,24 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 source.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
             }
             Message::ToolchainEntry { entry } => {
+                let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
+                    return Err(invalid("SDK entries are forbidden after toolchain reuse admission"));
+                };
                 window.record()?;
                 if !source_finished {
-                    source.seal_cancellable(|| {
-                        stopped.load(Ordering::Acquire) || Instant::now() >= input_deadline
-                    })?;
+                    source.seal_cancellable(&cancelled)?;
                     source_finished = true;
                 }
-                toolchain.entry(entry.native())?;
+                receiver.entry(entry.native())?;
             }
             Message::ToolchainChunk { chunk } => {
+                let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
+                    return Err(invalid("SDK bytes are forbidden after toolchain reuse admission"));
+                };
                 require(source_finished, "toolchain bytes arrived before its entry")?;
                 window.record()?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
-                toolchain.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
+                receiver.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
             }
             Message::WindowEnd { count } => {
                 window.acknowledge(count)?;
@@ -654,17 +758,36 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Message::InputsDone => {
                 require(
-                    source_finished && !window.pending(),
+                    !window.pending(),
                     "remote inputs ended before their complete acknowledged transfer",
                 )?;
+                if !source_finished {
+                    require(
+                        matches!(toolchain, ToolchainInput::Reuse(_)),
+                        "remote inputs ended before the declared SDK upload",
+                    )?;
+                    // A hit skips only the SDK transfer. Source still crosses
+                    // the same complete manifest/byte sealing boundary.
+                    source.seal_cancellable(&cancelled)?;
+                }
                 break;
             }
             _ => return Err(invalid("unexpected message during remote input transfer")),
         }
     }
-    let toolchain = Arc::new(
-        toolchain.seal(|| stopped.load(Ordering::Acquire) || Instant::now() >= input_deadline)?,
-    );
+    let toolchain = match toolchain {
+        ToolchainInput::Upload { mut receiver, owner } => Arc::new(ReceivedToolchain::new(
+            owner,
+            Arc::new(receiver.seal(&cancelled)?),
+            &cancelled,
+        )?),
+        ToolchainInput::Reuse(lease) => {
+            // Recheck the exact owner pinned before Ready. Corruption or
+            // cancellation cannot trigger a hidden upload or a different hit.
+            lease.verify(&cancelled)?;
+            lease
+        }
+    };
     checkpoint(stopped, input_deadline)?;
     Ok((source, toolchain))
 }
@@ -916,6 +1039,8 @@ mod tests {
         .unwrap();
         assert_eq!(profile.max_queued_roots, 0);
         assert_eq!(profile.queue_timeout_seconds, 300);
+        assert_eq!(profile.toolchain_cache_bytes, 0);
+        assert_eq!(profile.toolchain_cache_entries, 4);
         assert_eq!(profile.max_sessions(), 2);
         profile.validate().unwrap();
         profile.max_roots = 32;
@@ -930,6 +1055,261 @@ mod tests {
             profile.queue_timeout_seconds = timeout;
             assert!(profile.validate().is_err(), "timeout {timeout}");
         }
+        profile.queue_timeout_seconds = 300;
+        profile.toolchain_cache_bytes = 64 * 1024 * 1024 * 1024;
+        profile.toolchain_cache_entries = 32;
+        profile.validate().unwrap();
+        for entries in [0, 33, usize::MAX] {
+            profile.toolchain_cache_entries = entries;
+            assert!(profile.validate().is_err(), "cache entries {entries}");
+        }
+        profile.toolchain_cache_entries = 4;
+        for bytes in [64 * 1024 * 1024 * 1024 + 1, u64::MAX] {
+            profile.toolchain_cache_bytes = bytes;
+            assert!(profile.validate().is_err(), "cache bytes {bytes}");
+        }
+    }
+
+    #[test]
+    fn remote_sdk_decision_requires_v2_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v2", "build-one", "build-one").unwrap();
+        for (version, identity) in [
+            ("canonical-compile-remote-v1", "build-one"),
+            ("canonical-compile-remote-v2", "build-two"),
+            ("", "build-one"),
+        ] {
+            assert_eq!(
+                require_wire_identity(version, identity, "build-one")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    fn received_sdk() -> Arc<ReceivedToolchain> {
+        let original = crate::test_util::private_tempdir();
+        fs::write(original.path().join("compiler-data"), b"verified SDK").unwrap();
+        let owner = Arc::new(crate::test_util::private_tempdir());
+        let image = rabs_sandbox::toolchain_dataset::capture_toolchain(
+            original.path(),
+            &owner.path().join("toolchain"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        Arc::new(ReceivedToolchain::new(owner, Arc::new(image), || false).unwrap())
+    }
+
+    fn source_receiver(owner: &Path, bytes: &[u8]) -> SourceReceiver {
+        let manifest = SourceManifest::new(vec![SourceFile {
+            path: "src/lib.rs".into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        }])
+        .unwrap();
+        SourceReceiver::create(&owner.join("source"), manifest).unwrap()
+    }
+
+    fn source_upload(bytes: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        if !bytes.is_empty() {
+            input.extend(record(&Message::SourceChunk {
+                chunk: Chunk::new("src/lib.rs", 0, bytes).unwrap(),
+            }));
+            input.extend(record(&Message::WindowEnd { count: 1 }));
+        }
+        input.extend(record(&Message::InputsDone));
+        input
+    }
+
+    #[test]
+    fn verified_sdk_hit_is_peer_scoped_and_creates_no_upload_tree() {
+        let cache = RemoteToolchainCache::new(1024, 4).unwrap();
+        let sdk = received_sdk();
+        let pin = [7; 32];
+        let retained = cache.adopt(pin, Arc::clone(&sdk), || false).unwrap();
+        assert!(Arc::ptr_eq(&retained, &sdk));
+        let inputs = crate::test_util::private_tempdir();
+        let selection = prepare_toolchain_input(
+            &cache,
+            pin,
+            *sdk.identity(),
+            inputs.path(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(selection.disposition(), ToolchainDisposition::Reuse);
+        let ToolchainInput::Reuse(hit) = selection else {
+            panic!("verified retained SDK should skip upload");
+        };
+        assert!(Arc::ptr_eq(&hit, &sdk));
+        assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
+
+        // Another enrolled principal must upload its own independently
+        // verified data, even with an identical declared content digest.
+        let selection = prepare_toolchain_input(
+            &cache,
+            [8; 32],
+            *sdk.identity(),
+            inputs.path(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(selection.disposition(), ToolchainDisposition::Upload);
+        let ToolchainInput::Upload { owner, .. } = selection else {
+            panic!("a different authenticated peer must upload its own SDK");
+        };
+        assert!(owner.path().starts_with(inputs.path()));
+        assert_ne!(owner.path(), sdk.owner().path());
+        assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 1);
+        sdk.verify(|| false).unwrap();
+    }
+
+    #[test]
+    fn reused_sdk_seals_fresh_source_without_any_toolchain_frame() {
+        for bytes in [b"new source bytes".as_slice(), b"".as_slice()] {
+            let sdk = received_sdk();
+            let owner = crate::test_util::private_tempdir();
+            let source = source_receiver(owner.path(), bytes);
+            let manifest = source.manifest().clone();
+            let peer = AdmissionPeer::new(source_upload(bytes));
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let (source, retained) = ready(receive_inputs(
+                &mut wire,
+                source,
+                ToolchainInput::Reuse(Arc::clone(&sdk)),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .unwrap();
+            assert!(Arc::ptr_eq(&retained, &sdk));
+            assert_eq!(source.manifest(), &manifest);
+            assert_eq!(
+                fs::read(source.sealed_root().unwrap().join("src/lib.rs")).unwrap(),
+                bytes
+            );
+            assert!(!sdk.root().starts_with(owner.path()));
+            assert!(!owner.path().join("toolchain").exists());
+            assert_eq!(
+                messages(&output),
+                if bytes.is_empty() {
+                    Vec::<Value>::new()
+                } else {
+                    vec![json!({"kind":"window", "count":1})]
+                }
+            );
+            sdk.verify(|| false).unwrap();
+        }
+    }
+
+    #[test]
+    fn reuse_refuses_incomplete_unacknowledged_or_unrequested_input_bytes() {
+        let bytes = b"fresh input";
+        let chunk = record(&Message::SourceChunk {
+            chunk: Chunk::new("src/lib.rs", 0, bytes).unwrap(),
+        });
+        let incomplete = record(&Message::SourceChunk {
+            chunk: Chunk::new("src/lib.rs", 0, &bytes[..2]).unwrap(),
+        });
+        let wrong = record(&Message::SourceChunk {
+            chunk: Chunk::new("src/lib.rs", 0, b"wrong input").unwrap(),
+        });
+        let window = record(&Message::WindowEnd { count: 1 });
+        let done = record(&Message::InputsDone);
+        for input in [
+            done.clone(),
+            [chunk, done.clone()].concat(),
+            [incomplete, window.clone(), done.clone()].concat(),
+            [wrong, window, done].concat(),
+            record(&Message::ToolchainEntry {
+                entry: wire::Entry::Directory { path: "lib".into() },
+            }),
+            record(&Message::ToolchainChunk {
+                chunk: Chunk::new("compiler-data", 0, b"injected SDK").unwrap(),
+            }),
+        ] {
+            let sdk = received_sdk();
+            let owner = crate::test_util::private_tempdir();
+            let source = source_receiver(owner.path(), bytes);
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let error = ready(receive_inputs(
+                &mut wire,
+                source,
+                ToolchainInput::Reuse(Arc::clone(&sdk)),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .err()
+            .expect("reuse must preserve complete source and fixed SDK custody");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                messages(&output)
+                    .iter()
+                    .all(|message| message["kind"] == "window")
+            );
+            assert_eq!(
+                fs::read(sdk.root().join("compiler-data")).unwrap(),
+                b"verified SDK"
+            );
+            sdk.verify(|| false).unwrap();
+        }
+    }
+
+    #[test]
+    fn reused_sdk_mutation_during_source_upload_refuses_without_an_upload_retry() {
+        let sdk = received_sdk();
+        let owner = crate::test_util::private_tempdir();
+        let bytes = b"complete new source";
+        let source = source_receiver(owner.path(), bytes);
+        let mut peer = AdmissionPeer::new(source_upload(bytes));
+        let output = Arc::clone(&peer.output);
+        let changed = Arc::clone(&sdk);
+        peer.before_read = Some(Box::new(move || {
+            let path = changed.root().join("compiler-data");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(path, b"tampered SDK").unwrap();
+        }));
+        let mut wire = Wire::new(peer);
+        assert!(
+            ready(receive_inputs(
+                &mut wire,
+                source,
+                ToolchainInput::Reuse(sdk),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            messages(&output),
+            vec![json!({"kind":"window", "count":1})]
+        );
+        assert!(!owner.path().join("toolchain").exists());
+    }
+
+    #[test]
+    fn corrupt_cached_sdk_refuses_before_ready_without_creating_a_replacement() {
+        let cache = RemoteToolchainCache::new(1024, 4).unwrap();
+        let sdk = received_sdk();
+        let pin = [9; 32];
+        cache.adopt(pin, Arc::clone(&sdk), || false).unwrap();
+        let path = sdk.root().join("compiler-data");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, b"tampered SDK").unwrap();
+        let inputs = crate::test_util::private_tempdir();
+        assert!(
+            prepare_toolchain_input(
+                &cache, pin, *sdk.identity(), inputs.path(), || false,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
     }
 
     #[test]

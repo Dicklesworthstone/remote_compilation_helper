@@ -5,6 +5,8 @@
 //! capability. It is constructed by the driver, never decoded from a wrapper
 //! frame, and owns the operation directory until every request has drained.
 
+#[cfg(target_os = "linux")]
+use crate::coord::canonical_local::remote_toolchains::ReceivedToolchain;
 #[cfg(test)]
 use rabs_key::live_dependency::DependencySourceKind;
 use rabs_key::live_dependency::workspace_dependency_cache::CommittedDependencyPolicy;
@@ -50,6 +52,8 @@ struct Mount {
 pub struct CanonicalPaths {
     // Close captured filesystem descriptors before the operation directory.
     captured_toolchain: Option<Arc<PreparedToolchain>>,
+    #[cfg(target_os = "linux")]
+    received_toolchain: Option<Arc<ReceivedToolchain>>,
     input_owner: Option<Arc<tempfile::TempDir>>,
     _owner: Arc<tempfile::TempDir>,
     shared_toolchain: Option<Arc<RetainedToolchain>>,
@@ -150,18 +154,46 @@ impl CanonicalPaths {
         mappings: Vec<(PathBuf, PathBuf)>,
         shared_toolchain: Option<Arc<RetainedToolchain>>,
     ) -> Result<Arc<Self>, String> {
-        Self::new_owned(owner, mappings, shared_toolchain, None)
+        Self::new_owned(
+            owner,
+            mappings,
+            shared_toolchain,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
     }
 
     /// A remote operation retains uploaded inputs separately from its short
     /// runtime root. Only read-only source/compiler mounts may use that owner;
     /// writable HOME, Cargo home and targets remain under the runtime owner.
+    #[cfg(test)]
     pub(crate) fn new_with_input_owner(
         owner: Arc<tempfile::TempDir>,
         input_owner: Arc<tempfile::TempDir>,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<Arc<Self>, String> {
-        Self::new_owned(owner, mappings, None, Some(input_owner))
+        Self::new_owned(
+            owner,
+            mappings,
+            None,
+            Some(input_owner),
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Remote SDK reuse retains a distinct typed compiler lease. Only the
+    /// exact read-only toolchain mount may leave the source/runtime owners;
+    /// caching an SDK never retains an earlier client's source or outputs.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_with_received_toolchain(
+        owner: Arc<tempfile::TempDir>,
+        input_owner: Arc<tempfile::TempDir>,
+        toolchain: Arc<ReceivedToolchain>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_owned(owner, mappings, None, Some(input_owner), Some(toolchain))
     }
 
     fn new_owned(
@@ -169,6 +201,7 @@ impl CanonicalPaths {
         mappings: Vec<(PathBuf, PathBuf)>,
         shared_toolchain: Option<Arc<RetainedToolchain>>,
         input_owner: Option<Arc<tempfile::TempDir>>,
+        #[cfg(target_os = "linux")] received_toolchain: Option<Arc<ReceivedToolchain>>,
     ) -> Result<Arc<Self>, String> {
         let owned = owner.path();
         if !ordinary_absolute(owned) {
@@ -211,6 +244,20 @@ impl CanonicalPaths {
                 .verify_retained_generation(|| false)
                 .map_err(|error| error.to_string())?;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(toolchain) = &received_toolchain {
+            let parent = toolchain.owner().path();
+            if shared_toolchain.is_some()
+                || parent.starts_with(owned)
+                || owned.starts_with(parent)
+                || input_owner.as_ref().is_none_or(|inputs| {
+                    parent.starts_with(inputs.path()) || inputs.path().starts_with(parent)
+                })
+            {
+                return Err("received compiler must retain a distinct SDK owner".into());
+            }
+            toolchain.verify(|| false).map_err(|error| error.to_string())?;
+        }
         let mut visible = BTreeSet::new();
         let mut mounts: Vec<Mount> = Vec::new();
         for (logical, backing) in mappings {
@@ -232,6 +279,18 @@ impl CanonicalPaths {
                         ) && backing.starts_with(inputs.path())
                     })
                     .map_or(owned, |inputs| inputs.path()),
+            };
+            #[cfg(target_os = "linux")]
+            let mount_owner = match &received_toolchain {
+                Some(toolchain) if logical == Path::new("/__rabs/toolchain") => {
+                    if backing != toolchain.root() {
+                        return Err(
+                            "canonical compiler mount differs from its received lease".into(),
+                        );
+                    }
+                    toolchain.owner().path()
+                }
+                _ => mount_owner,
             };
             if !ROOTS.iter().any(|root| logical == Path::new(root))
                 || !visible.insert(logical.clone())
@@ -275,6 +334,8 @@ impl CanonicalPaths {
             _owner: owner,
             input_owner,
             shared_toolchain,
+            #[cfg(target_os = "linux")]
+            received_toolchain,
             captured_toolchain: None,
             mounts,
             closed_dependency_execution_required: false,
@@ -300,14 +361,21 @@ impl CanonicalPaths {
         let Some(toolchain) = toolchain else {
             return Ok(self);
         };
+        let owned = toolchain.root().starts_with(self._owner.path())
+            || self
+                .input_owner
+                .as_ref()
+                .is_some_and(|owner| toolchain.root().starts_with(owner.path()));
+        #[cfg(target_os = "linux")]
+        let owned = owned
+            || self
+                .received_toolchain
+                .as_ref()
+                .is_some_and(|received| Arc::ptr_eq(&toolchain, received.image()));
         if self.shared_toolchain.is_some()
             || self.captured_toolchain.is_some()
             || self.physical(Path::new("/__rabs/toolchain"))? != toolchain.root()
-            || !(toolchain.root().starts_with(self._owner.path())
-                || self
-                    .input_owner
-                    .as_ref()
-                    .is_some_and(|owner| toolchain.root().starts_with(owner.path())))
+            || !owned
         {
             return Err("captured compiler differs from its owned canonical mount".into());
         }
@@ -324,6 +392,22 @@ impl CanonicalPaths {
         self.captured_toolchain.as_ref()
     }
 
+    /// Recheck the exact compiler image and, for a reused remote SDK, its
+    /// separate directory witness at execution and delivery boundaries.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_captured_toolchain(
+        &self,
+        stopped: &impl Fn() -> bool,
+    ) -> std::io::Result<()> {
+        if let Some(received) = &self.received_toolchain {
+            received.verify(stopped)
+        } else if let Some(captured) = &self.captured_toolchain {
+            captured.verify_retained_generation(stopped)
+        } else {
+            Ok(())
+        }
+    }
+
     /// A compiler-only lease can outlive this operation's paths. Retain the
     /// actual validated SDK mount owner, independently of operation identity.
     pub(super) fn captured_toolchain_owner(&self) -> Result<&Arc<tempfile::TempDir>, String> {
@@ -334,6 +418,14 @@ impl CanonicalPaths {
         let backing = self.physical(Path::new("/__rabs/toolchain"))?;
         if backing != image.root() {
             return Err("captured compiler differs from its owned canonical mount".into());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(received) = &self.received_toolchain {
+            if !Arc::ptr_eq(image, received.image()) || backing != received.root() {
+                return Err("captured compiler differs from its retained SDK lease".into());
+            }
+            received.verify(|| false).map_err(|error| error.to_string())?;
+            return Ok(received.owner());
         }
         if let Some(inputs) = &self.input_owner
             && backing.starts_with(inputs.path())
@@ -1010,6 +1102,69 @@ mod tests {
         )
         .unwrap();
         assert!(paths.with_captured_toolchain(Some(image)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn received_compiler_exports_only_its_separate_sdk_owner() {
+        use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
+
+        let original = crate::test_util::private_tempdir();
+        std::fs::write(original.path().join("compiler"), b"received SDK bytes").unwrap();
+        let sdk_owner = Arc::new(crate::test_util::private_tempdir());
+        let image = Arc::new(
+            capture_toolchain(
+                original.path(),
+                &sdk_owner.path().join("toolchain"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let received = Arc::new(
+            ReceivedToolchain::new(Arc::clone(&sdk_owner), Arc::clone(&image), || false).unwrap(),
+        );
+        let (runtime, _) = fixture();
+        let (source, _) = fixture();
+        let runtime_path = runtime.path().to_path_buf();
+        let source_path = source.path().to_path_buf();
+        let sdk_path = sdk_owner.path().to_path_buf();
+        let mappings = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let backing = match *logical {
+                    "/__rabs/workspace" => source.path().join(index.to_string()),
+                    "/__rabs/toolchain" => image.root().to_path_buf(),
+                    _ => runtime.path().join(index.to_string()),
+                };
+                (PathBuf::from(logical), backing)
+            })
+            .collect();
+        let paths = CanonicalPaths::new_with_received_toolchain(
+            Arc::clone(&runtime),
+            Arc::clone(&source),
+            Arc::clone(&received),
+            mappings,
+        )
+        .unwrap()
+        .with_captured_toolchain(Some(Arc::clone(&image)))
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            paths.captured_toolchain_owner().unwrap(),
+            &sdk_owner,
+        ));
+        let escaped_owner = Arc::clone(paths.captured_toolchain_owner().unwrap());
+        let escaped_image = Arc::clone(paths.captured_toolchain().unwrap());
+        drop((paths, runtime, source, received, image, sdk_owner));
+        assert!(!runtime_path.exists());
+        assert!(!source_path.exists());
+        assert!(sdk_path.join("toolchain/compiler").is_file());
+        escaped_image.verify_retained_generation(|| false).unwrap();
+        drop(escaped_image);
+        drop(escaped_owner);
+        assert!(!sdk_path.exists());
     }
 
     #[test]

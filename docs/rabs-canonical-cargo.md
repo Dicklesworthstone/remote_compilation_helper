@@ -2413,6 +2413,8 @@ Save the complete service profile as `remote-service.json`:
   "max_roots": 4,
   "max_queued_roots": 16,
   "queue_timeout_seconds": 300,
+  "toolchain_cache_bytes": 8589934592,
+  "toolchain_cache_entries": 4,
   "jobs_per_root": 2
 }
 ```
@@ -2443,6 +2445,29 @@ It does not resubmit the operation. Once admitted, input transfer receives its
 own complete transfer budget. If all connection slots are occupied, the service
 still closes excess connections before authentication, without a plaintext
 response.
+
+The service can retain already uploaded SDKs for subsequent operations.
+`toolchain_cache_bytes` defaults to 0 (disabled) and accepts at most 64 GiB;
+`toolchain_cache_entries` defaults to 4 and accepts 1–32. The example enables
+an 8 GiB, four-image cache. Both limits apply to retained SDKs, including images
+still leased by operations or downstream uploads. Idle images may be evicted;
+a full or disabled cache still admits a normal private upload. These are
+logical retained-byte and image-count limits, separate from active operation
+input limits and filesystem free-space admission.
+
+Reuse requires the same enrolled TLS client key and complete toolchain dataset
+identity. The service verifies the cached image again before selecting reuse.
+The client then transfers its sealed source without SDK entries or SDK chunks.
+Every operation keeps its own source, runtime and output directories; a cached
+SDK retains only its dedicated compiler directory. Changes to the retained SDK
+or its ownership invalidate that generation and refuse the affected operation.
+A cache failure never causes a second execution, reconnection or local fallback.
+
+This cache lasts for the service process. A service restart requires a new SDK
+upload; no directory is adopted from a pathname or an old on-disk marker. The
+client still captures and validates its local SDK on each invocation. Reuse
+removes repeated SDK network transfer and reconstruction; it does not eliminate
+local capture or verification, and no end-to-end speedup is claimed here.
 
 Set the coordinator's dependency-worker environment before starting the service.
 For example, a single worker uses its own listener, separate from the remote
@@ -2517,8 +2542,9 @@ rabsd --canonical-compile-remote ./remote-build.json
 `coordinator` selects the remote host and port. `server_name` is checked against
 the coordinator certificate even when connecting by IP. All filesystem paths
 in the client profile are absolute and refer to that client. The captured source
-and toolchain are transferred as sealed datasets; the coordinator does not need
-access to those original host paths. The required `output_destination` names a
+and toolchain are admitted as sealed datasets; the coordinator does not need
+access to those original host paths. With SDK retention enabled, a verified
+same-client cache hit transfers only the source dataset. The required `output_destination` names a
 new directory whose immediate parent is owned and private.
 
 `settings` uses the same logical command, manifest, selection and literal
@@ -2640,8 +2666,12 @@ producer through the existing ownership path. Service shutdown stops admission
 and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
+Install matching client and coordinator binaries: SDK upload/reuse selection
+uses wire version `canonical-compile-remote-v2`, while existing client and
+service JSON profile versions remain unchanged. Older wire versions refuse
+before upload or execution.
 
-This first remote protocol has no detached-job resume or automatic operation
+This remote protocol has no detached-job resume or automatic operation
 retry after admission. A transport failure after acceptance can leave execution
 or final delivery uncertain. An interruption after the local atomic rename can
 leave the requested output already installed even when the client reports an
