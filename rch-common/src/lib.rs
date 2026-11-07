@@ -102,6 +102,19 @@ pub mod types;
 
 /// Standard-library-only worker guard shared by SSH and direct execution.
 pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
+
+/// Paired loop-break markers for an RCH-managed Cargo child process.
+///
+/// Install both only after execution has been admitted: on a worker command,
+/// a worker-owned benchmark, or an allowed local fallback. Never promote a
+/// caller's bypass flag into permission to run locally, or set these on the
+/// dispatcher process itself. Shim v9 rejects a bare bypass under remote-required
+/// policy; the origin is a cooperative provenance marker, not authentication.
+pub const MANAGED_CARGO_ENV: [(&str, &str); 2] = [
+    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+];
+
 pub mod ui;
 pub mod util;
 pub mod worker_config_validation;

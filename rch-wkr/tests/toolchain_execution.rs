@@ -62,6 +62,7 @@ esac
 const CARGO: &str = r#"#!/bin/sh
 set -eu
 printf '%s\n' "${RCH_TEST_SELECTED_TOOLCHAIN:-default}" "$@" >> "$RCH_TEST_STATE/cargo"
+printf '%s|%s\n' "${RCH_CARGO_WRAPPER_BYPASS-unset}" "${RCH_CARGO_WRAPPER_ORIGIN-unset}" >> "$RCH_TEST_STATE/markers"
 printf 'fixture compiler output\n'
 if [ "$RCH_TEST_COMMAND_STATUS" = signal ]; then
     kill -TERM "$$"
@@ -109,20 +110,12 @@ impl Fixture {
         self.root.path().join(name)
     }
 
-    fn run(&self, toolchain: Option<&str>, command_status: &str) -> Output {
+    fn worker_command(&self, workload: &str, command_status: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rch-wkr"));
         command
             .args(["execute", "--workdir"])
             .arg(self.path("work"))
-            .args(["--command", USER_COMMAND])
-            // These fixtures write only a few KiB. Exercise the real guard
-            // with an explicit small budget without depending on host GiB.
-            .args([
-                "--disk-budget-bytes",
-                "8388608",
-                "--disk-min-free-bytes",
-                "1048576",
-            ])
+            .args(["--command", workload])
             .env_clear()
             .env("PATH", self.path("bin"))
             .env("HOME", self.path("home"))
@@ -140,9 +133,26 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+
+    fn run(&self, toolchain: Option<&str>, command_status: &str) -> Output {
+        let mut command = self.worker_command(USER_COMMAND, command_status);
+        // These fixtures write only a few KiB. Exercise the real guard
+        // with an explicit small budget without depending on host GiB.
+        command.args([
+            "--disk-budget-bytes",
+            "8388608",
+            "--disk-min-free-bytes",
+            "1048576",
+        ]);
         if let Some(toolchain) = toolchain {
             command.args(["--toolchain", toolchain]);
         }
+        Self::collect(command)
+    }
+
+    fn collect(mut command: Command) -> Output {
         let mut child = command.spawn().expect("start worker CLI");
         let started = Instant::now();
         loop {
@@ -277,4 +287,86 @@ fn no_requested_toolchain_preserves_default_execution_without_rustup() {
     assert!(output.status.success(), "{output:?}");
     assert!(fixture.events().is_empty());
     fixture.assert_compiler("default");
+}
+
+#[test]
+fn plain_and_guarded_worker_jobs_stamp_provenance_for_every_cargo_child() {
+    // A dual-role worker may inherit the reported stale BYPASS=1 without its
+    // origin, neither marker, or conflicting caller values. The executor must
+    // establish its own pair after remote admission in every case. Merely
+    // forwarding the caller's environment would fail the marker assertions.
+    for guarded in [false, true] {
+        for (bypass, origin) in [
+            (None, None),
+            (Some("1"), None),
+            (Some("1"), Some("")),
+            (Some("0"), Some("caller")),
+            (None, Some("rch")),
+        ] {
+            for exit_code in [0, 101] {
+                let fixture = Fixture::new("missing");
+                // The outer command deliberately contains no compilation
+                // keyword, so omitting --disk-budget-bytes really exercises
+                // the executor's plain shell path rather than automatic Cargo
+                // disk admission. Each Cargo below is a separate subprocess.
+                fs::write(
+                    fixture.path("work/job.sh"),
+                    r#"#!/bin/sh
+set -eu
+printf '%s|%s\n' "${RCH_CARGO_WRAPPER_BYPASS-unset}" "${RCH_CARGO_WRAPPER_ORIGIN-unset}" > "$RCH_TEST_STATE/job-markers"
+RCH_TEST_COMMAND_STATUS=0 cargo --version
+sh -c 'RCH_TEST_COMMAND_STATUS=0 cargo test --features "feature with spaces"'
+cargo build --release
+"#,
+                )
+                .expect("write worker job");
+                let mut command = fixture.worker_command("sh ./job.sh", &exit_code.to_string());
+                command.env("RCH_REQUIRE_REMOTE", "1");
+                if let Some(value) = bypass {
+                    command.env("RCH_CARGO_WRAPPER_BYPASS", value);
+                }
+                if let Some(value) = origin {
+                    command.env("RCH_CARGO_WRAPPER_ORIGIN", value);
+                }
+                if guarded {
+                    command.args([
+                        "--disk-budget-bytes",
+                        "8388608",
+                        "--disk-min-free-bytes",
+                        "1048576",
+                    ]);
+                }
+                let output = Fixture::collect(command);
+                assert_eq!(
+                    output.status.code(),
+                    Some(exit_code),
+                    "guarded={guarded}, bypass={bypass:?}, origin={origin:?}: {output:?}"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("job-markers")).unwrap(),
+                    "1|rch\n",
+                    "the outer job must receive the managed pair"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("markers")).unwrap(),
+                    "1|rch\n1|rch\n1|rch\n",
+                    "each shell descendant must inherit the complete pair"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("cargo")).unwrap(),
+                    "default\n--version\ndefault\ntest\n--features\nfeature with spaces\ndefault\nbuild\n--release\n",
+                    "Cargo arguments and invocation count must be conserved"
+                );
+                assert_eq!(
+                    output.stdout.as_slice(),
+                    b"fixture compiler output\nfixture compiler output\nfixture compiler output\n",
+                    "worker output must be preserved"
+                );
+                assert!(
+                    fixture.events().is_empty(),
+                    "no recursive toolchain dispatch"
+                );
+            }
+        }
+    }
 }

@@ -586,7 +586,12 @@ pub async fn execute_with_disk_budget(
         shell.args(["-c", command]);
         shell
     };
-    cmd.current_dir(workdir)
+    // This child is already executing on the selected worker. Stamp the whole
+    // shim-v9 loop-break pair here, even if the incoming environment contains
+    // a bare or stale bypass marker. Keep it on the child Command so a dual-role
+    // host's ordinary dispatcher invocations do not inherit bypass authority.
+    cmd.envs(rch_common::MANAGED_CARGO_ENV)
+        .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
