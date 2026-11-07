@@ -441,6 +441,33 @@ async fn completion_probe_output(
     }
 }
 
+/// One receipt deadline includes command setup, transport and confirmation.
+/// A ready future at the timer boundary is still expired evidence.
+async fn receipt_probe_before<T>(
+    deadline: TokioInstant,
+    probe: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    let deadline = deadline.min(TokioInstant::now() + rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let expired = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "completion receipt probe timed out",
+        )
+    };
+    if TokioInstant::now() >= deadline {
+        return Err(expired());
+    }
+    let output = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => return Err(expired()),
+        output = probe => output?,
+    };
+    if TokioInstant::now() >= deadline {
+        return Err(expired());
+    }
+    Ok(output)
+}
+
 async fn run_source_content_rsync_capture(
     mut cmd: Command,
     operation: &str,
@@ -3843,6 +3870,8 @@ impl TransferPipeline {
         let Some((path, identity)) = &self.recovery_completion else {
             return Ok(None);
         };
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(10));
+        let deadline = TokioInstant::now() + budget;
         // A rename can be visible before its directory barrier succeeds. A
         // reconnect must re-establish both barriers before trusting that name.
         let script = format!(
@@ -3851,21 +3880,28 @@ impl TransferPipeline {
             sync_completion =
                 file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
-        let output = tokio::time::timeout(
-            rch_common::timing::scale_duration(Duration::from_secs(10)),
+        let output = receipt_probe_before(
+            deadline,
             // This immutable identity-bound receipt is outside source-tree
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
-            completion_probe_output(self.worker_ssh_command_with_activity(
+            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
                 worker,
                 &["sh", "-c", &escape(Cow::from(script.as_str()))],
                 false,
+                self.ssh_options
+                    .connect_timeout
+                    .min(deadline.saturating_duration_since(TokioInstant::now())),
             )),
         )
-        .await??;
+        .await?;
         anyhow::ensure!(output.status.success(), "completion probe SSH failed");
         let text = std::str::from_utf8(&output.stdout)?.trim();
         if text.is_empty() {
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "completion receipt probe timed out"
+            );
             return Ok(None);
         }
         let (observed, status) = text
@@ -3876,6 +3912,10 @@ impl TransferPipeline {
         anyhow::ensure!(
             (0..=255).contains(&status),
             "invalid remote completion status"
+        );
+        anyhow::ensure!(
+            TokioInstant::now() < deadline,
+            "completion receipt probe timed out"
         );
         Ok(Some(status))
     }
@@ -6038,19 +6078,23 @@ exit \"$__rch_disk_status\"; }}"
         let Some(path) = self.remote_disk_receipt_path() else {
             return Ok(None);
         };
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(10));
+        let deadline = TokioInstant::now() + budget;
         let path = escape(Cow::Owned(path));
         let script =
             format!("if [ -f {path} ] && [ ! -L {path} ]; then head -c 8193 -- {path}; fi");
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.worker_ssh_command_with_activity(
+        let output = receipt_probe_before(
+            deadline,
+            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
                 worker,
                 &["sh", "-c", &escape(Cow::Owned(script))],
                 false,
-            )
-            .output(),
+                self.ssh_options
+                    .connect_timeout
+                    .min(deadline.saturating_duration_since(TokioInstant::now())),
+            )),
         )
-        .await??;
+        .await?;
         anyhow::ensure!(output.status.success(), "disk receipt probe failed");
         anyhow::ensure!(
             output.stdout.len() <= 8192,
@@ -6058,6 +6102,10 @@ exit \"$__rch_disk_status\"; }}"
         );
         let text = String::from_utf8(output.stdout)?;
         if text.is_empty() {
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "completion receipt probe timed out"
+            );
             return Ok(None);
         }
         anyhow::ensure!(
@@ -6066,6 +6114,10 @@ exit \"$__rch_disk_status\"; }}"
                     || self.parse_disk_usage_marker(line).is_some()
                     || (line.ends_with('\n') && self.is_deadline_marker(line))),
             "disk receipt is incomplete or belongs to another attempt"
+        );
+        anyhow::ensure!(
+            TokioInstant::now() < deadline,
+            "completion receipt probe timed out"
         );
         Ok(Some(text))
     }
@@ -7200,6 +7252,21 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         remote_args: &[&str],
         bind_activity: bool,
     ) -> Command {
+        self.worker_ssh_command_with_activity_and_connect_timeout(
+            worker,
+            remote_args,
+            bind_activity,
+            self.ssh_options.connect_timeout,
+        )
+    }
+
+    fn worker_ssh_command_with_activity_and_connect_timeout(
+        &self,
+        worker: &WorkerConfig,
+        remote_args: &[&str],
+        bind_activity: bool,
+        connect_timeout: Duration,
+    ) -> Command {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
         crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
@@ -7208,7 +7275,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
+            rch_common::timing::ceil_seconds(connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -11874,6 +11941,200 @@ sys.stdout.buffer.write(b'complete')
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_refuses_unstarted_work_and_caps_pending_reads() {
+        let called = std::cell::Cell::new(false);
+        let now = TokioInstant::now();
+        for deadline in [now, now - Duration::from_secs(1)] {
+            let error = receipt_probe_before(deadline, async {
+                called.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(!called.get(), "expired receipt work must not be polled");
+        }
+        let started = TokioInstant::now();
+        let error = receipt_probe_before(
+            started + Duration::from_secs(7200),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), rch_common::timing::MAX_CONTROL_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_rejects_late_presence_and_absence() {
+        for receipt in [None, Some(0), Some(17)] {
+            let budget = Duration::from_secs(10);
+            let deadline = TokioInstant::now() + budget;
+            let error = receipt_probe_before(deadline, async {
+                tokio::time::sleep(budget).await;
+                Ok(receipt)
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_does_not_resume_a_ready_probe_after_expiry() {
+        let resumed = std::cell::Cell::new(false);
+        let (ready, pending) = tokio::sync::oneshot::channel();
+        let budget = Duration::from_secs(10);
+        let mut probe = Box::pin(receipt_probe_before(
+            TokioInstant::now() + budget,
+            async {
+                pending.await.unwrap();
+                resumed.set(true);
+                Ok(())
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(probe.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(budget).await;
+        ready.send(()).unwrap();
+        let error = probe.await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!resumed.get(), "expiry must win before polling newly ready work");
+    }
+
+    #[tokio::test]
+    async fn receipt_deadline_rejects_ready_output_after_executor_stall() {
+        let deadline = TokioInstant::now() + Duration::from_millis(10);
+        let error = receipt_probe_before(deadline, async {
+            // Model a loaded executor that cannot poll its timer on time.
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(Some(0))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Real local SSH-process fixtures exercise both public receipt readers.
+    /// The peer's delay is deterministic; this is not a live worker benchmark.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_and_completion_receipts_share_the_configured_slow_path() {
+        const CHILD: &str = "RCH_TEST_SCALED_RECEIPT_ROOT";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let retained = tempfile::tempdir().unwrap().keep();
+            let peer = retained.join("ssh");
+            std::fs::write(
+                &peer,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_TEST_SCALED_RECEIPT_ROOT
+case "$*" in
+  *'head -c 8193'*) kind=disk ;;
+  *) kind=completion ;;
+esac
+read -r pid rest </proc/self/stat
+printf '%s\n' "$pid" > "$root/$kind.pid"
+sleep "$(cat "$root/delay")"
+cat "$root/$kind.receipt"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(std::iter::once(retained.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            for scale in ["1", "2"] {
+                let root = retained.join(scale);
+                std::fs::create_dir(&root).unwrap();
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "transfer::tests::disk_and_completion_receipts_share_the_configured_slow_path",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, &root)
+                    .env("RCH_TIMING_SCALE", scale)
+                    .env("PATH", &path)
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(40), child.output())
+                    .await
+                    .expect("bounded receipt fixture")
+                    .unwrap();
+                assert!(output.status.success(), "scale={scale}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let policy = rch_common::timing::TimeoutsConfig::default()
+            .with_environment()
+            .unwrap();
+        rch_common::timing::install(policy.scale);
+        let pipeline = disk_budget_test_pipeline(&root, None, 20).with_recovery_completion(
+            root.join("completion").to_str().unwrap().into(),
+            "receipt-attempt".into(),
+        );
+        let usage = serde_json::json!({
+            "max_growth_bytes": 8 << 20, "min_free_bytes": 1 << 20,
+            "peak_output_bytes": 0, "peak_growth_bytes": 0,
+            "complete": true, "exit_code": 0,
+        });
+        let disk_receipt = format!("{}_DISK_USAGE:{usage}\n", pipeline.deadline_marker);
+        std::fs::write(root.join("delay"), b"12").unwrap();
+        std::fs::write(root.join("completion.receipt"), b"receipt-attempt 0\n").unwrap();
+        std::fs::write(root.join("disk.receipt"), &disk_receipt).unwrap();
+        let worker = estimate_test_worker();
+        let (completion, disk) = tokio::join!(
+            pipeline.read_recovery_completion(&worker),
+            pipeline.read_remote_disk_receipt(&worker),
+        );
+        if policy.scale == rch_common::timing::TimingScale::default() {
+            for error in [completion.unwrap_err(), disk.unwrap_err()] {
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::TimedOut,
+                );
+            }
+        } else {
+            assert_eq!(completion.unwrap(), Some(0));
+            assert_eq!(disk.unwrap(), Some(disk_receipt));
+        }
+        // Timeout/cancellation must release the owned local SSH processes.
+        // The separate pidfd regression below verifies descendant containment.
+        for kind in ["completion", "disk"] {
+            let pid = std::fs::read_to_string(root.join(format!("{kind}.pid"))).unwrap();
+            let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while process.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("receipt transport must be reaped");
+        }
+
+        std::fs::write(root.join("delay"), b"0").unwrap();
+        std::fs::write(root.join("completion.receipt"), b"another-attempt 0\n").unwrap();
+        std::fs::write(root.join("disk.receipt"), b"another-attempt_DISK_USAGE:{}\n").unwrap();
+        assert!(pipeline.read_recovery_completion(&worker).await.is_err());
+        assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
+        std::fs::write(root.join("disk.receipt"), vec![b'x'; 8193]).unwrap();
+        assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
+        std::fs::write(root.join("completion.receipt"), b"").unwrap();
+        std::fs::write(root.join("disk.receipt"), b"").unwrap();
+        assert_eq!(pipeline.read_recovery_completion(&worker).await.unwrap(), None);
+        assert_eq!(pipeline.read_remote_disk_receipt(&worker).await.unwrap(), None);
+    }
+
     /// A completion probe can be cancelled while its local SSH process and a
     /// ProxyCommand-like descendant are still alive. This runs real processes
     /// through the production capture helper; it does not emulate a worker.
@@ -11918,7 +12179,10 @@ while True:
 "#,
             )
             .arg(&ready);
-        let mut capture = Box::pin(completion_probe_output(command));
+        let mut capture = Box::pin(receipt_probe_before(
+            TokioInstant::now() + Duration::from_secs(60),
+            completion_probe_output(command),
+        ));
         let identities = tokio::time::timeout(Duration::from_secs(5), async {
             let announced = async {
                 loop {
