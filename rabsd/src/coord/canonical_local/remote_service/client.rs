@@ -1092,9 +1092,14 @@ mod tests {
             let mut replies = vec![Message::Ready {
                 toolchain: disposition,
             }];
+            // Like the production receiver, acknowledge exact cumulative counts.
+            let mut acknowledged = 0;
             while frames != 0 {
                 let count = frames.min(wire::WINDOW);
-                replies.push(Message::Window { count });
+                acknowledged += count;
+                replies.push(Message::Window {
+                    count: acknowledged,
+                });
                 frames -= count;
             }
             let mut peer = AdmissionStream::new(&replies, false);
@@ -1148,6 +1153,7 @@ mod tests {
             let mut sdk_bytes = 0_u64;
             let mut sdk_entries = 0_usize;
             let mut frames = 0_u64;
+            let mut window_total = 0_u64;
             let mut completed = false;
             for record in admission_messages(&output) {
                 assert!(!completed, "no frames may follow InputsDone");
@@ -1175,8 +1181,11 @@ mod tests {
                         frames += 1;
                     }
                     Message::WindowEnd { count } => {
-                        assert_eq!(count, frames);
-                        assert!((1..=wire::WINDOW).contains(&count));
+                        // Each window holds 1..=WINDOW frames; the end marker
+                        // carries the exact cumulative count (see wire::Window).
+                        assert!((1..=wire::WINDOW).contains(&frames));
+                        window_total += frames;
+                        assert_eq!(count, window_total);
                         frames = 0;
                     }
                     Message::InputsDone => {
