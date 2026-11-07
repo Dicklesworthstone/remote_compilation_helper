@@ -418,7 +418,7 @@ rch_scope_launch_finish() {
     __sl_setup_started=$rch_launch_now
     rch_timing_budget 6000
     __sl_setup_deadline=$((__sl_setup_started + rch_timing_scaled))
-    __sl_last_clock=$rch_launch_now
+    __sl_last_clock=$((rch_launch_now - 1))
     while :; do
         rch_scope_launch_process "$__sl_child"
         __sl_live=$?
@@ -432,7 +432,7 @@ rch_scope_launch_finish() {
         fi
         if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
         rch_scope_launch_clock || { __sl_reason=unknown; break; }
-        [ "$rch_launch_now" -ge "$__sl_last_clock" ] || { __sl_reason=unknown; break; }
+        [ "$rch_launch_now" -gt "$__sl_last_clock" ] || { __sl_reason=unknown; break; }
         __sl_last_clock=$rch_launch_now
         if [ "$__sl_admitted" = 0 ]; then
             # One deadline covers publication and all admission observations.
@@ -446,6 +446,7 @@ rch_scope_launch_finish() {
                 fi
                 # Live birth proves presence; only cleanup needs a full census.
                 rch_remote_leader_matches || { __sl_reason=unknown; break; }
+                __sl_scope_state=1
                 if [ $rch_scope_bound = 1 ]; then
                     __sl_admission_observations=$((__sl_admission_observations + 1))
                     rch_observation_deadline=$__sl_setup_deadline
@@ -454,15 +455,7 @@ rch_scope_launch_finish() {
                     __sl_scope_state=$?
                     unset rch_observation_deadline rch_observation_last_clock
                     case "$__sl_scope_state" in
-                        1) ;;
-                        2)
-                            # Retry only unknown with gate closed. Each pass
-                            # revalidates child birth and the complete receipt.
-                            if [ "$__sl_admission_observations" -lt 3 ]; then
-                                sleep 0.1 || { __sl_reason=unknown; break; }
-                                continue
-                            fi
-                            __sl_reason=unknown; break;;
+                        1|2) ;;
                         *) __sl_reason=unknown; break;;
                     esac
                 fi
@@ -474,6 +467,11 @@ rch_scope_launch_finish() {
                 fi
                 if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
                 rch_remote_leader_matches || { __sl_reason=unknown; break; }
+                if [ "$__sl_scope_state" = 2 ]; then
+                    # Gate stays closed; recheck birth and the receipt next pass.
+                    sleep 0.1 || { __sl_reason=unknown; break; }
+                    continue
+                fi
                 __sl_started=$rch_launch_now
                 # Mark admitted BEFORE gate write. Retain its binding in memory:
                 # receipt loss/replacement cannot redirect or waive cleanup.

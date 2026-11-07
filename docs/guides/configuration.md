@@ -79,11 +79,25 @@ retries. Their enclosing transport budgets must allow the same scaled work.
 Retry windows remain bounded by elapsed time. The shared duration policy caps
 each scaled control budget at one hour, even at scale 1.0; oversized configured
 base budgets and multiplication overflow cannot create an unbounded deadline.
+Fractional values remain fractional inside the control deadlines. OpenSSH's
+integer-only `ConnectTimeout` rounds upward: a five-second connection budget
+at scale `2.5` becomes `12.5s` internally and `13s` in the SSH argument.
+The enclosing elapsed deadline still applies; rounding the transport argument
+does not grant extra time to publish a result.
+
 The scale does not change compiler/test lifetimes, signal-escalation grace,
-queue limits, periodic polling cadence, resource or disk thresholds, or
-process-ownership evidence. A larger deadline cannot
+queue limits, periodic polling cadence, worker-exclusion cooldowns, resource or
+disk thresholds, or process-ownership evidence. A larger deadline cannot
 authorize a signal, declare an unknown process dead, bypass disk admission or
-release a reservation without its existing confirmation.
+release a reservation without its existing confirmation. Source acquisition,
+source release, completion receipts and telemetry reject evidence arriving at
+or after their elapsed deadline. An incomplete ownership acknowledgment remains
+a failure even when the transport exits successfully.
+
+Scope binding and launch admission may retry an unknown observation while their
+original deadline is open. They recheck cancellation and process identity and
+keep the execution gate closed until positive evidence is available. Retries refuse a stopped or backward-moving observation clock. Cancellation settlement
+also stays bounded and retains the process record when cleanup is unconfirmed.
 
 Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
 `show --sources`, `diff` or `export` to manage and inspect this setting.

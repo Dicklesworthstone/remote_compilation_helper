@@ -56,6 +56,29 @@ case " $* " in
         phase=before_pin
         if [ -e /proc/self/fd/8/cgroup.events ]; then phase=pinned; fi
         printf '%s\n' "$phase" >> "$RCH_SCOPE_TEST_ROOT/snapshot-started"
+        if [ "$phase" = before_pin ] &&
+            [ -s "$RCH_SCOPE_TEST_ROOT/cgroups/jobs.slice/$unit/cgroup.kill" ]; then
+            if [ -n "${RCH_SCOPE_TEST_SETTLE_STEP:-}" ]; then
+                read -r settle_clock < "$RCH_SCOPE_TEST_ROOT/clock" || exit 1
+                printf '%s\n' "$((settle_clock + RCH_SCOPE_TEST_SETTLE_STEP))" > "$RCH_SCOPE_TEST_ROOT/clock"
+            fi
+            if [ -n "${RCH_SCOPE_TEST_CLOCK_AFTER_KILL:-}" ]; then
+                printf '%s\n' "$RCH_SCOPE_TEST_CLOCK_AFTER_KILL" > "$RCH_SCOPE_TEST_ROOT/clock"
+                printf 'populated 0\nfrozen 0\n' > "$RCH_SCOPE_TEST_ROOT/cgroups/jobs.slice/$unit/cgroup.events"
+            fi
+        fi
+        if [ "$phase" = before_pin ] && [ -n "${RCH_SCOPE_TEST_BIND_FAILURES:-}" ]; then
+            bind_attempt=0
+            if [ -f "$RCH_SCOPE_TEST_ROOT/bind-attempts" ]; then
+                read -r bind_attempt < "$RCH_SCOPE_TEST_ROOT/bind-attempts" || exit 1
+            fi
+            bind_attempt=$((bind_attempt + 1))
+            printf '%s\n' "$bind_attempt" > "$RCH_SCOPE_TEST_ROOT/bind-attempts"
+            if [ -e "$RCH_SCOPE_TEST_ROOT/launched.pgid" ] || [ -e "$RCH_SCOPE_TEST_ROOT/payload" ]; then
+                printf 'published before binding proof\n' > "$RCH_SCOPE_TEST_ROOT/unsafe-binding"
+            fi
+            [ "$bind_attempt" -gt "$RCH_SCOPE_TEST_BIND_FAILURES" ] || exit 19
+        fi
         [ ! -e "$RCH_SCOPE_TEST_ROOT/snapshots-down" ] || exit 19
         delay=${RCH_SCOPE_TEST_SNAPSHOT_DELAY:-0}
         if [ "$phase" = pinned ]; then
@@ -145,7 +168,10 @@ esac
         self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
 
     def launch_with_scope_fixture(self, omit_kill: bool, *,
-                                  timeout: float = 12) -> subprocess.CompletedProcess[str]:
+                                  timeout: float = 12,
+                                  clock_step: int | None = None) -> subprocess.CompletedProcess[str]:
+        if clock_step is not None:
+            (self.root / "clock").write_text("100\n")
         # Model ONLY systemd's creation/move. The binding, cleanup admission,
         # atomic receipt publication and payload gate are production functions.
         return self.run_shell(r'''
@@ -160,14 +186,27 @@ rch_apply_configured_worker_policy() {
     if [ "$omit" = no ]; then : > "$directory/cgroup.kill"; fi
     printf 'LoadState=loaded\nActiveState=active\nInvocationID=1234567890abcdef1234567890abcdef\nControlGroup=%s\n' \
         "$rch_policy_expected_cgroup" > "$RCH_SCOPE_TEST_ROOT/manager/$rch_policy_scope"
+    printf '%s\n' "${rch_observation_deadline-}" > "$RCH_SCOPE_TEST_ROOT/binding-inherited-deadline" || return 1
     rch_scope_bind_created
 }
+if [ -n "$4" ]; then
+    rch_test_clock_step=$4
+    rch_observation_clock() {
+        read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"
+    }
+    sleep() {
+        [ "$1" = 0.1 ] || return 125
+        read -r rch_test_tick < "$RCH_SCOPE_TEST_ROOT/clock" || return 1
+        printf '%s\n' "$((rch_test_tick + rch_test_clock_step))" > "$RCH_SCOPE_TEST_ROOT/clock"
+    }
+fi
 omit=$3
 rch_remote_record "$1" 42 || exit $?
 printf 'payload\n' > "$2"
 rch_read_record "$1" 42 || exit $?
 [ "$rch_scope_bound" = 1 ] && [ "$rch_identified" = 1 ]
 ''', self.root / "launched.pgid", self.root / "payload", "yes" if omit_kill else "no",
+                              "" if clock_step is None else str(clock_step),
                               timeout=timeout)
 
     def test_publisher_binds_scope_in_one_atomic_required_record(self) -> None:
@@ -180,10 +219,12 @@ rch_read_record "$1" 42 || exit $?
         self.assertEqual(list(self.root.glob("launched.pgid.*")), [], "no partial publication")
 
     def test_scope_without_cleanup_capability_starts_no_payload(self) -> None:
-        result = self.launch_with_scope_fixture(True)
+        self.env["RCH_TIMING_SCALE"] = "1"
+        result = self.launch_with_scope_fixture(True, clock_step=750)
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertFalse((self.root / "launched.pgid").exists())
         self.assertFalse((self.root / "payload").exists())
+        self.assertEqual((self.root / "clock").read_text(), "3100\n")
 
     def test_slow_scope_snapshots_admit_only_after_both_generation_checks(self) -> None:
         # Delay the manager, not the production admission/binding functions.
@@ -200,6 +241,7 @@ rch_read_record "$1" 42 || exit $?
                          ["before_pin", "pinned"])
 
     def test_unavailable_scope_snapshots_never_publish_or_start_payload(self) -> None:
+        self.env["RCH_TIMING_SCALE"] = "1"
         unavailable = self.root / "snapshots-down"
         unavailable.touch()
         for fault in ("failure", "timeout"):
@@ -208,18 +250,81 @@ rch_read_record "$1" 42 || exit $?
                 if fault == "timeout":
                     unavailable.rename(self.root / "snapshots-down-resolved")
                     self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "20"
-                # Three adaptive exchanges share the production 30s probe
-                # budget. The outer test limit includes ordinary setup work.
-                result = self.launch_with_scope_fixture(False, timeout=35)
+                # Retry pauses advance virtual time; actual helper processes
+                # still have their real bounded control-operation timeouts.
+                result = self.launch_with_scope_fixture(
+                    False, timeout=35, clock_step=750,
+                )
                 self.assertEqual(result.returncode, 125, result.stderr)
                 self.assertFalse((self.root / "launched.pgid").exists())
                 self.assertFalse((self.root / "payload").exists())
                 self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
                 started = (self.root / "snapshot-started").read_text().splitlines()
                 self.assertGreaterEqual(len(started), 1)
-                self.assertLessEqual(len(started), 3, "unavailable observations have bounded retries")
+                self.assertEqual((self.root / "clock").read_text(), "3100\n")
                 self.assertEqual(set(started), {"before_pin"})
                 self.assertFalse((self.root / "snapshot-completed").exists())
+
+    def test_binding_ready_after_four_unknown_observations_publishes_once(self) -> None:
+        self.env.update(RCH_TIMING_SCALE="1", RCH_SCOPE_TEST_BIND_FAILURES="4")
+        result = self.launch_with_scope_fixture(False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "unsafe-binding").exists())
+        record = self.root / "launched.pgid"
+        self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:42:"))
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / "payload").read_text(), "payload\n")
+        self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
+        self.assertEqual(
+            (self.root / "snapshot-completed").read_text().splitlines(),
+            ["before_pin", "pinned"],
+        )
+
+    def test_binding_failure_expires_at_scaled_or_inherited_deadline(self) -> None:
+        (self.root / "snapshots-down").touch()
+        cases = (
+            ("1", 750, 3100, None),
+            ("2", 1500, 6100, None),
+            ("10", 7500, 30100, None),
+            ("10", 750, 1600, "1600"),
+        )
+        for scale, step, expected_clock, inherited in cases:
+            with self.subTest(scale=scale, inherited=inherited):
+                self.env["RCH_TIMING_SCALE"] = scale
+                self.env.pop("rch_observation_deadline", None)
+                if inherited is not None:
+                    self.env["rch_observation_deadline"] = inherited
+                (self.root / "snapshot-started").write_text("")
+                result = self.launch_with_scope_fixture(False, clock_step=step)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(
+                    (self.root / "binding-inherited-deadline").read_text(),
+                    (inherited or "") + "\n",
+                )
+                self.assertEqual(
+                    (self.root / "clock").read_text(), f"{expected_clock}\n",
+                )
+                self.assertFalse((self.root / "launched.pgid").exists())
+                self.assertFalse((self.root / "payload").exists())
+                self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
+                started = (self.root / "snapshot-started").read_text().splitlines()
+                self.assertGreaterEqual(len(started), 1)
+                self.assertEqual(set(started), {"before_pin"})
+                self.assertFalse((self.root / "snapshot-completed").exists())
+
+    def test_frozen_binding_clock_refuses_without_publication(self) -> None:
+        self.env["RCH_TIMING_SCALE"] = "10"
+        (self.root / "snapshots-down").touch()
+        result = self.launch_with_scope_fixture(False, clock_step=0)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertEqual((self.root / "clock").read_text(), "100\n")
+        self.assertEqual(
+            (self.root / "snapshot-started").read_text().splitlines(),
+            ["before_pin"],
+        )
+        self.assertFalse((self.root / "launched.pgid").exists())
+        self.assertFalse((self.root / "payload").exists())
+        self.assertEqual(list(self.root.glob("launched.pgid.*")), [])
 
     def test_slow_scope_state_and_kill_preserve_pinned_generation_authority(self) -> None:
         self.env["RCH_SCOPE_TEST_SNAPSHOT_DELAY"] = "1.25"
@@ -296,6 +401,128 @@ rch_remote_cancel "$1" 42 kill
                     self.assertIn("pinned", started, "remaining second must use a real timed exchange")
                 else:
                     self.assertNotIn("pinned", started, "subsecond remainder must not disable timeout")
+
+    def test_initial_and_post_term_empty_census_must_finish_before_deadline(self) -> None:
+        # Only the complete census result and observation clock are doubled.
+        # Receipt checks, scoped TERM authority, its real grace and cleanup
+        # decisions still use the production cancellation implementation.
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        kill = self.scope["directory"] / "cgroup.kill"
+        self.env["RCH_TIMING_SCALE"] = "1"
+        for mode in ("kill", "term"):
+            for clock, expected in (("3099", 0), ("3100", 44), ("3101", 44)):
+                with self.subTest(mode=mode, clock=clock):
+                    kill.write_text("")
+                    (self.root / "clock").write_text("100\n")
+                    result = self.run_shell(r'''
+rch_test_mode=$2
+rch_test_finished=$3
+rch_test_states=0
+rch_observation_clock() {
+    read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"
+}
+rch_group_state() {
+    rch_test_states=$((rch_test_states + 1))
+    if [ "$rch_test_mode" = term ] && [ "$rch_test_states" = 1 ]; then
+        return 1
+    fi
+    printf '%s\n' "$rch_test_finished" > "$RCH_SCOPE_TEST_ROOT/clock"
+    return 0
+}
+rch_remote_cancel "$1" 42 "$rch_test_mode"
+''', record, mode, clock)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual((self.root / "clock").read_text(), clock + "\n")
+                    self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                    self.assertEqual(kill.read_text(), "")
+                    self.assertFalse((self.root / "payload").exists())
+
+    def test_settling_census_keeps_shared_deadline_after_retry_window(self) -> None:
+        # Default entry100 gives retry-start cutoff300 and cancel cutoff3100.
+        # A compound census finishing at2900 is valid; one reaching3100 is late.
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        kill = self.scope["directory"] / "cgroup.kill"
+        events = self.scope["directory"] / "cgroup.events"
+        self.env["RCH_TIMING_SCALE"] = "1"
+        for clock, expected in (("2900", 0), ("3100", 44)):
+            with self.subTest(clock=clock):
+                kill.write_text("")
+                events.write_text("populated 1\nfrozen 0\n")
+                (self.root / "clock").write_text("100\n")
+                (self.root / "snapshot-started").write_text("")
+                (self.root / "snapshot-completed").write_text("")
+                self.env["RCH_SCOPE_TEST_CLOCK_AFTER_KILL"] = clock
+                result = self.run_shell(r'''
+rch_observation_clock() {
+    read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"
+}
+rch_remote_cancel "$1" 42 kill
+''', record)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(kill.read_text(), "1\n")
+                self.assertEqual((self.root / "clock").read_text(), clock + "\n")
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                self.assertFalse((self.root / "payload").exists())
+                completed = (self.root / "snapshot-completed").read_text().splitlines()
+                if expected == 0:
+                    self.assertEqual(completed, ["before_pin", "pinned"] * 3)
+                else:
+                    self.assertEqual(
+                        completed,
+                        ["before_pin", "pinned", "before_pin", "pinned", "before_pin"],
+                    )
+
+    def test_settlement_retries_use_elapsed_time_and_keep_shared_budget(self) -> None:
+        # Each complete census consumes150 ticks and each retry pause10 ticks.
+        # This exercises elapsed time rather than a fixed observation count.
+        # The clock also clobbers the same scratch value as the Darwin helper.
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        kill = self.scope["directory"] / "cgroup.kill"
+        events = self.scope["directory"] / "cgroup.events"
+        self.env["RCH_SCOPE_TEST_SETTLE_STEP"] = "150"
+        for scale, expected_clock in (("1", "420\n"), ("2", "580\n"), ("10", "2180\n")):
+            with self.subTest(scale=scale):
+                self.env["RCH_TIMING_SCALE"] = scale
+                kill.write_text("")
+                events.write_text("populated 1\nfrozen 0\n")
+                (self.root / "clock").write_text("100\n")
+                result = self.run_shell(r'''
+rch_observation_clock() {
+    read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock" || return 1
+    rch_timing_scaled=5
+}
+sleep() {
+    [ "$1" = 0.1 ] || return 125
+    read -r rch_test_tick < "$RCH_SCOPE_TEST_ROOT/clock" || return 1
+    printf '%s\n' "$((rch_test_tick + 10))" > "$RCH_SCOPE_TEST_ROOT/clock"
+}
+rch_remote_cancel "$1" 42 kill
+''', record)
+                self.assertEqual(result.returncode, 45, result.stderr)
+                self.assertEqual((self.root / "clock").read_text(), expected_clock)
+                self.assertEqual(kill.read_text(), "1\n")
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                self.assertFalse((self.root / "payload").exists())
+
+    def test_frozen_settlement_clock_cannot_wait_indefinitely_or_confirm_cleanup(self) -> None:
+        record = self.scope["record"]
+        before = (record.stat().st_ino, record.read_bytes())
+        kill = self.scope["directory"] / "cgroup.kill"
+        for scale in ("1", "10"):
+            with self.subTest(scale=scale):
+                self.env["RCH_TIMING_SCALE"] = scale
+                kill.write_text("")
+                result = self.run_shell(r'''
+rch_observation_clock() { rch_observation_now=100; }
+rch_remote_cancel "$1" 42 kill
+''', record, timeout=5)
+                self.assertEqual(result.returncode, 44, result.stderr)
+                self.assertEqual(kill.read_text(), "1\n")
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+                self.assertFalse((self.root / "payload").exists())
 
     def test_invalid_snapshot_clock_cannot_confirm_an_empty_scope(self) -> None:
         # The group has exited and the backend reports an empty scope. A

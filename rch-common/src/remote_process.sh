@@ -531,7 +531,9 @@ rch_remote_cancel_loaded() (
         esac
     fi
     rch_group_state
-    case $? in
+    rch_last_state=$?
+    rch_control_in_budget || return 44
+    case $rch_last_state in
         0) [ "$rch_kill_sent" = 1 ] || return 0;;
         1) ;;
         2)
@@ -556,7 +558,9 @@ rch_remote_cancel_loaded() (
         rch_term_sent=1
         sleep 1 || return 44
         rch_group_state
-        case $? in
+        rch_last_state=$?
+        rch_control_in_budget || return 44
+        case $rch_last_state in
             0) return 0;;
             1) ;;
             # TERM witnesses fence KILL; post-kill census still proves death.
@@ -571,20 +575,26 @@ rch_remote_cancel_loaded() (
     fi
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_last_state=2
-    # Census time consumes the remaining shared cancellation deadline. The old
-    # twenty 0.1s pauses were not a two-second wall limit on slow observations.
-    # Unknown still proves neither death nor authority to send another signal.
+    # Start retries for 2 * scale seconds; each full census retains the
+    # shared cancel deadline. Unknown evidence never confirms cleanup.
+    rch_observation_clock_checked || return 44
+    rch_timing_budget 200
+    rch_settle_deadline=$((rch_observation_now + rch_timing_scaled))
+    rch_settle_previous=-1
     while :; do
-        rch_observation_clock_checked || return 44
-        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || break
+        rch_control_in_budget || return 44
+        [ "$rch_observation_now" -gt "$rch_settle_previous" ] || return 44
+        [ "$rch_observation_now" -lt "$rch_settle_deadline" ] || break
         rch_group_state
         rch_last_state=$?
+        rch_control_in_budget || return 44
         case $rch_last_state in
             0) return 0;;
             1) ;;
             2) [ "$rch_kill_status" = 0 ] || return 43;;
             *) return 44;;
         esac
+        rch_settle_previous=$rch_observation_now
         sleep 0.1 || return 44
     done
     [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
@@ -1274,15 +1284,17 @@ rch_scope_bind_created() {
                 rch_probe_deadline=$rch_observation_deadline
         fi
         rch_observation_deadline=$rch_probe_deadline
-        rch_probe_attempt=0
-        while [ "$rch_probe_attempt" -lt 3 ]; do
+        rch_probe_previous=-1
+        while :; do
             rch_control_in_budget || exit 1
+            [ "$rch_observation_now" -gt "$rch_probe_previous" ] || exit 1
             rch_scope_operation probe
-            case $? in 0) exit 0;; 2) ;; *) exit 1;; esac
-            rch_probe_attempt=$((rch_probe_attempt + 1))
+            rch_probe_status=$?
+            rch_control_in_budget || exit 1
+            case "$rch_probe_status" in 0) exit 0;; 2) ;; *) exit 1;; esac
+            rch_probe_previous=$rch_observation_now
             sleep 0.1 || exit 1
         done
-        exit 1
     ) || return 1
     rch_scope_bound=1
 }
