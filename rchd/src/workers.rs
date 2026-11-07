@@ -2929,6 +2929,26 @@ fn revalidated_source_topologies(output: &rch_common::CommandResult, count: usiz
     parsed.unwrap_or_default()
 }
 
+// False means the shared deadline expired. Timely but invalid output contributes
+// no indices; neither case may discard acknowledgments from an earlier batch.
+fn acknowledge_source_topology_batch(
+    output: &rch_common::CommandResult,
+    range: std::ops::Range<usize>,
+    deadline: tokio::time::Instant,
+    revalidated: &mut Vec<usize>,
+) -> bool {
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    let indices = revalidated_source_topologies(output, range.len());
+    // Parsing is part of the observation, including for an already-ready result.
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    revalidated.extend(indices.into_iter().map(|index| range.start + index));
+    true
+}
+
 async fn revalidate_source_topologies(
     worker: &Arc<WorkerState>,
     history: &crate::history::BuildHistory,
@@ -2949,13 +2969,18 @@ async fn revalidate_source_topologies(
     if batches.is_empty() {
         return;
     }
+    let Some(deadline) =
+        tokio::time::Instant::now().checked_add(scale_duration(Duration::from_secs(20)))
+    else {
+        return;
+    };
     let mut revalidated = Vec::new();
     let probe = async {
         let mut client = rch_common::SshClient::new(
             endpoint.config.clone(),
             rch_common::SshOptions {
-                connect_timeout: Duration::from_secs(10),
-                command_timeout: Duration::from_secs(15),
+                connect_timeout: scale_duration(Duration::from_secs(10)),
+                command_timeout: scale_duration(Duration::from_secs(15)),
                 control_master: false,
                 ..Default::default()
             },
@@ -2963,12 +2988,13 @@ async fn revalidate_source_topologies(
         client.connect().await?;
         let result = async {
             for (range, command) in batches {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
                 let output = client.execute(&command).await?;
-                revalidated.extend(
-                    revalidated_source_topologies(&output, range.len())
-                        .into_iter()
-                        .map(|index| range.start + index),
-                );
+                if !acknowledge_source_topology_batch(&output, range, deadline, &mut revalidated) {
+                    break;
+                }
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -2977,10 +3003,10 @@ async fn revalidate_source_topologies(
         result
     };
     // Preserve fully acknowledged earlier batches even if a later read-only
-    // probe fails or exceeds the overall budget. Incomplete output proves
-    // nothing and never contributes an index to this list.
+    // probe fails or exceeds the overall budget. Incomplete or late output
+    // proves nothing and never contributes an index to this list.
     if permit
-        .run(tokio::time::timeout(Duration::from_secs(20), probe))
+        .run(tokio::time::timeout_at(deadline, probe))
         .await
         .is_none()
         || revalidated.is_empty()
@@ -3584,6 +3610,121 @@ mod tests {
         ] {
             assert!(revalidated_source_topologies(&response, 1).is_empty());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_topology_acknowledgments_require_time_remaining() {
+        let output = rch_common::CommandResult {
+            exit_code: 0,
+            stdout: "0\n1\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n".into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        for scale in [1.0, 2.0, 10.0] {
+            let timing = rch_common::timing::TimingScale::try_from(scale).unwrap();
+            let budget = timing.duration(Duration::from_secs(20));
+            let deadline = tokio::time::Instant::now().checked_add(budget).unwrap();
+            let mut revalidated = Vec::new();
+            tokio::time::advance(budget - Duration::from_millis(1)).await;
+            assert!(acknowledge_source_topology_batch(
+                &output,
+                10..12,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            assert!(!acknowledge_source_topology_batch(
+                &output,
+                20..22,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(!acknowledge_source_topology_batch(
+                &output,
+                30..32,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_topology_acknowledgments_preserve_earlier_valid_evidence() {
+        let output = |exit_code, stdout: &str| rch_common::CommandResult {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        let ready = output(0, "0\n1\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n");
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(20))
+            .unwrap();
+        let mut revalidated = Vec::new();
+        assert!(acknowledge_source_topology_batch(
+            &ready,
+            0..2,
+            deadline,
+            &mut revalidated,
+        ));
+        for invalid in [
+            output(1, "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+            output(0, "0\n"),
+            output(0, "2\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+        ] {
+            assert!(acknowledge_source_topology_batch(
+                &invalid,
+                2..4,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [0, 1]);
+        }
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(!acknowledge_source_topology_batch(
+            &ready,
+            2..4,
+            deadline,
+            &mut revalidated,
+        ));
+        assert_eq!(revalidated, [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_ready_source_topology_acknowledgment_cannot_win_timeout_race() {
+        let output = rch_common::CommandResult {
+            exit_code: 0,
+            stdout: "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n".into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(20))
+            .unwrap();
+        let mut revalidated = Vec::new();
+        assert!(acknowledge_source_topology_batch(
+            &output,
+            7..8,
+            deadline,
+            &mut revalidated,
+        ));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        // A ready future can finish even when the enclosing timeout is due.
+        // Either timeout ordering must leave the late batch unacknowledged.
+        let result = tokio::time::timeout_at(deadline, async {
+            let output = std::future::ready(&output).await;
+            acknowledge_source_topology_batch(output, 20..21, deadline, &mut revalidated)
+        })
+        .await;
+        assert!(!result.unwrap_or(false));
+        assert_eq!(revalidated, [7]);
     }
 
     fn recovered_worker_config(id: &str, slots: u32) -> WorkerConfig {
