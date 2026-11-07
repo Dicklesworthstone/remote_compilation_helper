@@ -2436,20 +2436,40 @@ delivery, bounding simultaneous work even while inputs are uploading.
 authenticated clients wait in FIFO order when the active roots are occupied.
 The example admits four operations and allows sixteen additional sessions.
 Total connections, including TLS handshakes, are bounded by the sum of those
-limits. At the coordinator, a queued request retains only its connection and
-bounded declaration. It receives no input tree or compiler tokens and cannot
-start uploading or execute Cargo until an operation slot becomes available.
-The client keeps its already captured inputs while waiting.
+limits. At the coordinator, a request waiting for an operation slot retains only
+its connection and bounded declaration. It receives no input tree or compiler
+tokens and cannot start uploading or execute Cargo until a slot becomes
+available. The client keeps its already captured inputs while waiting.
 
 `queue_timeout_seconds` accepts 1–1800 and defaults to 300. The queue deadline
 is fixed when a validated request enters admission; progress polls do not renew
-it. Client cancellation, disconnection, timeout or service shutdown removes that
-request from the queue so later callers can advance. The Cargo frontend waits
-on this same authenticated connection and starts uploading only after admission.
-It does not resubmit the operation. Once admitted, input transfer receives its
-own complete transfer budget. If all connection slots are occupied, the service
-still closes excess connections before authentication, without a plaintext
-response.
+it. The same fixed deadline bounds SDK selection and verification before Ready,
+including any wait for another admitted operation's cold upload. Acquiring a root
+slot does not reset that deadline. Client cancellation, disconnection, timeout or
+service shutdown releases that caller's waiting state without cancelling another
+caller. The Cargo frontend waits on the same authenticated connection and starts
+uploading only after Ready grants its input phase. It does not resubmit the
+operation. Input transfer then receives its own complete transfer budget. If all
+connection slots are occupied, the service still closes excess connections before
+authentication, without a plaintext response.
+
+Simultaneous admitted operations with the same authenticated client key and
+complete SDK identity share one cold upload. One caller uploads; existing
+followers receive Queued/Poll replies until its SDK is completely sealed and
+verified, then receive Ready with SDK reuse. Followers retain their operation
+permits but create no source or SDK input trees while waiting. If the uploader
+disappears, a surviving follower may become the uploader before Ready, within
+its original deadline. This never retries a Cargo execution.
+
+Cold upload sharing also works when persistent SDK caching is disabled or full.
+The pending registry contains at most 32 weak entries, independently of retained
+cache capacity. A completed flight is removed from that registry before existing
+followers receive its exact lease; later requests must use the ordinary cache or
+start a new upload. Only active admitted operations retain an uncached shared SDK.
+The registry cannot prolong its lifetime, and neither source trees nor command
+results are shared. Root-queue capacity and this waiting state are separate:
+`max_queued_roots: 0` still allows an already admitted operation to wait for a
+matching SDK upload.
 
 The service can retain already uploaded SDKs for subsequent operations.
 `toolchain_cache_bytes` defaults to 0 (disabled) and accepts at most 64 GiB;

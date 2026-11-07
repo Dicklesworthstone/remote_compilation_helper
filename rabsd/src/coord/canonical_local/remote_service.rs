@@ -12,7 +12,9 @@ pub use client::run_client_profile;
 
 use super::remote_artifacts::CapturedTarget;
 use super::remote_operation::{self, RemoteOperationInputs, RemoteOperationOutcome};
-use super::remote_toolchains::{ReceivedToolchain, RemoteToolchainCache};
+use super::remote_toolchains::{
+    ReceivedToolchain, RemoteToolchainCache, ToolchainAcquisition, UploadPoll, UploadPublisher,
+};
 use super::service::{AdmittedOperation, OperationAdmissions};
 use super::target_state::TargetCacheConfig;
 use super::{SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory};
@@ -459,33 +461,77 @@ impl ToolchainInput {
     }
 }
 
-fn prepare_toolchain_input(
-    cache: &RemoteToolchainCache,
+/// Prepared only after acquiring an operation permit. A pending SDK upload
+/// retains a bounded ticket and this declaration, without allocating input
+/// trees. The original admission deadline also bounds publisher handoff.
+struct ToolchainAdmission<'a> {
+    cache: &'a RemoteToolchainCache,
     edge_pin: [u8; 32],
     identity: ToolchainIdentity,
-    input_root: &Path,
-    cancelled: impl Fn() -> bool,
-) -> io::Result<ToolchainInput> {
-    if let Some(lease) = cache.lookup(edge_pin, &identity, &cancelled)? {
-        return Ok(ToolchainInput::Reuse(lease));
+    input_root: &'a Path,
+}
+
+impl<'a> ToolchainAdmission<'a> {
+    async fn prepare<S: AsyncRead + AsyncWrite + Unpin>(
+        self,
+        wire: &mut Wire<S>,
+        stopped: &AtomicBool,
+        deadline: Instant,
+        healthy: impl Fn() -> bool,
+    ) -> io::Result<(ToolchainInput, Option<UploadPublisher<'a>>)> {
+        let cancelled = || {
+            stopped.load(Ordering::Acquire) || !healthy() || Instant::now() >= deadline
+        };
+        loop {
+            match self.cache.acquire(self.edge_pin, &self.identity, &cancelled)? {
+                ToolchainAcquisition::Ready(lease) => {
+                    return Ok((ToolchainInput::Reuse(lease), None));
+                }
+                ToolchainAcquisition::Upload(publisher) => {
+                    checkpoint(stopped, deadline)?;
+                    require(healthy(), "remote coordinator stopped before SDK upload")?;
+                    // SDK custody remains separate from source and diagnostics.
+                    // A failed creation drops the publisher and lets an existing
+                    // waiter elect a successor within its own fixed deadline.
+                    let owner = Arc::new(
+                        tempfile::Builder::new()
+                            .prefix("canonical-remote-sdk-")
+                            .permissions(fs::Permissions::from_mode(0o700))
+                            .tempdir_in(self.input_root)?,
+                    );
+                    let receiver = ToolchainReceiver::create(
+                        &owner.path().join("toolchain"),
+                        self.identity,
+                        ToolchainLimits::default(),
+                    )?;
+                    checkpoint(stopped, deadline)?;
+                    require(healthy(), "remote coordinator stopped before SDK upload")?;
+                    return Ok((
+                        ToolchainInput::Upload {
+                            receiver: Box::new(receiver),
+                            owner,
+                        },
+                        Some(publisher),
+                    ));
+                }
+                ToolchainAcquisition::Wait(waiter) => loop {
+                    match waiter.poll(&cancelled)? {
+                        UploadPoll::Ready(lease) => {
+                            return Ok((ToolchainInput::Reuse(lease), None));
+                        }
+                        UploadPoll::Abandoned => break,
+                        UploadPoll::Pending => {
+                            wire.send(&Message::Queued, stopped, deadline).await?;
+                            require(
+                                matches!(wire.receive(stopped, deadline).await?, Message::Poll),
+                                "expected an admission status poll while awaiting an SDK upload",
+                            )?;
+                        }
+                    }
+                },
+            }
+        }
     }
-    // Keep SDK custody separate from source and diagnostics. Retaining a
-    // compiler must never retain an earlier client's complete workspace.
-    let owner = Arc::new(
-        tempfile::Builder::new()
-            .prefix("canonical-remote-sdk-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(input_root)?,
-    );
-    let receiver = ToolchainReceiver::create(
-        &owner.path().join("toolchain"),
-        identity,
-        ToolchainLimits::default(),
-    )?;
-    Ok(ToolchainInput::Upload {
-        receiver: Box::new(receiver),
-        owner,
-    })
 }
 
 fn require_wire_identity(version: &str, build_identity: &str, expected: &str) -> io::Result<()> {
@@ -547,17 +593,20 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         runtime.healthy()
     })
     .await?;
+    let (toolchain, publisher) = ToolchainAdmission {
+        cache: toolchains,
+        edge_pin,
+        identity,
+        input_root: &config.input_root,
+    }
+    .prepare(wire, stopped, queue_deadline, || runtime.healthy())
+    .await?;
+    // Waiting for a shared cold SDK cannot consume the caller's upload budget.
+    // Polls and publisher loss never renew the original admission deadline.
     let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
     let cancelled = || {
         stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= input_deadline
     };
-    let toolchain = prepare_toolchain_input(
-        toolchains,
-        edge_pin,
-        identity,
-        &config.input_root,
-        &cancelled,
-    )?;
     let disposition = toolchain.disposition();
     let owner = Arc::new(
         tempfile::Builder::new()
@@ -580,6 +629,11 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, &cancelled)?,
         ToolchainDisposition::Reuse => toolchain,
     };
+    if let Some(publisher) = publisher {
+        // Only the exact sealed SDK crosses this handoff. The publisher leaves
+        // the pending registry before existing waiters receive its lease.
+        publisher.publish(Arc::clone(&toolchain), &cancelled)?;
+    }
     let inputs = RemoteOperationInputs::new(
         Arc::clone(&owner),
         source,
@@ -1203,6 +1257,31 @@ mod tests {
         input
     }
 
+    fn prepare_toolchain_input(
+        cache: &RemoteToolchainCache,
+        edge_pin: [u8; 32],
+        identity: ToolchainIdentity,
+        input_root: &Path,
+        cancelled: impl Fn() -> bool,
+    ) -> io::Result<ToolchainInput> {
+        let mut wire = Wire::new(AdmissionPeer::new(Vec::new()));
+        let (input, _publisher) = ready(
+            ToolchainAdmission {
+                cache,
+                edge_pin,
+                identity,
+                input_root,
+            }
+            .prepare(
+                &mut wire,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(5),
+                || !cancelled(),
+            ),
+        )?;
+        Ok(input)
+    }
+
     #[test]
     fn verified_sdk_hit_is_peer_scoped_and_creates_no_upload_tree() {
         let cache = RemoteToolchainCache::new(1024, 4).unwrap();
@@ -1233,6 +1312,230 @@ mod tests {
         assert_ne!(owner.path(), sdk.owner().path());
         assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 1);
         sdk.verify(|| false).unwrap();
+    }
+
+    #[test]
+    fn cold_sdk_waiters_share_one_sealed_upload_without_persistent_retention() {
+        use std::sync::mpsc;
+
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = received_sdk();
+        let pin = [17; 32];
+        let identity = *sdk.identity();
+        let ToolchainAcquisition::Upload(publisher) =
+            cache.acquire(pin, &identity, || false).unwrap()
+        else {
+            panic!("the first cold operation must own its upload");
+        };
+        let inputs = crate::test_util::private_tempdir();
+        let input_root = inputs.path().to_path_buf();
+        let (release, waiting) = mpsc::channel();
+        let (published, acknowledgment) = mpsc::channel();
+        let peer_sdk = Arc::clone(&sdk);
+        let cache_ref = &cache;
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(move || {
+                waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                let lease = cache_ref.adopt(pin, peer_sdk, || false).unwrap();
+                publisher.publish(lease, || false).unwrap();
+                published.send(()).unwrap();
+            });
+            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            let output = Arc::clone(&peer.output);
+            peer.before_read = Some(Box::new(move || {
+                assert_eq!(fs::read_dir(&input_root).unwrap().count(), 0);
+                release.send(()).unwrap();
+                acknowledgment.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            let mut wire = Wire::new(peer);
+            let (input, publisher) = ready(
+                ToolchainAdmission {
+                    cache: &cache,
+                    edge_pin: pin,
+                    identity,
+                    input_root: inputs.path(),
+                }
+                .prepare(
+                    &mut wire,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(5),
+                    || true,
+                ),
+            )
+            .unwrap();
+            assert!(publisher.is_none());
+            let ToolchainInput::Reuse(reused) = input else {
+                panic!("the waiting operation must reuse the completed upload");
+            };
+            assert!(Arc::ptr_eq(&sdk, &reused));
+            assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
+            assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+            leader.join().unwrap();
+        });
+        // The ordinary cache is disabled. Active input sharing cannot turn a
+        // completed flight into a retained image for a later operation.
+        assert!(matches!(
+            cache.acquire(pin, &identity, || false).unwrap(),
+            ToolchainAcquisition::Upload(_)
+        ));
+    }
+
+    #[test]
+    fn abandoned_cold_sdk_publisher_hands_upload_to_an_existing_waiter() {
+        use std::sync::mpsc;
+
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = received_sdk();
+        let identity = *sdk.identity();
+        let pin = [18; 32];
+        let ToolchainAcquisition::Upload(publisher) =
+            cache.acquire(pin, &identity, || false).unwrap()
+        else {
+            panic!("the first cold operation must own its upload");
+        };
+        let inputs = crate::test_util::private_tempdir();
+        let (release, waiting) = mpsc::channel();
+        let (abandoned, acknowledgment) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(move || {
+                waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(publisher);
+                abandoned.send(()).unwrap();
+            });
+            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            let output = Arc::clone(&peer.output);
+            peer.before_read = Some(Box::new(move || {
+                release.send(()).unwrap();
+                acknowledgment.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            let mut wire = Wire::new(peer);
+            let (input, publisher) = ready(
+                ToolchainAdmission {
+                    cache: &cache,
+                    edge_pin: pin,
+                    identity,
+                    input_root: inputs.path(),
+                }
+                .prepare(
+                    &mut wire,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(5),
+                    || true,
+                ),
+            )
+            .unwrap();
+            assert!(publisher.is_some());
+            assert!(matches!(input, ToolchainInput::Upload { .. }));
+            assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 1);
+            assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+            assert!(matches!(
+                cache.acquire(pin, &identity, || false).unwrap(),
+                ToolchainAcquisition::Wait(_)
+            ));
+            leader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn waiting_for_a_cold_sdk_rejects_early_bytes_cancel_and_disconnect() {
+        let sdk = received_sdk();
+        let identity = *sdk.identity();
+        for input in [
+            Vec::new(),
+            record(&Message::Cancel),
+            record(&Message::SourceChunk {
+                chunk: Chunk::new("src/lib.rs", 0, b"too early").unwrap(),
+            }),
+            record(&Message::InputsDone),
+        ] {
+            let cache = RemoteToolchainCache::new(0, 1).unwrap();
+            let pin = [19; 32];
+            let ToolchainAcquisition::Upload(_publisher) =
+                cache.acquire(pin, &identity, || false).unwrap()
+            else {
+                panic!("the first cold operation must own its upload");
+            };
+            let inputs = crate::test_util::private_tempdir();
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            assert!(ready(
+                ToolchainAdmission {
+                    cache: &cache,
+                    edge_pin: pin,
+                    identity,
+                    input_root: inputs.path(),
+                }
+                .prepare(
+                    &mut wire,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(5),
+                    || true,
+                ),
+            )
+            .is_err());
+            assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
+            assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+            assert!(matches!(
+                cache.acquire(pin, &identity, || false).unwrap(),
+                ToolchainAcquisition::Wait(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn cold_sdk_waiting_preserves_cancellation_and_the_original_deadline() {
+        let sdk = received_sdk();
+        let identity = *sdk.identity();
+        for expire in [false, true] {
+            let cache = RemoteToolchainCache::new(0, 1).unwrap();
+            let pin = [20; 32];
+            let ToolchainAcquisition::Upload(_publisher) =
+                cache.acquire(pin, &identity, || false).unwrap()
+            else {
+                panic!("the first cold operation must own its upload");
+            };
+            let inputs = crate::test_util::private_tempdir();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let child_stop = Arc::clone(&stopped);
+            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            peer.before_read = Some(Box::new(move || {
+                if expire {
+                    std::thread::sleep(Duration::from_millis(40));
+                } else {
+                    child_stop.store(true, Ordering::Release);
+                }
+            }));
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let deadline = Instant::now()
+                + if expire {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::from_secs(5)
+                };
+            let error = ready(
+                ToolchainAdmission {
+                    cache: &cache,
+                    edge_pin: pin,
+                    identity,
+                    input_root: inputs.path(),
+                }
+                .prepare(&mut wire, &stopped, deadline, || true),
+            )
+            .err()
+            .expect("polling must not renew admission or discard cancellation");
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+            ));
+            assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
+            assert!(messages(&output).iter().all(|message| message["kind"] == "queued"));
+            assert!(matches!(
+                cache.acquire(pin, &identity, || false).unwrap(),
+                ToolchainAcquisition::Wait(_)
+            ));
+        }
     }
 
     #[test]

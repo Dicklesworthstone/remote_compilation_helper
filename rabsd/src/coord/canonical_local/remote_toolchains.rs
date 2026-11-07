@@ -5,8 +5,16 @@
 //! a full byte scan outside the cache lock. Overlapping checks of the exact same
 //! retained owner share one active scan; completed checks are never memoized.
 //! Each caller keeps its own cancellation and deadline. Source trees, diagnostics
-//! and operation paths never enter the
-//! cache. This is input reuse, with no action-result or publication authority.
+//! and operation paths never enter the cache. This is input reuse, with no
+//! action-result or publication authority.
+//!
+//! Already-admitted operations may also share one pending cold upload per peer
+//! and complete identity. A separate bounded registry owns only weak references;
+//! the admitted publisher and waiting operations own every flight. Publication
+//! detaches the pending generation before handing its exact sealed lease to
+//! existing waiters. Later callers use ordinary retention or start a new upload,
+//! even when earlier waiters still hold a completed flight. Disabled or full
+//! retention therefore cannot turn flights into an uncharged persistent cache.
 //!
 //! Active, invalidated and retiring images remain charged to the entry/byte
 //! limits. Eviction requires exclusive ownership of the lease AND its image and
@@ -24,11 +32,12 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 pub(crate) const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(crate) const MAX_CACHE_ENTRIES: usize = 32;
+const MAX_PENDING_UPLOADS: usize = 32;
 const VERIFICATION_WAIT_SLICE: Duration = Duration::from_millis(20);
 
 fn invalid(message: &str) -> io::Error {
@@ -412,6 +421,9 @@ struct Entry {
 #[derive(Default)]
 struct State {
     entries: VecDeque<Entry>,
+    // Only active uploads are discoverable. The registry never owns a flight
+    // or completed SDK; bounded admitted operations retain those capabilities.
+    pending_uploads: Vec<Weak<UploadFlight>>,
     // Retiring owners have left lookup but retain their quota until successful
     // cleanup. Failed cleanup permanently consumes its process-lifetime quota.
     retiring_entries: usize,
@@ -424,6 +436,152 @@ pub(crate) struct RemoteToolchainCache {
     max_bytes: u64,
     max_entries: usize,
     state: Mutex<State>,
+}
+
+/// One already-admitted operation's next input phase. No receiver or source
+/// tree is created until Upload or Ready; Wait owns only this bounded ticket.
+pub(crate) enum ToolchainAcquisition<'a> {
+    Ready(Arc<ReceivedToolchain>),
+    Upload(UploadPublisher<'a>),
+    Wait(UploadWaiter<'a>),
+}
+
+#[derive(Debug)]
+pub(crate) enum UploadPoll {
+    Pending,
+    Abandoned,
+    Ready(Arc<ReceivedToolchain>),
+}
+
+#[derive(Debug, Clone)]
+enum UploadResult {
+    Abandoned,
+    Ready(Arc<ReceivedToolchain>),
+}
+
+#[derive(Debug)]
+struct UploadFlight {
+    peer: [u8; 32],
+    identity: ToolchainIdentity,
+    result: Mutex<Option<UploadResult>>,
+}
+
+/// The service keeps its existing operation permit while this ticket is live.
+/// Pending polling never waits for the publisher or renews a deadline. Completed
+/// results verify under the caller's cancellation budget; transport drives polls.
+pub(crate) struct UploadWaiter<'a> {
+    cache: &'a RemoteToolchainCache,
+    flight: Arc<UploadFlight>,
+}
+
+impl UploadWaiter<'_> {
+    pub(crate) fn poll(&self, stopped: impl Fn() -> bool) -> io::Result<UploadPoll> {
+        checkpoint(&stopped)?;
+        let result = self
+            .flight
+            .result
+            .lock()
+            .map_err(|_| invalid("remote toolchain upload result is poisoned"))?
+            .clone();
+        // The flight lock never spans verification, cache admission or caller
+        // callbacks. Reuse verifies this exact owner, not a new identity lookup.
+        match result {
+            None => {
+                checkpoint(&stopped)?;
+                Ok(UploadPoll::Pending)
+            }
+            Some(UploadResult::Abandoned) => {
+                checkpoint(&stopped)?;
+                Ok(UploadPoll::Abandoned)
+            }
+            Some(UploadResult::Ready(lease)) => {
+                if lease.identity() != &self.flight.identity {
+                    return Err(invalid("shared compiler differs from its upload declaration"));
+                }
+                self.cache
+                    .verified_upload(self.flight.peer, lease, &stopped)
+                    .map(UploadPoll::Ready)
+            }
+        }
+    }
+}
+
+/// Owns exactly one pending generation. The normal service-owned receiver and
+/// its private SDK directory remain with the admitted operation. Publication
+/// follows sealing/adoption; cancellation or unwinding abandons only this
+/// generation so surviving waiters can reacquire within their original budget.
+pub(crate) struct UploadPublisher<'a> {
+    cache: &'a RemoteToolchainCache,
+    peer: [u8; 32],
+    identity: ToolchainIdentity,
+    flight: Option<Arc<UploadFlight>>,
+    finished: bool,
+}
+
+impl UploadPublisher<'_> {
+    pub(crate) fn publish(
+        mut self,
+        lease: Arc<ReceivedToolchain>,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        checkpoint(&stopped)?;
+        if lease.identity() != &self.identity {
+            return Err(invalid("received compiler differs from its upload declaration"));
+        }
+        // The sealed receiver already hashed every byte; preserve its complete
+        // owner/generation witness. Every waiting reuse performs a fresh full
+        // byte verification, including independently owned cancellation.
+        lease.verify(&stopped)?;
+        checkpoint(&stopped)?;
+        {
+            let mut state = self.cache.lock()?;
+            if RemoteToolchainCache::upload_invalidated(&state, self.peer, &lease) {
+                return Err(invalid("received compiler was invalidated before publication"));
+            }
+            if let Some(flight) = &self.flight {
+                RemoteToolchainCache::detach_upload(&mut state, flight);
+            }
+        }
+        // Detach before publishing: a later arrival must never join a finished
+        // private result just because an earlier waiter still owns its ticket.
+        if let Some(flight) = &self.flight {
+            let mut result = flight
+                .result
+                .lock()
+                .map_err(|_| invalid("remote toolchain upload result is poisoned"))?;
+            if result.is_some() {
+                return Err(invalid("remote toolchain upload was already completed"));
+            }
+            *result = Some(UploadResult::Ready(lease));
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for UploadPublisher<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(flight) = &self.flight else {
+            return;
+        };
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        RemoteToolchainCache::detach_upload(&mut state, flight);
+        drop(state);
+        let mut result = flight
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if result.is_none() {
+            *result = Some(UploadResult::Abandoned);
+        }
+    }
 }
 
 enum Adoption<'a> {
@@ -509,6 +667,118 @@ impl RemoteToolchainCache {
             .map_err(|_| invalid("remote toolchain cache ownership is poisoned"))
     }
 
+    fn detach_upload(state: &mut State, flight: &Arc<UploadFlight>) {
+        let selected = Arc::downgrade(flight);
+        state.pending_uploads.retain(|pending| {
+            pending.strong_count() != 0 && !Weak::ptr_eq(pending, &selected)
+        });
+    }
+
+    fn upload_invalidated(
+        state: &State,
+        peer: [u8; 32],
+        lease: &Arc<ReceivedToolchain>,
+    ) -> bool {
+        state.entries.iter().any(|entry| {
+            entry.peer == peer && entry.invalidated && Arc::ptr_eq(&entry.lease, lease)
+        })
+    }
+
+    /// A flight may publish a private upload when persistent retention is full
+    /// or disabled. Absence from the cache is valid; an exact invalidated entry
+    /// is not. Retained membership is still mandatory for ordinary warm hits.
+    fn verified_upload(
+        &self,
+        peer: [u8; 32],
+        lease: Arc<ReceivedToolchain>,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Arc<ReceivedToolchain>> {
+        if let Err(error) = lease.verify_bytes(stopped) {
+            if error.kind() != io::ErrorKind::Interrupted && !stopped() {
+                self.invalidate(peer, &lease)?;
+            }
+            return Err(error);
+        }
+        checkpoint(stopped)?;
+        let invalidated = {
+            let state = self.lock()?;
+            Self::upload_invalidated(&state, peer, &lease)
+        };
+        if invalidated {
+            return Err(invalid(
+                "received compiler was invalidated during shared acquisition",
+            ));
+        }
+        Ok(lease)
+    }
+
+    /// Select a verified warm image or join/elect one cold upload atomically.
+    /// Call only after acquiring the service's bounded operation permit, and
+    /// keep that permit through upload, every waiter ticket and SDK handoff.
+    /// Pending flights have their own count bound, independent of retention.
+    pub(crate) fn acquire(
+        &self,
+        peer: [u8; 32],
+        identity: &ToolchainIdentity,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<ToolchainAcquisition<'_>> {
+        checkpoint(&stopped)?;
+        if peer == [0; 32] {
+            return Err(invalid("remote compiler acquisition requires an authenticated edge key"));
+        }
+        let acquisition = {
+            let mut state = self.lock()?;
+            let retained = if self.max_bytes != 0 && identity.bytes <= self.max_bytes {
+                Self::select(&mut state, peer, identity)
+            } else {
+                None
+            };
+            if let Some(lease) = retained {
+                ToolchainAcquisition::Ready(lease)
+            } else {
+                state.pending_uploads.retain(|pending| pending.strong_count() != 0);
+                let pending = state
+                    .pending_uploads
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .find(|flight| flight.peer == peer && &flight.identity == identity);
+                if let Some(flight) = pending {
+                    ToolchainAcquisition::Wait(UploadWaiter { cache: self, flight })
+                } else {
+                    let flight = (state.pending_uploads.len() < MAX_PENDING_UPLOADS).then(|| {
+                        let flight = Arc::new(UploadFlight {
+                            peer,
+                            identity: *identity,
+                            result: Mutex::new(None),
+                        });
+                        state.pending_uploads.push(Arc::downgrade(&flight));
+                        flight
+                    });
+                    // A full registry falls back to the same private bounded
+                    // upload as before. It retains no additional map entry.
+                    ToolchainAcquisition::Upload(UploadPublisher {
+                        cache: self,
+                        peer,
+                        identity: *identity,
+                        flight,
+                        finished: false,
+                    })
+                }
+            }
+        };
+        match acquisition {
+            ToolchainAcquisition::Ready(lease) => self
+                .verified(peer, lease, &stopped)
+                .map(ToolchainAcquisition::Ready),
+            other => {
+                // Callbacks run outside the mutex. A cancelled newly elected
+                // owner drops here and promptly abandons its exact generation.
+                checkpoint(&stopped)?;
+                Ok(other)
+            }
+        }
+    }
+
     fn select(
         state: &mut State,
         peer: [u8; 32],
@@ -563,6 +833,7 @@ impl RemoteToolchainCache {
     /// Only this authenticated edge's complete identity may reuse a received
     /// image. Verification failures refuse this operation, never hide as misses.
     /// Cancellation leaves a ready entry available to other callers.
+    #[cfg(test)]
     pub(crate) fn lookup(
         &self,
         peer: [u8; 32],
@@ -729,6 +1000,415 @@ mod tests {
             state.retiring_entries,
             state.retained_bytes,
         )
+    }
+
+    fn upload<'a>(
+        cache: &'a RemoteToolchainCache,
+        peer: [u8; 32],
+        identity: &ToolchainIdentity,
+    ) -> UploadPublisher<'a> {
+        match cache.acquire(peer, identity, || false).unwrap() {
+            ToolchainAcquisition::Upload(owner) => owner,
+            _ => panic!("cold SDK should elect an upload owner"),
+        }
+    }
+
+    fn join_upload<'a>(
+        cache: &'a RemoteToolchainCache,
+        peer: [u8; 32],
+        identity: &ToolchainIdentity,
+    ) -> UploadWaiter<'a> {
+        match cache.acquire(peer, identity, || false).unwrap() {
+            ToolchainAcquisition::Wait(waiter) => waiter,
+            _ => panic!("overlapping cold SDK should join its pending owner"),
+        }
+    }
+
+    #[test]
+    fn concurrent_cold_acquisitions_elect_one_upload_and_share_its_exact_sealed_owner() {
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = fixture(b"one complete compiler upload");
+        let release = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let cache = &cache;
+                    let sdk = Arc::clone(&sdk);
+                    let release = Arc::clone(&release);
+                    let entered_tx = entered_tx.clone();
+                    scope.spawn(move || -> io::Result<Arc<ReceivedToolchain>> {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let stopped = || Instant::now() >= deadline;
+                        match cache.acquire(EDGE_A, sdk.identity(), &stopped)? {
+                            ToolchainAcquisition::Upload(owner) => {
+                                entered_tx.send(true).unwrap();
+                                while !release.load(Ordering::Acquire) {
+                                    checkpoint(&stopped)?;
+                                    thread::yield_now();
+                                }
+                                let lease = cache.adopt(EDGE_A, sdk, &stopped)?;
+                                owner.publish(Arc::clone(&lease), &stopped)?;
+                                Ok(lease)
+                            }
+                            ToolchainAcquisition::Wait(waiter) => {
+                                entered_tx.send(false).unwrap();
+                                loop {
+                                    match waiter.poll(&stopped)? {
+                                        UploadPoll::Pending => thread::yield_now(),
+                                        UploadPoll::Abandoned => {
+                                            return Err(invalid("fixture upload was abandoned"));
+                                        }
+                                        UploadPoll::Ready(lease) => return Ok(lease),
+                                    }
+                                }
+                            }
+                            ToolchainAcquisition::Ready(_) => {
+                                panic!("disabled retention cannot supply a warm hit")
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let elected = (0..4)
+                .map(|_| entered_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .filter(|leader| *leader)
+                .count();
+            assert_eq!(elected, 1);
+            assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+            release.store(true, Ordering::Release);
+            for thread in threads {
+                let received = thread.join().unwrap().unwrap();
+                assert!(Arc::ptr_eq(&received, &sdk));
+                received.verify(|| false).unwrap();
+            }
+        });
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        assert_eq!(counts(&cache), (0, 0, 0));
+    }
+
+    #[test]
+    fn private_completed_uploads_only_reach_registered_waiters_when_cache_is_disabled_or_full() {
+        for full in [false, true] {
+            let cache = RemoteToolchainCache::new(if full { 1024 } else { 0 }, 1).unwrap();
+            let _busy = full.then(|| cache.adopt(EDGE_B, fixture(b"busy SDK"), || false).unwrap());
+            let before = counts(&cache);
+            let sdk = fixture(b"shared private SDK");
+            let identity = *sdk.identity();
+            let path = sdk.owner().path().to_path_buf();
+            let owner = upload(&cache, EDGE_A, &identity);
+            let waiter = join_upload(&cache, EDGE_A, &identity);
+            let completed = Arc::downgrade(&waiter.flight);
+            let sdk = cache.adopt(EDGE_A, sdk, || false).unwrap();
+            owner.publish(sdk, || false).unwrap();
+            assert!(cache.lock().unwrap().pending_uploads.is_empty());
+            assert_eq!(counts(&cache), before);
+
+            // The completed ticket is deliberately still alive. New arrivals
+            // must upload; they cannot turn private handoff into warm retention.
+            let next = upload(&cache, EDGE_A, &identity);
+            assert!(!Weak::ptr_eq(
+                &completed,
+                &Arc::downgrade(next.flight.as_ref().unwrap()),
+            ));
+            let next_waiter = join_upload(&cache, EDGE_A, &identity);
+            let UploadPoll::Ready(received) = waiter
+                .poll(|| {
+                    assert!(cache.state.try_lock().is_ok());
+                    assert!(waiter.flight.result.try_lock().is_ok());
+                    false
+                })
+                .unwrap()
+            else {
+                panic!("registered waiter lost its completed SDK");
+            };
+            assert_eq!(received.owner().path(), path);
+            drop(received);
+            assert!(path.is_dir(), "the registered ticket still owns the SDK");
+            drop(waiter);
+            assert!(!path.exists(), "weak registry must not retain a private SDK");
+            assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+            assert!(matches!(next_waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+            drop((next_waiter, next));
+            assert!(cache.lock().unwrap().pending_uploads.is_empty());
+            assert_eq!(counts(&cache), before);
+        }
+    }
+
+    #[test]
+    fn upload_flights_bind_authenticated_peer_and_every_identity_field() {
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = fixture(b"identity-bound SDK");
+        let identity = *sdk.identity();
+        let mut owners = vec![upload(&cache, EDGE_A, &identity)];
+        let waiter = join_upload(&cache, EDGE_A, &identity);
+        owners.push(upload(&cache, EDGE_B, &identity));
+        for changed in ["hash", "files", "bytes"] {
+            let mut other = identity;
+            match changed {
+                "hash" => other.sha256[0] ^= 1,
+                "files" => other.files += 1,
+                "bytes" => other.bytes += 1,
+                _ => unreachable!(),
+            }
+            owners.push(upload(&cache, EDGE_A, &other));
+        }
+        assert_eq!(cache.lock().unwrap().pending_uploads.len(), 5);
+        assert!(cache.acquire([0; 32], &identity, || false).is_err());
+        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+        drop(owners);
+        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+    }
+
+    #[test]
+    fn abandoned_upload_generation_cannot_remove_its_replacement_or_strand_waiters() {
+        for unwind in [false, true] {
+            let cache = RemoteToolchainCache::new(0, 1).unwrap();
+            let sdk = fixture(b"recoverable compiler");
+            let identity = *sdk.identity();
+            let owner = upload(&cache, EDGE_A, &identity);
+            let abandoned = join_upload(&cache, EDGE_A, &identity);
+            if unwind {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _owner = owner;
+                        panic!("upload owner unwound");
+                    }))
+                    .is_err()
+                );
+            } else {
+                drop(owner);
+            }
+            assert!(matches!(abandoned.poll(|| false).unwrap(), UploadPoll::Abandoned));
+            let replacement = upload(&cache, EDGE_A, &identity);
+            let live = join_upload(&cache, EDGE_A, &identity);
+            assert!(!Arc::ptr_eq(&abandoned.flight, &live.flight));
+            drop(abandoned);
+            assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+            replacement.publish(Arc::clone(&sdk), || false).unwrap();
+            let UploadPoll::Ready(received) = live.poll(|| false).unwrap() else {
+                panic!("surviving waiter did not receive replacement upload");
+            };
+            assert!(Arc::ptr_eq(&received, &sdk));
+            assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        }
+    }
+
+    #[test]
+    fn failing_publication_after_detach_cannot_abandon_a_newer_upload_generation() {
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = fixture(b"replacement survives stale publisher");
+        let identity = *sdk.identity();
+        let owner = upload(&cache, EDGE_A, &identity);
+        let old_waiter = join_upload(&cache, EDGE_A, &identity);
+        let old_flight = Arc::clone(&old_waiter.flight);
+        let (held_tx, held_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        thread::scope(|scope| {
+            // Hold the actual result lock so publication pauses after registry
+            // detachment. Poisoning it makes the old publisher's Drop run only
+            // after a replacement generation has become discoverable.
+            let blocker = scope.spawn(move || {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _result = old_flight.result.lock().unwrap();
+                        held_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        panic!("publication result lock poisoned");
+                    }))
+                    .is_err()
+                );
+            });
+            held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let uploaded = Arc::clone(&sdk);
+            let publisher = scope.spawn(move || owner.publish(uploaded, || false));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cache.lock().unwrap().pending_uploads.is_empty() {
+                assert!(Instant::now() < deadline, "publisher did not detach");
+                thread::yield_now();
+            }
+            let next = upload(&cache, EDGE_A, &identity);
+            let waiter = join_upload(&cache, EDGE_A, &identity);
+            assert!(!Arc::ptr_eq(&old_waiter.flight, &waiter.flight));
+            release_tx.send(()).unwrap();
+            blocker.join().unwrap();
+            assert!(publisher.join().unwrap().is_err());
+            assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+            next.publish(Arc::clone(&sdk), || false).unwrap();
+            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Ready(_)));
+        });
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+    }
+
+    #[test]
+    fn upload_waiter_cancellation_is_independent_and_cancelled_acquisition_drops_outside_lock() {
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = fixture(b"independent waiter cancellation");
+        let owner = upload(&cache, EDGE_A, sdk.identity());
+        let survivor = join_upload(&cache, EDGE_A, sdk.identity());
+        for expired in [false, true] {
+            let waiter = join_upload(&cache, EDGE_A, sdk.identity());
+            let deadline = Instant::now();
+            let stopped = || !expired || Instant::now() >= deadline;
+            assert_eq!(waiter.poll(stopped).unwrap_err().kind(), io::ErrorKind::Interrupted);
+            drop(waiter);
+            assert!(matches!(survivor.poll(|| false).unwrap(), UploadPoll::Pending));
+            assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+        }
+        owner.publish(Arc::clone(&sdk), || false).unwrap();
+        assert!(matches!(survivor.poll(|| false).unwrap(), UploadPoll::Ready(_)));
+        drop(survivor);
+
+        let calls = Cell::new(0);
+        let result = cache.acquire(EDGE_A, sdk.identity(), || {
+            assert!(cache.state.try_lock().is_ok());
+            let previous = calls.get();
+            calls.set(previous + 1);
+            previous != 0
+        });
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted);
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        let next = upload(&cache, EDGE_A, sdk.identity());
+        let waiter = join_upload(&cache, EDGE_A, sdk.identity());
+        assert_eq!(
+            next.publish(Arc::clone(&sdk), || true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+    }
+
+    #[test]
+    fn upload_publication_refuses_wrong_identity_changed_sdk_and_changed_owner() {
+        for changed in ["hash", "files", "bytes", "sdk", "owner"] {
+            let cache = RemoteToolchainCache::new(0, 1).unwrap();
+            let sdk = fixture(b"verified compiler generation");
+            let mut identity = *sdk.identity();
+            match changed {
+                "hash" => identity.sha256[0] ^= 1,
+                "files" => identity.files += 1,
+                "bytes" => identity.bytes += 1,
+                _ => {}
+            }
+            let owner = upload(&cache, EDGE_A, &identity);
+            let waiter = join_upload(&cache, EDGE_A, &identity);
+            let published = match changed {
+                "hash" | "files" | "bytes" => Arc::clone(&sdk),
+                "sdk" => {
+                    let path = sdk.root().join("compiler");
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(path, b"tampered generation").unwrap();
+                    Arc::clone(&sdk)
+                }
+                "owner" => {
+                    fs::set_permissions(sdk.owner().path(), fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    Arc::clone(&sdk)
+                }
+                _ => unreachable!(),
+            };
+            assert!(owner.publish(published, || false).is_err(), "{changed}");
+            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+            assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        }
+    }
+
+    #[test]
+    fn upload_waiters_refuse_invalidated_cached_owners_and_later_mutation() {
+        let cache = RemoteToolchainCache::new(1024, 2).unwrap();
+        let sdk = fixture(b"shared compiler generation");
+        let identity = *sdk.identity();
+        let owner = upload(&cache, EDGE_A, &identity);
+        let waiter = join_upload(&cache, EDGE_A, &identity);
+        let sdk = cache.adopt(EDGE_A, sdk, || false).unwrap();
+        owner.publish(Arc::clone(&sdk), || false).unwrap();
+
+        let ToolchainAcquisition::Ready(warm) = cache.acquire(EDGE_A, &identity, || false).unwrap()
+        else {
+            panic!("retained SDK must win before another cold flight is created");
+        };
+        assert!(Arc::ptr_eq(&warm, &sdk));
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        drop(warm);
+
+        // A shared acquisition must respect invalidation even if intact bytes
+        // would otherwise pass. It cannot reinterpret this row as a private SDK.
+        cache.invalidate(EDGE_A, &sdk).unwrap();
+        assert!(waiter.poll(|| false).is_err());
+        let replacement_owner = upload(&cache, EDGE_A, &identity);
+        let replacement_waiter = join_upload(&cache, EDGE_A, &identity);
+        assert!(replacement_owner.publish(Arc::clone(&sdk), || false).is_err());
+        assert!(matches!(
+            replacement_waiter.poll(|| false).unwrap(),
+            UploadPoll::Abandoned
+        ));
+
+        let owner = upload(&cache, EDGE_A, &identity);
+        let successor_waiter = join_upload(&cache, EDGE_A, &identity);
+        let successor = cache
+            .adopt(EDGE_A, fixture(b"shared compiler generation"), || false)
+            .unwrap();
+        owner.publish(Arc::clone(&successor), || false).unwrap();
+        assert!(!Arc::ptr_eq(&sdk, &successor));
+        let path = sdk.root().join("compiler");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, b"mutated predecessor").unwrap();
+        assert!(waiter.poll(|| false).is_err());
+        let UploadPoll::Ready(received) = successor_waiter.poll(|| false).unwrap() else {
+            panic!("an older generation invalidated its replacement");
+        };
+        assert!(Arc::ptr_eq(&received, &successor));
+        assert!(!cache.lock().unwrap().entries.iter().any(|entry| {
+            Arc::ptr_eq(&entry.lease, &successor) && entry.invalidated
+        }));
+
+        let private_cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let private_sdk = fixture(b"private completed SDK");
+        let owner = upload(&private_cache, EDGE_A, private_sdk.identity());
+        let waiter = join_upload(&private_cache, EDGE_A, private_sdk.identity());
+        owner.publish(Arc::clone(&private_sdk), || false).unwrap();
+        let path = private_sdk.root().join("compiler");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, b"tampered private SDK").unwrap();
+        assert!(waiter.poll(|| false).is_err());
+        assert_eq!(counts(&private_cache), (0, 0, 0));
+    }
+
+    #[test]
+    fn pending_upload_registry_has_a_separate_bound_and_unshared_fallback_still_checks_identity() {
+        let cache = RemoteToolchainCache::new(0, 1).unwrap();
+        let sdk = fixture(b"bounded upload registry");
+        let identity = *sdk.identity();
+        let mut owners = Vec::new();
+        for index in 1..=MAX_PENDING_UPLOADS {
+            let mut different = identity;
+            different.sha256[0] ^= index as u8;
+            owners.push(upload(&cache, EDGE_A, &different));
+        }
+        assert_eq!(cache.lock().unwrap().pending_uploads.len(), MAX_PENDING_UPLOADS);
+        let fallback = upload(&cache, EDGE_A, &identity);
+        assert!(fallback.flight.is_none());
+        assert!(fallback.publish(fixture(b"wrong fallback SDK"), || false).is_err());
+        let fallback = upload(&cache, EDGE_A, &identity);
+        assert!(fallback.flight.is_none());
+        fallback.publish(Arc::clone(&sdk), || false).unwrap();
+        assert_eq!(cache.lock().unwrap().pending_uploads.len(), MAX_PENDING_UPLOADS);
+        assert_eq!(counts(&cache), (0, 0, 0));
+
+        drop(owners.pop());
+        let next = upload(&cache, EDGE_A, &identity);
+        assert!(next.flight.is_some());
+        let dead = Arc::downgrade(next.flight.as_ref().unwrap());
+        drop(next);
+        drop(owners);
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
+        // Exercise pruning independently of the ordinary Drop removal path.
+        cache.lock().unwrap().pending_uploads.push(dead);
+        let next = upload(&cache, EDGE_A, &identity);
+        assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
+        drop(next);
+        assert!(cache.lock().unwrap().pending_uploads.is_empty());
     }
 
     fn wait_for_verification_followers(received: &ReceivedToolchain, followers: usize) {
