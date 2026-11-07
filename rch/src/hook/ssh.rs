@@ -2234,7 +2234,9 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
-        rch_common::timing::scale_duration(Duration::from_secs(10)).as_secs()
+        rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(
+            Duration::from_secs(10),
+        ))
     ));
     cmd.arg("-o").arg("ServerAliveInterval=10");
     cmd.arg("-o").arg("ServerAliveCountMax=3");
@@ -2577,10 +2579,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
         // A large closure or a batch of bounded operations may legitimately
         // run for minutes. It must not also wait minutes to authenticate an
         // unreachable endpoint before the first operation can start.
-        timeout_duration.as_secs().clamp(
-            1,
-            rch_common::timing::scale_duration(Duration::from_secs(20)).as_secs(),
+        rch_common::timing::ceil_seconds(
+            timeout_duration.min(rch_common::timing::scale_duration(Duration::from_secs(20))),
         )
+        .max(1)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {

@@ -1306,7 +1306,8 @@ fn build_remote_kill_command(
     let config = cancellation_transport_endpoint(record)?;
     let mut ssh = tokio::process::Command::new("ssh");
     rch_common::ssh::configure_oneshot_ssh(&mut ssh, can_disable_background);
-    let connect_timeout = scale_duration(Duration::from_secs(5)).as_secs_f64().ceil();
+    let connect_timeout =
+        rch_common::timing::ceil_seconds(scale_duration(Duration::from_secs(5)));
     ssh.args([
         "-o",
         "StrictHostKeyChecking=no",

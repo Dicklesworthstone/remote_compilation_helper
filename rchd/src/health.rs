@@ -900,7 +900,10 @@ pub(crate) async fn probe_owned_recovery_transport(
                 "StrictHostKeyChecking=accept-new",
                 "-o",
             ])
-            .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)))
+            .arg(format!(
+                "ConnectTimeout={}",
+                rch_common::timing::ceil_seconds(timeout).max(1)
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());

@@ -911,7 +911,7 @@ impl SshClient {
             .arg("-o")
             .arg(format!(
                 "ConnectTimeout={}",
-                self.options.connect_timeout.as_secs()
+                crate::timing::ceil_seconds(self.options.connect_timeout).max(1)
             ));
         if can_disable_background {
             command.args(["-o", "ForkAfterAuthentication=no"]);
@@ -1551,7 +1551,7 @@ pub use crate::ssh_utils::identities_only_args;
 /// skip it — see `system_ssh_execute` which drops it.
 ///
 /// Argv layout:
-/// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=8 -o
+/// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=<scaled-seconds> -o
 ///   ConnectionAttempts=1 -o ControlMaster=no -o ControlPersist=no -o ControlPath=none -o
 ///   ForkAfterAuthentication=no (when supported) -o
 ///   StrictHostKeyChecking=accept-new -o ServerAliveInterval=<secs>
@@ -1562,6 +1562,8 @@ pub use crate::ssh_utils::identities_only_args;
 /// ports, so the argv has no `-p` flag. The 8s `ConnectTimeout` matches the
 /// fleet SshExecutor default (`DEFAULT_CONNECT_TIMEOUT_SECS = 10` would be
 /// the natural match too — kept at 8 to match the FINDINGS spec exactly).
+/// The shared timing policy extends that 8s baseline and fractional values
+/// round upward because OpenSSH accepts only integer connection seconds.
 /// `server_alive_interval` is rounded up to 1s minimum when non-zero to
 /// avoid `ServerAliveInterval=0` (which OpenSSH treats as "disable
 /// keepalives" — fine — but matches the spec "0 -> omit" intent).
@@ -1586,7 +1588,10 @@ pub(crate) fn system_ssh_argv(
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("BatchMode=yes"));
     argv.push(OsString::from("-o"));
-    argv.push(OsString::from("ConnectTimeout=8"));
+    argv.push(OsString::from(format!(
+        "ConnectTimeout={}",
+        crate::timing::ceil_seconds(crate::timing::scale_duration(Duration::from_secs(8)))
+    )));
     // This fallback opens its own connection. Never attach to an unrelated
     // master, inherit extra dials, or leave a persistent master behind.
     for option in oneshot_ssh_options(can_disable_background) {
@@ -3640,6 +3645,42 @@ exec sleep 30
             assert_eq!(output.status.code(), Some(255), "{output:?}");
             assert!(output.stdout.is_empty(), "{output:?}");
             assert_eq!(marker.exists(), !guarded, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_master_rounds_fractional_connection_budgets_up() {
+        let fake = FakeSsh::new("ready");
+        let fractional = crate::timing::TimingScale::try_from(2.5).unwrap();
+        let fine = crate::timing::TimingScale::try_from(1.001).unwrap();
+        let maximum = crate::timing::TimingScale::try_from(10.0).unwrap();
+        for (budget, expected_seconds) in [
+            (Duration::ZERO, 1),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_secs(5), 5),
+            (fractional.duration(Duration::from_secs(5)), 13),
+            (fine.duration(Duration::from_secs(10)), 11),
+            (maximum.duration(Duration::from_secs(10)), 100),
+        ] {
+            let client = fake.client(budget, true);
+            let command = client.master_command(
+                &fake.program,
+                "builder@worker",
+                Path::new("/private/control/master"),
+                Path::new("/private/control/log"),
+                true,
+            );
+            let connect_arguments: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .filter(|argument| argument.starts_with("ConnectTimeout="))
+                .collect();
+            assert_eq!(
+                connect_arguments,
+                vec![format!("ConnectTimeout={expected_seconds}")],
+                "budget={budget:?}"
+            );
         }
     }
 

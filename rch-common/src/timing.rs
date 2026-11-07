@@ -19,6 +19,15 @@ pub const TIMING_SCALE_ENV: &str = "RCH_TIMING_SCALE";
 /// Workload runtime limits and signal-escalation grace do not use this policy.
 pub const MAX_CONTROL_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Round a duration up for transports that accept only integer seconds.
+/// Preserve zero and saturate if the mathematical ceiling exceeds u64::MAX.
+#[must_use]
+pub fn ceil_seconds(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0))
+}
+
 /// A finite multiplier between one and ten, inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
@@ -153,6 +162,24 @@ pub fn shell_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_transport_seconds_round_up_without_overflow() {
+        for (duration, expected) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_secs(1), 1),
+            (Duration::new(5, 1), 6),
+            (Duration::from_millis(12_500), 13),
+            (Duration::new(u64::MAX - 1, 999_999_999), u64::MAX),
+            (Duration::from_secs(u64::MAX), u64::MAX),
+            (Duration::MAX, u64::MAX),
+        ] {
+            assert_eq!(ceil_seconds(duration), expected, "{duration:?}");
+        }
+        let scale = TimingScale::try_from(2.5).unwrap();
+        assert_eq!(ceil_seconds(scale.duration(Duration::from_secs(5))), 13);
+    }
 
     #[test]
     fn default_preserves_control_durations_within_ceiling_exactly() {

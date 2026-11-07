@@ -6475,8 +6475,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg(rsync_io_timeout_arg(self.transfer_estimate_timeout()));
 
         let ssh_command = format!(
-            "{} -o ConnectTimeout=5",
-            self.build_rsync_ssh_command(worker)
+            "{} -o ConnectTimeout={}",
+            self.build_rsync_ssh_command(worker),
+            rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(
+                Duration::from_secs(5),
+            ))
         );
 
         cmd.arg("-az");
@@ -7205,7 +7208,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -8049,7 +8052,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -8148,7 +8151,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
