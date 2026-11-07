@@ -3281,6 +3281,9 @@ fi
 printf '%s\n' "$$" >> "$root/master-pids"
 case "$mode" in
     ready|old-client|probe-stall|probe-reject) : > "$socket" ;;
+    readiness-barrier)
+        while [ ! -f "$root/release-ready" ]; do sleep 0.1 || exit 1; done
+        : > "$socket" ;;
     fail) printf 'Permission denied (publickey).\n' > "$log"; exit 255 ;;
     refused) printf 'ssh: connect to host worker port 22: Connection refused\n' > "$log"; exit 255 ;;
     vpn-down) printf 'ssh: connect to host worker port 22: Network is unreachable\n' > "$log"; exit 255 ;;
@@ -4144,6 +4147,80 @@ exit 37
         .expect("no live pipe-holding descendant may remain");
         assert_signal_blocked();
         println!("blocked-sigchld-verified {mode}");
+    }
+
+    #[tokio::test]
+    async fn scaled_connection_budget_admits_high_latency_readiness_without_retry() {
+        let default_scale = crate::timing::TimingScale::default();
+        let enlarged_scale = crate::timing::TimingScale::try_from(2.0).unwrap();
+        let baseline = SshOptions::default().connect_timeout;
+        let default_budget = default_scale.duration(baseline);
+        let enlarged_budget = enlarged_scale.duration(baseline);
+        let readiness_delay = baseline + Duration::from_secs(2);
+        let default_ssh = FakeSsh::new("readiness-barrier");
+        let enlarged_ssh = FakeSsh::new("readiness-barrier");
+        let mut default_client = default_ssh.client(default_budget, true);
+        let mut enlarged_client = enlarged_ssh.client(enlarged_budget, true);
+        let started = Instant::now();
+
+        // Both real masters start before the same latency interval. The
+        // default ten-second budget expires while authentication is held;
+        // scale two leaves several seconds for the actual readiness probe.
+        // Concurrent clients keep this test to one twelve-second delay.
+        let (default_result, enlarged_result, ()) = tokio::time::timeout(
+            enlarged_budget + Duration::from_secs(5),
+            async {
+                tokio::join!(
+                    default_ssh.connect(&mut default_client),
+                    enlarged_ssh.connect(&mut enlarged_client),
+                    async {
+                        tokio::join!(
+                            default_ssh.wait_for_pid("master-pids"),
+                            enlarged_ssh.wait_for_pid("master-pids"),
+                        );
+                        tokio::time::sleep(readiness_delay).await;
+                        std::fs::write(
+                            default_ssh.directory.path().join("release-ready"),
+                            b"ready\n",
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            enlarged_ssh.directory.path().join("release-ready"),
+                            b"ready\n",
+                        )
+                        .unwrap();
+                    },
+                )
+            },
+        )
+        .await
+        .expect("both connection attempts must remain bounded");
+
+        let error = default_result.expect_err("the unscaled budget must expire before readiness");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(!default_client.is_connected());
+        enlarged_result.expect("the enlarged budget must admit the same delayed readiness");
+        assert!(enlarged_client.is_connected());
+        assert!(started.elapsed() >= readiness_delay);
+        assert!(
+            default_ssh.pids("check-pids").is_empty(),
+            "an expired authentication attempt must not probe a late socket"
+        );
+        assert_eq!(enlarged_ssh.pids("check-pids").len(), 1);
+        for ssh in [&default_ssh, &enlarged_ssh] {
+            assert_eq!(ssh.pids("capability-pids").len(), 1);
+            assert_eq!(
+                ssh.pids("master-pids").len(),
+                1,
+                "scaling must not introduce a fallback connection or replay"
+            );
+        }
+
+        enlarged_client.disconnect().await.unwrap();
+        assert!(!enlarged_client.is_connected());
+        drop(default_client);
+        drop(enlarged_client);
+        tokio::join!(default_ssh.assert_reaped(), enlarged_ssh.assert_reaped());
     }
 
     #[tokio::test]

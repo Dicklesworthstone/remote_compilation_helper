@@ -1480,6 +1480,49 @@ m.subprocess.Popen=interrupted_spawn"""
                 self.assertIn("RCH_TIMING_SCALE", stderr)
                 self.assertFalse(mutation.exists())
 
+    def test_scaled_heartbeat_accepts_late_progress_beyond_default_deadline(self):
+        inject = """original_finish=m.finish_descendants
+def delayed_finish(value, heartbeat):
+    time.sleep(3.6)
+    return original_finish(value, heartbeat)
+m.finish_descendants=delayed_finish"""
+        for scale, succeeds in (("1", False), ("2", True)):
+            with self.subTest(scale=scale):
+                process, receipt = self.spawn(
+                    "print('foreground-finished')",
+                    inject=inject, timing_scale=scale)
+                status, stdout, stderr = self.complete(process, timeout=10)
+                self.assertIn("foreground-finished", stdout)
+                if succeeds:
+                    self.assertEqual(status, 0, stderr)
+                    usage = json.loads(receipt.read_text().split("_DISK_USAGE:", 1)[1])
+                    self.assertTrue(usage["complete"])
+                    self.assertEqual(usage["exit_code"], 0)
+                else:
+                    self.assertNotEqual(status, 0, stderr)
+                    self.assertEqual(receipt.read_text(), "")
+                    diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+                    self.assertEqual(diagnostic["reason"], "heartbeat_timeout")
+                    self.assertTrue(diagnostic["started"])
+
+    def test_scaled_heartbeat_stall_remains_bounded_and_unconfirmed(self):
+        inject = """original_finish=m.finish_descendants
+def stalled_finish(value, heartbeat):
+    time.sleep(20)
+    return original_finish(value, heartbeat)
+m.finish_descendants=stalled_finish"""
+        started = time.monotonic()
+        process, receipt = self.spawn(
+            "print('foreground-finished')", inject=inject, timing_scale="2")
+        status, stdout, stderr = self.complete(process, timeout=10)
+        self.assertNotEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        self.assertLess(time.monotonic() - started, 9)
+        self.assertEqual(receipt.read_text(), "")
+        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+        self.assertEqual(diagnostic["reason"], "heartbeat_timeout")
+        self.assertTrue(diagnostic["started"])
+
     def test_scaled_free_sample_deadline_allows_delayed_success(self):
         for value, succeeds in (("1", False), ("2", True)):
             with self.subTest(scale=value):
@@ -1548,16 +1591,23 @@ else:
         self.complete(process)
 
     def test_guardian_kills_writers_when_supervisor_is_killed(self):
-        ready = self.target / "writer"
-        process, receipt = self.spawn(f"from pathlib import Path; import os,signal,time; Path({str(ready)!r}).write_text(str(os.getpid())); os.kill(os.getppid(),signal.SIGKILL); time.sleep(20)")
-        status, _, stderr = self.complete(process)
-        self.assertNotEqual(status, 0)
-        self.assertEqual(receipt.read_text(), "")
-        diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
-        self.assertEqual(diagnostic["reason"], "supervisor_exit_unconfirmed")
-        self.assertEqual(diagnostic["wait_status"], signal.SIGKILL)
-        record = monitor.process_snapshot().get(int(ready.read_text()))
-        self.assertTrue(record is None or record["state"] in ("Z", "X"))
+        for scale in ("1", "10"):
+            with self.subTest(scale=scale):
+                ready = self.target / ("writer-" + scale)
+                payload = (
+                    "from pathlib import Path; import os,signal,time; "
+                    f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+                    "os.kill(os.getppid(),signal.SIGKILL); time.sleep(20)"
+                )
+                process, receipt = self.spawn(payload, timing_scale=scale)
+                status, _, stderr = self.complete(process)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(receipt.read_text(), "")
+                diagnostic = json.loads(stderr.split("_DISK_GUARDIAN:", 1)[1])
+                self.assertEqual(diagnostic["reason"], "supervisor_exit_unconfirmed")
+                self.assertEqual(diagnostic["wait_status"], signal.SIGKILL)
+                record = monitor.process_snapshot().get(int(ready.read_text()))
+                self.assertTrue(record is None or record["state"] in ("Z", "X"))
 
     def test_lost_group_leader_cannot_strand_workload(self):
         ready = self.target / "writer"
@@ -1594,14 +1644,21 @@ else:
         self.assertTrue(record is None or record["state"] in ("Z", "X"))
 
     def test_execution_deadline_uses_existing_marker_and_stops_group(self):
-        ready = self.target / "writer"
-        process, receipt = self.spawn(f"from pathlib import Path; import os,time; Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(20)", timeout_seconds=1)
-        self.complete(process)
-        lines = receipt.read_text().splitlines()
-        self.assertIn(MARKER.removesuffix("_DISK_BUDGET:"), lines)
-        self.assertFalse(any(line.startswith(MARKER) for line in lines))
-        record = monitor.process_snapshot().get(int(ready.read_text()))
-        self.assertTrue(record is None or record["state"] in ("Z", "X"))
+        for scale in ("1", "10"):
+            with self.subTest(scale=scale):
+                ready = self.target / ("writer-" + scale)
+                payload = (
+                    "from pathlib import Path; import os,time; "
+                    f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(20)"
+                )
+                process, receipt = self.spawn(
+                    payload, timeout_seconds=1, timing_scale=scale)
+                self.complete(process)
+                lines = receipt.read_text().splitlines()
+                self.assertIn(MARKER.removesuffix("_DISK_BUDGET:"), lines)
+                self.assertFalse(any(line.startswith(MARKER) for line in lines))
+                record = monitor.process_snapshot().get(int(ready.read_text()))
+                self.assertTrue(record is None or record["state"] in ("Z", "X"))
 
     def test_guardian_stops_writers_when_failure_receipt_write_hangs(self):
         inject = "m.persist_receipts=lambda *args: time.sleep(20)"
