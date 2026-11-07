@@ -582,7 +582,8 @@ rch_remote_cancel_loaded() (
     rch_settle_deadline=$((rch_observation_now + rch_timing_scaled))
     rch_settle_previous=-1
     while :; do
-        rch_control_in_budget || return 44
+        # Expiry after a timely live census is a survivor (45), not a fault.
+        rch_control_in_budget || { [ "$rch_observation_now" -ge "$rch_observation_deadline" ] && break; return 44; }
         [ "$rch_observation_now" -gt "$rch_settle_previous" ] || return 44
         [ "$rch_observation_now" -lt "$rch_settle_deadline" ] || break
         rch_group_state
