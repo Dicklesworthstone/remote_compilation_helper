@@ -97,7 +97,12 @@ class ControlTimeout(WithoutTimeout):
     def test_invalid_timeout_arguments_cannot_spawn(self):
         marker = self.root / "unsafe-launch"
         command = "/bin/sh -c " + shlex.quote("echo unsafe > " + shlex.quote(str(marker)))
-        for options in ("--signal=TERM 1s", "--signal=KILL 0s", "--signal=KILL NaN", "--signal=KILL 60s"):
+        # The native monitor receives an already-scaled cap: 8s * 10 = 80s.
+        # It must still refuse zero, unsupported signals and out-of-range data.
+        for options in (
+            "--signal=TERM 1s", "--signal=KILL 0s", "--signal=KILL NaN",
+            "--signal=KILL 81s", "--signal=KILL 999999999999999999999999s",
+        ):
             with self.subTest(options=options):
                 result = self.run_protocol("rch_group_timeout " + options + " " + command)
                 self.assertEqual(result.returncode, 125, result.stderr)
@@ -116,6 +121,32 @@ class ControlTimeout(WithoutTimeout):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "valid")
+
+    def test_scaled_native_monitor_accepts_maximum_effective_deadline(self):
+        self.env["RCH_TIMING_SCALE"] = "10"
+        for seconds in (60, 80):
+            with self.subTest(seconds=seconds):
+                result = self.run_protocol(
+                    f"rch_group_timeout --signal=KILL {seconds}s /bin/sh -c 'printf valid'"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "valid")
+        result = self.run_protocol("rch_control_capture 8s /bin/sh -c 'printf valid'")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "valid")
+        self.assert_no_capture_files()
+
+    def test_scale_does_not_widen_unscaled_capture_argument_domain(self):
+        self.env["RCH_TIMING_SCALE"] = "10"
+        marker = self.root / "unsafe-scaled-launch"
+        command = "/bin/sh -c " + shlex.quote("echo unsafe > " + shlex.quote(str(marker)))
+        for cap in ("9s", "80s", "999999999999999999999999s"):
+            with self.subTest(cap=cap):
+                result = self.run_protocol("rch_control_capture " + cap + " " + command)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(result.stdout, "")
+                self.assert_no_capture_files()
 
     def test_remaining_recovery_budget_bounds_the_fallback_and_its_pipe_holder(self):
         marker = self.root / "descendant-survived-shared-budget"

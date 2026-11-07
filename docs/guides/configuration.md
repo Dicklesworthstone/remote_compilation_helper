@@ -72,6 +72,14 @@ affects that invocation, not the daemon already running in another process.
 To use one fleet policy for both, set it in the user configuration and restart
 the daemon, or provide the variable to both processes.
 
+Health monitoring and recovery of recorded workers share the same scaled
+`worker_timeout_secs` allowance. SSH connection-pool reuse checks also use the
+scale. Toolchain and capability checks keep their original elapsed deadline
+through connection setup, lock waits and publication. A late or cancelled
+capability check retains the previous complete snapshot; it cannot advertise
+new capacity or reset that snapshot's age. A late toolchain verdict cannot
+refresh a cached worker exclusion.
+
 The affected operations are worker toolchain/capability/telemetry probes,
 embedded disk-monitor admission and heartbeat observations, source-namespace
 control, cancellation observation and settlement, and completion-receipt
@@ -96,7 +104,8 @@ a failure even when the transport exits successfully.
 
 Scope binding and launch admission may retry an unknown observation while their
 original deadline is open. They recheck cancellation and process identity and
-keep the execution gate closed until positive evidence is available. Retries refuse a stopped or backward-moving observation clock. Cancellation settlement
+keep the execution gate closed until positive evidence is available. Retries
+refuse a stopped or backward-moving observation clock. Cancellation settlement
 also stays bounded and retains the process record when cleanup is unconfirmed.
 
 Use `rch config set timeouts.scale 2.5`, `get`, `reset`,

@@ -60,6 +60,7 @@ default = ["rich-ui"]
 rich-ui = ["rich_rust"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tracing-subscriber = { workspace = true }
 proptest = "1.11.0"

@@ -7,7 +7,7 @@ use crate::disk_pressure::{
     DiskCapacityObservation, DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment,
     PressureState, refresh_pressure_policy,
 };
-use crate::health::probe_worker_capabilities;
+use crate::health::probe_worker_capabilities_until;
 use rch_common::bypass_record::AdminDisableStore;
 use rch_common::timing::scale_duration;
 use rch_common::{
@@ -871,6 +871,14 @@ pub(crate) struct CapabilityProbeContext {
     network_revision: u64,
     transport_generation: u64,
     current_transport_generation: Arc<AtomicU64>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl CapabilityProbeContext {
+    pub(crate) fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
 }
 
 /// Configuration and identity of the endpoint a network operation actually used.
@@ -1803,6 +1811,7 @@ impl WorkerState {
             network_revision: *self.network_changes.borrow(),
             transport_generation: transport.disk_capacity_generation.load(Ordering::Acquire),
             current_transport_generation: Arc::clone(&transport.disk_capacity_generation),
+            deadline: None,
         }
     }
 
@@ -1814,49 +1823,72 @@ impl WorkerState {
         context: CapabilityProbeContext,
         capabilities: WorkerCapabilities,
     ) -> bool {
-        let config = self.config.read().await;
-        let _publication = self.network_transition.lock().await;
-        if *self.network_changes.borrow() != context.network_revision
-            || context.current_transport_generation.load(Ordering::Acquire)
-                != context.transport_generation
-        {
+        let deadline = context.deadline;
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return false;
         }
-        if config.id != context.config.id
-            || config.host != context.config.host
-            || config.user != context.config.user
-            || config.identity_file != context.config.identity_file
-        {
-            return false;
-        }
-        let generation = context.generation.wrapping_add(1);
-        if self
-            .disk_capacity_generation
-            .compare_exchange(
-                context.generation,
+        let publication = async {
+            let config = self.config.read().await;
+            let _publication = self.network_transition.lock().await;
+            // Match reservation's capability-before-pressure-and-disk order.
+            // Acquire every destination before changing generation or any
+            // cached snapshot: cancellation while queued keeps old evidence.
+            let mut cached = self.capabilities.write().await;
+            let mut pressure = self.pressure_assessment.write().await;
+            let mut disk = self.disk_capacity_observation.write().await;
+            if *self.network_changes.borrow() != context.network_revision
+                || context.current_transport_generation.load(Ordering::Acquire)
+                    != context.transport_generation
+            {
+                return false;
+            }
+            if config.id != context.config.id
+                || config.host != context.config.host
+                || config.user != context.config.user
+                || config.identity_file != context.config.identity_file
+            {
+                return false;
+            }
+            let pressure_config = DiskPressurePolicyConfig::configured();
+            let next_pressure = refresh_pressure_policy(&capabilities, &pressure, &pressure_config);
+            let generation = context.generation.wrapping_add(1);
+            let observation = DiskCapacityObservation::from_capabilities(
+                config.id.to_string(),
+                &capabilities,
                 generation,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
+                Arc::clone(&self.disk_capacity_generation),
+                context.transport_generation,
+                context.current_transport_generation,
+                context.started_at,
+            );
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return false;
+            }
+            if self
+                .disk_capacity_generation
+                .compare_exchange(
+                    context.generation,
+                    generation,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            // No await follows the commit. Readers cannot observe a cancelled
+            // publication's new disk generation paired with old capabilities.
+            *disk = observation;
+            *cached = capabilities;
+            *pressure = next_pressure;
+            true
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, publication)
+                .await
+                .unwrap_or(false),
+            None => publication.await,
         }
-        let observation = DiskCapacityObservation::from_capabilities(
-            config.id.to_string(),
-            &capabilities,
-            generation,
-            Arc::clone(&self.disk_capacity_generation),
-            context.transport_generation,
-            context.current_transport_generation,
-            context.started_at,
-        );
-        *self.disk_capacity_observation.write().await = observation;
-        let pressure_config = DiskPressurePolicyConfig::configured();
-        *self.capabilities.write().await = capabilities.clone();
-        let mut current = self.pressure_assessment.write().await;
-        *current = refresh_pressure_policy(&capabilities, &current, &pressure_config);
-        true
     }
 
     /// Get worker capabilities.
@@ -1883,6 +1915,38 @@ impl WorkerState {
                 checked_at_unix_ms: current_unix_ms(),
             },
         );
+    }
+
+    /// Publish a completed toolchain verdict only while its original budget
+    /// remains. Waiting for the cache lock cannot turn late evidence into a
+    /// fresh success or restart a worker exclusion.
+    pub(crate) async fn record_toolchain_preflight_before(
+        &self,
+        toolchain: String,
+        usable: bool,
+        reason: Option<String>,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let Ok(mut cache) =
+            tokio::time::timeout_at(deadline, self.toolchain_preflight.write()).await
+        else {
+            return false;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        cache.insert(
+            toolchain,
+            ToolchainPreflightStatus {
+                usable,
+                reason,
+                checked_at_unix_ms: current_unix_ms(),
+            },
+        );
+        true
     }
 
     /// Retrieve a cached toolchain preflight verdict.
@@ -3076,24 +3140,26 @@ async fn refresh_worker_capabilities_for_worker(
 ) -> WorkerCapabilitiesRefreshInfo {
     let probe_timeout = scale_duration(CAPABILITIES_REFRESH_PROBE_TIMEOUT);
     let worker_budget = scale_duration(CAPABILITIES_REFRESH_WORKER_BUDGET);
-    let probe = tokio::time::timeout(
-        worker_budget,
-        // On-demand capability refresh (the `rch workers capabilities` API path)
-        // uses a throwaway SSH session — it is a low-frequency operator query, not
-        // one of the ~30s periodic poll loops the shared pool exists to de-flood.
-        probe_worker_capabilities(&worker, probe_timeout, None),
-    )
-    .await;
+    let Some(deadline) = tokio::time::Instant::now().checked_add(worker_budget) else {
+        return WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+            "capabilities probe deadline exceeds the monotonic clock range",
+        );
+    };
+    // Carry the operator response deadline through collection and publication;
+    // a ready inner future must not publish after this shorter outer budget.
+    let probe = probe_worker_capabilities_until(&worker, probe_timeout, None, deadline).await;
 
     match probe {
-        Ok(Some(_capabilities)) => WorkerCapabilitiesRefreshInfo::live_probe(),
-        Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+        Some(_capabilities) => WorkerCapabilitiesRefreshInfo::live_probe(),
+        None if tokio::time::Instant::now() >= deadline => {
+            WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+                "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
+                worker_budget.as_secs_f64()
+            ))
+        }
+        None => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
             "capabilities probe failed; returning cached capability snapshot",
         ),
-        Err(_) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
-            "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
-            worker_budget.as_secs_f64()
-        )),
     }
 }
 
@@ -5651,6 +5717,143 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn capability_publication_requires_time_remaining_after_all_destination_locks() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        for scale in [1.0, 2.0, 10.0] {
+            let policy = rch_common::timing::TimingScale::try_from(scale).unwrap();
+            let allowance = policy.duration(Duration::from_secs(2));
+            for elapsed in [
+                allowance - Duration::from_millis(1),
+                allowance,
+                allowance + Duration::from_millis(1),
+            ] {
+                let worker = WorkerState::new(recovered_worker_config("disk-deadline", 8));
+                let capabilities = |free| WorkerCapabilities {
+                    build_disk_free_gb: Some(free),
+                    build_disk_total_gb: Some(100.0),
+                    ..Default::default()
+                };
+                worker.set_capabilities(capabilities(51.0)).await;
+                let old_budget = DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    floor_gib: 0,
+                    warm_policy: None,
+                    capacity: worker.disk_capacity_observation().await,
+                };
+                let context = worker
+                    .capability_probe_context()
+                    .await
+                    .with_deadline(tokio::time::Instant::now() + allowance);
+                // Queue at the last destination lock. Neither capabilities,
+                // disk generation nor capacity may change before this lock.
+                let disk_guard = worker.disk_capacity_observation.write().await;
+                let mut publication =
+                    Box::pin(worker.publish_capabilities(context, capabilities(90.0)));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(elapsed).await;
+                drop(disk_guard);
+                let accepted = publication.await;
+                assert_eq!(accepted, elapsed < allowance, "scale={scale}");
+                if accepted {
+                    assert_eq!(
+                        old_budget.check("disk-deadline", 0),
+                        Err(DiskHeadroomRejection::Stale)
+                    );
+                    assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(90.0));
+                } else {
+                    assert!(
+                        matches!(
+                            old_budget.check("disk-deadline", 0),
+                            Err(DiskHeadroomRejection::Insufficient { .. })
+                        ),
+                        "expiry must retain the previous complete capacity observation"
+                    );
+                    assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+                }
+                let current_budget = DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    floor_gib: 0,
+                    warm_policy: None,
+                    capacity: worker.disk_capacity_observation().await,
+                };
+                assert_eq!(
+                    current_budget.check("disk-deadline", 0).is_ok(),
+                    accepted,
+                    "an expired generous observation must never fund new admission"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_capability_publication_preserves_old_evidence_and_allows_recovery() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        let worker = WorkerState::new(recovered_worker_config("disk-cancelled", 8));
+        let capabilities = |free| WorkerCapabilities {
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(100.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(capabilities(51.0)).await;
+        let old_budget = DiskHeadroomAdmission {
+            requested_gib: 64,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        let context = worker
+            .capability_probe_context()
+            .await
+            .with_deadline(tokio::time::Instant::now() + Duration::from_secs(20));
+        let disk_guard = worker.disk_capacity_observation.write().await;
+        let mut publication = Box::pin(worker.publish_capabilities(context, capabilities(90.0)));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Drop the owned future itself, while its final lock is still queued.
+        drop(publication);
+        drop(disk_guard);
+        assert!(matches!(
+            old_budget.check("disk-cancelled", 0),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+        assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+
+        let fresh_context = worker
+            .capability_probe_context()
+            .await
+            .with_deadline(tokio::time::Instant::now() + Duration::from_secs(1));
+        assert!(
+            worker
+                .publish_capabilities(fresh_context, capabilities(90.0))
+                .await
+        );
+        assert_eq!(
+            old_budget.check("disk-cancelled", 0),
+            Err(DiskHeadroomRejection::Stale),
+            "only the later complete publication may revoke the old token"
+        );
+        assert!(
+            DiskHeadroomAdmission {
+                requested_gib: 64,
+                floor_gib: 0,
+                warm_policy: None,
+                capacity: worker.disk_capacity_observation().await,
+            }
+            .check("disk-cancelled", 0)
+            .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn declared_disk_budget_probe_cannot_publish_after_retarget_or_newer_probe() {
         use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
@@ -7749,6 +7952,56 @@ mod tests {
             assert!(!pressure.telemetry_fresh);
             assert!(pressure.telemetry_age_secs.unwrap() >= 91);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toolchain_cache_publication_does_not_refresh_evidence_after_waiting_past_deadline() {
+        let worker = WorkerState::new(test_config("toolchain-cache-deadline"));
+        worker
+            .record_toolchain_preflight("stable".into(), false, Some("previous refusal".into()))
+            .await;
+        let original = worker.toolchain_preflight_status("stable").await.unwrap();
+        for usable in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let guard = worker.toolchain_preflight.write().await;
+                let budget = Duration::from_secs(2);
+                let mut publication = Box::pin(worker.record_toolchain_preflight_before(
+                    "stable".into(),
+                    usable,
+                    Some("late replacement".into()),
+                    tokio::time::Instant::now() + budget,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(budget + lateness).await;
+                drop(guard);
+                assert!(!publication.await);
+                let cached = worker.toolchain_preflight_status("stable").await.unwrap();
+                assert!(!cached.usable);
+                assert_eq!(cached.reason, original.reason);
+                assert_eq!(cached.checked_at_unix_ms, original.checked_at_unix_ms);
+            }
+        }
+        assert!(
+            worker
+                .record_toolchain_preflight_before(
+                    "stable".into(),
+                    true,
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        );
+        assert!(
+            worker
+                .toolchain_preflight_status("stable")
+                .await
+                .unwrap()
+                .usable
+        );
     }
 
     #[tokio::test]

@@ -738,8 +738,7 @@ where
         };
         let failure = match outcome {
             Ok(Ok(telemetry))
-                if started.elapsed() < attempt_timeout
-                    && poll_started.elapsed() < retry_budget =>
+                if started.elapsed() < attempt_timeout && poll_started.elapsed() < retry_budget =>
             {
                 debug!(
                     worker = worker_id.as_str(),

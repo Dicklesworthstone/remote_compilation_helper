@@ -2234,9 +2234,9 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
-        rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(
-            Duration::from_secs(10),
-        ))
+        rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(Duration::from_secs(
+            10
+        ),))
     ));
     cmd.arg("-o").arg("ServerAliveInterval=10");
     cmd.arg("-o").arg("ServerAliveCountMax=3");
@@ -3114,7 +3114,10 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
-        assert!(!polled.get(), "an expired budget must not start control work");
+        assert!(
+            !polled.get(),
+            "an expired budget must not start control work"
+        );
 
         let budget = Duration::from_secs(10);
         for (delay, expected) in [(Duration::from_secs(9), true), (budget, false)] {
@@ -3156,7 +3159,10 @@ mod tests {
             "READY"
         })
         .await;
-        assert!(result.is_err(), "late ready evidence must not beat the timer");
+        assert!(
+            result.is_err(),
+            "late ready evidence must not beat the timer"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -7599,7 +7605,11 @@ exec /bin/ln \"$@\"\n",
             let started = tokio::time::Instant::now();
             let result = guard.release().await;
             let expected_success = value != "1";
-            assert_eq!(result.is_ok(), expected_success, "scale={value}: {result:?}");
+            assert_eq!(
+                result.is_ok(),
+                expected_success,
+                "scale={value}: {result:?}"
+            );
             let expected_elapsed = if expected_success {
                 Duration::from_secs(20)
             } else {

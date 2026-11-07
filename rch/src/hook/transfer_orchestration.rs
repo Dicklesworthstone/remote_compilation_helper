@@ -5038,10 +5038,7 @@ sys.exit(99)
         })
         .await;
         assert!(result.is_err());
-        assert_eq!(
-            started.elapsed(),
-            rch_common::timing::MAX_CONTROL_TIMEOUT
-        );
+        assert_eq!(started.elapsed(), rch_common::timing::MAX_CONTROL_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]
@@ -5050,11 +5047,12 @@ sys.exit(99)
         let budget = Duration::from_secs(10);
         for receipt in [None, Some(0), Some(17)] {
             let started = tokio::time::Instant::now();
-            let result = super::retry_completion_probe(budget, Duration::from_secs(1), async || {
-                tokio::time::sleep(budget).await;
-                Ok(receipt)
-            })
-            .await;
+            let result =
+                super::retry_completion_probe(budget, Duration::from_secs(1), async || {
+                    tokio::time::sleep(budget).await;
+                    Ok(receipt)
+                })
+                .await;
             assert!(result.is_err(), "late receipt {receipt:?} was accepted");
             assert_eq!(started.elapsed(), budget);
         }
@@ -5074,7 +5072,10 @@ sys.exit(99)
             },
         )
         .await;
-        assert!(result.is_err(), "a late ready reader is not timely evidence");
+        assert!(
+            result.is_err(),
+            "a late ready reader is not timely evidence"
+        );
     }
 
     #[test]

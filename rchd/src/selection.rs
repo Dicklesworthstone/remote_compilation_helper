@@ -20,7 +20,7 @@ use crate::metrics::{
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use rand::RngExt;
-use rch_common::timing::scale_duration;
+use rch_common::timing::{MAX_CONTROL_TIMEOUT, scale_duration};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
     SelectionConfig, SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
@@ -3306,8 +3306,8 @@ impl WorkerSelector {
         let toolchain = request.toolchain.as_ref()?;
         let toolchain_name = toolchain.rustup_toolchain();
 
-        toolchain_preflight_with(worker, &toolchain_name, |endpoint| {
-            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref())
+        toolchain_preflight_with(worker, &toolchain_name, |endpoint, deadline| {
+            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref(), deadline)
         })
         .await
     }
@@ -4573,64 +4573,107 @@ async fn toolchain_preflight_with<F, Fut>(
     probe: F,
 ) -> Option<String>
 where
+    F: FnOnce(rch_common::WorkerConfig, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    // Keep the connect and command allowances, plus a fixed local teardown
+    // allowance. The same elapsed budget covers admission, SSH and cache
+    // publication, so a stalled local lock cannot extend remote evidence.
+    let budget = scale_duration(
+        TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT.saturating_add(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT),
+    )
+    .saturating_add(Duration::from_secs(1))
+    .min(MAX_CONTROL_TIMEOUT);
+    let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
+        return Some("toolchain_preflight_timeout".to_string());
+    };
+    toolchain_preflight_until(worker, toolchain_name, deadline, |endpoint| {
+        probe(endpoint, deadline)
+    })
+    .await
+}
+
+async fn toolchain_preflight_until<F, Fut>(
+    worker: &WorkerState,
+    toolchain_name: &str,
+    deadline: tokio::time::Instant,
+    probe: F,
+) -> Option<String>
+where
     F: FnOnce(rch_common::WorkerConfig) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let endpoint = worker.endpoint_snapshot().await;
-    let Some(mut admission) = worker.background_probe().await else {
-        return Some("toolchain_preflight_lifecycle_changed".to_string());
-    };
-    {
+    if tokio::time::Instant::now() >= deadline {
+        return Some("toolchain_preflight_timeout".to_string());
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        let endpoint = worker.endpoint_snapshot().await;
+        let Some(mut admission) = worker.background_probe().await else {
+            return Some("toolchain_preflight_lifecycle_changed".to_string());
+        };
+        {
+            let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+                return Some("toolchain_preflight_endpoint_changed".to_string());
+            };
+            let Some(_publication) = worker.lock_network_publication(&admission).await else {
+                return Some("toolchain_preflight_lifecycle_changed".to_string());
+            };
+            if let Some(cached) = worker.toolchain_preflight_status(toolchain_name).await
+                && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
+            {
+                return (!cached.usable).then(|| {
+                    cached
+                        .reason
+                        .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
+                });
+            }
+        }
+
+        // Keep toolchain probes concurrent and reloadable: the configuration guard
+        // covers only cache access/publication, never connect or remote execution.
+        if tokio::time::Instant::now() >= deadline {
+            return Some("toolchain_preflight_timeout".to_string());
+        }
+        let result = admission.run(probe(endpoint.config.clone())).await;
         let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            // A late success cannot authorize the replacement, and a late failure
+            // cannot poison its cache. A later selection obtains fresh evidence.
             return Some("toolchain_preflight_endpoint_changed".to_string());
         };
         let Some(_publication) = worker.lock_network_publication(&admission).await else {
             return Some("toolchain_preflight_lifecycle_changed".to_string());
         };
-        if let Some(cached) = worker.toolchain_preflight_status(toolchain_name).await
-            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
+        let Some(result) = result else {
+            return Some("toolchain_preflight_lifecycle_changed".to_string());
+        };
+        let reason = result.err();
+        if !worker
+            .record_toolchain_preflight_before(
+                toolchain_name.to_string(),
+                reason.is_none(),
+                reason.clone(),
+                deadline,
+            )
+            .await
         {
-            return (!cached.usable).then(|| {
-                cached
-                    .reason
-                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
-            });
+            return Some("toolchain_preflight_timeout".to_string());
         }
-    }
-
-    // Keep toolchain probes concurrent and reloadable: the configuration guard
-    // covers only cache access/publication, never connect or remote execution.
-    let result = admission.run(probe(endpoint.config.clone())).await;
-    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
-        // A late success cannot authorize the replacement, and a late failure
-        // cannot poison its cache. A later selection obtains fresh evidence.
-        return Some("toolchain_preflight_endpoint_changed".to_string());
-    };
-    let Some(_publication) = worker.lock_network_publication(&admission).await else {
-        return Some("toolchain_preflight_lifecycle_changed".to_string());
-    };
-    let Some(result) = result else {
-        return Some("toolchain_preflight_lifecycle_changed".to_string());
-    };
-    match result {
-        Ok(()) => {
-            worker
-                .record_toolchain_preflight(toolchain_name.to_string(), true, None)
-                .await;
-            None
-        }
-        Err(reason) => {
+        if let Some(reason) = &reason {
             warn!(
                 worker = %endpoint.config.id,
                 toolchain = %toolchain_name,
                 reason = %reason,
                 "Worker toolchain preflight failed"
             );
-            worker
-                .record_toolchain_preflight(toolchain_name.to_string(), false, Some(reason.clone()))
-                .await;
-            Some(reason)
         }
+        reason
+    })
+    .await;
+    // Tokio polls the inner future before its timer. A ready result may still
+    // be late after scheduler starvation; it cannot authorize this selection.
+    match result {
+        Ok(result) if tokio::time::Instant::now() < deadline => result,
+        _ => Some("toolchain_preflight_timeout".to_string()),
     }
 }
 
@@ -4638,7 +4681,11 @@ async fn probe_worker_toolchain(
     worker_config: rch_common::WorkerConfig,
     toolchain_name: &str,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("toolchain_preflight_timeout".to_string());
+    }
     let command_timeout = scale_duration(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT);
     let ssh_options = SshOptions {
         connect_timeout: scale_duration(TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT),
@@ -4653,16 +4700,24 @@ async fn probe_worker_toolchain(
     // spawn/leak). The pool distinguishes connect failures internally, so map a
     // pool error onto the same connect-failed reason string for callers.
     let result = if let Some(pool) = ssh_pool {
-        pool.run_with_timeout(&worker_config, &command, command_timeout)
+        pool.run_with_timeout_until(&worker_config, &command, command_timeout, deadline)
             .await
             .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))
     } else {
         let mut client = SshClient::new(worker_config, ssh_options);
+        if tokio::time::Instant::now() >= deadline {
+            return Err("toolchain_preflight_timeout".to_string());
+        }
         client
-            .connect()
+            .connect_until(deadline)
             .await
             .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))?;
-        let result = client.execute(&command).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err("toolchain_preflight_timeout".to_string());
+        }
+        let result = client
+            .execute_with_timeout_until(&command, command_timeout, deadline)
+            .await;
         let _ = client.disconnect().await;
         result.map_err(|err| format!("toolchain_preflight_command_error:{err}"))
     };
@@ -8914,6 +8969,165 @@ mod tests {
         assert_eq!(second.reason, SelectionReason::Success);
     }
 
+    async fn assert_toolchain_probe_pending<F: std::future::Future>(
+        mut probe: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(probe.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toolchain_preflight_accepts_loaded_worker_only_within_scaled_budget() {
+        for (scale, expected_usable) in [(1.0, false), (2.0, true)] {
+            let worker = make_worker("loaded-toolchain", 8, 50.0);
+            let budget = rch_common::timing::TimingScale::try_from(scale)
+                .unwrap()
+                .duration(
+                    TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT + TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+                )
+                + Duration::from_secs(1);
+            let result = toolchain_preflight_until(
+                &worker,
+                "nightly",
+                tokio::time::Instant::now() + budget,
+                |_| async {
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(result.is_none(), expected_usable, "scale={scale}");
+            assert_eq!(
+                worker.toolchain_preflight_status("nightly").await.is_some(),
+                expected_usable,
+                "an elapsed probe must not install a verdict"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toolchain_preflight_late_ready_results_do_not_poison_recovery() {
+        for success in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let worker = make_worker("late-toolchain", 8, 50.0);
+                let budget = Duration::from_secs(20);
+                let deadline = tokio::time::Instant::now() + budget;
+                let probe = toolchain_preflight_until(&worker, "nightly", deadline, |_| async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if success {
+                        Ok(())
+                    } else {
+                        Err("toolchain_preflight_command_failed:1:old_failure".to_string())
+                    }
+                });
+                tokio::pin!(probe);
+                assert_toolchain_probe_pending(probe.as_mut()).await;
+                // The result becomes ready earlier, but the dispatcher does
+                // not poll it until the enclosing control budget has expired.
+                tokio::time::advance(budget + lateness).await;
+                assert_eq!(probe.await.as_deref(), Some("toolchain_preflight_timeout"));
+                assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+
+                // In particular, a late failure must not exclude a healthy
+                // worker for the 60-second transient or ten-minute real TTL.
+                assert!(
+                    toolchain_preflight_with(&worker, "nightly", |_, _| std::future::ready(Ok(())))
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    worker
+                        .toolchain_preflight_status("nightly")
+                        .await
+                        .unwrap()
+                        .usable
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toolchain_preflight_deadline_covers_publication_lock_wait() {
+        let worker = make_worker("publication-delayed-toolchain", 8, 50.0);
+        let (ready, release) = tokio::sync::oneshot::channel::<()>();
+        let budget = Duration::from_secs(20);
+        let probe = toolchain_preflight_until(
+            &worker,
+            "nightly",
+            tokio::time::Instant::now() + budget,
+            |_| async {
+                release.await.unwrap();
+                Ok(())
+            },
+        );
+        tokio::pin!(probe);
+        assert_toolchain_probe_pending(probe.as_mut()).await;
+        let admission = worker.background_probe().await.unwrap();
+        let publication = worker.lock_network_publication(&admission).await.unwrap();
+        ready.send(()).unwrap();
+        assert_toolchain_probe_pending(probe.as_mut()).await;
+        tokio::time::advance(budget).await;
+        drop(publication);
+        assert_eq!(probe.await.as_deref(), Some("toolchain_preflight_timeout"));
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_toolchain_preflight_cannot_start_after_deadline() {
+        let worker = make_worker("queued-toolchain", 8, 50.0);
+        let admission = worker.background_probe().await.unwrap();
+        let publication = worker.lock_network_publication(&admission).await.unwrap();
+        let started = std::cell::Cell::new(false);
+        let budget = Duration::from_secs(20);
+        let probe = toolchain_preflight_until(
+            &worker,
+            "nightly",
+            tokio::time::Instant::now() + budget,
+            |_| {
+                started.set(true);
+                std::future::ready(Ok(()))
+            },
+        );
+        tokio::pin!(probe);
+        assert_toolchain_probe_pending(probe.as_mut()).await;
+        tokio::time::advance(budget).await;
+        drop(publication);
+        assert_eq!(probe.await.as_deref(), Some("toolchain_preflight_timeout"));
+        assert!(!started.get(), "an expired lock waiter must not connect");
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_toolchain_preflight_never_starts_remote_work() {
+        let worker = make_worker("expired-toolchain", 8, 50.0);
+        let result = toolchain_preflight_until(
+            &worker,
+            "nightly",
+            tokio::time::Instant::now(),
+            |_| -> std::future::Ready<Result<(), String>> {
+                panic!("an expired preflight must not connect");
+            },
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("toolchain_preflight_timeout"));
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+        let endpoint = worker.endpoint_snapshot().await;
+        assert_eq!(
+            probe_worker_toolchain(
+                endpoint.config,
+                "nightly",
+                None,
+                tokio::time::Instant::now(),
+            )
+            .await
+            .unwrap_err(),
+            "toolchain_preflight_timeout"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_preflights_discard_old_endpoint_results_and_reprobe_after_retarget() {
         for return_to_original in [false, true] {
@@ -8927,7 +9141,7 @@ mod tests {
                 let started = started.clone();
                 let release = release.clone();
                 tasks.push(tokio::spawn(async move {
-                    toolchain_preflight_with(&worker, toolchain, |endpoint| async move {
+                    toolchain_preflight_with(&worker, toolchain, |endpoint, _| async move {
                         assert_eq!(endpoint.host, "localhost");
                         started.wait().await;
                         release.notified().await;
@@ -8979,7 +9193,7 @@ mod tests {
             // cache. Fresh evidence can reach the opposite verdict for each.
             for (toolchain, fresh_success) in [("stable", false), ("nightly", true)] {
                 assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
-                let fresh = toolchain_preflight_with(&worker, toolchain, |endpoint| {
+                let fresh = toolchain_preflight_with(&worker, toolchain, |endpoint, _| {
                     assert_eq!(
                         endpoint.host,
                         if return_to_original {
@@ -9007,7 +9221,7 @@ mod tests {
                 let cached = toolchain_preflight_with(
                     &worker,
                     toolchain,
-                    |_| -> std::future::Ready<Result<(), String>> {
+                    |_, _| -> std::future::Ready<Result<(), String>> {
                         panic!("current endpoint verdict must be reusable");
                     },
                 )
@@ -9032,7 +9246,7 @@ mod tests {
         let probe_worker = worker.clone();
         let dropped = cancelled.clone();
         let task = tokio::spawn(async move {
-            toolchain_preflight_with(&probe_worker, "nightly", |_| async move {
+            toolchain_preflight_with(&probe_worker, "nightly", |_, _| async move {
                 let _owned_child = DropSignal(dropped);
                 let _ = started.send(());
                 std::future::pending::<Result<(), String>>().await
@@ -9053,7 +9267,7 @@ mod tests {
         assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert!(worker.toolchain_preflight_status("nightly").await.is_none());
         assert_eq!(
-            toolchain_preflight_with(&worker, "nightly", |_| async {
+            toolchain_preflight_with(&worker, "nightly", |_, _| async {
                 panic!("explicit enable must still wait for a successful health probe");
             })
             .await

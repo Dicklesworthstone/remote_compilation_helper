@@ -1359,10 +1359,20 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+    // Current and recovered endpoints must use the same effective health
+    // timeout. Apply the startup timing policy once; polling and circuit
+    // cooldowns keep the operator's original configuration.
+    let health_config = health::HealthConfig {
+        check_interval: Duration::from_secs(daemon_config.health_check_interval_secs.max(1)),
+        check_timeout: Duration::from_secs(daemon_config.worker_timeout_secs.max(1)),
+        circuit: rch_config.circuit.clone(),
+        ..health::HealthConfig::default()
+    }
+    .with_timing_scale(rch_config.timeouts.scale);
     let worker_pool = worker_pool.with_recovery_transport_policy(
-        rch_config.circuit.clone(),
-        Duration::from_secs(daemon_config.health_check_interval_secs.max(1)),
-        Duration::from_secs(daemon_config.worker_timeout_secs.max(1)),
+        health_config.circuit.clone(),
+        health_config.check_interval,
+        health_config.check_timeout,
     );
     if !daemon_config.project_lanes.is_empty() {
         info!(
@@ -1697,17 +1707,8 @@ async fn main() -> Result<()> {
     .with_history(context.history.clone());
     bypass_recovery.reconcile_on_start().await;
 
-    // Start health monitor with alert manager integration
-    // The health monitor and the telemetry poller both write the authoritative
-    // worker circuit; they must share the operator's `[circuit]` settings
-    // (previously the monitor silently used built-in defaults, so the
-    // configured thresholds only ever reached the selector's read side).
-    let health_config = health::HealthConfig {
-        check_interval: Duration::from_secs(daemon_config.health_check_interval_secs.max(1)),
-        check_timeout: Duration::from_secs(daemon_config.worker_timeout_secs.max(1)),
-        circuit: rch_config.circuit.clone(),
-        ..health::HealthConfig::default()
-    };
+    // Start health monitoring with the same startup timeout snapshot used for
+    // recovered transports and the operator's circuit settings used by telemetry.
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
         .with_status_panel(worker_status_panel.clone())
         .with_alert_manager(alert_manager.clone())
