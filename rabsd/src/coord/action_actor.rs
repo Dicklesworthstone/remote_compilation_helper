@@ -2622,7 +2622,7 @@ mod tests {
             .build()
             .unwrap();
         let handle = runtime.handle();
-        let host = runtime.block_on(async move {
+        let host = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async move {
             handle
                 .spawn(async move {
                     // Use a context owned by a real runtime task, as production

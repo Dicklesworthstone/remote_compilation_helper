@@ -91,7 +91,15 @@ def worker_reply(root, worker, command):
         print("{}")
 
 
+def owner_alive(owner):
+    # bin/ssh execs this fixture and records its parent, the daemon (OpenSSH
+    # is the proxy's parent). Once reparented nothing can cancel the transport:
+    # a failed or killed gate must not leave it running forever (bd-gjqj0).
+    return os.getppid() == owner
+
+
 def run_proxy(root, worker):
+    owner = os.getppid()
     mode = mode_for(root, worker)
     append_event(root, event="dial", worker=worker, mode=mode)
     if mode == "refused":
@@ -101,7 +109,7 @@ def run_proxy(root, worker):
         # Absorb the client banner but never answer. EOF ends the proxy when
         # the daemon cancels/times out its owned SSH child.
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and owner_alive(owner):
             if select.select([sys.stdin.buffer], [], [], 0.1)[0]:
                 if not os.read(sys.stdin.fileno(), 65536):
                     return 0
@@ -110,6 +118,7 @@ def run_proxy(root, worker):
 
 
 def fake_ssh(root, arguments):
+    owner = int(os.environ.get("RCH_FIXTURE_SSH_OWNER") or os.getppid())
     if "-G" in arguments:
         print("hostname none\nforkafterauthentication no")
         return 0
@@ -127,8 +136,9 @@ def fake_ssh(root, arguments):
             return 255
         if mode == "healthy":
             Path(control).write_text(worker)
-        while True:
+        while owner_alive(owner):
             time.sleep(0.1)
+        return 255
     if control:
         worker = Path(control).read_text()
         # A warm master can stay present while its authenticated transport
@@ -136,7 +146,8 @@ def fake_ssh(root, arguments):
         # local control checks still succeed, but remote commands cannot run.
         if mode_for(root, worker) == "blackhole":
             deadline = time.monotonic() + 60
-            while Path(control).exists() and time.monotonic() < deadline:
+            while (Path(control).exists() and time.monotonic() < deadline
+                   and owner_alive(owner)):
                 if mode_for(root, worker) == "healthy":
                     break
                 time.sleep(0.05)
@@ -212,7 +223,9 @@ class DaemonFixture:
         else:
             invocation = f"{python} {shlex.quote(str(SCRIPT))} --fake-ssh {shlex.quote(str(self.root))}"
         ssh = self.root / "bin/ssh"
-        ssh.write_text(f'#!/bin/sh\nexec {invocation} "$@"\n')
+        # The wrapper's parent is the daemon that owns this transport.
+        ssh.write_text(f'#!/bin/sh\nRCH_FIXTURE_SSH_OWNER=$PPID\nexport RCH_FIXTURE_SSH_OWNER\n'
+                       f'exec {invocation} "$@"\n')
         ssh.chmod(0o700)
         self.write_workers(self.modes)
         (self.root / "config/daemon.toml").write_text(

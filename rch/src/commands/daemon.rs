@@ -884,7 +884,32 @@ pub(crate) fn parse_admission_response(response: &str) -> Result<RestartAdmissio
         "daemon refused the admission request: {}",
         body.trim()
     );
-    serde_json::from_str(body).context("admission response was malformed")
+    serde_json::from_str(body).map_err(|error| {
+        if is_legacy_admission_reply(body) {
+            anyhow::anyhow!(
+                "the running daemon speaks the legacy (2.1.34 and earlier) admission protocol, \
+                 which has no maintenance incarnation this client can fence; nothing was changed. \
+                 Drain it with the client from the daemon's own release \
+                 (`rch daemon restart --drain` before replacing binaries, as install.sh does), \
+                 or restart it through the service manager once `rch queue` shows no builds"
+            )
+        } else {
+            anyhow::Error::new(error).context("admission response was malformed")
+        }
+    })
+}
+
+/// The 2.1.34 reply carries the workload barrier but none of the fenced
+/// maintenance state. Recognising it only selects the diagnostic: the legacy
+/// barrier gives this client no ownership proof, so it is never acted on.
+fn is_legacy_admission_reply(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+        value
+            .get("restart_permitted")
+            .is_some_and(serde_json::Value::is_boolean)
+            && value.get("daemon_incarnation").is_none()
+            && value.get("success").is_none()
+    })
 }
 
 /// The client chooses its unguessable operation token BEFORE acquisition. A
@@ -2380,6 +2405,46 @@ mod tests {
             parse_admission_response(&format!("HTTP/1.1 503 Unavailable\r\n\r\n{body}")).is_err()
         );
         assert!(parse_admission_response(&format!("HTTP/1.1 200 OK\r\n\r\n{body}")).is_ok());
+    }
+
+    #[test]
+    fn legacy_admission_reply_is_refused_with_its_drain_remedy() {
+        // The exact 2.1.34 /restart-admission shape seen on css (bd-306ep).
+        let legacy = "HTTP/1.1 200 OK\r\n\r\n{\"admission_closed\":false,\"restart_permitted\":true,\
+            \"active_build_ids\":[],\"queued_build_ids\":[],\"client_lease_ids\":[],\
+            \"client_lease_scan_error\":null}";
+        let error = format!("{:#}", parse_admission_response(legacy).unwrap_err());
+        assert!(
+            error.contains("legacy (2.1.34 and earlier) admission protocol"),
+            "{error}"
+        );
+        assert!(error.contains("nothing was changed"), "{error}");
+
+        // A current reply that merely lost a field is a malformed reply, not
+        // a legacy daemon: it must keep naming the missing field.
+        let mut current = serde_json::to_value(open_admission()).unwrap();
+        current.as_object_mut().unwrap().remove("maintenance_owner");
+        let error = format!(
+            "{:#}",
+            parse_admission_response(&format!("HTTP/1.1 200 OK\r\n\r\n{current}")).unwrap_err()
+        );
+        assert!(
+            error.contains("malformed") && error.contains("maintenance_owner"),
+            "{error}"
+        );
+        assert!(!error.contains("legacy"), "{error}");
+
+        // Non-JSON and unrelated objects stay generic.
+        for body in ["not json", "{\"restart_permitted\":\"yes\"}", "[]"] {
+            let error = format!(
+                "{:#}",
+                parse_admission_response(&format!("HTTP/1.1 200 OK\r\n\r\n{body}")).unwrap_err()
+            );
+            assert!(
+                error.contains("malformed") && !error.contains("legacy"),
+                "{body}: {error}"
+            );
+        }
     }
 
     #[test]

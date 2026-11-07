@@ -1071,24 +1071,18 @@ mod tests {
         const REQUEST: &[u8] = b"{\"kind\":\"canonical-transport-test\"}\n";
         const RESPONSE: &[u8] = b"{\"kind\":\"canonical-transport-received\"}\n";
         let run = |future| {
-            RuntimeBuilder::current_thread()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    asupersync::time::timeout(
-                        runtime_transport_now(),
-                        Duration::from_secs(15),
-                        future,
-                    )
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            crate::daemon_runtime::block_on_top_level(&runtime, async {
+                asupersync::time::timeout(runtime_transport_now(), Duration::from_secs(15), future)
                     .await
                     .expect("native transport exchange exceeded its deadline")
-                })
+            })
         };
         std::thread::scope(|scope| {
             let (address_sender, address_receiver) = std::sync::mpsc::sync_channel(1);
             let accepted = scope.spawn(move || {
                 let runtime = RuntimeBuilder::current_thread().build().unwrap();
-                runtime.block_on(async {
+                crate::daemon_runtime::block_on_top_level(&runtime, async {
                     asupersync::time::timeout(
                         runtime_transport_now(),
                         Duration::from_secs(15),
