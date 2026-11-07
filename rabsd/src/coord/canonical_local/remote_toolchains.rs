@@ -1,8 +1,11 @@
 //! Process-lifetime reuse of received SDKs for the canonical remote service.
 //!
 //! The authenticated edge key and complete toolchain identity select a lease.
-//! Every hit verifies its private owner and rehashes the retained bytes outside
-//! the cache lock. Source trees, diagnostics and operation paths never enter the
+//! Every hit verifies its private owner and retained generation before and after
+//! a full byte scan outside the cache lock. Overlapping checks of the exact same
+//! retained owner share one active scan; completed checks are never memoized.
+//! Each caller keeps its own cancellation and deadline. Source trees, diagnostics
+//! and operation paths never enter the
 //! cache. This is input reuse, with no action-result or publication authority.
 //!
 //! Active, invalidated and retiring images remain charged to the entry/byte
@@ -21,10 +24,12 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 pub(crate) const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(crate) const MAX_CACHE_ENTRIES: usize = 32;
+const VERIFICATION_WAIT_SLICE: Duration = Duration::from_millis(20);
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -67,6 +72,53 @@ fn same_directory(first: &Metadata, second: &Metadata) -> bool {
         )
 }
 
+#[derive(Debug, Clone)]
+struct VerificationFailure {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl VerificationFailure {
+    fn of(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_error(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
+#[derive(Debug, Default)]
+struct VerificationFlight {
+    result: Mutex<Option<Result<(), VerificationFailure>>>,
+    changed: Condvar,
+}
+
+impl VerificationFlight {
+    fn wait(&self, stopped: &impl Fn() -> bool) -> io::Result<Result<(), VerificationFailure>> {
+        loop {
+            // Every waiter owns its cancellation/deadline. The callback may
+            // inspect other state, so never call it while holding either lock.
+            checkpoint(stopped)?;
+            let result = self
+                .result
+                .lock()
+                .map_err(|_| invalid("remote toolchain verification result is poisoned"))?;
+            if let Some(result) = result.as_ref() {
+                return Ok(result.clone());
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(result, VERIFICATION_WAIT_SLICE)
+                .map_err(|_| invalid("remote toolchain verification result is poisoned"))?;
+            drop(next);
+        }
+    }
+}
+
 /// Exact received image and its independently owned, SDK-only directory.
 /// Keep this lease through use, or retain BOTH image and owner when handing
 /// their existing typed custody to a downstream compiler lease.
@@ -76,7 +128,75 @@ pub(crate) struct ReceivedToolchain {
     image: Arc<PreparedToolchain>,
     directory: File,
     stamp: Metadata,
+    // Only checks of this live owner may join. Never cache a completed result
+    // or combine distinct owners merely because their content hashes match.
+    verification: Mutex<Option<Arc<VerificationFlight>>>,
     owner: Arc<tempfile::TempDir>,
+}
+
+/// One caller performs a full scan on its existing session thread. Dropping
+/// that caller cannot leave followers waiting on an abandoned result.
+struct VerificationOwner<'a> {
+    received: &'a ReceivedToolchain,
+    flight: Arc<VerificationFlight>,
+    finished: bool,
+}
+
+impl VerificationOwner<'_> {
+    fn finish(&mut self, result: &io::Result<()>) -> io::Result<()> {
+        let mut active = self
+            .received
+            .verification
+            .lock()
+            .map_err(|_| invalid("remote toolchain verification ownership is poisoned"))?;
+        if active
+            .as_ref()
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            active.take();
+        }
+        // A later acquisition must start its own scan, even if an earlier
+        // follower has not yet consumed this completed result.
+        drop(active);
+        *self
+            .flight
+            .result
+            .lock()
+            .map_err(|_| invalid("remote toolchain verification result is poisoned"))? =
+            Some(result.as_ref().copied().map_err(VerificationFailure::of));
+        self.finished = true;
+        self.flight.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl Drop for VerificationOwner<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut active = self
+            .received
+            .verification
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            active.take();
+        }
+        drop(active);
+        *self
+            .flight
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Err(VerificationFailure {
+            kind: io::ErrorKind::Interrupted,
+            message: "remote toolchain verification owner abandoned its check".into(),
+        }));
+        self.flight.changed.notify_all();
+    }
 }
 
 impl ReceivedToolchain {
@@ -108,6 +228,7 @@ impl ReceivedToolchain {
             image,
             directory,
             stamp,
+            verification: Mutex::new(None),
             owner,
         };
         received.verify(&stopped)?;
@@ -181,11 +302,63 @@ impl ReceivedToolchain {
     }
 
     fn verify_bytes(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
-        checkpoint(stopped)?;
-        self.verify_owner()?;
-        self.image.verify(stopped)?;
-        self.verify_owner()?;
-        checkpoint(stopped)
+        self.verify_with(stopped, || self.scan_bytes(stopped))
+    }
+
+    /// Only the expensive byte scan participates in the flight. Its surrounding
+    /// complete generation and owner checks belong independently to each caller.
+    fn scan_bytes(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        let observed = self.image.rehash_retained_bytes(stopped)?;
+        if observed != *self.identity() {
+            return Err(invalid("received compiler content changed"));
+        }
+        Ok(())
+    }
+
+    fn verify_with(
+        &self,
+        stopped: &impl Fn() -> bool,
+        scan: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        loop {
+            self.verify(stopped)?;
+            let (flight, leader) = {
+                let mut active = self
+                    .verification
+                    .lock()
+                    .map_err(|_| invalid("remote toolchain verification ownership is poisoned"))?;
+                if let Some(flight) = active.as_ref() {
+                    (Arc::clone(flight), false)
+                } else {
+                    let flight = Arc::new(VerificationFlight::default());
+                    *active = Some(Arc::clone(&flight));
+                    (flight, true)
+                }
+            };
+            if leader {
+                let mut owner = VerificationOwner {
+                    received: self,
+                    flight,
+                    finished: false,
+                };
+                let result = scan();
+                owner.finish(&result)?;
+                result?;
+            } else {
+                match flight.wait(stopped)? {
+                    Ok(()) => {}
+                    // A cancelled or unwinding owner supplies no byte proof.
+                    // A surviving caller may lead a fresh scan, within its own
+                    // deadline and after checking this exact generation again.
+                    Err(error) if error.kind == io::ErrorKind::Interrupted => {
+                        checkpoint(stopped)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into_error()),
+                }
+            }
+            return self.verify(stopped);
+        }
     }
 
     fn idle(lease: &mut Arc<Self>) -> bool {
@@ -207,9 +380,11 @@ impl ReceivedToolchain {
             image,
             directory,
             stamp: _,
+            verification,
             owner,
         } = received;
         drop(image);
+        drop(verification);
         let owner = Arc::try_unwrap(owner)
             .map_err(|_| invalid("retiring compiler still has an active owner"))?;
         if let Err(error) = owner_witness {
@@ -510,6 +685,9 @@ mod tests {
     use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
     use std::cell::Cell;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     const EDGE_A: [u8; 32] = [1; 32];
@@ -547,6 +725,316 @@ mod tests {
             state.retiring_entries,
             state.retained_bytes,
         )
+    }
+
+    fn wait_for_verification_followers(received: &ReceivedToolchain, followers: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // The active slot and leader retain one reference each. Additional
+            // references prove followers joined this flight, not just that
+            // their threads were scheduled.
+            if received
+                .verification
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|flight| Arc::strong_count(flight) >= followers + 2)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "received SDK verification followers did not join"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn overlapping_received_checks_share_one_byte_scan_and_later_checks_start_fresh() {
+        let cache = RemoteToolchainCache::new(1024, 2).unwrap();
+        let lease = cache
+            .adopt(EDGE_A, fixture(b"compiler\0\xff"), || false)
+            .unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let leader_lease = Arc::clone(&lease);
+        let leader_scans = Arc::clone(&scans);
+        let leader = thread::spawn(move || {
+            leader_lease.verify_with(&|| false, || {
+                leader_scans.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                leader_lease.scan_bytes(&|| false)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let followers: Vec<_> = (0..2)
+            .map(|_| {
+                let lease = Arc::clone(&lease);
+                let scans = Arc::clone(&scans);
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let stopped = || Instant::now() >= deadline;
+                    lease.verify_with(&stopped, || {
+                        scans.fetch_add(1, Ordering::SeqCst);
+                        lease.scan_bytes(&stopped)
+                    })
+                })
+            })
+            .collect();
+        wait_for_verification_followers(&lease, followers.len());
+        let completed = Arc::clone(lease.verification.lock().unwrap().as_ref().unwrap());
+        release_tx.send(()).unwrap();
+        leader.join().unwrap().unwrap();
+        for follower in followers {
+            follower.join().unwrap().unwrap();
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(lease.verification.lock().unwrap().is_none());
+        assert!(completed.result.lock().unwrap().as_ref().unwrap().is_ok());
+
+        // Retaining an earlier completed result must not turn it into a memo.
+        // The later scan owns a different active flight and reads the bytes.
+        lease
+            .verify_with(&|| false, || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                let current = Arc::clone(
+                    lease.verification.lock().unwrap().as_ref().unwrap(),
+                );
+                assert!(!Arc::ptr_eq(&current, &completed));
+                lease.scan_bytes(&|| false)
+            })
+            .unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(lease.verification.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            &cache.lookup(EDGE_A, lease.identity(), || false).unwrap().unwrap(),
+            &lease,
+        ));
+    }
+
+    #[test]
+    fn identical_received_bytes_in_distinct_owners_have_separate_verification_flights() {
+        let cache = RemoteToolchainCache::new(1024, 2).unwrap();
+        let first = cache.adopt(EDGE_A, fixture(b"same SDK"), || false).unwrap();
+        let second = cache.adopt(EDGE_B, fixture(b"same SDK"), || false).unwrap();
+        assert_eq!(first.identity(), second.identity());
+        assert_ne!(first.root(), second.root());
+        let scans = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let mut releases = Vec::new();
+        let mut threads = Vec::new();
+        for lease in [&first, &second] {
+            let lease = Arc::clone(lease);
+            let scans = Arc::clone(&scans);
+            let entered_tx = entered_tx.clone();
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            releases.push(release_tx);
+            threads.push(thread::spawn(move || {
+                lease.verify_with(&|| false, || {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    lease.scan_bytes(&|| false)
+                })
+            }));
+        }
+        for _ in 0..2 {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert_eq!(counts(&cache), (2, 0, first.identity().bytes * 2));
+    }
+
+    #[test]
+    fn cancelled_or_expired_received_waiter_does_not_cancel_scan_or_retire_custody() {
+        for cancel_waiter in [false, true] {
+            let cache = Arc::new(RemoteToolchainCache::new(1024, 1).unwrap());
+            let lease = cache.adopt(EDGE_A, fixture(b"retained SDK"), || false).unwrap();
+            let identity = *lease.identity();
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let leader_lease = Arc::clone(&lease);
+            let leader = thread::spawn(move || {
+                leader_lease.verify_with(&|| false, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    leader_lease.scan_bytes(&|| false)
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let deadline = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(5)));
+            let follower_cancelled = Arc::clone(&cancelled);
+            let follower_deadline = Arc::clone(&deadline);
+            let follower_cache = Arc::clone(&cache);
+            let follower = thread::spawn(move || {
+                follower_cache.lookup(EDGE_A, &identity, || {
+                    follower_cancelled.load(Ordering::Acquire)
+                        || Instant::now() >= *follower_deadline.lock().unwrap()
+                })
+            });
+            wait_for_verification_followers(&lease, 1);
+            assert!(
+                cache.state.try_lock().is_ok(),
+                "a waiting lookup must not hold cache admission"
+            );
+            if cancel_waiter {
+                cancelled.store(true, Ordering::Release);
+            } else {
+                // Expire only this caller's deadline after it actually joined.
+                *deadline.lock().unwrap() = Instant::now();
+            }
+            let error = follower.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(lease.verification.lock().unwrap().is_some());
+            assert_eq!(counts(&cache), (1, 0, identity.bytes));
+            assert!(!cache.lock().unwrap().entries[0].invalidated);
+            assert!(lease.root().is_dir());
+
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            assert!(Arc::ptr_eq(
+                &cache.lookup(EDGE_A, &identity, || false).unwrap().unwrap(),
+                &lease,
+            ));
+            assert!(lease.verification.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_or_unwound_received_scan_leader_allows_a_live_waiter_to_retry() {
+        for panics in [false, true] {
+            let cache = RemoteToolchainCache::new(1024, 1).unwrap();
+            let lease = cache.adopt(EDGE_A, fixture(b"retained SDK"), || false).unwrap();
+            let scans = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let leader_lease = Arc::clone(&lease);
+            let leader_scans = Arc::clone(&scans);
+            let leader_cancelled = Arc::clone(&cancelled);
+            let leader = thread::spawn(move || {
+                let stopped = || leader_cancelled.load(Ordering::Acquire);
+                leader_lease.verify_with(&stopped, || {
+                    leader_scans.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(!panics, "injected received-SDK verification-owner unwind");
+                    leader_lease.scan_bytes(&stopped)
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let follower_lease = Arc::clone(&lease);
+            let follower_scans = Arc::clone(&scans);
+            let follower = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stopped = || Instant::now() >= deadline;
+                follower_lease.verify_with(&stopped, || {
+                    follower_scans.fetch_add(1, Ordering::SeqCst);
+                    follower_lease.scan_bytes(&stopped)
+                })
+            });
+            wait_for_verification_followers(&lease, 1);
+            if !panics {
+                cancelled.store(true, Ordering::Release);
+            }
+            release_tx.send(()).unwrap();
+            let leader = leader.join();
+            if panics {
+                assert!(leader.is_err());
+            } else {
+                assert_eq!(
+                    leader.unwrap().unwrap_err().kind(),
+                    io::ErrorKind::Interrupted
+                );
+            }
+            follower.join().unwrap().unwrap();
+            assert_eq!(scans.load(Ordering::SeqCst), 2);
+            assert!(lease.verification.lock().unwrap().is_none());
+            lease.verify(|| false).unwrap();
+            assert_eq!(counts(&cache), (1, 0, lease.identity().bytes));
+            assert!(!cache.lock().unwrap().entries[0].invalidated);
+        }
+    }
+
+    #[test]
+    fn shared_scan_success_never_skips_each_callers_owner_or_sdk_generation_barrier() {
+        for owner_mutation in [false, true] {
+            for after_scan in [false, true] {
+                let cache = RemoteToolchainCache::new(1024, 1).unwrap();
+                let lease = cache.adopt(EDGE_A, fixture(b"compiler"), || false).unwrap();
+                let identity = *lease.identity();
+                let scans = Arc::new(AtomicUsize::new(0));
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let leader_lease = Arc::clone(&lease);
+                let leader_scans = Arc::clone(&scans);
+                let leader = thread::spawn(move || {
+                    leader_lease.verify_with(&|| false, || {
+                        leader_scans.fetch_add(1, Ordering::SeqCst);
+                        if after_scan {
+                            leader_lease.scan_bytes(&|| false)?;
+                        }
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if after_scan {
+                            Ok(())
+                        } else {
+                            leader_lease.scan_bytes(&|| false)
+                        }
+                    })
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let follower_lease = Arc::clone(&lease);
+                let follower_scans = Arc::clone(&scans);
+                let follower = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let stopped = || Instant::now() >= deadline;
+                    follower_lease.verify_with(&stopped, || {
+                        follower_scans.fetch_add(1, Ordering::SeqCst);
+                        follower_lease.scan_bytes(&stopped)
+                    })
+                });
+                wait_for_verification_followers(&lease, 1);
+                if owner_mutation {
+                    fs::write(
+                        lease.owner().path().join("unexpected-source"),
+                        b"not SDK input",
+                    )
+                    .unwrap();
+                } else {
+                    let path = lease.root().join("compiler");
+                    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, b"tampered").unwrap();
+                    File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+                release_tx.send(()).unwrap();
+                for result in [leader.join().unwrap(), follower.join().unwrap()] {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                }
+                assert_eq!(scans.load(Ordering::SeqCst), 1);
+                assert!(lease.verification.lock().unwrap().is_none());
+                assert!(cache.lookup(EDGE_A, &identity, || false).is_err());
+                assert!(cache.lock().unwrap().entries[0].invalidated);
+                assert_eq!(counts(&cache), (1, 0, identity.bytes));
+            }
+        }
     }
 
     #[test]

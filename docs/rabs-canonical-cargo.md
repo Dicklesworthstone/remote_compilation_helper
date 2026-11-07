@@ -2457,6 +2457,10 @@ input limits and filesystem free-space admission.
 
 Reuse requires the same enrolled TLS client key and complete toolchain dataset
 identity. The service verifies the cached image again before selecting reuse.
+Concurrent requests for the same retained image can share one in-progress byte
+scan; each caller independently checks its owner and complete retained generation
+before and after that scan. Completed checks are never memoized, and cancelling
+one caller does not cancel another caller's wait or authorize partial results.
 The client then transfers its sealed source without SDK entries or SDK chunks.
 Every operation keeps its own source, runtime and output directories; a cached
 SDK retains only its dedicated compiler directory. Changes to the retained SDK
