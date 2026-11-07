@@ -30,7 +30,8 @@ pub struct AdviseArgs {
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
     /// Cargo timing report to read (`cargo build --timings` HTML). Repeatable.
-    /// Default: the newest reports under <target-dir>/cargo-timings/
+    /// Default: the newest reports under <target-dir>/cargo-timings/. Reports
+    /// of another profile than the first readable one are skipped.
     #[arg(long = "timings", value_name = "HTML")]
     pub timings: Vec<PathBuf>,
     /// Maximum number of discovered timing reports to read, newest first
@@ -180,25 +181,36 @@ fn host_platform() -> Option<String> {
 }
 
 pub(crate) fn cargo_metadata(manifest: &Path, platform: Option<&str>) -> anyhow::Result<Metadata> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(cargo);
-    command
-        .args(["metadata", "--format-version", "1", "--manifest-path"])
-        .arg(manifest);
-    if let Some(platform) = platform {
-        command.args(["--filter-platform", platform]);
-    }
-    if let Some(parent) = manifest.parent().filter(|parent| parent.is_dir()) {
-        // A workspace rust-toolchain.toml selects the toolchain Cargo resolves with.
-        command.current_dir(parent);
-    }
-    let output = command.output().context("cannot run cargo metadata")?;
+    let output = metadata_command(manifest, platform)?
+        .output()
+        .context("cannot run cargo metadata")?;
     anyhow::ensure!(
         output.status.success(),
         "cargo metadata failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     serde_json::from_slice(&output.stdout).context("cargo metadata output was not understood")
+}
+
+/// Cargo runs from the manifest's directory, so a workspace
+/// rust-toolchain.toml selects the toolchain it resolves with. The manifest
+/// path is therefore made absolute first: relative to our own working
+/// directory, `sub/Cargo.toml` would otherwise be read as `sub/sub/...`.
+fn metadata_command(manifest: &Path, platform: Option<&str>) -> anyhow::Result<Command> {
+    let manifest = std::path::absolute(manifest)
+        .with_context(|| format!("cannot resolve {}", manifest.display()))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut command = Command::new(cargo);
+    command
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
+        .arg(&manifest);
+    if let Some(platform) = platform {
+        command.args(["--filter-platform", platform]);
+    }
+    if let Some(parent) = manifest.parent().filter(|parent| parent.is_dir()) {
+        command.current_dir(parent);
+    }
+    Ok(command)
 }
 
 // -- timing reports ---------------------------------------------------------------
@@ -344,20 +356,25 @@ impl UnitTimes {
         }
     }
 
-    /// Every compile of one package version, all targets and variants.
+    /// One compile of every target of a package version. A target built under
+    /// several feature sets counts once, at its most expensive variant: the
+    /// extra variants are priced by feature advice and must not inflate a
+    /// rebuild tail or a version's cost.
     fn package_ms(&self, name: &str, version: &str) -> Option<u64> {
-        let mut found = false;
-        let total = self
-            .duration_ms
-            .iter()
-            .filter(|(key, _)| key.name == name && key.version == version)
-            .map(|(_, ms)| {
-                found = true;
-                *ms
-            })
-            .sum();
-        found.then_some(total)
+        let mut per_target: BTreeMap<&str, u64> = BTreeMap::new();
+        for (key, ms) in &self.duration_ms {
+            if key.name == name && key.version == version {
+                let slot = per_target.entry(key.target.as_str()).or_default();
+                *slot = (*slot).max(*ms);
+            }
+        }
+        (!per_target.is_empty()).then(|| saturating_sum(per_target.into_values()))
     }
+}
+
+/// Report durations are untrusted input; never overflow on a corrupt one.
+fn saturating_sum(values: impl IntoIterator<Item = u64>) -> u64 {
+    values.into_iter().fold(0, u64::saturating_add)
 }
 
 /// A unit that compiles the library crate itself (`""`, or `lib (check)` etc.).
@@ -450,7 +467,8 @@ fn attribute(metadata: &Metadata, times: &UnitTimes, timed: bool) -> Attribution
             older
                 .iter()
                 .map(|version| times.package_ms(name, version))
-                .sum::<Option<u64>>()
+                .collect::<Option<Vec<u64>>>()
+                .map(saturating_sum)
         } else {
             None
         };
@@ -493,7 +511,7 @@ fn attribute(metadata: &Metadata, times: &UnitTimes, timed: bool) -> Attribution
             if durations.len() < 2 {
                 continue;
             }
-            let total: u64 = durations.iter().sum();
+            let total = saturating_sum(durations.iter().copied());
             let kept = durations.iter().copied().max().unwrap_or(0);
             let entry = per_crate.entry(*name).or_default();
             if u32::try_from(durations.len()).unwrap_or(u32::MAX) > entry.0 {
@@ -532,7 +550,7 @@ fn attribute(metadata: &Metadata, times: &UnitTimes, timed: bool) -> Attribution
                 .and_then(|package| times.package_ms(&package.name, &package.version))
         };
         let mut memo: BTreeMap<&str, u64> = BTreeMap::new();
-        let mut untimed_dependents = 0_usize;
+        let mut untimed_dependents: BTreeSet<&str> = BTreeSet::new();
         for member in &metadata.workspace_members {
             let Some(package) = packages.get(member.as_str()) else {
                 continue;
@@ -558,10 +576,9 @@ fn attribute(metadata: &Metadata, times: &UnitTimes, timed: bool) -> Attribution
             if closure.is_empty() {
                 continue;
             }
-            untimed_dependents += closure.iter().filter(|id| cost(id).is_none()).count();
+            untimed_dependents.extend(closure.iter().filter(|id| cost(id).is_none()));
             let tail = critical_path(member, &dependents, &cost, &mut memo);
-            let sum: u64 = closure.iter().filter_map(|id| cost(id)).sum::<u64>()
-                + cost(member).unwrap_or_default();
+            let sum = saturating_sum(closure.iter().filter_map(|id| cost(id)).chain(cost(member)));
             extra_evidence.insert(
                 (
                     kind_code(AdviceKind::SplitRebuildTailCrate),
@@ -578,10 +595,11 @@ fn attribute(metadata: &Metadata, times: &UnitTimes, timed: bool) -> Attribution
                 u32::try_from(closure.len()).unwrap_or(u32::MAX),
             ));
         }
-        if untimed_dependents > 0 {
+        if !untimed_dependents.is_empty() {
             limits.push(format!(
-                "rebuild tails: {untimed_dependents} dependent crate compiles were absent from \
-                 the timing reports and count as 0ms"
+                "rebuild tails: {} dependent crates had no compile in the timing reports and \
+                 count as 0ms",
+                untimed_dependents.len()
             ));
         }
 
@@ -641,7 +659,7 @@ fn critical_path<'a>(
         .map(|dependent| critical_path(dependent, dependents, cost, memo))
         .max()
         .unwrap_or(0);
-    let total = cost(id).unwrap_or(0) + below;
+    let total = cost(id).unwrap_or(0).saturating_add(below);
     memo.insert(id, total);
     total
 }
@@ -665,7 +683,8 @@ fn build_report(
             }),
         }
     }
-    // Price with one profile: the newest report's (reports arrive newest first).
+    // Price with one profile: the first readable report's. Discovery lists
+    // reports newest first; explicit --timings keep the order given.
     let profile = parsed
         .first()
         .and_then(|(_, report)| report.profile.clone());
@@ -713,12 +732,13 @@ fn build_report(
 
 fn row(advice: Advice, extra: &BTreeMap<(AdviceKindCode, String), Vec<String>>) -> AdviceRow {
     let kind = kind_code(advice.kind);
-    let measured = advice.kind == AdviceKind::SplitRebuildTailCrate
-        || advice.kind == AdviceKind::LinkBottleneck
-        || advice
-            .non_claims
-            .iter()
-            .any(|claim| claim.starts_with("NO_CLAIM_INCREMENTAL_SAVINGS"));
+    // Only a duplicate-compile price is itself measured compiler time. A
+    // rebuild tail or link time is measured, but the saving the engine
+    // derives from it (a split halves it) is still an estimate.
+    let measured = advice
+        .non_claims
+        .iter()
+        .any(|claim| claim.starts_with("NO_CLAIM_INCREMENTAL_SAVINGS"));
     let mut evidence = advice.evidence;
     if let Some(lines) = extra.get(&(kind, advice.subject.clone())) {
         evidence.extend(lines.iter().cloned());
@@ -996,6 +1016,73 @@ const CONCURRENCY_DATA = [];
     }
 
     #[test]
+    fn metadata_runs_in_the_manifest_directory_with_an_absolute_manifest_path() {
+        // Test binaries run from their package directory, where src/ exists.
+        let command = metadata_command(
+            Path::new("src/Cargo.toml"),
+            Some("x86_64-unknown-linux-gnu"),
+        )
+        .unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        let at = args
+            .iter()
+            .position(|arg| *arg == "--manifest-path")
+            .unwrap();
+        let manifest = Path::new(args[at + 1]);
+        assert_eq!(
+            manifest,
+            std::env::current_dir().unwrap().join("src/Cargo.toml")
+        );
+        assert_eq!(command.get_current_dir(), manifest.parent());
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--filter-platform", "x86_64-unknown-linux-gnu"])
+        );
+    }
+
+    #[test]
+    fn a_feature_split_counts_one_compile_per_target_in_package_cost() {
+        // `core` was built under two feature sets across reports: its rebuild
+        // tail and version cost use one compile (the most expensive variant)
+        // per target, never the sum of the variants.
+        let reports = [
+            report(
+                "dev",
+                &[
+                    ("core", "0.1.0", "", &["a"], 2.0),
+                    ("core", "0.1.0", "build script", &[], 0.5),
+                ],
+            ),
+            report("dev", &[("core", "0.1.0", "", &["a", "b"], 5.0)]),
+        ];
+        let times = UnitTimes::from_reports(&reports);
+        assert_eq!(times.package_ms("core", "0.1.0"), Some(5_500));
+        // Corrupt reports cannot overflow the arithmetic.
+        assert_eq!(saturating_sum([u64::MAX, 1]), u64::MAX);
+    }
+
+    #[test]
+    fn only_duplicate_compile_prices_are_marked_measured() {
+        let inputs = AdviseInputs {
+            rebuild_tails: vec![("core".into(), 9_000, 4)],
+            link_ms: vec![("app bin \"app\"".into(), 12_000)],
+            version_spread: vec![("syn".into(), 2, Some(4_500)), ("rand".into(), 2, None)],
+            ..AdviseInputs::default()
+        };
+        let rows: BTreeMap<_, _> = advise(&inputs)
+            .into_iter()
+            .map(|advice| row(advice, &BTreeMap::new()))
+            .map(|row| (row.subject.clone(), row))
+            .collect();
+        // A measured tail or link time yields an estimated saving (half).
+        assert_eq!(rows["core"].expected_saved_ms, 4_500);
+        assert!(!rows["core"].measured);
+        assert!(!rows["app bin \"app\""].measured);
+        assert!(rows["syn"].measured);
+        assert!(!rows["rand"].measured);
+    }
+
+    #[test]
     fn discovery_reads_newest_reports_first_and_skips_the_alias() {
         let directory = tempfile::tempdir().unwrap();
         for name in [
@@ -1113,8 +1200,17 @@ const CONCURRENCY_DATA = [];
                 .iter()
                 .any(|line| line == "versions: 0.1.0, 0.2.0")
         );
-        // Nothing unplanted is advised, and nothing was edited.
-        assert_eq!(report.advice.len(), 2, "{:#?}", report.advice);
+        // Nothing unplanted is advised. The only legitimate extra row is a
+        // rebuild tail for `common` on a machine slow enough to cross its
+        // threshold, and that saving is an estimate, never "measured".
+        for row in &report.advice {
+            match (row.kind.as_str(), row.subject.as_str()) {
+                ("reduce_feature_coupling", "common") | ("align_versions", "dup") => {}
+                ("split_rebuild_tail_crate", "common") => assert!(!row.measured),
+                _ => panic!("unplanted advice: {row:#?}"),
+            }
+        }
+        // Nothing was edited.
         assert_eq!(
             std::fs::read_to_string(root.join("common/src/lib.rs")).unwrap(),
             "pub fn value() -> u32 { 1 }\n"
