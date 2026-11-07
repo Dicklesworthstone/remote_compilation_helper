@@ -244,6 +244,12 @@ a fresh successful preflight. A refresh that invalidates one of these facts
 causes selection to retry before it spends slots; existing builds retain their
 ownership, and jobs without the failed requirement remain eligible.
 
+Completed toolchain checks belong to the worker connection and lifecycle that
+produced them. Disabling a worker, replacing its endpoint or losing its shared
+transport invalidates both successful and failed checks. After recovery, RCH
+checks the requested toolchain again before reserving slots; reconnecting alone
+cannot reuse a pre-outage success or keep a repaired toolchain excluded.
+
 For `worker Cargo execution check failed`, inspect the reported PATH or
 toolchain failure, update the dispatcher and worker binaries together, and
 repair the worker's Cargo/shim installation as needed. Re-run the capability

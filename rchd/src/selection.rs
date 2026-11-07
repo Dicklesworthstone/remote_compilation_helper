@@ -4463,11 +4463,19 @@ where
                 toolchain_name.to_string(),
                 reason.is_none(),
                 reason.clone(),
+                &admission,
                 deadline,
             )
             .await
         {
-            return Some("toolchain_preflight_timeout".to_string());
+            return Some(
+                if admission.is_current() {
+                    "toolchain_preflight_timeout"
+                } else {
+                    "toolchain_preflight_lifecycle_changed"
+                }
+                .to_string(),
+            );
         }
         if let Some(reason) = &reason {
             warn!(
@@ -9085,6 +9093,106 @@ mod tests {
             .as_deref(),
             Some("toolchain_preflight_lifecycle_changed")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_toolchain_preflight_reprobes_after_worker_recovery() {
+        for disable_enable in [false, true] {
+            for old_usable in [false, true] {
+                let worker = make_worker("recovered-toolchain", 8, 50.0);
+                let initial = toolchain_preflight_with(&worker, "nightly", |_, _| {
+                    std::future::ready(if old_usable {
+                        Ok(())
+                    } else {
+                        Err("toolchain_preflight_command_failed:1:old failure".to_string())
+                    })
+                })
+                .await;
+                assert_eq!(initial.is_none(), old_usable);
+                assert_eq!(
+                    toolchain_preflight_with(
+                        &worker,
+                        "nightly",
+                        |_, _| -> std::future::Ready<Result<(), String>> {
+                            panic!("a current completed verdict must be reused");
+                        },
+                    )
+                    .await,
+                    initial
+                );
+
+                let heartbeat = Duration::from_secs(30);
+                let circuit = CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                };
+                if disable_enable {
+                    worker.disable(Some("maintenance".into())).await;
+                    worker.enable().await;
+                } else {
+                    worker
+                        .record_transport_result(false, heartbeat, &circuit)
+                        .await;
+                }
+                assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+                assert_eq!(
+                    toolchain_preflight_with(&worker, "nightly", |_, _| async {
+                        panic!("recovery still requires a successful health probe");
+                    })
+                    .await
+                    .as_deref(),
+                    Some("toolchain_preflight_lifecycle_changed")
+                );
+                tokio::time::advance(worker.next_health_probe_in().await.unwrap()).await;
+                let health = worker
+                    .health_probe_permit(heartbeat, &circuit)
+                    .await
+                    .unwrap();
+                assert!(health.isolated);
+                assert!(
+                    worker
+                        .record_health_transport_result(&health, true, heartbeat, &circuit)
+                        .await
+                        .is_some()
+                );
+                drop(health);
+
+                let probed = std::cell::Cell::new(false);
+                let fresh = toolchain_preflight_with(&worker, "nightly", |_, _| {
+                    probed.set(true);
+                    std::future::ready(if old_usable {
+                        Err("toolchain_preflight_command_failed:1:fresh failure".to_string())
+                    } else {
+                        Ok(())
+                    })
+                })
+                .await;
+                assert!(
+                    probed.get(),
+                    "recovery must probe even a fresh completed cache entry"
+                );
+                assert_eq!(fresh.is_none(), !old_usable);
+                assert_eq!(
+                    worker
+                        .toolchain_preflight_status("nightly")
+                        .await
+                        .unwrap()
+                        .usable,
+                    !old_usable
+                );
+                assert_eq!(
+                    toolchain_preflight_with(
+                        &worker,
+                        "nightly",
+                        |_, _| -> std::future::Ready<Result<(), String>> {
+                            panic!("new evidence must be reusable in the recovered epoch");
+                        },
+                    )
+                    .await,
+                    fresh
+                );
+            }
+        }
     }
 
     #[tokio::test]

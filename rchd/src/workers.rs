@@ -669,6 +669,27 @@ impl BackgroundProbe {
                 .is_none_or(|(changes, revision)| *changes.borrow() == *revision)
     }
 
+    /// Fence one synchronous commit against both worker and shared-transport
+    /// revocation. The operation must not await or reborrow either watch: a
+    /// queued writer could otherwise block that nested read indefinitely.
+    fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let current = self.changes.borrow();
+        if *current != self.revision {
+            return None;
+        }
+        let transport = self
+            .transport
+            .as_ref()
+            .map(|(changes, revision)| (changes.borrow(), *revision));
+        if transport
+            .as_ref()
+            .is_some_and(|(current, revision)| **current != *revision)
+        {
+            return None;
+        }
+        Some(operation())
+    }
+
     pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
         if !self.is_current() {
             return None;
@@ -763,7 +784,10 @@ impl OwnedRecoveryPermit {
         self.run_with_probe_before(operation, probe, None).await
     }
 
-    async fn run_with_probe_before<F: std::future::Future, P: std::future::Future<Output = bool>>(
+    async fn run_with_probe_before<
+        F: std::future::Future,
+        P: std::future::Future<Output = bool>,
+    >(
         &mut self,
         operation: F,
         probe: P,
@@ -783,7 +807,10 @@ impl OwnedRecoveryPermit {
         }
     }
 
-    async fn run_with_probe_admitted<F: std::future::Future, P: std::future::Future<Output = bool>>(
+    async fn run_with_probe_admitted<
+        F: std::future::Future,
+        P: std::future::Future<Output = bool>,
+    >(
         &mut self,
         operation: F,
         probe: P,
@@ -949,7 +976,7 @@ pub struct WorkerState {
     /// Serialize daemon-side capability requests from health, operators and selection.
     capability_probe: tokio::sync::Mutex<()>,
     /// Cached per-toolchain preflight verdicts.
-    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightStatus>>,
+    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightEvidence>>,
     /// Latest daemon-side pressure policy assessment for this worker.
     pressure_assessment: RwLock<PressureAssessment>,
     /// Disk budget shared by all workers created by the same daemon pool.
@@ -1632,7 +1659,7 @@ impl WorkerState {
             return false;
         }
         let total_slots = self.slots_for(config.total_slots, &pressure);
-        self.reserve_slots_accounting(count, total_slots)
+        self.reserve_slots_accounting(count, total_slots, None)
     }
 
     /// Reserve slots against the exact endpoint selected for a build and carry
@@ -1683,24 +1710,30 @@ impl WorkerState {
             return None;
         }
         let total_slots = self.slots_for(config.total_slots, &pressure);
-        if let Some(toolchain_name) = requirements.preflight_toolchain()
-            && !toolchain_preflight.as_ref().is_some_and(|cache| {
-                cache.get(toolchain_name).is_some_and(|verdict| {
-                    verdict.usable && verdict.is_fresh(TOOLCHAIN_PREFLIGHT_TTL)
-                })
-            })
-        {
-            return None;
-        }
+        let preflight_provenance = match requirements.preflight_toolchain() {
+            Some(toolchain_name) => {
+                let evidence = toolchain_preflight.as_ref()?.get(toolchain_name)?;
+                if !evidence.verdict.usable || !evidence.verdict.is_fresh(TOOLCHAIN_PREFLIGHT_TTL) {
+                    return None;
+                }
+                Some(&evidence.provenance)
+            }
+            None => None,
+        };
 
-        self.reserve_slots_accounting(count, total_slots)
+        self.reserve_slots_accounting(count, total_slots, preflight_provenance)
             .then_some(WorkerSlotAdmission { disk_capacity })
     }
 
     /// Synchronous accounting boundary shared by ordinary and endpoint-bound
     /// admission. Successful ownership is returned in the same poll that
     /// changes the counter; there is no cancellable post-commit validation.
-    fn reserve_slots_accounting(&self, count: u32, total_slots: u32) -> bool {
+    fn reserve_slots_accounting(
+        &self,
+        count: u32,
+        total_slots: u32,
+        preflight_provenance: Option<&BackgroundProbe>,
+    ) -> bool {
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
             if !self.connection_is_ready() {
@@ -1712,12 +1745,21 @@ impl WorkerState {
             if next > total_slots {
                 return false;
             }
-            match self.used_slots.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
+            // Check readiness before acquiring watch guards. Retain the
+            // preflight's original epochs across this CAS only, and recheck
+            // them on every retry. Reconnection cannot revive old evidence.
+            let commit = || {
+                self.used_slots
+                    .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
+            };
+            let result = match preflight_provenance {
+                Some(provenance) => match provenance.with_current(commit) {
+                    Some(result) => result,
+                    None => return false,
+                },
+                None => commit(),
+            };
+            match result {
                 Ok(_) => return true,
                 Err(actual) => current = actual,
             }
@@ -2047,34 +2089,39 @@ impl WorkerState {
         self.disk_capacity_observation.read().await.clone()
     }
 
-    /// Cache a toolchain preflight verdict for selection-time routing.
+    /// Seed a current verdict in tests without running a remote probe.
+    #[cfg(test)]
     pub async fn record_toolchain_preflight(
         &self,
         toolchain: String,
         usable: bool,
         reason: Option<String>,
     ) {
-        self.toolchain_preflight.write().await.insert(
+        let mut cache = self.toolchain_preflight.write().await;
+        cache.insert(
             toolchain,
-            ToolchainPreflightStatus {
-                usable,
-                reason,
-                checked_at_unix_ms: current_unix_ms(),
+            ToolchainPreflightEvidence {
+                verdict: ToolchainPreflightStatus {
+                    usable,
+                    reason,
+                    checked_at_unix_ms: current_unix_ms(),
+                },
+                provenance: self.network_revision_guard(),
             },
         );
     }
 
-    /// Publish a completed toolchain verdict only while its original budget
-    /// remains. Waiting for the cache lock cannot turn late evidence into a
-    /// fresh success or restart a worker exclusion.
+    /// Publish a completed verdict only within its original network epochs and
+    /// budget. Waiting for the cache lock cannot renew revoked or late evidence.
     pub(crate) async fn record_toolchain_preflight_before(
         &self,
         toolchain: String,
         usable: bool,
         reason: Option<String>,
+        provenance: &BackgroundProbe,
         deadline: tokio::time::Instant,
     ) -> bool {
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
             return false;
         }
         let Ok(mut cache) =
@@ -2082,21 +2129,25 @@ impl WorkerState {
         else {
             return false;
         };
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
             return false;
         }
         cache.insert(
             toolchain,
-            ToolchainPreflightStatus {
-                usable,
-                reason,
-                checked_at_unix_ms: current_unix_ms(),
+            ToolchainPreflightEvidence {
+                verdict: ToolchainPreflightStatus {
+                    usable,
+                    reason,
+                    checked_at_unix_ms: current_unix_ms(),
+                },
+                provenance: provenance.clone(),
             },
         );
         true
     }
 
-    /// Retrieve a cached toolchain preflight verdict.
+    /// Retrieve a verdict only while its original worker and transport epochs
+    /// remain current. Recovery requires a new probe for successes and failures.
     pub async fn toolchain_preflight_status(
         &self,
         toolchain: &str,
@@ -2105,7 +2156,8 @@ impl WorkerState {
             .read()
             .await
             .get(toolchain)
-            .cloned()
+            .filter(|evidence| evidence.provenance.is_current())
+            .map(|evidence| evidence.verdict.clone())
     }
 
     /// Update the latest disk-pressure policy assessment.
@@ -2397,6 +2449,14 @@ impl WorkerState {
                 )
             })
     }
+}
+
+/// A completed preflight retains the permission that admitted its remote I/O.
+/// Keep one entry per toolchain; revoked entries are replaced on the next probe.
+#[derive(Debug, Clone)]
+struct ToolchainPreflightEvidence {
+    verdict: ToolchainPreflightStatus,
+    provenance: BackgroundProbe,
 }
 
 /// Cached result of checking a concrete Rust toolchain on a worker.
@@ -4374,11 +4434,15 @@ mod tests {
                     publication.insert("another-toolchain".into(), verdict);
                 }
                 "expired" => {
-                    publication.get_mut(toolchain).unwrap().checked_at_unix_ms = current_unix_ms()
+                    publication
+                        .get_mut(toolchain)
+                        .unwrap()
+                        .verdict
+                        .checked_at_unix_ms = current_unix_ms()
                         .saturating_sub(duration_millis_i64(TOOLCHAIN_PREFLIGHT_TTL) + 1000);
                 }
                 "failed" | "transport-failed" => {
-                    let verdict = publication.get_mut(toolchain).unwrap();
+                    let verdict = &mut publication.get_mut(toolchain).unwrap().verdict;
                     verdict.usable = false;
                     verdict.reason = Some(if case == "failed" {
                         "toolchain_preflight_command_failed:1:wrapper refused".into()
@@ -4478,6 +4542,109 @@ mod tests {
                 .is_none()
         );
         assert_eq!(worker.used_slots(), 1, "existing ownership is preserved");
+    }
+
+    #[tokio::test]
+    async fn recovered_worker_requires_new_toolchain_evidence_without_losing_slots() {
+        for transition in [
+            "disable-enable",
+            "transport-failure",
+            "shared-transport-failure",
+        ] {
+            for old_usable in [false, true] {
+                let worker = WorkerState::new(recovered_worker_config("preflight-recovery", 8));
+                worker
+                    .set_capabilities(WorkerCapabilities::mock_with_rust())
+                    .await;
+                let mut request = execution_request(RequiredRuntime::Rust);
+                request.toolchain = Some(rch_common::ToolchainInfo::new(
+                    "nightly",
+                    Some("2026-08-31".into()),
+                    "nightly-2026-08-31",
+                ));
+                let requirements = ExecutionRequirements::new(&request);
+                let toolchain = requirements.preflight_toolchain().unwrap();
+                worker
+                    .record_toolchain_preflight(
+                        toolchain.to_owned(),
+                        old_usable,
+                        (!old_usable)
+                            .then(|| "toolchain_preflight_command_failed:1:old failure".into()),
+                    )
+                    .await;
+                assert!(worker.reserve_slots(3).await);
+                let selected = worker.endpoint_snapshot().await;
+                let original = worker.background_probe().await.unwrap();
+                let heartbeat = Duration::from_secs(30);
+                let circuit = CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                };
+                match transition {
+                    "disable-enable" => {
+                        worker.disable(Some("maintenance".into())).await;
+                        worker.enable().await;
+                    }
+                    "transport-failure" => {
+                        worker
+                            .record_transport_result(false, heartbeat, &circuit)
+                            .await;
+                    }
+                    "shared-transport-failure" => {
+                        // Historical recovery revokes the shared endpoint
+                        // without changing this worker's local watch revision.
+                        worker
+                            .transport()
+                            .record_result(false, heartbeat, &circuit)
+                            .await;
+                        assert_eq!(*original.changes.borrow(), original.revision);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!original.is_current(), "{transition}, usable={old_usable}");
+                assert!(!worker.background_network_allowed().await);
+                worker
+                    .record_transport_result(true, heartbeat, &circuit)
+                    .await;
+                assert!(worker.background_network_allowed().await);
+                assert!(worker.lock_current_endpoint(&selected).await.is_some());
+                assert!(worker.has_runtime(RequiredRuntime::Rust).await);
+                assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_none(),
+                    "{transition}, usable={old_usable}: recovery cannot revive old evidence"
+                );
+                assert_eq!(worker.used_slots(), 3, "existing ownership is preserved");
+
+                // Transport is healthy and unrelated work is eligible, but the
+                // pinned toolchain must publish new evidence before admission.
+                assert!(worker.reserve_slots(1).await);
+                worker.release_slots(1).await;
+                let fresh = worker.background_probe().await.unwrap();
+                assert!(
+                    worker
+                        .record_toolchain_preflight_before(
+                            toolchain.to_owned(),
+                            true,
+                            None,
+                            &fresh,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                );
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_some()
+                );
+                assert_eq!(worker.used_slots(), 4);
+                assert_eq!(worker.toolchain_preflight.read().await.len(), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -4734,7 +4901,10 @@ mod tests {
             assert_eq!(state.failures, 0);
             drop(state);
             let mut fresh = pool.owned_recovery_admission(&endpoint).await.unwrap();
-            assert_eq!(fresh.run_with_probe(async { 9 }, async { true }).await, Some(9));
+            assert_eq!(
+                fresh.run_with_probe(async { 9 }, async { true }).await,
+                Some(9)
+            );
         }
     }
 
@@ -8638,6 +8808,7 @@ mod tests {
             .record_toolchain_preflight("stable".into(), false, Some("previous refusal".into()))
             .await;
         let original = worker.toolchain_preflight_status("stable").await.unwrap();
+        let provenance = worker.network_revision_guard();
         for usable in [false, true] {
             for lateness in [Duration::ZERO, Duration::from_millis(1)] {
                 let guard = worker.toolchain_preflight.write().await;
@@ -8646,6 +8817,7 @@ mod tests {
                     "stable".into(),
                     usable,
                     Some("late replacement".into()),
+                    &provenance,
                     tokio::time::Instant::now() + budget,
                 ));
                 std::future::poll_fn(|cx| {
@@ -8668,6 +8840,7 @@ mod tests {
                     "stable".into(),
                     true,
                     None,
+                    &provenance,
                     tokio::time::Instant::now() + Duration::from_secs(1),
                 )
                 .await
@@ -8679,6 +8852,77 @@ mod tests {
                 .unwrap()
                 .usable
         );
+    }
+
+    #[tokio::test]
+    async fn queued_toolchain_cache_publication_rejects_revoked_original_permission() {
+        for shared_transport in [false, true] {
+            for usable in [false, true] {
+                let worker = WorkerState::new(test_config("queued-preflight"));
+                let provenance = worker.background_probe().await.unwrap();
+                let transition = worker.lock_network_publication(&provenance).await.unwrap();
+                let cache = worker.toolchain_preflight.write().await;
+                let mut publication = Box::pin(worker.record_toolchain_preflight_before(
+                    "stable".into(),
+                    usable,
+                    (!usable).then(|| "toolchain_preflight_command_failed:1:old failure".into()),
+                    &provenance,
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+
+                let heartbeat = Duration::from_secs(30);
+                let circuit = CircuitBreakerConfig::default();
+                if shared_transport {
+                    worker
+                        .transport()
+                        .record_result(false, heartbeat, &circuit)
+                        .await;
+                    assert_eq!(*provenance.changes.borrow(), provenance.revision);
+                } else {
+                    worker.require_connection_probe();
+                }
+                worker
+                    .record_transport_result(true, heartbeat, &circuit)
+                    .await;
+                assert!(worker.background_network_allowed().await);
+                assert!(!provenance.is_current());
+                drop(cache);
+                assert!(
+                    !publication.await,
+                    "shared={shared_transport}, usable={usable}: queued evidence retains its original epoch"
+                );
+                drop(transition);
+                assert!(worker.toolchain_preflight.read().await.is_empty());
+
+                let fresh = worker.background_probe().await.unwrap();
+                assert!(
+                    worker
+                        .record_toolchain_preflight_before(
+                            "stable".into(),
+                            !usable,
+                            usable.then(|| {
+                                "toolchain_preflight_command_failed:1:fresh failure".into()
+                            }),
+                            &fresh,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                );
+                assert_eq!(
+                    worker
+                        .toolchain_preflight_status("stable")
+                        .await
+                        .unwrap()
+                        .usable,
+                    !usable
+                );
+            }
+        }
     }
 
     #[tokio::test]
