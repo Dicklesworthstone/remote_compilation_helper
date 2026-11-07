@@ -12,6 +12,7 @@ pub use client::run_client_profile;
 
 use super::remote_artifacts::CapturedTarget;
 use super::remote_operation::{self, RemoteOperationInputs, RemoteOperationOutcome};
+use super::service::{AdmittedOperation, OperationAdmissions};
 use super::{SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory};
 use crate::coord::{source_manifest, worker_delivery};
 use crate::edge::live_facts::read_stable;
@@ -86,7 +87,16 @@ struct ServiceProfile {
     tls: TlsProfile,
     allowed_edge_pins: Vec<String>,
     max_roots: usize,
+    /// Waiting authenticated callers retain only their declaration and wire.
+    #[serde(default)]
+    max_queued_roots: usize,
+    #[serde(default = "default_queue_timeout_seconds")]
+    queue_timeout_seconds: u64,
     jobs_per_root: u32,
+}
+
+fn default_queue_timeout_seconds() -> u64 {
+    300
 }
 
 impl ServiceProfile {
@@ -100,6 +110,14 @@ impl ServiceProfile {
                 && (1..=4096).contains(&self.jobs_per_root)
                 && self.max_roots * self.jobs_per_root as usize <= 4096,
             "remote service capacity must be 1..32 roots, 1..4096 jobs per root, and at most 4096 aggregate jobs",
+        )?;
+        require(
+            self.max_queued_roots <= 128,
+            "remote service max_queued_roots must be between 0 and 128",
+        )?;
+        require(
+            (1..=wire::ADMISSION_BUDGET.as_secs()).contains(&self.queue_timeout_seconds),
+            "remote service queue_timeout_seconds must be between 1 and 1800",
         )?;
         let roots = [&self.state_root, &self.input_root, &self.operation_root];
         for (index, root) in roots.iter().enumerate() {
@@ -148,9 +166,13 @@ impl ServiceProfile {
         self.tls.files()?;
         Ok(pins)
     }
+
+    fn max_sessions(&self) -> usize {
+        self.max_roots + self.max_queued_roots
+    }
 }
 
-/// A session slot covers authentication, upload, execution and final receipt.
+/// Bounded session slots cover authentication, waiting, upload and delivery.
 /// Unauthenticated connections cannot create input trees or grow a work queue.
 struct Session {
     stopped: Arc<AtomicBool>,
@@ -234,6 +256,7 @@ pub fn run_service_profile(
         config.max_roots,
         config.jobs_per_root,
     )?;
+    let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
@@ -242,6 +265,8 @@ pub fn run_service_profile(
         "{}",
         json!({"kind":"canonical-remote-service-listening", "version":SERVICE_VERSION,
         "address":listener.local_addr()?.to_string(), "max_roots":config.max_roots,
+        "max_queued_roots":config.max_queued_roots,
+        "queue_timeout_seconds":config.queue_timeout_seconds,
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
         "transport":"mutual-tls-atp", "cargo_location":"coordinator"})
@@ -263,7 +288,7 @@ pub fn run_service_profile(
             Ok(Err(error)) => break Err(error),
             Ok(Ok((stream, _))) => stream,
         };
-        if sessions.0.len() >= config.max_roots {
+        if sessions.0.len() >= config.max_sessions() {
             // No plaintext rejection on an authenticated-only endpoint. No
             // admission took place, and clients never automatically retry.
             drop(stream);
@@ -273,6 +298,7 @@ pub fn run_service_profile(
         let child_stop = Arc::clone(&stopped);
         let child_config = Arc::clone(&config);
         let child_runtime = Arc::clone(&runtime);
+        let child_admissions = Arc::clone(&admissions);
         let child_acceptor = Arc::clone(&acceptor);
         let child_pins = Arc::clone(&pins);
         // The accepted socket has not been polled. Its first I/O registration
@@ -288,8 +314,14 @@ pub fn run_service_profile(
                         .await
                         .map_err(io::Error::other)?;
                     let mut wire = Wire::new(peer.stream);
-                    let result =
-                        handle_session(&mut wire, child_runtime, &child_config, &child_stop).await;
+                    let result = handle_session(
+                        &mut wire,
+                        child_runtime,
+                        &child_config,
+                        &child_admissions,
+                        &child_stop,
+                    )
+                    .await;
                     if let Err(error) = &result {
                         let _ = wire
                             .send(
@@ -374,9 +406,10 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     runtime: Arc<SharedRuntime>,
     config: &ServiceProfile,
+    admissions: &Arc<OperationAdmissions>,
     stopped: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
+    let declaration_deadline = Instant::now() + wire::IO_BUDGET;
     let Message::Hello {
         version,
         build_identity,
@@ -385,7 +418,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         source_manifest,
         toolchain_identity,
         cargo_home,
-    } = wire.receive(stopped, input_deadline).await?
+    } = wire.receive(stopped, declaration_deadline).await?
     else {
         return Err(invalid("remote operation must begin with hello"));
     };
@@ -404,19 +437,30 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     )?;
     let manifest = source_manifest.native()?;
     let identity = toolchain_identity.native()?;
+    // The synthesized request discards physical capture paths. Validate its
+    // complete logical declaration before reserving work or creating any tree.
+    let request = prepared_request(
+        &settings,
+        &config.input_root.join("toolchain"),
+        &source_manifest,
+        &toolchain_identity,
+        &cargo_home,
+    )?;
+    let queue_deadline = Instant::now()
+        .checked_add(Duration::from_secs(config.queue_timeout_seconds))
+        .ok_or_else(|| invalid("remote operation admission deadline overflow"))?;
+    // Keep this permit through input custody, execution, final delivery and
+    // every error/drop path. It is separate from the existing Cargo root token.
+    let _admission =
+        acquire_operation(wire, admissions, stopped, queue_deadline, || runtime.healthy())
+            .await?;
+    let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("canonical-remote-input-")
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&config.input_root)?,
     );
-    let request = prepared_request(
-        &settings,
-        &owner.path().join("toolchain"),
-        &source_manifest,
-        &toolchain_identity,
-        &cargo_home,
-    )?;
     let source = SourceReceiver::create(&owner.path().join("source"), manifest)?;
     let toolchain = ToolchainReceiver::create(
         &owner.path().join("toolchain"),
@@ -528,6 +572,39 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         &cancelled,
     )
     .await
+}
+
+/// One authenticated declaration owns a FIFO ticket, never an input tree or
+/// Cargo process, until admitted. Each poll receives exactly Queued or Ready;
+/// Ready is sent by the caller only after its receivers have been created.
+async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    admissions: &Arc<OperationAdmissions>,
+    stopped: &AtomicBool,
+    deadline: Instant,
+    healthy: impl Fn() -> bool,
+) -> io::Result<AdmittedOperation> {
+    checkpoint(stopped, deadline)?;
+    let mut waiting = admissions.enqueue()?;
+    loop {
+        checkpoint(stopped, deadline)?;
+        if !healthy() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote canonical coordinator stopped while awaiting admission",
+            ));
+        }
+        if let Some(admitted) = waiting.try_start()? {
+            return Ok(admitted);
+        }
+        wire.send(&Message::Queued, stopped, deadline).await?;
+        // Do not renew the queue deadline on activity or consume upload bytes.
+        // The bounded read also observes EOF, Cancel and service shutdown.
+        require(
+            matches!(wire.receive(stopped, deadline).await?, Message::Poll),
+            "expected an admission status poll before input upload",
+        )?;
+    }
 }
 
 /// The same finite upload receiver serves production sessions and native
@@ -713,9 +790,386 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::io::ReadBuf;
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     use rabs_sandbox::toolchain_dataset::ToolchainIdentity;
     use sha2::{Digest, Sha256};
+    use std::future::Future;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::pin::{Pin, pin};
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    /// An explicitly scripted transport, not a TLS/compiler substitute. Tests
+    /// exercise the production queue's frame handling and permit ownership.
+    struct AdmissionPeer {
+        input: Vec<u8>,
+        offset: usize,
+        eof: bool,
+        output: Arc<Mutex<Vec<u8>>>,
+        before_read: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl AdmissionPeer {
+        fn new(input: Vec<u8>) -> Self {
+            Self {
+                input,
+                offset: 0,
+                eof: true,
+                output: Arc::new(Mutex::new(Vec::new())),
+                before_read: None,
+            }
+        }
+    }
+
+    impl AsyncRead for AdmissionPeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let peer = self.get_mut();
+            if let Some(effect) = peer.before_read.take() {
+                effect();
+            }
+            if peer.offset == peer.input.len() && !peer.eof {
+                // No peer wakeup: cancellation/expiry must use the real timer.
+                return Poll::Pending;
+            }
+            let count = output.remaining().min(3).min(peer.input.len() - peer.offset);
+            output.put_slice(&peer.input[peer.offset..peer.offset + count]);
+            peer.offset += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for AdmissionPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let count = bytes.len().min(3);
+            self.output.lock().unwrap().extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn record(message: &Message) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(message).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn messages(output: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
+        std::str::from_utf8(&output.lock().unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..100_000 {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+        panic!("scripted remote admission did not settle");
+    }
+
+    #[test]
+    fn remote_queue_defaults_and_capacity_are_bounded() {
+        let owner = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        for name in ["state", "inputs", "operations"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(owner.path().join(name))
+                .unwrap();
+        }
+        let wrapper = owner.path().join("rabs-wrap");
+        fs::write(&wrapper, b"#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut profile: ServiceProfile = serde_json::from_value(json!({
+            "version": SERVICE_VERSION, "listen":"127.0.0.1:0",
+            "state_root":owner.path().join("state"),
+            "input_root":owner.path().join("inputs"),
+            "operation_root":owner.path().join("operations"), "wrapper":wrapper,
+            "tls":{"ca":owner.path().join("ca.pem"),
+                "certificate":owner.path().join("cert.pem"),
+                "private_key":owner.path().join("key.pem")},
+            "allowed_edge_pins":["ab".repeat(32)], "max_roots":2, "jobs_per_root":2,
+        }))
+        .unwrap();
+        assert_eq!(profile.max_queued_roots, 0);
+        assert_eq!(profile.queue_timeout_seconds, 300);
+        assert_eq!(profile.max_sessions(), 2);
+        profile.validate().unwrap();
+        profile.max_roots = 32;
+        profile.max_queued_roots = 128;
+        profile.queue_timeout_seconds = 1800;
+        profile.validate().unwrap();
+        assert_eq!(profile.max_sessions(), 160);
+        profile.max_queued_roots = 129;
+        assert!(profile.validate().is_err());
+        profile.max_queued_roots = 128;
+        for timeout in [0, 1801, u64::MAX] {
+            profile.queue_timeout_seconds = timeout;
+            assert!(profile.validate().is_err(), "timeout {timeout}");
+        }
+    }
+
+    #[test]
+    fn immediate_remote_admission_holds_capacity_until_owner_drop() {
+        let admissions = OperationAdmissions::new(1, 0);
+        let peer = AdmissionPeer::new(Vec::new());
+        let output = Arc::clone(&peer.output);
+        let mut wire = Wire::new(peer);
+        let stopped = AtomicBool::new(false);
+        let admitted = ready(acquire_operation(
+            &mut wire,
+            &admissions,
+            &stopped,
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .unwrap();
+        assert!(messages(&output).is_empty());
+        assert!(matches!(
+            admissions.enqueue(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(admitted);
+        drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+    }
+
+    #[test]
+    fn remote_poll_admission_preserves_fifo_and_cannot_be_barged() {
+        let admissions = OperationAdmissions::new(1, 2);
+        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let tail = Arc::new(Mutex::new(None));
+        let queued_tail = Arc::clone(&tail);
+        let peer_admissions = Arc::clone(&admissions);
+        let mut peer = AdmissionPeer::new(record(&Message::Poll));
+        let output = Arc::clone(&peer.output);
+        peer.before_read = Some(Box::new(move || {
+            *queued_tail.lock().unwrap() = Some(peer_admissions.enqueue().unwrap());
+            drop(active);
+        }));
+        let mut wire = Wire::new(peer);
+        let admitted = ready(acquire_operation(
+            &mut wire,
+            &admissions,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .unwrap();
+        assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+        let mut tail = tail.lock().unwrap().take().unwrap();
+        assert!(tail.try_start().unwrap().is_none());
+        let mut newcomer = admissions.enqueue().unwrap();
+        drop(admitted);
+        assert!(newcomer.try_start().unwrap().is_none());
+        drop(tail.try_start().unwrap().unwrap());
+        drop(newcomer.try_start().unwrap().unwrap());
+    }
+
+    #[test]
+    fn queued_remote_disconnect_cancel_and_early_upload_release_only_their_ticket() {
+        for (input, expected) in [
+            (Vec::new(), io::ErrorKind::UnexpectedEof),
+            (record(&Message::Cancel), io::ErrorKind::Interrupted),
+            (record(&Message::InputsDone), io::ErrorKind::InvalidData),
+            (
+                record(&Message::SourceChunk {
+                    chunk: Chunk::new("src/lib.rs", 0, b"not admitted").unwrap(),
+                }),
+                io::ErrorKind::InvalidData,
+            ),
+            (b"not-json\n".to_vec(), io::ErrorKind::InvalidData),
+        ] {
+            let admissions = OperationAdmissions::new(1, 1);
+            let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let error = ready(acquire_operation(
+                &mut wire,
+                &admissions,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(1),
+                || true,
+            ))
+            .err()
+            .expect("waiting client was not admitted");
+            assert_eq!(error.kind(), expected);
+            assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+            let mut successor = admissions.enqueue().unwrap();
+            assert!(successor.try_start().unwrap().is_none());
+            drop(active);
+            drop(successor.try_start().unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn remote_queue_refuses_overflow_expiry_and_unhealthy_runtime_before_grant() {
+        let admissions = OperationAdmissions::new(1, 1);
+        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let waiting = admissions.enqueue().unwrap();
+        let peer = AdmissionPeer::new(Vec::new());
+        let output = Arc::clone(&peer.output);
+        let mut wire = Wire::new(peer);
+        let error = ready(acquire_operation(
+            &mut wire,
+            &admissions,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(messages(&output).is_empty());
+        drop(waiting);
+        drop(active);
+        for (cancelled, healthy, budget, expected) in [
+            (false, true, Duration::ZERO, io::ErrorKind::TimedOut),
+            (
+                true,
+                true,
+                Duration::from_secs(1),
+                io::ErrorKind::Interrupted,
+            ),
+            (
+                false,
+                false,
+                Duration::from_secs(1),
+                io::ErrorKind::Interrupted,
+            ),
+        ] {
+            let error = ready(acquire_operation(
+                &mut wire,
+                &admissions,
+                &AtomicBool::new(cancelled),
+                Instant::now() + budget,
+                || healthy,
+            ))
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), expected);
+            drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn queued_remote_runtime_failure_cannot_take_a_newly_freed_slot() {
+        let admissions = OperationAdmissions::new(1, 1);
+        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let peer_health = Arc::clone(&healthy);
+        let mut peer = AdmissionPeer::new(record(&Message::Poll));
+        let output = Arc::clone(&peer.output);
+        peer.before_read = Some(Box::new(move || {
+            peer_health.store(false, Ordering::Release);
+            drop(active);
+        }));
+        let mut wire = Wire::new(peer);
+        let error = ready(acquire_operation(
+            &mut wire,
+            &admissions,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || healthy.load(Ordering::Acquire),
+        ))
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+        drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+    }
+
+    #[test]
+    fn silent_remote_queue_wait_ends_on_original_deadline_or_shutdown_without_peer_wakeup() {
+        for cancellation in [false, true] {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let handle = runtime.handle();
+            block_on_top_level(&runtime, async move {
+                handle
+                    .spawn(async move {
+                        let admissions = OperationAdmissions::new(1, 1);
+                        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+                        let stopped = Arc::new(AtomicBool::new(false));
+                        let mut peer = AdmissionPeer::new(Vec::new());
+                        peer.eof = false;
+                        let output = Arc::clone(&peer.output);
+                        let mut wire = Wire::new(peer);
+                        let stop_thread = cancellation.then(|| {
+                            let stopped = Arc::clone(&stopped);
+                            let output = Arc::clone(&output);
+                            std::thread::spawn(move || {
+                                let deadline = Instant::now() + Duration::from_secs(1);
+                                while !output.lock().unwrap().ends_with(b"\n") {
+                                    assert!(Instant::now() < deadline, "client never entered queue");
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                stopped.store(true, Ordering::Release);
+                            })
+                        });
+                        let budget = if cancellation {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_millis(20)
+                        };
+                        let error = asupersync::time::timeout(
+                            runtime_transport_now(),
+                            Duration::from_secs(2),
+                            acquire_operation(
+                                &mut wire,
+                                &admissions,
+                                &stopped,
+                                Instant::now() + budget,
+                                || true,
+                            ),
+                        )
+                        .await
+                        .expect("queue control did not wake silent peer")
+                        .err()
+                        .expect("quiet waiter must not start work");
+                        if let Some(thread) = stop_thread {
+                            thread.join().unwrap();
+                        }
+                        assert_eq!(
+                            error.kind(),
+                            if cancellation {
+                                io::ErrorKind::Interrupted
+                            } else {
+                                io::ErrorKind::TimedOut
+                            }
+                        );
+                        assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+                        let mut successor = admissions.enqueue().unwrap();
+                        assert!(successor.try_start().unwrap().is_none());
+                        drop(active);
+                        drop(successor.try_start().unwrap().unwrap());
+                    })
+                    .await
+            });
+        }
+    }
 
     #[test]
     fn generated_remote_request_contains_only_bound_logical_intent() {
@@ -742,6 +1196,18 @@ mod tests {
             &None,
         )
         .unwrap();
+        assert_eq!(
+            request,
+            prepared_request(
+                &settings,
+                Path::new("/different/input-owner/toolchain"),
+                &Manifest::from_native(&source),
+                &wire::Toolchain::from_native(&toolchain),
+                &None,
+            )
+            .unwrap(),
+            "validating the declaration before capture allocation cannot retain a physical path"
+        );
         let encoded = request.to_string();
         assert!(!encoded.contains("/private/server-owned"));
         assert!(!encoded.contains("toolchain_source"));

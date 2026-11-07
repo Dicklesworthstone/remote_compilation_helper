@@ -3,8 +3,9 @@
 use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
-    CargoHome, Chunk, Entry, Manifest, Message, Output, Toolchain, VERSION, Window, Wire,
-    checkpoint, decode_hex, digest, invalid, require,
+    ADMISSION_BUDGET, ADMISSION_POLL, CargoHome, Chunk, Entry, Manifest, Message, Output,
+    Toolchain, VERSION, Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid,
+    require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -240,15 +241,11 @@ pub fn run_client_profile(
             .await
             .map_err(io::Error::other)?;
         let mut wire = Wire::new(peer.stream);
-        let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
-        wire.send(&hello, stopped, input_deadline).await?;
-        require(
-            matches!(
-                wire.receive_until(stopped, input_deadline).await?,
-                Message::Ready
-            ),
-            "coordinator did not accept the input declaration",
-        )?;
+        let admission_deadline = Instant::now() + ADMISSION_BUDGET;
+        wire.send(&hello, stopped, admission_deadline).await?;
+        let input_deadline =
+            await_input_admission(&mut wire, stopped, &config.coordinator, admission_deadline)
+                .await?;
         upload_inputs(
             &mut wire,
             &mut bundle,
@@ -273,6 +270,45 @@ pub fn run_client_profile(
         );
         receive_operation(&mut wire, &config, stopped).await
     })
+}
+
+/// Remain on the authenticated connection while the coordinator owns our queue
+/// position. Only Ready permits input bytes, with a fresh upload budget; neither
+/// a queued reply nor a poll renews the fixed admission deadline.
+async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    stopped: &AtomicBool,
+    coordinator: &str,
+    admission_deadline: Instant,
+) -> io::Result<Instant> {
+    let mut reported_queue = false;
+    loop {
+        match wire.receive_until(stopped, admission_deadline).await? {
+            Message::Ready => return Ok(Instant::now() + TOOLCHAIN_INPUT_BUDGET),
+            Message::Queued => {
+                if !reported_queue {
+                    eprintln!(
+                        "{}",
+                        json!({"kind":"canonical-remote-queued", "coordinator":coordinator,
+                            "cargo_location":"coordinator", "automatic_retry":false})
+                    );
+                    reported_queue = true;
+                }
+                controlled_future(stopped, admission_deadline, async {
+                    asupersync::time::sleep(runtime_transport_now(), ADMISSION_POLL).await;
+                    Ok(())
+                })
+                .await?;
+                wire.send(&Message::Poll, stopped, admission_deadline)
+                    .await?;
+            }
+            _ => {
+                return Err(invalid(
+                    "coordinator did not grant or queue input admission",
+                ));
+            }
+        }
+    }
 }
 
 async fn flush_window<S: AsyncRead + AsyncWrite + Unpin>(
@@ -590,6 +626,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::super::wire;
     use super::*;
+    use asupersync::io::ReadBuf;
     use asupersync::net::{TcpListener, TcpStream};
     use rabs_asupersync::worker_transport::{JsonAtpStream, runtime_transport_now};
     use rabs_sandbox::snapshot_capture::capture_sealed_source;
@@ -599,7 +636,9 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::future::Future;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
+    use std::sync::{Mutex, mpsc};
+    use std::task::{Context, Poll};
 
     fn private() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -615,6 +654,277 @@ mod tests {
                 .await
                 .expect("native canonical input transfer exceeded its deadline")
         })
+    }
+
+    /// Exercise the real wire and client state machine without opening a socket.
+    /// This is a fragmented byte peer, not TLS or remote compiler qualification.
+    struct AdmissionStream {
+        input: Vec<u8>,
+        offset: usize,
+        repeat: bool,
+        output: Arc<Mutex<Vec<u8>>>,
+        ready_offset: Option<usize>,
+        ready_seen: Arc<Mutex<Option<Instant>>>,
+        first_read: Option<mpsc::Sender<()>>,
+    }
+
+    impl AdmissionStream {
+        fn new(messages: &[Message], repeat: bool) -> Self {
+            let mut input = Vec::new();
+            let mut ready_offset = None;
+            for message in messages {
+                if matches!(message, Message::Ready) && ready_offset.is_none() {
+                    ready_offset = Some(input.len());
+                }
+                input.extend(serde_json::to_vec(message).unwrap());
+                input.push(b'\n');
+            }
+            Self {
+                input,
+                offset: 0,
+                repeat,
+                output: Arc::new(Mutex::new(Vec::new())),
+                ready_offset,
+                ready_seen: Arc::new(Mutex::new(None)),
+                first_read: None,
+            }
+        }
+    }
+
+    impl AsyncRead for AdmissionStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let stream = self.get_mut();
+            if let Some(observed) = stream.first_read.take() {
+                observed.send(()).unwrap();
+            }
+            if stream.repeat && stream.offset == stream.input.len() {
+                stream.offset = 0;
+            }
+            let count = output
+                .remaining()
+                .min(3)
+                .min(stream.input.len() - stream.offset);
+            if stream
+                .ready_offset
+                .is_some_and(|offset| stream.offset <= offset && offset < stream.offset + count)
+            {
+                *stream.ready_seen.lock().unwrap() = Some(Instant::now());
+            }
+            output.put_slice(&stream.input[stream.offset..stream.offset + count]);
+            stream.offset += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for AdmissionStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let count = bytes.len().min(3);
+            self.output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn admission_messages(output: &Mutex<Vec<u8>>) -> Vec<Value> {
+        output
+            .lock()
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|record| !record.is_empty())
+            .map(|record| serde_json::from_slice(record).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn admission_wait_polls_only_queued_peer_and_gives_upload_its_full_budget() {
+        native(async {
+            let stream = AdmissionStream::new(
+                &[
+                    Message::Queued,
+                    Message::Queued,
+                    Message::Ready,
+                    Message::Accepted,
+                ],
+                false,
+            );
+            let output = Arc::clone(&stream.output);
+            let ready_seen = Arc::clone(&stream.ready_seen);
+            let mut wire = Wire::new(stream);
+            let stopped = AtomicBool::new(false);
+            let started = Instant::now();
+            let admission_deadline = started + Duration::from_secs(5);
+            let input_deadline =
+                await_input_admission(&mut wire, &stopped, "fixture", admission_deadline)
+                    .await
+                    .unwrap();
+            // Waiting does not subtract from or reset the upload phase's budget.
+            assert!(input_deadline >= ready_seen.lock().unwrap().unwrap() + TOOLCHAIN_INPUT_BUDGET);
+            assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
+            assert!(input_deadline > admission_deadline);
+            assert_eq!(
+                admission_messages(&output),
+                [json!({"kind":"poll"}), json!({"kind":"poll"})]
+            );
+            // Ready ends admission exactly; a buffered next-phase response is
+            // not mistaken for another queue reply or consumed by the wait.
+            assert!(matches!(
+                wire.receive_until(&stopped, input_deadline).await.unwrap(),
+                Message::Accepted
+            ));
+        });
+    }
+
+    #[test]
+    fn admission_ready_does_not_poll_and_only_then_allows_input_bytes() {
+        native(async {
+            let stream = AdmissionStream::new(&[Message::Ready], false);
+            let output = Arc::clone(&stream.output);
+            let mut wire = Wire::new(stream);
+            let stopped = AtomicBool::new(false);
+            let started = Instant::now();
+            let input_deadline =
+                await_input_admission(&mut wire, &stopped, "fixture", started + ADMISSION_BUDGET)
+                    .await
+                    .unwrap();
+            assert!(input_deadline >= started + TOOLCHAIN_INPUT_BUDGET);
+            assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
+            assert!(output.lock().unwrap().is_empty());
+            wire.send(
+                &Message::SourceChunk {
+                    chunk: Chunk::new("Cargo.toml", 0, b"approved input").unwrap(),
+                },
+                &stopped,
+                input_deadline,
+            )
+            .await
+            .unwrap();
+            let messages = admission_messages(&output);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["kind"], "source-chunk");
+        });
+    }
+
+    #[test]
+    fn admission_queue_replies_cannot_renew_the_absolute_deadline() {
+        native(async {
+            let stream = AdmissionStream::new(&[Message::Queued], true);
+            let output = Arc::clone(&stream.output);
+            let mut wire = Wire::new(stream);
+            let stopped = AtomicBool::new(false);
+            let deadline = Instant::now() + ADMISSION_POLL + ADMISSION_POLL / 2;
+            assert_eq!(
+                await_input_admission(&mut wire, &stopped, "fixture", deadline)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            let messages = admission_messages(&output);
+            assert!(messages.len() <= 1);
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message == &json!({"kind":"poll"}))
+            );
+        });
+    }
+
+    #[test]
+    fn admission_idle_poll_wait_observes_local_cancellation() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&stopped);
+        let (observed, waiting) = mpsc::channel();
+        let setter = std::thread::spawn(move || {
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            cancel.store(true, Ordering::Release);
+        });
+        let mut stream = AdmissionStream::new(&[Message::Queued], true);
+        stream.first_read = Some(observed);
+        let output = Arc::clone(&stream.output);
+        let mut wire = Wire::new(stream);
+        let result = native(await_input_admission(
+            &mut wire,
+            &stopped,
+            "fixture",
+            Instant::now() + Duration::from_secs(5),
+        ));
+        setter.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(
+            admission_messages(&output)
+                .iter()
+                .all(|message| message == &json!({"kind":"poll"}))
+        );
+    }
+
+    #[test]
+    fn admission_refusal_disconnect_and_wrong_phase_never_become_ready_or_retry() {
+        native(async {
+            for (reply, kind) in [
+                (
+                    Some(Message::Failure {
+                        message: "queue capacity exhausted".into(),
+                    }),
+                    io::ErrorKind::InvalidData,
+                ),
+                (Some(Message::Cancel), io::ErrorKind::Interrupted),
+                (Some(Message::Accepted), io::ErrorKind::InvalidData),
+                (
+                    Some(Message::Window { count: 1 }),
+                    io::ErrorKind::InvalidData,
+                ),
+                (None, io::ErrorKind::UnexpectedEof),
+            ] {
+                let mut replies = vec![Message::Queued];
+                replies.extend(reply);
+                let stream = AdmissionStream::new(&replies, false);
+                let output = Arc::clone(&stream.output);
+                let mut wire = Wire::new(stream);
+                let error = await_input_admission(
+                    &mut wire,
+                    &AtomicBool::new(false),
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+                assert_eq!(admission_messages(&output), [json!({"kind":"poll"})]);
+            }
+            let stream = AdmissionStream::new(&[Message::Accepted], false);
+            let output = Arc::clone(&stream.output);
+            let mut wire = Wire::new(stream);
+            assert!(
+                await_input_admission(
+                    &mut wire,
+                    &AtomicBool::new(false),
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .is_err()
+            );
+            assert!(output.lock().unwrap().is_empty());
+        });
     }
 
     struct InputFixture {

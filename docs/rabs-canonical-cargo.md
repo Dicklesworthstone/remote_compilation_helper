@@ -2411,6 +2411,8 @@ Save the complete service profile as `remote-service.json`:
     "REPLACE_WITH_EDGE_A_64_LOWERCASE_HEX_DIGITS"
   ],
   "max_roots": 4,
+  "max_queued_roots": 16,
+  "queue_timeout_seconds": 300,
   "jobs_per_root": 2
 }
 ```
@@ -2419,9 +2421,28 @@ Save the complete service profile as `remote-service.json`:
 roots must have ordinary absolute paths and no symlink ancestry. The wrapper
 must be an ordinary executable outside those mutable roots. `allowed_edge_pins`
 accepts 1–256 distinct nonzero client-key pins. `max_roots` accepts 1–32 and
-`jobs_per_root` accepts 1–4096, with at most 4096 aggregate jobs. A session slot
-covers authentication, input transfer, execution and final delivery, bounding
-the number of simultaneous operations even while inputs are uploading.
+`jobs_per_root` accepts 1–4096, with at most 4096 aggregate jobs. Each admitted
+operation holds its root slot across input transfer, execution and final
+delivery, bounding simultaneous work even while inputs are uploading.
+
+`max_queued_roots` accepts 0–128 and defaults to 0. Set it above zero to let
+authenticated clients wait in FIFO order when the active roots are occupied.
+The example admits four operations and allows sixteen additional sessions.
+Total connections, including TLS handshakes, are bounded by the sum of those
+limits. At the coordinator, a queued request retains only its connection and
+bounded declaration. It receives no input tree or compiler tokens and cannot
+start uploading or execute Cargo until an operation slot becomes available.
+The client keeps its already captured inputs while waiting.
+
+`queue_timeout_seconds` accepts 1–1800 and defaults to 300. The queue deadline
+is fixed when a validated request enters admission; progress polls do not renew
+it. Client cancellation, disconnection, timeout or service shutdown removes that
+request from the queue so later callers can advance. The Cargo frontend waits
+on this same authenticated connection and starts uploading only after admission.
+It does not resubmit the operation. Once admitted, input transfer receives its
+own complete transfer budget. If all connection slots are occupied, the service
+still closes excess connections before authentication, without a plaintext
+response.
 
 Set the coordinator's dependency-worker environment before starting the service.
 For example, a single worker uses its own listener, separate from the remote

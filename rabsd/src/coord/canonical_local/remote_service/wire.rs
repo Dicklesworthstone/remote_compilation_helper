@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
 pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
+pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
+pub(super) const ADMISSION_POLL: Duration = Duration::from_millis(100);
 const CANCELLATION_POLL: Duration = Duration::from_millis(100);
 const READS_BEFORE_YIELD: usize = 32;
 
@@ -284,6 +286,7 @@ pub(super) enum Message {
         toolchain_identity: Toolchain,
         cargo_home: Option<CargoHome>,
     },
+    Queued,
     Ready,
     SourceChunk {
         chunk: Chunk,
@@ -439,7 +442,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
 /// Poll one retained I/O future while an independent timer observes atomic
 /// cancellation. Ticks neither recreate partial reads/writes nor renew the
 /// supplied deadline. A quiet peer therefore cannot delay local cancellation.
-async fn controlled_future<T>(
+pub(super) async fn controlled_future<T>(
     stopped: &AtomicBool,
     deadline: Instant,
     future: impl Future<Output = io::Result<T>>,
@@ -693,12 +696,17 @@ mod tests {
 
     #[test]
     fn fragmented_and_coalesced_records_keep_the_exact_next_phase() {
-        let mut bytes = record(&Message::Ready);
+        let mut bytes = record(&Message::Queued);
+        bytes.extend(record(&Message::Ready));
         bytes.extend(record(&Message::Window { count: 4 }));
         bytes.extend(record(&Message::Complete { exit_code: 0 }));
         for quantum in [1, 3, 16 * 1024] {
             let mut stream = MemoryStream::new(bytes.clone(), quantum);
             let mut buffered = Vec::new();
+            assert!(matches!(
+                ready(read_record(&mut stream, &mut buffered)).unwrap(),
+                Message::Queued
+            ));
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
                 Message::Ready
@@ -954,6 +962,8 @@ mod tests {
     fn wire_refuses_duplicate_unknown_and_host_control_fields() {
         for bytes in [
             br#"{"kind":"poll","extra":1}"#.as_slice(),
+            br#"{"kind":"queued","position":1}"#,
+            br#"{"kind":"queued","kind":"ready"}"#,
             br#"{"kind":"window","count":1,"count":2}"#,
             br#"{"kind":"source-chunk","chunk":{"path":"x","offset":0,"sha256":"","bytes":"","source_root":"/"}}"#,
         ] {
