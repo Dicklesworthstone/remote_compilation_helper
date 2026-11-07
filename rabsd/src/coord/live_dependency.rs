@@ -886,10 +886,14 @@ fn put_bundle_root(
         .map_err(|error| error.to_string())?;
     let path = final_path.to_str().ok_or("non-UTF-8 CAS root")?;
     store
-        .record_object(&root.0, bytes.len() as u64)
-        .map_err(|error| format!("{error:?}"))?;
-    store
-        .add_location(&root.0, path, None, BUNDLE_ROOT_ENCODING, true)
+        .record_object_location(
+            &root.0,
+            bytes.len() as u64,
+            path,
+            None,
+            BUNDLE_ROOT_ENCODING,
+            true,
+        )
         .map_err(|error| format!("{error:?}"))
 }
 
