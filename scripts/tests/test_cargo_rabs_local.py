@@ -1266,5 +1266,489 @@ class CanonicalLocalCargo(unittest.TestCase):
         self.assertEqual(list(self.operations.iterdir()), [])
 
 
+REMOTE_DRIVER = r'''
+# Executable handoff double only. No TLS, Cargo, artifact verification, remote
+# service admission or compiler-cache behavior is simulated or claimed here.
+import json, os, pathlib, signal, stat, sys
+assert len(sys.argv) == 3 and sys.argv[1] == "--canonical-compile-remote", sys.argv
+path = pathlib.Path(sys.argv[2])
+profile = json.loads(path.read_bytes())
+assert profile["version"] == "canonical-compile-remote-v1"
+assert "toolchain_root" in profile and "toolchain" not in profile
+assert "output_root" not in profile
+capture = pathlib.Path(profile["staging_root"])
+destination = pathlib.Path(profile["output_destination"])
+record = {"pid": os.getpid(), "argv": sys.argv, "profile": profile,
+          "retained": str(path), "file_mode": stat.S_IMODE(path.stat().st_mode),
+          "directory_mode": stat.S_IMODE(path.parent.stat().st_mode),
+          "capture_exists": capture.is_dir(),
+          "capture_mode": stat.S_IMODE(capture.stat().st_mode) if capture.is_dir() else None,
+          "output_exists": os.path.lexists(destination),
+          "cwd": os.getcwd(), "environment": dict(os.environ),
+          "input": sys.stdin.buffer.read().hex()}
+if os.environ.get("TEST_INHERITED_FD"):
+    record["inherited"] = os.read(int(os.environ["TEST_INHERITED_FD"]), 1024).hex()
+with open(os.environ["TEST_DRIVER_RECORD"], "a") as output:
+    output.write(json.dumps(record) + "\n")
+if os.environ.get("TEST_MATERIALIZE_OUTPUT"):
+    # Emulate only the client's filesystem state at a failed final ack. The
+    # sentinel is not a claim that this double verified a remote result.
+    destination.mkdir(mode=0o700)
+    (destination / "native-result").write_bytes(b"retained native output\x00\xff")
+sys.stdout.buffer.write(b"fixture remote stdout\x00\xff\n")
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"fixture remote stderr\x00\xfe\n")
+sys.stderr.buffer.flush()
+if os.environ.get("TEST_SIGNAL"):
+    os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(int(os.environ.get("TEST_EXIT", "0")))
+'''
+
+
+class CanonicalRemoteCargo(unittest.TestCase):
+    """Real launcher/exec/filesystem checks at the native remote-client boundary."""
+
+    save = CanonicalLocalCargo.save
+    select_rustup = CanonicalLocalCargo.select_rustup
+    records = CanonicalLocalCargo.records
+    assert_refused = CanonicalLocalCargo.assert_refused
+
+    def setUp(self):
+        # Reuse fixture helpers, not the local-only test methods or assertions.
+        CanonicalLocalCargo.setUp(self)
+        self.output_root = self.operations
+        self.staging = self.state
+        self.operations = self.staging
+        credentials = self.root / "credentials"
+        credentials.mkdir(mode=0o700)
+        self.tls = {}
+        for field in ("ca", "certificate", "private_key"):
+            path = credentials / (field + ".pem")
+            path.write_text("fixture-local-" + field + "-bytes\n")
+            path.chmod(0o600)
+            self.tls[field] = str(path)
+        self.profile = {
+            "version": "canonical-compile-remote-v1",
+            "coordinator": "192.0.2.10:45300",
+            "server_name": "rabs-coordinator.internal",
+            "coordinator_pin": "ab" * 32,
+            "tls": dict(self.tls),
+            "source_root": str(self.source),
+            "toolchain_root": str(self.tools),
+            "staging_root": str(self.staging),
+            "output_root": str(self.output_root),
+            "settings": {"manifest": "member/Cargo.toml", "jobs": 3, "timeout_seconds": 600},
+        }
+        self.driver.write_text("#!" + sys.executable + " -S\n" + REMOTE_DRIVER)
+        self.save()
+
+    def invoke(self, args=None, env=None, prefix=None, input=b"", pass_fds=()):
+        if prefix is None:
+            prefix = ["rabs", "--rabs-canonical-remote", str(self.profile_path), "--"]
+        return CanonicalLocalCargo.invoke(self, args, env, prefix, input, pass_fds)
+
+    def test_remote_exec_preserves_identity_selected_profile_and_native_process(self):
+        self.profile["settings"].update(
+            command="build", selection={"lib": True},
+            source_selection="cargo-unit-graph-v1",
+            env={"APP_VERSION": "literal '雪'\nvalue", "EMPTY": ""},
+        )
+        self.save()
+        original = self.profile_path.read_bytes()
+        env = dict(self.env, TEST_EXIT="37", RABS_RELEASE_AUTHORIZATION="required",
+                   RABS_COORD_TLS_KEY="/local/never-captured-key", AMBIENT_SECRET="private-input")
+        code, stdout, stderr, pid = self.invoke(
+            ["check", "--workspace", "--features=app/fast"], env, input=b"\x00\xffstdin")
+        self.assertEqual(code, 37, stderr)
+        self.assertEqual(stdout, b"fixture remote stdout\x00\xff\n")
+        self.assertIn(b"fixture remote stderr\x00\xfe\n", stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["cwd"], str(self.root))
+        self.assertEqual(record["input"], "00ff737464696e")
+        self.assertEqual(record["environment"], dict(env, CARGO_RABS_CANONICAL_ACTIVE="1"))
+        self.assertEqual(record["argv"],
+                         [str(self.driver), "--canonical-compile-remote", record["retained"]])
+        expected = dict(self.profile)
+        expected.pop("output_root")
+        expected["staging_root"] = record["profile"]["staging_root"]
+        expected["output_destination"] = record["profile"]["output_destination"]
+        expected["settings"] = dict(self.profile["settings"], command="check",
+                                    selection={"workspace": True, "features": ["app/fast"]})
+        self.assertEqual(record["profile"], expected)
+        self.assertEqual(record["profile"]["tls"], self.tls)
+        retained = Path(record["retained"])
+        self.assertEqual(json.loads(retained.read_bytes()), expected)
+        self.assertEqual(self.profile_path.read_bytes(), original)
+        for private_value in ("private-input", "/local/never-captured-key",
+                              "fixture-local-private_key-bytes"):
+            self.assertNotIn(private_value, retained.read_text())
+
+    def test_remote_default_check_replaces_saved_selection_with_cargo_defaults(self):
+        self.profile["settings"].update(command="build", selection={"release": True, "lib": True})
+        self.save()
+        code, _, stderr, _ = self.invoke()
+        self.assertEqual(code, 0, stderr)
+        settings = self.records()[0]["profile"]["settings"]
+        self.assertEqual(settings["command"], "check")
+        self.assertEqual(settings["selection"], {})
+        self.assertEqual(settings["manifest"], "member/Cargo.toml")
+        self.assertEqual(settings["jobs"], 3)
+        self.assertEqual(settings["timeout_seconds"], 600)
+
+    def test_remote_cargo_selection_keeps_targets_features_and_ordered_tails(self):
+        cases = (
+            (["check", "--workspace", "--exclude", "unused", "--all-targets",
+              "-Ffast,feature'雪", "--no-default-features"],
+             {"workspace": True, "exclude": ["unused"], "all_targets": True,
+              "features": ["fast,feature'雪"], "no_default_features": True}),
+            (["build", "-papp", "--bin=server", "--example", "demo", "--release",
+              "--target", "aarch64-unknown-linux-gnu"],
+             {"packages": ["app"], "bin": ["server"], "example": ["demo"], "release": True,
+              "target": ["aarch64-unknown-linux-gnu"]}),
+            (["test", "-p", "app", "selected::test", "--", "--exact", "--nocapture", ""],
+             {"packages": ["app"], "test_filter": "selected::test",
+              "test_args": ["--exact", "--nocapture", ""]}),
+            (["test", "--workspace", "--no-run", "--no-fail-fast"],
+             {"workspace": True, "no_run": True, "no_fail_fast": True}),
+            (["clippy", "--all-targets", "--no-deps", "--", "-D", "warnings",
+              "-Aclippy::needless_return", "--cap-lints", "warn"],
+             {"all_targets": True, "no_deps": True,
+              "lint_args": ["-D", "warnings", "-Aclippy::needless_return", "--cap-lints", "warn"]}),
+            (["doc", "--lib", "--no-deps", "--document-private-items"],
+             {"lib": True, "no_deps": True, "document_private_items": True}),
+            (["bench", "--bench=measured", "--no-run", "--profile", "ci"],
+             {"bench": ["measured"], "no_run": True, "profile": "ci"}),
+        )
+        for args, selection in cases:
+            with self.subTest(args=args):
+                code, _, stderr, _ = self.invoke(args)
+                self.assertEqual(code, 0, stderr)
+                profile = self.records()[-1]["profile"]
+                self.assertEqual(profile["settings"]["command"], args[0])
+                self.assertEqual(profile["settings"]["selection"], selection)
+                self.assertEqual(profile["toolchain_root"], str(self.tools))
+        self.assertEqual(len(self.records()), len(cases))
+
+    def test_remote_capture_and_output_intent_are_private_fresh_and_not_overwritten(self):
+        original_profile = self.profile_path.read_bytes()
+        (self.source / "input.txt").write_bytes(b"approved input\x00\xff")
+        for command in ("build", "doc"):
+            code, _, stderr, _ = self.invoke([command])
+            self.assertEqual(code, 0, stderr)
+        records = self.records()
+        self.assertEqual(len(records), 2)
+        operations = []
+        destinations = []
+        for record in records:
+            retained = Path(record["retained"])
+            operation = retained.parent
+            capture = Path(record["profile"]["staging_root"])
+            destination = Path(record["profile"]["output_destination"])
+            self.assertEqual(operation.parent, self.staging)
+            self.assertEqual(capture, operation / "capture")
+            self.assertEqual(destination.parent, self.output_root)
+            self.assertEqual(record["directory_mode"], 0o700)
+            self.assertEqual(record["file_mode"], 0o600)
+            self.assertEqual(record["capture_mode"], 0o700)
+            self.assertTrue(record["capture_exists"])
+            self.assertFalse(record["output_exists"])
+            self.assertFalse(destination.exists())
+            self.assertEqual(json.loads(retained.read_bytes()), record["profile"])
+            operations.append(operation)
+            destinations.append(destination)
+        self.assertEqual(len(set(operations)), 2)
+        self.assertEqual(len(set(destinations)), 2)
+        self.assertEqual(self.profile_path.read_bytes(), original_profile)
+        self.assertEqual((self.source / "input.txt").read_bytes(), b"approved input\x00\xff")
+
+    def test_remote_explicit_destination_is_literal_and_cannot_be_reused_after_publication(self):
+        destination = self.output_root / "one-off result 雪"
+        self.profile.pop("output_root")
+        self.profile["output_destination"] = str(destination)
+        self.save()
+        code, _, stderr, _ = self.invoke(["build"], env=dict(self.env, TEST_MATERIALIZE_OUTPUT="1"))
+        self.assertEqual(code, 0, stderr)
+        record, = self.records()
+        self.assertEqual(record["profile"]["output_destination"], str(destination))
+        self.assertFalse(record["output_exists"])
+        before = (destination / "native-result").read_bytes()
+        self.assert_refused(["build"])
+        self.assertEqual((destination / "native-result").read_bytes(), before)
+
+    def test_remote_failure_after_output_install_retains_result_and_does_not_retry(self):
+        env = dict(self.env, TEST_MATERIALIZE_OUTPUT="1", TEST_EXIT="125")
+        code, stdout, stderr, _ = self.invoke(["build"], env=env)
+        self.assertEqual(code, 125, stderr)
+        self.assertEqual(stdout, b"fixture remote stdout\x00\xff\n")
+        first, = self.records()
+        destination = Path(first["profile"]["output_destination"])
+        retained_bytes = (destination / "native-result").read_bytes()
+        self.assertEqual(retained_bytes, b"retained native output\x00\xff")
+        code, _, stderr, _ = self.invoke(["build"])
+        self.assertEqual(code, 0, stderr)
+        second = self.records()[-1]
+        self.assertNotEqual(second["profile"]["output_destination"], str(destination))
+        self.assertEqual((destination / "native-result").read_bytes(), retained_bytes)
+        self.assertEqual(len(self.records()), 2)
+
+    def test_remote_native_status_signal_and_exec_failure_have_no_fallback(self):
+        for result in (0, 1, 2, 37, 101, 125, 255):
+            with self.subTest(result=result):
+                code, _, stderr, _ = self.invoke(env=dict(self.env, TEST_EXIT=str(result)))
+                self.assertEqual(code, result, stderr)
+        self.assertEqual(len(self.records()), 7)
+        code, _, _, _ = self.invoke(env=dict(self.env, TEST_SIGNAL="1"))
+        self.assertEqual(code, -signal.SIGTERM)
+        self.assertEqual(len(self.records()), 8)
+        operations = len(list(self.staging.iterdir()))
+        self.driver.write_bytes(b"not an executable image\n")
+        code, stdout, _, _ = self.invoke()
+        self.assertEqual(code, 127)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(len(self.records()), 8)
+        self.assertEqual(len(list(self.staging.iterdir())), operations + 1)
+
+    def test_remote_rustup_selection_is_once_in_the_original_context(self):
+        self.select_rustup()
+        self.env["RUSTUP_TOOLCHAIN"] = "ambient-choice"
+        self.env["TEST_RUSTUP_SELECTIONS"] = json.dumps(
+            {"nightly-explicit": str(self.tools / "bin/rustc")})
+        original = self.profile_path.read_bytes()
+        code, _, stderr, _ = self.invoke(["+nightly-explicit", "clippy", "--lib"])
+        self.assertEqual(code, 0, stderr)
+        record, = self.records()
+        self.assertEqual(record["profile"]["toolchain_root"], str(self.tools))
+        self.assertNotIn("toolchain", record["profile"])
+        self.assertEqual(record["profile"]["settings"]["command"], "clippy")
+        self.assertEqual(record["profile"]["settings"]["selection"], {"lib": True})
+        discovery, = [json.loads(line) for line in self.rustup_record.read_text().splitlines()]
+        self.assertEqual(discovery["argv"], ["which", "--toolchain", "nightly-explicit", "rustc"])
+        self.assertEqual(discovery["cwd"], str(self.root))
+        self.assertEqual(discovery["selected"], "ambient-choice")
+        self.assertEqual(discovery["auto_install"], "0")
+        self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_remote_explicit_toolchain_never_discovers_or_executes_another_tool(self):
+        env = dict(self.env, CARGO_RABS_RUSTUP=str(self.tools / "bin/rch"),
+                   RUSTUP_TOOLCHAIN="ambient-is-not-authority")
+        code, _, stderr, _ = self.invoke(["build"], env=env)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.records()[0]["profile"]["toolchain_root"], str(self.tools))
+
+    def test_remote_input_environment_and_dependency_roots_remain_explicit(self):
+        cargo_home = self.root / "approved cargo-home"
+        cargo_home.mkdir(mode=0o700)
+        self.profile["cargo_home_source"] = str(cargo_home)
+        self.profile["settings"].update(source_selection="cargo-unit-graph-v1",
+                                         env={"BUILD_LABEL": "quoted '雪'", "EMPTY": ""})
+        self.save()
+        code, _, stderr, _ = self.invoke(["build"], env=dict(self.env, SECRET="not-an-input"))
+        self.assertEqual(code, 0, stderr)
+        profile = self.records()[0]["profile"]
+        self.assertEqual(profile["cargo_home_source"], str(cargo_home))
+        self.assertEqual(profile["settings"]["source_selection"], "cargo-unit-graph-v1")
+        self.assertEqual(profile["settings"]["env"], {"BUILD_LABEL": "quoted '雪'", "EMPTY": ""})
+        self.assertNotIn("SECRET", json.dumps(profile))
+        self.profile.pop("cargo_home_source")
+        self.profile["settings"].pop("source_selection")
+        self.profile["settings"]["vendor"] = "third_party/vendor"
+        self.save()
+        code, _, stderr, _ = self.invoke(["check"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.records()[-1]["profile"]["settings"]["vendor"], "third_party/vendor")
+
+    def test_remote_unsupported_commands_and_authority_overrides_refuse_before_spawn(self):
+        cases = (
+            ["run"], ["run", "--bin=server", "--", "literal"],
+            ["bench"], ["bench", "filter"], ["bench", "--", "--no-run"],
+            ["rustc"], ["clean"], ["fetch"], ["build", "--manifest-path", "other/Cargo.toml"],
+            ["check", "--target-dir", "/tmp/foreign"], ["check", "--config", "build.rustc=other"],
+            ["check", "--message-format=json"], ["build", "-j", "8"], ["doc", "--open"],
+            ["clippy", "--fix"], ["clippy", "--", "--emit=link"],
+            ["build", "--profile=ci", "--release"], ["check", "--exclude=other"],
+            ["check", "--target=target.json"], ["build", "--package"], ["check", "--", "tail"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_refused(args)
+
+    def test_remote_saved_settings_are_validated_before_cli_replacement(self):
+        for settings in (
+            {"command": "run"}, {"command": "bench"}, {"selection": {"workspace": "true"}},
+            {"selection": {"unknown": []}}, {"selection": {"features": ["-Zbad"]}},
+            {"selection": {"test_args": ["--exact"]}}, {"jobs": True}, {"jobs": 0},
+            {"timeout_seconds": 7201}, {"manifest": "../Cargo.toml"},
+            {"source_selection": "unknown"}, {"vendor": "vendor", "source_selection": "cargo-unit-graph-v1"},
+            {"env": {"RUSTC": "/foreign/compiler"}}, {"env": {"RABS_CONFIG": "/foreign/policy"}},
+            {"env": {"CARGO_INCREMENTAL": "1"}}, {"wrapper": "/foreign/wrapper"},
+        ):
+            with self.subTest(settings=settings):
+                self.profile_path.write_text(json.dumps(dict(self.profile, settings=settings)))
+                self.assert_refused(["check"])
+
+    def test_remote_schema_identity_and_tls_refusals_precede_rustup_discovery(self):
+        self.select_rustup()
+        good = json.loads(self.profile_path.read_bytes())
+        cases = [
+            dict(good, version="canonical-compile-local-v1"),
+            dict(good, unknown=True), dict(good, coordinator="127.0.0.1:0"),
+            dict(good, coordinator_pin="00" * 32), dict(good, coordinator_pin="AB" * 32),
+            dict(good, coordinator_pin="ab" * 31), dict(good, coordinator_pin=True),
+            dict(good, server_name=""), dict(good, tls={}),
+            dict(good, tls=dict(self.tls, unknown="/local/file")),
+            dict(good, tls=dict(self.tls, private_key=str(self.root / "missing-key"))),
+            dict(good, settings={"jobs": 0}), dict(good, settings={"env": {"RUSTC": "foreign"}}),
+        ]
+        for profile in cases:
+            with self.subTest(profile=profile):
+                self.profile_path.write_text(json.dumps(profile))
+                self.assert_refused()
+                self.assertFalse(self.rustup_record.exists())
+        valid = json.dumps(good)
+        for data in ("[]", "null", "{", valid.replace("{", '{"version":"duplicate",', 1),
+                     valid.replace('"settings": {', '"settings": {"jobs":1,', 1), " " * 65537):
+            with self.subTest(data=data[:80]):
+                self.profile_path.write_text(data)
+                self.assert_refused()
+                self.assertFalse(self.rustup_record.exists())
+
+    def test_remote_output_storage_and_secret_boundaries_refuse_without_mutation(self):
+        good = json.loads(self.profile_path.read_bytes())
+        key_in_source = self.source / "private-key.pem"
+        key_in_source.write_text("do not upload")
+        key_in_source.chmod(0o600)
+        alias = self.root / "source-alias"
+        alias.symlink_to(self.source, target_is_directory=True)
+        missing_output = self.output_root / "dangling"
+        missing_output.symlink_to(self.root / "does-not-exist")
+        cases = [
+            dict(good, output_destination=str(self.output_root / "ambiguous")),
+            {key: value for key, value in good.items() if key != "output_root"},
+            dict(good, staging_root=str(self.source)),
+            dict(good, output_root=str(self.source)),
+            dict(good, output_root=str(self.staging)),
+            dict(good, source_root=str(alias)),
+            dict(good, tls=dict(self.tls, private_key=str(key_in_source))),
+        ]
+        explicit = dict(good)
+        explicit.pop("output_root")
+        explicit["output_destination"] = str(missing_output)
+        cases.append(explicit)
+        for profile in cases:
+            with self.subTest(profile=profile):
+                self.profile_path.write_text(json.dumps(profile))
+                self.assert_refused()
+        self.profile_path.write_text(json.dumps(good))
+        self.output_root.chmod(0o770)
+        self.assert_refused()
+        self.assertEqual(self.output_root.stat().st_mode & 0o777, 0o770)
+        self.assertTrue(missing_output.is_symlink())
+        self.assertEqual(key_in_source.read_text(), "do not upload")
+
+    def test_remote_profile_file_kinds_components_and_modes_refuse_before_handoff(self):
+        original = self.root / "original-profile.json"
+        self.profile_path.rename(original)
+        self.profile_path.symlink_to(original)
+        self.assert_refused()
+        self.profile_path.rename(self.root / "retained-profile-link")
+        os.mkfifo(self.profile_path)
+        self.assert_refused()
+        self.profile_path.rename(self.root / "retained-profile-fifo")
+        original.rename(self.profile_path)
+        for name, command in (("rustdoc", "doc"), ("clippy-driver", "clippy")):
+            tool = self.tools / "bin" / name
+            original_mode = tool.stat().st_mode & 0o777
+            tool.chmod(0o600)
+            self.assert_refused([command])
+            tool.chmod(original_mode)
+        self.staging.chmod(0o770)
+        self.assert_refused()
+        self.assertEqual(self.staging.stat().st_mode & 0o777, 0o770)
+
+    def test_remote_nested_modes_and_missing_or_recursive_driver_never_fall_back(self):
+        for name in ("CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE"):
+            self.assert_refused(env=dict(self.env, **{name: "1"}))
+        for driver in (str(self.root / "missing-driver"), str(LAUNCHER)):
+            self.assert_refused(env=dict(self.env, CARGO_RABS_DAEMON=driver))
+        for flag in ("--rabs-no-start", "--rabs-require-daemon", "--rabs-remote",
+                     "--rabs-canonical", "--rabs-canonical-local"):
+            self.assert_refused(prefix=[flag, "--rabs-canonical-remote", str(self.profile_path)])
+            self.assert_refused(prefix=["--rabs-canonical-remote", str(self.profile_path), flag])
+        self.assert_refused(prefix=["--rabs-canonical-remote"])
+
+    def test_remote_selection_byte_and_count_limits_refuse_without_retained_intent(self):
+        for args in (
+            ["check", "--features=" + "a" * 1025],
+            ["check"] + ["--features=x"] * 129,
+            ["check"] + ["--features=" + "a" * 1024] * 17,
+            ["build", "--profile=../named"],
+            ["test", "--", "bad\ncontrol"],
+        ):
+            with self.subTest(args=args[:3]):
+                self.assert_refused(args)
+
+    def test_remote_help_is_available_without_loading_profile_or_launching_native_client(self):
+        code, stdout, _, _ = self.invoke(prefix=["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn(b"--rabs-canonical-remote", stdout)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+    def test_remote_endpoint_names_ipv6_and_tls_identity_remain_literal(self):
+        for coordinator, server_name in (
+            ("coordinator.example:45300", "coordinator.example"),
+            ("[2001:db8::10]:45300", "2001:db8::10"),
+            ("192.0.2.10:45300", "rabs-coordinator.internal"),
+        ):
+            with self.subTest(coordinator=coordinator):
+                self.profile.update(coordinator=coordinator, server_name=server_name)
+                self.save()
+                code, _, stderr, _ = self.invoke(["check"])
+                self.assertEqual(code, 0, stderr)
+                profile = self.records()[-1]["profile"]
+                self.assertEqual(profile["coordinator"], coordinator)
+                self.assertEqual(profile["server_name"], server_name)
+                self.assertEqual(profile["coordinator_pin"], "ab" * 32)
+                self.assertEqual(profile["tls"], self.tls)
+
+    def test_remote_emitted_json_size_is_bounded_before_creating_an_operation(self):
+        # The input fits the reader, but literal Unicode expands when the private
+        # native request is encoded. Check the final native wire/file boundary.
+        self.profile["settings"]["env"] = {"MANY": "雪" * 11000}
+        self.profile_path.write_text(json.dumps(self.profile, ensure_ascii=False), encoding="utf-8")
+        self.assertLess(len(self.profile_path.read_bytes()), 64 * 1024)
+        self.assert_refused(["check"])
+
+    def test_remote_root_admission_and_unsupported_platform_refuse_before_handoff(self):
+        for name in ("CARGO_RABS_ROOT_BUDGET_DIR", "CARGO_RABS_ROOT_CAPACITY",
+                     "CARGO_RABS_ROOT_CGROUP"):
+            with self.subTest(name=name):
+                self.assert_refused(env=dict(self.env, **{name: ""}))
+        with patch.object(launcher.sys, "platform", "darwin"):
+            with self.assertRaises(launcher.SetupError):
+                launcher.canonical_remote_invocation(str(self.profile_path), ["check"], self.env)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+    def test_remote_inherited_descriptor_reaches_only_the_native_exec_boundary(self):
+        # This checks local exec custody only; the remote service has closed
+        # stdin and this fixture makes no claim that a descriptor crosses TLS.
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"inherited\x00\xff")
+            os.close(write_fd)
+            write_fd = None
+            env = dict(self.env, TEST_INHERITED_FD=str(read_fd))
+            code, _, stderr, pid = self.invoke(["build"], env=env, pass_fds=(read_fd,))
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+        self.assertEqual(code, 0, stderr)
+        record, = self.records()
+        self.assertEqual(record["pid"], pid)
+        self.assertEqual(record["inherited"], "696e6865726974656400ff")
+
 if __name__ == "__main__":
     unittest.main()

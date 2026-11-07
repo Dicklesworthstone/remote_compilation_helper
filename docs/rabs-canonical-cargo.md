@@ -43,12 +43,13 @@ connects captured Cargo checks and builds to the external-dependency cache, with
 isolated worker execution for eligible Rust archives. Its commands and narrower
 graph requirements are described below.
 
-For clients on separate hosts, the native
-[`--canonical-compile-remote` frontend](#submit-from-separate-hosts-to-the-shared-coordinator)
+For clients on separate hosts,
+[`cargo rabs --rabs-canonical-remote`](#submit-from-separate-hosts-to-the-shared-coordinator)
 uploads captured inputs to one pinned, mutually authenticated coordinator. Cargo
 runs at that coordinator, and eligible dependency compilations from independent
 clients share its existing worker pool and action ownership. Each client receives
-its own verified output tree.
+its own verified output tree. The native `rabsd --canonical-compile-remote`
+entrypoint remains available for explicit one-off profiles.
 
 ## Profile and prerequisites
 
@@ -65,10 +66,11 @@ Clippy installation.
 For `doc`, the captured dataset also requires ordinary executable `bin/rustdoc`.
 Both `RUSTDOC` and `RUSTC` are bound to that dataset's canonical executables.
 
-For an installed Rustup toolchain, either canonical **launcher** profile can
+For an installed Rustup toolchain, any canonical **launcher** profile can
 replace `"toolchain_root": "/absolute/toolchain"` with `"toolchain": "rustup"`.
-Specify exactly one of these fields. `cargo rabs --rabs-canonical ...` and
-`cargo rabs --rabs-canonical-local ...` resolve `rustup which rustc` once in the
+Specify exactly one of these fields. `cargo rabs --rabs-canonical ...`,
+`cargo rabs --rabs-canonical-local ...` and
+`cargo rabs --rabs-canonical-remote ...` resolve `rustup which rustc` once in the
 caller's original working directory and environment. This honors the selected
 `RUSTUP_TOOLCHAIN`, including `cargo +nightly rabs`, and Rustup's directory
 overrides and toolchain files at the invocation location. It does not select a
@@ -80,6 +82,7 @@ command selects that installed toolchain explicitly:
 ```sh
 cargo rabs --rabs-canonical PROFILE.json -- +nightly-2026-08-31 build --workspace
 cargo rabs --rabs-canonical-local LOCAL.json -- +nightly-2026-08-31 check --workspace
+cargo rabs --rabs-canonical-remote REMOTE.json -- +nightly-2026-08-31 build --workspace
 ```
 
 The launcher passes this selection to `rustup which --toolchain NAME rustc` in
@@ -2515,6 +2518,80 @@ when `source_selection` is enabled. The entire approved source anchor remains
 the capture boundary. Client application environment is supplied only through
 `settings.env`; worker, loader and canonical execution controls remain reserved.
 
+#### Submit through Cargo with a reusable remote profile
+
+The Cargo frontend accepts the native client profile above. For repeated
+invocations, replace `output_destination` with `output_root`, an owned private
+parent for fresh results. The launcher also accepts `"toolchain": "rustup"`
+instead of `toolchain_root`, using the caller's selected installed toolchain.
+For example, save this launcher profile as `remote-cargo.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-v1",
+  "coordinator": "192.0.2.10:45300",
+  "server_name": "rabs-coordinator.internal",
+  "coordinator_pin": "REPLACE_WITH_COORDINATOR_64_LOWERCASE_HEX_DIGITS",
+  "tls": {
+    "ca": "/home/dev/credentials/ca.pem",
+    "certificate": "/home/dev/credentials/edge-a.pem",
+    "private_key": "/home/dev/credentials/edge-a.key"
+  },
+  "source_root": "/home/dev/projects/approved-anchor",
+  "toolchain": "rustup",
+  "staging_root": "/home/dev/rabs-remote-staging",
+  "output_root": "/home/dev/rabs-remote-results",
+  "cargo_home_source": "/home/dev/.cargo",
+  "settings": {
+    "manifest": "app/Cargo.toml",
+    "source_selection": "cargo-unit-graph-v1",
+    "jobs": 2,
+    "timeout_seconds": 1800,
+    "env": {
+      "APP_VERSION": "2026.11"
+    }
+  }
+}
+```
+
+Use the same client prerequisites, credentials and private parent directories
+described above. The private key must remain outside the captured source,
+toolchain and optional Cargo-home roots. Invoke the installed Cargo launcher:
+
+```sh
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- check --workspace
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- build -p app --release
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- test -p app -- --test-threads=1
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- bench --no-run
+```
+
+Check, Build, Clippy, Doc, Test and nonexecuting Bench use the canonical Cargo
+selection parser, including package, target, feature and profile choices.
+Clippy requires the captured Clippy tools; Doc and executing doctests require
+the captured rustdoc executable. Run and Bench without `--no-run` refuse before dispatch
+because the remote protocol does not forward stdin.
+
+The command line replaces any saved `settings.command` and
+`settings.selection`; other settings remain in effect. With no Cargo command,
+the launcher selects `check` with an explicit empty selection, so Cargo chooses
+its ordinary default members and targets. It does not inherit application
+environment variables into `settings.env`.
+
+Each invocation retains a mode-0600 native `profile.json` inside a new
+mode-0700 `staging_root/<command>-<token>` directory. Its capture directory is
+private, and its output destination is the absent
+`output_root/<command>-<token>` path. The launcher reports the retained profile
+on stderr and invokes `rabsd --canonical-compile-remote` exactly once, preserving
+the native client's output streams and exit status. It leaves the reusable
+profile unchanged. Launcher-only `output_root` and `toolchain` fields are
+resolved before the native client reads the retained profile.
+
+Alternatively, retain an explicit `output_destination` for a one-off operation;
+it must be absent, and it cannot be combined with `output_root`. The launcher
+does not clear an earlier result. The selected launcher profile remains available
+for inspection after failure or interruption; remote operations are not resumable.
+A failure does not trigger a local fallback or automatic resubmission.
+
 #### Results, ownership and current limits
 
 The client preserves Cargo's numeric exit status and separate stdout/stderr
@@ -2556,8 +2633,9 @@ does not run an independent local Cargo driver against a distributed action
 coordinator. This route extends the existing shared dependency runtime across
 authenticated client hosts; complete M6 fleet scheduling, a measured multi-host
 build storm and its performance targets still require their own qualification.
-The native commands above are the entry points for this profile; the current
-`cargo-rabs` launcher profile formats remain unchanged.
+The Cargo frontend submits through this same native protocol. It does not add
+a detached-job resume mechanism or change the service's admission and artifact
+delivery limits.
 
 ### Persistent reuse and command results
 

@@ -356,6 +356,15 @@ real compiler execution, replay, delivered binaries, and persistent worker/SDK
 reuse over authenticated loopback TLS. Practical acceleration remains under
 qualification; the measured whole-project warm run was slower than ordinary RCH.
 
+A configured shared canonical coordinator is also available through
+`cargo rabs --rabs-canonical-remote PROFILE.json -- build --workspace`.
+This explicit route uploads captured inputs over pinned mutual TLS, runs Cargo
+at the coordinator, shares eligible dependency compilations across clients and
+returns verified build artifacts to a fresh private destination. Reusable
+profiles support Rustup toolchain selection and a separate output root. See
+[remote Cargo profiles and command support](docs/rabs-canonical-cargo.md#submit-through-cargo-with-a-reusable-remote-profile)
+for setup, supported commands and the current qualification limits.
+
 ### Named Cargo JSON for installer consumers
 
 An installer selecting explicit binary targets can request caller-visible
