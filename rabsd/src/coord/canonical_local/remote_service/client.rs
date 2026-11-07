@@ -4,7 +4,7 @@ use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, CargoHome, Chunk, Entry, Manifest, Message, Output,
-    Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
+    SourcePlan, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
     controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
@@ -23,7 +23,7 @@ use rabs_asupersync::worker_transport::{
 };
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceCheckpointError};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceCheckpointError, SourceManifest};
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_INPUT_BUDGET, ToolchainEntryKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -243,14 +243,20 @@ pub fn run_client_profile(
         let mut wire = Wire::new(peer.stream);
         let admission_deadline = Instant::now() + ADMISSION_BUDGET;
         wire.send(&hello, stopped, admission_deadline).await?;
-        let (input_deadline, toolchain_disposition) =
-            await_input_admission(&mut wire, stopped, &config.coordinator, admission_deadline)
-                .await?;
+        let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+            &mut wire,
+            bundle.source.manifest(),
+            stopped,
+            &config.coordinator,
+            admission_deadline,
+        )
+        .await?;
         upload_inputs(
             &mut wire,
             &mut bundle,
             owner.path(),
             toolchain_disposition,
+            &source_plan,
             stopped,
             input_deadline,
         )
@@ -278,15 +284,18 @@ pub fn run_client_profile(
 /// a queued reply nor a poll renews the fixed admission deadline.
 async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
+    source_manifest: &SourceManifest,
     stopped: &AtomicBool,
     coordinator: &str,
     admission_deadline: Instant,
-) -> io::Result<(Instant, ToolchainDisposition)> {
+) -> io::Result<(Instant, ToolchainDisposition, SourcePlan)> {
     let mut reported_queue = false;
     loop {
         match wire.receive_until(stopped, admission_deadline).await? {
-            Message::Ready { toolchain } => {
-                return Ok((Instant::now() + TOOLCHAIN_INPUT_BUDGET, toolchain));
+            Message::Ready { toolchain, source } => {
+                let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
+                source.validate(source_manifest)?;
+                return Ok((input_deadline, toolchain, source));
             }
             Message::Queued {} => {
                 if !reported_queue {
@@ -356,16 +365,20 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     bundle: &mut PreparedLocalBundle,
     scratch: &Path,
     toolchain_disposition: ToolchainDisposition,
+    source_plan: &SourcePlan,
     stopped: &AtomicBool,
     deadline: Instant,
 ) -> io::Result<()> {
+    source_plan.validate(bundle.source.manifest())?;
     let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
     let mut window = Window::default();
     let files = bundle.source.manifest().files().to_vec();
-    for file in files {
+    let mut requested = source_plan.missing_files.iter().copied().peekable();
+    for (index, file) in files.into_iter().enumerate() {
         checkpoint(stopped, deadline)?;
+        // Every captured member is checked, including reused and empty files.
         // The checkpoint API hashes through retained descriptors and refuses
-        // replacement/mutation. Never reopen a captured input by a bare path.
+        // replacement/mutation. A remote hit never replaces local custody.
         let checkpoint_file = tempfile::NamedTempFile::new_in(scratch)?;
         let mut verified = bundle
             .source
@@ -379,6 +392,10 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 | SourceCheckpointError::Destination(error) => error,
             })?
             .into_file();
+        if requested.peek().copied().map(usize::from) != Some(index) {
+            continue;
+        }
+        requested.next();
         verified.seek(SeekFrom::Start(0))?;
         let mut offset = 0;
         // Held across awaits: an inline array would sit in the future, and
@@ -635,13 +652,14 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::super::ToolchainInput;
+    use super::super::source_inputs::SourceInput;
     use super::super::wire;
     use super::*;
     use asupersync::io::ReadBuf;
     use asupersync::net::{TcpListener, TcpStream};
     use rabs_asupersync::worker_transport::{JsonAtpStream, runtime_transport_now};
     use rabs_sandbox::snapshot_capture::capture_sealed_source;
-    use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceReceiver};
+    use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceFile, SourceReceiver};
     use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
     use rabs_sandbox::toolchain_transfer::ToolchainReceiver;
     use sha2::{Digest, Sha256};
@@ -766,15 +784,41 @@ mod tests {
             .collect()
     }
 
+    fn admission_manifest() -> SourceManifest {
+        SourceManifest::new(vec![
+            SourceFile {
+                path: "Cargo.toml".into(),
+                len: b"approved input".len() as u64,
+                sha256: Sha256::digest(b"approved input").into(),
+                executable: false,
+            },
+            SourceFile {
+                path: "empty".into(),
+                len: 0,
+                sha256: Sha256::digest([]).into(),
+                executable: false,
+            },
+            SourceFile {
+                path: "src/lib.rs".into(),
+                len: 1,
+                sha256: Sha256::digest(b"x").into(),
+                executable: false,
+            },
+        ])
+        .unwrap()
+    }
+
     #[test]
     fn admission_wait_polls_only_queued_peer_and_gives_upload_its_full_budget() {
         native(async {
+            let manifest = admission_manifest();
             let stream = AdmissionStream::new(
                 &[
                     Message::Queued {},
                     Message::Queued {},
                     Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
+                        source: SourcePlan::all(&manifest).unwrap(),
                     },
                     Message::Accepted {},
                 ],
@@ -786,11 +830,17 @@ mod tests {
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
             let admission_deadline = started + Duration::from_secs(5);
-            let (input_deadline, toolchain_disposition) =
-                await_input_admission(&mut wire, &stopped, "fixture", admission_deadline)
-                    .await
-                    .unwrap();
+            let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+                &mut wire,
+                &manifest,
+                &stopped,
+                "fixture",
+                admission_deadline,
+            )
+            .await
+            .unwrap();
             assert_eq!(toolchain_disposition, ToolchainDisposition::Upload);
+            assert_eq!(source_plan, SourcePlan::all(&manifest).unwrap());
             // Waiting does not subtract from or reset the upload phase's budget.
             assert!(input_deadline >= ready_seen.lock().unwrap().unwrap() + TOOLCHAIN_INPUT_BUDGET);
             assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
@@ -811,9 +861,11 @@ mod tests {
     #[test]
     fn admission_ready_does_not_poll_and_only_then_allows_input_bytes() {
         native(async {
+            let manifest = admission_manifest();
             let stream = AdmissionStream::new(
                 &[Message::Ready {
                     toolchain: ToolchainDisposition::Reuse,
+                    source: SourcePlan::all(&manifest).unwrap(),
                 }],
                 false,
             );
@@ -821,11 +873,17 @@ mod tests {
             let mut wire = Wire::new(stream);
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
-            let (input_deadline, toolchain_disposition) =
-                await_input_admission(&mut wire, &stopped, "fixture", started + ADMISSION_BUDGET)
-                    .await
-                    .unwrap();
+            let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+                &mut wire,
+                &manifest,
+                &stopped,
+                "fixture",
+                started + ADMISSION_BUDGET,
+            )
+            .await
+            .unwrap();
             assert_eq!(toolchain_disposition, ToolchainDisposition::Reuse);
+            assert_eq!(source_plan, SourcePlan::all(&manifest).unwrap());
             assert!(input_deadline >= started + TOOLCHAIN_INPUT_BUDGET);
             assert!(input_deadline <= Instant::now() + TOOLCHAIN_INPUT_BUDGET);
             assert!(output.lock().unwrap().is_empty());
@@ -847,13 +905,14 @@ mod tests {
     #[test]
     fn admission_queue_replies_cannot_renew_the_absolute_deadline() {
         native(async {
+            let manifest = admission_manifest();
             let stream = AdmissionStream::new(&[Message::Queued {}], true);
             let output = Arc::clone(&stream.output);
             let mut wire = Wire::new(stream);
             let stopped = AtomicBool::new(false);
             let deadline = Instant::now() + ADMISSION_POLL + ADMISSION_POLL / 2;
             assert_eq!(
-                await_input_admission(&mut wire, &stopped, "fixture", deadline)
+                await_input_admission(&mut wire, &manifest, &stopped, "fixture", deadline)
                     .await
                     .unwrap_err()
                     .kind(),
@@ -883,8 +942,10 @@ mod tests {
         stream.first_read = Some(observed);
         let output = Arc::clone(&stream.output);
         let mut wire = Wire::new(stream);
+        let manifest = admission_manifest();
         let result = native(await_input_admission(
             &mut wire,
+            &manifest,
             &stopped,
             "fixture",
             Instant::now() + Duration::from_secs(5),
@@ -901,6 +962,7 @@ mod tests {
     #[test]
     fn admission_refusal_disconnect_and_wrong_phase_never_become_ready_or_retry() {
         native(async {
+            let manifest = admission_manifest();
             for (reply, kind) in [
                 (
                     Some(Message::Failure {
@@ -923,6 +985,7 @@ mod tests {
                 let mut wire = Wire::new(stream);
                 let error = await_input_admission(
                     &mut wire,
+                    &manifest,
                     &AtomicBool::new(false),
                     "fixture",
                     Instant::now() + Duration::from_secs(5),
@@ -938,6 +1001,7 @@ mod tests {
             assert!(
                 await_input_admission(
                     &mut wire,
+                    &manifest,
                     &AtomicBool::new(false),
                     "fixture",
                     Instant::now() + Duration::from_secs(5),
@@ -946,6 +1010,61 @@ mod tests {
                 .is_err()
             );
             assert!(output.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn admission_refuses_invalid_source_plans_before_any_input_bytes() {
+        native(async {
+            let manifest = admission_manifest();
+            let all = SourcePlan::all(&manifest).unwrap();
+            let mut invalid_plans = vec![
+                SourcePlan {
+                    manifest_sha256: "00".repeat(32),
+                    ..all.clone()
+                },
+                SourcePlan {
+                    manifest_sha256: "FF".repeat(32),
+                    ..all.clone()
+                },
+            ];
+            for missing_files in [
+                vec![0, 0],
+                vec![2, 0],
+                vec![1],
+                vec![3],
+                vec![u16::MAX],
+                vec![0; rabs_sandbox::source_transfer::MAX_SOURCE_FILES + 1],
+            ] {
+                invalid_plans.push(SourcePlan {
+                    missing_files,
+                    ..all.clone()
+                });
+            }
+            for toolchain in [ToolchainDisposition::Upload, ToolchainDisposition::Reuse] {
+                for source in &invalid_plans {
+                    let peer = AdmissionStream::new(
+                        &[Message::Ready {
+                            toolchain,
+                            source: source.clone(),
+                        }],
+                        false,
+                    );
+                    let output = Arc::clone(&peer.output);
+                    let mut wire = Wire::new(peer);
+                    let error = await_input_admission(
+                        &mut wire,
+                        &manifest,
+                        &AtomicBool::new(false),
+                        "fixture",
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert!(output.lock().unwrap().is_empty());
+                }
+            }
         });
     }
 
@@ -1072,14 +1191,20 @@ mod tests {
             )
         }
 
-        fn upload_peer(&self, disposition: ToolchainDisposition) -> AdmissionStream {
-            let mut frames: u64 = self
-                .bundle
-                .source
-                .manifest()
-                .files()
+        fn upload_peer(
+            &self,
+            disposition: ToolchainDisposition,
+            source: SourcePlan,
+        ) -> AdmissionStream {
+            source.validate(self.bundle.source.manifest()).unwrap();
+            let mut frames: u64 = source
+                .missing_files
                 .iter()
-                .map(|file| file.len.div_ceil(MAX_SOURCE_CHUNK as u64))
+                .map(|index| {
+                    self.bundle.source.manifest().files()[usize::from(*index)]
+                        .len
+                        .div_ceil(MAX_SOURCE_CHUNK as u64)
+                })
                 .sum();
             if disposition == ToolchainDisposition::Upload {
                 for entry in self.bundle.toolchain.as_ref().unwrap().entries().unwrap() {
@@ -1091,6 +1216,7 @@ mod tests {
             }
             let mut replies = vec![Message::Ready {
                 toolchain: disposition,
+                source,
             }];
             // Like the production receiver, acknowledge exact cumulative counts.
             let mut acknowledged = 0;
@@ -1116,13 +1242,17 @@ mod tests {
         for disposition in [ToolchainDisposition::Upload, ToolchainDisposition::Reuse] {
             let mut fixture = InputFixture::new();
             let expected_sdk = *fixture.bundle.toolchain.as_ref().unwrap().identity();
-            let peer = fixture.upload_peer(disposition);
+            let peer = fixture.upload_peer(
+                disposition,
+                SourcePlan::all(fixture.bundle.source.manifest()).unwrap(),
+            );
             let output = Arc::clone(&peer.output);
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             native(async {
-                let (deadline, selected) = await_input_admission(
+                let (deadline, selected, source_plan) = await_input_admission(
                     &mut wire,
+                    fixture.bundle.source.manifest(),
                     &stopped,
                     "fixture",
                     Instant::now() + Duration::from_secs(5),
@@ -1136,6 +1266,7 @@ mod tests {
                     &mut fixture.bundle,
                     &fixture.owner.path().join("scratch"),
                     selected,
+                    &source_plan,
                     &stopped,
                     deadline,
                 )
@@ -1243,10 +1374,247 @@ mod tests {
     }
 
     #[test]
+    fn source_delta_uploads_only_missing_bytes_and_reconstructs_the_complete_tree() {
+        // The byte peer selects real captured members. Seed its other members
+        // into a fresh receiver, then apply exactly the production client's
+        // emitted frames. This is input transfer proof, not a TLS/Cargo claim.
+        for disposition in [ToolchainDisposition::Upload, ToolchainDisposition::Reuse] {
+            for missing in [Vec::new(), vec![0], vec![2]] {
+                let mut fixture = InputFixture::new();
+                let manifest = fixture.bundle.source.manifest().clone();
+                let plan = SourcePlan::new(&manifest, missing).unwrap();
+                let expected_bytes: u64 = plan
+                    .missing_files
+                    .iter()
+                    .map(|index| manifest.files()[usize::from(*index)].len)
+                    .sum();
+                let destination = private();
+                let mut receiver = SourceReceiver::create(
+                    &destination.path().join("source"),
+                    manifest.clone(),
+                )
+                .unwrap();
+                for (index, file) in manifest.files().iter().enumerate() {
+                    let index = u16::try_from(index).unwrap();
+                    if file.len == 0 || plan.missing_files.contains(&index) {
+                        continue;
+                    }
+                    let spool = tempfile::NamedTempFile::new_in(destination.path()).unwrap();
+                    let mut verified = fixture
+                        .bundle
+                        .source
+                        .checkpoint_file(
+                            &file.path,
+                            spool.as_file().try_clone().unwrap(),
+                            || false,
+                        )
+                        .unwrap()
+                        .into_file();
+                    receiver
+                        .import_file_with_cloner(
+                            &file.path,
+                            &mut verified,
+                            || false,
+                            rabs_cas::materialization::try_verified_reflink,
+                        )
+                        .unwrap();
+                }
+                let peer = fixture.upload_peer(disposition, plan.clone());
+                let output = Arc::clone(&peer.output);
+                let mut wire = Wire::new(peer);
+                let stopped = AtomicBool::new(false);
+                native(async {
+                    let (deadline, selected, source_plan) = await_input_admission(
+                        &mut wire,
+                        &manifest,
+                        &stopped,
+                        "fixture",
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(selected, disposition);
+                    assert_eq!(source_plan, plan);
+                    upload_inputs(
+                        &mut wire,
+                        &mut fixture.bundle,
+                        &fixture.owner.path().join("scratch"),
+                        selected,
+                        &source_plan,
+                        &stopped,
+                        deadline,
+                    )
+                    .await
+                    .unwrap();
+                    wire.send(&Message::InputsDone {}, &stopped, deadline)
+                        .await
+                        .unwrap();
+                });
+                let mut source_bytes = 0_u64;
+                let mut sdk_bytes = 0_u64;
+                let mut sdk_entries = 0;
+                let mut pending = 0_u64;
+                let mut cumulative = 0_u64;
+                let mut completed = false;
+                for record in admission_messages(&output) {
+                    assert!(!completed, "no frames may follow InputsDone");
+                    match serde_json::from_value::<Message>(record).unwrap() {
+                        Message::SourceChunk { chunk } => {
+                            let index = manifest
+                                .files()
+                                .iter()
+                                .position(|file| file.path == chunk.path)
+                                .unwrap();
+                            assert!(plan.missing_files.contains(&u16::try_from(index).unwrap()));
+                            let (bytes, sha256) = chunk.verified_bytes().unwrap();
+                            receiver
+                                .write_chunk(&chunk.path, chunk.offset, &bytes, sha256)
+                                .unwrap();
+                            source_bytes += bytes.len() as u64;
+                            pending += 1;
+                        }
+                        Message::ToolchainEntry { .. } => {
+                            assert_eq!(disposition, ToolchainDisposition::Upload);
+                            sdk_entries += 1;
+                            pending += 1;
+                        }
+                        Message::ToolchainChunk { chunk } => {
+                            assert_eq!(disposition, ToolchainDisposition::Upload);
+                            sdk_bytes += chunk.verified_bytes().unwrap().0.len() as u64;
+                            pending += 1;
+                        }
+                        Message::WindowEnd { count } => {
+                            assert!((1..=wire::WINDOW).contains(&pending));
+                            cumulative += pending;
+                            assert_eq!(count, cumulative);
+                            pending = 0;
+                        }
+                        Message::InputsDone {} => {
+                            assert_eq!(pending, 0);
+                            completed = true;
+                        }
+                        message => panic!("unexpected delta upload message: {message:?}"),
+                    }
+                    assert!(pending <= wire::WINDOW);
+                }
+                assert!(completed);
+                assert_eq!(source_bytes, expected_bytes);
+                if disposition == ToolchainDisposition::Upload {
+                    assert!(sdk_entries > 0);
+                    assert_eq!(
+                        sdk_bytes,
+                        fixture.bundle.toolchain.as_ref().unwrap().identity().bytes,
+                    );
+                } else {
+                    assert_eq!((sdk_bytes, sdk_entries), (0, 0));
+                }
+                receiver.seal().unwrap();
+                assert_eq!(receiver.manifest(), &manifest);
+                let root = receiver.sealed_root().unwrap();
+                assert_eq!(fs::read(root.join("a-binary")).unwrap(), fixture.source_bytes);
+                assert!(fs::read(root.join("b-empty")).unwrap().is_empty());
+                assert_eq!(
+                    fs::read(root.join("c-executable")).unwrap(),
+                    b"#!/bin/sh\nexit 0\n",
+                );
+                assert_eq!(
+                    fs::metadata(root.join("c-executable")).unwrap().mode() & 0o7777,
+                    0o555,
+                );
+                for file in manifest.files() {
+                    let received = fs::metadata(root.join(&file.path)).unwrap();
+                    let captured = fs::metadata(
+                        fixture.bundle.source.sealed_root().unwrap().join(&file.path),
+                    )
+                    .unwrap();
+                    assert_eq!(received.nlink(), 1);
+                    assert_ne!((received.dev(), received.ino()), (captured.dev(), captured.ino()));
+                }
+                assert_eq!(
+                    fs::read_dir(fixture.owner.path().join("scratch")).unwrap().count(),
+                    0,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_source_reuse_does_not_skip_changed_or_empty_members_or_sdk_custody() {
+        for member in ["a-binary", "b-empty", "c-executable", "sdk"] {
+            let mut fixture = InputFixture::new();
+            let plan = SourcePlan::new(fixture.bundle.source.manifest(), Vec::new()).unwrap();
+            let peer = fixture.upload_peer(ToolchainDisposition::Reuse, plan);
+            let path = if member == "sdk" {
+                fixture.bundle.toolchain.as_ref().unwrap().root().join("lib/runtime")
+            } else {
+                fixture.bundle.source.sealed_root().unwrap().join(member)
+            };
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(path, b"changed retained bytes").unwrap();
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let stopped = AtomicBool::new(false);
+            let result = native(async {
+                let (deadline, disposition, source_plan) = await_input_admission(
+                    &mut wire,
+                    fixture.bundle.source.manifest(),
+                    &stopped,
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await?;
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &fixture.owner.path().join("scratch"),
+                    disposition,
+                    &source_plan,
+                    &stopped,
+                    deadline,
+                )
+                .await?;
+                wire.send(&Message::InputsDone {}, &stopped, deadline).await
+            });
+            assert!(result.is_err(), "a warm hint cannot hide changed {member}");
+            assert!(output.lock().unwrap().is_empty());
+            assert_eq!(
+                fs::read_dir(fixture.owner.path().join("scratch")).unwrap().count(),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn uploader_validates_the_complete_plan_before_opening_scratch_or_sending_bytes() {
+        let mut fixture = InputFixture::new();
+        let mut source_plan = SourcePlan::all(fixture.bundle.source.manifest()).unwrap();
+        source_plan.missing_files.push(0);
+        let peer = AdmissionStream::new(&[], false);
+        let output = Arc::clone(&peer.output);
+        let mut wire = Wire::new(peer);
+        let error = native(upload_inputs(
+            &mut wire,
+            &mut fixture.bundle,
+            &fixture.owner.path().join("absent-scratch"),
+            ToolchainDisposition::Upload,
+            &source_plan,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.lock().unwrap().is_empty());
+        assert!(!fixture.owner.path().join("absent-scratch").exists());
+    }
+
+    #[test]
     fn sdk_reuse_still_refuses_mutated_source_or_retained_sdk_before_inputs_done() {
         for mutate_sdk in [false, true] {
             let mut fixture = InputFixture::new();
-            let peer = fixture.upload_peer(ToolchainDisposition::Reuse);
+            let peer = fixture.upload_peer(
+                ToolchainDisposition::Reuse,
+                SourcePlan::all(fixture.bundle.source.manifest()).unwrap(),
+            );
             let path = if mutate_sdk {
                 fixture
                     .bundle
@@ -1269,8 +1637,9 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             let result = native(async {
-                let (deadline, disposition) = await_input_admission(
+                let (deadline, disposition, source_plan) = await_input_admission(
                     &mut wire,
+                    fixture.bundle.source.manifest(),
                     &stopped,
                     "fixture",
                     Instant::now() + Duration::from_secs(5),
@@ -1281,6 +1650,7 @@ mod tests {
                     &mut fixture.bundle,
                     &fixture.owner.path().join("scratch"),
                     disposition,
+                    &source_plan,
                     &stopped,
                     deadline,
                 )
@@ -1299,25 +1669,29 @@ mod tests {
 
     #[test]
     fn sdk_reuse_failure_or_second_disposition_never_restarts_the_upload() {
-        for (reply, expected) in [
-            (
-                Some(Message::Ready {
-                    toolchain: ToolchainDisposition::Upload,
-                }),
-                io::ErrorKind::InvalidData,
-            ),
-            (
-                Some(Message::Failure {
-                    message: "cached SDK became unavailable".into(),
-                }),
-                io::ErrorKind::InvalidData,
-            ),
-            (Some(Message::Cancel {}), io::ErrorKind::Interrupted),
-            (None, io::ErrorKind::UnexpectedEof),
-        ] {
+        for case in 0..4 {
             let mut fixture = InputFixture::new();
+            let source = SourcePlan::all(fixture.bundle.source.manifest()).unwrap();
+            let (reply, expected) = match case {
+                0 => (
+                    Some(Message::Ready {
+                        toolchain: ToolchainDisposition::Upload,
+                        source: source.clone(),
+                    }),
+                    io::ErrorKind::InvalidData,
+                ),
+                1 => (
+                    Some(Message::Failure {
+                        message: "cached SDK became unavailable".into(),
+                    }),
+                    io::ErrorKind::InvalidData,
+                ),
+                2 => (Some(Message::Cancel {}), io::ErrorKind::Interrupted),
+                _ => (None, io::ErrorKind::UnexpectedEof),
+            };
             let mut replies = vec![Message::Ready {
                 toolchain: ToolchainDisposition::Reuse,
+                source,
             }];
             replies.extend(reply);
             let mut peer = AdmissionStream::new(&replies, false);
@@ -1326,8 +1700,9 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             let result = native(async {
-                let (deadline, disposition) = await_input_admission(
+                let (deadline, disposition, source_plan) = await_input_admission(
                     &mut wire,
+                    fixture.bundle.source.manifest(),
                     &stopped,
                     "fixture",
                     Instant::now() + Duration::from_secs(5),
@@ -1338,6 +1713,7 @@ mod tests {
                     &mut fixture.bundle,
                     &fixture.owner.path().join("scratch"),
                     disposition,
+                    &source_plan,
                     &stopped,
                     deadline,
                 )
@@ -1422,6 +1798,7 @@ mod tests {
         assert!(fixture.source_bytes.len() > MAX_SOURCE_CHUNK * wire::WINDOW as usize);
         assert!(fixture.runtime_bytes.len() > MAX_SOURCE_CHUNK * wire::WINDOW as usize);
         let scratch = fixture.owner.path().join("scratch");
+        let source_plan = SourcePlan::all(fixture.bundle.source.manifest()).unwrap();
         let received = std::thread::scope(|scope| {
             let (addresses, address) = std::sync::mpsc::sync_channel(1);
             let server = scope.spawn(move || {
@@ -1434,7 +1811,7 @@ mod tests {
                     let deadline = Instant::now() + Duration::from_secs(25);
                     let sealed = super::super::receive_inputs(
                         &mut wire,
-                        source,
+                        SourceInput::uncached(source)?,
                         ToolchainInput::Upload {
                             receiver: Box::new(toolchain),
                             owner: sdk_destination,
@@ -1458,6 +1835,7 @@ mod tests {
                     &mut fixture.bundle,
                     &scratch,
                     ToolchainDisposition::Upload,
+                    &source_plan,
                     &stopped,
                     deadline,
                 )
@@ -1530,6 +1908,7 @@ mod tests {
             let disconnect = Arc::new(AtomicBool::new(false));
             let accepted = Arc::new(AtomicBool::new(false));
             let scratch = fixture.owner.path().join("scratch");
+            let source_plan = SourcePlan::all(fixture.bundle.source.manifest()).unwrap();
             let (sent, received) = std::thread::scope(|scope| {
                 let (addresses, address) = std::sync::mpsc::sync_channel(1);
                 let server_cancel = Arc::clone(&client_stop);
@@ -1572,7 +1951,7 @@ mod tests {
                         // Neither EOF nor cancellation can return sealed owners.
                         let received = super::super::receive_inputs(
                             &mut wire,
-                            source,
+                            SourceInput::uncached(source)?,
                             ToolchainInput::Upload {
                                 receiver: Box::new(toolchain),
                                 owner: sdk_destination,
@@ -1602,6 +1981,7 @@ mod tests {
                             &mut fixture.bundle,
                             &scratch,
                             ToolchainDisposition::Upload,
+                            &source_plan,
                             &client_stop,
                             deadline,
                         ));

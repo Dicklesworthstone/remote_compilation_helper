@@ -9,7 +9,7 @@ use super::super::remote_operation::RemoteOperationSettings;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceManifest};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest};
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
 };
@@ -24,7 +24,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v2";
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v3";
 pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
@@ -141,6 +141,59 @@ impl Manifest {
             "remote manifest digest differs from its complete file declaration",
         )?;
         Ok(manifest)
+    }
+}
+
+/// Missing input bytes, indexed by the complete manifest's canonical path order.
+/// This hint never grants source authority: the receiver must still seal the
+/// entire declared tree, including every independently imported cache hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourcePlan {
+    pub(super) manifest_sha256: String,
+    pub(super) missing_files: Vec<u16>,
+}
+
+impl SourcePlan {
+    pub(super) fn all(manifest: &SourceManifest) -> io::Result<Self> {
+        let missing_files = manifest
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.len != 0)
+            .map(|(index, _)| {
+                u16::try_from(index)
+                    .map_err(|_| invalid("source upload index exceeds its wire bound"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::new(manifest, missing_files)
+    }
+
+    pub(super) fn new(manifest: &SourceManifest, missing_files: Vec<u16>) -> io::Result<Self> {
+        let plan = Self {
+            manifest_sha256: encode_hex(&manifest.digest()),
+            missing_files,
+        };
+        plan.validate(manifest)?;
+        Ok(plan)
+    }
+
+    pub(super) fn validate(&self, manifest: &SourceManifest) -> io::Result<()> {
+        require(
+            digest(&self.manifest_sha256)? == manifest.digest(),
+            "source upload plan differs from the captured manifest",
+        )?;
+        require(
+            self.missing_files.len() <= MAX_SOURCE_FILES
+                && self.missing_files.windows(2).all(|pair| pair[0] < pair[1])
+                && self.missing_files.iter().all(|index| {
+                    manifest
+                        .files()
+                        .get(usize::from(*index))
+                        .is_some_and(|file| file.len != 0)
+                }),
+            "source upload indexes must be a bounded ordered subset of nonempty files",
+        )
     }
 }
 
@@ -303,6 +356,7 @@ pub(super) enum Message {
     Queued {},
     Ready {
         toolchain: ToolchainDisposition,
+        source: SourcePlan,
     },
     SourceChunk {
         chunk: Chunk,
@@ -711,11 +765,36 @@ mod tests {
         bytes
     }
 
+    fn source_manifest() -> SourceManifest {
+        SourceManifest::new(vec![
+            SourceFile {
+                path: "src/lib.rs".into(),
+                len: 1,
+                sha256: Sha256::digest(b"x").into(),
+                executable: false,
+            },
+            SourceFile {
+                path: "empty".into(),
+                len: 0,
+                sha256: Sha256::digest([]).into(),
+                executable: false,
+            },
+            SourceFile {
+                path: "Cargo.toml".into(),
+                len: 1,
+                sha256: Sha256::digest(b"m").into(),
+                executable: false,
+            },
+        ])
+        .unwrap()
+    }
+
     #[test]
     fn fragmented_and_coalesced_records_keep_the_exact_next_phase() {
         let mut bytes = record(&Message::Queued {});
         bytes.extend(record(&Message::Ready {
             toolchain: ToolchainDisposition::Reuse,
+            source: SourcePlan::all(&source_manifest()).unwrap(),
         }));
         bytes.extend(record(&Message::Window { count: 4 }));
         bytes.extend(record(&Message::Complete { exit_code: 0 }));
@@ -729,7 +808,8 @@ mod tests {
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
                 Message::Ready {
-                    toolchain: ToolchainDisposition::Reuse
+                    toolchain: ToolchainDisposition::Reuse,
+                    ..
                 }
             ));
             assert!(matches!(
@@ -931,6 +1011,7 @@ mod tests {
                     gate.store(true, Ordering::Release);
                     wire.stream.input = record(&Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
+                        source: SourcePlan::all(&source_manifest()).unwrap(),
                     });
                     wire.stream.offset = 0;
                     wire.stream.eof = true;
@@ -973,6 +1054,7 @@ mod tests {
                 let reads = wire.stream.reads.load(Ordering::Relaxed);
                 wire.stream.input = record(&Message::Ready {
                     toolchain: ToolchainDisposition::Upload,
+                    source: SourcePlan::all(&source_manifest()).unwrap(),
                 });
                 wire.stream.offset = 0;
                 assert!(wire.receive_until(&stopped, deadline).await.is_err());
@@ -1002,6 +1084,16 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<Message>(bytes).is_err());
         }
+        let ready = serde_json::to_value(Message::Ready {
+            toolchain: ToolchainDisposition::Reuse,
+            source: SourcePlan::all(&source_manifest()).unwrap(),
+        })
+        .unwrap();
+        for field in ["toolchain_root", "source_root", "peer", "extra"] {
+            let mut value = ready.clone();
+            value[field] = json!("/not-an-input-capability");
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
         let settings = json!({"state_root":"/server/state"});
         assert!(serde_json::from_value::<RemoteOperationSettings>(settings).is_err());
     }
@@ -1030,24 +1122,123 @@ mod tests {
 
     #[test]
     fn ready_contract_carries_exact_upload_or_reuse_disposition() {
+        let manifest = source_manifest();
+        let plan = SourcePlan::all(&manifest).unwrap();
         for (spelling, expected) in [
             ("upload", ToolchainDisposition::Upload),
             ("reuse", ToolchainDisposition::Reuse),
         ] {
             let bytes = serde_json::to_vec(&json!({
-                "kind": "ready", "toolchain": spelling
+                "kind": "ready", "toolchain": spelling, "source": plan
             }))
             .unwrap();
-            let Message::Ready { toolchain } = serde_json::from_slice::<Message>(&bytes).unwrap()
+            let Message::Ready { toolchain, source } =
+                serde_json::from_slice::<Message>(&bytes).unwrap()
             else {
-                panic!("expected explicit SDK admission");
+                panic!("expected explicit SDK and source admission");
             };
             assert_eq!(toolchain, expected);
+            assert_eq!(source, plan);
+            source.validate(&manifest).unwrap();
             assert_eq!(
-                serde_json::to_value(Message::Ready { toolchain }).unwrap(),
-                json!({"kind": "ready", "toolchain": spelling})
+                serde_json::to_value(Message::Ready { toolchain, source }).unwrap(),
+                json!({"kind": "ready", "toolchain": spelling, "source": plan})
             );
         }
+    }
+
+    #[test]
+    fn source_plans_bind_canonical_manifest_members_and_refuse_ambiguous_hints() {
+        let manifest = source_manifest();
+        assert_eq!(
+            manifest.files().iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["Cargo.toml", "empty", "src/lib.rs"],
+        );
+        let all = SourcePlan::all(&manifest).unwrap();
+        assert_eq!(all.missing_files, [0, 2]);
+        assert_eq!(all.manifest_sha256, encode_hex(&manifest.digest()));
+        SourcePlan::new(&manifest, Vec::new()).unwrap();
+        SourcePlan::new(&manifest, vec![0]).unwrap();
+        SourcePlan::new(&manifest, vec![2]).unwrap();
+        for missing in [
+            vec![0, 0],
+            vec![2, 0],
+            vec![1],
+            vec![3],
+            vec![u16::MAX],
+            vec![0; MAX_SOURCE_FILES + 1],
+        ] {
+            assert!(SourcePlan::new(&manifest, missing).is_err());
+        }
+        for digest in ["00".repeat(32), "ff".repeat(31), "FF".repeat(32)] {
+            let mut plan = all.clone();
+            plan.manifest_sha256 = digest;
+            assert!(plan.validate(&manifest).is_err());
+        }
+        for changed in 0..4 {
+            let mut files = manifest.files().to_vec();
+            match changed {
+                0 => files[0].sha256 = Sha256::digest(b"changed").into(),
+                1 => files[0].path = "Cargo.lock".into(),
+                2 => files[0].executable = true,
+                _ => files[0].len += 1,
+            }
+            let different = SourceManifest::new(files).unwrap();
+            assert!(all.validate(&different).is_err());
+        }
+    }
+
+    #[test]
+    fn source_plan_wire_shape_refuses_unbounded_types_and_unknown_fields() {
+        let valid = serde_json::to_value(SourcePlan::all(&source_manifest()).unwrap()).unwrap();
+        for index in [json!(-1), json!(65536), json!("0"), json!(0.5)] {
+            let mut value = valid.clone();
+            value["missing_files"] = json!([index]);
+            assert!(serde_json::from_value::<SourcePlan>(value).is_err());
+        }
+        for field in ["root", "source_root", "peer", "extra"] {
+            let mut value = valid.clone();
+            value[field] = json!("/not-an-input-capability");
+            assert!(serde_json::from_value::<SourcePlan>(value).is_err());
+        }
+        let duplicate = format!(
+            "{{\"manifest_sha256\":\"{}\",\"missing_files\":[],\"missing_files\":[0]}}",
+            encode_hex(&source_manifest().digest()),
+        );
+        assert!(serde_json::from_str::<SourcePlan>(&duplicate).is_err());
+        for bytes in [
+            br#"{"kind":"ready","toolchain":"upload"}"#.as_slice(),
+            br#"{"kind":"ready","toolchain":"reuse","source":null}"#,
+            br#"{"kind":"ready","toolchain":"reuse","source":{"missing_files":[]}}"#,
+        ] {
+            assert!(serde_json::from_slice::<Message>(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn maximum_source_plan_stays_compact_for_long_manifest_paths() {
+        let files = (0..MAX_SOURCE_FILES)
+            .map(|index| SourceFile {
+                path: format!("{index:04}/{}", "x".repeat(900)),
+                len: 1,
+                sha256: Sha256::digest(b"x").into(),
+                executable: false,
+            })
+            .collect();
+        let manifest = SourceManifest::new(files).unwrap();
+        let source = SourcePlan::all(&manifest).unwrap();
+        assert_eq!(source.missing_files.len(), MAX_SOURCE_FILES);
+        let bytes = serde_json::to_vec(&Message::Ready {
+            toolchain: ToolchainDisposition::Reuse,
+            source,
+        })
+        .unwrap();
+        assert!(bytes.len() < 24 * 1024);
+        assert!(bytes.len() <= MAX_JSON_RECORD);
+        let Message::Ready { source, .. } = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("expected source admission");
+        };
+        source.validate(&manifest).unwrap();
     }
 
     #[test]

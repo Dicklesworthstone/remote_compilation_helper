@@ -2335,8 +2335,9 @@ rabsd --canonical-compile-remote ./remote-build.json
 
 Run the first command on the coordinator and the second on a client. Each client
 captures its approved source/dependency closure and complete toolchain, then
-uploads those exact bytes. The coordinator allocates private input and operation
-directories and runs the existing canonical Cargo driver. Cargo plans at the
+uploads the exact bytes requested by the coordinator's verified input plan. The
+coordinator allocates private input and operation directories and runs the
+existing canonical Cargo driver. Cargo plans at the
 same stable paths used by local canonical operations. Eligible concurrent
 dependency requests from different clients can join one shared execution, while
 each operation keeps its own source observations, Cargo process, target,
@@ -2413,6 +2414,7 @@ Save the complete service profile as `remote-service.json`:
   "max_roots": 4,
   "max_queued_roots": 16,
   "queue_timeout_seconds": 300,
+  "source_cache_bytes": 536870912,
   "toolchain_cache_bytes": 8589934592,
   "toolchain_cache_entries": 4,
   "target_cache": {
@@ -2443,14 +2445,16 @@ available. The client keeps its already captured inputs while waiting.
 
 `queue_timeout_seconds` accepts 1–1800 and defaults to 300. The queue deadline
 is fixed when a validated request enters admission; progress polls do not renew
-it. The same fixed deadline bounds SDK selection and verification before Ready,
-including any wait for another admitted operation's cold upload. Acquiring a root
-slot does not reset that deadline. Client cancellation, disconnection, timeout or
+it. The same fixed deadline bounds SDK selection, verification and source-cache
+prefill before Ready, including any wait for another admitted operation's cold
+SDK upload. Acquiring a root slot does not reset that deadline. Client
+cancellation, disconnection, timeout or
 service shutdown releases that caller's waiting state without cancelling another
 caller. The Cargo frontend waits on the same authenticated connection and starts
 uploading only after Ready grants its input phase. It does not resubmit the
-operation. Input transfer then receives its own complete transfer budget. If all
-connection slots are occupied, the service still closes excess connections before
+operation. Ready starts a fresh, fixed 35-minute input-transfer budget; cached
+source preparation does not consume it. If all connection slots are occupied,
+the service still closes excess connections before
 authentication, without a plaintext response.
 
 Simultaneous admitted operations with the same authenticated client key and
@@ -2486,8 +2490,8 @@ Concurrent requests for the same retained image can share one in-progress byte
 scan; each caller independently checks its owner and complete retained generation
 before and after that scan. Completed checks are never memoized, and cancelling
 one caller does not cancel another caller's wait or authorize partial results.
-The client then transfers its sealed source without SDK entries or SDK chunks.
-Every operation keeps its own source, runtime and output directories; a cached
+The client then transfers the requested source bytes without SDK entries or SDK
+chunks. Every operation keeps its own source, runtime and output directories; a cached
 SDK retains only its dedicated compiler directory. Changes to the retained SDK
 or its ownership invalidate that generation and refuse the affected operation.
 A cache failure never causes a second execution, reconnection or local fallback.
@@ -2497,6 +2501,33 @@ upload; no directory is adopted from a pathname or an old on-disk marker. The
 client still captures and validates its local SDK on each invocation. Reuse
 removes repeated SDK network transfer and reconstruction; it does not eliminate
 local capture or verification, and no end-to-end speedup is claimed here.
+
+The optional `source_cache_bytes` setting retains verified source-file bytes for
+later requests. It defaults to 0 (disabled), accepts at most 8 GiB, and uses one
+aggregate budget of at most 4096 objects across all enrolled clients. The example
+enables 512 MiB. Objects are scoped by the client key authenticated by TLS and
+their content digest; another client key cannot reuse those bytes. The service
+owns a private pool for its process lifetime. A restart starts a fresh pool and
+does not adopt old cache directories. This budget is separate from SDK retention,
+Cargo target state and active operations' private input trees.
+
+Every request still sends its complete `SourceManifest`. Ready includes a
+`SourcePlan` binding that manifest's digest to a strictly increasing list of
+missing nonempty-file indices in canonical manifest order. The coordinator
+imports verified cache hits into a fresh private receiver before sending Ready.
+The client validates the plan, checks **every captured source member**, including
+omitted and empty files, and uploads only the requested members. Each operation
+still requires a complete fresh server-side seal before execution; imported bytes
+and mutable execution files never share writable inodes. Source chunks outside
+the frozen missing-file plan are terminal protocol errors.
+
+Verified per-file checkpoints can seed later transfers even if an upload stops
+before the complete tree is sealed. They are byte-reuse hints, never execution
+or action-cache authority. Missing, evicted, corrupt or unavailable cache objects
+request ordinary upload before import begins. Once an import has started, a
+verification or cancellation failure cannot be converted into a cache miss in
+that receiver. Optional cache-write contention or storage failure can skip
+retention, but cannot hide invalid source bytes or authorize a partial tree.
 
 The optional server `target_cache` object retains Cargo's private compilation
 state across remote operations and service restarts. It uses the existing
@@ -2512,9 +2543,9 @@ Remote target families also bind the client key authenticated by TLS. A
 different client key or a local canonical command cannot restore another
 client's target, even when source and compiler identities match. The client
 cannot provide this scope, a cache directory, or target-cache policy through its
-remote settings. Every operation still uploads and seals its source, uses an
-independent runtime workspace and target, and executes the selected Cargo
-command. Timestamp restoration only touches that runtime copy; the original
+remote settings. Every operation still declares its complete source, seals a
+fresh input tree, uses an independent runtime workspace and target, and executes
+the selected Cargo command. Timestamp restoration only touches that runtime copy; the original
 received source remains available for final verification. Compiler-only checks
 retain the existing eligible source-edit behavior; codegen, Clippy and graphs
 with project executors keep the complete captured source identity.
@@ -2722,9 +2753,9 @@ producer through the existing ownership path. Service shutdown stops admission
 and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
-Install matching client and coordinator binaries: SDK upload/reuse selection
-uses wire version `canonical-compile-remote-v2`, while existing client and
-service JSON profile versions remain unchanged. Older wire versions refuse
+Install matching client and coordinator binaries: source-file delta negotiation
+and SDK upload/reuse selection use wire version `canonical-compile-remote-v3`,
+while existing client and service JSON profile versions remain unchanged. Older wire versions refuse
 before upload or execution.
 
 This remote protocol has no detached-job resume or automatic operation

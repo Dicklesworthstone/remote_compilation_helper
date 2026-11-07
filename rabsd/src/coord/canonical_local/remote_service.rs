@@ -6,6 +6,7 @@
 //! path-based Unix service is deliberately not used as a network protocol.
 
 mod client;
+mod source_inputs;
 mod wire;
 
 pub use client::run_client_profile;
@@ -28,6 +29,7 @@ use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
+use rabs_sandbox::source_cache::MAX_SOURCE_CACHE_BYTES;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceReceiver};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
@@ -35,6 +37,7 @@ use rabs_sandbox::toolchain_transfer::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use source_inputs::{RemoteSourceCache, SourceInput};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::net::SocketAddr;
@@ -97,6 +100,9 @@ struct ServiceProfile {
     max_queued_roots: usize,
     #[serde(default = "default_queue_timeout_seconds")]
     queue_timeout_seconds: u64,
+    /// Retain verified source bytes under one authenticated-peer-aware budget.
+    #[serde(default)]
+    source_cache_bytes: u64,
     /// Retain only verified SDKs, independently of each operation's source.
     #[serde(default)]
     toolchain_cache_bytes: u64,
@@ -135,6 +141,10 @@ impl ServiceProfile {
         require(
             (1..=wire::ADMISSION_BUDGET.as_secs()).contains(&self.queue_timeout_seconds),
             "remote service queue_timeout_seconds must be between 1 and 1800",
+        )?;
+        require(
+            self.source_cache_bytes <= MAX_SOURCE_CACHE_BYTES,
+            "remote source cache must be at most 8 GiB",
         )?;
         require(
             self.toolchain_cache_bytes <= 64 * 1024 * 1024 * 1024
@@ -194,6 +204,33 @@ impl ServiceProfile {
 
     fn max_sessions(&self) -> usize {
         self.max_roots + self.max_queued_roots
+    }
+}
+
+/// Reuse budgets belong to the service, not to individual connections or peers.
+struct InputCaches {
+    toolchains: RemoteToolchainCache,
+    sources: Option<RemoteSourceCache>,
+}
+
+impl InputCaches {
+    fn new(config: &ServiceProfile) -> io::Result<Self> {
+        let toolchains = RemoteToolchainCache::new(
+            config.toolchain_cache_bytes,
+            config.toolchain_cache_entries,
+        )?;
+        let sources = if config.source_cache_bytes == 0 {
+            None
+        } else {
+            Some(RemoteSourceCache::new(
+                &config.input_root,
+                config.source_cache_bytes,
+            )?)
+        };
+        Ok(Self {
+            toolchains,
+            sources,
+        })
     }
 }
 
@@ -274,6 +311,8 @@ pub fn run_service_profile(
         .build()
         .map_err(|error| io::Error::other(format!("remote listener runtime: {error:?}")))?;
     let listener = block_on_top_level(&network, TcpListener::bind(config.listen))?;
+    // Finish fallible cache setup before starting the coordinator's threads.
+    let caches = Arc::new(InputCaches::new(&config)?);
     let runtime = SharedRuntime::start(
         &config.state_root,
         release_mode,
@@ -282,10 +321,6 @@ pub fn run_service_profile(
         config.jobs_per_root,
     )?;
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
-    let toolchains = Arc::new(RemoteToolchainCache::new(
-        config.toolchain_cache_bytes,
-        config.toolchain_cache_entries,
-    )?);
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
@@ -296,6 +331,7 @@ pub fn run_service_profile(
         "address":listener.local_addr()?.to_string(), "max_roots":config.max_roots,
         "max_queued_roots":config.max_queued_roots,
         "queue_timeout_seconds":config.queue_timeout_seconds,
+        "source_cache_bytes":config.source_cache_bytes,
         "toolchain_cache_bytes":config.toolchain_cache_bytes,
         "toolchain_cache_entries":config.toolchain_cache_entries,
         "target_cache":config.target_cache.as_ref().map(|cache| json!({
@@ -333,7 +369,7 @@ pub fn run_service_profile(
         let child_config = Arc::clone(&config);
         let child_runtime = Arc::clone(&runtime);
         let child_admissions = Arc::clone(&admissions);
-        let child_toolchains = Arc::clone(&toolchains);
+        let child_caches = Arc::clone(&caches);
         let child_acceptor = Arc::clone(&acceptor);
         let child_pins = Arc::clone(&pins);
         // The accepted socket has not been polled. Its first I/O registration
@@ -357,7 +393,7 @@ pub fn run_service_profile(
                         child_runtime,
                         &child_config,
                         &child_admissions,
-                        &child_toolchains,
+                        &child_caches,
                         edge_pin,
                         &child_stop,
                     )
@@ -546,7 +582,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     runtime: Arc<SharedRuntime>,
     config: &ServiceProfile,
     admissions: &Arc<OperationAdmissions>,
-    toolchains: &RemoteToolchainCache,
+    caches: &InputCaches,
     edge_pin: [u8; 32],
     stopped: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -594,20 +630,13 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     })
     .await?;
     let (toolchain, publisher) = ToolchainAdmission {
-        cache: toolchains,
+        cache: &caches.toolchains,
         edge_pin,
         identity,
         input_root: &config.input_root,
     }
     .prepare(wire, stopped, queue_deadline, || runtime.healthy())
     .await?;
-    // Waiting for a shared cold SDK cannot consume the caller's upload budget.
-    // Polls and publisher loss never renew the original admission deadline.
-    let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
-    let cancelled = || {
-        stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= input_deadline
-    };
-    let disposition = toolchain.disposition();
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("canonical-remote-input-")
@@ -615,9 +644,30 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             .tempdir_in(&config.input_root)?,
     );
     let source = SourceReceiver::create(&owner.path().join("source"), manifest)?;
+    let source_cache = caches
+        .sources
+        .as_ref()
+        .map(|cache| cache.for_peer(edge_pin, Arc::clone(stopped), queue_deadline))
+        .transpose()?;
+    let source = SourceInput::prepare(source, source_cache, || {
+        stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= queue_deadline
+    })?;
+    checkpoint(stopped, queue_deadline)?;
+    require(
+        runtime.healthy(),
+        "remote coordinator stopped before input admission",
+    )?;
+    // Both SDK handoff and verified source prefill use the original admission
+    // deadline. Only completed readiness grants one fresh input-transfer budget.
+    let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
+    let cancelled = || {
+        stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= input_deadline
+    };
+    let disposition = toolchain.disposition();
     wire.send(
         &Message::Ready {
             toolchain: disposition,
+            source: source.plan().clone(),
         },
         stopped,
         input_deadline,
@@ -626,7 +676,9 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     let (source, toolchain) =
         receive_inputs(wire, source, toolchain, stopped, input_deadline).await?;
     let toolchain = match disposition {
-        ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, cancelled)?,
+        ToolchainDisposition::Upload => {
+            caches.toolchains.adopt(edge_pin, toolchain, cancelled)?
+        }
         ToolchainDisposition::Reuse => toolchain,
     };
     if let Some(publisher) = publisher {
@@ -780,11 +832,13 @@ async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
 /// transport tests. Only sealed byte owners can cross into execution admission.
 async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
-    mut source: SourceReceiver,
+    mut source: SourceInput,
     mut toolchain: ToolchainInput,
     stopped: &AtomicBool,
     input_deadline: Instant,
 ) -> io::Result<(SourceReceiver, Arc<ReceivedToolchain>)> {
+    checkpoint(stopped, input_deadline)?;
+    source.begin_transfer(input_deadline)?;
     let mut window = Window::default();
     let mut source_finished = false;
     let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= input_deadline;
@@ -799,7 +853,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 )?;
                 window.record()?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
-                source.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
+                source.write_chunk(&chunk.path, chunk.offset, &bytes, sha256, cancelled)?;
             }
             Message::ToolchainEntry { entry } => {
                 let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
@@ -809,7 +863,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 window.record()?;
                 if !source_finished {
-                    source.seal_cancellable(cancelled)?;
+                    source.seal(cancelled)?;
                     source_finished = true;
                 }
                 receiver.entry(entry.native())?;
@@ -840,9 +894,9 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                         matches!(toolchain, ToolchainInput::Reuse(_)),
                         "remote inputs ended before the declared SDK upload",
                     )?;
-                    // A hit skips only the SDK transfer. Source still crosses
-                    // the same complete manifest/byte sealing boundary.
-                    source.seal_cancellable(cancelled)?;
+                    // Reuse skips only requested network bytes. Source still
+                    // crosses the complete manifest/byte sealing boundary.
+                    source.seal(cancelled)?;
                 }
                 break;
             }
@@ -865,6 +919,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             lease
         }
     };
+    let source = source.finish(cancelled)?;
     checkpoint(stopped, input_deadline)?;
     Ok((source, toolchain))
 }
@@ -1128,6 +1183,7 @@ mod tests {
         let (_owner, mut profile) = service_profile();
         assert_eq!(profile.max_queued_roots, 0);
         assert_eq!(profile.queue_timeout_seconds, 300);
+        assert_eq!(profile.source_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_entries, 4);
         assert!(profile.target_cache.is_none());
@@ -1146,6 +1202,13 @@ mod tests {
             assert!(profile.validate().is_err(), "timeout {timeout}");
         }
         profile.queue_timeout_seconds = 300;
+        profile.source_cache_bytes = MAX_SOURCE_CACHE_BYTES;
+        profile.validate().unwrap();
+        for bytes in [MAX_SOURCE_CACHE_BYTES + 1, u64::MAX] {
+            profile.source_cache_bytes = bytes;
+            assert!(profile.validate().is_err(), "source cache bytes {bytes}");
+        }
+        profile.source_cache_bytes = 0;
         profile.toolchain_cache_bytes = 64 * 1024 * 1024 * 1024;
         profile.toolchain_cache_entries = 32;
         profile.validate().unwrap();
@@ -1204,11 +1267,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_sdk_decision_requires_v2_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v2", "build-one", "build-one").unwrap();
+    fn remote_input_decisions_require_v3_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v3", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
-            ("canonical-compile-remote-v2", "build-two"),
+            ("canonical-compile-remote-v2", "build-one"),
+            ("canonical-compile-remote-v3", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1551,7 +1615,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let (source, retained) = ready(receive_inputs(
                 &mut wire,
-                source,
+                SourceInput::uncached(source).unwrap(),
                 ToolchainInput::Reuse(Arc::clone(&sdk)),
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(5),
@@ -1575,6 +1639,153 @@ mod tests {
             );
             sdk.verify(|| false).unwrap();
         }
+    }
+
+    #[test]
+    fn source_delta_transport_reconstructs_cold_warm_edited_and_peer_scoped_inputs() {
+        let cache_parent = crate::test_util::private_tempdir();
+        let cache = RemoteSourceCache::new(cache_parent.path(), 1024).unwrap();
+        let sdk = received_sdk();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut owners = Vec::new();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let cases: [([u8; 32], &[u8], &[u16]); 4] = [
+            ([7; 32], b"first main", &[1, 2]),
+            ([7; 32], b"first main", &[]),
+            ([7; 32], b"edited main", &[2]),
+            ([8; 32], b"edited main", &[1, 2]),
+        ];
+        for (pin, main, missing) in cases {
+            let owner = crate::test_util::private_tempdir();
+            let files: [(&str, &[u8]); 3] = [
+                ("empty", b""),
+                ("src/lib.rs", b"unchanged library"),
+                ("src/main.rs", main),
+            ];
+            let manifest = SourceManifest::new(
+                files
+                    .iter()
+                    .map(|(path, bytes)| SourceFile {
+                        path: (*path).into(),
+                        len: bytes.len() as u64,
+                        sha256: Sha256::digest(bytes).into(),
+                        executable: false,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let receiver =
+                SourceReceiver::create(&owner.path().join("source"), manifest.clone()).unwrap();
+            let source = SourceInput::prepare(
+                receiver,
+                Some(cache.for_peer(pin, Arc::clone(&stopped), deadline).unwrap()),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(source.plan().missing_files.as_slice(), missing);
+            source.plan().validate(&manifest).unwrap();
+            let mut input = Vec::new();
+            for index in missing {
+                let (path, bytes) = files[usize::from(*index)];
+                input.extend(record(&Message::SourceChunk {
+                    chunk: Chunk::new(path, 0, bytes).unwrap(),
+                }));
+            }
+            if !missing.is_empty() {
+                input.extend(record(&Message::WindowEnd {
+                    count: missing.len() as u64,
+                }));
+            }
+            input.extend(record(&Message::InputsDone {}));
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let (source, retained) = ready(receive_inputs(
+                &mut wire,
+                source,
+                ToolchainInput::Reuse(Arc::clone(&sdk)),
+                &stopped,
+                deadline,
+            ))
+            .unwrap();
+            assert!(Arc::ptr_eq(&retained, &sdk));
+            assert_eq!(source.manifest(), &manifest);
+            let root = source.sealed_root().unwrap().to_path_buf();
+            for (path, bytes) in files {
+                assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
+            }
+            let current = fs::metadata(root.join("src/lib.rs")).unwrap();
+            for previous in &roots {
+                let previous = fs::metadata(previous.join("src/lib.rs")).unwrap();
+                assert_ne!(
+                    (current.dev(), current.ino()),
+                    (previous.dev(), previous.ino()),
+                    "reused bytes must not share execution inodes"
+                );
+            }
+            assert_eq!(
+                messages(&output),
+                if missing.is_empty() {
+                    Vec::<Value>::new()
+                } else {
+                    vec![json!({"kind":"window", "count":missing.len()})]
+                }
+            );
+            roots.push(root);
+            owners.push(owner);
+        }
+        sdk.verify(|| false).unwrap();
+    }
+
+    #[test]
+    fn warm_source_transport_refuses_unrequested_chunks_before_acknowledgment() {
+        let cache_parent = crate::test_util::private_tempdir();
+        let cache = RemoteSourceCache::new(cache_parent.path(), 1024).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pin = [9; 32];
+        let bytes = b"verified source";
+        let seed_owner = crate::test_util::private_tempdir();
+        let mut seed = SourceInput::prepare(
+            source_receiver(seed_owner.path(), bytes),
+            Some(cache.for_peer(pin, Arc::clone(&stopped), deadline).unwrap()),
+            || false,
+        )
+        .unwrap();
+        seed.begin_transfer(deadline).unwrap();
+        seed.write_chunk(
+            "src/lib.rs",
+            0,
+            bytes,
+            Sha256::digest(bytes).into(),
+            || false,
+        )
+        .unwrap();
+        seed.finish(|| false).unwrap();
+        let owner = crate::test_util::private_tempdir();
+        let source = SourceInput::prepare(
+            source_receiver(owner.path(), bytes),
+            Some(cache.for_peer(pin, Arc::clone(&stopped), deadline).unwrap()),
+            || false,
+        )
+        .unwrap();
+        assert!(source.plan().missing_files.is_empty());
+        // Even byte-identical retries are forbidden for an omitted member.
+        let peer = AdmissionPeer::new(source_upload(bytes));
+        let output = Arc::clone(&peer.output);
+        let mut wire = Wire::new(peer);
+        let error = ready(receive_inputs(
+            &mut wire,
+            source,
+            ToolchainInput::Reuse(received_sdk()),
+            &stopped,
+            deadline,
+        ))
+        .err()
+        .expect("cache-hit members were not requested for upload");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(messages(&output).is_empty());
     }
 
     #[test]
@@ -1611,7 +1822,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let error = ready(receive_inputs(
                 &mut wire,
-                source,
+                SourceInput::uncached(source).unwrap(),
                 ToolchainInput::Reuse(Arc::clone(&sdk)),
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(5),
@@ -1650,7 +1861,7 @@ mod tests {
         assert!(
             ready(receive_inputs(
                 &mut wire,
-                source,
+                SourceInput::uncached(source).unwrap(),
                 ToolchainInput::Reuse(sdk),
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(5),
