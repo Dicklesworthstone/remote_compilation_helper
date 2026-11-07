@@ -105,6 +105,22 @@ cancellation retains ownership. Durable completion and fallback disk receipts
 both use the scaled ten-second read allowance and terminate their owned local
 transport on timeout.
 
+The disk monitor's mandatory completion acknowledgment uses the existing scaled
+heartbeat allowance when its pipe is full. The guardian also drains queued
+heartbeats before accepting that acknowledgment and normal supervisor exit.
+Parent loss, cancellation, abnormal exit and uncertain delivery still stop the
+owned process group.
+
+Automatic recovery of a dead client's lease scales its five-minute control
+allowance and retains a fixed thirty seconds of local exit slack, within the
+one-hour cap. Admission, historical transport verification, SSH inspection,
+the recovery client and final journal confirmation consume one original
+deadline. The child receives the daemon's resolved timing scale and a
+whole-second timeout derived from the remaining allowance; the parent enforces
+the exact elapsed boundary. Readiness scans also bound queued lock waits while
+retaining candidates and their ownership for a later scan. These limits govern
+recovery control work and do not change compiler or test lifetimes.
+
 The affected operations are worker toolchain/capability/telemetry probes,
 embedded disk-monitor admission and heartbeat observations, source-namespace
 control, cancellation observation and settlement, and completion-receipt
