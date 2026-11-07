@@ -62,14 +62,19 @@ class SourceNamespaceRegistryLockTests(unittest.TestCase):
                 child.kill()  # Only this fixture's exact unreaped child.
             child.communicate(timeout=5)
 
-    def start(self, command=None):
+    def start(self, command=None, *, timing_scale=None):
         if command is None:
             command = [sys.executable, "-I", "-S", "-c",
                        "from pathlib import Path; Path({!r}).write_text('admitted'); "
                        "print('ADMITTED', flush=True)".format(str(self.mutation))]
+        env = dict(os.environ)
+        env.pop("RCH_TIMING_SCALE", None)
+        if timing_scale is not None:
+            env["RCH_TIMING_SCALE"] = timing_scale
         child = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", self.program, str(self.lock), *command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env,
         )
         self.children.append(child)
         return child
@@ -88,6 +93,78 @@ class SourceNamespaceRegistryLockTests(unittest.TestCase):
                     return
             time.sleep(0.01)
         self.fail("metadata waiter never opened the held inode")
+
+    def test_invalid_transported_scale_refuses_before_creating_lock(self):
+        for value in ("", "0", "0.99", "10.1", "nan", "inf", "1e9999",
+                      "1_0", "٢", " 2", "2 ", "0" * 128 + "2",
+                      "$(printf injected)", "1;printf injected"):
+            with self.subTest(value=value):
+                child = self.start(timing_scale=value)
+                stdout, stderr = child.communicate(timeout=3)
+                self.assertEqual((child.returncode, stdout), (78, b""))
+                self.assertIn(b"RCH_SOURCE_NAMESPACE_INVALID_TIMING_SCALE", stderr)
+                self.assertFalse(self.lock.exists())
+                self.assertFalse(self.mutation.exists())
+
+    def test_scaled_lock_wait_accepts_release_after_default_deadline(self):
+        self.lock.write_text("metadata\n")
+        with self.lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = self.start(timing_scale="2")
+            self.wait_until_old_inode_is_open(child, held)
+            time.sleep(5.5)
+            self.assertIsNone(child.poll())
+            self.assertFalse(self.mutation.exists())
+            fcntl.flock(held, fcntl.LOCK_UN)
+            stdout, stderr = child.communicate(timeout=5)
+        self.assertEqual((child.returncode, stdout, stderr),
+                         (0, b"ADMITTED\n", b""))
+        self.assertEqual(self.mutation.read_text(), "admitted")
+
+    def test_scaled_lock_wait_still_expires_without_late_mutation(self):
+        self.lock.write_text("retained metadata\n")
+        started = time.monotonic()
+        with self.lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = self.start(timing_scale="2")
+            stdout, stderr = child.communicate(timeout=13)
+            self.assertEqual((child.returncode, stdout), (76, b""))
+            self.assertIn(b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY", stderr)
+            elapsed = int(stderr.split(b"elapsed_ms=", 1)[1].split()[0])
+            self.assertGreaterEqual(elapsed, 10000)
+            self.assertLess(time.monotonic() - started, 13)
+            self.assertFalse(self.mutation.exists())
+            self.assertEqual(self.lock.read_text(), "retained metadata\n")
+        self.assertFalse(self.mutation.exists())
+
+    def test_late_successful_flock_cannot_bypass_elapsed_admission_limit(self):
+        # Delay only return from the real native acquisition. This models a
+        # waiter descheduled across its deadline without replacing flock,
+        # inode validation, descriptor inheritance, or the initializer.
+        original = self.program
+        self.program = (
+            "import fcntl,time\n"
+            "native_flock=fcntl.flock\n"
+            "def delayed_flock(descriptor,operation):\n"
+            "    time.sleep(5.5)\n"
+            "    return native_flock(descriptor,operation)\n"
+            "fcntl.flock=delayed_flock\n"
+        ) + original
+        try:
+            for scale, succeeds in (("1", False), ("2", True)):
+                with self.subTest(scale=scale):
+                    child = self.start(timing_scale=scale)
+                    stdout, stderr = child.communicate(timeout=9)
+                    if succeeds:
+                        self.assertEqual((child.returncode, stdout, stderr),
+                                         (0, b"ADMITTED\n", b""))
+                    else:
+                        self.assertEqual((child.returncode, stdout), (76, b""))
+                        self.assertIn(
+                            b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY", stderr)
+                        self.assertFalse(self.mutation.exists())
+        finally:
+            self.program = original
 
     def test_busy_timeout_names_lock_and_elapsed_wait_without_admission(self):
         self.lock.write_text("original metadata lock\n")
@@ -594,6 +671,157 @@ class SourceNamespaceControlTests(unittest.TestCase):
             child.wait(timeout=5)
             child.stdout.close()
             child.stderr.close()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and FLOCK,
+                     "requires native Linux metadata supervision and flock")
+class SourceClaimAdmissionTimingTests(unittest.TestCase):
+    """Run the shared retry program inside the actual metadata controller."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-source-admission-timing-"))
+        self.counter = self.root / "attempts"
+        self.ready = self.root / "released"
+        self.mutation = self.root / "admitted"
+        self.lock = self.root / "source.lock"
+        self.children = []
+        self.control = CONTROL.read_text()
+        self.admission = Path(os.environ.get(
+            "RCH_TEST_SOURCE_NAMESPACE_ADMISSION",
+            REPO / "rch/src/hook/source_claim_admission.sh")).read_text()
+        tools = self.root / "tools"
+        tools.mkdir()
+        shell = tools / "sh"
+        shell.write_text("#!/bin/sh\nexec " + shlex.quote(SHELL) + ' "$@"\n')
+        shell.chmod(0o700)
+        self.env = {**os.environ, "LC_ALL": "C",
+                    "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+
+    def tearDown(self):
+        for child in self.children:
+            if child.poll() is None:
+                child.terminate()  # Exact unreaped observer; its guardian drains the group.
+            try:
+                child.communicate(timeout=4)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate(timeout=4)
+
+    def start(self, body, *, retry_seconds=5, scale="1"):
+        program = (
+            "rch_source_attempt() { (\nset -eu\n"
+            + "exec 9<>" + shlex.quote(str(self.lock)) + "\n"
+            + shlex.quote(FLOCK) + " -x 9\n"
+            + "printf 'attempt\\n' >> " + shlex.quote(str(self.counter)) + "\n"
+            + body + "\n); }\n"
+            + f"rch_admission_retry_seconds={retry_seconds}\n" + self.admission
+        )
+        child = subprocess.Popen(
+            [SHELL, "-c", "set -- RCH_SOURCE_INTENT_CANCEL\n" + self.control],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**self.env, "RCH_TIMING_SCALE": scale},
+        )
+        self.children.append(child)
+        child.stdin.write(program.encode())
+        child.stdin.close()
+        child.stdin = None
+        return child
+
+    def attempt_count(self):
+        try:
+            return len(self.counter.read_text().splitlines())
+        except FileNotFoundError:
+            return 0
+
+    def wait_for_attempts(self, child, count, timeout):
+        deadline = time.monotonic() + timeout
+        while self.attempt_count() < count:
+            self.assertIsNone(child.poll(), "admission ended before its scheduled recovery")
+            self.assertLess(time.monotonic(), deadline, "admission did not make progress")
+            time.sleep(0.01)
+
+    def conflict_until_released(self):
+        return (
+            "if [ ! -e " + shlex.quote(str(self.ready)) + " ]; then\n"
+            "  printf '%s\\n' 'RCH: durable source ownership: unfinished overlapping source owner' >&2\n"
+            "  exit 75\nfi\n"
+            "printf 'retained admission\\n' > " + shlex.quote(str(self.mutation)) + "\n"
+            "printf owned\n"
+        )
+
+    def test_scaled_window_accepts_recovery_after_old_six_attempt_ceiling(self):
+        child = self.start(self.conflict_until_released(), scale="2")
+        # Seven started attempts exceed the old count ceiling.
+        # Do not assert a fixed total attempt count for an elapsed policy.
+        self.wait_for_attempts(child, 7, timeout=12)
+        self.assertFalse(self.mutation.exists())
+        self.ready.touch()
+        stdout, stderr = child.communicate(timeout=6)
+        self.assertEqual((child.returncode, stdout), (0, b"owned"), stderr)
+        self.assertGreater(self.attempt_count(), 6)
+        self.assertEqual(self.mutation.read_text(), "retained admission\n")
+        with self.lock.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_default_elapsed_expiry_cannot_admit_after_late_owner_release(self):
+        started = time.monotonic()
+        child = self.start(self.conflict_until_released())
+        stdout, stderr = child.communicate(timeout=9)
+        self.assertEqual((child.returncode, stdout), (75, b""), stderr)
+        self.assertIn(b"unfinished overlapping source owner", stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 5)
+        self.assertLess(time.monotonic() - started, 9)
+        attempts = self.attempt_count()
+        self.assertGreaterEqual(attempts, 2)
+        self.assertFalse(self.mutation.exists())
+        with self.lock.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.ready.touch()
+        time.sleep(0.2)
+        self.assertEqual(self.attempt_count(), attempts)
+        self.assertFalse(self.mutation.exists())
+
+    def test_first_slow_success_keeps_its_enclosing_execution_allowance(self):
+        started = time.monotonic()
+        child = self.start("sleep 1.3\nprintf owned\n", retry_seconds=1)
+        stdout, stderr = child.communicate(timeout=6)
+        self.assertEqual((child.returncode, stdout, stderr), (0, b"owned", b""))
+        self.assertGreaterEqual(time.monotonic() - started, 1.2)
+        self.assertEqual(self.attempt_count(), 1)
+
+    def test_late_mutating_success_is_unconfirmed_and_never_retried(self):
+        body = (
+            "if [ \"$(wc -l < " + shlex.quote(str(self.counter)) + ")\" -eq 1 ]; then\n"
+            "  printf '%s\\n' 'RCH: durable source ownership: unfinished overlapping source owner' >&2\n"
+            "  exit 75\nfi\n"
+            "printf 'retained admission\\n' > " + shlex.quote(str(self.mutation)) + "\n"
+            "sleep 1.3\nprintf owned\n"
+        )
+        child = self.start(body, retry_seconds=2)
+        stdout, stderr = child.communicate(timeout=6)
+        # The attempt really mutated. Returning retryable75 or forwarding its
+        # ready bytes would misclassify uncertain publication as pre-grant busy.
+        self.assertEqual((child.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"unfinished overlapping source owner", stderr)
+        self.assertIn(b"RCH_SOURCE_ADMISSION_UNCONFIRMED", stderr)
+        self.assertEqual(self.mutation.read_text(), "retained admission\n")
+        self.assertEqual(self.attempt_count(), 2, "unconfirmed mutation was retried")
+        with self.lock.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_non_conflict_statuses_and_failed_setup_are_terminal(self):
+        for status in (1, 73, 76, 137):
+            with self.subTest(status=status):
+                before = self.attempt_count()
+                child = self.start(f"printf owned\nexit {status}\n", retry_seconds=2)
+                stdout, stderr = child.communicate(timeout=5)
+                self.assertEqual((child.returncode, stdout), (status, b""), stderr)
+                self.assertEqual(self.attempt_count(), before + 1)
+        before = self.attempt_count()
+        child = self.start("false\nprintf owned\n", retry_seconds=2)
+        stdout, stderr = child.communicate(timeout=5)
+        self.assertEqual((child.returncode, stdout), (1, b""), stderr)
+        self.assertEqual(self.attempt_count(), before + 1)
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),

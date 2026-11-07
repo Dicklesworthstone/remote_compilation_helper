@@ -568,13 +568,9 @@ mod source_topology_cli {
                 .unwrap()["status"],
             75
         );
-        assert_eq!(
-            std::fs::read_to_string(fixture.root.path().join("bad/attempts"))
-                .unwrap()
-                .lines()
-                .count(),
-            6
-        );
+        let attempts = std::fs::read_to_string(fixture.root.path().join("bad/attempts")).unwrap();
+        // An elapsed window permits a variable number of registry transactions.
+        assert!(attempts.lines().count() >= 1, "{attempts}");
         let state = fixture.state.lock().unwrap();
         assert!(state.cached.is_none());
         assert_eq!(state.releases[0]["worker_source_busy"], "1");
@@ -671,6 +667,14 @@ def event(phase, status):
     with (base / 'ssh-events.jsonl').open('a') as stream:
         stream.write(json.dumps(dict(worker=worker, phase=phase, status=status)) + '\n')
 first = sys.stdin.buffer.readline()
+timing_prefix = b''
+if first.startswith(b'export RCH_TIMING_SCALE='):
+    assert first.endswith(b';\n'), 'invalid transported timing header'
+    value = first[len(b'export RCH_TIMING_SCALE='):-2].decode('ascii')
+    assert 1.0 <= float(value) <= 10.0, 'invalid transported timing scale'
+    os.environ['RCH_TIMING_SCALE'] = value
+    timing_prefix = first
+    first = sys.stdin.buffer.readline()
 if first == b'{\n':
     second = sys.stdin.buffer.readline()
     if second != b'(\n':
@@ -683,7 +687,7 @@ if first == b'{\n':
         sys.exit(73)
     # The namespace RPC batches its live-checkout guard into one compound.
     first += second
-payload = first.decode() + sys.stdin.buffer.read().decode()
+payload = timing_prefix.decode() + first.decode() + sys.stdin.buffer.read().decode()
 batched = first == b'{\n(\n'
 if batched:
     assert payload.count('RCH_SYNC_LIVE_CHECKOUT_REFUSED:') == 1, 'namespace RPC lost its guard'
@@ -739,7 +743,7 @@ attempt = command('topology', 'b1', check, create)
 script = ('rch_source_attempt() { (\nset -eu\nprintf "attempt\\n" >> '
           + shlex.quote(str(root / 'attempts')) + '\nexec ' + shlex.join(attempt)
           + " <<'RCH_FIXTURE_ROOTS'\n" + roots.decode() + 'RCH_FIXTURE_ROOTS\n); }\n'
-          + 'rch_admission_attempts=6\n' + (base / 'admission.sh').read_text())
+          + 'rch_admission_retry_seconds=5\n' + (base / 'admission.sh').read_text())
 result = subprocess.run(['sh', '-c', script], capture_output=True, timeout=10)
 event('namespace', result.returncode)
 sys.stdout.buffer.write(result.stdout)

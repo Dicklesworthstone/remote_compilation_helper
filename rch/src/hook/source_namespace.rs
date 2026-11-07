@@ -119,15 +119,30 @@ fn topology_refusal_detail(
 // required for the registry's record/directory fsync. The descriptor survives
 // exec and CONTROL kills every inheriting descendant before acknowledgement.
 const REGISTRY_LOCK: &str = r#"
-import errno, fcntl, math, os, stat, sys, time
+import errno, fcntl, math, os, re, stat, sys, time
 try:
-    timing_scale = float(os.environ.get('RCH_TIMING_SCALE', '1'))
+    timing_text = os.environ.get('RCH_TIMING_SCALE', '1')
+    if (len(timing_text) > 128 or re.fullmatch(
+            r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?',
+            timing_text) is None):
+        raise ValueError('invalid transported scale')
+    timing_scale = float(timing_text)
     if not math.isfinite(timing_scale) or not 1.0 <= timing_scale <= 10.0:
         raise ValueError('scale outside [1, 10]')
 except ValueError:
     print('RCH_SOURCE_NAMESPACE_INVALID_TIMING_SCALE', file=sys.stderr)
     sys.exit(78)
+
 started = time.monotonic()
+deadline = started + 5 * timing_scale
+
+def require_admission_time():
+    now = time.monotonic()
+    if now >= deadline:
+        print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
+            int((now - started) * 1000), sys.argv[1]), file=sys.stderr)
+        sys.exit(76)
+
 try:
     lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     info = os.fstat(lock)
@@ -137,22 +152,22 @@ try:
         named = os.stat(sys.argv[1], follow_symlinks=False)
         if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
             raise OSError('metadata lock changed while waiting')
+        # A resumed waiter must not acquire after its observation window.
+        require_admission_time()
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
         except OSError as error:
             if error.errno not in (errno.EAGAIN, errno.EACCES):
                 raise
-        elapsed = time.monotonic() - started
-        if elapsed >= 5 * timing_scale:
-            print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
-                int(elapsed * 1000), sys.argv[1]), file=sys.stderr)
-            sys.exit(76)
-        time.sleep(0.02)
+        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
     named = os.stat(sys.argv[1], follow_symlinks=False)
     if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
         raise OSError('metadata lock changed after acquisition')
     os.set_inheritable(lock, True)
+    # Successful LOCK_NB can itself return after a scheduling stall. No
+    # initializer may run merely because acquisition eventually succeeded.
+    require_admission_time()
     os.execvp(sys.argv[2], sys.argv[2:])
 except OSError as error:
     print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID {}'.format(error), file=sys.stderr)
@@ -296,7 +311,7 @@ fn namespace_command(
          exec python3 -I -S -c {lock_program} \"$registry/metadata.lock\" sh -c {script} \
          rch-source-namespace \"$registry\" {identity} {digest} topology {check} {create} \
          <<'RCH_NAMESPACE_SCOPE'\n{body}RCH_NAMESPACE_SCOPE\n\
-         ); }}\nrch_admission_attempts=6\n{ADMISSION}",
+         ); }}\nrch_admission_retry_seconds=5\n{ADMISSION}",
         setup = super::ssh::source_registry_setup(registry),
         lock_program = quote(REGISTRY_LOCK),
         script = quote(&registry_script),
@@ -384,7 +399,7 @@ pub(super) async fn initialize_worker_namespace(
 }
 
 /// The initializer's refusal as an error. Its admission loop already retried
-/// a briefly overlapping owner (`rch_admission_attempts`), so an overlap
+/// a briefly overlapping owner (`rch_admission_retry_seconds`), so an overlap
 /// verdict means another owner still holds this worker's source. Typed busy,
 /// the release fences the (project, worker) pair (bd-p3kuz). Untyped, rchd
 /// kept placing the project on the same worker: vmi1153651 refused it four
@@ -396,6 +411,10 @@ fn namespace_refusal(
     stderr: &[u8],
 ) -> anyhow::Error {
     let detail = String::from_utf8_lossy(stderr);
+    let admission_unconfirmed = detail.lines().any(|line| {
+        line.starts_with("RCH_SOURCE_ADMISSION_UNCONFIRMED")
+            || line.starts_with("RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE")
+    });
     let permanent_mapping = if status == Some(73)
         && !detail.lines().any(|line| {
             [
@@ -405,6 +424,8 @@ fn namespace_refusal(
                 "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY",
                 "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
                 "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH_SOURCE_ADMISSION_UNCONFIRMED",
+                "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
                 "RCH: durable source ownership: unfinished overlapping",
             ]
             .iter()
@@ -446,12 +467,18 @@ fn namespace_refusal(
                 detail: rendered_detail,
             },
         })
-    } else if status == Some(76) && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY") {
+    } else if !admission_unconfirmed
+        && status == Some(76)
+        && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY")
+    {
         error.context(crate::transfer::SourceAuthorityBusy(format!(
             "worker registry metadata lock on {} remained busy; no source grant was admitted",
             worker.id
         )))
-    } else if status == Some(75) && retryable_source_admission_error(&error) {
+    } else if !admission_unconfirmed
+        && status == Some(75)
+        && retryable_source_admission_error(&error)
+    {
         overlapping_owner_outlived_wait(error, worker)
     } else {
         error
@@ -772,6 +799,32 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_admission_never_becomes_busy_or_permanent() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("unconfirmed-admission"),
+            ..WorkerConfig::default()
+        };
+        let policy = test_policy();
+        for marker in [
+            "RCH_SOURCE_ADMISSION_UNCONFIRMED cause=deadline-after-success",
+            "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
+        ] {
+            let diagnostic = format!(
+                "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base\n\
+                 RCH: durable source ownership: unfinished overlapping source owner\n\
+                 RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5000\n\
+                 {marker}\n"
+            );
+            for status in [None, Some(73), Some(75), Some(76), Some(137)] {
+                let error = namespace_refusal(&worker, &policy, status, diagnostic.as_bytes());
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+                assert!(error.downcast_ref::<SourceTopologyIncompatible>().is_none());
+                assert!(format!("{error:#}").contains(marker));
+            }
+        }
+    }
+
+    #[test]
     fn source_namespace_permanent_mapping_requires_completed_explicit_verdict() {
         let worker = WorkerConfig {
             id: WorkerId::new("incompatible-worker"),
@@ -809,6 +862,8 @@ mod tests {
                 "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5000",
                 "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
                 "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH_SOURCE_ADMISSION_UNCONFIRMED cause=deadline-after-success",
+                "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
                 "RCH: durable source ownership: unfinished overlapping source owner",
             ] {
                 let mixed = format!("{diagnostic}{uncertain}\n");

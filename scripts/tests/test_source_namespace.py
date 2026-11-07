@@ -139,10 +139,10 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
             + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
             + "exec " + shlex.join(command) + " <<'RCH_NAMESPACE_SCOPE'\n"
             + data.decode() + "RCH_NAMESPACE_SCOPE\n); }\n"
-            + "rch_admission_attempts=6\n" + base.RETRY.read_text()
+            + "rch_admission_retry_seconds=5\n" + base.RETRY.read_text()
         )
         result = subprocess.run([base.SHELL, "-c", script], capture_output=True,
-                                timeout=5, env=self.env)
+                                timeout=5, env={**self.env, "RCH_TIMING_SCALE": "1"})
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(counter.read_text().splitlines(), ["attempt"])
         self.assertEqual(self.alias.resolve(), physical)
@@ -184,10 +184,11 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
             + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
             + "exec " + shlex.join(command) + " <<'RCH_NAMESPACE_SCOPE'\n"
             + data.decode() + "RCH_NAMESPACE_SCOPE\n); }\n"
-            + "rch_admission_attempts=3\n" + base.RETRY.read_text()
+            + "rch_admission_retry_seconds=3\n" + base.RETRY.read_text()
         )
         child = subprocess.Popen([base.SHELL, "-c", script], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=self.env)
+                                 stderr=subprocess.PIPE,
+                                 env={**self.env, "RCH_TIMING_SCALE": "1"})
         self.addCleanup(self.reap, child)
         deadline = time.monotonic() + 5
         while not counter.exists() and child.poll() is None and time.monotonic() < deadline:
