@@ -690,22 +690,32 @@ impl BackgroundProbe {
         Some(operation())
     }
 
-    pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
-        if !self.is_current() {
-            return None;
+    /// Boxes `operation` before any state machine captures it: as an
+    /// `async fn` parameter it was stored twice (argument and select arm),
+    /// and every probe caller inlined both copies up the selection, health
+    /// and cleanup chains until debug test stacks overflowed (bd-4ncr5).
+    pub(crate) fn run<F: std::future::Future>(
+        &mut self,
+        operation: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> {
+        let operation = Box::pin(operation);
+        async move {
+            if !self.is_current() {
+                return None;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = self.changes.changed() => None,
+                () = async {
+                    match &mut self.transport {
+                        Some((changes, _)) => { let _ = changes.changed().await; }
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                result = operation => Some(result),
+            };
+            self.is_current().then_some(result).flatten()
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.changes.changed() => None,
-            () = async {
-                match &mut self.transport {
-                    Some((changes, _)) => { let _ = changes.changed().await; }
-                    None => std::future::pending().await,
-                }
-            } => None,
-            result = operation => Some(result),
-        };
-        self.is_current().then_some(result).flatten()
     }
 }
 

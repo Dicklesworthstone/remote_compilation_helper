@@ -4,9 +4,9 @@
 //! and provides the Unix socket API for the hook CLI.
 
 #![forbid(unsafe_code)]
-// The fenced cancellation/recovery futures (634f68b) nest deeper than the
-// default 128 query depth when rustc proves spawned tasks Send (cancellation
-// and selection) and lays out api::handle_connection. Compile-time bound only.
+// Proving the spawned cancellation (cancellation.rs) and toolchain-probe
+// (selection.rs) tasks Send walks deeper than the default 128 query depth;
+// that depth follows type nesting, not future size. Compile-time bound only.
 #![recursion_limit = "256"]
 
 mod admission;
