@@ -1925,6 +1925,41 @@ impl WorkerState {
         (tokio::time::Instant::now() < deadline).then_some(guard)
     }
 
+    /// Acquire every live recovery destination before its durable commit.
+    /// Callers retain store, endpoint, then network-publication guards. Match
+    /// command failure's circuit-before-error order; lifecycle is acquired last.
+    /// The callback must commit synchronously, without awaiting or reborrowing
+    /// the admission watches, so cancellation cannot retire a durable quarantine
+    /// and then abandon its matching live transition.
+    pub(crate) async fn with_recovery_state_before<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        provenance: &BackgroundProbe,
+        commit: impl FnOnce(&mut WorkerLifecycle, &mut CircuitStats, &mut Option<String>) -> T,
+    ) -> Option<T> {
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
+            return None;
+        }
+        let acquire = async {
+            let circuit = self.circuit.write().await;
+            let last_error = self.last_error_msg.write().await;
+            let lifecycle = self.lifecycle.write().await;
+            (lifecycle, circuit, last_error)
+        };
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => None,
+            (mut lifecycle, mut circuit, mut last_error) = acquire => {
+                provenance.with_current(|| {
+                    if tokio::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    Some(commit(&mut lifecycle, &mut circuit, &mut last_error))
+                }).flatten()
+            }
+        }
+    }
+
     /// Record a failed operation for circuit breaker.
     pub async fn record_failure(&self, error_msg: Option<String>) {
         let mut circuit = self.circuit.write().await;
@@ -8808,6 +8843,137 @@ mod tests {
             assert_eq!(pressure.state, PressureState::Warning);
             assert!(!pressure.telemetry_fresh);
             assert!(pressure.telemetry_age_secs.unwrap() >= 91);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_publication_waits_for_every_destination_before_committing() {
+        for destination in ["circuit", "error", "lifecycle"] {
+            for elapsed in [
+                Duration::from_millis(19),
+                Duration::from_millis(20),
+                Duration::from_millis(21),
+            ] {
+                let worker = WorkerState::new(test_config("recovery-publication"));
+                assert!(worker.reserve_slots(1).await);
+                worker.enter_bypass(BypassFailureClass::Ssh).await;
+                worker.open_circuit().await;
+                worker.set_error("original failure".into()).await;
+                let original = worker.lifecycle().await;
+                let provenance = worker.network_revision_guard();
+                let circuit = if destination == "circuit" {
+                    Some(worker.circuit.write().await)
+                } else {
+                    None
+                };
+                let error = if destination == "error" {
+                    Some(worker.last_error_msg.write().await)
+                } else {
+                    None
+                };
+                let lifecycle = if destination == "lifecycle" {
+                    Some(worker.lifecycle.write().await)
+                } else {
+                    None
+                };
+                let committed = std::cell::Cell::new(false);
+                let mut publication = Box::pin(worker.with_recovery_state_before(
+                    tokio::time::Instant::now() + Duration::from_millis(20),
+                    &provenance,
+                    |lifecycle, circuit, error| {
+                        committed.set(true);
+                        lifecycle.recover_to_canary().unwrap();
+                        lifecycle.promote_from_canary().unwrap();
+                        circuit.close();
+                        *error = None;
+                    },
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert!(!committed.get());
+                tokio::time::advance(elapsed).await;
+                drop((circuit, error, lifecycle));
+                let timely = elapsed < Duration::from_millis(20);
+                assert_eq!(publication.await.is_some(), timely, "{destination}");
+                assert_eq!(committed.get(), timely, "{destination}");
+                assert_eq!(
+                    worker.used_slots(),
+                    1,
+                    "recovery never retires a build owner"
+                );
+                if timely {
+                    assert!(worker.lifecycle().await.is_schedulable());
+                    assert_eq!(worker.circuit_stats().await.state(), CircuitState::Closed);
+                    assert_eq!(worker.last_error().await, None);
+                } else {
+                    assert_eq!(worker.lifecycle().await, original);
+                    assert_eq!(worker.circuit_stats().await.state(), CircuitState::Open);
+                    assert_eq!(
+                        worker.last_error().await.as_deref(),
+                        Some("original failure")
+                    );
+                    assert!(
+                        worker
+                            .with_recovery_state_before(
+                                tokio::time::Instant::now() + Duration::from_millis(20),
+                                &provenance,
+                                |lifecycle, circuit, error| {
+                                    lifecycle.recover_to_canary().unwrap();
+                                    lifecycle.promote_from_canary().unwrap();
+                                    circuit.close();
+                                    *error = None;
+                                },
+                            )
+                            .await
+                            .is_some()
+                    );
+                    assert!(worker.lifecycle().await.is_schedulable());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_or_revoked_recovery_publication_retains_all_old_evidence() {
+        for revoke in [false, true] {
+            let worker = WorkerState::new(test_config("recovery-revoked"));
+            worker.enter_bypass(BypassFailureClass::Ssh).await;
+            worker.open_circuit().await;
+            worker.set_error("retained failure".into()).await;
+            let original = worker.lifecycle().await;
+            let provenance = worker.network_revision_guard();
+            let lifecycle = worker.lifecycle.write().await;
+            let committed = std::cell::Cell::new(false);
+            let mut publication = Box::pin(worker.with_recovery_state_before(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &provenance,
+                |_, _, _| committed.set(true),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if revoke {
+                worker
+                    .network_changes
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                drop(lifecycle);
+                assert!(publication.await.is_none());
+            } else {
+                drop(publication);
+                drop(lifecycle);
+            }
+            assert!(!committed.get());
+            assert_eq!(worker.lifecycle().await, original);
+            assert_eq!(worker.circuit_stats().await.state(), CircuitState::Open);
+            assert_eq!(
+                worker.last_error().await.as_deref(),
+                Some("retained failure")
+            );
         }
     }
 

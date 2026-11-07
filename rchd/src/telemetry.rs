@@ -23,6 +23,11 @@ use tracing::{debug, info, warn};
 
 const TEST_RUN_MEMORY_CAPACITY: usize = 200;
 
+/// Cache contention is distinct from absent or endpoint-mismatched evidence.
+/// A bounded recovery caller may retry without blocking its runtime thread.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TelemetryCacheBusy;
+
 struct StoredTelemetry {
     received: ReceivedTelemetry,
     observed_at: tokio::time::Instant,
@@ -204,6 +209,27 @@ impl TelemetryStore {
                 .find(|entry| entry.belongs_to(endpoint))
                 .map(|entry| entry.received.clone())
         })
+    }
+
+    /// Inspect endpoint-bound evidence without waiting on the synchronous
+    /// cache lock. Preserve both receipt clocks so queued recovery cannot make
+    /// an old observation fresh by reading or publishing it later.
+    pub(crate) fn try_latest_for_endpoint(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+    ) -> Result<Option<(ReceivedTelemetry, tokio::time::Instant)>, TelemetryCacheBusy> {
+        let recent = match self.recent.try_read() {
+            Ok(recent) => recent,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(TelemetryCacheBusy),
+        };
+        Ok(recent.get(endpoint.config.id.as_str()).and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry.belongs_to(endpoint))
+                .map(|entry| (entry.received.clone(), entry.observed_at))
+        }))
     }
 
     /// Get the most recent telemetry for all workers.
@@ -584,7 +610,10 @@ where
     Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
 {
     let ssh_timeout = scale_duration(ssh_timeout);
-    anyhow::ensure!(!ssh_timeout.is_zero(), "Telemetry collection timed out before admission");
+    anyhow::ensure!(
+        !ssh_timeout.is_zero(),
+        "Telemetry collection timed out before admission"
+    );
     // Disconnect retains its fixed local cleanup allowance. Remote durations
     // arrive already scaled, and an extreme caller cannot exceed the control cap.
     let budget = ssh_timeout
@@ -641,8 +670,7 @@ pub(crate) async fn publish_collected_telemetry(
     store: &TelemetryStore,
     collected: CollectedTelemetry,
 ) -> anyhow::Result<WorkerTelemetry> {
-    publish_telemetry_before(worker, store, &collected, TelemetrySource::OnDemand, None)
-    .await?;
+    publish_telemetry_before(worker, store, &collected, TelemetrySource::OnDemand, None).await?;
     Ok(collected.telemetry)
 }
 
@@ -740,9 +768,7 @@ async fn publish_telemetry_before(
     {
         info!(
             worker = endpoint.config.id.as_str(),
-            "Worker circuit state: {:?} -> {:?} (telemetry poll succeeded)",
-            previous,
-            new,
+            "Worker circuit state: {:?} -> {:?} (telemetry poll succeeded)", previous, new,
         );
     }
     store.notify_ingested(telemetry);
@@ -779,13 +805,8 @@ async fn collect_telemetry_for_endpoint(
     // fall back to a throwaway connect+exec+disconnect (mirrors the pattern in
     // TelemetryPoller::run_remote for the on-demand / no-pool paths).
     let result = if let Some(pool) = &ssh_pool {
-        pool.run_with_timeout_until(
-            &worker_config,
-            &command,
-            options.command_timeout,
-            deadline,
-        )
-        .await
+        pool.run_with_timeout_until(&worker_config, &command, options.command_timeout, deadline)
+            .await
     } else {
         let mut client = SshClient::new(worker_config, options);
         client.connect_until(deadline).await?;
@@ -882,9 +903,15 @@ async fn poll_worker(
         "throwaway-ssh"
     };
     let ssh_timeout = scale_duration(config.ssh_timeout);
-    poll_worker_with_deadline(worker, store, config, transport, move |endpoint, deadline| {
-        collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone(), deadline)
-    })
+    poll_worker_with_deadline(
+        worker,
+        store,
+        config,
+        transport,
+        move |endpoint, deadline| {
+            collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone(), deadline)
+        },
+    )
     .await
 }
 
@@ -900,9 +927,13 @@ where
     F: FnMut(rch_common::WorkerConfig) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
 {
-    poll_worker_with_deadline(worker, store, config, transport, move |endpoint, _deadline| {
-        collect(endpoint)
-    })
+    poll_worker_with_deadline(
+        worker,
+        store,
+        config,
+        transport,
+        move |endpoint, _deadline| collect(endpoint),
+    )
     .await
 }
 
@@ -930,8 +961,10 @@ where
         let endpoint = worker.endpoint_snapshot().await;
         Some((admission, endpoint))
     };
-    let Some((mut admission, endpoint)) =
-        tokio::time::timeout_at(poll_deadline, preparation).await.ok().flatten()
+    let Some((mut admission, endpoint)) = tokio::time::timeout_at(poll_deadline, preparation)
+        .await
+        .ok()
+        .flatten()
     else {
         return false;
     };
@@ -1075,8 +1108,7 @@ where
         render_poll_failures(&failures)
     );
     if attempts != 0
-        && let Some(deadline) =
-            poll_deadline.checked_add(TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE)
+        && let Some(deadline) = poll_deadline.checked_add(TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE)
     {
         record_poll_failure_before(
             &worker,
@@ -1135,13 +1167,14 @@ async fn record_poll_failure_before(
                     // A successful sample observed during this poll supersedes
                     // its failure. The monotonic receipt time is preserved
                     // through handoff and cache contention.
-                    let superseded = recent
-                        .get(endpoint.config.id.as_str())
-                        .is_some_and(|entries| {
-                            entries.iter().any(|entry| {
-                                entry.belongs_to(endpoint) && entry.observed_at >= poll_started
-                            })
-                        });
+                    let superseded =
+                        recent
+                            .get(endpoint.config.id.as_str())
+                            .is_some_and(|entries| {
+                                entries.iter().any(|entry| {
+                                    entry.belongs_to(endpoint) && entry.observed_at >= poll_started
+                                })
+                            });
                     if superseded
                         || tokio::time::Instant::now() >= deadline
                         || !admission.is_current()
@@ -1162,17 +1195,17 @@ async fn record_poll_failure_before(
             tokio::time::sleep(Duration::from_millis(5).min(remaining)).await;
         }
     };
-    let Some((previous, new)) =
-        tokio::time::timeout_at(deadline, publication).await.ok().flatten()
+    let Some((previous, new)) = tokio::time::timeout_at(deadline, publication)
+        .await
+        .ok()
+        .flatten()
     else {
         return false;
     };
     if previous != new {
         info!(
             worker = endpoint.config.id.as_str(),
-            "Worker circuit state: {:?} -> {:?} (telemetry poll exhausted)",
-            previous,
-            new,
+            "Worker circuit state: {:?} -> {:?} (telemetry poll exhausted)", previous, new,
         );
     }
     true
@@ -1669,6 +1702,57 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn nonblocking_endpoint_telemetry_distinguishes_contention_and_preserves_age() {
+        let worker = WorkerState::new(create_worker_config("recovery-cache"));
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        assert!(store.try_latest_for_endpoint(&endpoint).unwrap().is_none());
+        store.ingest_for_endpoint(
+            make_telemetry("recovery-cache", 42.0, 20.0),
+            TelemetrySource::SshPoll,
+            &endpoint,
+        );
+        let (before, observed_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+
+        let blocked = HeldTelemetryCache::new(store.clone());
+        assert!(matches!(
+            store.try_latest_for_endpoint(&endpoint),
+            Err(TelemetryCacheBusy)
+        ));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drop(blocked);
+
+        let (after, still_observed_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+        assert_eq!(after.received_at, before.received_at);
+        assert_eq!(after.telemetry.cpu.overall_percent, 42.0);
+        assert_eq!(still_observed_at, observed_at);
+        assert_eq!(still_observed_at.elapsed(), Duration::from_secs(20));
+
+        // Match the existing getter's poison-recovery policy; poisoning is
+        // not reported as contention and does not replace the stored clocks.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = store.recent.write().unwrap();
+            panic!("fixture poisons the telemetry cache");
+        }));
+        assert!(poisoned.is_err());
+        let (recovered, recovered_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+        assert_eq!(recovered.received_at, before.received_at);
+        assert_eq!(recovered_at, observed_at);
+
+        let mut replacement = create_worker_config("recovery-cache");
+        replacement.host = "replacement.example".into();
+        assert!(worker.update_config(replacement).await);
+        let replacement = worker.endpoint_snapshot().await;
+        assert!(
+            store
+                .try_latest_for_endpoint(&replacement)
+                .unwrap()
+                .is_none(),
+            "an old endpoint sample cannot qualify the replacement"
+        );
+    }
+
     async fn test_collected_telemetry(
         worker: &WorkerState,
         cpu: f64,
@@ -1756,9 +1840,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(telemetry.cpu.overall_percent, 42.0);
-        assert_eq!(store.latest("receipt-time").unwrap().received_at, received_at);
         assert_eq!(
-            store.recent.read().unwrap()["receipt-time"].back().unwrap().observed_at,
+            store.latest("receipt-time").unwrap().received_at,
+            received_at
+        );
+        assert_eq!(
+            store.recent.read().unwrap()["receipt-time"]
+                .back()
+                .unwrap()
+                .observed_at,
             observed_at
         );
         assert_eq!(
@@ -1784,9 +1874,7 @@ mod tests {
             let allowance = Duration::from_secs(2);
             let collected = test_collected_telemetry(&worker, 90.0, allowance).await;
             let blocked = worker
-                .lock_command_outcome_before(
-                    tokio::time::Instant::now() + Duration::from_secs(30),
-                )
+                .lock_command_outcome_before(tokio::time::Instant::now() + Duration::from_secs(30))
                 .await
                 .unwrap();
             let mut publication = Box::pin(publish_telemetry_before(
@@ -1801,7 +1889,12 @@ mod tests {
             drop(blocked);
             assert!(publication.await.is_err());
             assert_eq!(
-                store.latest("queued-publication").unwrap().telemetry.cpu.overall_percent,
+                store
+                    .latest("queued-publication")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
                 10.0
             );
             assert_eq!(
@@ -1820,7 +1913,12 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(
-                store.latest("queued-publication").unwrap().telemetry.cpu.overall_percent,
+                store
+                    .latest("queued-publication")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
                 20.0
             );
             assert_eq!(
@@ -1865,8 +1963,8 @@ mod tests {
                 } else {
                     None
                 };
-                let blocked_cache = (destination == "cache")
-                    .then(|| HeldTelemetryCache::new(store.clone()));
+                let blocked_cache =
+                    (destination == "cache").then(|| HeldTelemetryCache::new(store.clone()));
                 let attempts = AtomicUsize::new(0);
                 let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
                 let started = tokio::time::Instant::now();
@@ -1905,18 +2003,19 @@ mod tests {
                         "fresh-publication-test",
                         |endpoint| {
                             attempts.fetch_add(1, Ordering::SeqCst);
-                            std::future::ready(Ok(make_telemetry(
-                                endpoint.id.as_str(),
-                                20.0,
-                                20.0,
-                            )))
+                            std::future::ready(Ok(make_telemetry(endpoint.id.as_str(), 20.0, 20.0)))
                         },
                     )
                     .await
                 );
                 assert_eq!(attempts.load(Ordering::SeqCst), 2);
                 assert_eq!(
-                    store.latest("local-contention").unwrap().telemetry.cpu.overall_percent,
+                    store
+                        .latest("local-contention")
+                        .unwrap()
+                        .telemetry
+                        .cpu
+                        .overall_percent,
                     20.0
                 );
                 assert_eq!(
@@ -1941,11 +2040,7 @@ mod tests {
             let allowance = Duration::from_secs(2);
             let collected = test_collected_telemetry(&worker, 90.0, allowance).await;
             let blocked = HeldTelemetryCache::new(store.clone());
-            let mut publication = Box::pin(publish_collected_telemetry(
-                &worker,
-                &store,
-                collected,
-            ));
+            let mut publication = Box::pin(publish_collected_telemetry(&worker, &store, collected));
             assert_telemetry_pending(publication.as_mut()).await;
             match action {
                 "expire" => {
@@ -1965,7 +2060,15 @@ mod tests {
                 _ => unreachable!(),
             }
             drop(blocked);
-            assert_eq!(store.latest("busy-cache").unwrap().telemetry.cpu.overall_percent, 10.0);
+            assert_eq!(
+                store
+                    .latest("busy-cache")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
+                10.0
+            );
             assert_eq!(
                 worker.circuit_stats().await.consecutive_command_failures(),
                 1
@@ -2000,7 +2103,10 @@ mod tests {
             tokio::time::advance(TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE + lateness).await;
             drop(blocked);
             assert!(!publication.await);
-            assert_eq!(worker.circuit_stats().await.consecutive_command_failures(), 0);
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                0
+            );
             assert!(
                 record_poll_failure_before(
                     &worker,
@@ -2013,7 +2119,10 @@ mod tests {
                 )
                 .await
             );
-            assert_eq!(worker.circuit_stats().await.consecutive_command_failures(), 1);
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1
+            );
         }
     }
 
@@ -2026,8 +2135,7 @@ mod tests {
         let admission = worker.background_probe().await.unwrap();
         let poll_started = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_millis(1)).await;
-        let collected =
-            test_collected_telemetry(&worker, 42.0, Duration::from_secs(2)).await;
+        let collected = test_collected_telemetry(&worker, 42.0, Duration::from_secs(2)).await;
         publish_telemetry_before(
             &worker,
             &store,
@@ -2049,9 +2157,17 @@ mod tests {
             )
             .await
         );
-        assert_eq!(worker.circuit_stats().await.consecutive_command_failures(), 0);
         assert_eq!(
-            store.latest("superseded-failure").unwrap().telemetry.cpu.overall_percent,
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+        assert_eq!(
+            store
+                .latest("superseded-failure")
+                .unwrap()
+                .telemetry
+                .cpu
+                .overall_percent,
             42.0
         );
     }
@@ -2084,7 +2200,10 @@ mod tests {
         assert!(!publication.await);
         drop(blocked);
         assert!(store.latest("cancel-failure").is_none());
-        assert_eq!(worker.circuit_stats().await.consecutive_command_failures(), 0);
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
     }
 
     #[test]

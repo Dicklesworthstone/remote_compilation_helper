@@ -121,6 +121,21 @@ the exact elapsed boundary. Readiness scans also bound queued lock waits while
 retaining candidates and their ownership for a later scan. These limits govern
 recovery control work and do not change compiler or test lifetimes.
 
+Recovery of temporarily bypassed workers keeps one captured allowance across
+its concurrency queue, admission, SSH setup, capability probes and optional
+canary. Telemetry retains its original, unscaled freshness limit through local
+publication and the canary; a longer control allowance cannot make an old
+sample current. An exhausted remote phase has a fixed one-second allowance for
+local failure bookkeeping, with no further SSH work.
+
+Full worker rejoin stages the durable record removal before the final evidence
+check and acquires all live eligibility and circuit guards before committing.
+Expired or cancelled queued work retains quarantine. The final check uses the
+original deadline, telemetry expiry, endpoint and administrative authority.
+Once the atomic replacement commits under valid evidence, its outcome remains
+explicit even if the directory flush takes longer; unconfirmed durability
+retains the live quarantine for a later recovery attempt.
+
 The affected operations are worker toolchain/capability/telemetry probes,
 embedded disk-monitor admission and heartbeat observations, source-namespace
 control, cancellation observation and settlement, and completion-receipt

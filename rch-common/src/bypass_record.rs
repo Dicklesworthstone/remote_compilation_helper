@@ -39,7 +39,7 @@
 //! truncated to [`MAX_DIAGNOSTIC_CHARS`].
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -494,6 +494,81 @@ pub struct BypassRecordStore {
     records: BTreeMap<String, BypassRecord>,
 }
 
+/// Whether a staged retirement replaced the durable document. Once published,
+/// a directory-sync error must not be described as an unpublished rollback.
+#[derive(Debug)]
+#[must_use]
+pub enum BypassRetirementOutcome {
+    /// The caller's final proof/deadline check refused publication.
+    NotPublished,
+    /// The replacement was renamed into place. A sync failure keeps the live
+    /// quarantine record discoverable and must not authorize worker rejoin.
+    Published {
+        directory_sync_error: Option<std::io::Error>,
+    },
+}
+
+/// A removal staged without changing either the live map or durable document.
+///
+/// The exclusive store borrow spans staging and commit, preventing a queued
+/// update from being replaced by this removal's older map. Dropping this value
+/// discards its private temporary file and leaves the quarantine in place.
+#[derive(Debug)]
+#[must_use]
+pub struct PreparedBypassRetirement<'a> {
+    store: &'a mut BypassRecordStore,
+    proposed: BTreeMap<String, BypassRecord>,
+    staged: StagedBypassRecords,
+}
+
+impl PreparedBypassRetirement<'_> {
+    /// Revalidate the caller's original proof and deadline immediately before
+    /// atomic replacement. There are no awaits or file writes before rename
+    /// after this gate. An error return means rename did not publish.
+    ///
+    /// After rename, inspect the explicit publication outcome even if the
+    /// caller's deadline elapsed during directory synchronization. Only a
+    /// successfully synchronized replacement updates the live map.
+    pub fn commit(
+        self,
+        still_current: impl FnOnce() -> bool,
+    ) -> std::io::Result<BypassRetirementOutcome> {
+        if !still_current() {
+            return Ok(BypassRetirementOutcome::NotPublished);
+        }
+        let directory_sync_error = self.staged.publish(&self.store.path)?;
+        if directory_sync_error.is_none() {
+            self.store.records = self.proposed;
+        }
+        Ok(BypassRetirementOutcome::Published {
+            directory_sync_error,
+        })
+    }
+}
+
+/// The file body and directory handle are prepared before publication locks.
+/// Each staging operation owns a distinct file, including stores in the same
+/// process and directory; abandoning one cannot overwrite another's snapshot.
+#[derive(Debug)]
+struct StagedBypassRecords {
+    file: tempfile::NamedTempFile,
+    #[cfg(unix)]
+    directory: fs::File,
+}
+
+impl StagedBypassRecords {
+    /// An outer error is exclusively pre-publication. A directory-sync error
+    /// is returned as data because the atomic replacement already happened.
+    fn publish(self, path: &Path) -> std::io::Result<Option<std::io::Error>> {
+        self.file.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        let directory_sync_error = self.directory.sync_all().err();
+        #[cfg(not(unix))]
+        let directory_sync_error = None;
+        Ok(directory_sync_error)
+    }
+}
+
 impl BypassRecordStore {
     /// An empty store bound to `path` (nothing read from disk).
     #[must_use]
@@ -580,41 +655,72 @@ impl BypassRecordStore {
         Ok(Some(removed))
     }
 
+    /// Stage one removal while retaining the live quarantine and durable file.
+    /// Writing, flushing and file synchronization finish before this returns,
+    /// so the caller can acquire its destination locks afterward and perform a
+    /// final synchronous proof/deadline check in the returned commit method.
+    pub fn prepare_remove(
+        &mut self,
+        worker_id: &str,
+    ) -> std::io::Result<Option<PreparedBypassRetirement<'_>>> {
+        if !self.records.contains_key(worker_id) {
+            return Ok(None);
+        }
+        let mut proposed = self.records.clone();
+        proposed.remove(worker_id);
+        let staged = self.stage(&proposed)?;
+        Ok(Some(PreparedBypassRetirement {
+            store: self,
+            proposed,
+            staged,
+        }))
+    }
+
     /// Atomically and durably publish the records. The file and directory
     /// must reach storage before an owner-bound failure receipt is acknowledged.
     fn persist(&self, records: &BTreeMap<String, BypassRecord>) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
+        match self.stage(records)?.publish(&self.path)? {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
+    }
+
+    fn stage(
+        &self,
+        records: &BTreeMap<String, BypassRecord>,
+    ) -> std::io::Result<StagedBypassRecords> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        let directory = fs::File::open(parent)?;
+
         let doc = BypassRecordFile {
             schema_version: bypass_record_schema_version().to_string(),
             records: records.values().cloned().collect(),
         };
         let body = serde_json::to_vec_pretty(&doc)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let parent = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let tmp = parent.join(format!(".bypass_records.{}.tmp", std::process::id()));
-        {
-            let mut tmp_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
-            tmp_file.write_all(&body)?;
-            tmp_file.flush()?;
-            tmp_file.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".bypass_records.").suffix(".tmp");
         #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Match the previous OpenOptions create mode, including umask.
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        let mut file = builder.tempfile_in(parent)?;
+        file.write_all(&body)?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        Ok(StagedBypassRecords {
+            file,
+            #[cfg(unix)]
+            directory,
+        })
     }
 }
 
@@ -1411,6 +1517,316 @@ mod tests {
         assert!(store.remove("css").unwrap().is_none());
         let restarted = BypassRecordStore::load(&path);
         assert!(!restarted.contains("css"));
+        assert_eq!(restarted.get("peer"), Some(&peer));
+    }
+
+    #[test]
+    fn prepared_retirement_stages_and_revalidates_without_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let expected = record(BypassFailureClass::Ssh);
+        let peer = BypassRecord::new(
+            "peer",
+            "peer.example",
+            "u",
+            BypassFailureClass::PathSync,
+            TS,
+        );
+        store.upsert(expected.clone()).unwrap();
+        store.upsert(peer.clone()).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let current = std::cell::Cell::new(true);
+        let calls = std::cell::Cell::new(0);
+        let prepared = store.prepare_remove("css").unwrap().unwrap();
+        let staged_path = prepared.staged.file.path().to_path_buf();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let staged = BypassRecordStore::load(&staged_path);
+        assert!(!staged.contains("css"));
+        assert_eq!(staged.get("peer"), Some(&peer));
+
+        // Staging was allowed; evidence expired while destination locks were
+        // being acquired. Only the final gate can authorize replacement.
+        current.set(false);
+        let outcome = prepared
+            .commit(|| {
+                calls.set(calls.get() + 1);
+                assert!(staged_path.is_file());
+                assert_eq!(fs::read(&path).unwrap(), original);
+                current.get()
+            })
+            .unwrap();
+        assert!(matches!(outcome, BypassRetirementOutcome::NotPublished));
+        assert_eq!(calls.get(), 1);
+        assert!(!staged_path.exists());
+        assert_eq!(store.get("css"), Some(&expected));
+        assert_eq!(store.get("peer"), Some(&peer));
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let abandoned = store.prepare_remove("css").unwrap().unwrap();
+        let abandoned_path = abandoned.staged.file.path().to_path_buf();
+        drop(abandoned);
+        assert!(!abandoned_path.exists());
+        assert_eq!(store.get("css"), Some(&expected));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(store.prepare_remove("absent").unwrap().is_none());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn prepared_retirement_commits_exact_map_and_preserves_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let peer = BypassRecord::new("peer", "peer.example", "u", BypassFailureClass::Ssh, TS);
+        store
+            .upsert(record(BypassFailureClass::DiskInodePressure))
+            .unwrap();
+        store.upsert(peer.clone()).unwrap();
+
+        let prepared = store.prepare_remove("css").unwrap().unwrap();
+        let staged_path = prepared.staged.file.path().to_path_buf();
+        assert!(matches!(
+            prepared.commit(|| true).unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        assert!(!staged_path.exists());
+        assert!(!store.contains("css"));
+        assert_eq!(store.get("peer"), Some(&peer));
+        let document: BypassRecordFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document.schema_version, bypass_record_schema_version());
+        assert_eq!(document.records, vec![peer.clone()]);
+        let restarted = BypassRecordStore::load(&path);
+        assert!(!restarted.contains("css"));
+        assert_eq!(restarted.get("peer"), Some(&peer));
+    }
+
+    #[test]
+    fn prepared_retirement_failed_staging_keeps_live_and_durable_quarantine() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let saved = directory.path().join("saved-state");
+        let path = state.join("bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let expected = record(BypassFailureClass::DiskInodePressure);
+        store.upsert(expected.clone()).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        // A native filesystem obstruction prevents staging. It must not clear
+        // the discoverable live record or alter the last durable document.
+        fs::rename(&state, &saved).unwrap();
+        fs::write(&state, b"not a directory").unwrap();
+        assert!(store.prepare_remove("css").is_err());
+        assert_eq!(store.get("css"), Some(&expected));
+        assert_eq!(fs::read(saved.join("bypass.json")).unwrap(), original);
+        assert_eq!(
+            BypassRecordStore::load(saved.join("bypass.json")).get("css"),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn prepared_retirement_rename_failure_keeps_quarantine_and_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let saved = directory.path().join("saved-bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let expected = record(BypassFailureClass::DiskInodePressure);
+        let peer = BypassRecord::new("peer", "peer.example", "u", BypassFailureClass::Ssh, TS);
+        store.upsert(expected.clone()).unwrap();
+        store.upsert(peer.clone()).unwrap();
+        let original = fs::read(&path).unwrap();
+        let prepared = store.prepare_remove("css").unwrap().unwrap();
+        let staged_path = prepared.staged.file.path().to_path_buf();
+
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(prepared.commit(|| true).is_err());
+        assert!(!staged_path.exists());
+        assert!(path.is_dir());
+        assert_eq!(store.get("css"), Some(&expected));
+        assert_eq!(store.get("peer"), Some(&peer));
+        assert_eq!(fs::read(&saved).unwrap(), original);
+
+        fs::rename(&path, directory.path().join("obstruction")).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        assert!(matches!(
+            store
+                .prepare_remove("css")
+                .unwrap()
+                .unwrap()
+                .commit(|| true)
+                .unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        assert!(!store.contains("css"));
+        assert!(!BypassRecordStore::load(&path).contains("css"));
+        assert_eq!(store.get("peer"), Some(&peer));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_retirement_sync_failure_reports_publication_without_rejoin() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let mut store = BypassRecordStore::with_path(&path);
+        let expected = record(BypassFailureClass::ProcessObservation);
+        let peer = BypassRecord::new("peer", "peer.example", "u", BypassFailureClass::Ssh, TS);
+        store.upsert(expected.clone()).unwrap();
+        store.upsert(peer.clone()).unwrap();
+        let mut prepared = store.prepare_remove("css").unwrap().unwrap();
+        let staged_path = prepared.staged.file.path().to_path_buf();
+
+        // Use an actual failing sync_all syscall after the real rename. This
+        // local fault injection does not replace the publication operation.
+        let (socket, _peer_socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let descriptor: std::os::fd::OwnedFd = socket.into();
+        let unsyncable = fs::File::from(descriptor);
+        assert!(unsyncable.sync_all().is_err());
+        prepared.staged.directory = unsyncable;
+        assert!(matches!(
+            prepared.commit(|| true).unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: Some(_)
+            }
+        ));
+        assert!(!staged_path.exists());
+        let renamed = BypassRecordStore::load(&path);
+        assert!(!renamed.contains("css"), "rename already published");
+        assert_eq!(renamed.get("peer"), Some(&peer));
+        assert_eq!(
+            store.get("css"),
+            Some(&expected),
+            "live quarantine is retained"
+        );
+        assert_eq!(store.get("peer"), Some(&peer));
+
+        // A later complete synchronization may retire the retained record;
+        // the earlier published-but-unconfirmed outcome did not authorize it.
+        assert!(matches!(
+            store
+                .prepare_remove("css")
+                .unwrap()
+                .unwrap()
+                .commit(|| true)
+                .unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        assert!(!store.contains("css"));
+        assert_eq!(store.get("peer"), Some(&peer));
+    }
+
+    #[test]
+    fn prepared_retirements_have_independent_staging_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.json");
+        let second_path = directory.path().join("second.json");
+        let mut first = BypassRecordStore::with_path(&first_path);
+        let mut second = BypassRecordStore::with_path(&second_path);
+        let first_peer = BypassRecord::new(
+            "first-peer",
+            "first.example",
+            "u",
+            BypassFailureClass::Ssh,
+            TS,
+        );
+        let second_peer = BypassRecord::new(
+            "second-peer",
+            "second.example",
+            "u",
+            BypassFailureClass::PathSync,
+            TS,
+        );
+        first.upsert(record(BypassFailureClass::Ssh)).unwrap();
+        first.upsert(first_peer.clone()).unwrap();
+        second
+            .upsert(record(BypassFailureClass::StaleTelemetry))
+            .unwrap();
+        second.upsert(second_peer.clone()).unwrap();
+
+        let first_pending = first.prepare_remove("css").unwrap().unwrap();
+        let second_pending = second.prepare_remove("css").unwrap().unwrap();
+        assert_ne!(
+            first_pending.staged.file.path(),
+            second_pending.staged.file.path()
+        );
+        assert!(matches!(
+            second_pending.commit(|| true).unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        assert!(matches!(
+            first_pending.commit(|| true).unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        assert_eq!(
+            BypassRecordStore::load(&first_path).all(),
+            vec![&first_peer]
+        );
+        assert_eq!(
+            BypassRecordStore::load(&second_path).all(),
+            vec![&second_peer]
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_retirement_serializes_queued_quarantine_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let mut initial = BypassRecordStore::with_path(&path);
+        initial.upsert(record(BypassFailureClass::Ssh)).unwrap();
+        let peer = BypassRecord::new(
+            "peer",
+            "peer.example",
+            "u",
+            BypassFailureClass::PathSync,
+            TS,
+        );
+        initial.upsert(peer.clone()).unwrap();
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(initial));
+        let mut locked = shared.lock().await;
+        let prepared = locked.prepare_remove("css").unwrap().unwrap();
+        let replacement = record(BypassFailureClass::ProcessObservation)
+            .with_diagnostic("new quarantine observed after the old recovery");
+
+        let queued_store = shared.clone();
+        let queued_record = replacement.clone();
+        let (queued, waiting) = tokio::sync::oneshot::channel();
+        let mutation = tokio::spawn(async move {
+            queued.send(()).unwrap();
+            let mut current = queued_store.lock().await;
+            current.upsert(queued_record)
+        });
+        waiting.await.unwrap();
+        assert!(!mutation.is_finished());
+        assert!(matches!(
+            prepared.commit(|| true).unwrap(),
+            BypassRetirementOutcome::Published {
+                directory_sync_error: None
+            }
+        ));
+        drop(locked);
+        tokio::time::timeout(std::time::Duration::from_secs(5), mutation)
+            .await
+            .expect("queued replacement must run after the prepared borrow ends")
+            .unwrap()
+            .unwrap();
+
+        let live = shared.lock().await;
+        assert_eq!(live.get("css"), Some(&replacement));
+        assert_eq!(live.get("peer"), Some(&peer));
+        let restarted = BypassRecordStore::load(&path);
+        assert_eq!(restarted.get("css"), Some(&replacement));
         assert_eq!(restarted.get("peer"), Some(&peer));
     }
 
