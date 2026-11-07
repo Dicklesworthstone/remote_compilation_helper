@@ -953,12 +953,14 @@ async fn clean_overlay_namespace_pipeline(
         .clone()
         .with_local_root(namespace.path().to_owned());
     let (files, directories) = pipeline.enumerate_clean_overlay_source_namespace().await?;
-    let expected_files = root
+    let mut expected_files = root
         .manifest
         .files
         .iter()
         .map(|file| PathBuf::from(&file.path))
         .collect::<Vec<_>>();
+    // Archive manifests use String order; enumeration uses PathBuf order.
+    expected_files.sort();
     anyhow::ensure!(
         files == expected_files && directories == root.directories,
         "selected source collides with an owned RCH runtime namespace or its namespace skeleton changed"
@@ -4785,6 +4787,9 @@ sys.exit(99)
     #[tokio::test]
     async fn clean_overlay_receipt_namespace_tracks_the_complete_base_and_rejects_local_drift() {
         let (root, _) = build_source_stamp_fixture_repo();
+        // String order puts src-extra before src/lib, unlike PathBuf order.
+        std::fs::create_dir_all(root.join("src-extra")).unwrap();
+        std::fs::write(root.join("src-extra/lib.rs"), b"pub fn alternate() {}\n").unwrap();
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
         std::fs::write(
             root.join("node_modules/pinned.txt"),
@@ -4807,6 +4812,7 @@ sys.exit(99)
         for path in [
             "Cargo.toml",
             "src/lib.rs",
+            "src-extra/lib.rs",
             "node_modules/pinned.txt",
             "SOURCE_LINK",
         ] {
