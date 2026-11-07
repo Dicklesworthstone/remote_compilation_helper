@@ -10572,7 +10572,10 @@ mod object_location_tests {
                 Err(StoreError::Corruption(_))
             ));
             assert_eq!((store.engine.begins, store.engine.commits), (0, 0));
-            assert_eq!(snapshot(&mut store), [Vec::new(), Vec::new()]);
+            assert_eq!(
+                snapshot(&mut store),
+                [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+            );
         }
     }
 
@@ -10660,13 +10663,19 @@ mod object_location_tests {
             Err(PutError::Store(StoreError::Backend(ref detail))) if detail.contains("location fault")
         ));
         assert!(store.engine.inner.conn.is_autocommit());
-        assert_eq!(snapshot(&mut store), [Vec::new(), Vec::new()]);
+        assert_eq!(
+            snapshot(&mut store),
+            [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+        );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         drop(store);
 
         let engine = RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap();
         let mut reopened = SqlMetadataStore::open(CountedEngine::new(engine)).unwrap();
-        assert_eq!(snapshot(&mut reopened), [Vec::new(), Vec::new()]);
+        assert_eq!(
+            snapshot(&mut reopened),
+            [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+        );
         reopened
             .engine
             .execute("DROP TRIGGER refuse_location", &[])
