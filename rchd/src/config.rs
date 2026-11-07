@@ -660,20 +660,36 @@ pub fn load_self_test_config() -> Result<SelfTestConfig> {
     Ok(config.self_test)
 }
 
-/// Load full RCH configuration from config.toml.
+/// Load full RCH configuration and install its validated control timing policy.
 pub fn load_rch_config() -> Result<RchConfig> {
-    let Some(dir) = config_dir() else {
-        return Ok(RchConfig::default());
+    let path = config_dir().map(|dir| dir.join("config.toml"));
+    let timing_override = match std::env::var(rch_common::timing::TIMING_SCALE_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(rch_common::timing::TimingScaleError.into());
+        }
     };
-    let path = dir.join("config.toml");
-    if !path.exists() {
-        return Ok(RchConfig::default());
-    }
+    let config = load_rch_config_from_path(path.as_deref(), timing_override.as_deref())?;
+    rch_common::timing::install(config.timeouts.scale);
+    Ok(config)
+}
 
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config {:?}", path))?;
-    let config: RchConfig =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {:?}", path))?;
+fn load_rch_config_from_path(
+    path: Option<&Path>,
+    timing_override: Option<&str>,
+) -> Result<RchConfig> {
+    let mut config = if let Some(path) = path.filter(|path| path.exists()) {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config {:?}", path))?;
+        toml::from_str::<RchConfig>(&contents)
+            .with_context(|| format!("Failed to parse {:?}", path))?
+    } else {
+        RchConfig::default()
+    };
+    // Environment-only daemon starts must honor the policy too. Apply it even
+    // when config.toml or the platform's config directory does not exist.
+    config.timeouts = config.timeouts.with_override(timing_override)?;
     Ok(config)
 }
 
@@ -750,6 +766,46 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_timing_policy_resolves_file_and_environment_without_installing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let defaults = load_rch_config_from_path(None, None).unwrap();
+        assert_eq!(defaults.timeouts.scale.env_value(), "1");
+        let env_only = load_rch_config_from_path(None, Some("2.5")).unwrap();
+        assert_eq!(env_only.timeouts.scale.env_value(), "2.5");
+        let missing_file = load_rch_config_from_path(Some(&path), Some("3")).unwrap();
+        assert_eq!(missing_file.timeouts.scale.env_value(), "3");
+
+        std::fs::write(&path, "[timeouts]\nscale = 4\n").unwrap();
+        let file = load_rch_config_from_path(Some(&path), None).unwrap();
+        assert_eq!(file.timeouts.scale.env_value(), "4");
+        let reset = load_rch_config_from_path(Some(&path), Some("1")).unwrap();
+        assert_eq!(reset.timeouts.scale.env_value(), "1");
+        assert_eq!(
+            reset.compilation.build_timeout_sec,
+            file.compilation.build_timeout_sec
+        );
+    }
+
+    #[test]
+    fn daemon_timing_policy_rejects_invalid_values_before_startup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in ["nan", "inf", "-inf", "0", "-1", "0.5", "11"] {
+            assert!(
+                load_rch_config_from_path(None, Some(value)).is_err(),
+                "accepted environment scale {value}"
+            );
+            std::fs::write(&path, format!("[timeouts]\nscale = {value}\n")).unwrap();
+            assert!(
+                load_rch_config_from_path(Some(&path), None).is_err(),
+                "accepted file scale {value}"
+            );
+        }
+        assert!(load_rch_config_from_path(None, Some("")).is_err());
+    }
 
     #[test]
     fn daemon_config_reads_per_worker_project_lanes() {

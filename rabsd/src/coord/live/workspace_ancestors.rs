@@ -54,8 +54,14 @@ impl ProducerPolicy {
             }
             CommittedDependencyPolicy::ImmutableDagRlib => (false, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
-            CommittedDependencyPolicy::WorkspaceDagRlib => (false, ProducerDomain::WorkspaceDag),
-            CommittedDependencyPolicy::WorkspaceDagMetadata => (true, ProducerDomain::WorkspaceDag),
+            CommittedDependencyPolicy::WorkspaceDagRlib
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                (false, ProducerDomain::WorkspaceDag)
+            }
+            CommittedDependencyPolicy::WorkspaceDagMetadata
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                (true, ProducerDomain::WorkspaceDag)
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
             | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                 (true, ProducerDomain::WorkspaceDag)
@@ -85,6 +91,12 @@ impl ProducerPolicy {
             ActionClassRisk::WorkspaceDagMetadata => {
                 CommittedDependencyPolicy::WorkspaceDagMetadata
             }
+            ActionClassRisk::GeneratedWorkspaceDagRlib => {
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+            }
+            ActionClassRisk::GeneratedWorkspaceDagMetadata => {
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+            }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
             }
@@ -108,17 +120,21 @@ impl ProducerPolicy {
             ProducerDomain::ImmutableDag | ProducerDomain::WorkspaceDag
         );
         match risk {
-            ActionClassRisk::ClosedWorkspaceRlib | ActionClassRisk::CommittedWorkspaceRlib => {
-                workspace
-            }
+            ActionClassRisk::ClosedWorkspaceRlib
+            | ActionClassRisk::GeneratedWorkspaceRlib
+            | ActionClassRisk::CommittedWorkspaceRlib => workspace,
             ActionClassRisk::ClosedWorkspaceMetadata
+            | ActionClassRisk::GeneratedWorkspaceMetadata
             | ActionClassRisk::CommittedWorkspaceMetadata => workspace && self.metadata_allowed,
             ActionClassRisk::MixedWorkspaceRlib => mixed,
             ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
             ActionClassRisk::ImmutableDagRlib => immutable_dag,
             ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
-            ActionClassRisk::WorkspaceDagRlib => self.domain == ProducerDomain::WorkspaceDag,
-            ActionClassRisk::WorkspaceDagMetadata => {
+            ActionClassRisk::WorkspaceDagRlib | ActionClassRisk::GeneratedWorkspaceDagRlib => {
+                self.domain == ProducerDomain::WorkspaceDag
+            }
+            ActionClassRisk::WorkspaceDagMetadata
+            | ActionClassRisk::GeneratedWorkspaceDagMetadata => {
                 self.domain == ProducerDomain::WorkspaceDag && self.metadata_allowed
             }
             // A successful terminal check never supplies a Rust dependency,
@@ -190,6 +206,7 @@ impl CoordLive {
             return Err("immutable leaf differs from its retained remote action".into());
         }
         validate_immutable_library_manifest(&manifest, proof.output_class())?;
+        crate::coord::native_archives::require_manifest(&mut *store, &manifest)?;
         if !store
             .list_provisional_ancestors(&action_key)
             .map_err(store_error)?
@@ -239,10 +256,10 @@ impl CoordLive {
     ) -> Result<CanonicalActionResultManifest, String> {
         let (risk, key_epoch) = match policy {
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
-                (ActionClassRisk::WorkspaceTerminalLeafMetadata, 14)
+                (ActionClassRisk::WorkspaceTerminalLeafMetadata, 24)
             }
             CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
-                (ActionClassRisk::WorkspaceTerminalMetadata, 15)
+                (ActionClassRisk::WorkspaceTerminalMetadata, 25)
             }
             _ => return Err("terminal completion has a nonterminal policy".into()),
         };
@@ -471,6 +488,16 @@ pub(super) fn check_offer(
     lease_now: &dyn Fn() -> u64,
 ) -> Result<(), String> {
     let risk = recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?;
+    if matches!(
+        risk,
+        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+    ) {
+        return if offer.provisional_ancestors.is_empty() {
+            Ok(())
+        } else {
+            Err("generated workspace leaf offer contains unexpected producer ancestry".into())
+        };
+    }
     if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
         return if offer.provisional_ancestors.is_empty() {
             Ok(())
@@ -510,6 +537,20 @@ pub(super) fn check_serving(
     epoch: u64,
 ) -> Result<(), String> {
     let risk = recorded_action_risk(store, action).map_err(store_error)?;
+    if matches!(
+        risk,
+        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+    ) {
+        return if store
+            .list_provisional_ancestors(&digest_key(action))
+            .map_err(store_error)?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err("generated workspace leaf publication contains unexpected producer ancestry".into())
+        };
+    }
     if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
         return if store
             .list_provisional_ancestors(&digest_key(action))
@@ -702,10 +743,12 @@ fn verify_graph(
         let metadata_producer = matches!(
             risk,
             ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::GeneratedWorkspaceMetadata
                 | ActionClassRisk::CommittedWorkspaceMetadata
                 | ActionClassRisk::MixedWorkspaceMetadata
                 | ActionClassRisk::ImmutableDagMetadata
                 | ActionClassRisk::WorkspaceDagMetadata
+                | ActionClassRisk::GeneratedWorkspaceDagMetadata
         ) || immutable_leaf == Some(RemoteDependencyOutputClass::Metadata);
         if !(policy.admits_class(risk)
             || immutable_leaf.is_some_and(|class| {
@@ -748,6 +791,15 @@ fn verify_graph(
                 check.producer
             ));
         }
+        // A retained target seed or a transitive committed producer can bypass
+        // a new output-install request. Its complete publication must carry the
+        // same current archive proof, even when this edge consumes only rmeta.
+        crate::coord::native_archives::require_manifest(store, &manifest).map_err(|reason| {
+            format!(
+                "workspace producer {} native archive is unsafe: {reason}",
+                check.producer
+            )
+        })?;
         // Validate every edge even if its producer was visited before; only the
         // expansion is shared. An active producer detects cycles, including a
         // corrupt self-reference to the consumer currently being checked.
@@ -764,6 +816,8 @@ fn verify_graph(
             risk,
             ActionClassRisk::ClosedWorkspaceRlib
                 | ActionClassRisk::ClosedWorkspaceMetadata
+                | ActionClassRisk::GeneratedWorkspaceRlib
+                | ActionClassRisk::GeneratedWorkspaceMetadata
                 | ActionClassRisk::LowRiskRegistry
         ) && !ancestors.is_empty())
             || (matches!(
@@ -776,6 +830,8 @@ fn verify_graph(
                     | ActionClassRisk::ImmutableDagMetadata
                     | ActionClassRisk::WorkspaceDagRlib
                     | ActionClassRisk::WorkspaceDagMetadata
+                    | ActionClassRisk::GeneratedWorkspaceDagRlib
+                    | ActionClassRisk::GeneratedWorkspaceDagMetadata
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -954,6 +1010,24 @@ pub(crate) mod tests {
             self.prepare_class(tag, parents, outputs, class)
         }
 
+        pub(crate) fn prepare_generated_leaf(
+            &self,
+            tag: u8,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            self.prepare_class(
+                tag,
+                Vec::new(),
+                outputs,
+                if metadata {
+                    LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+                } else {
+                    LIVE_GENERATED_WORKSPACE_RLIB_CLASS
+                },
+            )
+        }
+
         pub(crate) fn prepare_mixed(
             &self,
             tag: u8,
@@ -974,6 +1048,25 @@ pub(crate) mod tests {
             )
         }
 
+        pub(crate) fn prepare_generated_dag(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            metadata: bool,
+        ) -> OfferPreparedActionResult {
+            self.prepare_dag(
+                tag,
+                parents,
+                outputs,
+                if metadata {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                } else {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                },
+            )
+        }
+
         pub(crate) fn prepare_dag(
             &self,
             tag: u8,
@@ -990,6 +1083,12 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
                 CommittedDependencyPolicy::WorkspaceDagMetadata => {
                     LIVE_WORKSPACE_DAG_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                    LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                    LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
                 }
                 _ => panic!("DAG fixture requires an independently keyed DAG policy"),
             };
@@ -1022,13 +1121,40 @@ pub(crate) mod tests {
             outputs: &[(&str, OutputRole, &[u8])],
             class: &str,
         ) -> OfferPreparedActionResult {
+            self.prepare_class_with_key_epoch(tag, parents, outputs, class, None)
+        }
+
+        fn prepare_class_with_key_epoch(
+            &self,
+            tag: u8,
+            parents: Vec<ProvisionalAncestorRef>,
+            outputs: &[(&str, OutputRole, &[u8])],
+            class: &str,
+            key_epoch: Option<u32>,
+        ) -> OfferPreparedActionResult {
             assert!(!outputs.is_empty());
             let logical_outputs: Vec<_> = outputs
                 .iter()
-                .map(|(name, role, bytes)| LogicalOutput {
-                    role: *role,
-                    virtual_path: RawBytes::from(*name),
-                    object: self.put(bytes),
+                .map(|(name, role, marker)| {
+                    // Rust archive arguments are model-test markers, retained
+                    // byte-exact inside a structurally closed ELF/ar fixture.
+                    let archive = name
+                        .ends_with(".rlib")
+                        .then(|| crate::test_util::closed_rlib_fixture(marker));
+                    let bytes = archive.as_deref().unwrap_or(marker);
+                    let object = self.put(bytes);
+                    if archive.is_some() {
+                        crate::test_util::record_rlib_fixture_closure(
+                            &mut *self.cas.store().lock().unwrap(),
+                            &object.0,
+                            bytes,
+                        );
+                    }
+                    LogicalOutput {
+                        role: *role,
+                        virtual_path: RawBytes::from(*name),
+                        object,
+                    }
                 })
                 .collect();
             let (base, _) =
@@ -1037,11 +1163,15 @@ pub(crate) mod tests {
             authority.action_key = tagged_digest("rabs.action-key.sha256.v1", tag);
             let mut manifest = base.manifest.clone();
             manifest.action_key = authority.action_key.clone();
-            manifest.key_epoch = match class {
-                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 14,
-                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 15,
+            manifest.key_epoch = key_epoch.unwrap_or(match class {
+                LIVE_GENERATED_WORKSPACE_RLIB_CLASS => 26,
+                LIVE_GENERATED_WORKSPACE_METADATA_CLASS => 27,
+                LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => 28,
+                LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 29,
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 _ => manifest.key_epoch,
-            };
+            });
             manifest.logical_outputs = logical_outputs;
             let declared: Vec<_> = manifest
                 .logical_outputs
@@ -1160,6 +1290,35 @@ pub(crate) mod tests {
                     "explicit producer quarantine during lineage test",
                 )
                 .unwrap();
+        }
+
+        pub(crate) fn expire_archive_closure(&self, offer: &OfferPreparedActionResult) {
+            let object = &offer
+                .manifest
+                .logical_outputs
+                .iter()
+                .find(|output| output.virtual_path.as_bytes().ends_with(b".rlib"))
+                .unwrap()
+                .object
+                .0;
+            let _store = self.cas.store().lock().unwrap();
+            let mut engine =
+                RusqliteEngine::open(&self.cas.cas_root().join("meta.sqlite")).unwrap();
+            assert_eq!(
+                engine
+                    .execute(
+                        "UPDATE decision_receipts SET kind = ?1 \
+                         WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                        &[
+                            SqlValue::Text("native-rlib-closure-v0".into()),
+                            SqlValue::Text("native-rlib-closure-v1".into()),
+                            SqlValue::Text(digest_key(object)),
+                        ],
+                    )
+                    .unwrap(),
+                1,
+                "expire only the selected producer archive's current proof"
+            );
         }
 
         fn compare_twice(&self, offer: &OfferPreparedActionResult) {
@@ -1327,6 +1486,147 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn generated_workspace_leaves_keep_output_roles_origin_and_empty_ancestry() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let mut outputs = vec![(
+                "libgenerated.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated library metadata".as_slice(),
+            )];
+            if !metadata {
+                outputs.push((
+                    "libgenerated.rlib",
+                    OutputRole::Materializable,
+                    b"generated library implementation".as_slice(),
+                ));
+            }
+            let leaf = fixture.prepare_generated_leaf(70, &outputs, metadata);
+            assert_eq!(leaf.manifest.key_epoch, if metadata { 27 } else { 26 });
+            fixture.commit(&leaf);
+            fixture.assert_unsampled(&leaf);
+            for (policy, allows_metadata, allows_workspace) in [
+                (CommittedDependencyPolicy::WorkspaceRlib, false, true),
+                (CommittedDependencyPolicy::WorkspaceMetadata, true, true),
+                (CommittedDependencyPolicy::MixedWorkspaceRlib, false, true),
+                (
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                    true,
+                    true,
+                ),
+                (CommittedDependencyPolicy::WorkspaceDagRlib, false, true),
+                (CommittedDependencyPolicy::WorkspaceDagMetadata, true, true),
+                (
+                    CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                    true,
+                    true,
+                ),
+                (CommittedDependencyPolicy::ImmutableDagRlib, false, false),
+                (CommittedDependencyPolicy::ImmutableDagMetadata, true, false),
+            ] {
+                let result = fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(&leaf)], policy);
+                assert_eq!(
+                    result.is_ok(),
+                    allows_workspace && (!metadata || allows_metadata),
+                    "metadata={metadata}, policy={policy:?}, result={result:?}"
+                );
+            }
+
+            let consumer = if metadata {
+                fixture.prepare_metadata(
+                    71,
+                    vec![consumes(&leaf)],
+                    &[(
+                        "libconsumer.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"consumer metadata",
+                    )],
+                )
+            } else {
+                fixture.prepare(
+                    71,
+                    vec![consumes(&leaf)],
+                    &[
+                        (
+                            "libconsumer.rmeta",
+                            OutputRole::ProvisionalMetadata,
+                            b"consumer metadata",
+                        ),
+                        (
+                            "libconsumer.rlib",
+                            OutputRole::Materializable,
+                            b"consumer archive",
+                        ),
+                    ],
+                )
+            };
+            fixture.commit(&consumer);
+            fixture.compare_twice(&leaf);
+            fixture.compare_twice(&consumer);
+            for (name, offer) in [("generated", &leaf), ("consumer", &consumer)] {
+                let destination = fixture.root.path().join(format!("healthy-{name}"));
+                assert!(matches!(
+                    fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::Served { .. }
+                ));
+            }
+
+            // Generated leaves cannot acquire a producer graph merely through
+            // a generated class receipt, either at commit or after retention.
+            let invalid = fixture.prepare_class(
+                72,
+                vec![consumes(&leaf)],
+                &outputs,
+                if metadata {
+                    LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+                } else {
+                    LIVE_GENERATED_WORKSPACE_RLIB_CLASS
+                },
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&invalid, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains("generated workspace leaf offer")
+            ));
+            fixture.assert_unpublished(&invalid);
+
+            let parent = consumes(&consumer);
+            let held = fixture.cas.store().lock().unwrap();
+            let mut engine =
+                RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+            assert_eq!(
+                engine.execute(
+                    "INSERT INTO provisional_ancestry (consumer_action_key, producer_action_key, role, virtual_path, object_key, adopted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    &[
+                        SqlValue::Text(digest_key(&leaf.manifest.action_key)),
+                        SqlValue::Text(digest_key(&parent.producer_action_key)),
+                        SqlValue::Text("provisional-metadata".into()),
+                        SqlValue::Blob(parent.virtual_path.as_bytes().to_vec()),
+                        SqlValue::Text(digest_key(&parent.consumed_object.0)),
+                    ],
+                ).unwrap(),
+                1,
+            );
+            drop(engine);
+            drop(held);
+            for (name, offer, refusal) in [
+                ("generated", &leaf, "generated workspace leaf publication"),
+                ("consumer", &consumer, "inconsistent class ancestry"),
+            ] {
+                let destination = fixture.root.path().join(format!("refused-{name}"));
+                assert!(matches!(
+                    fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                        if reason.contains(refusal)
+                ));
+                assert!(!destination.exists());
+            }
+        }
+    }
+
+    #[test]
     fn terminal_completion_standing_requires_exact_publication_without_positive_samples() {
         for policy in [
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
@@ -1423,6 +1723,84 @@ pub(crate) mod tests {
                         wrong,
                     )
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_completion_rejects_retired_epochs_under_current_class_receipts() {
+        for (policy, class, retired_epoch) in [
+            (
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                14,
+            ),
+            (
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+                15,
+            ),
+        ] {
+            let fixture = WorkspaceLineageFixture::new();
+            let parents = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+                let upstream = fixture.commit_metadata_leaf(
+                    90,
+                    &[(
+                        "libupstream.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"library metadata",
+                    )],
+                );
+                vec![consumes(&upstream)]
+            } else {
+                Vec::new()
+            };
+            let outputs = [
+                (
+                    "libterminal.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"".as_slice(),
+                ),
+                (
+                    "terminal.d",
+                    OutputRole::DepInfo,
+                    b"/__rabs/out/libterminal.rmeta:\n".as_slice(),
+                ),
+            ];
+            let current = fixture.prepare_terminal(91, parents.clone(), &outputs, policy);
+            fixture.commit(&current);
+            fixture
+                .coord
+                .verify_terminal_completion(
+                    &current.manifest.action_key,
+                    &current.manifest.canonical_descriptor_digest,
+                    &current.manifest_id.0,
+                    policy,
+                )
+                .expect("current-epoch completion remains qualified");
+
+            // Build, hash and publish an internally consistent old-epoch
+            // manifest. Even a current class receipt cannot upgrade its epoch.
+            let retired = fixture.prepare_class_with_key_epoch(
+                92,
+                parents,
+                &outputs,
+                class,
+                Some(retired_epoch),
+            );
+            fixture.commit(&retired);
+            assert!(
+                fixture
+                    .coord
+                    .verify_terminal_completion(
+                        &retired.manifest.action_key,
+                        &retired.manifest.canonical_descriptor_digest,
+                        &retired.manifest_id.0,
+                        policy,
+                    )
+                    .unwrap_err()
+                    .contains("differs from its exact class or manifest"),
+                "retired epoch {retired_epoch} must not acquire v2 completion standing"
             );
         }
     }
@@ -1758,7 +2136,7 @@ pub(crate) mod tests {
             if !metadata {
                 assert_eq!(
                     std::fs::read(destination.join("libc.rlib")).unwrap(),
-                    b"mixed archive C"
+                    crate::test_util::closed_rlib_fixture(b"mixed archive C")
                 );
             }
             fixture.assert_unsampled(&a);
@@ -2008,6 +2386,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn metadata_selected_dag_edges_require_every_producers_current_archive_closure() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, _b, _c, d] = immutable_dag_chain(&fixture, false);
+        let selected = witness(&d);
+        assert_eq!(selected.role, OutputRole::ProvisionalMetadata);
+        fixture
+            .coord
+            .verify_committed_dependencies(
+                std::slice::from_ref(&selected),
+                CommittedDependencyPolicy::WorkspaceDagRlib,
+            )
+            .unwrap();
+        fixture.compare_twice(&d);
+        let healthy = fixture.root.path().join("current-archive-closure");
+        assert!(matches!(
+            fixture.replay(&d, &healthy, None).unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+
+        // Only the immutable root archive's receipt changes. Its metadata,
+        // every downstream manifest/object and ordinary serving gates remain
+        // valid; a metadata-selected edge must still recheck the whole producer.
+        fixture.expire_archive_closure(&a);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(&[selected], CommittedDependencyPolicy::WorkspaceDagRlib)
+            .unwrap_err();
+        assert!(reason.contains("native archive"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&a.manifest.action_key)),
+            "{reason}"
+        );
+
+        let refused = fixture.root.path().join("expired-ancestor-closure");
+        let mut calls = 0;
+        let mut ready = |_: &[PathBuf]| {
+            calls += 1;
+            Ok(())
+        };
+        assert!(matches!(
+            fixture.replay(&d, &refused, Some(&mut ready)).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("native archive")
+                    && reason.contains(&digest_key(&a.manifest.action_key))
+        ));
+        assert_eq!(calls, 0);
+        assert!(!refused.exists());
+    }
+
+    #[test]
     fn immutable_dag_replay_requires_own_samples_and_current_transitive_producers() {
         for metadata in [false, true] {
             let fixture = WorkspaceLineageFixture::new();
@@ -2077,7 +2505,7 @@ pub(crate) mod tests {
             if !metadata {
                 assert_eq!(
                     std::fs::read(destination.join("libd.rlib")).unwrap(),
-                    b"metadata D"
+                    crate::test_util::closed_rlib_fixture(b"metadata D")
                 );
             }
             for producer in [&a, &b, &c] {
@@ -2103,6 +2531,209 @@ pub(crate) mod tests {
             );
             fixture.assert_unpublished(&later);
         }
+    }
+
+    #[test]
+    fn generated_dag_replay_and_ordinary_consumers_recheck_transitive_producers() {
+        for metadata in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let [a, _b, _c, d] = immutable_dag_chain(&fixture, metadata);
+            let outputs = |metadata_name, archive_name, bytes| {
+                let mut outputs = vec![(metadata_name, OutputRole::ProvisionalMetadata, bytes)];
+                if !metadata {
+                    outputs.push((archive_name, OutputRole::Materializable, bytes));
+                }
+                outputs
+            };
+            let generated = fixture.prepare_generated_dag(
+                111,
+                vec![consumes(&d)],
+                &outputs("libe.rmeta", "libe.rlib", b"generated E".as_slice()),
+                metadata,
+            );
+            fixture.commit(&generated);
+            let dependent = fixture.prepare_generated_dag(
+                112,
+                vec![consumes(&generated), consumes(&d)],
+                &outputs("libf.rmeta", "libf.rlib", b"generated F".as_slice()),
+                metadata,
+            );
+            fixture.commit(&dependent);
+            let workspace_policy = if metadata {
+                CommittedDependencyPolicy::WorkspaceDagMetadata
+            } else {
+                CommittedDependencyPolicy::WorkspaceDagRlib
+            };
+            let ordinary = fixture.prepare_dag(
+                113,
+                vec![consumes(&dependent), consumes(&generated), consumes(&d)],
+                &outputs("libg.rmeta", "libg.rlib", b"ordinary G".as_slice()),
+                workspace_policy,
+            );
+            fixture.commit(&ordinary);
+            for producer in [&generated, &dependent] {
+                for policy in [
+                    CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                ] {
+                    fixture
+                        .coord
+                        .verify_committed_dependencies(&[witness(producer)], policy)
+                        .unwrap();
+                }
+                for policy in [
+                    CommittedDependencyPolicy::WorkspaceRlib,
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                    CommittedDependencyPolicy::MixedWorkspaceRlib,
+                    CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                    CommittedDependencyPolicy::ImmutableDagRlib,
+                    CommittedDependencyPolicy::ImmutableDagMetadata,
+                ] {
+                    assert!(
+                        fixture
+                            .coord
+                            .verify_committed_dependencies(&[witness(producer)], policy)
+                            .is_err()
+                    );
+                }
+            }
+            let unsampled = fixture.root.path().join("generated-dag-unsampled");
+            assert!(matches!(
+                fixture.replay(&dependent, &unsampled, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                ))
+            ));
+            assert!(!unsampled.exists());
+            for (offer, name, bytes) in [
+                (&dependent, "libf.rmeta", b"generated F".as_slice()),
+                (&ordinary, "libg.rmeta", b"ordinary G".as_slice()),
+            ] {
+                fixture.compare_twice(offer);
+                let destination = fixture.root.path().join(name);
+                assert!(matches!(fixture.replay(offer, &destination, None).unwrap(),
+                    ServeOutcome::Served { files }
+                        if files.len() == if metadata { 1 } else { 2 }));
+                assert_eq!(std::fs::read(destination.join(name)).unwrap(), bytes);
+            }
+            fixture.assert_unsampled(&generated);
+            fixture.assert_unsampled(&d);
+
+            fixture.quarantine(&a.manifest.action_key);
+            for (offer, name) in [
+                (&dependent, "generated-revoked"),
+                (&ordinary, "ordinary-revoked"),
+            ] {
+                let refused = fixture.root.path().join(name);
+                assert!(matches!(fixture.replay(offer, &refused, None).unwrap(),
+                    ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                        if reason.contains(&digest_key(&a.manifest.action_key))));
+                assert!(!refused.exists());
+            }
+            let later = fixture.prepare_generated_dag(
+                114,
+                vec![consumes(&ordinary)],
+                &outputs("liblater.rmeta", "liblater.rlib", b"later".as_slice()),
+                metadata,
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&later, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&a.manifest.action_key))
+            ));
+            fixture.assert_unpublished(&later);
+        }
+    }
+
+    #[test]
+    fn generated_dag_classes_require_parents_and_preserve_metadata_only_authority() {
+        let fixture = WorkspaceLineageFixture::new();
+        for (tag, class) in [
+            (115, LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS),
+            (116, LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS),
+        ] {
+            let orphan = fixture.prepare_class(
+                tag,
+                Vec::new(),
+                &[(
+                    "liborphan.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"orphan",
+                )],
+                class,
+            );
+            assert!(matches!(
+                fixture.coord.commit_offer(&orphan, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason))
+                    if reason.contains("lacks bounded producer ancestry")
+            ));
+            fixture.assert_unpublished(&orphan);
+        }
+
+        let [_a, _b, _c, d] = immutable_dag_chain(&fixture, true);
+        let generated = fixture.prepare_generated_dag(
+            117,
+            vec![consumes(&d)],
+            &[(
+                "libe.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated E",
+            )],
+            true,
+        );
+        fixture.commit(&generated);
+        for policy in [
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+        ] {
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[witness(&generated)], policy)
+                    .is_err()
+            );
+        }
+        let consumer = fixture.prepare_generated_dag(
+            118,
+            vec![consumes(&generated)],
+            &[(
+                "libf.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"generated F",
+            )],
+            true,
+        );
+        fixture.commit(&consumer);
+        fixture.compare_twice(&consumer);
+        // A stale class receipt must not conceal a missing generated producer
+        // graph, even when the consumer has already earned replay samples.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(engine.execute(
+            "UPDATE provisional_ancestry SET consumer_action_key = ?1 WHERE consumer_action_key = ?2",
+            &[
+                SqlValue::Text("explicit-generated-test-orphan".into()),
+                SqlValue::Text(digest_key(&generated.manifest.action_key)),
+            ],
+        ).unwrap(), 1);
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&generated)],
+                CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("inconsistent class ancestry"), "{reason}");
+        let refused = fixture.root.path().join("generated-dag-without-ancestry");
+        assert!(matches!(fixture.replay(&consumer, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("inconsistent class ancestry")));
+        assert!(!refused.exists());
     }
 
     #[test]
@@ -2374,7 +3005,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             std::fs::read(destination.join("libc.rlib")).unwrap(),
-            b"actual CAS archive C"
+            crate::test_util::closed_rlib_fixture(b"actual CAS archive C")
         );
         fixture.assert_unsampled(&a);
         fixture.assert_unsampled(&b);

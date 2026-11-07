@@ -59,6 +59,32 @@ tokio::task_local! {
     static OFFLOAD_SSH_TRANSPORT: Option<OffloadSshTransport>;
 }
 
+/// Configure explicitly requested connection reuse within one dispatch.
+/// Unset and zero retain the one-shot transport; only a positive idle window
+/// opts into the existing owned foreground connection on Unix workers.
+fn owned_offload_ssh_options(
+    worker: &WorkerConfig,
+    transfer: &TransferConfig,
+) -> Option<rch_common::ssh::SshOptions> {
+    let idle = transfer
+        .ssh_control_persist_secs
+        .filter(|seconds| *seconds > 0)?;
+    if WorkerPlatform::from_worker(worker).is_windows() {
+        return None;
+    }
+    Some(rch_common::ssh::SshOptions {
+        connect_timeout: rch_common::timing::scale_duration(
+            rch_common::ssh::SshOptions::default().connect_timeout,
+        ),
+        control_master: true,
+        control_persist_idle: Some(Duration::from_secs(idle)),
+        server_alive_interval: Some(Duration::from_secs(
+            transfer.ssh_server_alive_interval_secs.unwrap_or(15),
+        )),
+        ..Default::default()
+    })
+}
+
 /// Reuse one supervised foreground connection for an explicitly opted-in Unix
 /// dispatch. The client and active-use guard outlive every control/transfer/build
 /// channel and the dispatch's cancellation cleanup. No persistent background
@@ -68,22 +94,15 @@ pub(super) async fn with_owned_offload_ssh<T>(
     transfer: &TransferConfig,
     operation: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    if !transfer
-        .ssh_control_persist_secs
-        .is_some_and(|secs| secs > 0)
-        || WorkerPlatform::from_worker(&worker).is_windows()
-        || crate::transfer::use_mock_transport(&worker)
+    let options = if crate::transfer::use_mock_transport(&worker)
         || !crate::commands::jobs::automatic_recovery_ssh_options().is_empty()
     {
+        None
+    } else {
+        owned_offload_ssh_options(&worker, transfer)
+    };
+    let Some(options) = options else {
         return OFFLOAD_SSH_TRANSPORT.scope(None, operation).await;
-    }
-    let options = rch_common::ssh::SshOptions {
-        control_master: true,
-        control_persist_idle: transfer.ssh_control_persist_secs.map(Duration::from_secs),
-        server_alive_interval: Some(Duration::from_secs(
-            transfer.ssh_server_alive_interval_secs.unwrap_or(15),
-        )),
-        ..Default::default()
     };
     let mut client = rch_common::ssh::SshClient::new(worker.clone(), options);
     client
@@ -184,12 +203,29 @@ pub(crate) async fn with_offload_ssh_arguments_for_test<F: std::future::Future>(
         .await
 }
 
+/// Control evidence is valid only while its original deadline is open.
+/// Tokio polls an operation before its timer, so a ready or non-yielding
+/// operation also needs an elapsed-time check after it returns.
+async fn control_timeout_at<T>(
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(());
+    }
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(result) if tokio::time::Instant::now() < deadline => Ok(result),
+        _ => Err(()),
+    }
+}
+
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const SOURCE_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
+const SOURCE_LOCK_SESSION_READY: &str = "RCH_SOURCE_LOCK_SESSION_READY";
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
 const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
 // Observe cancellation without publishing retirement or changing ownership.
@@ -750,13 +786,17 @@ impl RemoteSourceAuthorityLock {
 
     /// Release the locks after Cargo exits and prove the holder stayed healthy.
     pub(super) async fn release(self) -> anyhow::Result<()> {
-        self.release_with_timeout(Duration::from_secs(15)).await
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(15));
+        self.release_with_timeout(budget).await
     }
 
     async fn release_with_timeout(mut self, budget: Duration) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
-        let deadline = tokio::time::Instant::now() + budget;
+        let budget = budget.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget)
+            .context("source-authority release deadline exceeds the clock range")?;
         let collect = async {
             if let Some(heartbeat) = self.heartbeat.as_mut() {
                 heartbeat.release(self.release_request.clone()).await?;
@@ -802,7 +842,7 @@ impl RemoteSourceAuthorityLock {
         };
         // A successful wait() does not imply EOF: descendants can retain the
         // pipes. The same deadline must cover the write, wait and BOTH drains.
-        match tokio::time::timeout_at(deadline, collect).await {
+        match control_timeout_at(deadline, collect).await {
             Ok(result) => result,
             Err(_) => anyhow::bail!(
                 "timed out releasing remote source-authority lock on {}",
@@ -1468,12 +1508,18 @@ async fn run_source_metadata_rpc(
     client_timeout: Duration,
 ) -> anyhow::Result<Output> {
     let controller = format!(
-        "set -- {}\n{}",
+        "{}set -- {}\n{}",
+        rch_common::timing::shell_prefix(),
         shell_escape::escape(contract.into()),
         include_str!("source_namespace_control.sh"),
     );
-    run_offload_ssh_command_with_stdin(worker, &controller, command.as_bytes(), client_timeout)
-        .await
+    run_offload_ssh_command_with_stdin(
+        worker,
+        &controller,
+        command.as_bytes(),
+        rch_common::timing::scale_duration(client_timeout),
+    )
+    .await
 }
 
 /// Probe whether a started remote execution is gone for good. Every activity
@@ -1515,7 +1561,7 @@ pub(super) async fn remote_execution_lost(
         worker,
         "sh -s",
         script.as_bytes(),
-        Duration::from_secs(15),
+        rch_common::timing::scale_duration(Duration::from_secs(15)),
     )
     .await?;
     Ok(output.status.success()
@@ -2175,6 +2221,10 @@ async fn spawn_source_authority_lock(
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use anyhow::Context as _;
+    let wait_timeout = wait_timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(wait_timeout)
+        .context("source-authority acquisition deadline exceeds the clock range")?;
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
     let mut cmd = Command::new("ssh");
@@ -2182,7 +2232,12 @@ async fn spawn_source_authority_lock(
     configure_offload_ssh_transport(cmd.as_std_mut(), worker);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg(format!(
+        "ConnectTimeout={}",
+        rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(Duration::from_secs(
+            10
+        ),))
+    ));
     cmd.arg("-o").arg("ServerAliveInterval=10");
     cmd.arg("-o").arg("ServerAliveCountMax=3");
     cmd.arg("-i").arg(identity_file.as_ref());
@@ -2205,30 +2260,84 @@ async fn spawn_source_authority_lock(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    if tokio::time::Instant::now() >= deadline {
+        return Err(anyhow::Error::new(crate::transfer::SourceAuthorityBusy(
+            format!(
+                "timed out waiting {:?} for source-authority locks on {}",
+                wait_timeout, worker.id
+            ),
+        )));
+    }
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to start source-authority lock on {destination}"))?;
-    finish_source_authority_lock_acquisition(
+    finish_source_authority_lock_acquisition_until(
         child,
         worker.id.clone(),
         ready_marker,
         stdin_bootstrap.as_deref(),
-        wait_timeout,
+        deadline,
         heartbeat,
     )
     .await
 }
 
+async fn read_source_lock_frame(
+    stdout: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+    observed: &mut String,
+) -> std::io::Result<usize> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let read = stdout
+        .take((MAX_SOURCE_LOCK_READY_BYTES + 1) as u64)
+        .read_line(observed)
+        .await?;
+    if read > MAX_SOURCE_LOCK_READY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source-authority ready frame exceeded its byte limit",
+        ));
+    }
+    Ok(read)
+}
+
+// Existing local fixtures supply a duration. Production captures its absolute
+// deadline before building and spawning SSH, and passes it to the same body.
+#[cfg(test)]
 async fn finish_source_authority_lock_acquisition(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     worker_id: WorkerId,
     ready_marker: &str,
     stdin_bootstrap: Option<&str>,
     wait_timeout: Duration,
     heartbeat: bool,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let wait_timeout = wait_timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(wait_timeout)
+        .context("source-authority acquisition deadline exceeds the clock range")?;
+    finish_source_authority_lock_acquisition_until(
+        child,
+        worker_id,
+        ready_marker,
+        stdin_bootstrap,
+        deadline,
+        heartbeat,
+    )
+    .await
+}
 
+async fn finish_source_authority_lock_acquisition_until(
+    mut child: tokio::process::Child,
+    worker_id: WorkerId,
+    ready_marker: &str,
+    stdin_bootstrap: Option<&str>,
+    deadline: tokio::time::Instant,
+    heartbeat: bool,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let wait_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
     let stdin = child
         .stdin
         .take()
@@ -2271,33 +2380,38 @@ async fn finish_source_authority_lock_acquisition(
                 pipe.write_all(bootstrap.as_bytes()).await?;
                 pipe.flush().await?;
             }
-            if heartbeat {
-                guard.heartbeat = Some(SourceLockHeartbeat::start(
-                    stdin.take().expect("bootstrap retains stdin"),
-                    SOURCE_LOCK_HEARTBEAT_INTERVAL,
-                ));
-            }
             Ok::<(), std::io::Error>(())
         };
-        let read_ready = async {
-            // Bound the read itself, not just the buffer after read_line has
-            // waited for an arbitrarily large or never-terminated frame.
-            let read = (&mut stdout)
-                .take((MAX_SOURCE_LOCK_READY_BYTES + 1) as u64)
-                .read_line(&mut observed)
-                .await?;
-            if read > MAX_SOURCE_LOCK_READY_BYTES {
+        let ((), mut read) = tokio::try_join!(
+            write_bootstrap,
+            read_source_lock_frame(&mut stdout, &mut observed)
+        )?;
+        if heartbeat {
+            // Until the monitor acknowledges control ownership, shell
+            // read-ahead can consume a prefix of the first heartbeat. This
+            // handoff grants no source authority: still require the separate
+            // exact ready marker within the original acquisition deadline.
+            if observed
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                != Some(SOURCE_LOCK_SESSION_READY)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "source-authority ready frame exceeded its byte limit",
+                    "source-authority control handoff was not acknowledged",
                 ));
             }
-            Ok(read)
-        };
-        tokio::try_join!(write_bootstrap, read_ready)
+            guard.heartbeat = Some(SourceLockHeartbeat::start(
+                stdin.take().expect("bootstrap retains stdin"),
+                SOURCE_LOCK_HEARTBEAT_INTERVAL,
+            ));
+            observed.clear();
+            read = read_source_lock_frame(&mut stdout, &mut observed).await?;
+        }
+        Ok::<((), usize), std::io::Error>(((), read))
     };
     let mut timed_out = false;
-    let failure = match timeout(wait_timeout, acquisition).await {
+    let failure = match control_timeout_at(deadline, acquisition).await {
         Ok(Ok(((), 0))) => Some(format!(
             "source-authority lock on {} exited before acquisition",
             guard.worker_id
@@ -2445,6 +2559,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
     stdin_payload: Option<&[u8]>,
     timeout_duration: Duration,
 ) -> anyhow::Result<Output> {
+    let timeout_duration = timeout_duration.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout_duration)
+        .context("SSH command deadline exceeds the clock range")?;
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
 
@@ -2458,7 +2576,13 @@ async fn run_offload_ssh_command_with_optional_stdin(
     crate::transfer::source_content_barrier::configure_ssh_command(cmd.as_std_mut());
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
-        timeout_duration.as_secs().max(1)
+        // A large closure or a batch of bounded operations may legitimately
+        // run for minutes. It must not also wait minutes to authenticate an
+        // unreachable endpoint before the first operation can start.
+        rch_common::timing::ceil_seconds(
+            timeout_duration.min(rch_common::timing::scale_duration(Duration::from_secs(20))),
+        )
+        .max(1)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -2488,6 +2612,11 @@ async fn run_offload_ssh_command_with_optional_stdin(
     use anyhow::Context as _;
     use tokio::io::AsyncWriteExt as _;
 
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "SSH command timed out after {:?}",
+        timeout_duration
+    );
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
@@ -2534,7 +2663,7 @@ async fn run_offload_ssh_command_with_optional_stdin(
         })
     };
 
-    match timeout(timeout_duration, collect).await {
+    match control_timeout_at(deadline, collect).await {
         Ok(result) => result.context("Failed to collect ssh output"),
         Err(_) => {
             // collect future is dropped here; with kill_on_drop=true the
@@ -2615,7 +2744,9 @@ pub(super) fn remote_preflight_topology_policy(
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 
-fn build_worker_projects_topology_probe_cmd(topology_policy: &PathTopologyPolicy) -> String {
+pub(super) fn build_worker_projects_topology_probe_cmd(
+    topology_policy: &PathTopologyPolicy,
+) -> String {
     format!(
         "set -eu; \
          if {{ [ ! -e {canonical} ] && [ ! -L {canonical} ]; }} \
@@ -2627,39 +2758,9 @@ fn build_worker_projects_topology_probe_cmd(topology_policy: &PathTopologyPolicy
     )
 }
 
-/// Probe without changing paths so initialization can be included in the exact
-/// durable grant before any topology or source mutation. The later preflight
-/// refuses creation if this observation becomes stale in the other direction.
-pub(super) async fn worker_projects_topology_requires_initialization(
-    worker: &WorkerConfig,
-    topology_policy: &PathTopologyPolicy,
-) -> anyhow::Result<bool> {
-    let command = build_worker_projects_topology_probe_cmd(topology_policy);
-    let output = run_offload_ssh_command_with_stdin(
-        worker,
-        "sh -s",
-        command.as_bytes(),
-        Duration::from_secs(20),
-    )
-    .await?;
-    anyhow::ensure!(
-        output.status.success(),
-        "remote topology initialization probe failed on {} (status {:?}): {}",
-        worker.id,
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-    match output.stdout.as_slice() {
-        b"RCH_TOPOLOGY_INITIALIZATION_REQUIRED\n" => Ok(true),
-        b"RCH_TOPOLOGY_PATHS_PRESENT\n" => Ok(false),
-        other => anyhow::bail!(
-            "unrecognized topology initialization probe response from {}: {:?}",
-            worker.id,
-            String::from_utf8_lossy(other),
-        ),
-    }
-}
-
+// A missing canonical root beside an alias that already names a real directory
+// is restored as a link. A `mkdir` there would mint a second physical tree and
+// make the mapping a permanent alias conflict (bd-r2gcc).
 fn build_worker_projects_topology_cmd(
     topology_policy: &PathTopologyPolicy,
     allow_initialization: bool,
@@ -2672,7 +2773,18 @@ fn build_worker_projects_topology_cmd(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
            if [ {allow_initialization} != true ]; then printf 'RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED:path=%s\\n' {canonical} >&2; exit 48; fi; \
-           mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; \
+           if [ -L {alias} ] && [ -d {alias} ]; then \
+             alias_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+             case {canonical}/ in \"$alias_real\"/*) ;; *) \
+               if [ -n \"$alias_real\" ]; then \
+                 mkdir -p -- \"$(dirname -- {canonical})\" 2>/dev/null || true; \
+                 if command -v gln >/dev/null 2>&1; then \
+                   gln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; \
+                 else ln -sT -- \"$alias_real\" {canonical} 2>/dev/null || true; fi; fi;; esac; \
+             if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
+               printf 'RCH_TOPOLOGY_ERR_ALIAS_TARGET_CONFLICT:path=%s:target=%s:expected=%s\\n' {alias} \"$alias_real\" {canonical} >&2; exit 43; fi; \
+           else \
+             mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; fi; \
          if [ ! -d {canonical} ]; then printf 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path=%s\\n' {canonical} >&2; exit 41; fi; \
          canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
          ensure_alias_symlink() {{ \
@@ -2697,7 +2809,7 @@ fn build_worker_projects_topology_cmd(
            printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; return 44; \
          fi; \
          }}; \
-         ensure_alias_symlink; \
+         ensure_alias_symlink || exit $?; \
          echo RCH_TOPOLOGY_OK",
         canonical = shell_escape::escape(canonical_display.into()),
         canonical_slash = shell_escape::escape(canonical_slash_display.into()),
@@ -2857,6 +2969,49 @@ pub(crate) async fn probe_worker_mirror_ownership(
     }
 }
 
+/// Verify topology, then repair only this dispatch's source roots on the same
+/// SSH channel. Each activity retains its own admission check, deadline and
+/// descendant teardown; a failed topology check cannot start a repair.
+fn worker_mirror_preflight_command(
+    worker: &WorkerConfig,
+    topology_policy: &PathTopologyPolicy,
+    dispatch_closure_roots: &[PathBuf],
+    source_identity: Option<&str>,
+    allow_initialization: bool,
+) -> anyhow::Result<(String, Duration)> {
+    let topology_timeout = Duration::from_secs(20);
+    let repair_timeout = Duration::from_secs(600);
+    let activity = source_identity
+        .map(source_authority_activity_prefix)
+        .transpose()?;
+    let bounded = |script: String, deadline| match &activity {
+        Some(prefix) => crate::transfer::source_activity_bounded_script(prefix, &script, deadline),
+        None => script,
+    };
+    let topology = bounded(
+        build_worker_projects_topology_cmd(topology_policy, allow_initialization),
+        topology_timeout,
+    );
+    // Root already owns its receiver writes; its sweep would count everything
+    // as drift and then fail because chown-to-root changes nothing (bd-gc0ze).
+    if worker.user == "root" {
+        return Ok((topology, topology_timeout));
+    }
+    let roots = if dispatch_closure_roots.is_empty() {
+        vec![topology_policy.canonical_root().to_path_buf()]
+    } else {
+        dispatch_closure_roots.to_vec()
+    };
+    let repair = bounded(
+        build_worker_ownership_repair_cmd(&roots, &worker.user),
+        repair_timeout,
+    );
+    Ok((
+        format!("(\n{topology}\n) || exit $?\n(\n{repair}\n)"),
+        topology_timeout + repair_timeout,
+    ))
+}
+
 pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
@@ -2880,22 +3035,31 @@ pub(super) async fn ensure_worker_projects_topology(
 
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
-    let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
-    let timeout = Duration::from_secs(20);
-    let topology_cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_bounded_script(
-            &source_authority_activity_prefix(identity)?,
-            &topology_cmd,
-            timeout,
-        ),
-        None => topology_cmd,
-    };
+    let (script, timeout) = worker_mirror_preflight_command(
+        worker,
+        topology_policy,
+        dispatch_closure_roots,
+        source_identity,
+        allow_initialization,
+    )?;
+    // The closure-sized program stays off argv (#71); one channel owns both
+    // finite activities and is reaped on cancellation or the combined bound.
     let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", topology_cmd.as_bytes(), timeout)
-            .await?;
+        run_offload_ssh_command_with_stdin(worker, "sh -s", script.as_bytes(), timeout).await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.lines().any(|line| line == "RCH_TOPOLOGY_OK") {
+            anyhow::bail!(
+                "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
+                 root-owned entries under the dispatch closure block rsync-as-{} (bd-8iwkm)",
+                worker.id,
+                output.status.code(),
+                stdout.trim(),
+                stderr,
+                worker.user,
+            );
+        }
         // A non-symlink alias that does NOT resolve to the canonical root is a
         // path_topology *policy* problem, not a worker fault — every worker will
         // refuse it identically. Name the config sources so operators fix the
@@ -2915,7 +3079,7 @@ pub(super) async fn ensure_worker_projects_topology(
             "remote topology preflight failed on {} (status {:?}): stdout='{}' stderr='{}'{}",
             worker.id,
             output.status.code(),
-            stdout,
+            stdout.trim(),
             stderr,
             policy_hint
         );
@@ -2924,25 +3088,10 @@ pub(super) async fn ensure_worker_projects_topology(
         "[RCH] topology preflight ok on {} ({} -> {} enforced)",
         worker.id, alias_display, canonical_display
     ));
-    // bd-8iwkm: root-owned entries inside the canonical mirror tree make
-    // rsync-as-ssh-user fail exit 23 on replace/unlink even when topology is
-    // healthy. Repair them before sync so the failure window closes here
-    // instead of mid-transfer.
-    // bd-gc0ze follow-up: scope the ownership sweep to THIS dispatch's closure
-    // roots instead of the whole canonical mirror. A global scan walks every
-    // mirrored repo (13GB+ franken_engine mirrors included) on every dispatch,
-    // which blew the fixed SSH budget and failed closed on E104 before any
-    // rsync started. The drift that breaks THIS transfer can only live under
-    // the remote roots THIS transfer writes into.
-    let ownership_scan_roots: Vec<PathBuf> = if dispatch_closure_roots.is_empty() {
-        vec![topology_policy.canonical_root().to_path_buf()]
-    } else {
-        dispatch_closure_roots.to_vec()
-    };
-    let repaired =
-        repair_worker_mirror_ownership(worker, reporter, &ownership_scan_roots, source_identity)
-            .await?;
-    if repaired > 0 {
+    if let Some(repaired) = stdout.lines().find_map(|line| {
+        line.strip_prefix("RCH_OWNERSHIP_REPAIRED:count=")
+            .and_then(|value| value.parse::<u64>().ok())
+    }) {
         reporter.summary(&format!(
             "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
             worker.id, worker.user
@@ -2951,81 +3100,104 @@ pub(super) async fn ensure_worker_projects_topology(
     Ok(())
 }
 
-/// bd-8iwkm: detect and repair root-owned entries under the dispatch's closure
-/// roots on the worker's canonical mirror. Returns the number of repaired
-/// entries; zero means either no drift or a fail-open check-unavailable (never
-/// blocks dispatch). Scoped to the closure roots (see caller) so cost tracks
-/// the trees about to be rsynced rather than the entire mirror.
-async fn repair_worker_mirror_ownership(
-    worker: &WorkerConfig,
-    reporter: &HookReporter,
-    roots: &[PathBuf],
-    source_identity: Option<&str>,
-) -> anyhow::Result<u64> {
-    if should_skip_remote_preflight(worker) {
-        reporter.verbose("[RCH] ownership preflight skipped in mock mode");
-        return Ok(0);
-    }
-    if crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
-        reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
-        return Ok(0);
-    }
-    // bd-8iwkm/bd-gc0ze: when the SSH user IS root, rsync already runs as
-    // root and root-owned entries cannot block replace/unlink. Counting them
-    // would flag the entire mirror as drift while the repair chown is a
-    // no-op, so the sweep would report RCH_OWNERSHIP_PARTIAL forever and
-    // fail-closed every dispatch on root-login workers.
-    if worker.user == "root" {
-        reporter.verbose("[RCH] ownership preflight skipped for root-login worker");
-        return Ok(0);
-    }
-    let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
-    let timeout = Duration::from_secs(600);
-    let cmd = match source_identity {
-        Some(identity) => crate::transfer::source_activity_bounded_script(
-            &source_authority_activity_prefix(identity)?,
-            &cmd,
-            timeout,
-        ),
-        None => cmd,
-    };
-    // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
-    // pathological trees without failing every dispatch the way the old fixed
-    // 60s budget did once mirrors grew past multi-GB.
-    // rch#71: keep the closure-sized script off argv. The existing stdin
-    // executor retains the timeout, concurrent output drains and kill-on-drop.
-    let output =
-        run_offload_ssh_command_with_stdin(worker, "sh -s", cmd.as_bytes(), timeout).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
-             root-owned entries under the dispatch closure block rsync-as-{} (bd-8iwkm)",
-            worker.id,
-            output.status.code(),
-            stdout,
-            stderr,
-            worker.user
-        );
-    }
-    if let Some(count) = stdout
-        .strip_prefix("RCH_OWNERSHIP_REPAIRED:count=")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        reporter.verbose(&format!(
-            "[RCH] ownership drift repaired on {}: {count} entries chowned to {}",
-            worker.id, worker.user
-        ));
-        return Ok(count);
-    }
-    Ok(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_path_control_deadline_checks_before_and_after_polling() {
+        let polled = std::cell::Cell::new(false);
+        let result = control_timeout_at(tokio::time::Instant::now(), async {
+            polled.set(true);
+            "READY"
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !polled.get(),
+            "an expired budget must not start control work"
+        );
+
+        let budget = Duration::from_secs(10);
+        for (delay, expected) in [(Duration::from_secs(9), true), (budget, false)] {
+            let deadline = tokio::time::Instant::now() + budget;
+            let result = control_timeout_at(deadline, async {
+                tokio::time::sleep(delay).await;
+                "READY"
+            })
+            .await;
+            assert_eq!(result.is_ok(), expected, "delay={delay:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_path_control_deadline_drops_pending_operation() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = Dropped(dropped.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let result = control_timeout_at(deadline, async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn slow_path_control_deadline_rejects_non_yielding_success() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let result = control_timeout_at(deadline, async {
+            std::thread::sleep(Duration::from_millis(30));
+            "READY"
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "late ready evidence must not beat the timer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn slow_path_source_acquisition_keeps_expired_deadline_and_reaps_child() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let result = timeout(
+            Duration::from_secs(2),
+            finish_source_authority_lock_acquisition_until(
+                child,
+                WorkerId::new("expired-source-acquisition"),
+                "READY",
+                None,
+                tokio::time::Instant::now(),
+                false,
+            ),
+        )
+        .await
+        .expect("acquisition reset an expired deadline after spawning");
+        let error = match result {
+            Ok(_) => panic!("expired acquisition authorized source ownership"),
+            Err(error) => error,
+        };
+        assert!(crate::transfer::source_authority_busy(&error));
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
 
     #[tokio::test]
     async fn owned_offload_socket_is_bound_to_endpoint_and_task() {
@@ -3093,6 +3265,18 @@ mod tests {
                         let mut command = std::process::Command::new("ssh");
                         configure_offload_ssh_transport(&mut command, &worker);
                         assert_eq!(command.get_args().count(), 0);
+                        for setting in [None, Some(60)] {
+                            let transfer = TransferConfig {
+                                ssh_control_persist_secs: setting,
+                                ..TransferConfig::default()
+                            };
+                            with_owned_offload_ssh(worker.clone(), &transfer, async {
+                                assert!(offload_ssh_transport_arguments(&worker).is_none());
+                                Ok(())
+                            })
+                            .await
+                            .expect("automatic recovery must not create a reusable connection");
+                        }
                     },
                 )
                 .await
@@ -3103,8 +3287,48 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn owned_offload_reuse_requires_positive_opt_in_and_unix_worker() {
+        let worker = WorkerConfig::default();
+        for seconds in [1, 60] {
+            let transfer = TransferConfig {
+                ssh_control_persist_secs: Some(seconds),
+                ..TransferConfig::default()
+            };
+            let options = owned_offload_ssh_options(&worker, &transfer)
+                .expect("positive settings opt into an owned Unix connection");
+            assert!(options.control_master);
+            assert_eq!(
+                options.control_persist_idle,
+                Some(Duration::from_secs(seconds))
+            );
+            assert_eq!(options.server_alive_interval, Some(Duration::from_secs(15)));
+        }
+        for setting in [None, Some(0)] {
+            let disabled = TransferConfig {
+                ssh_control_persist_secs: setting,
+                ..TransferConfig::default()
+            };
+            assert!(owned_offload_ssh_options(&worker, &disabled).is_none());
+        }
+        let configured = TransferConfig {
+            ssh_control_persist_secs: Some(60),
+            ssh_server_alive_interval_secs: Some(30),
+            ..TransferConfig::default()
+        };
+        assert_eq!(
+            owned_offload_ssh_options(&worker, &configured)
+                .unwrap()
+                .server_alive_interval,
+            Some(Duration::from_secs(30))
+        );
+        let mut windows = worker;
+        windows.tags = vec!["os:windows".into()];
+        assert!(owned_offload_ssh_options(&windows, &configured).is_none());
+    }
+
     #[tokio::test]
-    async fn owned_offload_reuse_requires_positive_opt_in_and_unix_worker() {
+    async fn owned_offload_reuse_exclusions_do_not_connect() {
         let worker = WorkerConfig {
             host: "must-not-connect.invalid".into(),
             ..WorkerConfig::default()
@@ -3122,18 +3346,24 @@ mod tests {
             .unwrap();
             assert_eq!(value, 42);
         }
-        let mut windows = worker;
+        let mut windows = worker.clone();
         windows.tags = vec!["os:windows".into()];
-        let transfer = TransferConfig {
-            ssh_control_persist_secs: Some(60),
-            ..TransferConfig::default()
-        };
-        with_owned_offload_ssh(windows.clone(), &transfer, async {
-            assert!(offload_ssh_transport_arguments(&windows).is_none());
-            Ok(())
-        })
-        .await
-        .unwrap();
+        let mut mock = worker;
+        mock.host = "mock://dispatch".into();
+        for excluded in [windows, mock] {
+            for setting in [None, Some(0), Some(60)] {
+                let transfer = TransferConfig {
+                    ssh_control_persist_secs: setting,
+                    ..TransferConfig::default()
+                };
+                with_owned_offload_ssh(excluded.clone(), &transfer, async {
+                    assert!(offload_ssh_transport_arguments(&excluded).is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -3193,22 +3423,24 @@ mod tests {
             // An existing, shell-sensitive root at the end also proves that
             // the large payload was not truncated or its roots reinterpreted.
             roots.push(PathBuf::from(std::env::var_os(ROOT_ENV).unwrap()));
-            let script = build_worker_ownership_repair_cmd(&roots, &worker.user);
+            let topology = dir.join("topology");
+            std::fs::create_dir(&topology).unwrap();
+            let policy = PathTopologyPolicy::new(topology.clone(), topology);
+            let (script, _) =
+                worker_mirror_preflight_command(&worker, &policy, &roots, None, false).unwrap();
             assert!(script.len() > 128 * 1024);
 
-            for (mode, count, error, calls) in [
-                ("healthy", 0, None, "detect\n"),
-                ("repair", 1, None, "detect\nrepair\ndetect\n"),
-                ("check-unavailable", 0, None, "detect\n"),
+            for (mode, error, calls) in [
+                ("healthy", None, "detect\n"),
+                ("repair", None, "detect\nrepair\ndetect\n"),
+                ("check-unavailable", None, "detect\n"),
                 (
                     "unavailable",
-                    0,
                     Some((46, "RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=1")),
                     "detect\nrepair\n",
                 ),
                 (
                     "partial",
-                    0,
                     Some((47, "RCH_OWNERSHIP_PARTIAL:remaining=1")),
                     "detect\nrepair\ndetect\n",
                 ),
@@ -3216,9 +3448,12 @@ mod tests {
                 std::fs::write(dir.join("mode"), mode).unwrap();
                 std::fs::write(dir.join("state"), "pending").unwrap();
                 std::fs::write(dir.join("calls"), "").unwrap();
+                std::fs::write(dir.join("ssh_calls"), "").unwrap();
                 let result = timeout(
                     Duration::from_secs(20),
-                    repair_worker_mirror_ownership(&worker, &reporter, &roots, None),
+                    ensure_worker_projects_topology(
+                        &worker, &reporter, &policy, &roots, None, false,
+                    ),
                 )
                 .await
                 .expect("ownership repair must not hang on stdin/EOF");
@@ -3227,14 +3462,76 @@ mod tests {
                     assert!(error.contains(&format!("status Some({code})")), "{error}");
                     assert!(error.contains(marker), "{error}");
                 } else {
-                    assert_eq!(result.expect(mode), count, "{mode}");
+                    result.expect(mode);
                 }
                 assert_eq!(
                     std::fs::read(dir.join("payload")).unwrap(),
                     script.as_bytes()
                 );
                 assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), calls);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                    "request\n",
+                    "topology and ownership must share one remote round trip",
+                );
             }
+            std::fs::write(dir.join("calls"), "").unwrap();
+            std::fs::write(dir.join("ssh_calls"), "").unwrap();
+            let missing = dir.join("missing topology");
+            let unavailable = PathTopologyPolicy::new(missing.clone(), missing.clone());
+            let error = ensure_worker_projects_topology(
+                &worker,
+                &reporter,
+                &unavailable,
+                &roots,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED")
+            );
+            assert!(!missing.exists());
+            assert!(
+                std::fs::read(dir.join("calls")).unwrap().is_empty(),
+                "topology failure must prevent every ownership operation"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                "request\n"
+            );
+            // A function's nonzero return is different from an explicit
+            // shell exit. The batching caller must not suppress errexit and
+            // let an alias conflict fall through to ownership repair.
+            std::fs::write(dir.join("ssh_calls"), "").unwrap();
+            let conflict = dir.join("conflicting alias");
+            std::fs::create_dir(&conflict).unwrap();
+            let conflicting =
+                PathTopologyPolicy::new(policy.canonical_root().to_path_buf(), conflict.clone());
+            let error = ensure_worker_projects_topology(
+                &worker,
+                &reporter,
+                &conflicting,
+                &roots,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK")
+            );
+            assert!(conflict.is_dir() && !conflict.is_symlink());
+            assert!(std::fs::read(dir.join("calls")).unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ssh_calls")).unwrap(),
+                "request\n"
+            );
             std::fs::write(dir.join("finished"), "ok").unwrap();
             return;
         }
@@ -3253,11 +3550,15 @@ set -eu
 LC_ALL=C
 export LC_ALL
 remote=''
+connect_timeout=''
 for arg; do
     [ "${#arg}" -lt 131072 ] || exit 90
+    case "$arg" in ConnectTimeout=*) connect_timeout=$arg ;; esac
     remote=$arg
 done
 [ "$remote" = "sh -lc 'sh -s'" ] || exit 91
+[ "$connect_timeout" = ConnectTimeout=20 ] || exit 99
+echo request >> "$RCH_OWNERSHIP_TEST_DIR/ssh_calls"
 cat > "$RCH_OWNERSHIP_TEST_DIR/payload"
 # Execute the real remote wrapper and script, replacing only privileged work.
 {
@@ -3489,14 +3790,20 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
 
     #[cfg(target_os = "linux")]
     fn source_lock_test_dir() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
         // RCH places TMPDIR inside its exclusively held source snapshot.
         // These tests acquire real hierarchical source locks, so their
         // independent repositories must be outside that enclosing grant.
-        tempfile::Builder::new()
+        let directory = tempfile::Builder::new()
             .prefix("rch-source-lock-test-")
             .tempdir_in("/tmp")
             .unwrap()
-            .keep()
+            .keep();
+        // Custody rejects writable-by-others parents independently of the
+        // caller's umask. Positive fixtures must establish that contract.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
     }
 
     #[cfg(target_os = "linux")]
@@ -4025,6 +4332,7 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn terminal_cancellation_command_preserves_quoted_evidence_and_exact_control_result() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use tokio::io::AsyncWriteExt as _;
 
         let directory = tempfile::Builder::new()
@@ -4036,21 +4344,38 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
         let control = directory.path().join("control receipts");
         std::fs::create_dir(&registry).unwrap();
         std::fs::create_dir(&control).unwrap();
+        for path in [directory.path(), registry.as_path(), control.as_path()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         for name in ["released", "cancelled", "quarantine"] {
-            std::fs::create_dir(registry.join(name)).unwrap();
+            let path = registry.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let source = directory
             .path()
             .join("source ' ; $(touch expanded-dollar) `touch expanded-backtick`");
         let roots = vec![source.display().to_string()];
         let identity = "ac03";
+        // A previously cancelled token retains its original mutex inodes.
+        // Settlement must drain these, never create a new activity-lock inode
+        // and mistake it for evidence that an old holder has finished.
+        for name in [
+            "metadata.lock".to_owned(),
+            format!("{identity}.activity.lock"),
+        ] {
+            let lock = registry.join(name);
+            std::fs::write(&lock, b"").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let (body, digest) = source_claim_roots(&roots).unwrap();
         let fence = registry.join(format!("{identity}.{digest}.cancelling"));
         let receipt = registry
             .join("cancelled")
             .join(format!("{identity}.{digest}.claim"));
         std::fs::write(&fence, &body).unwrap();
-        for attempt in 0..5 {
+        std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for attempt in 0..6 {
             let discover = attempt == 0;
             let locate = attempt == 1;
             let command = source_cancellation_settlement_command(
@@ -4083,8 +4408,32 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                 ),
             );
             if attempt == 4 {
+                // Replace just this name: the complete receipt and original
+                // immutable fence inode remain intact, and a contradictory
+                // replacement must not be repaired or acknowledged.
+                std::fs::rename(&fence, registry.join("retained-cancellation-fence")).unwrap();
                 std::fs::write(&fence, b"/incomplete\n").unwrap();
+            } else if attempt == 5 {
+                // Separately corrupt the shared immutable inode in place.
+                // Both names must now fail the roots digest; neither may be
+                // rewritten from caller-supplied roots to manufacture success.
+                std::fs::rename(&fence, registry.join("retained-invalid-fence")).unwrap();
+                std::fs::hard_link(&receipt, &fence).unwrap();
+                std::fs::write(&fence, b"/incomplete\n").unwrap();
+                assert_eq!(
+                    std::fs::metadata(&fence).unwrap().ino(),
+                    std::fs::metadata(&receipt).unwrap().ino()
+                );
+                assert_eq!(std::fs::read(&receipt).unwrap(), b"/incomplete\n");
             }
+            let refused_evidence = (attempt >= 4).then(|| {
+                [&fence, &receipt].map(|path| {
+                    (
+                        std::fs::metadata(path).unwrap().ino(),
+                        std::fs::read(path).unwrap(),
+                    )
+                })
+            });
             // Use the real generated upload, login-shell quoting and bounded
             // controller. The standalone Python qualification uses shlex and
             // cannot detect a regression in these Rust command boundaries.
@@ -4130,6 +4479,19 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                         .contains("RCH_SOURCE_CANCELLATION_UNSETTLED")
                 );
                 assert_eq!(std::fs::read(&fence).unwrap(), b"/incomplete\n");
+                for (path, (inode, bytes)) in [&fence, &receipt]
+                    .into_iter()
+                    .zip(refused_evidence.as_ref().unwrap())
+                {
+                    assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+                    assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                }
+                assert!(!registry.join(format!("{identity}.{digest}.claim")).exists());
+                assert!(
+                    !registry
+                        .join(format!("{identity}.{digest}.pending"))
+                        .exists()
+                );
             }
             if discover || locate {
                 assert!(
@@ -4137,7 +4499,14 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
                     "namespace discovery published a cancellation receipt"
                 );
             } else {
-                assert_eq!(std::fs::read(&receipt).unwrap(), body.as_bytes());
+                assert_eq!(
+                    std::fs::read(&receipt).unwrap(),
+                    if attempt == 5 {
+                        b"/incomplete\n".as_slice()
+                    } else {
+                        body.as_bytes()
+                    }
+                );
             }
             assert!(!source.exists(), "metadata recovery created a source root");
             assert!(!directory.path().join("expanded-dollar").exists());
@@ -4317,15 +4686,19 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_registry_repairs_empty_legacy_cancellation_as_unowned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = tempfile::tempdir().unwrap();
         let registry = directory.path().join("registry");
         std::fs::create_dir_all(&registry).unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
         let roots = vec![directory.path().join("source").display().to_string()];
         let (content, digest) = source_claim_roots(&roots).unwrap();
         // rch <= 2.1.16 left exactly this when its cancellation redirect hit
         // ENOSPC: the record was created and never written.
         let cancelling = registry.join(format!("ad02.{digest}.cancelling"));
         std::fs::write(&cancelling, b"").unwrap();
+        std::fs::set_permissions(&cancelling, std::fs::Permissions::from_mode(0o600)).unwrap();
         let acquire = test_source_intent(&registry, &roots, "ad02", "acquire").await;
         assert_eq!(acquire.status.code(), Some(73));
         assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
@@ -4345,10 +4718,30 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         let cancelled = registry
             .join("cancelled")
             .join(format!("ad02.{digest}.claim"));
-        assert_eq!(std::fs::read(cancelled).unwrap(), content.as_bytes());
-        assert!(!cancelling.exists());
+        assert_eq!(std::fs::read(&cancelled).unwrap(), content.as_bytes());
+        // Cancellation has retained a permanent, complete fence since
+        // 2070d439. Removing it would let receipt collection revive a delayed
+        // acquire. Repair must replace the empty legacy bytes, not the fence.
+        assert_eq!(std::fs::read(&cancelling).unwrap(), content.as_bytes());
+        assert!(!registry.join(format!("ad02.{digest}.claim")).exists());
+        assert!(!registry.join(format!("ad02.{digest}.pending")).exists());
+        assert!(!directory.path().join("source").exists());
         let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
         assert_eq!(late.status.code(), Some(73));
+        // Model receipt collection without deleting the evidence. The fence
+        // alone must still deny a delayed acquire and permit exact settlement.
+        std::fs::rename(
+            &cancelled,
+            directory.path().join("retired-cancellation-receipt"),
+        )
+        .unwrap();
+        let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(late.status.code(), Some(73));
+        let settled = test_source_intent(&registry, &roots, "ad02", "cancel").await;
+        assert!(settled.status.success(), "{settled:?}");
+        assert_eq!(settled.stdout, b"unowned");
+        assert_eq!(std::fs::read(&cancelled).unwrap(), content.as_bytes());
+        assert_eq!(std::fs::read(&cancelling).unwrap(), content.as_bytes());
     }
 
     #[cfg(target_os = "linux")]
@@ -5461,7 +5854,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_claim_does_not_mutate_source_before_full_grant() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let root = directory.join("not-yet-materialized");
         let lock = directory.join("pair.lock");
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -5500,7 +5893,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_serializes_until_retirement_and_explicit_release() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source with ' quotes");
         let lock = dir.join("pair.lock");
         let first = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5550,7 +5943,7 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_holder_loss_never_authorizes_another_writer() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source");
         let lock = dir.join("pair.lock");
         let first = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5576,7 +5969,7 @@ os.execv({python:?}, [{python:?}] + args)
     async fn source_pair_holder_loss_blocks_setup_capability_fallback() {
         use crate::transfer::{RemoteExecutionUnconfirmed, RemoteProcessSetupUnavailable};
 
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let root = dir.join("source");
         let lock = dir.join("pair.lock");
         let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5658,7 +6051,7 @@ os.execv({python:?}, [{python:?}] + args)
         use tokio::io::AsyncWriteExt as _;
 
         for exit_code in [255, -1] {
-            let dir = tempfile::tempdir().unwrap().keep();
+            let dir = source_lock_test_dir();
             let root = dir.join("source");
             let lock = dir.join("pair.lock");
             let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
@@ -5694,16 +6087,60 @@ os.execv({python:?}, [{python:?}] + args)
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_pair_rejects_empty_or_malformed_ownership_state() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = source_lock_test_dir();
         for (index, contents) in ["", "release", "released\noccupied", "unknown"]
             .iter()
             .enumerate()
         {
             let lock = dir.join(format!("pair-{index}.lock"));
             let root = dir.join(format!("source-{index}"));
-            std::fs::write(dir.join(format!("pair-{index}.lock.owner")), contents).unwrap();
-            assert!(claim_test_source_pair(&lock, &root).await.is_err());
+            let owner = dir.join(format!("pair-{index}.lock.owner"));
+            std::fs::write(&owner, contents).unwrap();
+            std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let error = match claim_test_source_pair(&lock, &root).await {
+                Ok(_) => panic!("malformed ownership must refuse source access"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("malformed release receipt"),
+                "{error:#}"
+            );
             assert!(!root.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_rejects_group_writable_parent_and_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for writable_parent in [true, false] {
+            let dir = source_lock_test_dir();
+            let root = dir.join("source");
+            let lock = dir.join("pair.lock");
+            let owner = dir.join("pair.lock.owner");
+            if writable_parent {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+            } else {
+                std::fs::write(&owner, b"released\n").unwrap();
+                std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o620)).unwrap();
+            }
+            let error = match claim_test_source_pair(&lock, &root).await {
+                Ok(_) => panic!("group-writable custody must refuse source access"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("unsafe source pair record"),
+                "{error:#}"
+            );
+            assert!(!root.exists());
+            if writable_parent {
+                assert!(!owner.exists());
+            } else {
+                assert_eq!(std::fs::read(&owner).unwrap(), b"released\n");
+            }
         }
     }
 
@@ -5817,6 +6254,85 @@ os.execv({python:?}, [{python:?}] + args)
             .spawn()
             .expect("spawn source lock transport");
         (child, bootstrap)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_control_handoff_preserves_heartbeat_at_shell_buffer_boundaries()
+    {
+        let leaf = "sleep 0.05; printf '%s\\n' HANDOFF_TEST_READY; \
+            IFS= read -r release; [ \"$release\" = RCH_SOURCE_AUTHORITY_RELEASE:abc ]; \
+            printf '%s\\n' \"$release\"";
+        for block in [8192, 16384] {
+            for remainder in [block - 15, block - 1, 0, 1] {
+                let base = source_authority_live_session_command(
+                    &format!("#\n{leaf}"),
+                    SOURCE_LOCK_HEARTBEAT_TIMEOUT,
+                );
+                let (_, bootstrap) = source_authority_lock_transport(WorkerPlatform::Posix, &base);
+                let padding = (remainder + block - bootstrap.unwrap().len() % block) % block;
+                let script = source_authority_live_session_command(
+                    &format!("#{}\n{leaf}", "x".repeat(padding)),
+                    SOURCE_LOCK_HEARTBEAT_TIMEOUT,
+                );
+                let (child, bootstrap) =
+                    local_source_lock_transport(WorkerPlatform::Posix, &script);
+                assert_eq!(bootstrap.as_ref().unwrap().len() % block, remainder);
+                let mut guard = finish_source_authority_lock_acquisition(
+                    child,
+                    WorkerId::new("handoff-boundary-test"),
+                    "HANDOFF_TEST_READY",
+                    bootstrap.as_deref(),
+                    Duration::from_secs(10),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("block={block}, remainder={remainder}: {error:#}"));
+                guard.release_request = Some("RCH_SOURCE_AUTHORITY_RELEASE:abc".into());
+                guard.ensure_held().unwrap();
+                guard.release().await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_lifecycle_control_handoff_never_substitutes_for_source_readiness() {
+        for (frames, reason) in [
+            (
+                "HANDOFF_TEST_READY\n",
+                "control handoff was not acknowledged",
+            ),
+            (
+                "RCH_SOURCE_LOCK_SESSION_READY\nWRONG_SOURCE_READY\n",
+                "invalid ready marker",
+            ),
+        ] {
+            let script = format!(
+                "printf '%s' {}; exec cat >/dev/null",
+                shell_escape::escape(frames.into())
+            );
+            let child = Command::new("sh")
+                .args(["-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let refused = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("handoff-refusal-test"),
+                "HANDOFF_TEST_READY",
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await
+            .err()
+            .expect("both control ownership and exact source readiness are required");
+            assert!(refused.to_string().contains(reason), "{refused:#}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6454,6 +6970,72 @@ os.execv({python:?}, [{python:?}] + args)
 
     #[cfg(unix)]
     #[test]
+    fn topology_preflight_links_an_absent_canonical_to_the_existing_alias_target() {
+        let _guard = test_guard!();
+        let raw = tempfile::tempdir().unwrap().keep();
+        let directory = std::fs::canonicalize(raw).unwrap();
+        let physical = directory.join("data/projects");
+        let alias = directory.join("dp");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(physical.join("input"), b"mirror\n").unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let canonical = directory.join("Users/test/projects");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        let run = |policy: &PathTopologyPolicy, allow: bool| {
+            std::process::Command::new("sh")
+                .args(["-c", &build_worker_projects_topology_cmd(policy, allow)])
+                .output()
+                .unwrap()
+        };
+
+        let denied = run(&policy, false);
+        assert_eq!(denied.status.code(), Some(48));
+        assert!(!canonical.exists() && !canonical.is_symlink());
+
+        let initialized = run(&policy, true);
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        assert_eq!(initialized.stdout, b"RCH_TOPOLOGY_OK\n");
+        assert_eq!(std::fs::read_link(&canonical).unwrap(), physical);
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+        let healthy = run(&policy, false);
+        assert!(healthy.status.success());
+        assert_eq!(std::fs::read(canonical.join("input")).unwrap(), b"mirror\n");
+
+        // A real directory at the alias may hold other work: it is never a
+        // link target, and its contents stay untouched.
+        let real_alias = directory.join("real-alias");
+        std::fs::create_dir(&real_alias).unwrap();
+        std::fs::write(real_alias.join("keep"), b"unfinished\n").unwrap();
+        let elsewhere = directory.join("elsewhere/projects");
+        let policy = PathTopologyPolicy::new(elsewhere.clone(), real_alias.clone());
+        let refused = run(&policy, true);
+        assert_eq!(refused.status.code(), Some(42));
+        assert!(!elsewhere.is_symlink());
+        assert_eq!(
+            std::fs::read(real_alias.join("keep")).unwrap(),
+            b"unfinished\n"
+        );
+
+        // When the link cannot be made, refuse without minting a second tree:
+        // a real directory here would turn this into a permanent conflict.
+        let blocked = directory.join("blocked");
+        std::fs::write(&blocked, b"a file, not a directory").unwrap();
+        let policy = PathTopologyPolicy::new(blocked.join("projects"), alias.clone());
+        let refused = run(&policy, true);
+        assert_eq!(refused.status.code(), Some(43));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("RCH_TOPOLOGY_ERR_ALIAS_TARGET_CONFLICT")
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"a file, not a directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn topology_preflight_never_retargets_an_existing_source_alias() {
         let _guard = test_guard!();
         let directory = tempfile::tempdir().unwrap().keep();
@@ -6968,6 +7550,148 @@ exec /bin/ln \"$@\"\n",
                 .await
                 .expect("release detached an output reader")
                 .expect("reader drop notification lost");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_rejects_completed_drains_after_deadline() {
+        let (guard, writers, notices) = source_lock_pending_release_fixture().await;
+        tokio::time::pause();
+        let budget = Duration::from_secs(15);
+        let mut release = Box::pin(guard.release_with_timeout(budget));
+        assert!(futures::poll!(release.as_mut()).is_pending());
+
+        // Make both collectors ready without polling their waiting owner.
+        // Tokio then polls a ready collect future before its expired timer.
+        drop(writers);
+        source_lock_assert_readers_dropped(notices).await;
+        tokio::time::advance(budget).await;
+        let error = release.await.unwrap_err();
+        assert!(error.to_string().contains("timed out releasing"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_caps_supplied_budget_and_drops_readers() {
+        let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let error = guard.release_with_timeout(Duration::MAX).await.unwrap_err();
+        assert!(error.to_string().contains("timed out releasing"));
+        let cap = rch_common::timing::MAX_CONTROL_TIMEOUT;
+        assert!(started.elapsed() >= cap);
+        assert!(started.elapsed() < cap + Duration::from_secs(1));
+        // Writers remain alive: only aborting the owned readers can notify us.
+        source_lock_assert_readers_dropped(notices).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_path_source_release_scales_waiting_and_preserves_receipts() {
+        const SCALE_ENV: &str = "RCH_TEST_SOURCE_RELEASE_SCALE";
+        const FINISHED: &str = "RCH_TEST_SOURCE_RELEASE_SCALE_OK";
+        if let Ok(value) = std::env::var(SCALE_ENV) {
+            let scale: rch_common::timing::TimingScale = value.parse().unwrap();
+            rch_common::timing::install(scale);
+            let budget = scale.duration(Duration::from_secs(15));
+
+            let (guard, writers, notices) = source_lock_pending_release_fixture().await;
+            tokio::time::pause();
+            let close = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                drop(writers);
+            });
+            let started = tokio::time::Instant::now();
+            let result = guard.release().await;
+            let expected_success = value != "1";
+            assert_eq!(
+                result.is_ok(),
+                expected_success,
+                "scale={value}: {result:?}"
+            );
+            let expected_elapsed = if expected_success {
+                Duration::from_secs(20)
+            } else {
+                budget
+            };
+            assert!(started.elapsed() >= expected_elapsed);
+            assert!(started.elapsed() < expected_elapsed + Duration::from_secs(1));
+            close.abort();
+            let _ = close.await;
+            source_lock_assert_readers_dropped(notices).await;
+            tokio::time::resume();
+
+            // Extra time cannot substitute for the complete identity-bound
+            // acknowledgment, even when the holder exits successfully.
+            let child = Command::new("sh")
+                .args([
+                    "-c",
+                    "printf 'READY\n'; IFS= read -r request; printf '%s' \"$request\"",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut guard = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("scaled-release-ack"),
+                "READY",
+                None,
+                Duration::from_secs(2),
+                false,
+            )
+            .await
+            .unwrap();
+            guard.release_request = Some("RELEASE".to_owned());
+            let error = timeout(Duration::from_secs(5), guard.release())
+                .await
+                .expect("incomplete acknowledgment waited for the scaled deadline")
+                .unwrap_err();
+            assert!(error.to_string().contains("acknowledgment missing"));
+
+            let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let error = guard.release().await.unwrap_err();
+            assert!(error.to_string().contains("timed out releasing"));
+            assert!(started.elapsed() >= budget);
+            assert!(started.elapsed() < budget + Duration::from_secs(1));
+            source_lock_assert_readers_dropped(notices).await;
+            tokio::time::resume();
+            println!("{FINISHED}");
+            return;
+        }
+
+        // The installed policy is process-wide. Isolate each policy case from
+        // other tests instead of changing their concurrent remote budgets.
+        let _guard = test_guard!();
+        let test_name = concat!(
+            module_path!(),
+            "::slow_path_source_release_scales_waiting_and_preserves_receipts"
+        );
+        let test_name = test_name.split_once("::").unwrap().1;
+        for scale in ["1", "2.5", "10"] {
+            let output = timeout(
+                Duration::from_secs(30),
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(SCALE_ENV, scale)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("isolated source release regression timed out")
+            .expect("start isolated source release regression");
+            assert!(
+                output.status.success(),
+                "scale={scale}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(FINISHED));
         }
     }
 

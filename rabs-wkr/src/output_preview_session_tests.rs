@@ -173,8 +173,8 @@ fn report() -> rabs_wkr::session::CapabilityReport {
 
 fn pressure() -> rabs_wkr::session::PressureSample {
     rabs_wkr::session::PressureSample {
-        load_x100: 0,
-        free_disk_mib: 100,
+        load_x100: Some(0),
+        free_disk_mib: Some(100),
     }
 }
 
@@ -333,21 +333,66 @@ fn assert_observation(reply: &Value, active: bool) {
     assert!(reply.get("exit_code").is_none() && reply.get("retained_result_sha256").is_none());
 }
 
+fn account_prefix_segment(segment: &Value, expected: &[u8], cursor: usize) -> usize {
+    let offset = usize::try_from(segment["offset"].as_u64().unwrap()).unwrap();
+    let skipped = usize::try_from(segment["skipped_bytes"].as_u64().unwrap()).unwrap();
+    let observed = usize::try_from(segment["observed_bytes"].as_u64().unwrap()).unwrap();
+    let data = segment["data_hex"].as_str().unwrap();
+    assert_eq!(
+        offset.checked_sub(cursor),
+        Some(skipped),
+        "preview advanced without an exact reported gap"
+    );
+    assert!(data.len().is_multiple_of(2));
+    let end = offset.checked_add(data.len() / 2).unwrap();
+    assert!(end <= observed && observed <= expected.len());
+    assert_eq!(data, hex(&expected[offset..end]), "preview bytes changed");
+    end
+}
+
+#[test]
+fn prefix_accounting_accepts_only_exact_data_and_explicit_gaps() {
+    let data = json!({"offset":0, "skipped_bytes":0, "observed_bytes":5,
+        "data_hex":hex(&STDOUT[..2])});
+    let cursor = account_prefix_segment(&data, STDOUT, 0);
+    assert_eq!(cursor, 2);
+    let gap = json!({"offset":5, "skipped_bytes":3, "observed_bytes":5, "data_hex":""});
+    assert_eq!(account_prefix_segment(&gap, STDOUT, cursor), STDOUT.len());
+}
+
+#[test]
+#[should_panic(expected = "preview advanced without an exact reported gap")]
+fn prefix_accounting_rejects_silently_consumed_bytes() {
+    let unreported = json!({"offset":5, "skipped_bytes":0,
+        "observed_bytes":5, "data_hex":""});
+    account_prefix_segment(&unreported, STDOUT, 0);
+}
+
+#[test]
+#[should_panic(expected = "preview bytes changed")]
+fn prefix_accounting_rejects_substituted_bytes() {
+    let changed = json!({"offset":0, "skipped_bytes":0,
+        "observed_bytes":5, "data_hex":"0000000000"});
+    account_prefix_segment(&changed, STDOUT, 0);
+}
+
 fn collect_prefix<F: Future>(mut driver: Pin<&mut F>, peer: &Wire) {
     let until = Instant::now() + Duration::from_secs(3);
-    let (mut stdout, mut stderr) = (String::new(), String::new());
-    while stdout != hex(STDOUT) || stderr != hex(STDERR) {
+    let (mut stdout, mut stderr) = (0, 0);
+    while stdout != STDOUT.len() || stderr != STDERR.len() {
         let reply = exchange(driver.as_mut(), peer, query(REQUEST));
         assert_observation(&reply, true);
         for segment in reply["segments"].as_array().unwrap() {
-            let lane = match segment["stream"].as_str().unwrap() {
-                "stdout" => &mut stdout,
-                "stderr" => &mut stderr,
+            let (lane, expected): (&mut usize, &[u8]) = match segment["stream"].as_str().unwrap() {
+                "stdout" => (&mut stdout, STDOUT),
+                "stderr" => (&mut stderr, STDERR),
                 _ => panic!("unknown preview stream"),
             };
-            assert_eq!(segment["offset"], lane.len() / 2);
-            assert_eq!(segment["skipped_bytes"], 0);
-            lane.push_str(segment["data_hex"].as_str().unwrap());
+            // The real drain never blocks on a preview consumer. Contention
+            // can discard a preview chunk, but every byte must still appear
+            // either as exact data or an explicit gap. A refused query that
+            // consumes the cursor silently cannot satisfy this accounting.
+            *lane = account_prefix_segment(segment, expected, *lane);
         }
         assert!(
             Instant::now() < until,

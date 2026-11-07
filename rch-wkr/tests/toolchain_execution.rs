@@ -62,6 +62,7 @@ esac
 const CARGO: &str = r#"#!/bin/sh
 set -eu
 printf '%s\n' "${RCH_TEST_SELECTED_TOOLCHAIN:-default}" "$@" >> "$RCH_TEST_STATE/cargo"
+printf '%s|%s\n' "${RCH_CARGO_WRAPPER_BYPASS-unset}" "${RCH_CARGO_WRAPPER_ORIGIN-unset}" >> "$RCH_TEST_STATE/markers"
 printf 'fixture compiler output\n'
 if [ "$RCH_TEST_COMMAND_STATUS" = signal ]; then
     kill -TERM "$$"
@@ -83,7 +84,7 @@ fn executable(path: &Path, source: &str) {
 impl Fixture {
     fn new(mode: &'static str) -> Self {
         let root = tempfile::tempdir().expect("create fixture");
-        for directory in ["bin", "work", "home"] {
+        for directory in ["bin", "work", "home", "home/.rustup"] {
             fs::create_dir(root.path().join(directory)).expect("create fixture directory");
         }
         // PATH contains only fixtures, so even an installed host rustup cannot
@@ -109,20 +110,9 @@ impl Fixture {
         self.root.path().join(name)
     }
 
-    fn run(&self, toolchain: Option<&str>, command_status: &str) -> Output {
+    fn worker_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rch-wkr"));
         command
-            .args(["execute", "--workdir"])
-            .arg(self.path("work"))
-            .args(["--command", USER_COMMAND])
-            // These fixtures write only a few KiB. Exercise the real guard
-            // with an explicit small budget without depending on host GiB.
-            .args([
-                "--disk-budget-bytes",
-                "8388608",
-                "--disk-min-free-bytes",
-                "1048576",
-            ])
             .env_clear()
             .env("PATH", self.path("bin"))
             .env("HOME", self.path("home"))
@@ -136,13 +126,34 @@ impl Fixture {
             .env("RCH_TEST_STATE", self.root.path())
             .env("RCH_TEST_MODE", self.mode)
             .env("RCH_TEST_TOOLCHAIN", TOOLCHAIN)
-            .env("RCH_TEST_COMMAND_STATUS", command_status)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+
+    fn run(&self, toolchain: Option<&str>, command_status: &str) -> Output {
+        let mut command = self.worker_command();
+        command
+            .args(["execute", "--workdir"])
+            .arg(self.path("work"))
+            .args(["--command", USER_COMMAND])
+            // These fixtures write only a few KiB. Exercise the real guard
+            // with an explicit small budget without depending on host GiB.
+            .args([
+                "--disk-budget-bytes",
+                "8388608",
+                "--disk-min-free-bytes",
+                "1048576",
+            ])
+            .env("RCH_TEST_COMMAND_STATUS", command_status);
         if let Some(toolchain) = toolchain {
             command.args(["--toolchain", toolchain]);
         }
+        Self::collect(command)
+    }
+
+    fn collect(mut command: Command) -> Output {
         let mut child = command.spawn().expect("start worker CLI");
         let started = Instant::now();
         loop {
@@ -277,4 +288,309 @@ fn no_requested_toolchain_preserves_default_execution_without_rustup() {
     assert!(output.status.success(), "{output:?}");
     assert!(fixture.events().is_empty());
     fixture.assert_compiler("default");
+}
+
+#[test]
+fn plain_and_guarded_worker_jobs_stamp_provenance_for_every_cargo_child() {
+    // A dual-role worker may inherit the reported stale BYPASS=1 without its
+    // origin, neither marker, or conflicting caller values. The executor must
+    // establish its own pair after remote admission in every case. Merely
+    // forwarding the caller's environment would fail the marker assertions.
+    for guarded in [false, true] {
+        for (bypass, origin) in [
+            (None, None),
+            (Some("1"), None),
+            (Some("1"), Some("")),
+            (Some("0"), Some("caller")),
+            (None, Some("rch")),
+        ] {
+            for exit_code in [0, 101] {
+                let fixture = Fixture::new("missing");
+                // The outer command deliberately contains no compilation
+                // keyword, so omitting --disk-budget-bytes really exercises
+                // the executor's plain shell path rather than automatic Cargo
+                // disk admission. Each Cargo below is a separate subprocess.
+                fs::write(
+                    fixture.path("work/job.sh"),
+                    r#"#!/bin/sh
+set -eu
+printf '%s|%s\n' "${RCH_CARGO_WRAPPER_BYPASS-unset}" "${RCH_CARGO_WRAPPER_ORIGIN-unset}" > "$RCH_TEST_STATE/job-markers"
+RCH_TEST_COMMAND_STATUS=0 cargo --version
+sh -c 'RCH_TEST_COMMAND_STATUS=0 cargo test --features "feature with spaces"'
+cargo build --release
+"#,
+                )
+                .expect("write worker job");
+                let mut command = fixture.worker_command();
+                command
+                    .args(["execute", "--workdir"])
+                    .arg(fixture.path("work"))
+                    .args(["--command", "sh ./job.sh"])
+                    .env("RCH_TEST_COMMAND_STATUS", exit_code.to_string())
+                    .env("RCH_REQUIRE_REMOTE", "1");
+                if let Some(value) = bypass {
+                    command.env("RCH_CARGO_WRAPPER_BYPASS", value);
+                }
+                if let Some(value) = origin {
+                    command.env("RCH_CARGO_WRAPPER_ORIGIN", value);
+                }
+                if guarded {
+                    command.args([
+                        "--disk-budget-bytes",
+                        "8388608",
+                        "--disk-min-free-bytes",
+                        "1048576",
+                    ]);
+                }
+                let output = Fixture::collect(command);
+                assert_eq!(
+                    output.status.code(),
+                    Some(exit_code),
+                    "guarded={guarded}, bypass={bypass:?}, origin={origin:?}: {output:?}"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("job-markers")).unwrap(),
+                    "1|rch\n",
+                    "the outer job must receive the managed pair"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("markers")).unwrap(),
+                    "1|rch\n1|rch\n1|rch\n",
+                    "each shell descendant must inherit the complete pair"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("cargo")).unwrap(),
+                    "default\n--version\ndefault\ntest\n--features\nfeature with spaces\ndefault\nbuild\n--release\n",
+                    "Cargo arguments and invocation count must be conserved"
+                );
+                assert_eq!(
+                    output.stdout.as_slice(),
+                    b"fixture compiler output\nfixture compiler output\nfixture compiler output\n",
+                    "worker output must be preserved"
+                );
+                assert!(
+                    fixture.events().is_empty(),
+                    "no recursive toolchain dispatch"
+                );
+            }
+        }
+    }
+}
+
+// These executables are explicit test doubles. The real worker CLI, shell,
+// disk supervisor, timeout, and environment propagation are exercised here;
+// the generated production shims have their own integration coverage in rch.
+const MANAGED_CARGO: &str = r#"#!/bin/sh
+set -eu
+if [ "$0" = "$RCH_TEST_STATE/bin/cargo" ]; then
+    route=PATH
+else
+    route=toolchain
+fi
+printf '%s|%s|%s' "$route" "${RCH_CARGO_WRAPPER_BYPASS:-unset}" "${RCH_CARGO_WRAPPER_ORIGIN:-unset}" >> "$RCH_TEST_STATE/cargo-probes"
+for arg in "$@"; do printf '|%s' "$arg" >> "$RCH_TEST_STATE/cargo-probes"; done
+printf '\n' >> "$RCH_TEST_STATE/cargo-probes"
+if [ "${RCH_CARGO_WRAPPER_BYPASS:-}" != 1 ] || [ "${RCH_CARGO_WRAPPER_ORIGIN:-}" != rch ]; then
+    printf 'fixture: missing managed Cargo environment\n' >&2
+    exit 91
+fi
+case "${RCH_TEST_PROBE_MODE:-ok}:$route" in
+    path_refusal:PATH|toolchain_refusal:toolchain)
+        printf 'fixture: incompatible Cargo wrapper\n' >&2
+        exit 1
+        ;;
+    timeout:PATH)
+        printf '%s\n' "$$" > "$RCH_TEST_STATE/probe-pid"
+        exec python3 -c 'import time; time.sleep(30)'
+        ;;
+    oversized:PATH)
+        exec python3 -c 'import sys; sys.stdout.write("x" * 32768)'
+        ;;
+esac
+printf 'cargo 1.99.0 (fixture)\n'
+"#;
+
+const CAPABILITY_RUSTUP: &str = r#"#!/bin/sh
+set -eu
+case "$1" in
+    which)
+        [ "$#" = 2 ] && [ "$2" = cargo ] || exit 92
+        [ "${RCH_CARGO_WRAPPER_BYPASS:-}" = 1 ] && [ "${RCH_CARGO_WRAPPER_ORIGIN:-}" = rch ] || exit 93
+        printf '%s\n' "$RCH_TEST_STATE/toolchain bin/cargo"
+        ;;
+    toolchain)
+        [ "$#" = 2 ] && [ "$2" = list ] || exit 94
+        # No installed inventory entries are needed for this execution check.
+        ;;
+    *) exit 95;;
+esac
+"#;
+
+impl Fixture {
+    fn prepare_managed_cargo(&self) {
+        fs::create_dir(self.path("toolchain bin")).expect("create direct Cargo directory");
+        executable(&self.path("bin/cargo"), MANAGED_CARGO);
+        executable(&self.path("toolchain bin/cargo"), MANAGED_CARGO);
+    }
+
+    fn cargo_probes(&self) -> String {
+        fs::read_to_string(self.path("cargo-probes")).expect("read Cargo execution records")
+    }
+
+    fn capabilities(&self, mode: &str) -> (rch_common::WorkerCapabilities, Duration) {
+        self.prepare_managed_cargo();
+        executable(&self.path("bin/rustup"), CAPABILITY_RUSTUP);
+        executable(
+            &self.path("bin/rustc"),
+            "#!/bin/sh\nprintf 'rustc 1.99.0 (fixture)\\n'\n",
+        );
+        executable(&self.path("bin/node"), "#!/bin/sh\nprintf 'v20.11.0\\n'\n");
+        executable(&self.path("bin/npm"), "#!/bin/sh\nexit 1\n");
+        let mut command = self.worker_command();
+        command
+            .arg("capabilities")
+            .current_dir(self.path("work"))
+            .env("RCH_REQUIRE_REMOTE", "1")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "0")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+            .env("RCH_TEST_PROBE_MODE", mode)
+            .env("RCH_WKR_CANONICAL_ROOT", self.path("work"))
+            .env("RCH_WKR_ALIAS_ROOT", self.path("work"));
+        let started = Instant::now();
+        let output = Self::collect(command);
+        assert!(output.status.success(), "{output:?}");
+        let capabilities = serde_json::from_slice(&output.stdout).expect("worker capability JSON");
+        (capabilities, started.elapsed())
+    }
+}
+
+#[test]
+fn opaque_worker_jobs_stamp_both_markers_for_shell_and_disk_guard() {
+    for guarded in [false, true] {
+        for (bypass, origin) in [("0", "caller"), ("1", "")] {
+            let fixture = Fixture::new("available");
+            fixture.prepare_managed_cargo();
+            executable(
+                &fixture.path("work/job.sh"),
+                "#!/bin/sh\nset -eu\ncargo test -- 'filter with spaces'\n\"$RCH_TEST_STATE/toolchain bin/cargo\" --version\n",
+            );
+            let mut command = fixture.worker_command();
+            command
+                .args(["execute", "--workdir"])
+                .arg(fixture.path("work"))
+                // The worker cannot infer Cargo from this opaque command.
+                .args(["--command", "sh job.sh"])
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_CARGO_WRAPPER_BYPASS", bypass)
+                .env("RCH_CARGO_WRAPPER_ORIGIN", origin);
+            if guarded {
+                command.args([
+                    "--disk-budget-bytes",
+                    "8388608",
+                    "--disk-min-free-bytes",
+                    "1048576",
+                ]);
+            }
+            let output = Fixture::collect(command);
+            assert!(
+                output.status.success(),
+                "guarded={guarded} inherited={bypass}/{origin}: {output:?}"
+            );
+            assert_eq!(
+                fixture.cargo_probes(),
+                "PATH|1|rch|test|--|filter with spaces\ntoolchain|1|rch|--version\n"
+            );
+            assert_eq!(fixture.path("work/.rch-run").exists(), guarded);
+        }
+    }
+}
+
+#[test]
+fn worker_capabilities_execute_path_and_direct_toolchain_cargo() {
+    let fixture = Fixture::new("available");
+    let (capabilities, _) = fixture.capabilities("ok");
+    assert!(capabilities.has_rust(), "{capabilities:?}");
+    assert!(
+        !capabilities
+            .probe_warnings
+            .iter()
+            .any(|warning| warning.contains("Cargo execution check failed")),
+        "{capabilities:?}"
+    );
+    assert_eq!(
+        fixture.cargo_probes(),
+        "PATH|1|rch|--version\ntoolchain|1|rch|--version\n"
+    );
+}
+
+#[test]
+fn worker_capabilities_refuse_unusable_cargo_without_hiding_other_runtimes() {
+    for (mode, route, expected_probes) in [
+        ("path_refusal", "PATH Cargo", "PATH|1|rch|--version\n"),
+        (
+            "toolchain_refusal",
+            "toolchain Cargo",
+            "PATH|1|rch|--version\ntoolchain|1|rch|--version\n",
+        ),
+    ] {
+        let fixture = Fixture::new("available");
+        let (capabilities, _) = fixture.capabilities(mode);
+        assert!(!capabilities.has_rust(), "{capabilities:?}");
+        assert!(capabilities.has_node(), "{capabilities:?}");
+        let warning = capabilities
+            .probe_warnings
+            .iter()
+            .find(|warning| warning.contains("Cargo execution check failed"))
+            .expect("failed execution must have an actionable diagnostic");
+        assert!(warning.contains(route), "{warning}");
+        assert!(
+            warning.contains("fixture: incompatible Cargo wrapper"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("RCH_CARGO_WRAPPER_ORIGIN=rch"),
+            "{warning}"
+        );
+        assert_eq!(fixture.cargo_probes(), expected_probes);
+    }
+}
+
+#[test]
+fn worker_capabilities_bound_and_reap_hung_cargo_probes() {
+    let fixture = Fixture::new("available");
+    let (capabilities, elapsed) = fixture.capabilities("timeout");
+    assert!(!capabilities.has_rust(), "{capabilities:?}");
+    assert!(capabilities.has_node(), "{capabilities:?}");
+    assert!(
+        capabilities.probe_warnings.iter().any(|warning| {
+            warning.contains("PATH Cargo command timed out")
+                && warning.contains("Cargo execution check failed")
+        }),
+        "{capabilities:?}"
+    );
+    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+    assert_eq!(fixture.cargo_probes(), "PATH|1|rch|--version\n");
+    #[cfg(target_os = "linux")]
+    {
+        let pid = fs::read_to_string(fixture.path("probe-pid")).expect("hung probe PID");
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "timed-out Cargo probe must be killed and reaped"
+        );
+    }
+}
+
+#[test]
+fn worker_capabilities_bound_cargo_probe_output() {
+    let fixture = Fixture::new("available");
+    let (capabilities, _) = fixture.capabilities("oversized");
+    assert!(!capabilities.has_rust(), "{capabilities:?}");
+    assert!(
+        capabilities
+            .probe_warnings
+            .iter()
+            .any(|warning| { warning.contains("PATH Cargo output exceeds shared byte limit") }),
+        "{capabilities:?}"
+    );
+    assert_eq!(fixture.cargo_probes(), "PATH|1|rch|--version\n");
 }

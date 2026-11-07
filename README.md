@@ -313,6 +313,18 @@ a remote collection batch finished: an interrupted `--apply` batch is reported
 as having an unknown outcome, alongside confirmed earlier batches. The default
 invocation remains a preview.
 
+`rch cache status` also scans workers concurrently, with one 15-minute deadline
+and a 10 MiB output budget per worker across all roots. Set
+`rch cache status --worker-timeout=120` to shorten the deadline. Completed
+workers and roots remain in the report if another scan fails; a timeout exits
+nonzero, with one final JSON/TOON error response retaining those results.
+
+Windows cache status and GC inspect the same `C:/rch` base as the tar transport,
+plus the worker's resolved Cargo cache root. Every Windows directory remains
+kept until native process/handle ownership checks are available; `--apply`
+reports an explicit refusal. See [Windows cache inventory](docs/runbooks/worker-recovery.md#inspecting-windows-build-and-cargo-caches)
+for additional roots and incomplete-scan behavior.
+
 Capability refreshes skip duplicate requests for a worker while its probe is
 running. Workers reuse verified Rustup inventory across requests and invalidate
 entries when installed toolchains or component metadata change. Inventory runs
@@ -335,6 +347,23 @@ rch --robot-triage --json
 rch capabilities --json
 rch robot-docs guide
 ```
+
+RABS offers an experimental, opt-in worker-local dependency cache through
+`cargo rabs --rabs-remote check`. See the [setup and measured validation
+boundaries](docs/rabs-rch-worker-cache.md) before enabling it. Correct cache
+serving has passed real Cargo/SSH tests. Four native Linux scenarios also passed
+real compiler execution, replay, delivered binaries, and persistent worker/SDK
+reuse over authenticated loopback TLS. Practical acceleration remains under
+qualification; the measured whole-project warm run was slower than ordinary RCH.
+
+A configured shared canonical coordinator is also available through
+`cargo rabs --rabs-canonical-remote PROFILE.json -- build --workspace`.
+This explicit route uploads captured inputs over pinned mutual TLS, runs Cargo
+at the coordinator, shares eligible dependency compilations across clients and
+returns verified build artifacts to a fresh private destination. Reusable
+profiles support Rustup toolchain selection and a separate output root. See
+[remote Cargo profiles and command support](docs/rabs-canonical-cargo.md#submit-through-cargo-with-a-reusable-remote-profile)
+for setup, supported commands and the current qualification limits.
 
 ### Named Cargo JSON for installer consumers
 
@@ -728,6 +757,32 @@ export RCH_ALIAS_PROJECT_ROOT=/home/me/code
 Empty strings are treated as unset (defaults apply). See
 `docs/guides/configuration.md` (`[path_topology]`) for details.
 
+### Loaded or High-Latency Workers
+
+Increase bounded control-operation deadlines together when healthy workers need
+more time for SSH setup, filesystem scans or lock acquisition:
+
+```toml
+[timeouts]
+scale = 2.5                  # default 1.0; finite values from 1.0 through 10.0
+```
+
+`RCH_TIMING_SCALE=2.5 rch exec -- cargo check` overrides the client policy for
+one invocation. The daemon reads its own user configuration and environment at
+startup; restart `rchd` after changing its policy. A project override or an
+environment variable on `rch exec` does not reconfigure an already running
+daemon. Inspect the effective client value with
+`rch config get timeouts.scale` or `rch config show --sources`.
+
+The scale extends slow-path control deadlines and bounded retry windows. The
+shared timing policy caps each scaled control budget at one hour, including at
+scale 1.0. Build and test execution time limits, signal-escalation grace,
+polling cadence, disk thresholds, ownership checks and the proof required to
+release a worker remain separate. Invalid, non-finite or out-of-range values
+are configuration errors. See the
+[configuration guide](docs/guides/configuration.md#timeouts) for scope and
+precedence.
+
 ### Minimal Example
 
 ```toml
@@ -780,7 +835,8 @@ remote_base = "/data/tmp/rch"
 # The foreground master is reaped when the dispatch and its cleanup finish;
 # it does not leave a background ControlPersist process between invocations.
 # Unset or zero keeps the existing one-shot exec paths. Windows workers and
-# automatic recovery do not use this dispatch connection.
+# automatic recovery do not use this dispatch connection. Enable it for
+# high-latency workers: without it every SSH step pays a fresh handshake.
 # ssh_control_persist_secs = 60
 adaptive_compression = true
 verify_artifacts = false
@@ -820,9 +876,9 @@ strategy = "balanced"
 # Reserve this much free disk, then budget space for each concurrent slot (GiB).
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
-# A worker at or below this free-disk ratio gets no slots (rchd reads it at start).
+# Critical when both this ratio and the absolute cap below are reached.
 # disk_critical_free_ratio = 0.05
-# Judge large disks by absolute headroom: the ratio rule applies only at or below this many GB.
+# Default cap in GiB; use "uncapped" for an unconditional critical ratio.
 # disk_critical_ratio_cap_gb = 25.0
 
 [self_healing]
@@ -913,13 +969,27 @@ builds retain their reservations when capacity drops; new work waits for space.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
 
-Separately, rchd marks a worker Critical, with no slots at all, when its free
-space falls to `selection.disk_critical_free_ratio` (default `0.05`) or to 10 GB.
-On a 900 GB worker the ratio line is 45 GB. Set `selection.disk_critical_ratio_cap_gb`
-(for example `25.0`) so the ratio rule applies only at or below that many free GB and
-large disks are judged by absolute headroom. Both keys go in the daemon's
-`config.toml` and take effect when rchd restarts; the defaults keep the ratio rule
-unconditional.
+Separately, on build filesystems of at least 50 GiB, rchd marks a worker Critical
+when free space falls to 10 GiB, or when **both** the free ratio is at or below
+`selection.disk_critical_free_ratio` (default `0.05`) and free space is at or below
+`selection.disk_critical_ratio_cap_gb` (default `25.0` GiB). These defaults also
+apply when the dispatcher has no `config.toml`. A 900 GiB disk with 30 GiB free
+retains disk-budgeted capacity despite its low free percentage; the same disk
+with 8 GiB free stays Critical. Existing small-filesystem and `/tmp` rules still
+apply. A noncritical classification alone does not admit a
+build: fresh storage evidence, active reservations, the authorized build budget
+and safety buffers must still fit.
+
+Explicit caps such as `15.0` or `30.0` and custom critical ratios remain honored.
+Set `disk_critical_ratio_cap_gb = "uncapped"` to enforce the ratio independently
+of absolute free space. A finite cap must be at least 10 GiB; invalid numeric
+caps fall back to the stricter uncapped rule with a daemon warning. Inspect or
+change the settings with `rch config get selection.disk_critical_ratio_cap_gb --sources`
+and `rch config set selection.disk_critical_ratio_cap_gb 25`. The `get` and `set`
+commands also accept `selection.disk_critical_free_ratio`.
+Both keys take effect when rchd restarts, and its startup log reports the
+effective disk policy. The cap does not change per-slot allowances, protected
+free-space floors, or authorized build-storage budgets.
 
 Balanced selection also favors free disk before a worker reaches the admission
 floor. `selection.weights.disk` (default `0.2`, range `0` to `1`) adds disk

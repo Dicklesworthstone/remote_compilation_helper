@@ -727,6 +727,8 @@ rch_recovery_boot_state
         result = self.boot_observation(
             "printf '%s\\n' '13572468-1234-4abc-8def-135724681357'; sleep 6\n",
             r'''
+# Production's budget grows with load; pin the bound this assertion checks.
+rch_observation_budget() { rch_observation_seconds=3; }
 rch_identified=1
 rch_boot=24681357-1234-4abc-8def-246813572468
 rch_recovery_boot_state

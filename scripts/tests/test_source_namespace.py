@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -138,10 +139,10 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
             + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
             + "exec " + shlex.join(command) + " <<'RCH_NAMESPACE_SCOPE'\n"
             + data.decode() + "RCH_NAMESPACE_SCOPE\n); }\n"
-            + "rch_admission_attempts=6\n" + base.RETRY.read_text()
+            + "rch_admission_retry_seconds=5\n" + base.RETRY.read_text()
         )
         result = subprocess.run([base.SHELL, "-c", script], capture_output=True,
-                                timeout=5, env=self.env)
+                                timeout=5, env={**self.env, "RCH_TIMING_SCALE": "1"})
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(counter.read_text().splitlines(), ["attempt"])
         self.assertEqual(self.alias.resolve(), physical)
@@ -183,10 +184,11 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
             + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
             + "exec " + shlex.join(command) + " <<'RCH_NAMESPACE_SCOPE'\n"
             + data.decode() + "RCH_NAMESPACE_SCOPE\n); }\n"
-            + "rch_admission_attempts=3\n" + base.RETRY.read_text()
+            + "rch_admission_retry_seconds=3\n" + base.RETRY.read_text()
         )
         child = subprocess.Popen([base.SHELL, "-c", script], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=self.env)
+                                 stderr=subprocess.PIPE,
+                                 env={**self.env, "RCH_TIMING_SCALE": "1"})
         self.addCleanup(self.reap, child)
         deadline = time.monotonic() + 5
         while not counter.exists() and child.poll() is None and time.monotonic() < deadline:
@@ -200,6 +202,188 @@ class ProductionNamespaceTests(base.SourceTopologyTests):
         self.assertEqual(list(self.registry.glob("*.claim")), [])
         self.assertEqual(len(list((self.registry / "released").glob("*.claim"))), 1)
         self.assertEqual(self.alias.resolve(), self.canonical.resolve())
+
+
+class NamespaceCheckReportTests(unittest.TestCase):
+    """Execute the production read-only report with real directory layouts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="rch-namespace-probe-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.canonical = self.root / "dispatcher/projects"
+        self.alias = self.root / "alias"
+        self.physical = self.root / "worker/projects"
+
+    def run_check(self, canonical=None, alias=None, *, report=True, env=None):
+        arguments = ["check", str(canonical or self.canonical), str(alias or self.alias)]
+        if report:
+            arguments.append("--report-json")
+        result = subprocess.run(
+            [base.SHELL, "-c", PATHS.read_text(), "rch-namespace-probe", *arguments],
+            capture_output=True, timeout=5, env=env,
+        )
+        if report:
+            self.assertEqual(result.stderr, b"")
+            prefix = b"RCH_SOURCE_TOPOLOGY_CHECK_V1 "
+            self.assertTrue(result.stdout.startswith(prefix), result)
+            self.assertEqual(result.stdout.count(b"\n"), 1)
+            self.assertLessEqual(len(result.stdout), 65536)
+            return result, json.loads(result.stdout.removeprefix(prefix))
+        return result
+
+    def snapshot(self):
+        return {
+            str(path.relative_to(self.root)): (
+                path.lstat().st_ino, path.lstat().st_mode, path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+                os.readlink(path) if path.is_symlink() else None,
+            )
+            for path in self.root.rglob("*")
+        }
+
+    def test_worker_defaults_cannot_hide_dispatcher_conflicting_alias(self):
+        self.physical.mkdir(parents=True)
+        self.canonical.mkdir(parents=True)
+        self.alias.symlink_to(self.physical, target_is_directory=True)
+        (self.physical / "keep").write_bytes(b"private worker source")
+        (self.canonical / "keep").write_bytes(b"private dispatcher source")
+        before = self.snapshot()
+        defaults, defaults_report = self.run_check(canonical=self.physical)
+        self.assertEqual(defaults.returncode, 0)
+        self.assertEqual(defaults_report["outcome"], "compatible")
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report, {
+            "canonical": str(self.canonical),
+            "alias": str(self.alias),
+            "canonical_physical": str(self.canonical.resolve()),
+            "alias_physical": str(self.physical.resolve()),
+            "outcome": "conflicting_alias_base",
+        })
+        self.assertNotIn(b"private", result.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_missing_dispatcher_canonical_is_reported_without_initialization(self):
+        self.physical.mkdir(parents=True)
+        self.alias.symlink_to(self.physical, target_is_directory=True)
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["outcome"], "canonical_missing")
+        self.assertEqual(report["canonical"], str(self.canonical))
+        self.assertEqual(report["alias_physical"], str(self.physical.resolve()))
+        self.assertFalse(self.canonical.parent.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_matching_canonical_and_alias_symlinks_are_preserved(self):
+        self.physical.mkdir(parents=True)
+        self.canonical.parent.mkdir()
+        self.canonical.symlink_to(self.physical, target_is_directory=True)
+        self.alias.symlink_to(self.physical, target_is_directory=True)
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(report["outcome"], "compatible")
+        self.assertEqual(report["canonical_physical"], report["alias_physical"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_single_staging_root_needs_no_alias(self):
+        self.physical.mkdir(parents=True)
+        result, report = self.run_check(canonical=self.physical, alias=self.physical)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(report["outcome"], "compatible")
+        self.assertFalse(self.alias.exists())
+
+    def test_missing_alias_is_not_created(self):
+        self.canonical.mkdir(parents=True)
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["outcome"], "alias_missing")
+        self.assertFalse(self.alias.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_dangling_alias_target_is_not_created(self):
+        self.canonical.mkdir(parents=True)
+        self.alias.symlink_to(self.physical, target_is_directory=True)
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["outcome"], "alias_missing")
+        self.assertEqual(report["alias_physical"], str(self.physical.resolve()))
+        self.assertFalse(self.physical.parent.exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_canonical_file_is_not_replaced(self):
+        self.canonical.parent.mkdir()
+        self.canonical.write_bytes(b"keep canonical file")
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["outcome"], "canonical_not_directory")
+        self.assertEqual(self.canonical.read_bytes(), b"keep canonical file")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_alias_file_is_not_replaced(self):
+        self.canonical.mkdir(parents=True)
+        self.alias.write_bytes(b"keep alias file")
+        before = self.snapshot()
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["outcome"], "alias_not_directory")
+        self.assertEqual(self.alias.read_bytes(), b"keep alias file")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_ordinary_check_retains_silent_admission_contract(self):
+        missing = self.run_check(report=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(missing.stdout, b"")
+        self.canonical.mkdir(parents=True)
+        self.alias.symlink_to(self.canonical, target_is_directory=True)
+        matching = self.run_check(report=False)
+        self.assertEqual(matching.returncode, 0)
+        self.assertEqual(matching.stdout, b"")
+        self.assertEqual(matching.stderr, b"")
+
+    def test_report_option_cannot_invoke_create_mode(self):
+        result = subprocess.run(
+            [base.SHELL, "-c", PATHS.read_text(), "rch-namespace-probe", "create",
+             str(self.canonical), str(self.alias), "--report-json"],
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 73)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_resolver_failure_is_unavailable_not_a_matching_namespace(self):
+        self.canonical.mkdir(parents=True)
+        self.alias.symlink_to(self.canonical, target_is_directory=True)
+        binary_dir = self.root / "bin"
+        binary_dir.mkdir()
+        resolver = binary_dir / "grealpath"
+        resolver.write_text("#!/bin/sh\nexit 1\n")
+        resolver.chmod(0o755)
+        env = {**os.environ, "PATH": f"{binary_dir}:{os.environ['PATH']}"}
+        before = self.snapshot()
+        result, report = self.run_check(env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["outcome"], "unavailable")
+        self.assertIsNone(report["canonical_physical"])
+        self.assertIsNone(report["alias_physical"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_physical_mapping_controls_are_escaped_in_report(self):
+        physical = self.root / "physical\t\x1b[31m' $(touch BAD)"
+        physical.mkdir()
+        self.canonical.mkdir(parents=True)
+        self.alias.symlink_to(physical, target_is_directory=True)
+        result, report = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["alias_physical"], str(physical.resolve()))
+        self.assertNotIn(b"\x1b", result.stdout)
+        self.assertNotIn(b"\t", result.stdout)
+        self.assertFalse((self.root / "BAD").exists())
 
 
 class NamespaceOrchestrationWiringTests(unittest.TestCase):

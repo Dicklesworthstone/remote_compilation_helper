@@ -132,64 +132,174 @@ impl StagedOutput {
         if signature(&self.source)? != self.source_sig {
             return Err(io::Error::other("compiler output changed after capture"));
         }
+        self.verify_stage()
+    }
+
+    /// After the custody acknowledgment Cargo owns its output again and may
+    /// rewrite it; publication then depends only on the private copy.
+    fn verify_stage(&self) -> io::Result<()> {
         if signature(&self.stage)? != self.stage_sig {
             return Err(io::Error::other("private compiler capture changed"));
         }
         Ok(())
     }
+
+    /// Inspect the same retained generation that supplied the content digest.
+    /// A successful compiler can pack a thin archive or linker script without
+    /// opening its external inputs, including through source `#[link]` attributes.
+    /// Filename/argv admission is therefore not evidence of native closure.
+    fn validate_native_archive(&self) -> io::Result<bool> {
+        if self
+            .source
+            .extension()
+            .is_none_or(|extension| extension != "rlib")
+        {
+            return Ok(false);
+        }
+        self.verify()?;
+        let file = open_observed(&self.stage, self.stage_sig, self.stage_sig.size())?;
+        rabs_sandbox::native_archive::validate_rlib_native_closure_file(&file)
+            .map_err(io::Error::other)?;
+        if regular_signature(&file.metadata()?)? != self.stage_sig {
+            return Err(io::Error::other(
+                "private compiler archive changed during validation",
+            ));
+        }
+        self.verify()?;
+        Ok(true)
+    }
 }
 
-/// Stage one native output without retaining its bytes in memory or holding
-/// the metadata mutex during source I/O. The pin and durable location become
-/// visible together. Later inputs/output failures still drop the capture owner
-/// without publishing an action pointer or acknowledging compiler completion.
+/// Stage and immediately store one output while its source is still owned.
+/// Production capture stages first and stores after the custody ACK; this
+/// composition keeps the pin and collision tests on the same two halves.
+#[cfg(test)]
 pub(super) fn put_output(
     cas: &LiveCas,
     source: &Path,
     maximum: u64,
     pins: &mut CapturePins,
 ) -> Result<KnownOutput, String> {
+    let capture = stage_output(cas, source, maximum)?;
+    let known = capture.known();
+    publish(cas, &capture, pins, true)?;
+    // publish_staged consumes/removes the private staging name, not the
+    // compiler output. Never manufacture a newer source identity here.
+    if signature(source).map_err(|error| error.to_string())? != known.sig {
+        return Err("compiler output changed while its capture was stored".into());
+    }
+    Ok(known)
+}
+
+/// A native output copied into private staging and validated, with nothing
+/// linked, synced or recorded in the CAS yet (bd-lxmfd). Dropping it removes
+/// the private copy; [`publish_output`] makes it a durable CAS object.
+pub(super) struct StagedCapture {
+    staged: StagedOutput,
+    native_archive: bool,
+    maximum: u64,
+}
+
+impl std::fmt::Debug for StagedCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedCapture")
+            .field("source", &self.staged.source)
+            .field("native_archive", &self.native_archive)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedCapture {
+    /// The compiler output this copy was taken from, at the copied generation.
+    pub(super) fn known(&self) -> KnownOutput {
+        KnownOutput {
+            path: self.staged.source.clone(),
+            sig: self.staged.source_sig,
+            digest: self.staged.digest.clone(),
+        }
+    }
+}
+
+/// Copy, hash and validate one compiler output without touching the CAS,
+/// retaining its bytes in memory, or holding the metadata mutex during source
+/// I/O. A later failure drops the stage without publishing anything.
+pub(super) fn stage_output(
+    cas: &LiveCas,
+    source: &Path,
+    maximum: u64,
+) -> Result<StagedCapture, String> {
     let staged = StagedOutput::capture(&cas.layout().root().join("staging"), source, maximum)
         .map_err(|error| format!("output capture {}: {error}", source.display()))?;
+    // Validate outside the shared metadata lock, before any CAS location or
+    // closure receipt is created. This is bounded inspection of the private
+    // copy, never a second lookup of a worker-controlled compiler output.
+    let native_archive = staged
+        .validate_native_archive()
+        .map_err(|error| format!("output native closure {}: {error}", source.display()))?;
+    Ok(StagedCapture {
+        staged,
+        native_archive,
+        maximum,
+    })
+}
+
+/// Publish a staged copy as a durable, pinned CAS object. Only the private
+/// copy is verified: Cargo may already have rewritten its own output.
+pub(super) fn publish_output(
+    cas: &LiveCas,
+    capture: &StagedCapture,
+    pins: &mut CapturePins,
+) -> Result<(), String> {
+    publish(cas, capture, pins, false)
+}
+
+fn publish(
+    cas: &LiveCas,
+    capture: &StagedCapture,
+    pins: &mut CapturePins,
+    source_owned: bool,
+) -> Result<(), String> {
+    let staged = &capture.staged;
     // Verification repeats commonly ingest the same large rlib/rmeta. Hash
     // that possible duplicate before taking the ONE shared metadata lock.
     // Retry at most twice if another publisher/GC changed the destination;
     // keep the same captured stage and custody pin, never recopy the compiler.
     let mut retries = 0;
     loop {
-        let observation = RawTargetObservation::observe(cas.layout(), &staged.digest, maximum)
-            .map_err(|error| format!("observe output target: {error:?}"))?;
+        let observation =
+            RawTargetObservation::observe(cas.layout(), &staged.digest, capture.maximum)
+                .map_err(|error| format!("observe output target: {error:?}"))?;
         let result = {
             let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
-            staged.verify().map_err(|error| error.to_string())?;
+            if source_owned {
+                staged.verify()
+            } else {
+                staged.verify_stage()
+            }
+            .map_err(|error| error.to_string())?;
             pins.protect(&mut *store, &staged.digest)?;
-            publish_staged_with_observation(
+            let published = publish_staged_with_observation(
                 cas.layout(),
                 &mut *store,
                 &staged.digest,
                 &staged.stage,
                 DurabilityPolicy::FULL,
                 &observation,
-            )
+            );
+            if published.is_ok() && capture.native_archive {
+                crate::coord::native_archives::record_validated(&mut *store, &staged.digest)?;
+            }
+            published
         };
         match result {
-            Ok(_) => break,
+            Ok(_) => return Ok(()),
             Err(error) if RawTargetObservation::changed(&error) && retries < 2 => {
                 retries += 1;
             }
             Err(error) => return Err(format!("publish output capture: {error:?}")),
         }
     }
-    // publish_staged consumes/removes the private staging name, not the
-    // compiler output. Never manufacture a newer source identity here.
-    if signature(source).map_err(|error| error.to_string())? != staged.source_sig {
-        return Err("compiler output changed while its capture was stored".into());
-    }
-    Ok(KnownOutput {
-        path: staged.source.clone(),
-        sig: staged.source_sig,
-        digest: staged.digest.clone(),
-    })
 }
 
 #[cfg(test)]

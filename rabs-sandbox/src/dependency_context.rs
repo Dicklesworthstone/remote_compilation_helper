@@ -53,6 +53,10 @@ pub const CANONICAL_NATIVE_METADATA_CAPABILITY: &str = "canonical-generated-stat
 /// native search paths. Peers must negotiate this before transferring inputs;
 /// it does not widen ordinary dependency execution or cache authority.
 pub const CANONICAL_NATIVE_ROOTS_CAPABILITY: &str = "canonical-generated-native-roots-v1";
+/// Explicit bundled static-library modifiers and exact archive filenames.
+/// Both peers must negotiate this syntax before transferring native inputs;
+/// the complete retained trees and measured execution mode remain required.
+pub const CANONICAL_NATIVE_MODIFIERS_CAPABILITY: &str = "canonical-generated-static-modifiers-v1";
 /// Full environments remain bounded by the existing command transport allowance.
 pub const MAX_DEPENDENCY_ENV_ENTRIES: usize = 1024;
 /// Maximum dependency search roots accepted in this bounded execution mode.
@@ -4048,6 +4052,452 @@ mod tests {
         runtime.verify(|| false).unwrap();
     }
 
+    // The third field is the constructor's observable contribution. Without
+    // whole-archive, no undefined symbol asks the final linker to pull its
+    // otherwise unreferenced object out of the bundled native archive.
+    #[cfg(target_os = "linux")]
+    const STATIC_NATIVE_MODIFIER_CASES: &[(&str, &str, u32)] = &[
+        ("static=retained", "static=thin", 0),
+        ("static:+bundle=retained", "static:+bundle=thin", 0),
+        (
+            "static:+verbatim=retained.custom.a",
+            "static:+verbatim=thin.custom.a",
+            0,
+        ),
+        (
+            "static:+bundle,+verbatim=retained.custom.a",
+            "static:+bundle,+verbatim=thin.custom.a",
+            0,
+        ),
+        (
+            "static:+bundle,-verbatim=retained",
+            "static:+bundle,-verbatim=thin",
+            0,
+        ),
+        (
+            "static:+bundle,-whole-archive=retained",
+            "static:+bundle,-whole-archive=thin",
+            0,
+        ),
+        (
+            "static:+whole-archive=retained",
+            "static:+whole-archive=thin",
+            5,
+        ),
+        (
+            "static:+whole-archive,+bundle,+verbatim=retained.custom.a",
+            "static:+whole-archive,+bundle,+verbatim=thin.custom.a",
+            5,
+        ),
+    ];
+
+    /// Compiler/archive component evidence only: this test does not enter a
+    /// namespace or grant cache authority. It proves the actual retained rlib
+    /// carries its selected native archive through final linking, including
+    /// whole-archive's effect on an otherwise unreferenced constructor object.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT; real compiler/archive component, no namespaces"]
+    fn real_static_native_modifiers_preserve_bundling_and_captured_archive_bytes() {
+        use std::process::Command;
+
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let owner = private_runtime_owner();
+        let source = owner.path().join("source");
+        let original = owner.path().join("original");
+        let retained = owner.path().join("retained");
+        let refreshed = owner.path().join("refreshed");
+        for directory in [&source, &original, &retained, &refreshed] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let checked = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{command:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            result
+        };
+        let header = source.join("answer.h");
+        std::fs::write(&header, "#define RABS_NATIVE_ANSWER 37\n").unwrap();
+        std::fs::write(
+            source.join("answer.c"),
+            "#include \"answer.h\"\nunsigned int rabs_native_value = RABS_NATIVE_ANSWER;\nunsigned int rabs_native_answer(void) { return rabs_native_value; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("constructor.c"),
+            "extern unsigned int rabs_native_value;\n__attribute__((constructor)) static void rabs_native_initialize(void) { rabs_native_value += 5; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("lib.rs"),
+            "unsafe extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer() -> u32 { unsafe { rabs_native_answer() } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("main.rs"),
+            "fn main() { println!(\"{}\", native_bridge::answer()); }\n",
+        )
+        .unwrap();
+        let compile_object = |name: &str| {
+            checked(
+                Command::new("cc")
+                    .args(["-c", "-fPIC", "-o"])
+                    .arg(original.join(format!("{name}.o")))
+                    .arg(source.join(format!("{name}.c"))),
+            );
+        };
+        let archive = || {
+            checked(
+                Command::new("ar")
+                    .arg("crsD")
+                    .arg(original.join("libretained.a"))
+                    .arg(original.join("answer.o"))
+                    .arg(original.join("constructor.o")),
+            );
+            std::fs::copy(
+                original.join("libretained.a"),
+                original.join("retained.custom.a"),
+            )
+            .unwrap();
+        };
+        compile_object("answer");
+        compile_object("constructor");
+        archive();
+        let first_object = std::fs::read(original.join("answer.o")).unwrap();
+        let first_archive = std::fs::read(original.join("libretained.a")).unwrap();
+        assert!(first_archive.starts_with(b"!<arch>\n"));
+        for name in ["libretained.a", "retained.custom.a"] {
+            std::fs::copy(original.join(name), retained.join(name)).unwrap();
+        }
+        let link_and_run = |destination: &Path, binary_name: &str| {
+            let binary = destination.join(binary_name);
+            // No native search path is supplied to this final link. The rlib
+            // must carry both the bytes and the selected modifier semantics.
+            checked(
+                Command::new(toolchain.join("bin/rustc"))
+                    .arg(source.join("main.rs"))
+                    .arg("--edition=2024")
+                    .arg("--extern")
+                    .arg(format!(
+                        "native_bridge={}",
+                        destination.join("libnative_bridge.rlib").display()
+                    ))
+                    .arg("-o")
+                    .arg(&binary),
+            );
+            checked(&mut Command::new(&binary)).stdout
+        };
+        let compile_and_run = |library: &str, native: &Path, destination: &Path| {
+            std::fs::create_dir(destination).unwrap();
+            let compiled = checked(
+                Command::new(toolchain.join("bin/rustc"))
+                    .arg(source.join("lib.rs"))
+                    .args([
+                        "--crate-name=native_bridge",
+                        "--edition=2024",
+                        "--crate-type=rlib",
+                        "--emit=dep-info,metadata,link",
+                        "-Cembed-bitcode=no",
+                    ])
+                    .arg(format!("-l{library}"))
+                    .arg(format!("-Lnative={}", native.display()))
+                    .arg("--out-dir")
+                    .arg(destination),
+            );
+            assert!(compiled.stdout.is_empty());
+            assert!(compiled.stderr.is_empty());
+            crate::native_archive::validate_rlib_native_closure(
+                &std::fs::read(destination.join("libnative_bridge.rlib")).unwrap(),
+            )
+            .unwrap();
+            link_and_run(destination, "linked-native")
+        };
+        let assert_same_artifacts = |left: &Path, right: &Path| {
+            for name in ["libnative_bridge.rlib", "libnative_bridge.rmeta"] {
+                assert!(
+                    std::fs::read(left.join(name)).unwrap()
+                        == std::fs::read(right.join(name)).unwrap(),
+                    "same compiler inputs at different native/output placements: {name}"
+                );
+            }
+        };
+        for (index, &(library, _, constructor)) in STATIC_NATIVE_MODIFIER_CASES.iter().enumerate() {
+            let stock = owner.path().join(format!("stock-{index}"));
+            let captured = owner.path().join(format!("captured-{index}"));
+            let expected = format!("{}\n", 37 + constructor).into_bytes();
+            assert_eq!(compile_and_run(library, &original, &stock), expected);
+            assert_eq!(compile_and_run(library, &retained, &captured), expected);
+            assert_same_artifacts(&stock, &captured);
+        }
+
+        // Accepted output must be independently usable after both the source
+        // archive/object tree and its captured input backing cease to exist at
+        // their original paths. No fixture is deleted to exercise this boundary.
+        let hidden_original = owner.path().join("hidden-original");
+        let hidden_retained = owner.path().join("hidden-retained");
+        std::fs::rename(&original, &hidden_original).unwrap();
+        std::fs::rename(&retained, &hidden_retained).unwrap();
+        for (index, &(_, _, constructor)) in STATIC_NATIVE_MODIFIER_CASES.iter().enumerate() {
+            assert_eq!(
+                link_and_run(
+                    &owner.path().join(format!("captured-{index}")),
+                    "linked-without-originals"
+                ),
+                format!("{}\n", 37 + constructor).into_bytes()
+            );
+        }
+        std::fs::rename(hidden_original, &original).unwrap();
+        std::fs::rename(hidden_retained, &retained).unwrap();
+
+        std::fs::write(&header, "#define RABS_NATIVE_ANSWER 91\n").unwrap();
+        compile_object("answer");
+        assert_ne!(
+            std::fs::read(original.join("answer.o")).unwrap(),
+            first_object
+        );
+        assert_eq!(
+            std::fs::read(original.join("libretained.a")).unwrap(),
+            first_archive,
+            "a changed source/header/object is not a changed captured archive"
+        );
+        let object_only = owner.path().join("changed-object-old-archive");
+        assert_eq!(
+            compile_and_run("static=retained", &original, &object_only),
+            b"37\n"
+        );
+        assert_same_artifacts(&owner.path().join("stock-0"), &object_only);
+        archive();
+        assert_ne!(
+            std::fs::read(original.join("libretained.a")).unwrap(),
+            first_archive
+        );
+        for name in ["libretained.a", "retained.custom.a"] {
+            assert_eq!(std::fs::read(retained.join(name)).unwrap(), first_archive);
+            std::fs::copy(original.join(name), refreshed.join(name)).unwrap();
+        }
+        for (index, &(library, _, constructor)) in STATIC_NATIVE_MODIFIER_CASES.iter().enumerate() {
+            let stock = owner.path().join(format!("changed-stock-{index}"));
+            let captured = owner.path().join(format!("unchanged-capture-{index}"));
+            let fresh = owner.path().join(format!("refreshed-capture-{index}"));
+            let old = format!("{}\n", 37 + constructor).into_bytes();
+            let new = format!("{}\n", 91 + constructor).into_bytes();
+            assert_eq!(compile_and_run(library, &original, &stock), new);
+            assert_eq!(compile_and_run(library, &retained, &captured), old);
+            assert_eq!(compile_and_run(library, &refreshed, &fresh), new);
+            assert_same_artifacts(&owner.path().join(format!("stock-{index}")), &captured);
+            assert_same_artifacts(&stock, &fresh);
+            assert!(
+                std::fs::read(stock.join("libnative_bridge.rlib")).unwrap()
+                    != std::fs::read(captured.join("libnative_bridge.rlib")).unwrap(),
+                "changed native archive bytes must change the delivered rlib"
+            );
+        }
+    }
+
+    /// Actual rustc can pack a thin archive or a linker script into an ELF
+    /// `.bundled_lib` member without reading the external objects it names.
+    /// The output validator must reject that deferred read even when the
+    /// modifier came from a source attribute and no command-line -l exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires cc, GNU ar, and RABS_TEST_TOOLCHAIN_ROOT; real compiler/output closure component, no namespaces"]
+    fn real_native_archive_closure_rejects_deferred_thin_and_linker_script_reads() {
+        use std::process::Command;
+
+        let toolchain = PathBuf::from(
+            std::env::var_os("RABS_TEST_TOOLCHAIN_ROOT")
+                .expect("set RABS_TEST_TOOLCHAIN_ROOT to the installed toolchain root"),
+        );
+        assert!(toolchain.is_absolute());
+        let owner = private_runtime_owner();
+        let native = owner.path().join("native");
+        let objects = owner.path().join("objects");
+        std::fs::create_dir(&native).unwrap();
+        std::fs::create_dir(&objects).unwrap();
+        let checked = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{command:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            result
+        };
+        for value in [37, 91] {
+            let source = objects.join(format!("answer-{value}.c"));
+            std::fs::write(
+                &source,
+                format!("unsigned int rabs_native_answer(void) {{ return {value}; }}\n"),
+            )
+            .unwrap();
+            checked(
+                Command::new("cc")
+                    .args(["-c", "-fPIC", "-o"])
+                    .arg(objects.join(format!("answer-{value}.o")))
+                    .arg(source),
+            );
+        }
+        let external = objects.join("answer.o");
+        std::fs::copy(objects.join("answer-37.o"), &external).unwrap();
+        checked(
+            Command::new("ar")
+                .arg("crsTD")
+                .arg(native.join("libthin.a"))
+                .arg(&external),
+        );
+        assert!(
+            std::fs::read(native.join("libthin.a"))
+                .unwrap()
+                .starts_with(b"!<thin>\n")
+        );
+        for name in ["thin.custom.a", "thin.payload"] {
+            std::fs::copy(native.join("libthin.a"), native.join(name)).unwrap();
+        }
+        for name in ["libscript.a", "script.custom.a", "script.payload"] {
+            std::fs::write(
+                native.join(name),
+                format!("INPUT ({})\n", external.display()),
+            )
+            .unwrap();
+        }
+        let main = owner.path().join("main.rs");
+        std::fs::write(
+            &main,
+            "fn main() { println!(\"{}\", native_bridge::answer()); }\n",
+        )
+        .unwrap();
+        let cases = [
+            (Some("static:+whole-archive=thin"), ""),
+            (
+                Some("static:+whole-archive,+bundle,+verbatim=thin.custom.a"),
+                "",
+            ),
+            (
+                None,
+                "#[link(name=\"thin\", kind=\"static\", modifiers=\"+whole-archive\")]\n",
+            ),
+            (
+                None,
+                "#[link(name=\"thin.payload\", kind=\"static\", modifiers=\"+whole-archive,+verbatim\")]\n",
+            ),
+            (Some("static:+whole-archive=script"), ""),
+            (
+                Some("static:+whole-archive,+bundle,+verbatim=script.custom.a"),
+                "",
+            ),
+            (
+                None,
+                "#[link(name=\"script\", kind=\"static\", modifiers=\"+whole-archive\")]\n",
+            ),
+            (
+                None,
+                "#[link(name=\"script.payload\", kind=\"static\", modifiers=\"+whole-archive,+verbatim\")]\n",
+            ),
+        ];
+        let link = |output: &Path, name: &str| {
+            Command::new(toolchain.join("bin/rustc"))
+                .arg(&main)
+                .arg("--edition=2024")
+                .arg("--extern")
+                .arg(format!(
+                    "native_bridge={}",
+                    output.join("libnative_bridge.rlib").display()
+                ))
+                .arg("-o")
+                .arg(output.join(name))
+                .output()
+                .unwrap()
+        };
+        let mut retained = Vec::new();
+        for (index, (library, attribute)) in cases.into_iter().enumerate() {
+            let output = owner.path().join(format!("case-{index}"));
+            std::fs::create_dir(&output).unwrap();
+            let source = output.join("lib.rs");
+            std::fs::write(
+                &source,
+                format!(
+                    "{attribute}unsafe extern \"C\" {{ fn rabs_native_answer() -> u32; }}\npub fn answer() -> u32 {{ unsafe {{ rabs_native_answer() }} }}\n"
+                ),
+            )
+            .unwrap();
+            let mut compile = Command::new(toolchain.join("bin/rustc"));
+            compile
+                .arg(&source)
+                .args([
+                    "--crate-name=native_bridge",
+                    "--edition=2024",
+                    "--crate-type=rlib",
+                    "--emit=dep-info,metadata,link",
+                    "-Cembed-bitcode=no",
+                ])
+                .arg(format!("-Lnative={}", native.display()))
+                .arg("--out-dir")
+                .arg(&output);
+            if let Some(library) = library {
+                compile.arg(format!("-l{library}"));
+            }
+            checked(&mut compile);
+            let bytes = std::fs::read(output.join("libnative_bridge.rlib")).unwrap();
+            assert!(
+                crate::native_archive::validate_rlib_native_closure(&bytes).is_err(),
+                "deferred native input survived output admission: case {index}"
+            );
+            // Deliberately bypass admission only for the negative stock oracle:
+            // a successful baseline plus a changed final answer demonstrates
+            // the real deferred read that production must reject before delivery.
+            let linked = link(&output, "baseline");
+            assert!(
+                linked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            assert_eq!(
+                checked(&mut Command::new(output.join("baseline"))).stdout,
+                b"37\n"
+            );
+            retained.push((output, bytes));
+        }
+        std::fs::rename(&external, objects.join("answer-original.o")).unwrap();
+        for (output, bytes) in &retained {
+            assert_eq!(
+                std::fs::read(output.join("libnative_bridge.rlib")).unwrap(),
+                *bytes
+            );
+            let linked = link(output, "missing-object");
+            assert!(!linked.status.success());
+            assert!(
+                String::from_utf8_lossy(&linked.stderr).contains(external.to_str().unwrap()),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+        }
+        std::fs::copy(objects.join("answer-91.o"), &external).unwrap();
+        for (output, bytes) in &retained {
+            assert_eq!(
+                std::fs::read(output.join("libnative_bridge.rlib")).unwrap(),
+                *bytes
+            );
+            assert!(crate::native_archive::validate_rlib_native_closure(bytes).is_err());
+            let linked = link(output, "changed-object");
+            assert!(
+                linked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            assert_eq!(
+                checked(&mut Command::new(output.join("changed-object"))).stdout,
+                b"91\n"
+            );
+        }
+    }
+
     /// Use the actual production archive view, including the retained sparse
     /// runtime, without requiring the broader Cargo namespace's private procfs.
     /// Native objects must come from the captured tree; a thin archive cannot
@@ -4138,16 +4588,26 @@ mod tests {
                     .starts_with(b"!<thin>\n"),
                 "the escape case must be an actual thin archive"
             );
+            for (from, to) in [
+                ("libretained.a", "retained.custom.a"),
+                ("libthin.a", "thin.custom.a"),
+            ] {
+                std::fs::copy(original.join(from), original.join(to)).unwrap();
+            }
             for (name, destination) in [
                 ("libretained.a", &generated),
+                ("retained.custom.a", &generated),
                 ("libthin.a", &thin_generated),
+                ("thin.custom.a", &thin_generated),
             ] {
                 std::fs::copy(original.join(name), destination.join(name)).unwrap();
             }
             // Corrupt only the original archive after the private snapshot exists.
             // The original object deliberately remains readable on the host for
             // the thin-archive escape oracle below.
-            std::fs::write(original.join("libretained.a"), b"not an archive").unwrap();
+            for name in ["libretained.a", "retained.custom.a"] {
+                std::fs::write(original.join(name), b"not an archive").unwrap();
+            }
             std::fs::write(
             source.join("lib.rs"),
             "unsafe extern \"C\" { fn rabs_native_answer() -> u32; }\npub fn answer() -> u32 { unsafe { rabs_native_answer() } }\n",
@@ -4155,24 +4615,6 @@ mod tests {
         .unwrap();
             let control = owner.path().join("host-control");
             std::fs::create_dir(&control).unwrap();
-            // Prove this compiler actually accepts the same thin archive when
-            // its original object is visible. A generic unsupported-archive error
-            // must never stand in for successful namespace confinement.
-            checked(
-                Command::new(toolchain.join("bin/rustc"))
-                    .arg(source.join("lib.rs"))
-                    .args([
-                        "--crate-name=thin_control",
-                        "--edition=2024",
-                        "--crate-type=rlib",
-                        "--emit=dep-info,metadata,link",
-                        "-lstatic=thin",
-                    ])
-                    .arg("--out-dir")
-                    .arg(&control)
-                    .arg(format!("-Lnative={}", original.display())),
-            );
-            assert!(control.join("libthin_control.rlib").is_file());
             let runtime = crate::runtime_cohort::retain_runtime_cohort(
                 &toolchain.join("bin/rustc"),
                 &toolchain,
@@ -4271,7 +4713,7 @@ mod tests {
                     "--emit=dep-info,metadata,link".into(),
                     format!("--out-dir={}", context.out_dir()),
                     format!("-Lnative={generated_root}/native"),
-                    format!("-lstatic={library}"),
+                    format!("-l{library}"),
                 ];
                 if foreign {
                     args.push(format!("-Lnative={foreign_second_root}/native"));
@@ -4301,45 +4743,115 @@ mod tests {
                     .output()
                     .unwrap()
             };
-            let built = compile("retained", "native_bridge");
-            assert!(
-                built.status.success(),
-                "{}",
-                String::from_utf8_lossy(&built.stderr)
-            );
-            assert!(
-                !std::fs::read_to_string(output.join("native_bridge.d"))
-                    .unwrap()
-                    .contains("libretained.a"),
-                "the archive is a real compiler input absent from dep-info"
-            );
             let main = owner.path().join("main.rs");
             std::fs::write(
             &main,
             "fn main() { assert_eq!(native_bridge::answer(), 37); println!(\"{}\", native_bridge::answer()); }\n",
         )
         .unwrap();
-            let binary = owner.path().join("linked-native");
-            checked(
-                Command::new(toolchain.join("bin/rustc"))
-                    .arg(&main)
-                    .arg("--edition=2024")
-                    .arg("--extern")
-                    .arg(format!(
-                        "native_bridge={}",
-                        output.join("libnative_bridge.rlib").display()
-                    ))
-                    .arg("-o")
-                    .arg(&binary),
-            );
-            assert_eq!(checked(&mut Command::new(&binary)).stdout, b"37\n");
-            let denied = compile("thin", "native_escape");
-            assert!(
-                !denied.status.success(),
-                "thin archive unexpectedly read the unmounted original host object"
-            );
-            assert!(String::from_utf8_lossy(&denied.stderr).contains("error"));
-            assert!(!output.join("libnative_escape.rlib").exists());
+            let link_and_run = |archive: &Path, binary: &Path| {
+                checked(
+                    Command::new(toolchain.join("bin/rustc"))
+                        .arg(&main)
+                        .arg("--edition=2024")
+                        .arg("--extern")
+                        .arg(format!("native_bridge={}", archive.display()))
+                        .arg("-o")
+                        .arg(binary),
+                );
+                checked(&mut Command::new(binary)).stdout
+            };
+            for (index, &(library, thin_library, constructor)) in
+                STATIC_NATIVE_MODIFIER_CASES.iter().enumerate()
+            {
+                let name = format!("native_bridge_{index}");
+                let stock = control.join(format!("stock-{index}"));
+                std::fs::create_dir(&stock).unwrap();
+                checked(
+                    Command::new(toolchain.join("bin/rustc"))
+                        .arg(source.join("lib.rs"))
+                        .arg(format!("--crate-name={name}"))
+                        .args([
+                            "--edition=2024",
+                            "--crate-type=rlib",
+                            "--emit=dep-info,metadata,link",
+                        ])
+                        .arg(format!("-l{library}"))
+                        .arg("--out-dir")
+                        .arg(&stock)
+                        .arg(format!("-Lnative={}", generated.display())),
+                );
+                let built = compile(library, &name);
+                assert!(
+                    built.status.success(),
+                    "{library}: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let dep_info = std::fs::read_to_string(output.join(format!("{name}.d"))).unwrap();
+                assert!(
+                    !dep_info.contains("libretained.a") && !dep_info.contains("retained.custom.a"),
+                    "the archive is a real compiler input absent from dep-info"
+                );
+                let archive_name = format!("lib{name}.rlib");
+                for archive in [stock.join(&archive_name), output.join(&archive_name)] {
+                    crate::native_archive::validate_rlib_native_closure(
+                        &std::fs::read(archive).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let stock_stdout = link_and_run(
+                    &stock.join(&archive_name),
+                    &owner.path().join(format!("linked-stock-{index}")),
+                );
+                let retained_stdout = link_and_run(
+                    &output.join(archive_name),
+                    &owner.path().join(format!("linked-retained-{index}")),
+                );
+                assert_eq!(stock_stdout, b"37\n");
+                assert_eq!(retained_stdout, stock_stdout, "{library}");
+
+                // Each exact spelling must succeed against the SAME thin bytes
+                // on the host before failure can establish namespace denial.
+                // The verbatim case uses a filename without the lib prefix.
+                let thin_control = control.join(format!("thin-{index}"));
+                std::fs::create_dir(&thin_control).unwrap();
+                checked(
+                    Command::new(toolchain.join("bin/rustc"))
+                        .arg(source.join("lib.rs"))
+                        .args([
+                            "--crate-name=thin_control",
+                            "--edition=2024",
+                            "--crate-type=rlib",
+                            "--emit=dep-info,metadata,link",
+                        ])
+                        .arg(format!("-l{thin_library}"))
+                        .arg("--out-dir")
+                        .arg(&thin_control)
+                        .arg(format!("-Lnative={}", original.display())),
+                );
+                assert!(thin_control.join("libthin_control.rlib").is_file());
+                let denied_name = format!("native_escape_{index}");
+                let denied = compile(thin_library, &denied_name);
+                if constructor == 0 || !denied.status.success() {
+                    // Preserve the original eager-bundling confinement check.
+                    assert!(
+                        !denied.status.success(),
+                        "{thin_library} unexpectedly read the unmounted original host object"
+                    );
+                    assert!(String::from_utf8_lossy(&denied.stderr).contains("error"));
+                    assert!(!output.join(format!("lib{denied_name}.rlib")).exists());
+                } else {
+                    // Whole-archive can copy opaque thin bytes without reading
+                    // the missing objects. Production output admission must
+                    // reject that deferred read before any downstream link.
+                    let bytes =
+                        std::fs::read(output.join(format!("lib{denied_name}.rlib"))).unwrap();
+                    assert!(
+                        crate::native_archive::validate_rlib_native_closure(&bytes).is_err(),
+                        "{thin_library} escaped native output admission"
+                    );
+                }
+            }
             runtime.verify(|| false).unwrap();
         }
     }

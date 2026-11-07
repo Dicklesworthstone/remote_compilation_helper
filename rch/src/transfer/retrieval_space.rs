@@ -96,6 +96,51 @@ impl RsyncStoragePlan {
         Some(plan)
     }
 
+    /// A completed selection contains no regular files, symlinks or special
+    /// files. Zero bytes alone is insufficient: empty files must still return,
+    /// and a checksum no-op may describe already-staged nonempty artifacts.
+    ///
+    /// Only a complete, unambiguous directory-only file count authorizes
+    /// skipping the payload connection. Unknown rsync dialects retain it.
+    pub(super) fn empty_selection(stdout: &[u8]) -> Option<Self> {
+        let plan = Self::parse(stdout)?;
+        if plan.selected_bytes != 0 || plan.replacement_bytes != 0 || plan.replacement_files != 0 {
+            return None;
+        }
+        let output = std::str::from_utf8(stdout).ok()?;
+        let mut directories = None;
+        for line in output.lines() {
+            if let Some(value) = line.strip_prefix("Number of files:") {
+                let value = value.trim();
+                let selected = if let Some((total, dirs)) = value.split_once(" (dir:") {
+                    let total = count(total)?;
+                    let dirs = count(dirs.strip_suffix(')')?)?;
+                    if total != dirs {
+                        return None;
+                    }
+                    total
+                } else if count(value)? == 0 {
+                    0
+                } else {
+                    return None;
+                };
+                set_once(&mut directories, Some(selected))?;
+            } else {
+                // A contradictory itemized payload is never an empty result,
+                // even if a malformed peer also emitted directory-only stats.
+                let bytes = line.as_bytes();
+                if bytes.len() >= 2
+                    && matches!(bytes[0], b'<' | b'>' | b'c' | b'.' | b'h' | b'*')
+                    && (bytes[0] == b'*' || bytes[1] != b'd')
+                {
+                    return None;
+                }
+            }
+        }
+        directories?;
+        Some(plan)
+    }
+
     /// Conservative payload allocation including up to one allocation unit
     /// of padding per replaced file. Metadata, quotas and concurrent writers
     /// can still cause failure; the configured reserve is added separately.
@@ -165,6 +210,39 @@ mod tests {
         let empty = RsyncStoragePlan::parse(report("0", "0", "2").as_bytes()).unwrap();
         assert_eq!(empty.additional_bytes(4096), Some(8190));
         assert_eq!(empty.additional_bytes(0), None);
+    }
+
+    #[test]
+    fn empty_selection_requires_complete_directory_only_evidence() {
+        let empty = format!("Number of files: 3 (dir: 3)\n{}", report("0", "0", "0"));
+        assert!(RsyncStoragePlan::empty_selection(empty.as_bytes()).is_some());
+        let no_entries = empty.replace("3 (dir: 3)", "0");
+        assert!(RsyncStoragePlan::empty_selection(no_entries.as_bytes()).is_some());
+        for invalid in [
+            String::new(),
+            empty.trim_end().to_owned(),
+            empty.replace("Total bytes received: 119\n", ""),
+            empty.replace("Number of files: 3 (dir: 3)\n", ""),
+            empty.replace("3 (dir: 3)", "3"),
+            empty.replace("3 (dir: 3)", "3 (dir: 2)"),
+            empty.replace("3 (dir: 3)", "3 (reg: 1, dir: 2)"),
+            empty.replace("3 (dir: 3)", "3 (link: 1, dir: 2)"),
+            empty.replace("3 (dir: 3)", "3 (dev: 1, dir: 2)"),
+            empty.replace("3 (dir: 3)", "3 (special: 1, dir: 2)"),
+            empty.replace("3 (dir: 3)", "1,00 (dir: 1,00)"),
+            empty.replace("Total file size: 0 bytes", "Total file size: 1 bytes"),
+            format!("{empty}Number of files: 0\n"),
+            format!("{empty}Total file size: 0 bytes\n"),
+            format!(">f+++++++++ empty-report\n{empty}"),
+            format!(".f          already-staged\n{empty}"),
+            format!("cL+++++++++ link -> target\n{empty}"),
+            format!("*deleting   old-output\n{empty}"),
+        ] {
+            assert!(
+                RsyncStoragePlan::empty_selection(invalid.as_bytes()).is_none(),
+                "accepted incomplete or nonempty selection: {invalid:?}"
+            );
+        }
     }
 
     #[test]

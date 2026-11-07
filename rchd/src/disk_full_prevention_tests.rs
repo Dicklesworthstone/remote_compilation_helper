@@ -13,16 +13,22 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::admission::{AdmissionConfig, AdmissionGate, AdmissionVerdict};
-    use crate::disk_pressure::{PressureAssessment, PressureConfidence, PressureState};
+    use crate::admission::{
+        AdmissionConfig, AdmissionGate, AdmissionVerdict, ExecutionRequirements,
+    };
+    use crate::disk_pressure::{
+        DiskHeadroomAdmission, DiskHeadroomRejection, DiskPressurePolicyConfig, PressureAssessment,
+        PressureConfidence, PressureState, evaluate_pressure_policy,
+    };
     use crate::headroom::{HeadroomConfig, HeadroomEstimator};
-    use crate::history::BuildHistory;
+    use crate::history::{BuildCompletion, BuildHistory};
     use crate::reclaim::{ReclaimConfig, ReclaimMode, check_safety_gate};
     use crate::selection::WorkerSelector;
     use crate::workers::{WorkerPool, WorkerState};
     use rch_common::{
         BuildLocation, BuildRecord, CircuitBreakerConfig, CommandPriority, RequiredRuntime,
-        SelectionConfig, SelectionRequest, SelectionStrategy, WorkerConfig, WorkerId, test_guard,
+        SelectionConfig, SelectionRequest, SelectionStrategy, WorkerCapabilities, WorkerConfig,
+        WorkerId, test_guard,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -45,6 +51,7 @@ mod tests {
             disk_io_util_pct: None,
             memory_pressure: None,
             telemetry_age_secs: Some(5),
+            telemetry_received_at_unix_ms: None,
             telemetry_fresh: true,
             evaluated_at_unix_ms: 1000,
         }
@@ -82,6 +89,7 @@ mod tests {
             command_priority: CommandPriority::Normal,
             estimated_cores: 1,
             disk_headroom_gib: 0,
+            disk_observation_version: 0,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -89,6 +97,40 @@ mod tests {
             hook_pid: None,
             required_tools: Vec::new(),
         }
+    }
+
+    /// Mirror the API's non-cancellable handoff after successful accounting.
+    async fn admit_selected(
+        worker: &WorkerState,
+        endpoint: &crate::workers::WorkerEndpointSnapshot,
+        history: &BuildHistory,
+        request: &SelectionRequest,
+        slots: u32,
+    ) -> Option<crate::history::ActiveBuildState> {
+        let requirements = ExecutionRequirements::new(request);
+        let admission = worker
+            .reserve_slots_for_endpoint(slots, endpoint, &requirements)
+            .await?;
+        history
+            .try_start_active_build_with_waiter(
+                request.project.clone(),
+                endpoint.config.id.to_string(),
+                request
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| "fixture build".into()),
+                0,
+                Some(format!("owner-{}", request.project)),
+                slots,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    capacity: admission.disk_capacity,
+                    ..Default::default()
+                },
+                Some(endpoint.clone()),
+            )
+            .expect("persist admitted ownership")
     }
 
     fn remote_build(id: u64, project: &str, bytes: u64) -> BuildRecord {
@@ -513,6 +555,644 @@ mod tests {
     // =================================================================
     // Selection Pipeline Integration
     // =================================================================
+
+    #[tokio::test]
+    async fn runtime_refusal_after_selection_does_not_create_durable_ownership() {
+        // Exercise the same no-await handoff from endpoint admission to durable
+        // history as the API, including a successful owner before the race.
+        async fn admit(
+            worker: &WorkerState,
+            endpoint: &crate::workers::WorkerEndpointSnapshot,
+            history: &BuildHistory,
+            required: RequiredRuntime,
+            project: &str,
+            slots: u32,
+        ) -> Option<crate::history::ActiveBuildState> {
+            let mut request = select_request(project);
+            request.required_runtime = required;
+            admit_selected(worker, endpoint, history, &request, slots).await
+        }
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("runtime-history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+        let config = rch_common::RchConfig::default();
+        let pool = WorkerPool::with_selection_config(&config.selection);
+        let id = WorkerId::new("runtime-race");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            host: "localhost".into(),
+            total_slots: 8,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        let available = WorkerCapabilities {
+            rustc_version: Some("rustc fixture".into()),
+            rustup_toolchains: vec!["nightly-fixture".into()],
+            rustup_components: vec!["nightly-fixture:clippy".into()],
+            node_version: Some("node fixture".into()),
+            zig_version: Some("zig fixture".into()),
+            cargo_zigbuild_version: Some("cargo-zigbuild fixture".into()),
+            disk_free_gb: Some(100.0),
+            disk_total_gb: Some(500.0),
+            build_disk_free_gb: Some(100.0),
+            build_disk_total_gb: Some(500.0),
+            projects_root_ok: Some(true),
+            ..Default::default()
+        };
+        worker.set_capabilities(available.clone()).await;
+        let endpoint = worker.endpoint_snapshot().await;
+        let existing = admit(
+            &worker,
+            &endpoint,
+            &history,
+            RequiredRuntime::Rust,
+            "already-running",
+            2,
+        )
+        .await
+        .expect("initial healthy owner");
+
+        let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+        let mut request = select_request("new-build");
+        request.required_runtime = RequiredRuntime::Rust;
+        let selected = selector
+            .select(&pool, &request)
+            .await
+            .worker
+            .expect("positive runtime evidence permits selection");
+        let selected_endpoint = selected.endpoint_snapshot().await;
+
+        // Inventory remains populated, but the worker's live Cargo check now
+        // failed. The selected Arc and endpoint still point at the same worker.
+        let mut unavailable = available.clone();
+        unavailable.rustc_version = None;
+        unavailable
+            .probe_warnings
+            .push("Cargo execution check failed: fixture wrapper refusal".into());
+        worker.set_capabilities(unavailable).await;
+        for required in [RequiredRuntime::Rust, RequiredRuntime::Zig] {
+            assert!(
+                admit(
+                    &selected,
+                    &selected_endpoint,
+                    &history,
+                    required,
+                    "refused-build",
+                    1,
+                )
+                .await
+                .is_none(),
+                "{required:?} cannot spend slots on stale positive evidence"
+            );
+            assert_eq!(worker.used_slots(), 2);
+            assert_eq!(history.active_builds().len(), 1);
+            assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+        }
+
+        for (required, project) in [
+            (RequiredRuntime::Node, "node-build"),
+            (RequiredRuntime::None, "runtime-independent-build"),
+        ] {
+            assert!(
+                admit(
+                    &selected,
+                    &selected_endpoint,
+                    &history,
+                    required,
+                    project,
+                    1,
+                )
+                .await
+                .is_some(),
+                "the Rust refusal must not block {required:?} ownership"
+            );
+        }
+        worker.set_capabilities(available).await;
+        assert!(
+            admit(
+                &selected,
+                &selected_endpoint,
+                &history,
+                RequiredRuntime::Rust,
+                "recovered-build",
+                1,
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(worker.used_slots(), 5);
+        assert_eq!(history.active_builds().len(), 4);
+        assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+
+        drop(selector);
+        drop(history);
+        let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        assert_eq!(restored.active_builds().len(), 4);
+        assert!(
+            restored
+                .active_builds()
+                .iter()
+                .all(|owner| owner.project_id != "refused-build")
+        );
+        assert_eq!(restored.active_build(existing.id).unwrap().slots, 2);
+    }
+
+    #[tokio::test]
+    async fn execution_requirement_changes_after_selection_never_create_durable_owners() {
+        let _guard = test_guard!();
+        for scenario in [
+            "named-tool",
+            "exact-node",
+            "exact-bun",
+            "clippy",
+            "rustfmt",
+            "rustc-version",
+            "toolchain-preflight",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let history_path = directory.path().join("execution-history.jsonl");
+            let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+            let config = rch_common::RchConfig::default();
+            let pool = WorkerPool::with_selection_config(&config.selection);
+            let id = WorkerId::new("execution-race");
+            pool.add_worker(WorkerConfig {
+                id: id.clone(),
+                host: "localhost".into(),
+                total_slots: 8,
+                ..Default::default()
+            })
+            .await;
+            let worker = pool.get(&id).await.unwrap();
+            let available = WorkerCapabilities {
+                rustc_version: Some("rustc 1.100.0".into()),
+                rustup_toolchains: vec!["nightly-fixture".into(), "1.100.0".into()],
+                rustup_components: vec![
+                    "nightly-fixture:clippy".into(),
+                    "nightly-fixture:rustfmt".into(),
+                ],
+                node_version: Some("v26.7.0".into()),
+                bun_version: Some("1.3.0".into()),
+                tools_present: vec!["clang".into()],
+                disk_free_gb: Some(100.0),
+                disk_total_gb: Some(500.0),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(500.0),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            };
+            worker.set_capabilities(available.clone()).await;
+            let endpoint = worker.endpoint_snapshot().await;
+            let existing = admit_selected(
+                &worker,
+                &endpoint,
+                &history,
+                &select_request("already-running"),
+                2,
+            )
+            .await
+            .expect("existing owner");
+
+            let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+            let mut request = select_request("new-build::clean-overlay::fixture");
+            let mut changed = available.clone();
+            match scenario {
+                "named-tool" => {
+                    request.command = Some("clang -c input.c".into());
+                    request.required_tools.push("clang".into());
+                    changed.tools_present.clear();
+                    changed.tools_absent.push("clang".into());
+                }
+                "exact-node" => {
+                    request.command = Some("node build.js".into());
+                    request.required_runtime = RequiredRuntime::Node;
+                    request.required_tools.push("node@26.7.0".into());
+                    changed.node_version = Some("v26.6.0".into());
+                }
+                "exact-bun" => {
+                    request.command = Some("bun test".into());
+                    request.required_runtime = RequiredRuntime::Bun;
+                    request.required_tools.push("bun@1.3.0".into());
+                    changed.bun_version = Some("1.2.9".into());
+                }
+                "clippy" | "rustfmt" => {
+                    request.required_runtime = RequiredRuntime::Rust;
+                    request.command = Some(if scenario == "clippy" {
+                        "cargo +nightly-fixture clippy".into()
+                    } else {
+                        "cargo +nightly-fixture fmt --check".into()
+                    });
+                    changed
+                        .rustup_components
+                        .retain(|entry| !entry.ends_with(scenario));
+                }
+                "rustc-version" | "toolchain-preflight" => {
+                    request.required_runtime = RequiredRuntime::Rust;
+                    request.command = Some("cargo build".into());
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "1.100.0",
+                        None,
+                        "rustc 1.100.0",
+                    ));
+                    worker
+                        .record_toolchain_preflight("1.100.0".into(), true, None)
+                        .await;
+                    if scenario == "rustc-version" {
+                        changed.rustc_version = Some("rustc 1.99.0".into());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap_or_else(|| panic!("{scenario}: initially valid worker"));
+            let selected_endpoint = selected.endpoint_snapshot().await;
+
+            // The runtime is still present. Only the request's finer execution
+            // contract changes after the actual selector has accepted it.
+            assert!(changed.has_runtime(request.required_runtime));
+            worker.set_capabilities(changed).await;
+            if scenario == "toolchain-preflight" {
+                worker
+                    .record_toolchain_preflight(
+                        "1.100.0".into(),
+                        false,
+                        Some("toolchain_preflight_command_failed:1:Cargo refused".into()),
+                    )
+                    .await;
+            }
+            assert!(
+                admit_selected(&selected, &selected_endpoint, &history, &request, 1)
+                    .await
+                    .is_none(),
+                "{scenario}: stale selection must not publish ownership"
+            );
+            assert_eq!(worker.used_slots(), 2, "{scenario}");
+            assert_eq!(history.active_builds().len(), 1, "{scenario}");
+            assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+
+            assert!(
+                admit_selected(
+                    &worker,
+                    &endpoint,
+                    &history,
+                    &select_request("unconstrained-job"),
+                    1,
+                )
+                .await
+                .is_some(),
+                "{scenario}: refusal is scoped to the execution requirements"
+            );
+            worker.set_capabilities(available).await;
+            if request.toolchain.is_some() {
+                worker
+                    .record_toolchain_preflight("1.100.0".into(), true, None)
+                    .await;
+            }
+            request.project = "recovered-build::clean-overlay::fixture".into();
+            assert!(
+                admit_selected(&worker, &endpoint, &history, &request, 1)
+                    .await
+                    .is_some(),
+                "{scenario}: fresh positive evidence restores admission"
+            );
+            assert_eq!(worker.used_slots(), 4, "{scenario}");
+
+            drop(selector);
+            drop(history);
+            let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+            assert_eq!(restored.active_builds().len(), 3, "{scenario}");
+            assert!(
+                restored
+                    .active_builds()
+                    .iter()
+                    .all(|owner| { owner.project_id != "new-build::clean-overlay::fixture" }),
+                "{scenario}: no refused owner persisted"
+            );
+            assert_eq!(restored.active_build(existing.id).unwrap().slots, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_large_disk_admission_keeps_storage_budgets_and_explicit_policy() {
+        let _guard = test_guard!();
+        for total in [774.0, 900.0] {
+            let config = rch_common::RchConfig::default();
+            let pool = WorkerPool::with_selection_config(&config.selection);
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new("large-disk"),
+                host: "localhost".into(),
+                total_slots: 8,
+                ..Default::default()
+            })
+            .await;
+            let worker = pool.get(&WorkerId::new("large-disk")).await.unwrap();
+            let caps = |free| WorkerCapabilities {
+                disk_free_gb: Some(free),
+                disk_total_gb: Some(total),
+                build_disk_free_gb: Some(free),
+                build_disk_total_gb: Some(total),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            };
+            worker.set_capabilities(caps(30.0)).await;
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Warning
+            );
+            assert_eq!(worker.effective_total_slots().await, 2);
+            let history = Arc::new(BuildHistory::new(10));
+            let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+            let mut request = select_request("large-disk-budget");
+            request.disk_headroom_gib = 20;
+            assert!(
+                selector.select(&pool, &request).await.worker.is_some(),
+                "{total}"
+            );
+            assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 0);
+
+            // At 30 GiB free, the independent 10 GiB floor leaves exactly
+            // 20 GiB for this declaration. The cap never rounds that up.
+            request.disk_headroom_gib = 21;
+            let too_large = selector.select(&pool, &request).await;
+            assert!(too_large.worker.is_none(), "{total}");
+            assert!(
+                too_large.diagnostics.unwrap().workers[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "disk_headroom_insufficient")
+            );
+            request.disk_headroom_gib = 1;
+            request.command = Some("cargo test".into());
+            assert!(
+                selector.select(&pool, &request).await.worker.is_none(),
+                "a tiny declaration cannot underfund the cold test-build allowance"
+            );
+
+            request.command = None;
+            request.disk_headroom_gib = 20;
+            for cap in [None, Some(40.0)] {
+                let policy = DiskPressurePolicyConfig::from_selection(&SelectionConfig {
+                    disk_critical_ratio_cap_gb: cap,
+                    ..Default::default()
+                });
+                worker
+                    .set_pressure_assessment(evaluate_pressure_policy(&caps(30.0), None, &policy))
+                    .await;
+                assert_eq!(
+                    worker.pressure_assessment().await.state,
+                    PressureState::Critical
+                );
+                // A fresh gate keeps this check independent of recovery hysteresis.
+                let strict = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+                let result = strict.select(&pool, &request).await;
+                assert!(result.worker.is_none(), "explicit cap {cap:?}");
+                assert!(
+                    result.diagnostics.unwrap().workers[0]
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "pressure.critical")
+                );
+            }
+
+            worker.set_capabilities(caps(8.0)).await;
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Critical
+            );
+            assert_eq!(worker.available_slots().await, 0);
+            assert!(selector.select(&pool, &request).await.worker.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn large_disk_restart_preserves_reservations_and_requires_recovery_evidence() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(history_path.clone());
+        let config = WorkerConfig {
+            id: WorkerId::new("large-disk"),
+            host: "localhost".into(),
+            total_slots: 8,
+            ..Default::default()
+        };
+        let caps = |free| WorkerCapabilities {
+            disk_free_gb: Some(free),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        let original = WorkerState::new(config.clone());
+        original.set_capabilities(caps(30.0)).await;
+        let endpoint = original.endpoint_snapshot().await;
+        let request = select_request("initial-disk-owner");
+        let slot = original
+            .reserve_slots_for_endpoint(1, &endpoint, &ExecutionRequirements::new(&request))
+            .await
+            .unwrap();
+        let active = history
+            .try_start_active_build_with_waiter(
+                "already-running".into(),
+                "large-disk".into(),
+                "custom-build".into(),
+                0,
+                Some("large-disk-owner".into()),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: 12,
+                    floor_gib: 10,
+                    warm_policy: None,
+                    capacity: slot.disk_capacity,
+                },
+                Some(endpoint),
+            )
+            .unwrap()
+            .unwrap();
+
+        // A worker outage and reconnect preserve ownership, but neither the
+        // previous disk sample nor a delayed pre-outage probe can fund work.
+        let before_restart = original.capability_probe_context().await;
+        let mut live_request = DiskHeadroomAdmission {
+            requested_gib: 8,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: original.disk_capacity_observation().await,
+        };
+        assert!(
+            history
+                .check_disk_headroom("large-disk", &live_request)
+                .is_ok()
+        );
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let health_probe = original
+            .health_probe_permit(heartbeat, &circuit)
+            .await
+            .unwrap();
+        assert_eq!(
+            original
+                .record_health_transport_result(&health_probe, false, heartbeat, &circuit)
+                .await,
+            Some((false, true))
+        );
+        drop(health_probe);
+        assert!(!original.reserve_slots(1).await);
+        assert_eq!(original.used_slots(), 1);
+        assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 12);
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Stale)
+        );
+
+        original
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Stale),
+            "a successful reconnect does not measure free disk capacity"
+        );
+        assert!(
+            !original
+                .publish_capabilities(before_restart, caps(30.0))
+                .await
+        );
+        original.set_capabilities(caps(8.0)).await;
+        assert_eq!(
+            original.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(original.available_slots().await, 0);
+        assert!(!original.reserve_slots(1).await);
+        original.set_capabilities(caps(30.0)).await;
+        assert_eq!(original.used_slots(), 1);
+        assert_eq!(original.available_slots().await, 1);
+        assert_eq!(history.reserved_disk_headroom_gib("large-disk"), 12);
+        live_request.capacity = original.disk_capacity_observation().await;
+        assert!(
+            history
+                .check_disk_headroom("large-disk", &live_request)
+                .is_ok()
+        );
+        live_request.requested_gib = 9;
+        assert_eq!(
+            history.check_disk_headroom("large-disk", &live_request),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31,
+            }),
+            "worker recovery retains the active 12 GiB budget and its 10 GiB floor"
+        );
+
+        // A separate daemon restart reconstructs the same durable ownership.
+        drop(history);
+        drop(original);
+
+        let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("large-disk"), 12);
+        let pool = WorkerPool::with_selection_config(&SelectionConfig::default())
+            .with_unmeasured_capacity_hold(Duration::from_secs(120));
+        pool.add_worker(config).await;
+        for running in restored.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&running.worker_id), running.slots)
+                .await
+                .unwrap();
+        }
+        let worker = pool.get(&WorkerId::new("large-disk")).await.unwrap();
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 0);
+        let mut request = DiskHeadroomAdmission {
+            requested_gib: 9,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+        // Expiry of the legacy startup hold does not authorize disk spending.
+        worker.hold_until_capacity_measured(Duration::ZERO);
+        assert!(worker.available_slots().await > 0);
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+
+        worker.set_capabilities(caps(8.0)).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(worker.available_slots().await, 0);
+        assert_eq!(worker.used_slots(), 1);
+        worker.set_capabilities(caps(30.0)).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert_eq!(worker.available_slots().await, 1);
+        request.capacity = worker.disk_capacity_observation().await;
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31
+            }),
+            "the recovered 12 GiB reservation retains its 10 GiB floor"
+        );
+        request.requested_gib = 8;
+        assert!(restored.check_disk_headroom("large-disk", &request).is_ok());
+
+        restored
+            .complete_durable(
+                active.id,
+                "large-disk",
+                Some("large-disk-owner"),
+                BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: Some(1),
+                    bytes_transferred: None,
+                    disk_peak_output_bytes: None,
+                    disk_observation: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        worker.release_slots(1).await;
+        assert_eq!(worker.used_slots(), 0);
+        assert_eq!(restored.reserved_disk_headroom_gib("large-disk"), 0);
+        assert_eq!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Stale),
+            "completion releases ownership, not the bytes left by the build"
+        );
+
+        worker.set_capabilities(caps(30.0)).await;
+        request.capacity = worker.disk_capacity_observation().await;
+        request.requested_gib = 20;
+        request.floor_gib = 10;
+        assert!(restored.check_disk_headroom("large-disk", &request).is_ok());
+        assert_eq!(worker.available_slots().await, 2);
+        request.requested_gib = 21;
+        assert!(matches!(
+            restored.check_disk_headroom("large-disk", &request),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn daemon_admission_is_present_with_default_context() {

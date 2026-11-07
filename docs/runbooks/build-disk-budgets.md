@@ -46,14 +46,101 @@ within a bounded window of eight samples per key and a 30-day age limit. The
 footprint book is stored beside the history log as `history.footprints.json`.
 A missing, expired, or unreadable book falls back to the conservative defaults.
 
-Only a successful, attributed measurement of **total peak allocated output**
-for the exact project and command can establish an estimate below its default.
-Warm target directories are included in that total, so a near-zero incremental
-rebuild does not erase the size of the existing output pool. Failed builds,
-broader command-family evidence, and legacy changes in filesystem free space
-can raise estimates but cannot independently establish a smaller complete build.
-Cancelled builds do not teach a complete footprint. Free-space changes on a
-worker shared by simultaneous jobs are not attributed to one job as output.
+Cold history continues to use **total peak allocated output**. A successful,
+attributed measurement for the exact project and command can establish a cold
+estimate below its default. Failed builds, broader command-family evidence,
+and legacy changes in filesystem free space can raise estimates but cannot
+independently establish a smaller complete build. Cancelled builds do not teach
+a complete footprint. Legacy totals are never reinterpreted as incremental
+measurements, and a small warm rebuild cannot erase a larger cold requirement.
+
+### Retained Cargo pools and incremental admission
+
+[Issue #132](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/132)
+reported 81–95 GB retained target pools charged repeatedly against approximately
+220 GB free, although each incremental check added only hundreds of megabytes.
+The daemon now maintains separate, versioned incremental observations for the
+exact project, command, and worker endpoint. The book retains at most eight
+pools per key and eight samples per pool, with the same 30-day expiry and
+high-water policy as cold history.
+
+A successful observation first establishes a pool anchor. A subsequent
+successful observation must begin at that exact anchor before its additional
+space can qualify a smaller reservation. The worker binds a pool to its physical
+target path, boot, device, inode, and a fingerprint of the tree's names and
+allocation metadata. Equal directory sizes do not prove equal retained state.
+Reading files does not invalidate the fingerprint; changing or replacing them
+does. Metadata collection is capped at 100,000 entries. Incomplete, changing,
+oversized, or expired evidence cannot authorize a smaller reservation.
+
+Incremental observations conservatively charge:
+
+```text
+unproven baseline = total starting output - verified starting target pool
+measured requirement = unproven baseline
+                     + max(peak new/modified output, peak free-space decline)
+```
+
+Only the verified target pool receives retained allocation credit. Source trees
+and other cache/output roots remain charged. New or modified inodes are counted
+without subtracting old artifacts that disappeared concurrently. Rewriting an
+existing inode can charge its entire current allocation, even when its final
+size is unchanged. Other writers can inflate the free-space decline; RCH never
+divides shared usage into unsupported per-job estimates. The minimum measured
+footprint remains 1 GiB, followed by the ordinary growth margin and protected
+floor.
+
+The proof covers the selected target, not every directory with a cache-like
+name. Large sibling target pools inside the scanned source tree remain part of
+the unproven baseline and can limit the reduction. They are not deleted or
+silently excluded. This is a conservative scope limit when several retained
+pools share one source mirror.
+
+The smaller reservation carries its qualifying pool proofs and the cold
+fallback requirement in durable ownership. The worker verifies a matching pool
+before admission and launch. A mismatch or an unfunded current source/cache
+baseline requires a **new cold reservation**; the worker cannot enlarge its
+allowance independently. After confirmed release, `rch exec` refreshes capacity
+and permits one cold reselection. A failed refresh does not waive freshness.
+An ordinary positive client headroom request remains a minimum and permits
+verified warm-pool credit. The client marks the cold retry explicitly and omits
+warm capability on that request, so concurrently learned cold requirements
+cannot turn the retry into another conditional reservation. Admission previews
+use the same minimum and warm capability as ordinary durable execution.
+
+New ownership snapshots use format version 3 so an older daemon cannot silently
+discard the warm condition and restore a discounted reservation as unconditional.
+The current daemon accepts legacy versions 1 and 2 only for cold reservations;
+conditional reservations require the complete, validated version 3 state.
+
+If the cold retry must queue, its durable row binds the exact previous remote
+attempt's completion receipt. An older receipt cannot stand in for the new
+waiter during cancellation, remove it on an unrelated ownership write, or
+release another active attempt. Recovery verifies the same wrapper, project,
+command, and predecessor ID; ambiguous legacy queued/terminal overlaps still
+refuse recovery. The predecessor receipt is retained while that waiter needs
+it. Older readers reject this additional queue field instead of discarding the
+retry relationship.
+
+Warm execution is currently limited to durable `rch exec` with ordinary,
+single-root Cargo source synchronization. Its rsync receiver runs under the
+same disk supervisor, using the selected reservation throughout upload; compiler
+execution then verifies the exact target pool and takes a fresh capacity sample.
+Canonical repository convergence is skipped on this path. Clean overlays,
+source-content receipts, and multiple-root materializers request cold admission
+before uploading. Legacy hook clients keep cold admission. A started command or
+uncertain source cancellation never authorizes replay.
+If the source receiver cannot establish its bounded initial allocation map, it
+refuses before rsync rather than proceeding with only a net-size measurement.
+That preparation failure retains the existing cancellation/recovery path; it
+does not manufacture a compiler completion or a retryable pool receipt.
+
+Failed, cancelled, incomplete, or unreliable observations remove warm eligibility
+without erasing larger measured bounds. Recovery must establish and match a new
+successful anchor. Old installations therefore need two qualifying successes
+before receiving a warm allowance; a worker that cannot fit even one cold
+reservation remains conservatively refused. Deleting or manually shrinking
+history is not a substitute for trustworthy observations.
 
 ### The 21 GiB incident and smaller controls
 
@@ -70,8 +157,9 @@ With the default 10 GiB floor and no other active reservations:
 The small control does not require pretending the reported failed build
 succeeded. It uses separate, successful output evidence. These rows describe the
 per-build admission calculation; slot availability, health, capabilities, and
-the existing disk-pressure policy still apply. In particular, 3.7% free also
-crosses the default 5% critical ratio rule, independently of this calculation.
+the disk-pressure policy still apply. With 33 GiB free at 3.7%, the disk
+thresholds produce Warning under the default 25 GiB cap. The larger growth
+budgets in the table are still refused.
 
 ## Reservations and fresh capacity
 
@@ -79,12 +167,19 @@ Admission requires all of the following:
 
 - A valid build-filesystem free and total capacity sample. Generic `/tmp` disk
   telemetry alone is insufficient when the actual build storage differs.
-- A current worker endpoint and probe generation, with a sample no older than
-  90 seconds. CPU telemetry and pressure reevaluation do not refresh disk age.
+- A current worker endpoint, probe generation, and transport generation, with
+  a sample no older than 90 seconds. CPU telemetry and pressure reevaluation
+  do not refresh disk age.
 - Enough free space for the new growth budget, every active growth reservation
   on that worker, and the largest applicable free-space floor, counted once.
 - Working durable ownership accounting. An accounting failure prevents new
   guarded admission.
+
+If active disk-budget ownership cannot be restored safely at startup, the
+daemon stops and retains the original snapshot. Invalid or mislabeled snapshots
+must not shed their reservations, protected floors, or conditional allowances
+through legacy quarantine recovery. Restore verified ownership before retrying;
+clearing the ledger does not establish that the old work stopped.
 
 Selection previews and the authoritative admission check use the same budget.
 The authoritative check and reservation update share the ownership lock, so
@@ -99,6 +194,30 @@ a new capacity probe must start strictly after completion. A probe already in
 flight at completion is insufficient. Interrupted or unconfirmed ownership
 remains reserved through retries and recovery; elapsed time or a reused PID is
 not evidence that the old work stopped.
+
+When fresh capacity proves that a request fits by itself but competing owned
+reservations prevent admission, selection reports the worker as busy. With
+queueing enabled, the request enters the same durable wait queue as a request
+waiting for CPU slots. It retains the original deadline and cancellation
+identity and does not hold CPU slots while waiting for disk. Other suitability
+checks still apply; Critical pressure, insufficient capacity for a single
+request, missing observations, and expired or superseded evidence remain
+refusals.
+
+An existing queued request can bridge the short interval between a competing
+owner's confirmed completion and the next capacity probe. This permits waiting
+only: the old observation cannot fund admission, and its ordinary age and
+generation limits still apply. New requests retain the normal stale-capacity
+refresh/refusal behavior. A post-completion probe must prove enough current
+space, including retained artifacts and remaining owners, before the waiter
+receives a reservation.
+
+A connection loss invalidates earlier capacity measurements, including copies
+already held by an admission attempt. Reconnecting or re-enabling a worker
+does not restore those measurements or clear its reservations. Guarded
+admission requires a fresh capability probe; successful health recovery
+already schedules that probe. A probe started before the connection loss
+cannot establish recovered capacity.
 
 The worker checks capacity again immediately before launching the command. Its
 private, locked ledger at `/var/tmp/rch-build-disk-<uid>` coordinates guarded
@@ -119,9 +238,46 @@ symlink output roots, replacement roots, scan failures, and unaccounted
 filesystem changes cannot silently become zero usage. Hard links and nested
 output roots are deduplicated within a scan.
 
-The initial output size is the baseline. The job budget limits additional
-allocated growth above it, while the receipt records the total peak output for
-future estimates. Runtime checks currently use a 250 ms control interval,
+Dispatcher-managed Cargo execution also includes the worker's durable
+`rch-cargo-cache-<worker>` home, an explicit literal absolute `CARGO_HOME`
+override, and physical destinations of their `registry` and `git` redirects.
+The client captures the original command before shell wrapping; the monitor
+resolves the default cache from the worker's canonical `RCH_CH_BASE`, before
+client environment forwarding or a change of working directory. Redirects and
+physical directory identities are rechecked during scans and free-space
+sampling. Every resulting filesystem participates in reservation and floor
+checks.
+
+Existing Cargo cache bytes receive no target-pool credit. They remain an
+unproven baseline, and an unfunded cache requires cold readmission before the
+workload starts. New cache allocations count even if target cleanup masks
+their filesystem free-space change. A dynamic, relative, removed, or otherwise
+unresolved Cargo home refuses before launch with `monitor_unavailable` and no
+learning receipt; a larger cold allowance cannot resolve an unknown output
+scope. Cache preparation creates only the bounded home/registry/git
+directories; their parent trees must already exist.
+
+Each build walks its outputs every two seconds, and a walk that outlives its
+30-second deadline stops the build. A shared cache past 25,000 entries is
+therefore left out of that walk: one holding 600,000 entries took 30 seconds to
+walk cold on an idle worker. Such a cache still participates in reservation and
+floor checks, and its redirects are still verified, but its bytes are neither
+charged to the build nor held against a warm admission. New downloads into it
+are bounded by the free-space floor rather than by the growth budget, and a
+usage receipt's peak growth omits them.
+
+Direct `rch-wkr execute` remains cold-only and rejects conditional warm
+budgets. Its existing inherited Cargo/Rustup home probes protect filesystem
+floors, but do not provide the dispatcher's cache-output attribution or resolve
+command-local home overrides. Arbitrary build-script destinations remain
+outside the declared output scope.
+
+The initial output size is the baseline. Runtime accounting tracks new and
+modified allocation as well as positive net growth, so concurrent cleanup cannot
+erase observed new output. A conditional warm execution also charges its
+unproven baseline. Receipts retain total peak output for cold history and carry
+optional incremental evidence separately from confirmed completion. Runtime
+checks currently use a 250 ms control interval,
 approximately two-second output scans, a one-second free-space probe deadline,
 and a 30-second output-scan deadline. Scans run separately from free-space
 sampling. An independent guardian stops the owned process group if supervision
@@ -144,11 +300,12 @@ Typed failures use **`RCH-E330`** (`BuildDiskBudgetExceeded`):
 
 | Evidence | Recovery behavior |
 | --- | --- |
+| Exact `cold_required` refusal before compiler launch | After acknowledged release, `rch exec` permits one fresh cold selection. Unsupported source modes make this decision before any source-content receipt or upload. |
 | Confirmed refusal before command launch (`started: false`) | After the daemon acknowledges release, RCH may select another eligible worker while excluding the refusing worker. Exhausting alternatives reports E330. |
 | Command started, or spawning it may have started it (`started: true`) | Stop the owned group and report the failure. Do not automatically replay the command locally or on another worker. |
 | Missing or invalid receipt, unknown execution state, or unacknowledged release | Retain uncertain ownership and use the existing no-replay recovery path. A transport error does not prove a safe pre-start refusal. |
 
-The detailed reason distinguishes `admission`, `growth`, `free_floor`,
+The detailed reason distinguishes `cold_required`, `admission`, `growth`, `free_floor`,
 `monitor_unavailable`, and `interrupted`. A confirmed `free_floor` failure also
 feeds the existing worker disk-pressure recovery path. Exceeding one project's
 growth budget does not by itself prove the entire disk is full.
@@ -184,6 +341,8 @@ The existing selection settings remain independent controls:
 [selection]
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
+disk_critical_free_ratio = 0.05
+disk_critical_ratio_cap_gb = 25.0
 ```
 
 Despite the legacy `gb` names, these capacity calculations use GiB.
@@ -197,11 +356,30 @@ silently remove protection.
 
 `disk_gb_per_slot` remains a positive allowance for deriving effective slot
 capacity; changing it does not override a particular project's growth budget.
-The separate `disk_critical_free_ratio` and optional
-`disk_critical_ratio_cap_gb` still control the ratio-based critical rule. Restart
-the daemon after selection-policy changes. Update the dispatcher, daemon, and
-worker together: a new dispatcher talking to an older daemon uses a conservative
-cold command budget and a 10 GiB floor, without the new daemon history policy.
+The separate critical ratio rule requires both free ratio at or below
+`disk_critical_free_ratio` and free GiB at or below `disk_critical_ratio_cap_gb`.
+The defaults are 5% and 25 GiB, including on a dispatcher without a config file.
+Thus a 900 GiB disk with 30 GiB free can retain slots, while the same disk at
+8 GiB free still triggers the independent 10 GiB critical floor. Existing
+small-filesystem and `/tmp` rules still apply. Stale or unavailable build
+storage telemetry, outstanding reservations, and an authorized budget that
+cannot fit still refuse admission regardless of the cap.
+
+An explicit numeric cap remains authoritative; `disk_critical_ratio_cap_gb =
+"uncapped"` retains an unconditional ratio rule. Programmatic `None` and JSON
+`null` have the same meaning and serialize as `"uncapped"` so configuration
+edits cannot silently reinstate the default cap. `rch config get
+selection.disk_critical_ratio_cap_gb --sources` reports the value and its source;
+`rch config set selection.disk_critical_ratio_cap_gb uncapped` selects the
+stricter mode. Numeric caps must be finite and at least 10 GiB. The CLI rejects
+invalid values before writing; invalid numeric file settings make the daemon
+use the stricter uncapped rule and log the reason.
+
+Restart the daemon after selection-policy changes; the startup log records the
+effective critical thresholds, protected floor and per-slot budget. Update the
+dispatcher, daemon, and worker together: a new dispatcher talking to an older
+daemon uses a conservative cold command budget and a 10 GiB floor, without the
+new daemon history policy.
 
 To investigate a refusal, inspect the selected worker and the daemon's capacity
 observations:
@@ -214,12 +392,18 @@ rch status --remediation
 
 `disk_headroom_unknown` means a valid build-storage sample or durable accounting
 is unavailable. `disk_headroom_stale` requires a current daemon probe, including
-the probe-after-completion rule. `disk_headroom_insufficient` reports the free
+the probe-after-connection-change and probe-after-completion rules.
+`disk_headroom_insufficient` reports the free
 and required GiB, including active reservations and the floor. Inspect space on
 the actual remote build and target filesystems, and allow confirmed completion
 and a fresh probe to update capacity before diagnosing a retained reservation
 as a leak. Use the [worker recovery runbook](worker-recovery.md) for uncertain
 process ownership; do not kill a process using only an old numeric PID.
+
+`disk_headroom_reserved` identifies a request that fits alone and can wait for
+competing reservations. `disk_headroom_awaiting_probe` identifies an existing
+waiter awaiting a post-completion sample. Neither diagnostic waives disk
+admission or reserves CPU capacity.
 
 Callers can reduce artifact size with validated Cargo profile settings such as
 `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_PROFILE_TEST_INCREMENTAL=false`.

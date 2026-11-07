@@ -42,7 +42,7 @@ set -euo pipefail
 # Last-resort floor used only when every release-discovery path fails. Keep it in
 # step with the newest published release; enforce_no_downgrade() stops a stale
 # value here from clobbering a newer install.
-INSTALLER_VERSION="2.1.34"
+INSTALLER_VERSION="2.1.36"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 # Records whether the caller pinned a version (VERSION=... or --version), which
 # suppresses the no-downgrade guard so deliberate rollbacks still work.
@@ -67,6 +67,9 @@ WORKER_BIN="rch-wkr"
 USE_COLOR=true
 USE_GUM=false
 TEMP_DIR=""
+# An upgrading client must not restart its daemon until the new sibling daemon
+# has been installed. The old client remains in place until that drain succeeds.
+DAEMON_BINARY_INSTALLED=false
 # Expand arrays that may be empty as ${a[@]+"${a[@]}"}: under `set -u`, macOS's
 # /bin/bash 3.2 treats an empty "${a[@]}" as an unbound variable and exits.
 PROXY_ARGS=()
@@ -650,13 +653,73 @@ create_directories() {
     success "Directories created"
 }
 
+validate_binary_source() {
+    local source_path="$1"
+    if [[ ! -f "$source_path" || -L "$source_path" || ! -s "$source_path" ||
+          ! -r "$source_path" || ! -x "$source_path" ]]; then
+        error "Unusable binary $source_path: expected a nonempty, readable executable regular file, not a symlink"
+        return 1
+    fi
+}
+
+# Validate the entire selected toolset before replacing the daemon, worker or
+# client, or activating an optional RABS generation. A malformed release must
+# not leave a newer daemon beside the old client that still needs to drain it.
+validate_archive_binaries() {
+    local archive_dir="$1"
+    local binary source_path
+    local binaries=("$WORKER_BIN")
+    if [[ "$MODE" != "worker" ]]; then
+        binaries=("$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN")
+    fi
+    for binary in "${binaries[@]}"; do
+        source_path="$archive_dir/$binary"
+        if [[ "$MODE" != "worker" && "$binary" == "$WORKER_BIN" &&
+              "${RCH_SKIP_FLEET_SYNC:-}" == "1" &&
+              ! -e "$source_path" && ! -L "$source_path" ]]; then
+            continue
+        fi
+        if ! validate_binary_source "$source_path"; then
+            error "RCH archive validation failed for $binary; installation refused before replacing binaries"
+            return 1
+        fi
+    done
+}
+
 install_binary_file() {
     local source_path="$1"
     local dest_path="$2"
     local temp_path="${dest_path}.tmp.$$"
 
-    install -m 755 "$source_path" "$temp_path"
-    mv -f "$temp_path" "$dest_path"
+    validate_binary_source "$source_path" || return 1
+    install -m 755 "$source_path" "$temp_path" || return 1
+
+    if [[ "$dest_path" == "$INSTALL_DIR/$HOOK_BIN" &&
+          "${MODE:-local}" == "local" && "${EASY_MODE:-false}" == "true" &&
+          "${RCH_SKIP_DAEMON_RESTART:-}" != "1" && -x "$dest_path" ]] &&
+       ! system_rchd_service_active; then
+        if [[ "$DAEMON_BINARY_INSTALLED" != "true" ]]; then
+            warn "Cannot upgrade the client before installing its sibling daemon; existing client retained at $dest_path"
+            warn "Incoming client is staged at $temp_path"
+            return 1
+        fi
+        # The running daemon can speak an older admission protocol than the
+        # incoming client (notably 2.1.34 -> 2.1.35). Let its existing client
+        # drain it and launch the new sibling rchd before replacing that client.
+        # A stop before binary installation would race supervisor respawning.
+        # Keep the final new-client restart below: the legacy client's success
+        # is not proof of readiness under the new maintenance protocol.
+        info "Using the existing client to drain rchd before replacing it..."
+        if ! restart_daemon_if_needed; then
+            warn "Existing client retained at $dest_path; incoming client staged at $temp_path"
+            return 1
+        fi
+    fi
+
+    mv -f "$temp_path" "$dest_path" || return 1
+    if [[ "$dest_path" == "$INSTALL_DIR/$DAEMON_BIN" ]]; then
+        DAEMON_BINARY_INSTALLED=true
+    fi
 }
 
 # A021 split-profile installer: resolve NAME built under PROFILE, falling back
@@ -679,7 +742,7 @@ install_split_binary() {
         info "Optional binary $name not present; skipping"
         return 0
     fi
-    install_binary_file "$src" "$INSTALL_DIR/$name"
+    install_binary_file "$src" "$INSTALL_DIR/$name" || return 1
     success "Installed $name ($profile)"
 }
 
@@ -814,13 +877,14 @@ build_from_source() {
     build_rabs_toolset "$project_dir"
 
     if [[ "$MODE" == "worker" ]]; then
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
     else
         # Local mode: hook CLI from wrapper-release; daemon and worker from
-        # daemon-release (worker binary needed for fleet deploy).
-        install_split_binary "$HOOK_BIN" "wrapper-release" required
-        install_split_binary "$DAEMON_BIN" "daemon-release" required
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        # daemon-release (worker binary needed for fleet deploy). Install the
+        # client last so the existing client can drain the running daemon.
+        install_split_binary "$DAEMON_BIN" "daemon-release" required || return 1
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
+        install_split_binary "$HOOK_BIN" "wrapper-release" required || return 1
     fi
 
     success "Build complete"
@@ -983,11 +1047,12 @@ download_binaries() {
         fi
     fi
 
+    validate_archive_binaries "$TEMP_DIR" || return 1
     install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$TEMP_DIR/$asset_name"
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN" || return 1
             success "Installed $WORKER_BIN"
         else
             warn "Worker binary not in release"
@@ -997,16 +1062,15 @@ download_binaries() {
             return
         fi
     else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
+        for binary in "$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary" || return 1
                 success "Installed $binary"
+            elif [[ "$binary" == "$WORKER_BIN" && "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
+                warn "Worker binary not in release (fleet sync disabled)"
             else
-                warn "$binary not in release"
-                info "Falling back to building from source..."
-                rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-                clone_and_build_from_source
-                return
+                error "Validated binary disappeared from release: $binary; installation stopped"
+                return 1
             fi
         done
     fi
@@ -1075,11 +1139,11 @@ clone_and_build_from_source() {
     build_rabs_toolset "$TEMP_DIR/rch"
 
     if [[ "$MODE" == "worker" ]]; then
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
     else
-        install_split_binary "$HOOK_BIN" "wrapper-release" required
-        install_split_binary "$DAEMON_BIN" "daemon-release" required
-        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "$DAEMON_BIN" "daemon-release" required || return 1
+        install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
+        install_split_binary "$HOOK_BIN" "wrapper-release" required || return 1
     fi
 
     success "Build from source complete"
@@ -1790,42 +1854,45 @@ install_from_tarball() {
 
     # Extract tarball
     if $USE_GUM; then
-        spin "Extracting tarball..." tar -xzf "$tarball" -C "$TEMP_DIR"
+        if ! spin "Extracting tarball..." tar -xzf "$tarball" -C "$TEMP_DIR"; then
+            error "Offline tarball extraction failed; existing binaries were not replaced"
+            return 1
+        fi
     else
         info "Extracting tarball..."
-        tar -xzf "$tarball" -C "$TEMP_DIR"
+        if ! tar -xzf "$tarball" -C "$TEMP_DIR"; then
+            error "Offline tarball extraction failed; existing binaries were not replaced"
+            return 1
+        fi
     fi
 
+    validate_archive_binaries "$TEMP_DIR" || return 1
     install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$tarball"
 
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN" || return 1
             success "Installed $WORKER_BIN"
         else
             die "Worker binary not found in tarball"
         fi
     else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
+        for binary in "$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary" || return 1
                 success "Installed $binary"
+            elif [[ "$binary" == "$WORKER_BIN" ]]; then
+                if [[ "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
+                    warn "Worker binary not found in tarball (fleet sync disabled)"
+                else
+                    die "Worker binary not found in tarball (required for fleet deploy)"
+                fi
             else
-                warn "$binary not found in tarball"
+                error "Validated binary disappeared from tarball: $binary; installation stopped"
+                return 1
             fi
         done
-
-        if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
-            success "Installed $WORKER_BIN"
-        else
-            if [[ "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
-                warn "Worker binary not found in tarball (fleet sync disabled)"
-            else
-                die "Worker binary not found in tarball (required for fleet deploy)"
-            fi
-        fi
     fi
 
     success "Offline installation complete"
@@ -2223,15 +2290,31 @@ setup_launchd_service() {
 
     info "Setting up launchd service..."
 
+    # An already loaded job owns a running (or restarting) daemon. Unloading
+    # it here bypasses the client's admission barrier, including on installs
+    # that never reach the easy-mode restart below. Leave that job and its
+    # definition alone; only the peer-verified CLI maintenance path may stop it.
+    local jobs
+    if ! jobs="$(launchctl list 2>&1)"; then
+        warn "Cannot inspect launchd jobs; daemon service setup is unconfirmed: $jobs"
+        return 1
+    fi
+    if ! printf '%s\n' "$jobs" | awk '
+        NR == 1 { if ($1 != "PID" || $2 != "Status" || $3 != "Label" || NF != 3) exit 1; next }
+        NF != 3 || ($1 != "-" && $1 !~ /^[0-9]+$/) || $2 !~ /^-?[0-9]+$/ { exit 1 }
+        END { if (NR == 0) exit 1 }
+    '; then
+        warn "Cannot interpret launchd job ownership; leaving the daemon unchanged"
+        return 1
+    fi
+    if printf '%s\n' "$jobs" | awk '$3 == "com.rch.daemon" { found = 1 } END { exit !found }'; then
+        info "Existing launchd daemon retained; apply updates with 'rch daemon restart --drain'"
+        return 0
+    fi
+
     local plist_file="$HOME/Library/LaunchAgents/com.rch.daemon.plist"
     mkdir -p "$(dirname "$plist_file")"
     mkdir -p "$CONFIG_DIR/logs"
-
-    # Unload existing service if present
-    if launchctl list 2>/dev/null | grep -q "com.rch.daemon"; then
-        info "Unloading existing service..."
-        launchctl unload "$plist_file" 2>/dev/null || true
-    fi
 
     cat > "$plist_file" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2580,34 +2663,22 @@ restart_daemon_if_needed() {
 
     local rch_bin="$INSTALL_DIR/$HOOK_BIN"
     if [[ ! -x "$rch_bin" ]]; then
-        warn "Cannot restart daemon: rch binary not found"
-        return 0
+        warn "Cannot confirm daemon upgrade: rch binary not found at $rch_bin"
+        return 1
     fi
 
-    info "Restarting rchd to apply updates..."
-    if "$rch_bin" daemon restart 2>&1; then
+    info "Draining rchd before applying updates (up to 300 seconds)..."
+    if "$rch_bin" daemon restart --drain --drain-timeout 300 2>&1; then
         success "rchd restarted"
         return 0
     fi
 
-    warn "rch daemon restart failed; trying service manager fallback"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user restart rchd.service 2>/dev/null && {
-            success "rchd restarted via systemd"
-            return 0
-        }
-    fi
-    if command -v launchctl >/dev/null 2>&1; then
-        local plist="$HOME/Library/LaunchAgents/com.rch.daemon.plist"
-        if [[ -f "$plist" ]]; then
-            launchctl unload "$plist" 2>/dev/null || true
-            if launchctl load "$plist" 2>/dev/null; then
-                success "rchd restarted via launchctl"
-                return 0
-            fi
-        fi
-    fi
-    warn "Could not restart rchd automatically"
+    # A timeout, old protocol, lost connection or ownership refusal is not
+    # evidence of an idle daemon. In particular, do not replace this failure
+    # with systemctl restart or launchctl unload/load: both can kill builds.
+    warn "Daemon upgrade is unconfirmed; no service-manager restart was attempted"
+    warn "Binaries may already be installed. Resolve the client diagnostic, then retry: $rch_bin daemon restart --drain --drain-timeout 300"
+    return 1
 }
 
 harmonize_workers() {
@@ -3277,7 +3348,7 @@ main() {
         install_skill
         maybe_prompt_service
         setup_systemd_service
-        setup_launchd_service
+        setup_launchd_service || die "Daemon service setup is unconfirmed; installation stopped before daemon restart or worker sync"
     fi
 
     setup_path
@@ -3289,7 +3360,7 @@ main() {
     # Easy mode extras
     if [[ "$EASY_MODE" == "true" ]]; then
         detect_agents
-        restart_daemon_if_needed
+        restart_daemon_if_needed || die "Daemon upgrade is unconfirmed; installation stopped before worker sync"
         harmonize_workers
         run_doctor
     fi

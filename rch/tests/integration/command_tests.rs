@@ -568,13 +568,9 @@ mod source_topology_cli {
                 .unwrap()["status"],
             75
         );
-        assert_eq!(
-            std::fs::read_to_string(fixture.root.path().join("bad/attempts"))
-                .unwrap()
-                .lines()
-                .count(),
-            6
-        );
+        let attempts = std::fs::read_to_string(fixture.root.path().join("bad/attempts")).unwrap();
+        // An elapsed window permits a variable number of registry transactions.
+        assert!(attempts.lines().count() >= 1, "{attempts}");
         let state = fixture.state.lock().unwrap();
         assert!(state.cached.is_none());
         assert_eq!(state.releases[0]["worker_source_busy"], "1");
@@ -671,15 +667,30 @@ def event(phase, status):
     with (base / 'ssh-events.jsonl').open('a') as stream:
         stream.write(json.dumps(dict(worker=worker, phase=phase, status=status)) + '\n')
 first = sys.stdin.buffer.readline()
+timing_prefix = b''
+if first.startswith(b'export RCH_TIMING_SCALE='):
+    assert first.endswith(b';\n'), 'invalid transported timing header'
+    value = first[len(b'export RCH_TIMING_SCALE='):-2].decode('ascii')
+    assert 1.0 <= float(value) <= 10.0, 'invalid transported timing scale'
+    os.environ['RCH_TIMING_SCALE'] = value
+    timing_prefix = first
+    first = sys.stdin.buffer.readline()
 if first == b'{\n':
-    # A source holder keeps stdin open for heartbeat/release frames. Identify
-    # its actual transport header without waiting for EOF or issuing a grant.
-    header = (sys.stdin.buffer.readline(), sys.stdin.buffer.readline())
-    assert header == (b'set -eu\n', b"exec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n"), header
-    event('source_admission_boundary', 73)
-    print('RCH fixture stopped after namespace: source admission intentionally unavailable', file=sys.stderr)
-    sys.exit(73)
-payload = first.decode() + sys.stdin.buffer.read().decode()
+    second = sys.stdin.buffer.readline()
+    if second != b'(\n':
+        # A source holder keeps stdin open for heartbeat/release frames. Identify
+        # its actual transport header without waiting for EOF or issuing a grant.
+        header = (second, sys.stdin.buffer.readline())
+        assert header == (b'set -eu\n', b"exec 3<<'RCH_SOURCE_LOCK_SESSION_PROGRAM'\n"), header
+        event('source_admission_boundary', 73)
+        print('RCH fixture stopped after namespace: source admission intentionally unavailable', file=sys.stderr)
+        sys.exit(73)
+    # The namespace RPC batches its live-checkout guard into one compound.
+    first += second
+payload = timing_prefix.decode() + first.decode() + sys.stdin.buffer.read().decode()
+batched = first == b'{\n(\n'
+if batched:
+    assert payload.count('RCH_SYNC_LIVE_CHECKOUT_REFUSED:') == 1, 'namespace RPC lost its guard'
 if payload.startswith('(set -eu\nrch_destination='):
     # Execute the production read-only guard against the worker's mapped
     # fixture root and host marker, rather than accepting every control RPC.
@@ -697,9 +708,12 @@ if payload.startswith('(set -eu\nrch_destination='):
     sys.exit(result.returncode)
 if 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED' in payload:
     present = all(os.path.lexists(path) for path in (canonical, alias))
-    print('RCH_TOPOLOGY_PATHS_PRESENT' if present else 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED')
+    print('RCH_TOPOLOGY_PATHS_PRESENT' if present else 'RCH_TOPOLOGY_INITIALIZATION_REQUIRED',
+          file=sys.stderr if batched else sys.stdout)
     event('probe', 0)
-    sys.exit(0)
+    # Batched, the observation is a diagnostic: the initializer still runs.
+    if not batched:
+        sys.exit(0)
 if 'RCH_NAMESPACE_SCOPE' not in payload:
     event('unexpected_control_command', 73)
     sys.exit('unexpected fixture SSH control command')
@@ -729,7 +743,7 @@ attempt = command('topology', 'b1', check, create)
 script = ('rch_source_attempt() { (\nset -eu\nprintf "attempt\\n" >> '
           + shlex.quote(str(root / 'attempts')) + '\nexec ' + shlex.join(attempt)
           + " <<'RCH_FIXTURE_ROOTS'\n" + roots.decode() + 'RCH_FIXTURE_ROOTS\n); }\n'
-          + 'rch_admission_attempts=6\n' + (base / 'admission.sh').read_text())
+          + 'rch_admission_retry_seconds=5\n' + (base / 'admission.sh').read_text())
 result = subprocess.run(['sh', '-c', script], capture_output=True, timeout=10)
 event('namespace', result.returncode)
 sys.stdout.buffer.write(result.stdout)

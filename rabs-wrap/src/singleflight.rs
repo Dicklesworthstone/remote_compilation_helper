@@ -21,7 +21,7 @@ mod policy;
 
 use super::reply_json::{self, Value};
 use super::{
-    ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, connect_owned,
+    ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, PanicFence, connect_owned,
     consult_succeeded, live_outcome,
 };
 use policy::WaitPolicy;
@@ -247,6 +247,7 @@ fn reconnect_waiter(
     decision_budget: Duration,
     absolute_deadline: Instant,
     owned: &impl Fn() -> bool,
+    panic_fence: PanicFence,
 ) -> io::Result<BufReader<ConsultStream>> {
     check_owner(owned)?;
     let remaining = absolute_deadline.saturating_duration_since(Instant::now());
@@ -258,7 +259,11 @@ fn reconnect_waiter(
         .checked_add(decision_budget)
         .ok_or_else(|| io::Error::other("RABS consult deadline overflow"))?
         .min(absolute_deadline);
-    let mut reader = BufReader::new(ConsultStream { stream, deadline });
+    let mut reader = BufReader::new(ConsultStream {
+        stream,
+        deadline,
+        panic_fence,
+    });
     write_owned(&mut reader, HELLO.as_bytes(), deadline, owned)?;
     write_owned(&mut reader, b"\n", deadline, owned)?;
     let hello = read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)?;
@@ -382,9 +387,19 @@ fn read_with_policy(
             rollovers += 1;
             // Drop the old follower connection before opening a new one. The
             // edge releases any connection-scoped flight accounting on drop.
+            // Panic recovery, unlike connection accounting, belongs to the
+            // whole invocation and must follow any subsequently accepted work.
+            let panic_fence = reader.get_ref().panic_fence.clone();
             drop(reader);
-            reader = reconnect_waiter(socket, connect_timeout, decision_budget, deadline, owned)
-                .map_err(|_| ())?;
+            reader = reconnect_waiter(
+                socket,
+                connect_timeout,
+                decision_budget,
+                deadline,
+                owned,
+                panic_fence,
+            )
+            .map_err(|_| ())?;
             requests_on_connection = 0;
         }
         let request_deadline = Instant::now()

@@ -302,6 +302,10 @@ pub struct PackageFacts {
     pub build_script_output: Option<Vec<u8>>,
     /// Complete propagated native trees, in the planner's sorted root order.
     pub native: Vec<NativePackageFacts>,
+    /// Every `env!`/`option_env!` name spelled in a captured package or
+    /// generated file (`rabs_key::live_dependency::source_env_reads`),
+    /// sorted: what `dependency-env-v3` keys among ambient variables.
+    pub source_env_reads: Vec<String>,
     source_kind: DependencySourceKind,
     members: Vec<(String, MemberSig)>,
     generated: Option<GeneratedObservation>,
@@ -1154,6 +1158,26 @@ fn captured_files(
     Ok(files)
 }
 
+/// The environment names every sealed regular file of `roots` spells in an
+/// `env!`/`option_env!` literal. Any file may be `include!`d, so none is
+/// skipped by extension; a spurious name only keys more.
+fn sealed_env_reads(snapshot: &SealedSourceSnapshot, roots: &[&str]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for root in roots {
+        let Some(manifest) = snapshot.manifest(root) else {
+            continue;
+        };
+        for (relative, member) in &manifest.members {
+            if matches!(member, MemberKind::Regular { .. })
+                && let Some(bytes) = snapshot.file_bytes(root, relative)
+            {
+                names.extend(rabs_key::live_dependency::source_env_reads(bytes));
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 fn capture_package(
     root: &Path,
     source_kind: DependencySourceKind,
@@ -1252,12 +1276,14 @@ fn capture_package(
         }
     }
     let files = captured_files(&snapshot, PACKAGE_ROOT, &before)?;
+    let source_env_reads = sealed_env_reads(&snapshot, &[PACKAGE_ROOT, GENERATED_ROOT]);
     Ok(PackageFacts {
         snapshot: Arc::new(snapshot),
         files,
         generated_files,
         build_script_output,
         native,
+        source_env_reads,
         source_kind,
         members: before,
         generated,
@@ -3417,14 +3443,20 @@ mod tests {
                 .unwrap()
         ));
         captured.verify_unchanged(&root).unwrap();
-        std::fs::write(root.join("src/extra.rs"), b"").unwrap();
+        assert!(captured.source_env_reads.is_empty());
+        // Any captured file may be include!d: every one is scanned.
+        std::fs::write(
+            root.join("src/extra.rs"),
+            b"const V: Option<&str> = option_env!(\"ITOA_FLAVOR\");\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("table.in"), b"env!(\"TABLE_SEED\")").unwrap();
         assert!(captured.verify_unchanged(&root).is_err());
-        assert!(!Arc::ptr_eq(
-            &captured,
-            &facts
-                .package(&root, DependencySourceKind::RegistryPackage, None)
-                .unwrap()
-        ));
+        let rescanned = facts
+            .package(&root, DependencySourceKind::RegistryPackage, None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&captured, &rescanned));
+        assert_eq!(rescanned.source_env_reads, ["ITOA_FLAVOR", "TABLE_SEED"]);
         std::os::unix::fs::symlink("lib.rs", root.join("src/alias.rs")).unwrap();
         assert!(matches!(
             facts.package(&root, DependencySourceKind::RegistryPackage, None),

@@ -163,7 +163,7 @@ impl BuildContext {
             .env("CARGO_INCREMENTAL", if incremental { "1" } else { "0" })
             .env("CARGO_TERM_COLOR", "never")
             // This is the worker's own benchmark, not a caller build to offload.
-            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .envs(rch_common::MANAGED_CARGO_ENV)
             .env("RCH_ENABLED", "0");
         Ok(command)
     }
@@ -266,6 +266,42 @@ mod tests {
             env[OsStr::new("CARGO_CACHE_AUTO_CLEAN_FREQUENCY")],
             Some(OsStr::new("never"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_benchmark_cargo_receives_paired_loop_break_on_every_phase() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cargo = directory.path().join("cargo");
+        // A child-process probe, not a compiler benchmark: inspect the environment
+        // actually received by Cargo, including a nested shell as a build script
+        // would, and fail if either half of the shim contract is missing.
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\nexec sh -c 'test \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 && test \"$RCH_CARGO_WRAPPER_ORIGIN\" = rch'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let context = BuildContext { cargo, ..context() };
+
+        for (release, incremental) in [(false, false), (true, false), (true, true)] {
+            let mut command = context
+                .command(directory.path(), release, incremental)
+                .unwrap();
+            // A test runner may itself be RCH-managed. Require explicit child
+            // assignments so ambient markers cannot hide a missing handoff.
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            for (name, value) in [
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+            ] {
+                assert_eq!(env.get(OsStr::new(name)), Some(&Some(OsStr::new(value))));
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
     }
 
     #[test]

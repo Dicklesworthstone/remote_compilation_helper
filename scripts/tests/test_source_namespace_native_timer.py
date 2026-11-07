@@ -358,5 +358,327 @@ class NativeTimerTests(unittest.TestCase):
         self.assertFalse(mutation.exists())
 
 
+@unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),
+                     "metadata lifecycle checks require Linux pidfds")
+class MetadataMemoryTests(unittest.TestCase):
+    """Real finite metadata control with no writable scratch or GNU tools.
+
+    Positive acknowledgement requires a native procfs view. A host-mounted
+    procfs inside a nested PID namespace must refuse; it is not repaired or
+    replaced with a fake census to obtain positive qualification.
+    """
+
+    python_command = NativeTimerTests.python_command
+    pin_pidfile = NativeTimerTests.pin_pidfile
+    check_pinned_children = NativeTimerTests.check_pinned_children
+    finish_process = staticmethod(NativeTimerTests.finish_process)
+    assert_lock_released = NativeTimerTests.assert_lock_released
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rch-metadata-memory-"))
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        for name, executable in (("sh", SHELL), ("python3", PYTHON),
+                                 ("sleep", shutil.which("sleep"))):
+            self.assertIsNotNone(executable, name)
+            (self.tools / name).symlink_to(executable)
+        # A file cannot host scratch under ANY uid, including root. Keep its
+        # bytes unchanged; do not claim this is a filesystem ENOSPC campaign.
+        self.scratch = self.root / "unavailable-scratch"
+        self.scratch.write_bytes(b"retained storage sentinel\n")
+        self.env = {"PATH": str(self.tools), "HOME": str(self.root),
+                    "TMPDIR": str(self.scratch), "LC_ALL": "C"}
+        self.control = CONTROL.read_text()
+        self.script = "set -- RCH_SOURCE_CANCELLATION_SETTLED\n" + self.control
+        self.ready = b"RCH_SOURCE_CANCELLATION_SETTLED\n"
+        self.pinned = []
+        self.addCleanup(self.check_pinned_children)
+        self.addCleanup(self.check_scratch)
+
+    def check_scratch(self):
+        self.assertEqual(self.scratch.read_bytes(), b"retained storage sentinel\n")
+
+    def native_view(self):
+        with open("/proc/self/status", encoding="ascii") as stream:
+            namespace = [line.split()[1:] for line in stream if line.startswith("NSpid:")]
+        return namespace == [[str(os.getpid())]]
+
+    def require_native_view(self):
+        if not self.native_view():
+            self.skipTest("positive settlement requires the actual native PID/procfs view")
+
+    def start(self, program=None, **kwargs):
+        process = subprocess.Popen([SHELL, "-c", self.script], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=self.env, **kwargs)
+        self.addCleanup(self.finish_process, process)
+        if program is not None:
+            process.stdin.write(program.encode())
+            process.stdin.close()
+            process.stdin = None
+        return process
+
+    def run_control(self, program, contract="RCH_SOURCE_CANCELLATION_SETTLED", **kwargs):
+        return subprocess.run([SHELL, "-c", "set -- " + contract + "\n" + self.control],
+                              input=program.encode(), capture_output=True,
+                              env=self.env, timeout=20, **kwargs)
+
+    def locked_child(self, quiet=False, change_group=False):
+        code = ("import fcntl, os, signal, time\n"
+                "for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM): signal.signal(s, signal.SIG_IGN)\n")
+        if change_group:
+            code += "os.setpgid(0, 0)\n"
+        if quiet:
+            code += "os.close(1); os.close(2)\n"
+        code += (f"lock = open({str(self.root / 'owned.lock')!r}, 'a')\n"
+                 "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                 f"open({str(self.root / 'descendant.pid')!r}, 'w').write(str(os.getpid()))\n"
+                 "time.sleep(30)\n")
+        return self.python_command(code)
+
+    def test_success_and_refusal_preserve_bytes_without_temporary_storage(self):
+        self.require_native_view()
+        for status in (0, 7, 75, 125, 137):
+            with self.subTest(status=status):
+                result = self.run_control("printf 'diagnostic\\n' >&2\nprintf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n"
+                                          f"exit {status}\n")
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, self.ready if status == 0 else b"")
+                if status < 128:
+                    self.assertEqual(result.stderr, b"diagnostic\n")
+                else:
+                    self.assertIn(b"RCH_SOURCE_NAMESPACE_PROCESS_TERMINATED", result.stderr)
+        for contract, reply in (("RCH_SOURCE_INTENT_CANCEL", "owned"),
+                                ("RCH_SOURCE_INTENT_CANCEL", "unowned"),
+                                ("RCH_SOURCE_INTENT_FINISHED", "")):
+            result = self.run_control("printf %s " + shlex.quote(reply), contract)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, reply.encode(), b""))
+
+    def test_foreign_procfs_cannot_confirm_success(self):
+        if self.native_view():
+            self.skipTest("this control applies to a foreign procfs view")
+        result = self.run_control("printf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n")
+        self.assertEqual((result.returncode, result.stdout), (73, b""), result.stderr)
+        self.assertIn(b"RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED", result.stderr)
+
+    def test_malformed_and_oversized_replies_never_acknowledge(self):
+        for descriptor, content in ((1, b""), (1, self.ready[:-1]),
+                                    (1, self.ready + b"\n"), (1, self.ready + b"\x00"),
+                                    (1, b"x" * 4097), (2, b"x" * 65537)):
+            with self.subTest(descriptor=descriptor, bytes=len(content)):
+                code = f"import os; os.write({descriptor}, {content!r})"
+                if descriptor == 2:
+                    code += f"; os.write(1, {self.ready!r})"
+                result = self.run_control(self.python_command(code))
+                self.assertEqual((result.returncode, result.stdout), (73, b""), result.stderr[:200])
+                self.assertLessEqual(len(result.stderr), 65536)
+
+    def test_full_diagnostic_bound_is_preserved(self):
+        self.require_native_view()
+        result = self.run_control(self.python_command(
+            f"import os; os.write(2, b'x' * 65536); os.write(1, {self.ready!r})"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, self.ready, b"x" * 65536))
+
+    def test_large_uploaded_script_and_authority_descriptor_are_preserved(self):
+        self.require_native_view()
+        authority = self.root / "authority"
+        authority.write_bytes(b"authority-bytes\x00not-stdin")
+        with authority.open("rb") as file:
+            descriptor = fcntl.fcntl(file, fcntl.F_DUPFD, 10)
+            try:
+                code = (f"import os; assert os.read({descriptor}, 100) == b'authority-bytes\\x00not-stdin'; "
+                        f"os.write(1, {self.ready!r})")
+                program = ("#" + "x" * 2048 + "\n") * 130 + self.python_command(code)
+                self.assertGreater(len(program), 262144)
+                result = self.run_control(program, pass_fds=(descriptor,))
+            finally:
+                os.close(descriptor)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.ready, b""))
+
+    def test_success_drains_quiet_lock_holder_before_acknowledgement(self):
+        self.require_native_view()
+        gate = self.root / "reply-gate"
+        program = (self.locked_child(quiet=True) + " &\nwhile [ ! -s " + shlex.quote(str(gate)) +
+                   " ]; do sleep 0.01; done\nprintf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n")
+        process = self.start(program)
+        self.pin_pidfile(self.root / "descendant.pid", process)
+        with (self.root / "owned.lock").open("a") as lock:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        gate.write_text("release")
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual((process.returncode, stdout, stderr), (0, self.ready, b""))
+        self.check_pinned_children()
+        self.assert_lock_released()
+
+    def test_changed_process_group_within_session_cannot_be_acknowledged(self):
+        self.require_native_view()
+        gate = self.root / "reply-gate"
+        program = (self.locked_child(quiet=True, change_group=True) +
+                   " &\nwhile [ ! -s " + shlex.quote(str(gate)) +
+                   " ]; do sleep 0.01; done\nprintf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n")
+        process = self.start(program)
+        self.pin_pidfile(self.root / "descendant.pid", process)
+        gate.write_text("release")
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+        # This negative intentionally leaves its new group outside killpg.
+        # The census must retain obligations, never equate a sent signal with
+        # absence. Retire only the pinned fixture; this is not production cleanup.
+        descriptor, _ = self.pinned[0]
+        poll = select.poll()
+        poll.register(descriptor, select.POLLIN)
+        self.assertFalse(poll.poll(0), "fixture must actually survive the original group")
+        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+        self.check_pinned_children()
+        self.assert_lock_released()
+
+    def test_guardian_death_or_stop_retires_its_real_descendants(self):
+        for signum in (signal.SIGKILL, signal.SIGSTOP):
+            with self.subTest(signal=signum):
+                if signum == signal.SIGSTOP:
+                    self.setUp()
+                process = self.start(self.locked_child() + " &\nwait\n")
+                pid = self.pin_pidfile(self.root / "descendant.pid", process)
+                group = os.getpgid(pid)
+                self.assertNotEqual(group, os.getpgrp())
+                self.assertNotEqual(group, process.pid)
+                guardian = os.pidfd_open(group)
+                try:
+                    signal.pidfd_send_signal(guardian, signum)
+                    stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    os.close(guardian)
+                self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+                self.check_pinned_children()
+                self.assert_lock_released()
+
+    def test_observer_death_does_not_leave_an_unbounded_lock_holder(self):
+        process = self.start(self.locked_child() + " &\nwait\n")
+        self.pin_pidfile(self.root / "descendant.pid", process)
+        process.kill()  # This is our exact unreaped observer process.
+        stdout, _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertEqual(stdout, b"")
+        self.check_pinned_children()
+        self.assert_lock_released()
+
+    def test_stopped_observer_keeps_independent_guardian_deadline(self):
+        process = self.start(self.locked_child() + " &\nwait\n")
+        self.pin_pidfile(self.root / "descendant.pid", process)
+        observer = os.pidfd_open(process.pid)
+        try:
+            signal.pidfd_send_signal(observer, signal.SIGSTOP)
+            descriptor, _ = self.pinned[0]
+            poll = select.poll()
+            poll.register(descriptor, select.POLLIN)
+            self.assertTrue(poll.poll(18000), "stopped observer disabled its independent deadline")
+            signal.pidfd_send_signal(observer, signal.SIGCONT)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            os.close(observer)
+        self.assertEqual((process.returncode, stdout), (73, b""), stderr)
+        self.check_pinned_children()
+        self.assert_lock_released()
+
+    def test_checker_deadline_survives_observer_death_and_inherited_alarm_mask(self):
+        # Inject one stalled procfs read, not a fabricated empty census. All
+        # processes, timers and signals are the actual production controller.
+        # The inherited blocked ALRM used to disable its independent checker
+        # deadline after the outer observer died.
+        pidfile = self.root / "checker.pid"
+        shim = self.root / "stalled-procfs.py"
+        shim.write_text(
+            "import builtins, os, signal, sys, time\n"
+            "arguments = sys.argv[1:]\n"
+            "index = arguments.index('-c')\n"
+            "program = arguments[index + 1]\n"
+            "sys.argv = ['-c', *arguments[index + 2:]]\n"
+            "original_open = builtins.open\n"
+            "def stalled_open(path, *args, **kwargs):\n"
+            "    if path == '/proc/self/status':\n"
+            f"        with original_open({str(pidfile)!r}, 'w') as stream: stream.write(str(os.getpid()))\n"
+            "        while True: time.sleep(60)\n"
+            "    return original_open(path, *args, **kwargs)\n"
+            "builtins.open = stalled_open\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})\n"
+            "exec(compile(program, '<production-controller>', 'exec'), {'__name__': '__main__'})\n")
+        (self.tools / "python3").rename(self.tools / "retained-python3")
+        launcher = self.tools / "python3"
+        launcher.write_text("#!/bin/sh\nexec " + shlex.quote(PYTHON) + " -I -S " +
+                            shlex.quote(str(shim)) + ' "$@"\n')
+        launcher.chmod(0o700)
+        process = self.start("printf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n")
+        self.pin_pidfile(pidfile, process)
+        process.kill()
+        stdout, _ = process.communicate(timeout=5)
+        self.assertEqual((process.returncode, stdout), (-signal.SIGKILL, b""))
+        descriptor, _ = self.pinned[0]
+        poll = select.poll()
+        poll.register(descriptor, select.POLLIN)
+        self.assertTrue(poll.poll(18000), "checker lost its own alarm when observer died")
+        self.check_pinned_children()
+
+    def test_incomplete_upload_is_inside_the_execution_deadline(self):
+        started = time.monotonic()
+        process = self.start()
+        process.stdin.write(b"{\n")
+        process.stdin.flush()
+        process.wait(timeout=20)
+        self.assertLess(time.monotonic() - started, 18)
+        self.assertEqual(process.returncode, 73)
+        self.assertEqual(process.stdout.read(), b"")
+        process.stdin.close()
+        process.stdin = None
+
+    def test_stalled_diagnostics_withhold_readiness_and_delivery_is_bounded(self):
+        self.require_native_view()
+        process = self.start()
+        fcntl.fcntl(process.stderr.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+        process.stdin.write(self.python_command(
+            f"import os; os.write(2, b'x' * 65536); os.write(1, {self.ready!r})").encode())
+        process.stdin.close()
+        process.stdin = None
+        started = time.monotonic()
+        process.wait(timeout=5)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual((process.returncode, process.stdout.read()), (73, b""))
+
+    def test_stalled_stdout_cannot_hang_or_partially_publish_readiness(self):
+        self.require_native_view()
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(write_end, fcntl.F_SETPIPE_SZ, 4096)
+        filler = b"p" * 4096
+        self.assertEqual(os.write(write_end, filler), len(filler))
+        try:
+            process = subprocess.Popen([SHELL, "-c", self.script], stdin=subprocess.PIPE,
+                                       stdout=write_end, stderr=subprocess.PIPE, env=self.env)
+            self.addCleanup(self.finish_process, process)
+            os.close(write_end)
+            write_end = None
+            process.stdin.write(b"printf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n")
+            process.stdin.close()
+            process.stdin = None
+            process.wait(timeout=5)
+            self.assertEqual(process.returncode, 73)
+            os.set_blocking(read_end, False)
+            self.assertEqual(os.read(read_end, 8192), filler)
+            self.assertEqual(os.read(read_end, 8192), b"")
+        finally:
+            if write_end is not None:
+                os.close(write_end)
+            os.close(read_end)
+
+    def test_inherited_child_signal_policy_does_not_hide_teardown(self):
+        self.require_native_view()
+        def inherited_policy():
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+        result = self.run_control("printf 'RCH_SOURCE_CANCELLATION_SETTLED\\n'\n",
+                                  preexec_fn=inherited_policy)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.ready, b""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

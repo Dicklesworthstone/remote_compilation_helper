@@ -1105,6 +1105,10 @@ impl CanonicalPaths {
             DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -1501,6 +1505,12 @@ mod tests {
         bytes: &[u8],
     ) -> KnownOutput {
         let path = paths.physical(&Path::new(OUTPUT).join(name)).unwrap();
+        // Match WorkspaceLineageFixture's explicit synthetic archive container;
+        // the caller's marker remains part of the exact installed byte identity.
+        let archive = name
+            .ends_with(".rlib")
+            .then(|| crate::test_util::closed_rlib_fixture(bytes));
+        let bytes = archive.as_deref().unwrap_or(bytes);
         std::fs::write(&path, bytes).unwrap();
         let output = committed_output(&offer.manifest, &path).unwrap();
         known_installed_output(&path, &output.object.0).unwrap()
@@ -2566,17 +2576,22 @@ mod tests {
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let archive = matches!(
                 policy,
                 CommittedDependencyPolicy::ImmutableDagRlib
                     | CommittedDependencyPolicy::WorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             );
             let workspace = matches!(
                 policy,
                 CommittedDependencyPolicy::WorkspaceDagMetadata
                     | CommittedDependencyPolicy::WorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             );
             let mut parent_outputs =
                 vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
@@ -2602,8 +2617,20 @@ mod tests {
             );
             fixture.commit(&immutable);
             let offer = if workspace {
-                let offer =
-                    fixture.prepare_dag(82, vec![parent_dependency(&immutable)], &outputs, policy);
+                let offer = if matches!(
+                    policy,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                ) {
+                    fixture.prepare_generated_dag(
+                        82,
+                        vec![parent_dependency(&immutable)],
+                        &outputs,
+                        !archive,
+                    )
+                } else {
+                    fixture.prepare_dag(82, vec![parent_dependency(&immutable)], &outputs, policy)
+                };
                 fixture.commit(&offer);
                 offer
             } else {
@@ -2648,6 +2675,26 @@ mod tests {
                 .capture_committed_inputs(&restarted, Arc::clone(&candidates), policy)
                 .unwrap();
             inputs.verify_for_policy(policy).unwrap();
+            if matches!(
+                policy,
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+            ) {
+                let ordinary = if archive {
+                    CommittedDependencyPolicy::WorkspaceDagRlib
+                } else {
+                    CommittedDependencyPolicy::WorkspaceDagMetadata
+                };
+                restored
+                    .capture_committed_inputs(&restarted, Arc::clone(&candidates), ordinary)
+                    .unwrap()
+                    .verify_original()
+                    .unwrap();
+                assert!(
+                    inputs.verify_for_policy(ordinary).is_err(),
+                    "a generated consumer capability changed classes after restoration"
+                );
+            }
             for legacy in [
                 CommittedDependencyPolicy::WorkspaceRlib,
                 CommittedDependencyPolicy::WorkspaceMetadata,
@@ -3228,7 +3275,8 @@ mod tests {
                 .dependencies()
                 .iter()
                 .any(|input| input.role == OutputRole::Materializable
-                    && input.object.0 == object_id(ARCHIVE).unwrap())
+                    && input.object.0
+                        == object_id(&crate::test_util::closed_rlib_fixture(ARCHIVE)).unwrap())
         );
         std::fs::write(
             paths
@@ -3342,6 +3390,7 @@ mod tests {
         for producer_policy in [
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let parent = fixture.commit_immutable_leaf(
@@ -3352,24 +3401,34 @@ mod tests {
                 ],
                 false,
             );
-            let offer = fixture.prepare_dag(
-                63,
-                vec![parent_dependency(&parent)],
-                &[
-                    (
-                        "libupstream.rmeta",
-                        OutputRole::ProvisionalMetadata,
-                        METADATA,
-                    ),
-                    ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
-                ],
-                producer_policy,
-            );
-            fixture.commit(&offer);
-            let original = paths();
+            let outputs = [
+                (
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                ),
+                ("libupstream.rlib", OutputRole::Materializable, ARCHIVE),
+            ];
+            let offer = if producer_policy == CommittedDependencyPolicy::GeneratedWorkspaceDagRlib {
+                fixture.prepare_generated_dag(63, vec![parent_dependency(&parent)], &outputs, false)
+            } else {
+                fixture.prepare_dag(
+                    63,
+                    vec![parent_dependency(&parent)],
+                    &outputs,
+                    producer_policy,
+                )
+            };
+            let original = paths().require_closed_dependency_execution().unwrap();
+            assert!(original.require_local_capture().is_err());
             let metadata = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
             let metadata_path = metadata.path.clone();
             let generation = metadata.sig;
+            assert!(
+                register(&original, &fixture, &offer, std::slice::from_ref(&metadata)).is_err()
+            );
+            assert!(original.committed_outputs.0.lock().unwrap().is_empty());
+            fixture.commit(&offer);
             register(&original, &fixture, &offer, &[metadata]).unwrap();
             let head = original
                 .capture_committed_inputs(
@@ -3393,7 +3452,7 @@ mod tests {
                     "existing policy {policy:?} must not silently admit a new DAG producer"
                 );
             }
-            if producer_policy == CommittedDependencyPolicy::WorkspaceDagRlib {
+            if producer_policy != CommittedDependencyPolicy::ImmutableDagRlib {
                 for policy in [
                     CommittedDependencyPolicy::ImmutableDagRlib,
                     CommittedDependencyPolicy::ImmutableDagMetadata,
@@ -3431,7 +3490,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(complete.dependencies().len(), 2);
-            let copied = paths();
+            let copied = paths().require_closed_dependency_execution().unwrap();
             let _metadata = install_bytes(&copied, &offer, "libupstream.rmeta", METADATA);
             let _archive = install_bytes(&copied, &offer, "libupstream.rlib", ARCHIVE);
             assert!(
@@ -3517,6 +3576,8 @@ mod tests {
             DependencySourceKind::WorkspaceExecutionOnly,
             DependencySourceKind::WorkspaceClosedRlib,
             DependencySourceKind::WorkspaceClosedMetadata,
+            DependencySourceKind::WorkspaceGeneratedRlib,
+            DependencySourceKind::WorkspaceGeneratedMetadata,
             DependencySourceKind::RegistryPackage,
         ] {
             assert!(CommittedDependencyPolicy::from_source_kind(kind).is_none());
@@ -3568,6 +3629,116 @@ mod tests {
         );
         fixture.quarantine(&offer.manifest.action_key);
         assert!(metadata.verify_original().is_err());
+    }
+
+    #[test]
+    fn generated_leaf_outputs_require_publication_installation_and_consumer_mode_proof() {
+        for archive in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let mut outputs = vec![(
+                "libupstream.rmeta",
+                OutputRole::ProvisionalMetadata,
+                METADATA,
+            )];
+            if archive {
+                outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
+            }
+            // Class enrollment is the explicit unit fixture boundary. CAS
+            // publication, retained file generations and ancestry are real.
+            let offer = fixture.prepare_generated_leaf(47, &outputs, !archive);
+            let original = paths().require_closed_dependency_execution().unwrap();
+            assert!(original.require_local_capture().is_err());
+            let installed = outputs
+                .iter()
+                .map(|(name, _, bytes)| install_bytes(&original, &offer, name, bytes))
+                .collect::<Vec<_>>();
+            assert!(register(&original, &fixture, &offer, &installed).is_err());
+            assert!(original.committed_outputs.0.lock().unwrap().is_empty());
+            fixture.commit(&offer);
+            assert!(
+                original
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&original, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err(),
+                "publication alone cannot discover installed ancestry"
+            );
+            register(&original, &fixture, &offer, &installed).unwrap();
+            let captured = original
+                .capture_committed_inputs(
+                    &fixture.coord,
+                    observed(&original, false),
+                    CommittedDependencyPolicy::WorkspaceMetadata,
+                )
+                .unwrap();
+            captured.verify_original().unwrap();
+            assert_eq!(captured.ancestors().len(), 1);
+            assert_eq!(
+                captured.ancestors()[0].producer_action_key,
+                offer.manifest.action_key
+            );
+            assert_eq!(
+                captured.ancestors()[0].consumed_object.0,
+                object_id(METADATA).unwrap()
+            );
+            let archive_consumer = original.capture_committed_inputs(
+                &fixture.coord,
+                observed(&original, archive),
+                CommittedDependencyPolicy::WorkspaceRlib,
+            );
+            if archive {
+                let inputs = archive_consumer.unwrap();
+                inputs.verify_original().unwrap();
+                assert_eq!(inputs.dependencies().len(), 2);
+            } else {
+                assert!(
+                    archive_consumer.is_err(),
+                    "generated check output authorized codegen"
+                );
+            }
+            for policy in [
+                CommittedDependencyPolicy::ImmutableDagRlib,
+                CommittedDependencyPolicy::ImmutableDagMetadata,
+            ] {
+                assert!(
+                    original
+                        .capture_committed_inputs(
+                            &fixture.coord,
+                            observed(&original, false),
+                            policy,
+                        )
+                        .is_err(),
+                    "generated workspace provenance escaped into {policy:?}"
+                );
+            }
+            let copied = paths();
+            for (name, _, bytes) in &outputs {
+                install_bytes(&copied, &offer, name, bytes);
+            }
+            assert!(
+                copied
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&copied, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err(),
+                "matching files in another target acquired installation authority"
+            );
+            fixture.quarantine(&offer.manifest.action_key);
+            assert!(captured.verify_original().is_err());
+            assert!(
+                original
+                    .capture_committed_inputs(
+                        &fixture.coord,
+                        observed(&original, false),
+                        CommittedDependencyPolicy::WorkspaceMetadata,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3657,59 +3828,130 @@ mod tests {
     }
 
     #[test]
-    fn same_byte_replacement_refuses_old_witness_even_after_fresh_observation() {
-        let fixture = WorkspaceLineageFixture::new();
-        let offer = fixture.commit_leaf(
-            41,
-            &[(
-                "libupstream.rmeta",
-                OutputRole::ProvisionalMetadata,
-                METADATA,
-            )],
-        );
-        let paths = paths();
-        let metadata = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
-        let path = metadata.path.clone();
-        let old_generation = metadata.sig;
-        register(&paths, &fixture, &offer, &[metadata]).unwrap();
-        let inputs = paths
-            .capture_committed_inputs(
-                &fixture.coord,
-                observed(&paths, false),
-                CommittedDependencyPolicy::WorkspaceRlib,
-            )
-            .unwrap();
-        inputs.verify_original().unwrap();
-        let replacement = path.with_file_name("replacement.tmp");
-        std::fs::write(&replacement, METADATA).unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-        let (new_generation, same_object) = digest_stable(&path).unwrap();
-        assert_ne!(old_generation, new_generation);
-        assert_eq!(same_object, object_id(METADATA).unwrap());
-        assert!(inputs.verify_original().is_err());
-        assert!(
-            paths
+    fn project_executors_cannot_replace_committed_metadata_or_archive_generations() {
+        for (archive, generated) in [(false, false), (true, false), (false, true), (true, true)] {
+            for same_bytes in [false, true] {
+                let fixture = WorkspaceLineageFixture::new();
+                let mut outputs = vec![(
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                )];
+                if archive {
+                    outputs.push(("libupstream.rlib", OutputRole::Materializable, ARCHIVE));
+                }
+                let offer = if generated {
+                    let offer = fixture.prepare_generated_leaf(41, &outputs, !archive);
+                    fixture.commit(&offer);
+                    offer
+                } else if archive {
+                    fixture.commit_leaf(41, &outputs)
+                } else {
+                    fixture.commit_metadata_leaf(41, &outputs)
+                };
+                let policy = if archive {
+                    CommittedDependencyPolicy::WorkspaceRlib
+                } else {
+                    CommittedDependencyPolicy::WorkspaceMetadata
+                };
+                let paths = paths().require_closed_dependency_execution().unwrap();
+                assert!(paths.require_local_capture().is_err());
+                let installed = outputs
+                    .iter()
+                    .map(|(name, _, bytes)| install_bytes(&paths, &offer, name, bytes))
+                    .collect::<Vec<_>>();
+                let replaced = installed.last().unwrap();
+                let path = replaced.path.clone();
+                let old_generation = replaced.sig;
+                let bytes = std::fs::read(&path).unwrap();
+                let object = object_id(&bytes).unwrap();
+                register(&paths, &fixture, &offer, &installed).unwrap();
+                let inputs = paths
+                    .capture_committed_inputs(&fixture.coord, observed(&paths, archive), policy)
+                    .unwrap();
+                inputs.verify_original().unwrap();
+
+                // Project code can write the live Cargo target. Neither a
+                // different object nor identical bytes in a fresh inode may
+                // inherit the coordinator's original installation witness.
+                let mut replacement_bytes = bytes.clone();
+                if !same_bytes {
+                    if archive {
+                        replacement_bytes = crate::test_util::closed_rlib_fixture(
+                            b"project executor replaced these native object bytes",
+                        );
+                    } else {
+                        replacement_bytes.push(0);
+                    }
+                }
+                let replacement = path.with_file_name("replacement.tmp");
+                std::fs::write(&replacement, replacement_bytes).unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+                let (new_generation, replacement_object) = digest_stable(&path).unwrap();
+                assert_ne!(old_generation, new_generation);
+                assert_eq!(replacement_object == object, same_bytes);
+                assert!(inputs.verify_original().is_err());
+                assert!(
+                    paths
+                        .capture_committed_inputs(
+                            &fixture.coord,
+                            observed(&paths, archive),
+                            policy,
+                        )
+                        .is_err(),
+                    "archive={archive}, generated={generated}, same_bytes={same_bytes}"
+                );
+                // Only a separately verified reinstall can mint the new
+                // generation. Old observations never refresh themselves.
+                std::fs::write(&path, &bytes).unwrap();
+                let verified = known_installed_output(&path, &object).unwrap();
+                register(&paths, &fixture, &offer, &[verified]).unwrap();
+                paths
+                    .capture_committed_inputs(&fixture.coord, observed(&paths, archive), policy)
+                    .unwrap()
+                    .verify_original()
+                    .unwrap();
+                assert!(inputs.verify_original().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn project_executor_dynamic_candidates_revoke_a_committed_input_view() {
+        for name in ["libproject_macro.so", "libproject_macro.dylib"] {
+            let fixture = WorkspaceLineageFixture::new();
+            let offer = fixture.commit_metadata_leaf(
+                42,
+                &[(
+                    "libupstream.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    METADATA,
+                )],
+            );
+            let paths = paths().require_closed_dependency_execution().unwrap();
+            let metadata = install_bytes(&paths, &offer, "libupstream.rmeta", METADATA);
+            register(&paths, &fixture, &offer, &[metadata]).unwrap();
+            let inputs = paths
                 .capture_committed_inputs(
                     &fixture.coord,
                     observed(&paths, false),
-                    CommittedDependencyPolicy::WorkspaceRlib,
+                    CommittedDependencyPolicy::WorkspaceMetadata,
                 )
-                .is_err()
-        );
-        // A verified reinstall may mint the new generation; old observations
-        // never refresh themselves or inherit the new witness.
-        let verified = known_installed_output(&path, &same_object).unwrap();
-        register(&paths, &fixture, &offer, &[verified]).unwrap();
-        paths
-            .capture_committed_inputs(
-                &fixture.coord,
-                observed(&paths, false),
-                CommittedDependencyPolicy::WorkspaceRlib,
-            )
-            .unwrap()
-            .verify_original()
-            .unwrap();
-        assert!(inputs.verify_original().is_err());
+                .unwrap();
+            inputs.verify_original().unwrap();
+            // Executable candidate names are refused before parsing their
+            // contents. Adding one must also invalidate an earlier retained
+            // view, even though its registered Rust producer did not change.
+            let candidate = paths.physical(&Path::new(OUTPUT).join(name)).unwrap();
+            std::fs::write(candidate, b"unclosed project executable input").unwrap();
+            assert!(
+                inputs
+                    .verify_original()
+                    .unwrap_err()
+                    .contains(&format!("dynamic dependency candidate {name}"))
+            );
+            assert!(paths.require_local_capture().is_err());
+        }
     }
 
     #[test]
@@ -3723,7 +3965,7 @@ mod tests {
                 METADATA,
             )],
         );
-        let original = paths();
+        let original = paths().require_closed_dependency_execution().unwrap();
         let metadata = install_bytes(&original, &offer, "libupstream.rmeta", METADATA);
         register(&original, &fixture, &offer, &[metadata]).unwrap();
         original
@@ -3733,7 +3975,7 @@ mod tests {
                 CommittedDependencyPolicy::WorkspaceRlib,
             )
             .unwrap();
-        let other = paths();
+        let other = paths().require_closed_dependency_execution().unwrap();
         let _copied = install_bytes(&other, &offer, "libupstream.rmeta", METADATA);
         assert!(
             other

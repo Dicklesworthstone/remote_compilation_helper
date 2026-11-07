@@ -225,7 +225,7 @@ pub(super) enum Operation {
 }
 
 pub(super) struct Assignment {
-    pub admission: PinnedWorkerAdmission,
+    pub admission: Arc<PinnedWorkerAdmission>,
     pub request: Value,
     pub destination: PathBuf,
     pub cancellation: OperationCancellation,
@@ -1015,12 +1015,10 @@ mod tests {
         let upload =
             SourceUpload::from_snapshot(snapshot, "workspace", &["lib.rs".into()]).unwrap();
         let assignment = Assignment {
-            admission: PinnedWorkerAdmission::open(
-                &state.path().join("admission"),
-                "worker",
-                [1; 32],
-            )
-            .unwrap(),
+            admission: Arc::new(
+                PinnedWorkerAdmission::open(&state.path().join("admission"), "worker", [1; 32])
+                    .unwrap(),
+            ),
             request: json!({"request_id":1}),
             destination: state.path().join("delivery"),
             cancellation: OperationCancellation::new(),

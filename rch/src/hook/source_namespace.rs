@@ -14,6 +14,7 @@ use super::{PathTopologyPolicy, SyncClosurePlanEntry, WorkerConfig};
 use anyhow::Context as _;
 use rch_common::WorkerId;
 use sha2::{Digest as _, Sha256};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
@@ -118,8 +119,30 @@ fn topology_refusal_detail(
 // required for the registry's record/directory fsync. The descriptor survives
 // exec and CONTROL kills every inheriting descendant before acknowledgement.
 const REGISTRY_LOCK: &str = r#"
-import errno, fcntl, os, stat, sys, time
+import errno, fcntl, math, os, re, stat, sys, time
+try:
+    timing_text = os.environ.get('RCH_TIMING_SCALE', '1')
+    if (len(timing_text) > 128 or re.fullmatch(
+            r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?',
+            timing_text) is None):
+        raise ValueError('invalid transported scale')
+    timing_scale = float(timing_text)
+    if not math.isfinite(timing_scale) or not 1.0 <= timing_scale <= 10.0:
+        raise ValueError('scale outside [1, 10]')
+except ValueError:
+    print('RCH_SOURCE_NAMESPACE_INVALID_TIMING_SCALE', file=sys.stderr)
+    sys.exit(78)
+
 started = time.monotonic()
+deadline = started + 5 * timing_scale
+
+def require_admission_time():
+    now = time.monotonic()
+    if now >= deadline:
+        print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
+            int((now - started) * 1000), sys.argv[1]), file=sys.stderr)
+        sys.exit(76)
+
 try:
     lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     info = os.fstat(lock)
@@ -129,22 +152,22 @@ try:
         named = os.stat(sys.argv[1], follow_symlinks=False)
         if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
             raise OSError('metadata lock changed while waiting')
+        # A resumed waiter must not acquire after its observation window.
+        require_admission_time()
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
         except OSError as error:
             if error.errno not in (errno.EAGAIN, errno.EACCES):
                 raise
-        elapsed = time.monotonic() - started
-        if elapsed >= 5:
-            print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
-                int(elapsed * 1000), sys.argv[1]), file=sys.stderr)
-            sys.exit(76)
-        time.sleep(0.02)
+        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
     named = os.stat(sys.argv[1], follow_symlinks=False)
     if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
         raise OSError('metadata lock changed after acquisition')
     os.set_inheritable(lock, True)
+    # Successful LOCK_NB can itself return after a scheduling stall. No
+    # initializer may run merely because acquisition eventually succeeded.
+    require_admission_time()
     os.execvp(sys.argv[2], sys.argv[2:])
 except OSError as error:
     print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID {}'.format(error), file=sys.stderr)
@@ -170,7 +193,8 @@ pub(super) async fn acquire_source_authority_with_retry(
     identity: &str,
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    let deadline = tokio::time::Instant::now() + wait_timeout.min(SOURCE_ADMISSION_WAIT);
+    let deadline = tokio::time::Instant::now()
+        + wait_timeout.min(rch_common::timing::scale_duration(SOURCE_ADMISSION_WAIT));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -287,7 +311,7 @@ fn namespace_command(
          exec python3 -I -S -c {lock_program} \"$registry/metadata.lock\" sh -c {script} \
          rch-source-namespace \"$registry\" {identity} {digest} topology {check} {create} \
          <<'RCH_NAMESPACE_SCOPE'\n{body}RCH_NAMESPACE_SCOPE\n\
-         ); }}\nrch_admission_attempts=6\n{ADMISSION}",
+         ); }}\nrch_admission_retry_seconds=5\n{ADMISSION}",
         setup = super::ssh::source_registry_setup(registry),
         lock_program = quote(REGISTRY_LOCK),
         script = quote(&registry_script),
@@ -297,25 +321,74 @@ fn namespace_command(
     ))
 }
 
+/// Batch the read-only destination guards and topology observation with the
+/// initializer. They still run before registry setup or any namespace write;
+/// the registry transaction independently rechecks the physical mapping under
+/// its mutex. Keeping this on one bounded channel saves two SSH round trips
+/// without caching an observation or granting any source authority.
+fn namespace_preflight_command(
+    policy: &PathTopologyPolicy,
+    identity: &str,
+    registry: &str,
+    source_roots: &[PathBuf],
+) -> anyhow::Result<String> {
+    let initializer = namespace_command(policy, identity, registry)?;
+    let mut guard = String::from("set -eu\n");
+    for root in source_roots {
+        let root = root.to_str().context("source destination is not UTF-8")?;
+        guard.push_str(&crate::transfer::live_checkout_sync_guard(root));
+        guard.push_str(" || exit 73\n");
+    }
+    // The controller accepts only the final topology acknowledgment on stdout.
+    // This observation is diagnostic, never permission to skip initialization.
+    guard.push_str(&format!(
+        "({}) >&2\n",
+        super::ssh::build_worker_projects_topology_probe_cmd(policy),
+    ));
+    // Keep the guard's original 30-second allowance separate from the
+    // namespace controller's 15-second mutation deadline. This finite RPC has
+    // no source grant yet and owns only its read-only guard process group.
+    let guard = crate::transfer::source_activity_bounded_script(
+        "",
+        &guard,
+        rch_common::timing::scale_duration(Duration::from_secs(30)),
+    );
+    let controller = shell_escape::escape(CONTROL.into());
+    let mut delimiter = format!("RCH_NAMESPACE_{}", uuid::Uuid::new_v4().simple());
+    while initializer.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    // Parse the entire compound before running either operation. A truncated
+    // stdin upload cannot launch a partially received initializer.
+    Ok(format!(
+        "{}{{\n(\n{guard}\n) || exit $?\nsh -c {controller} <<'{delimiter}'\n{initializer}\n{delimiter}\n}}\n",
+        rch_common::timing::shell_prefix(),
+    ))
+}
+
 pub(super) async fn initialize_worker_namespace(
     worker: &WorkerConfig,
     policy: &PathTopologyPolicy,
     identity: &str,
-) -> anyhow::Result<()> {
-    let script = namespace_command(policy, identity, REGISTRY)?;
+    source_roots: &[PathBuf],
+) -> anyhow::Result<bool> {
+    let script = namespace_preflight_command(policy, identity, REGISTRY, source_roots)?;
     // Bound the worker as well as the SSH client. Killing only the local SSH
     // process can leave a queued initializer or a pipe-holding descendant on
     // the worker, retaining the registry mutex after this future has failed.
-    // CONTROL owns only pre-intent namespace setup, never a source/build grant.
+    // Both controllers own only pre-intent setup, never a source/build grant.
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        CONTROL,
+        "sh -s",
         script.as_bytes(),
-        Duration::from_secs(20),
+        rch_common::timing::scale_duration(Duration::from_secs(50)),
     )
     .await?;
     if output.status.success() && output.stdout.as_slice() == b"RCH_TOPOLOGY_OK\n" {
-        return Ok(());
+        return Ok(output
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == b"RCH_TOPOLOGY_INITIALIZATION_REQUIRED"));
     }
     Err(namespace_refusal(
         worker,
@@ -326,7 +399,7 @@ pub(super) async fn initialize_worker_namespace(
 }
 
 /// The initializer's refusal as an error. Its admission loop already retried
-/// a briefly overlapping owner (`rch_admission_attempts`), so an overlap
+/// a briefly overlapping owner (`rch_admission_retry_seconds`), so an overlap
 /// verdict means another owner still holds this worker's source. Typed busy,
 /// the release fences the (project, worker) pair (bd-p3kuz). Untyped, rchd
 /// kept placing the project on the same worker: vmi1153651 refused it four
@@ -338,6 +411,10 @@ fn namespace_refusal(
     stderr: &[u8],
 ) -> anyhow::Error {
     let detail = String::from_utf8_lossy(stderr);
+    let admission_unconfirmed = detail.lines().any(|line| {
+        line.starts_with("RCH_SOURCE_ADMISSION_UNCONFIRMED")
+            || line.starts_with("RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE")
+    });
     let permanent_mapping = if status == Some(73)
         && !detail.lines().any(|line| {
             [
@@ -347,6 +424,8 @@ fn namespace_refusal(
                 "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY",
                 "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
                 "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH_SOURCE_ADMISSION_UNCONFIRMED",
+                "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
                 "RCH: durable source ownership: unfinished overlapping",
             ]
             .iter()
@@ -373,11 +452,12 @@ fn namespace_refusal(
         || detail.escape_debug().to_string(),
         |verdict| topology_refusal_detail(verdict, detail, &topology),
     );
-    let error = anyhow::anyhow!(
-        "worker source namespace initialization refused on {} (status {:?}): {}",
-        worker.id,
-        status,
-        rendered_detail,
+    let error = crate::transfer::destination_check_refusal(
+        format!(
+            "worker source namespace initialization refused on {} (status {:?}): {}",
+            worker.id, status, rendered_detail,
+        ),
+        detail,
     );
     if permanent_mapping.is_some() {
         error.context(SourceTopologyIncompatible {
@@ -387,12 +467,18 @@ fn namespace_refusal(
                 detail: rendered_detail,
             },
         })
-    } else if status == Some(76) && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY") {
+    } else if !admission_unconfirmed
+        && status == Some(76)
+        && detail.contains("RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY")
+    {
         error.context(crate::transfer::SourceAuthorityBusy(format!(
             "worker registry metadata lock on {} remained busy; no source grant was admitted",
             worker.id
         )))
-    } else if status == Some(75) && retryable_source_admission_error(&error) {
+    } else if !admission_unconfirmed
+        && status == Some(75)
+        && retryable_source_admission_error(&error)
+    {
         overlapping_owner_outlived_wait(error, worker)
     } else {
         error
@@ -486,10 +572,20 @@ mod tests {
         let alias = temp.path().join("alias");
         let registry = temp.path().join("registry");
         let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
-        let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
-        for _ in 0..2 {
+        let source = canonical.join("repository");
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        for observation in [
+            "RCH_TOPOLOGY_INITIALIZATION_REQUIRED",
+            "RCH_TOPOLOGY_PATHS_PRESENT",
+        ] {
             let mut child = std::process::Command::new("sh")
-                .args(["-c", CONTROL])
+                .arg("-s")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -508,7 +604,13 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(output.stdout, b"RCH_TOPOLOGY_OK\n");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == observation)
+            );
             assert_eq!(std::fs::canonicalize(&alias).unwrap(), canonical);
+            assert!(!source.exists(), "preflight must not create source trees");
             assert!(std::fs::read_dir(&registry).unwrap().all(|entry| {
                 let path = entry.unwrap().path();
                 !matches!(
@@ -516,6 +618,114 @@ mod tests {
                     Some("claim" | "pending")
                 )
             }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_preflight_checks_every_destination_before_any_mutation() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("projects");
+        let alias = temp.path().join("alias");
+        let registry = temp.path().join("registry");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        // A valid first root must not cause the initializer to run before
+        // checking the later unsafe root. Even registry setup is forbidden.
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            &[canonical.join("safe repository"), PathBuf::from("/")],
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(command.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(!canonical.exists() && !alias.exists() && !registry.exists());
+        let worker = WorkerConfig::default();
+        let error = namespace_refusal(&worker, &policy, output.status.code(), &output.stderr);
+        assert!(
+            error.is::<crate::transfer::LiveCheckoutRefused>(),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_preflight_truncated_upload_never_starts_a_program_or_mutates_paths() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("projects with ' quotes");
+        let alias = temp.path().join("alias");
+        let registry = temp.path().join("registry");
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
+        let source = canonical.join("repository");
+        let command = namespace_preflight_command(
+            &policy,
+            "0123",
+            registry.to_str().unwrap(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert!(command.ends_with("}\n"));
+        let outer_heredoc_end = command.rfind("\nRCH_NAMESPACE_").unwrap();
+        // A complete heredoc alone is insufficient: the outer compound must
+        // also arrive before even the read-only guards or observation run.
+        for (name, end) in [
+            ("mid_program", command.len() / 2),
+            ("missing_final_heredoc", outer_heredoc_end),
+            ("missing_outer_brace", command.len() - 2),
+        ] {
+            let mut child = std::process::Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&command.as_bytes()[..end])
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{name} accepted a truncated command"
+            );
+            assert!(output.stdout.is_empty(), "{name}");
+            assert!(
+                !diagnostic.contains("RCH_TOPOLOGY_"),
+                "{name}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("RCH_SOURCE_NAMESPACE_CONTROL_UNSETTLED"),
+                "{name}: {diagnostic}"
+            );
+            assert!(!canonical.exists(), "{name}");
+            assert!(std::fs::symlink_metadata(&alias).is_err(), "{name}");
+            assert!(!registry.exists(), "{name}");
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0, "{name}");
         }
     }
 
@@ -589,6 +799,32 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_admission_never_becomes_busy_or_permanent() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("unconfirmed-admission"),
+            ..WorkerConfig::default()
+        };
+        let policy = test_policy();
+        for marker in [
+            "RCH_SOURCE_ADMISSION_UNCONFIRMED cause=deadline-after-success",
+            "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
+        ] {
+            let diagnostic = format!(
+                "RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base\n\
+                 RCH: durable source ownership: unfinished overlapping source owner\n\
+                 RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5000\n\
+                 {marker}\n"
+            );
+            for status in [None, Some(73), Some(75), Some(76), Some(137)] {
+                let error = namespace_refusal(&worker, &policy, status, diagnostic.as_bytes());
+                assert!(!crate::transfer::source_authority_busy(&error), "{error:#}");
+                assert!(error.downcast_ref::<SourceTopologyIncompatible>().is_none());
+                assert!(format!("{error:#}").contains(marker));
+            }
+        }
+    }
+
+    #[test]
     fn source_namespace_permanent_mapping_requires_completed_explicit_verdict() {
         let worker = WorkerConfig {
             id: WorkerId::new("incompatible-worker"),
@@ -626,6 +862,8 @@ mod tests {
                 "RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5000",
                 "RCH_SOURCE_REGISTRY_PUBLICATION_UNCONFIRMED",
                 "RCH_SOURCE_CANCELLATION_FENCE",
+                "RCH_SOURCE_ADMISSION_UNCONFIRMED cause=deadline-after-success",
+                "RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE",
                 "RCH: durable source ownership: unfinished overlapping source owner",
             ] {
                 let mixed = format!("{diagnostic}{uncertain}\n");
@@ -786,6 +1024,70 @@ mod tests {
                 Some("claim" | "pending")
             )
         }));
+    }
+
+    #[test]
+    fn source_namespace_restores_absent_canonical_name_beside_a_real_alias() {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let physical = root.join("data/projects");
+        let alias = root.join("dp");
+        let registry = root.join("registry");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(physical.join("keep"), b"source contents").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let run = |canonical: &std::path::Path| {
+            let policy = PathTopologyPolicy::new(canonical.to_path_buf(), alias.clone());
+            let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", CONTROL])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(command.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // The parent is absent too, as on a worker whose home was never populated.
+        let canonical = root.join("Users/test/projects");
+        for _ in 0..2 {
+            let output = run(&canonical);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"RCH_TOPOLOGY_OK\n");
+            assert_eq!(std::fs::read_link(&canonical).unwrap(), physical);
+        }
+        assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
+        assert_eq!(
+            std::fs::read(canonical.join("keep")).unwrap(),
+            b"source contents"
+        );
+
+        // A link that cannot be made stays the permanent refusal it always was,
+        // and leaves no second tree behind.
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"a file, not a directory").unwrap();
+        let output = run(&blocked.join("projects"));
+        assert_eq!(output.status.code(), Some(73));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("RCH_SOURCE_TOPOLOGY_INCOMPATIBLE: conflicting_alias_base")
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"a file, not a directory");
     }
 
     #[test]

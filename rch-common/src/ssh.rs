@@ -736,19 +736,40 @@ impl SshClient {
         self.connect_using(Path::new("ssh"), None).await
     }
 
+    /// Connect within a control operation's original absolute deadline.
+    /// Local client inspection and authentication share this budget.
+    pub async fn connect_until(&mut self, deadline: Instant) -> Result<()> {
+        let deadline = bounded_ssh_deadline(deadline)?;
+        self.connect_using_before(Path::new("ssh"), None, Some(deadline))
+            .await
+    }
+
     async fn connect_using(
         &mut self,
         ssh_program: &Path,
         control_directory: Option<&Path>,
     ) -> Result<()> {
+        self.connect_using_before(ssh_program, control_directory, None)
+            .await
+    }
+
+    async fn connect_using_before(
+        &mut self,
+        ssh_program: &Path,
+        control_directory: Option<&Path>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let admission = self.pool_admission.clone();
-        let result = tokio::select! {
-            biased;
-            () = pool_admission_revoked(admission) => {
-                Err(anyhow::anyhow!("SSH worker pool admission was revoked"))
+        let result = ssh_operation_before(deadline, async {
+            tokio::select! {
+                biased;
+                () = pool_admission_revoked(admission) => {
+                    Err(anyhow::anyhow!("SSH worker pool admission was revoked"))
+                }
+                result = self.connect_admitted(ssh_program, control_directory, deadline) => result,
             }
-            result = self.connect_admitted(ssh_program, control_directory) => result,
-        };
+        })
+        .await;
         result.map_err(|error| anyhow::Error::new(SshConnectError(error)))
     }
 
@@ -756,7 +777,9 @@ impl SshClient {
         &mut self,
         ssh_program: &Path,
         control_directory: Option<&Path>,
+        caller_deadline: Option<Instant>,
     ) -> Result<()> {
+        ensure_ssh_deadline(caller_deadline)?;
         if self.is_connected() {
             debug!("Already connected to {}", self.config.id);
             return Ok(());
@@ -766,6 +789,7 @@ impl SshClient {
         let deadline = Instant::now()
             .checked_add(self.options.connect_timeout)
             .context("SSH connect_timeout exceeds the supported clock range")?;
+        let deadline = caller_deadline.map_or(deadline, |caller| deadline.min(caller));
 
         let destination = format!("{}@{}", self.config.user, self.config.host);
         debug!("Connecting to {} via SSH...", destination);
@@ -785,6 +809,9 @@ impl SshClient {
             .await
             .with_context(|| format!("Failed to connect to {}", destination))?;
 
+        // A ready authentication result cannot install a session after its
+        // caller's budget. Dropping the owned session still stops/reaps it.
+        ensure_ssh_deadline(Some(deadline))?;
         // debug, not info: the telemetry pool connects to every worker each poll
         // cycle, so at info this floods the daemon log (8M+ lines / multi-GB).
         debug!("Connected to {} ({})", self.config.id, self.config.host);
@@ -851,6 +878,7 @@ impl SshClient {
             &log,
             can_disable_background,
         );
+        ensure_ssh_deadline(Some(deadline))?;
         let mut process = OwnedSshProcess::spawn_with_admission(
             &mut command,
             Some(control_dir.clone()),
@@ -911,7 +939,7 @@ impl SshClient {
             .arg("-o")
             .arg(format!(
                 "ConnectTimeout={}",
-                self.options.connect_timeout.as_secs()
+                crate::timing::ceil_seconds(self.options.connect_timeout).max(1)
             ));
         if can_disable_background {
             command.args(["-o", "ForkAfterAuthentication=no"]);
@@ -951,13 +979,20 @@ impl SshClient {
     /// `reconnect` tears the old master down even if its local process is
     /// running but its transport no longer answers, then establishes a new one.
     pub async fn reconnect(&mut self) -> Result<()> {
+        self.reconnect_before(None).await
+    }
+
+    async fn reconnect_before(&mut self, deadline: Option<Instant>) -> Result<()> {
+        ensure_ssh_deadline(deadline)?;
         if let Err(e) = self.disconnect().await {
             debug!(
                 "Ignoring error closing stale session to {} before reconnect: {}",
                 self.config.id, e
             );
         }
-        self.connect().await
+        ensure_ssh_deadline(deadline)?;
+        self.connect_using_before(Path::new("ssh"), None, deadline)
+            .await
     }
 
     /// Execute a command on the remote worker using this client's configured
@@ -977,20 +1012,56 @@ impl SshClient {
         command: &str,
         command_timeout: Duration,
     ) -> Result<CommandResult> {
-        tokio::select! {
-            biased;
-            () = pool_admission_revoked(self.pool_admission.clone()) => {
-                anyhow::bail!("SSH worker pool admission was revoked")
+        self.execute_with_timeout_before(command, command_timeout, None)
+            .await
+    }
+
+    /// Run a control command without restarting its caller's response budget.
+    /// The supplied per-command timeout is already effective and is not scaled.
+    pub async fn execute_with_timeout_until(
+        &self,
+        command: &str,
+        command_timeout: Duration,
+        deadline: Instant,
+    ) -> Result<CommandResult> {
+        let deadline = bounded_ssh_deadline(deadline)?;
+        self.execute_with_timeout_before(command, command_timeout, Some(deadline))
+            .await
+    }
+
+    async fn execute_with_timeout_before(
+        &self,
+        command: &str,
+        command_timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<CommandResult> {
+        ssh_operation_before(deadline, async {
+            ensure_ssh_deadline(deadline)?;
+            tokio::select! {
+                biased;
+                () = pool_admission_revoked(self.pool_admission.clone()) => {
+                    anyhow::bail!("SSH worker pool admission was revoked")
+                }
+                result = self.execute_admitted(command, command_timeout, deadline) => result,
             }
-            result = self.execute_admitted(command, command_timeout) => result,
-        }
+        })
+        .await
     }
 
     async fn execute_admitted(
         &self,
         command: &str,
         command_timeout: Duration,
+        caller_deadline: Option<Instant>,
     ) -> Result<CommandResult> {
+        ensure_ssh_deadline(caller_deadline)?;
+        let command_timeout = caller_deadline.map_or(command_timeout, |deadline| {
+            command_timeout.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        anyhow::ensure!(
+            caller_deadline.is_none() || !command_timeout.is_zero(),
+            "SSH command timed out: deadline exceeded before spawn"
+        );
         // Windows fallback (bd-kzy2x): the openssh crate cannot execute
         // commands on Windows OpenSSH (the slave never completes the
         // command channel), so we dispatch through the system `ssh` binary
@@ -998,15 +1069,31 @@ impl SshClient {
         // supervised SSH master; Linux / unlabelled workers execute through
         // the openssh session attached to that master.
         if prefers_system_ssh(&self.config) {
-            return system_ssh_execute(
-                &self.config,
-                command,
-                command_timeout,
-                self.options
-                    .server_alive_interval
-                    .unwrap_or(Duration::from_secs(2)),
-            )
-            .await;
+            let server_alive_interval = self
+                .options
+                .server_alive_interval
+                .unwrap_or(Duration::from_secs(2));
+            return match caller_deadline {
+                Some(deadline) => {
+                    system_ssh_execute_before(
+                        &self.config,
+                        command,
+                        command_timeout,
+                        server_alive_interval,
+                        Some(deadline),
+                    )
+                    .await
+                }
+                None => {
+                    system_ssh_execute(
+                        &self.config,
+                        command,
+                        command_timeout,
+                        server_alive_interval,
+                    )
+                    .await
+                }
+            };
         }
 
         let session = self.session.as_ref().context("Not connected to worker")?;
@@ -1019,6 +1106,7 @@ impl SshClient {
             crate::util::mask_sensitive_command(command)
         );
 
+        ensure_ssh_deadline(caller_deadline)?;
         let mut child = session
             .session
             .command("sh")
@@ -1029,6 +1117,7 @@ impl SshClient {
             .spawn()
             .await
             .with_context(|| format!("Failed to spawn command on {}", self.config.id))?;
+        ensure_ssh_deadline(caller_deadline)?;
 
         let execution_future = async {
             // Read stdout and stderr concurrently to avoid deadlock if one pipe fills.
@@ -1096,6 +1185,7 @@ impl SshClient {
                     duration.as_millis()
                 );
 
+                ensure_ssh_deadline(caller_deadline)?;
                 activity.complete();
                 Ok(CommandResult {
                     exit_code,
@@ -1294,8 +1384,12 @@ impl SshClient {
     /// [`health_check`](Self::health_check) bounded by `timeout` instead of
     /// the client's command timeout (300s for pooled clients).
     pub async fn health_check_with_timeout(&self, timeout: Duration) -> Result<bool> {
+        self.health_check_before(timeout, None).await
+    }
+
+    async fn health_check_before(&self, timeout: Duration, deadline: Option<Instant>) -> Result<bool> {
         match self
-            .execute_with_timeout(HEALTH_CHECK_COMMAND, timeout)
+            .execute_with_timeout_before(HEALTH_CHECK_COMMAND, timeout, deadline)
             .await
         {
             Ok(result) => Ok(result.success() && is_expected_health_check_output(&result.stdout)),
@@ -1551,7 +1645,7 @@ pub use crate::ssh_utils::identities_only_args;
 /// skip it — see `system_ssh_execute` which drops it.
 ///
 /// Argv layout:
-/// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=8 -o
+/// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=<scaled-seconds> -o
 ///   ConnectionAttempts=1 -o ControlMaster=no -o ControlPersist=no -o ControlPath=none -o
 ///   ForkAfterAuthentication=no (when supported) -o
 ///   StrictHostKeyChecking=accept-new -o ServerAliveInterval=<secs>
@@ -1562,6 +1656,8 @@ pub use crate::ssh_utils::identities_only_args;
 /// ports, so the argv has no `-p` flag. The 8s `ConnectTimeout` matches the
 /// fleet SshExecutor default (`DEFAULT_CONNECT_TIMEOUT_SECS = 10` would be
 /// the natural match too — kept at 8 to match the FINDINGS spec exactly).
+/// The shared timing policy extends that 8s baseline and fractional values
+/// round upward because OpenSSH accepts only integer connection seconds.
 /// `server_alive_interval` is rounded up to 1s minimum when non-zero to
 /// avoid `ServerAliveInterval=0` (which OpenSSH treats as "disable
 /// keepalives" — fine — but matches the spec "0 -> omit" intent).
@@ -1586,7 +1682,10 @@ pub(crate) fn system_ssh_argv(
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("BatchMode=yes"));
     argv.push(OsString::from("-o"));
-    argv.push(OsString::from("ConnectTimeout=8"));
+    argv.push(OsString::from(format!(
+        "ConnectTimeout={}",
+        crate::timing::ceil_seconds(crate::timing::scale_duration(Duration::from_secs(8)))
+    )));
     // This fallback opens its own connection. Never attach to an unrelated
     // master, inherit extra dials, or leave a persistent master behind.
     for option in oneshot_ssh_options(can_disable_background) {
@@ -1651,6 +1750,16 @@ pub(crate) async fn system_ssh_execute(
     command_timeout: Duration,
     server_alive_interval: Duration,
 ) -> Result<CommandResult> {
+    system_ssh_execute_before(config, command, command_timeout, server_alive_interval, None).await
+}
+
+async fn system_ssh_execute_before(
+    config: &WorkerConfig,
+    command: &str,
+    command_timeout: Duration,
+    server_alive_interval: Duration,
+    caller_deadline: Option<Instant>,
+) -> Result<CommandResult> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
@@ -1659,6 +1768,8 @@ pub(crate) async fn system_ssh_execute(
     let deadline = Instant::now()
         .checked_add(command_timeout)
         .context("SSH command timeout exceeds the supported clock range")?;
+    let deadline = caller_deadline.map_or(deadline, |caller| deadline.min(caller));
+    ensure_ssh_deadline(Some(deadline))?;
     let control_dir = Arc::new(tempfile::tempdir().context("SSH client probe directory")?);
     let can_disable_background =
         ssh_can_disable_background_in(Path::new("ssh"), control_dir, deadline).await?;
@@ -1690,6 +1801,7 @@ pub(crate) async fn system_ssh_execute(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    ensure_ssh_deadline(Some(deadline))?;
     let mut child = OwnedProcessGroup::spawn(&mut process).with_context(|| {
         format!(
             "failed to spawn system ssh for {} (Windows fallback)",
@@ -1745,6 +1857,7 @@ pub(crate) async fn system_ssh_execute(
                 exit_code,
                 duration.as_millis()
             );
+            ensure_ssh_deadline(Some(deadline))?;
             Ok(CommandResult {
                 exit_code,
                 stdout,
@@ -1771,6 +1884,46 @@ fn same_ssh_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
         && left.user == right.user
         && left.identity_file == right.identity_file
         && declared_os(&left.tags) == declared_os(&right.tags)
+}
+
+fn ensure_ssh_deadline(deadline: Option<Instant>) -> Result<()> {
+    anyhow::ensure!(
+        deadline.is_none_or(|deadline| Instant::now() < deadline),
+        "SSH control operation timed out: deadline exceeded"
+    );
+    Ok(())
+}
+
+fn bounded_ssh_deadline(deadline: Instant) -> Result<Instant> {
+    let maximum = Instant::now()
+        .checked_add(crate::timing::MAX_CONTROL_TIMEOUT)
+        .context("SSH control deadline exceeds the supported clock range")?;
+    Ok(deadline.min(maximum))
+}
+
+async fn ssh_operation_before<T>(
+    deadline: Option<Instant>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(deadline) = deadline else {
+        return operation.await;
+    };
+    ensure_ssh_deadline(Some(deadline))?;
+    let result = tokio::time::timeout_at(deadline, operation)
+        .await
+        .context("SSH control operation timed out: deadline exceeded")?;
+    // Tokio polls an inner future before its timer. A ready result observed
+    // at expiry is not timely connection or command evidence.
+    ensure_ssh_deadline(Some(deadline))?;
+    result
+}
+
+fn pool_liveness_probe_timeout(
+    scale: crate::timing::TimingScale,
+    command_timeout: Option<Duration>,
+) -> Duration {
+    let timeout = scale.duration(POOL_LIVENESS_PROBE_TIMEOUT);
+    command_timeout.map_or(timeout, |command_timeout| timeout.min(command_timeout))
 }
 
 #[derive(Clone)]
@@ -1861,84 +2014,149 @@ impl SshPool {
     /// stalled remote transport. Probe before reuse and reconnect once under
     /// the per-worker write lock if the transport no longer answers.
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
-        self.get_or_connect_probing_within(config, POOL_LIVENESS_PROBE_TIMEOUT)
+        let probe_timeout = pool_liveness_probe_timeout(crate::timing::configured(), None);
+        self.get_or_connect_probing_within(config, probe_timeout, None)
             .await
     }
 
-    /// [`get_or_connect`](Self::get_or_connect) with the liveness probe bounded
-    /// by `probe_timeout`.
-    ///
-    /// The probe used to run under the client's command timeout (300s for the
-    /// daemon's pools), and a failed probe is followed by a reconnect and a
-    /// second probe. A worker whose master was up but whose commands hung (fork
-    /// exhaustion, D-state) therefore held a caller with a 10-15s budget (health
-    /// probe, toolchain preflight during selection) for ~10 minutes, and the
-    /// sequential health loop stalled the whole fleet's state behind it.
+    /// Borrow a verified connection within a control caller's original budget.
+    /// Queued admission, cache and client locks cannot restart this deadline.
+    pub async fn get_or_connect_until(
+        &self,
+        config: &WorkerConfig,
+        deadline: Instant,
+    ) -> Result<Arc<RwLock<SshClient>>> {
+        let deadline = bounded_ssh_deadline(deadline)?;
+        let probe_timeout = pool_liveness_probe_timeout(crate::timing::configured(), None);
+        self.get_or_connect_probing_within(config, probe_timeout, Some(deadline))
+            .await
+    }
+
+    async fn worker_control_before(
+        &self,
+        worker_id: &WorkerId,
+        deadline: Option<Instant>,
+    ) -> Result<Arc<PoolWorkerControl>> {
+        ensure_ssh_deadline(deadline)?;
+        {
+            let controls = self.controls.read().await;
+            ensure_ssh_deadline(deadline)?;
+            if let Some(control) = controls.get(worker_id) {
+                return Ok(control.clone());
+            }
+        }
+        let mut controls = self.controls.write().await;
+        ensure_ssh_deadline(deadline)?;
+        Ok(controls
+            .entry(worker_id.clone())
+            .or_insert_with(|| Arc::new(PoolWorkerControl::new()))
+            .clone())
+    }
+
+    /// Keep the per-probe allowance separate from the total operation deadline.
+    /// Both are already effective; internal calls must not scale them again.
     async fn get_or_connect_probing_within(
         &self,
         config: &WorkerConfig,
         probe_timeout: Duration,
+        deadline: Option<Instant>,
     ) -> Result<Arc<RwLock<SshClient>>> {
-        let admission = self.worker_control(&config.id).await.admission();
-        tokio::select! {
-            biased;
-            () = admission.revoked() => {
-                anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
-            }
-            result = self.get_or_connect_admitted(config, probe_timeout) => result,
-        }
+        ssh_operation_before(deadline, async {
+            let admission = self
+                .worker_control_before(&config.id, deadline)
+                .await?
+                .admission();
+            ensure_ssh_deadline(deadline)?;
+            let result = tokio::select! {
+                biased;
+                () = admission.clone().revoked() => {
+                    anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
+                }
+                result = self.get_or_connect_admitted(config, probe_timeout, deadline) => result,
+            };
+            anyhow::ensure!(
+                admission.is_current(),
+                "SSH worker {} pool admission was revoked",
+                config.id
+            );
+            result
+        })
+        .await
     }
 
     async fn get_or_connect_admitted(
         &self,
         config: &WorkerConfig,
         probe_timeout: Duration,
+        deadline: Option<Instant>,
     ) -> Result<Arc<RwLock<SshClient>>> {
-        let shared_client = self.get_or_create_client_entry(config).await;
+        let shared_client = self
+            .get_or_create_client_entry_before(config, deadline)
+            .await?;
 
-        // Fast path: reuse only a session that is both present AND verified live.
-        // The probe needs `&self` only (health_check → execute), so it runs under
-        // a shared read lock and never blocks other borrowers of this worker.
+        // Reuse only a session verified live in this operation. Check after
+        // every queued client lock and observation before starting more I/O.
         let reusable = {
             let guard = shared_client.read().await;
-            guard.is_connected()
+            ensure_ssh_deadline(deadline)?;
+            let reusable = guard.is_connected()
                 && guard
-                    .health_check_with_timeout(probe_timeout)
+                    .health_check_before(probe_timeout, deadline)
                     .await
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+            ensure_ssh_deadline(deadline)?;
+            reusable
         };
         if reusable {
             debug!("Reusing live connection to {}", config.id);
             return Ok(shared_client);
         }
 
-        // Slow path: (re)connect under the per-worker write lock. Re-evaluate the
-        // state here because another task may have connected/reconnected while we
-        // waited for the lock, and to distinguish "never connected" (connect)
-        // from "session exists but the master is dead" (reconnect).
+        // Re-evaluate under the write lock: another borrower may have
+        // connected while we waited. A failed probe still requires reconnect;
+        // timing scale never substitutes for verified transport liveness.
         let mut client_guard = shared_client.write().await;
+        ensure_ssh_deadline(deadline)?;
         if !client_guard.is_connected() {
-            client_guard.connect().await?;
-        } else if !client_guard
-            .health_check_with_timeout(probe_timeout)
-            .await
-            .unwrap_or(false)
-        {
-            warn!(
-                "Pooled SSH connection to {} failed liveness probe; reconnecting",
-                config.id
-            );
-            client_guard.reconnect().await?;
+            client_guard
+                .connect_using_before(Path::new("ssh"), None, deadline)
+                .await?;
+        } else {
+            let live = client_guard
+                .health_check_before(probe_timeout, deadline)
+                .await
+                .unwrap_or(false);
+            ensure_ssh_deadline(deadline)?;
+            if !live {
+                warn!(
+                    "Pooled SSH connection to {} failed liveness probe; reconnecting",
+                    config.id
+                );
+                client_guard.reconnect_before(deadline).await?;
+            }
         }
-        // Drop write lock before returning
+        ensure_ssh_deadline(deadline)?;
         drop(client_guard);
-
         Ok(shared_client)
     }
 
+    #[cfg(test)]
     async fn get_or_create_client_entry(&self, config: &WorkerConfig) -> Arc<RwLock<SshClient>> {
+        self.get_or_create_client_entry_before(config, None)
+            .await
+            .expect("a lookup without a caller deadline cannot expire")
+    }
+
+    async fn get_or_create_client_entry_before(
+        &self,
+        config: &WorkerConfig,
+        deadline: Option<Instant>,
+    ) -> Result<Arc<RwLock<SshClient>>> {
         let worker_id = config.id.clone();
-        let admission = self.worker_control(&worker_id).await.admission();
+        let admission = self
+            .worker_control_before(&worker_id, deadline)
+            .await?
+            .admission();
 
         let new_client = || {
             let mut client =
@@ -1948,14 +2166,16 @@ impl SshPool {
         };
 
         loop {
+            ensure_ssh_deadline(deadline)?;
             if !admission.is_current() {
                 // A disable/enable may have raced an entry-map lock. Never
                 // replace a newer generation's entry with a revoked client.
                 // Public callers' admission guards reject this detached one.
-                return new_client();
+                return Ok(new_client());
             }
             let existing_entry = {
                 let connections = self.connections.read().await;
+                ensure_ssh_deadline(deadline)?;
                 connections.get(&worker_id).cloned()
             };
 
@@ -1963,12 +2183,13 @@ impl SshPool {
                 if same_ssh_endpoint(&entry.config, config)
                     && entry.generation == admission.generation
                 {
-                    return entry.client;
+                    return Ok(entry.client);
                 }
 
                 let replacement = new_client();
                 let replaced = {
                     let mut connections = self.connections.write().await;
+                    ensure_ssh_deadline(deadline)?;
                     if admission.is_current()
                         && connections
                             .get(&worker_id)
@@ -1993,7 +2214,7 @@ impl SshPool {
                         "Replaced SSH connection entry for {} after endpoint config changed",
                         worker_id
                     );
-                    return replacement;
+                    return Ok(replacement);
                 }
 
                 continue;
@@ -2002,6 +2223,7 @@ impl SshPool {
             let new_client = new_client();
             let inserted = {
                 let mut connections = self.connections.write().await;
+                ensure_ssh_deadline(deadline)?;
                 if !admission.is_current() || connections.contains_key(&worker_id) {
                     false
                 } else {
@@ -2018,7 +2240,7 @@ impl SshPool {
             };
 
             if inserted {
-                return new_client;
+                return Ok(new_client);
             }
         }
     }
@@ -2085,25 +2307,66 @@ impl SshPool {
         command: &str,
         command_timeout: Duration,
     ) -> Result<CommandResult> {
-        let admission = self.worker_control(&config.id).await.admission();
-        tokio::select! {
-            biased;
-            () = admission.revoked() => {
-                anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
-            }
-            result = async {
-                let client = self
-                    .get_or_connect_probing_within(
-                        config,
-                        command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT),
-                    )
-                    .await?;
-                // The admission above also covers waiting for this lock, so
-                // a queued command cannot survive disable followed by enable.
-                let guard = client.read().await;
-                guard.execute_with_timeout(command, command_timeout).await
-            } => result,
-        }
+        self.run_with_timeout_before(config, command, command_timeout, None)
+            .await
+    }
+
+    /// Run one control command within the caller's original response deadline.
+    /// Admission, liveness, reconnect, queued client locks and execution share
+    /// this deadline; per-command timeouts are supplied already scaled.
+    pub async fn run_with_timeout_until(
+        &self,
+        config: &WorkerConfig,
+        command: &str,
+        command_timeout: Duration,
+        deadline: Instant,
+    ) -> Result<CommandResult> {
+        let deadline = bounded_ssh_deadline(deadline)?;
+        self.run_with_timeout_before(config, command, command_timeout, Some(deadline))
+            .await
+    }
+
+    async fn run_with_timeout_before(
+        &self,
+        config: &WorkerConfig,
+        command: &str,
+        command_timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<CommandResult> {
+        let probe_timeout =
+            pool_liveness_probe_timeout(crate::timing::configured(), Some(command_timeout));
+        ssh_operation_before(deadline, async {
+            let admission = self
+                .worker_control_before(&config.id, deadline)
+                .await?
+                .admission();
+            ensure_ssh_deadline(deadline)?;
+            let result = tokio::select! {
+                biased;
+                () = admission.clone().revoked() => {
+                    anyhow::bail!("SSH worker {} is disabled or its pool admission was revoked", config.id)
+                }
+                result = async {
+                    let client = self
+                        .get_or_connect_probing_within(config, probe_timeout, deadline)
+                        .await?;
+                    // Keep the original admission guard through this queued
+                    // read, and refuse a late ready lock before command spawn.
+                    let guard = client.read().await;
+                    ensure_ssh_deadline(deadline)?;
+                    guard
+                        .execute_with_timeout_before(command, command_timeout, deadline)
+                        .await
+                } => result,
+            };
+            anyhow::ensure!(
+                admission.is_current(),
+                "SSH worker {} pool admission was revoked",
+                config.id
+            );
+            result
+        })
+        .await
     }
 }
 
@@ -2230,6 +2493,180 @@ mod tests {
             "ubuntu",
             "~/.ssh/other_key",
         )));
+    }
+
+    #[test]
+    fn pool_reuse_probe_scales_once_and_respects_effective_command_allowance() {
+        for (scale, seconds) in [(1.0, 10), (1.5, 15), (2.0, 20), (10.0, 100)] {
+            let scale = crate::timing::TimingScale::try_from(scale).unwrap();
+            let expected = Duration::from_secs(seconds);
+            assert_eq!(pool_liveness_probe_timeout(scale, None), expected);
+            assert_eq!(
+                pool_liveness_probe_timeout(scale, Some(Duration::MAX)),
+                expected
+            );
+            assert_eq!(
+                pool_liveness_probe_timeout(scale, Some(Duration::from_secs(7))),
+                Duration::from_secs(7),
+                "an already-effective shorter command allowance is not scaled again"
+            );
+        }
+        assert_eq!(
+            pool_liveness_probe_timeout(
+                crate::timing::TimingScale::try_from(10.0).unwrap(),
+                Some(Duration::from_secs(25)),
+            ),
+            Duration::from_secs(25),
+            "a loaded mux must not retain the former fixed ten-second limit"
+        );
+    }
+
+    async fn assert_ssh_operation_pending<F: std::future::Future>(
+        mut operation: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_pool_borrows_do_not_create_entries_after_queued_admission() {
+        for run_command in [false, true] {
+            for block_controls in [false, true] {
+                for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                    let pool = SshPool::default();
+                    let config = worker_config("queued", "unreachable.invalid", "builder", "");
+                    let controls = if block_controls {
+                        Some(pool.controls.write().await)
+                    } else {
+                        None
+                    };
+                    let connections = if block_controls {
+                        None
+                    } else {
+                        Some(pool.connections.write().await)
+                    };
+                    let budget = Duration::from_secs(2);
+                    let deadline = Instant::now() + budget;
+                    let operation = async {
+                        if run_command {
+                            pool.run_with_timeout_until(
+                                &config,
+                                "echo must-not-run",
+                                Duration::MAX,
+                                deadline,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            pool.get_or_connect_until(&config, deadline).await.map(|_| ())
+                        }
+                    };
+                    tokio::pin!(operation);
+                    assert_ssh_operation_pending(operation.as_mut()).await;
+                    tokio::time::advance(budget + lateness).await;
+                    drop(controls);
+                    drop(connections);
+                    let error = operation.await.unwrap_err();
+                    assert!(format!("{error:#}").contains("deadline exceeded"), "{error:#}");
+                    assert!(is_retryable_transport_error(&error));
+                    assert!(pool.connections.read().await.is_empty());
+                    if block_controls {
+                        assert!(
+                            pool.controls.read().await.is_empty(),
+                            "expired admission must not mutate the control cache"
+                        );
+                    }
+                    let entry = pool.get_or_create_client_entry(&config).await;
+                    assert!(!entry.read().await.is_connected());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_pool_retarget_does_not_replace_old_entry_after_cache_write_wait() {
+        for run_command in [false, true] {
+            let pool = SshPool::default();
+            let old_config = worker_config("retarget", "old.invalid", "builder", "");
+            let new_config = worker_config("retarget", "new.invalid", "builder", "");
+            let old = pool.get_or_create_client_entry(&old_config).await;
+            // Readers may inspect the old entry, but replacing it must queue.
+            let cache = pool.connections.read().await;
+            let budget = Duration::from_secs(2);
+            let deadline = Instant::now() + budget;
+            let operation = async {
+                if run_command {
+                    pool.run_with_timeout_until(
+                        &new_config,
+                        "echo must-not-run",
+                        Duration::from_secs(30),
+                        deadline,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    pool.get_or_connect_until(&new_config, deadline).await.map(|_| ())
+                }
+            };
+            tokio::pin!(operation);
+            assert_ssh_operation_pending(operation.as_mut()).await;
+            tokio::time::advance(budget).await;
+            drop(cache);
+            assert!(operation.await.is_err());
+            assert!(Arc::ptr_eq(
+                &pool.connections.read().await.get(&old_config.id).unwrap().client,
+                &old,
+            ));
+            let fresh = pool
+                .get_or_create_client_entry_before(
+                    &new_config,
+                    Some(Instant::now() + Duration::from_secs(1)),
+                )
+                .await
+                .unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ssh_control_deadline_rejects_late_ready_results_and_caps_extreme_allowances() {
+        let now = Instant::now();
+        assert_eq!(
+            bounded_ssh_deadline(now + Duration::from_secs(7200)).unwrap(),
+            now + crate::timing::MAX_CONTROL_TIMEOUT,
+        );
+        assert_eq!(bounded_ssh_deadline(now).unwrap(), now);
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let (ready, release) = tokio::sync::oneshot::channel::<()>();
+            let budget = Duration::from_secs(2);
+            let operation = ssh_operation_before(Some(Instant::now() + budget), async {
+                release.await.unwrap();
+                Ok(())
+            });
+            tokio::pin!(operation);
+            assert_ssh_operation_pending(operation.as_mut()).await;
+            tokio::time::advance(budget + lateness).await;
+            ready.send(()).unwrap();
+            let error = operation.await.unwrap_err();
+            assert!(is_retryable_transport_error(&error));
+        }
+
+        let mut client = SshClient::new(
+            worker_config("expired", "unreachable.invalid", "builder", ""),
+            SshOptions::default(),
+        );
+        let error = client.connect_until(Instant::now()).await.unwrap_err();
+        assert!(is_connection_error(&error));
+        assert!(is_retryable_transport_error(&error));
+        assert!(!client.is_connected());
+        let error = client
+            .execute_with_timeout_until("echo must-not-run", Duration::MAX, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(is_retryable_transport_error(&error));
     }
 
     #[tokio::test]
@@ -3276,6 +3713,9 @@ fi
 printf '%s\n' "$$" >> "$root/master-pids"
 case "$mode" in
     ready|old-client|probe-stall|probe-reject) : > "$socket" ;;
+    readiness-barrier)
+        while [ ! -f "$root/release-ready" ]; do sleep 0.1 || exit 1; done
+        : > "$socket" ;;
     fail) printf 'Permission denied (publickey).\n' > "$log"; exit 255 ;;
     refused) printf 'ssh: connect to host worker port 22: Connection refused\n' > "$log"; exit 255 ;;
     vpn-down) printf 'ssh: connect to host worker port 22: Network is unreachable\n' > "$log"; exit 255 ;;
@@ -3464,6 +3904,31 @@ exec sleep 30
     }
 
     #[tokio::test]
+    async fn external_transport_without_idle_timer_is_reaped_on_dispatch_drop() {
+        // Clients can own a connection without an idle timer. Dropping either
+        // the client or its active-use guard must still stop and reap it;
+        // cleanup cannot depend on a later idle expiration.
+        for owner_first in [false, true] {
+            let fake = FakeSsh::new("ready");
+            let mut client = fake.client(Duration::from_secs(3), true);
+            assert!(client.options.control_persist_idle.is_none());
+            fake.connect(&mut client).await.unwrap();
+            let transport = client.external_transport().unwrap();
+            assert!(transport.arguments().is_ok());
+            if owner_first {
+                drop(client);
+                assert!(transport.arguments().is_err());
+                drop(transport);
+            } else {
+                drop(transport);
+                assert!(client.external_transport().is_err());
+                drop(client);
+            }
+            fake.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
     async fn external_transport_holds_activity_until_explicit_completion() {
         let fake = FakeSsh::new("ready");
         let mut client = fake.client(Duration::from_secs(3), true);
@@ -3615,6 +4080,42 @@ exec sleep 30
             assert_eq!(output.status.code(), Some(255), "{output:?}");
             assert!(output.stdout.is_empty(), "{output:?}");
             assert_eq!(marker.exists(), !guarded, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_master_rounds_fractional_connection_budgets_up() {
+        let fake = FakeSsh::new("ready");
+        let fractional = crate::timing::TimingScale::try_from(2.5).unwrap();
+        let fine = crate::timing::TimingScale::try_from(1.001).unwrap();
+        let maximum = crate::timing::TimingScale::try_from(10.0).unwrap();
+        for (budget, expected_seconds) in [
+            (Duration::ZERO, 1),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_secs(5), 5),
+            (fractional.duration(Duration::from_secs(5)), 13),
+            (fine.duration(Duration::from_secs(10)), 11),
+            (maximum.duration(Duration::from_secs(10)), 100),
+        ] {
+            let client = fake.client(budget, true);
+            let command = client.master_command(
+                &fake.program,
+                "builder@worker",
+                Path::new("/private/control/master"),
+                Path::new("/private/control/log"),
+                true,
+            );
+            let connect_arguments: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .filter(|argument| argument.starts_with("ConnectTimeout="))
+                .collect();
+            assert_eq!(
+                connect_arguments,
+                vec![format!("ConnectTimeout={expected_seconds}")],
+                "budget={budget:?}"
+            );
         }
     }
 
@@ -4081,6 +4582,78 @@ exit 37
     }
 
     #[tokio::test]
+    async fn scaled_connection_budget_admits_high_latency_readiness_without_retry() {
+        let default_scale = crate::timing::TimingScale::default();
+        let enlarged_scale = crate::timing::TimingScale::try_from(2.0).unwrap();
+        let baseline = SshOptions::default().connect_timeout;
+        let default_budget = default_scale.duration(baseline);
+        let enlarged_budget = enlarged_scale.duration(baseline);
+        let readiness_delay = baseline + Duration::from_secs(2);
+        let default_ssh = FakeSsh::new("readiness-barrier");
+        let enlarged_ssh = FakeSsh::new("readiness-barrier");
+        let mut default_client = default_ssh.client(default_budget, true);
+        let mut enlarged_client = enlarged_ssh.client(enlarged_budget, true);
+        let started = Instant::now();
+
+        // Both real masters start before the same latency interval. The
+        // default ten-second budget expires while authentication is held;
+        // scale two leaves several seconds for the actual readiness probe.
+        // Concurrent clients keep this test to one twelve-second delay.
+        let (default_result, enlarged_result, ()) =
+            tokio::time::timeout(enlarged_budget + Duration::from_secs(5), async {
+                tokio::join!(
+                    default_ssh.connect(&mut default_client),
+                    enlarged_ssh.connect(&mut enlarged_client),
+                    async {
+                        tokio::join!(
+                            default_ssh.wait_for_pid("master-pids"),
+                            enlarged_ssh.wait_for_pid("master-pids"),
+                        );
+                        tokio::time::sleep(readiness_delay).await;
+                        std::fs::write(
+                            default_ssh.directory.path().join("release-ready"),
+                            b"ready\n",
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            enlarged_ssh.directory.path().join("release-ready"),
+                            b"ready\n",
+                        )
+                        .unwrap();
+                    },
+                )
+            })
+            .await
+            .expect("both connection attempts must remain bounded");
+
+        let error = default_result.expect_err("the unscaled budget must expire before readiness");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(!default_client.is_connected());
+        enlarged_result.expect("the enlarged budget must admit the same delayed readiness");
+        assert!(enlarged_client.is_connected());
+        assert!(started.elapsed() >= readiness_delay);
+        assert!(
+            default_ssh.pids("check-pids").is_empty(),
+            "an expired authentication attempt must not probe a late socket"
+        );
+        assert_eq!(enlarged_ssh.pids("check-pids").len(), 1);
+        for ssh in [&default_ssh, &enlarged_ssh] {
+            assert_eq!(ssh.pids("capability-pids").len(), 1);
+            assert_eq!(
+                ssh.pids("master-pids").len(),
+                1,
+                "scaling must not introduce a fallback connection or replay"
+            );
+        }
+
+        enlarged_client.disconnect().await.unwrap();
+        assert!(!enlarged_client.is_connected());
+        drop(default_client);
+        drop(enlarged_client);
+        tokio::join!(default_ssh.assert_reaped(), enlarged_ssh.assert_reaped());
+    }
+
+    #[tokio::test]
     async fn stalled_readiness_probe_shares_deadline_and_is_reaped() {
         let fake = FakeSsh::new("probe-stall");
         let mut client = fake.client(Duration::from_millis(200), true);
@@ -4143,6 +4716,70 @@ exit 37
     }
 
     #[tokio::test]
+    async fn expired_queued_pool_borrows_leave_a_healthy_master_untouched() {
+        for run_command in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let fake = FakeSsh::new("ready");
+                let config = fake.client(Duration::from_secs(3), true).config;
+                let pool = SshPool::new(SshOptions {
+                    control_master: true,
+                    ..SshOptions::default()
+                });
+                let entry = pool.get_or_create_client_entry(&config).await;
+                fake.connect(&mut *entry.write().await).await.unwrap();
+                let state = entry
+                    .read()
+                    .await
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .process
+                    .state
+                    .clone();
+                let blocked = entry.write().await;
+                // Establish the real stand-in first, then pause only the
+                // queued borrow. OS process startup must not race virtual time.
+                tokio::time::pause();
+                let budget = Duration::from_secs(2);
+                let deadline = Instant::now() + budget;
+                let operation = async {
+                    if run_command {
+                        pool.run_with_timeout_until(
+                            &config,
+                            "echo must-not-run",
+                            Duration::from_secs(30),
+                            deadline,
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        pool.get_or_connect_until(&config, deadline).await.map(|_| ())
+                    }
+                };
+                tokio::pin!(operation);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(budget + lateness).await;
+                drop(blocked);
+                let result = operation.await;
+                tokio::time::resume();
+                assert!(result.is_err());
+                assert!(entry.read().await.is_connected());
+                assert!(!state.borrow().draining);
+                assert_eq!(state.borrow().active_commands, 0);
+                assert_eq!(fake.pids("master-pids").len(), 1);
+                assert_eq!(fake.pids("check-pids").len(), 1);
+                pool.close(&config.id).await.unwrap();
+                drop(entry);
+                fake.assert_reaped().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pool_disable_cancels_authentication_and_queued_borrows() {
         let fake = FakeSsh::new("auth-stall");
         let config = fake.client(Duration::from_secs(30), true).config;
@@ -4165,12 +4802,22 @@ exit 37
         fake.wait_for_pid("master-pids").await;
 
         let mut queued = tokio::task::JoinSet::new();
-        for _ in 0..16 {
+        for index in 0..16 {
             let pool = pool.clone();
             let config = config.clone();
             queued.spawn(async move {
-                pool.run_with_timeout(&config, "echo ok", Duration::from_secs(30))
+                if index % 2 == 0 {
+                    pool.run_with_timeout(&config, "echo ok", Duration::from_secs(30))
+                        .await
+                } else {
+                    pool.run_with_timeout_until(
+                        &config,
+                        "echo ok",
+                        Duration::from_secs(30),
+                        Instant::now() + Duration::from_secs(30),
+                    )
                     .await
+                }
             });
         }
         // Let the callers reach the per-worker client lock held by the

@@ -253,6 +253,9 @@ pub enum ReplayRefusal {
     /// A workspace result's committed producer closure is unavailable or has
     /// been revoked. This is not permission to reuse the consumer's old bytes.
     CommittedDependency(String),
+    /// One of the result's Rust archives has no current, digest-bound proof
+    /// that its packed native payloads contain no deferred external inputs.
+    NativeArchive(String),
 }
 
 /// The answer to a serve request that is not a fault.
@@ -468,19 +471,30 @@ fn resolve_destination(root: &Path, virtual_path: &[u8]) -> Option<PathBuf> {
 // an action key has one semantic class, independent of attempts and restarts.
 const LIVE_CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
 const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
-const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v1";
-const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v1";
-const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v1";
-const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v1";
-const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v1";
-const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v1";
+// V2 qualifies the selected, independently isolated compiler action even when
+// other units in its Cargo operation can execute project code. Earlier graph-
+// restricted class receipts do not enroll these revised descriptor profiles.
+// Local completion remains untrusted for the entire operation.
+const LIVE_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
+const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
+// Generated-input leaves bind their own complete OUT_DIR and Cargo output
+// record. They earn independent evidence without retiring existing pure keys.
+const LIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
+const LIVE_GENERATED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
+const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
+const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
+const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
+const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v2";
 const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
-const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v1";
-const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v1";
+const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
+const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
+const LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
+const LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
+    "rustc-workspace-generated-dag-metadata-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
-    "rustc-workspace-terminal-leaf-metadata-v1";
-const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v1";
+    "rustc-workspace-terminal-leaf-metadata-v2";
+const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -503,6 +517,7 @@ fn record_descriptor_class(
 ) -> Result<(), StoreError> {
     use rabs_key::live_dependency::workspace_cache::{
         ClosedWorkspaceLibraryClass, closed_workspace_library_descriptor_class,
+        uses_closed_workspace_library_namespace,
     };
     use rabs_key::live_dependency::workspace_dependency_cache::{
         CommittedDependencyPolicy, committed_dependency_descriptor_policy,
@@ -524,6 +539,12 @@ fn record_descriptor_class(
             CommittedDependencyPolicy::ImmutableDagMetadata => LIVE_IMMUTABLE_DAG_METADATA_CLASS,
             CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
             CommittedDependencyPolicy::WorkspaceDagMetadata => LIVE_WORKSPACE_DAG_METADATA_CLASS,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+                LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
             }
@@ -531,18 +552,27 @@ fn record_descriptor_class(
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
             }
         }
-    } else if uses_committed_dependency_namespace(descriptor) {
+    } else if let Some(class) = closed_workspace_library_descriptor_class(descriptor) {
+        match class {
+            ClosedWorkspaceLibraryClass::Rlib => LIVE_WORKSPACE_RLIB_CLASS,
+            ClosedWorkspaceLibraryClass::Metadata => LIVE_WORKSPACE_METADATA_CLASS,
+            ClosedWorkspaceLibraryClass::GeneratedRlib => LIVE_GENERATED_WORKSPACE_RLIB_CLASS,
+            ClosedWorkspaceLibraryClass::GeneratedMetadata => {
+                LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+            }
+        }
+    } else if uses_committed_dependency_namespace(descriptor)
+        || uses_closed_workspace_library_namespace(descriptor)
+    {
+        // A historical or malformed workspace profile cannot become an
+        // ordinary dependency merely by changing its action-family field.
         LIVE_PRIVATE_CLASS
     } else if descriptor.action_class
         == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
     {
         LIVE_DEPENDENCY_CLASS
     } else {
-        match closed_workspace_library_descriptor_class(descriptor) {
-            Some(ClosedWorkspaceLibraryClass::Rlib) => LIVE_WORKSPACE_RLIB_CLASS,
-            Some(ClosedWorkspaceLibraryClass::Metadata) => LIVE_WORKSPACE_METADATA_CLASS,
-            None => LIVE_PRIVATE_CLASS,
-        }
+        LIVE_PRIVATE_CLASS
     };
     store.record_action_key_provenance(authority, descriptor, class)
 }
@@ -573,6 +603,12 @@ fn recorded_action_risk(
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::ClosedWorkspaceMetadata)
             }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_RLIB_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceMetadata)
+            }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceRlib)
             }
@@ -596,6 +632,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceDagRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
+                Ok(ActionClassRisk::GeneratedWorkspaceDagMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -3958,10 +4000,11 @@ impl CoordLive {
     /// Boot semantics (plan §10.8, V1): fresh incarnation every start and
     /// a durably advanced term. A row left behind by a previous boot of
     /// THIS store belongs to a dead incarnation — we hold the store's
-    /// exclusive mount, which is the local fence — so it is released and
-    /// superseded at `term + 1`. A row from a different cluster is NOT
-    /// superseded: that is a misconfiguration, and it refuses loudly.
-    /// Cross-host election is M6.
+    /// exclusive mount, which is the local fence — so it is atomically
+    /// superseded above the highest retained term. Released rows remain
+    /// fences too, including after an older binary died between release and
+    /// acquisition. Foreign or mixed cluster history is never superseded.
+    /// Cross-host election and operator-reset authority are separate.
     ///
     /// # Errors
     /// A string reason if no store is mounted or the store refuses.
@@ -3969,25 +4012,13 @@ impl CoordLive {
         let cas = self.cas.as_ref().ok_or("no rabs-cas store mounted")?;
         let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
         declare_coordinator_domains(&mut *store);
-        let prior = store
-            .active_authority()
-            .map_err(|e| format!("active authority: {e:?}"))?;
-        let term = match &prior {
-            Some(row) if row.cluster_id != cluster_id => {
-                return Err(format!(
-                    "store is held by cluster {:?} but this coordinator claims {cluster_id:?} — \
-                     refusing to supersede another cluster's authority",
-                    row.cluster_id
-                ));
-            }
-            Some(row) => {
-                store
-                    .release_authority(&row.digest)
-                    .map_err(|e| format!("release prior authority: {e:?}"))?;
-                row.term.saturating_add(1)
-            }
-            None => 1,
-        };
+        let previous_term = store
+            .authority_term_high_water(cluster_id)
+            .map_err(|e| format!("authority history: {e:?}"))?;
+        let term = previous_term
+            .checked_add(1)
+            .filter(|term| i64::try_from(*term).is_ok())
+            .ok_or("coordinator authority term exhausted")?;
         let authority = CoordinatorAuthority {
             cluster_id: ClusterId(cluster_id.to_owned()),
             // Credential rotation (S013) is not wired yet; generation 1
@@ -3998,7 +4029,7 @@ impl CoordLive {
         };
         let digest = authority_digest(&authority);
         store
-            .acquire_authority(&AuthorityRow {
+            .replace_authority_for_boot(&AuthorityRow {
                 digest: digest.clone(),
                 cluster_id: cluster_id.to_owned(),
                 incarnation: u128::from(self.boot_nonce),
@@ -4519,6 +4550,16 @@ impl CoordLive {
                 ReplayRefusal::FreshVerificationRequired,
             ));
         }
+        // Old results can predate native-payload validation, and source-level
+        // link attributes are absent from argv. Require the complete result's
+        // digest-bound proofs before granting even a preview or exposing its
+        // metadata head; archive-tail staging may happen only after the ACK.
+        if let Err(reason) = crate::coord::native_archives::require_manifest(&mut *store, &manifest)
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::NativeArchive(reason),
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -4607,6 +4648,7 @@ impl CoordLive {
         let context = metadata_replay::InstallContext {
             action: action_key,
             manifest_key: &manifest_key,
+            manifest: &manifest,
             authority: replay_authority.as_ref(),
             now_unix_micros,
             now_epoch,
@@ -5562,9 +5604,9 @@ mod tests {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
-            plan_mixed_workspace_library, plan_terminal_workspace_metadata,
-            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
-            remote_committed_workspace_rlib_key,
+            plan_generated_workspace_dag_library, plan_mixed_workspace_library,
+            plan_terminal_workspace_metadata, remote_committed_dependency_key,
+            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
@@ -5575,7 +5617,20 @@ mod tests {
 
         // Exercise the real pure key builder and the production durable receipt
         // writer. Compiler execution is covered by the canonical Cargo fixture.
-        let descriptor = |emit: &str, policy: Option<CommittedDependencyPolicy>| {
+        let descriptor_with_generated = |emit: &str,
+                                         policy: Option<CommittedDependencyPolicy>,
+                                         generated: bool| {
+            assert!(
+                !generated
+                    || policy.is_none()
+                    || matches!(
+                        policy,
+                        Some(
+                            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                                | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                        )
+                    )
+            );
             let terminal = matches!(
                 policy,
                 Some(
@@ -5622,7 +5677,7 @@ mod tests {
                     "--extern=upstream=/__rabs/out/cargo/debug/deps/libupstream.rmeta".into(),
                 );
             }
-            let env = [
+            let mut env = [
                 ("CARGO_MANIFEST_DIR", source_root),
                 ("CARGO_PKG_NAME", "leaf"),
                 ("CARGO_PRIMARY_PACKAGE", "1"),
@@ -5633,6 +5688,12 @@ mod tests {
             .filter(|(name, _)| !immutable || *name != "CARGO_PRIMARY_PACKAGE")
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect::<Vec<_>>();
+            if generated {
+                env.push((
+                    "OUT_DIR".into(),
+                    "/__rabs/out/cargo/debug/build/leaf-generated/out".into(),
+                ));
+            }
             let request = LiveRustcRequest {
                 argv: &argv,
                 env: &env,
@@ -5653,6 +5714,10 @@ mod tests {
                     plan_committed_workspace_metadata(&execution)
                 }
                 Some(
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                ) => plan_generated_workspace_dag_library(&execution),
+                Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                     | CommittedDependencyPolicy::WorkspaceTerminalMetadata,
                 ) => plan_terminal_workspace_metadata(&execution),
@@ -5670,7 +5735,7 @@ mod tests {
             .unwrap();
             let identity =
                 rabs_key::typed_digest::compute("rabs.closed-workspace-class-test.v1", b"fixture");
-            let inputs = ActionInputManifest {
+            let mut inputs = ActionInputManifest {
                 schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
                 inputs: vec![PositiveInput {
                     virtual_path: RawBytes::new(plan.input_virtual_path("src.rs").into_bytes()),
@@ -5689,6 +5754,21 @@ mod tests {
                 },
                 ..ActionInputManifest::default()
             };
+            if generated {
+                inputs.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("config.rs").into_bytes(),
+                    ),
+                    object: ObjectId(identity.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: vec![],
+                });
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: vec![RawBytes::from("config.rs")],
+                });
+            }
             let toolchain = ToolchainFacts {
                 compiler_binary_digest: identity.clone(),
                 verbose_version: "rustc 1.100.0\nhost: x86_64-unknown-linux-gnu\nLLVM version: 21"
@@ -5773,7 +5853,7 @@ mod tests {
                     &directories,
                     &dependencies,
                     &inputs,
-                    None,
+                    generated.then_some(b"".as_slice()),
                     "/__rabs/toolchain",
                     &[39; 32],
                     &runtime,
@@ -5783,7 +5863,7 @@ mod tests {
                     &toolchain,
                     &[],
                     &inputs,
-                    None,
+                    generated.then_some(b"".as_slice()),
                     "/__rabs/toolchain",
                     &[39; 32],
                     &runtime,
@@ -5792,6 +5872,7 @@ mod tests {
             .unwrap()
             .descriptor
         };
+        let descriptor = |emit, policy| descriptor_with_generated(emit, policy, false);
         let descriptors = [
             (
                 descriptor("--emit=dep-info,metadata,link", None),
@@ -5800,6 +5881,14 @@ mod tests {
             (
                 descriptor("--emit=dep-info,metadata", None),
                 ActionClassRisk::ClosedWorkspaceMetadata,
+            ),
+            (
+                descriptor_with_generated("--emit=dep-info,metadata,link", None, true),
+                ActionClassRisk::GeneratedWorkspaceRlib,
+            ),
+            (
+                descriptor_with_generated("--emit=dep-info,metadata", None, true),
+                ActionClassRisk::GeneratedWorkspaceMetadata,
             ),
             (
                 descriptor(
@@ -5858,6 +5947,22 @@ mod tests {
                 ActionClassRisk::WorkspaceDagMetadata,
             ),
             (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceDagRlib),
+                    true,
+                ),
+                ActionClassRisk::GeneratedWorkspaceDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata),
+                    true,
+                ),
+                ActionClassRisk::GeneratedWorkspaceDagMetadata,
+            ),
+            (
                 descriptor(
                     "--emit=dep-info,metadata",
                     Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata),
@@ -5872,12 +5977,10 @@ mod tests {
                 ActionClassRisk::WorkspaceTerminalMetadata,
             ),
         ];
-        assert_eq!(descriptors[2].0.key_epoch, 6);
-        assert_eq!(descriptors[3].0.key_epoch, 7);
-        assert_eq!(descriptors[4].0.key_epoch, 8);
-        assert_eq!(descriptors[5].0.key_epoch, 9);
-        for (index, (descriptor, _)) in descriptors[6..].iter().enumerate() {
-            assert_eq!(descriptor.key_epoch, 10 + u32::try_from(index).unwrap());
+        for ((descriptor, _), expected_epoch) in descriptors.iter().zip([
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 24, 25,
+        ]) {
+            assert_eq!(descriptor.key_epoch, expected_epoch);
         }
         for (index, (descriptor, _)) in descriptors.iter().enumerate() {
             for (other, _) in &descriptors[index + 1..] {
@@ -5894,11 +5997,20 @@ mod tests {
             let mut store = coord.live_cas().unwrap().store().lock().unwrap();
             for (descriptor, _) in &descriptors {
                 record_descriptor_class(&mut *store, &authority, descriptor).unwrap();
-                let dag = (10..=15).contains(&descriptor.key_epoch);
-                for mutation in 0..if dag { 6 } else { 4 } {
+                let typed_provenance = !matches!(descriptor.key_epoch, 16 | 17);
+                for mutation in [0, 1, 2, 3, 5]
+                    .into_iter()
+                    .chain(typed_provenance.then_some(4))
+                {
                     let mut changed = descriptor.clone();
                     match mutation {
-                        0 => changed.key_epoch = if dag { 1 } else { changed.key_epoch + 1 },
+                        0 => {
+                            changed.key_epoch = if typed_provenance {
+                                1
+                            } else {
+                                changed.key_epoch + 1
+                            }
+                        }
                         1 => changed.projection_epoch += 1,
                         2 => changed.sandbox_semantic_policy.bytes[0] ^= 1,
                         3 => changed.execution_semantics.bytes[0] ^= 1,
@@ -5936,6 +6048,50 @@ mod tests {
             assert_eq!(
                 recorded_action_risk(&mut *store, &key).unwrap(),
                 ActionClassRisk::Elevated
+            );
+        }
+    }
+
+    #[test]
+    fn executor_free_workspace_receipts_cannot_enroll_action_scoped_workspace_classes() {
+        let (state, coord) = submission_coordinator();
+        let old_classes = [
+            "rustc-workspace-closed-rlib-v1",
+            "rustc-workspace-closed-metadata-v1",
+            "rustc-workspace-committed-rlib-v1",
+            "rustc-workspace-committed-metadata-v1",
+            "rustc-workspace-committed-mixed-rlib-v1",
+            "rustc-workspace-committed-mixed-metadata-v1",
+            "rustc-workspace-committed-dag-rlib-v1",
+            "rustc-workspace-committed-dag-metadata-v1",
+            "rustc-workspace-terminal-leaf-metadata-v1",
+            "rustc-workspace-terminal-metadata-v1",
+        ];
+        let mut actions = Vec::new();
+        {
+            let mut store = coord.live_cas().unwrap().store().lock().unwrap();
+            for class in old_classes {
+                let action = rabs_key::typed_digest::compute(DOMAIN_ACTION_KEY, class.as_bytes());
+                store
+                    .record_decision_receipt(
+                        LIVE_CLASS_RECEIPT,
+                        &digest_key(&action),
+                        0,
+                        class,
+                        "retained prior workspace class enrollment",
+                    )
+                    .unwrap();
+                actions.push(action);
+            }
+        }
+        drop(coord);
+        let reopened = mount_and_reconcile(state.path()).unwrap();
+        let mut store = reopened.store().lock().unwrap();
+        for action in actions {
+            assert_eq!(
+                recorded_action_risk(&mut *store, &action).unwrap(),
+                ActionClassRisk::Elevated,
+                "old class evidence cannot authorize the expanded remote workspace profile"
             );
         }
     }

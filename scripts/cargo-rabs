@@ -67,8 +67,26 @@ unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
   --rabs-remote          Dispatch through RCH with worker-local RABS enabled.
   --rabs-canonical FILE  Build, check, lint, test, run or bench on a canonical worker.
   --rabs-canonical-local FILE  Build, check, lint, test, run or bench in the local canonical namespace.
+  --rabs-canonical-remote FILE  Submit captured Cargo inputs to a shared pinned-TLS coordinator.
   --rabs-recover DIR     Recover a retained canonical operation; never execute it again.
   --help                Show this help without starting a daemon or Cargo.
+
+Remote canonical mode: cargo rabs --rabs-canonical-remote PROFILE.json -- check --workspace
+It captures the client's explicit source and toolchain, runs Cargo at the shared
+coordinator and receives verified results through the existing native remote
+service. The profile version is canonical-compile-remote-v1. Supply coordinator,
+server_name, coordinator_pin, tls, source_root, staging_root, toolchain_root (or
+toolchain: "rustup"), and output_root for fresh per-invocation destinations.
+A one-off output_destination may replace output_root and must not already exist.
+The optional settings object carries manifest, jobs, timeout_seconds, env and
+source-selection inputs. Cargo arguments replace settings.command and selection;
+with no command the launcher selects ordinary check. Build, check, Clippy, Doc,
+Test and bench --no-run use the existing canonical selectors. Run and executing
+Bench require inherited stdin and are unsupported by the remote service.
+Each invocation retains its exact private native profile beneath staging_root
+and execs rabsd --canonical-compile-remote once. It never falls back or retries.
+The native client reports any installed target path after its final receipt.
+See docs/rabs-canonical-cargo.md for enrollment, output and interruption rules.
 
 Local canonical mode: cargo rabs --rabs-canonical-local PROFILE.json -- check --workspace
 It runs the captured nightly Cargo and rustc through rabsd's operation-owned
@@ -272,6 +290,8 @@ combine with remote/canonical mode. CARGO_RABS_ROOT_HELPER selects an explicit
 helper executable. See docs/rabs-cargo-root.md for setup and crash quarantine.
 
 New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
+New daemons also keep temporary staging under that private startup directory,
+so retiring a build's TMPDIR does not break later replay. Cargo keeps its TMPDIR.
 Daemon startup holds both state-directory and socket-endpoint lifetime locks.
 The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
 different state directories cannot start competing daemons for one endpoint.
@@ -1073,8 +1093,14 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
         try:
             if stale is not None and socket_identity(socket_path) != stale:
                 raise SetupError("RABS endpoint changed before daemon restart")
+            # A shared daemon outlives this Cargo invocation. RCH retires its
+            # source-owned TMPDIR after completion; replay scratch must instead
+            # live under the already verified, persistent private state owner.
+            # Change only the new daemon's environment, never Cargo's bindings
+            # or an attached daemon's policy.
+            child_env = dict(env, TMPDIR=lock.path)
             child = subprocess.Popen(
-                [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                [daemon], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=descriptor, close_fds=True, start_new_session=True,
                 pass_fds=lock.inherited_fds(),
             )
@@ -1169,7 +1195,7 @@ def arguments(argv):
             required = True
         elif args[0] == "--rabs-remote":
             remote = True
-        elif args[0] in ("--rabs-canonical", "--rabs-canonical-local", "--rabs-recover"):
+        elif args[0] in ("--rabs-canonical", "--rabs-canonical-local", "--rabs-canonical-remote", "--rabs-recover"):
             raise SetupError(args[0] + " must be the first and only launcher mode")
         else:
             break
@@ -2003,6 +2029,47 @@ def canonical_local_selection(args):
     return selection
 
 
+def canonical_saved_selection(profile):
+    """Validate saved logical selectors before an explicit command replaces them."""
+    if profile.get("selection") is not None:
+        selection = profile["selection"]
+        flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS, **LOCAL_DOC_FLAGS)
+        allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args", "lint_args", "run_args"}
+        if type(selection) is not dict or selection.keys() - allowed:
+            raise SetupError("invalid local canonical profile selection fields")
+        original_args = [profile.get("command", "check")]
+        for option, field in flags.items():
+            if field in selection and type(selection[field]) is not bool:
+                raise SetupError("local canonical selection " + field + " must be a boolean")
+            if selection.get(field):
+                original_args.append(option)
+        for option, field in LOCAL_COMPILATION_VALUES.items():
+            if field in selection:
+                if type(selection[field]) is not list or any(type(value) is not str for value in selection[field]):
+                    raise SetupError("local canonical selection " + field + " must be a string array")
+                for value in selection[field]:
+                    original_args.extend((option, value))
+        if selection.get("profile") is not None:
+            if type(selection["profile"]) is not str:
+                raise SetupError("local canonical selection profile must be a string or null")
+            original_args.extend(("--profile", selection["profile"]))
+        if selection.get("test_filter") is not None:
+            if type(selection["test_filter"]) is not str:
+                raise SetupError("local canonical test filter must be a string or null")
+            original_args.append(selection["test_filter"])
+        for field, commands in (("test_args", ("test", "bench")),
+                                ("lint_args", ("clippy",)), ("run_args", ("run",))):
+            if field in selection:
+                if (type(selection[field]) is not list
+                        or any(type(value) is not str for value in selection[field])):
+                    raise SetupError("local canonical " + field + " must be a string array")
+                if selection[field]:
+                    if profile.get("command", "check") not in commands:
+                        raise SetupError("local canonical " + field + " requires command " + " or ".join(commands))
+                    original_args.extend(["--"] + selection[field])
+        canonical_local_selection(original_args)
+
+
 def canonical_local_profile(path, env=None, toolchain=None):
     """Validate retained intent before writing; the native driver checks it again."""
     profile = canonical_profile_object(path)
@@ -2075,43 +2142,7 @@ def canonical_local_profile(path, env=None, toolchain=None):
         raise SetupError("local canonical wrapper must be an ordinary executable")
     if any(Path(profile[field]) in wrapper.parents for field in ("source_root", "state_root", "operation_root")):
         raise SetupError("local canonical wrapper must be outside source, state and operation roots")
-    if profile.get("selection") is not None:
-        selection = profile["selection"]
-        flags = dict(LOCAL_COMPILATION_FLAGS, **LOCAL_TEST_FLAGS, **LOCAL_CLIPPY_FLAGS, **LOCAL_DOC_FLAGS)
-        allowed = set(flags.values()) | set(LOCAL_COMPILATION_VALUES.values()) | {"profile", "test_filter", "test_args", "lint_args", "run_args"}
-        if type(selection) is not dict or selection.keys() - allowed:
-            raise SetupError("invalid local canonical profile selection fields")
-        original_args = [profile.get("command", "check")]
-        for option, field in flags.items():
-            if field in selection and type(selection[field]) is not bool:
-                raise SetupError("local canonical selection " + field + " must be a boolean")
-            if selection.get(field):
-                original_args.append(option)
-        for option, field in LOCAL_COMPILATION_VALUES.items():
-            if field in selection:
-                if type(selection[field]) is not list or any(type(value) is not str for value in selection[field]):
-                    raise SetupError("local canonical selection " + field + " must be a string array")
-                for value in selection[field]:
-                    original_args.extend((option, value))
-        if selection.get("profile") is not None:
-            if type(selection["profile"]) is not str:
-                raise SetupError("local canonical selection profile must be a string or null")
-            original_args.extend(("--profile", selection["profile"]))
-        if selection.get("test_filter") is not None:
-            if type(selection["test_filter"]) is not str:
-                raise SetupError("local canonical test filter must be a string or null")
-            original_args.append(selection["test_filter"])
-        for field, commands in (("test_args", ("test", "bench")),
-                                ("lint_args", ("clippy",)), ("run_args", ("run",))):
-            if field in selection:
-                if (type(selection[field]) is not list
-                        or any(type(value) is not str for value in selection[field])):
-                    raise SetupError("local canonical " + field + " must be a string array")
-                if selection[field]:
-                    if profile.get("command", "check") not in commands:
-                        raise SetupError("local canonical " + field + " requires command " + " or ".join(commands))
-                    original_args.extend(["--"] + selection[field])
-        canonical_local_selection(original_args)
+    canonical_saved_selection(profile)
     canonical_local_service_command(profile)
     return profile
 
@@ -2201,6 +2232,247 @@ def canonical_local_invocation(profile_path, args, env):
     child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
     print("cargo-rabs: local canonical profile retained at " + str(retained), file=sys.stderr, flush=True)
     return daemon, [daemon, "--canonical-compile-local", str(retained)], child_env
+
+
+def canonical_remote_host(value, label):
+    """Accept an explicit TLS name or address without resolving it locally."""
+    import re
+    if (type(value) is not str or not value or len(value) > 253 or "%" in value
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+        raise SetupError("remote canonical " + label + " must be a bounded host name or IP address")
+    try:
+        ipaddress.ip_address(value)
+        return
+    except ValueError:
+        pass
+    labels = value[:-1].split(".") if value.endswith(".") else value.split(".")
+    if any(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part) is None
+           for part in labels):
+        raise SetupError("remote canonical " + label + " must be a host name or IP address")
+
+
+def canonical_remote_directory(value, private=False):
+    directory = Path("/") if value == "/" else Path(canonical_path(value, absolute=True))
+    for parent in reversed((directory,) + tuple(directory.parents)):
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise SetupError("remote canonical roots require ordinary directory ancestors")
+    if private:
+        metadata = directory.lstat()
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SetupError("remote canonical staging and output parents must be private to this user")
+    return directory
+
+
+def canonical_remote_absent(destination):
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        return
+    raise SetupError("remote canonical output destination already exists; choose a new directory")
+
+
+def canonical_remote_settings(settings, cargo_home_source):
+    """Validate only the native remote service's logical Cargo intent."""
+    allowed = {"command", "manifest", "vendor", "source_selection", "selection",
+               "jobs", "timeout_seconds", "env"}
+    if type(settings) is not dict or settings.keys() - allowed:
+        raise SetupError("invalid remote canonical settings fields")
+    command = settings.get("command", "check")
+    if command not in ("check", "build", "clippy", "doc", "test", "bench"):
+        raise SetupError("remote canonical service supports check, build, clippy, doc, test and bench --no-run")
+    canonical_local_source_selection(settings)
+    canonical_local_environment(settings)
+    canonical_saved_selection(settings)
+    if command == "bench" and not (settings.get("selection") or {}).get("no_run", False):
+        raise SetupError("remote canonical service requires bench --no-run; inherited stdin is unsupported")
+    for name, maximum in (("jobs", 4096), ("timeout_seconds", 7200)):
+        if name in settings and (type(settings[name]) is not int or not 1 <= settings[name] <= maximum):
+            raise SetupError("remote canonical " + name + " must be an integer from 1 to " + str(maximum))
+    manifest = canonical_path(settings.get("manifest", "Cargo.toml"))
+    if len(manifest) > 1024 or Path(manifest).name != "Cargo.toml":
+        raise SetupError("remote canonical manifest must name a relative Cargo.toml")
+    if settings.get("vendor") is not None:
+        vendor = canonical_path(settings["vendor"])
+        if len(vendor) > 1024:
+            raise SetupError("remote canonical vendor path is too long")
+        if cargo_home_source is not None:
+            raise SetupError("remote canonical profile must select either vendor or cargo_home_source")
+
+
+def canonical_remote_profile(path, env=None, toolchain=None, *, command=None, selection=None):
+    """Resolve a reusable operator profile into validated, explicit native intent."""
+    import re
+    profile = canonical_profile_object(path)
+    required = {"version", "coordinator", "server_name", "coordinator_pin", "tls",
+                "source_root", "staging_root"}
+    optional = {"toolchain_root", "toolchain", "cargo_home_source", "output_root",
+                "output_destination", "settings"}
+    if (not required <= profile.keys() or profile.keys() - required - optional
+            or profile["version"] != "canonical-compile-remote-v1"):
+        raise SetupError("invalid canonical-compile-remote-v1 profile fields")
+    if ("output_root" in profile) == ("output_destination" in profile):
+        raise SetupError("remote canonical profile requires exactly one of output_root or output_destination")
+    if ("toolchain" in profile) == ("toolchain_root" in profile):
+        raise SetupError("canonical profile requires exactly one of toolchain_root or toolchain")
+    if toolchain is not None and "toolchain_root" in profile:
+        raise SetupError('canonical +toolchain requires "toolchain": "rustup", not an explicit toolchain_root')
+    if "toolchain" in profile and profile["toolchain"] != "rustup":
+        raise SetupError('canonical toolchain must be "rustup" or use an explicit toolchain_root')
+    address = profile["coordinator"]
+    if (type(address) is not str or len(address) > 1024
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in address)):
+        raise SetupError("remote canonical coordinator must be an explicit host:port")
+    try:
+        host, port = address.rsplit(":", 1)
+        if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError("invalid port")
+        if host.startswith("[") and host.endswith("]"):
+            if "%" in host:
+                raise ValueError("scoped IPv6 is unsupported")
+            ipaddress.IPv6Address(host[1:-1])
+        else:
+            if ":" in host:
+                raise ValueError("IPv6 requires brackets")
+            canonical_remote_host(host, "coordinator")
+    except ValueError as error:
+        raise SetupError("remote canonical coordinator must be an explicit host:port") from error
+    canonical_remote_host(profile["server_name"], "server_name")
+    if (type(profile["coordinator_pin"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", profile["coordinator_pin"]) is None
+            or profile["coordinator_pin"] == "0" * 64):
+        raise SetupError("remote canonical coordinator_pin must be a nonzero lowercase SHA-256 pin")
+    tls = profile["tls"]
+    if type(tls) is not dict or tls.keys() != {"ca", "certificate", "private_key"}:
+        raise SetupError("remote canonical tls requires exactly ca, certificate and private_key")
+    for value in tls.values():
+        credential = Path(canonical_path(value, absolute=True))
+        canonical_remote_directory(str(credential.parent))
+        if not stat.S_ISREG(credential.lstat().st_mode) or not os.access(credential, os.R_OK):
+            raise SetupError("remote canonical TLS credentials must be readable ordinary files")
+    settings = profile.setdefault("settings", {})
+    canonical_remote_settings(settings, profile.get("cargo_home_source"))
+    if command is not None:
+        settings["command"] = command
+        settings["selection"] = selection
+        canonical_remote_settings(settings, profile.get("cargo_home_source"))
+
+    roots = []
+
+    def add_root(value, private=False):
+        root = canonical_remote_directory(value, private)
+        if any(root == other or root in other.parents or other in root.parents for other in roots):
+            raise SetupError("remote canonical source, toolchain, Cargo home, staging and output roots must be disjoint")
+        roots.append(root)
+        return root
+
+    captured = [add_root(profile["source_root"])]
+    if profile.get("cargo_home_source") is not None:
+        captured.append(add_root(profile["cargo_home_source"]))
+    add_root(profile["staging_root"], private=True)
+    if "output_root" in profile:
+        add_root(profile["output_root"], private=True)
+    else:
+        destination = Path(canonical_path(profile["output_destination"], absolute=True))
+        add_root(str(destination.parent), private=True)
+        canonical_remote_absent(destination)
+    key = Path(tls["private_key"])
+    if any(key == root or root in key.parents for root in captured):
+        raise SetupError("remote canonical authentication key must be outside captured inputs")
+
+    # Discovery runs only after the operator's route, logical intent and known
+    # capture roots have passed validation. Its selected physical SDK is retained.
+    canonical_toolchain_selection(profile, env, toolchain)
+    captured.append(add_root(profile["toolchain_root"]))
+    if any(key == root or root in key.parents for root in captured):
+        raise SetupError("remote canonical authentication key must be outside captured inputs")
+    binaries = Path(profile["toolchain_root"]) / "bin"
+    canonical_remote_directory(str(binaries))
+    tools = ["cargo", "rustc"]
+    if settings.get("command", "check") == "clippy":
+        tools += ["cargo-clippy", "clippy-driver"]
+    elif settings.get("command", "check") == "doc":
+        tools.append("rustdoc")
+    for name in tools:
+        executable_path = binaries / name
+        if not stat.S_ISREG(executable_path.lstat().st_mode) or not os.access(executable_path, os.X_OK):
+            raise SetupError("remote canonical command requires ordinary executable " + name)
+    return profile
+
+
+def canonical_remote_invocation(profile_path, args, env):
+    """Retain one remote request, then hand execution and receipts to rabsd."""
+    if sys.platform != "linux":
+        raise SetupError("remote canonical Cargo compilation requires Linux")
+    if any(env.get(name) == "1" for name in (
+        "CARGO_RABS_CANONICAL_ACTIVE", "CARGO_RABS_REMOTE_ACTIVE", "RCH_RABS_WORKER_ACTIVE",
+    )):
+        raise SetupError("nested canonical/remote dispatch is not supported")
+    if any(name in env for name in ROOT_ADMISSION_KEYS):
+        raise SetupError("local root admission cannot combine with remote canonical mode")
+    toolchain, args = canonical_toolchain_arguments(args)
+    selection = canonical_local_selection(args)
+    command = args[0] if args else "check"
+    if command == "run" or (command == "bench" and not selection.get("no_run", False)):
+        raise SetupError("remote canonical service requires closed stdin; run and executing bench are unsupported")
+    profile = canonical_remote_profile(
+        profile_path, env, toolchain, command=command, selection=selection,
+    )
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    if os.path.samefile(daemon, __file__):
+        raise SetupError("CARGO_RABS_DAEMON resolves to cargo-rabs itself")
+    import secrets
+    operation_name = command + "-" + secrets.token_hex(16)
+    operation = Path(profile["staging_root"]) / operation_name
+    capture = operation / "capture"
+    retained = operation / "profile.json"
+    for path in (operation, capture, retained):
+        canonical_path(str(path), absolute=True)
+    profile["staging_root"] = str(capture)
+    if "output_root" in profile:
+        destination = Path(profile.pop("output_root")) / operation_name
+        canonical_path(str(destination), absolute=True)
+        canonical_remote_absent(destination)
+        profile["output_destination"] = str(destination)
+    encoded = json.dumps(profile, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_FRAME:
+        raise SetupError("remote canonical profile exceeds its native size bound")
+    # Neither an output directory nor an execution is created here. An existing
+    # destination remains a refusal, including after uncertain final delivery.
+    operation.mkdir(mode=0o700)
+    capture.mkdir(mode=0o700)
+    descriptor = os.open(retained, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(encoded)
+        output.flush()
+        os.fsync(output.fileno())
+    for path in (capture, operation, operation.parent):
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    child_env = dict(env)
+    child_env["CARGO_RABS_CANONICAL_ACTIVE"] = "1"
+    print("cargo-rabs: remote canonical profile retained at " + str(retained), file=sys.stderr, flush=True)
+    return daemon, [daemon, "--canonical-compile-remote", str(retained)], child_env
+
+
+def run_canonical_remote(args, env):
+    try:
+        if not args or not args[0] or args[0].startswith("--"):
+            raise SetupError("--rabs-canonical-remote requires a profile file")
+        cargo_args = args[1:]
+        if cargo_args[:1] == ["--"]:
+            cargo_args = cargo_args[1:]
+        daemon, command, child_env = canonical_remote_invocation(args[0], cargo_args, env)
+    except (SetupError, OSError, ValueError) as error:
+        print("cargo-rabs: remote canonical setup refused: {}".format(error), file=sys.stderr)
+        return 2
+    try:
+        os.execvpe(daemon, command, child_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute remote canonical driver: {}".format(error), file=sys.stderr)
+        return 127
 
 
 def run_canonical_local(args, env):
@@ -2501,6 +2773,8 @@ def main():
         raw = raw[1:]
     if raw[:1] == ["--rabs-recover"]:
         return run_canonical_recovery(raw[1:], dict(os.environ))
+    if raw[:1] == ["--rabs-canonical-remote"]:
+        return run_canonical_remote(raw[1:], dict(os.environ))
     if raw[:1] == ["--rabs-canonical-local"]:
         if any(key in os.environ for key in ROOT_ADMISSION_KEYS):
             print("cargo-rabs: local root admission cannot combine with canonical mode", file=sys.stderr)

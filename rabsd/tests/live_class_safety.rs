@@ -5,6 +5,9 @@
 //! these tests do not claim a real rustc run or authenticated remote execution.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,7 +93,7 @@ fn held(culprit: &TypedDigest, reason: &'static str) -> ServeOutcome {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
         let authority = coord
@@ -113,7 +116,13 @@ impl Fixture {
     fn commit(&mut self, action: &TypedDigest, artifact: &[u8]) -> PublicationOutcome {
         self.serial += 1;
         let coordinator = self.coord.authority().unwrap();
-        let object = put(&self.cas, artifact);
+        let artifact = test_util::closed_rlib_fixture(artifact);
+        let object = put(&self.cas, &artifact);
+        test_util::record_rlib_fixture_closure(
+            &mut *self.cas.store().lock().unwrap(),
+            &object.0,
+            &artifact,
+        );
         let (template, _) = offer_serving_object(&coordinator, &object);
         let mut authority = template.authority;
         authority.action_key = action.clone();
@@ -203,7 +212,10 @@ fn a_real_publication_conflict_stops_peer_replay_and_survives_coordinator_restar
         serve(&fixture.coord, &requested, &before),
         ServeOutcome::Served { .. }
     ));
-    assert_eq!(std::fs::read(before.join("out/lib.rlib")).unwrap(), GOOD);
+    assert_eq!(
+        std::fs::read(before.join("out/lib.rlib")).unwrap(),
+        test_util::closed_rlib_fixture(GOOD)
+    );
     let publication = fixture
         .cas
         .store()
@@ -236,7 +248,10 @@ fn a_real_publication_conflict_stops_peer_replay_and_survives_coordinator_restar
         serve(&fixture.coord, &requested, &before),
         held(&culprit, "divergence-incident")
     );
-    assert_eq!(std::fs::read(before.join("out/lib.rlib")).unwrap(), GOOD);
+    assert_eq!(
+        std::fs::read(before.join("out/lib.rlib")).unwrap(),
+        test_util::closed_rlib_fixture(GOOD)
+    );
     assert_eq!(
         std::fs::metadata(before.join("out/lib.rlib"))
             .unwrap()

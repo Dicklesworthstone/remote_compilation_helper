@@ -287,7 +287,7 @@ class SourceTopologyTests(unittest.TestCase):
                         child.terminate()
                     child.communicate(timeout=5)
 
-    def start_retry(self, attempts):
+    def start_retry(self, retry_seconds):
         roots = [self.canonical / "repo"]
         self.accepted(self.run_op("acquire", "a1", roots))
         command, data = self.command("try-acquire", "b1", roots)
@@ -297,9 +297,10 @@ class SourceTopologyTests(unittest.TestCase):
                   + "printf 'attempt\\n' >> " + shlex.quote(str(counter)) + "\n"
                   + "exec " + shlex.join(command) + " <<'RCH_RETRY_ROOTS'\n"
                   + data.decode() + "RCH_RETRY_ROOTS\n); }\n"
-                  + f"rch_admission_attempts={attempts}\n" + RETRY.read_text())
+                  + f"rch_admission_retry_seconds={retry_seconds}\n" + RETRY.read_text())
         child = subprocess.Popen([SHELL, "-c", script], stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=self.env)
+                                 stderr=subprocess.PIPE,
+                                 env={**self.env, "RCH_TIMING_SCALE": "1"})
         self.addCleanup(self.reap, child)
         deadline = time.monotonic() + 5
         while not counter.exists() and child.poll() is None and time.monotonic() < deadline:
@@ -327,14 +328,17 @@ class SourceTopologyTests(unittest.TestCase):
         self.assertEqual(len(list(self.registry.glob("*.claim"))), 1)
         self.assertEqual(len(list((self.registry / "released").glob("*.claim"))), 1)
 
-    def test_persistent_active_owner_exhausts_retry_without_stealing_it(self):
+    def test_persistent_active_owner_expires_retry_without_stealing_it(self):
         self.initialize()
+        started = time.monotonic()
         child, roots, _, counter = self.start_retry(2)
         before = self.inventory()
         stdout, stderr = child.communicate(timeout=5)
         self.assertEqual(child.returncode, 75, stderr)
         self.assertEqual(stdout, b"")
-        self.assertEqual(len(counter.read_text().splitlines()), 2)
+        self.assertGreaterEqual(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertGreaterEqual(len(counter.read_text().splitlines()), 1)
         self.assertEqual(before, self.inventory())
 
 

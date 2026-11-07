@@ -33,12 +33,22 @@ const REQUEST_OBSERVATION_REASON: &str =
 /// Concurrent operator processes targeting the same worker refuse while its
 /// owner is live. Different workers have independent admission stores. This
 /// capability is not cloneable: a public delivery entrypoint consumes it, so
-/// two live transports cannot share one owner's admission state.
+/// independent transports cannot share one owner's admission state. The remote
+/// dependency transport privately retains an owner across its serialized calls.
 pub struct PinnedWorkerAdmission {
     coord: CoordLive,
     cas: Arc<LiveCas>,
     worker: String,
     pin: [u8; 32],
+}
+
+impl std::fmt::Debug for PinnedWorkerAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedWorkerAdmission")
+            .field("worker", &self.worker)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PinnedWorkerAdmission {
@@ -242,6 +252,17 @@ impl PinnedWorkerAdmission {
 
     pub(super) fn worker(&self) -> &str {
         &self.worker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authority_for_test(&self) -> rabs_cas::metadata_store::AuthorityRow {
+        self.cas
+            .store()
+            .lock()
+            .unwrap()
+            .active_authority()
+            .unwrap()
+            .unwrap()
     }
 
     /// Called only after the TLS-pinned session challenge succeeds, and before
@@ -645,6 +666,29 @@ mod tests {
                 .to_string()
                 .contains("already bound to another SPKI pin")
         );
+        let transport = Arc::new(
+            crate::coord::remote_dependency_transport::RemoteDependencyTransport::new(
+                "127.0.0.1:9123".parse().unwrap(),
+                "worker".into(),
+                [2; 32],
+                root.path().to_path_buf(),
+                rabs_asupersync::worker_transport::TlsFiles {
+                    ca: root.path().join("unused-ca.pem"),
+                    certificate: root.path().join("unused-cert.pem"),
+                    private_key: root.path().join("unused-key.pem"),
+                },
+            )
+            .unwrap(),
+        );
+        for _ in 0..2 {
+            let mut reserved = transport.try_reserve().unwrap();
+            let refused = reserved.allocate_request_id().unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("already bound to another SPKI pin")
+            );
+        }
         let original = open(root.path(), "worker", [1; 32]).unwrap();
         assert!(original.admit(&identity(), &hello(4, 3)).is_err());
     }

@@ -16,7 +16,7 @@ use rabs_cas::serving_sample_gate::SamplingPolicy;
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_protocol::release_authorization::authorization as release_standing;
-use rabs_protocol::result_identity::{OutputRole, TypedDigest};
+use rabs_protocol::result_identity::{CanonicalActionResultManifest, OutputRole, TypedDigest};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,6 +35,7 @@ pub(super) struct CommittedResult<'manifest, 'callback, 'env> {
 pub(super) struct InstallContext<'a> {
     pub(super) action: &'a TypedDigest,
     pub(super) manifest_key: &'a str,
+    pub(super) manifest: &'a CanonicalActionResultManifest,
     pub(super) authority: Option<&'a CoordinatorAuthority>,
     pub(super) now_unix_micros: i64,
     pub(super) now_epoch: u64,
@@ -104,7 +105,14 @@ impl InstallContext<'_> {
             .published_manifest_key(self.action)
             .map_err(store_error)?
         {
-            Some(current) if current == self.manifest_key => Ok(None),
+            Some(current) if current == self.manifest_key => {
+                match crate::coord::native_archives::require_manifest(store, self.manifest) {
+                    Ok(()) => Ok(None),
+                    Err(reason) => Ok(Some(ServeOutcome::ExecutePrivately(
+                        super::ReplayRefusal::NativeArchive(reason),
+                    ))),
+                }
+            }
             Some(current) => Ok(Some(ServeOutcome::ManifestUnavailable { key: current })),
             None => Ok(Some(ServeOutcome::NoCommit)),
         }

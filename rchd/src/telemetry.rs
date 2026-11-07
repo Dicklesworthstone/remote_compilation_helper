@@ -5,6 +5,7 @@ use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
+use rch_common::timing::scale_duration;
 use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
     ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, TestRunStatsAccumulator,
@@ -22,8 +23,14 @@ use tracing::{debug, info, warn};
 
 const TEST_RUN_MEMORY_CAPACITY: usize = 200;
 
+/// Cache contention is distinct from absent or endpoint-mismatched evidence.
+/// A bounded recovery caller may retry without blocking its runtime thread.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TelemetryCacheBusy;
+
 struct StoredTelemetry {
     received: ReceivedTelemetry,
+    observed_at: tokio::time::Instant,
     endpoint: Option<WorkerEndpointSnapshot>,
 }
 
@@ -93,8 +100,9 @@ impl TelemetryStore {
         self.ingest_inner(telemetry, source, None);
     }
 
-    /// Record telemetry collected from an exact endpoint. The caller retains
-    /// its current-endpoint guard until this publication completes.
+    /// Test fixtures may install endpoint-bound evidence without remote work.
+    /// Production probes publish through their original collection deadline.
+    #[cfg(test)]
     pub(crate) fn ingest_for_endpoint(
         &self,
         telemetry: WorkerTelemetry,
@@ -110,37 +118,72 @@ impl TelemetryStore {
         source: TelemetrySource,
         endpoint: Option<WorkerEndpointSnapshot>,
     ) {
-        let received = ReceivedTelemetry::new(telemetry, source);
+        let received = ReceivedTelemetry::new(telemetry.clone(), source);
+        let observed_at = tokio::time::Instant::now();
         let worker_id = received.telemetry.worker_id.clone();
-
-        // Get summary for event emission before moving into storage
-        let summary = received.telemetry.summary();
-
         let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
         let entries = recent.entry(worker_id).or_default();
-        entries.push_back(StoredTelemetry { received, endpoint });
-
+        entries.push_back(StoredTelemetry {
+            received,
+            observed_at,
+            endpoint,
+        });
         self.evict_old(entries);
+        drop(recent);
+        self.notify_ingested(&telemetry);
+    }
 
-        // Emit WebSocket event for real-time dashboard updates
-        if let Some(event_bus) = &self.event_bus {
-            event_bus.emit("telemetry:update", &summary);
+    /// The caller already holds the worker's endpoint/network/circuit guards.
+    /// Never block the runtime on the synchronous cache lock: contention is
+    /// retried by the caller within the original collection deadline.
+    fn try_publish_before(
+        &self,
+        pending: &mut Option<StoredTelemetry>,
+        deadline: tokio::time::Instant,
+        on_commit: impl FnOnce() -> bool,
+    ) -> bool {
+        let worker_id = pending
+            .as_ref()
+            .expect("a pending telemetry sample is committed once")
+            .received
+            .telemetry
+            .worker_id
+            .clone();
+        let mut recent = match self.recent.try_write() {
+            Ok(recent) => recent,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return false;
         }
+        // The callback rechecks the administrative epoch while every
+        // destination lock is held, then updates command evidence.
+        if !on_commit() {
+            return false;
+        }
+        let entries = recent.entry(worker_id).or_default();
+        entries.push_back(pending.take().expect("pending telemetry sample"));
+        self.evict_old(entries);
+        true
+    }
 
+    fn notify_ingested(&self, telemetry: &WorkerTelemetry) {
+        if let Some(event_bus) = &self.event_bus {
+            event_bus.emit("telemetry:update", &telemetry.summary());
+        }
         if let Some(storage) = self.storage.as_ref() {
             let storage = Arc::clone(storage);
-            let telemetry = entries.back().map(|e| e.received.telemetry.clone());
-            if let Some(telemetry) = telemetry {
-                task::spawn(async move {
-                    let result =
-                        task::spawn_blocking(move || storage.insert_telemetry(&telemetry)).await;
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => warn!("Failed to persist telemetry: {}", e),
-                        Err(e) => warn!("Telemetry persistence task failed: {}", e),
-                    }
-                });
-            }
+            let telemetry = telemetry.clone();
+            task::spawn(async move {
+                let result =
+                    task::spawn_blocking(move || storage.insert_telemetry(&telemetry)).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Failed to persist telemetry: {}", e),
+                    Err(e) => warn!("Telemetry persistence task failed: {}", e),
+                }
+            });
         }
     }
 
@@ -166,6 +209,27 @@ impl TelemetryStore {
                 .find(|entry| entry.belongs_to(endpoint))
                 .map(|entry| entry.received.clone())
         })
+    }
+
+    /// Inspect endpoint-bound evidence without waiting on the synchronous
+    /// cache lock. Preserve both receipt clocks so queued recovery cannot make
+    /// an old observation fresh by reading or publishing it later.
+    pub(crate) fn try_latest_for_endpoint(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+    ) -> Result<Option<(ReceivedTelemetry, tokio::time::Instant)>, TelemetryCacheBusy> {
+        let recent = match self.recent.try_read() {
+            Ok(recent) => recent,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(TelemetryCacheBusy),
+        };
+        Ok(recent.get(endpoint.config.id.as_str()).and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry.belongs_to(endpoint))
+                .map(|entry| (entry.received.clone(), entry.observed_at))
+        }))
     }
 
     /// Get the most recent telemetry for all workers.
@@ -376,7 +440,15 @@ const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 16;
 /// its concurrency permit) leaks indefinitely, silently starving future polls.
 /// Sized just above `ssh_timeout` so a healthy-but-slow worker still completes.
 fn poll_hard_timeout(ssh_timeout: Duration) -> Duration {
-    ssh_timeout + Duration::from_secs(5)
+    ssh_timeout.saturating_add(Duration::from_secs(5))
+}
+
+/// Preserve the old two full attempts plus backoff as one elapsed-time budget.
+/// Fast transient failures may retry within it, but a retry never resets it.
+fn poll_retry_budget(ssh_timeout: Duration) -> Duration {
+    poll_hard_timeout(ssh_timeout)
+        .saturating_mul(2)
+        .saturating_add(TELEMETRY_RETRY_BACKOFF)
 }
 
 pub struct TelemetryPoller {
@@ -418,8 +490,8 @@ impl TelemetryPoller {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(self.config.poll_interval);
-            // A cycle can occasionally run long (a worker failing both attempts
-            // back-to-back). Skip missed ticks rather than firing a burst of
+            // A cycle can occasionally exhaust a worker's retry budget.
+            // Skip missed ticks rather than firing a burst of
             // back-to-back cycles, which would only add SSH contention.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -496,56 +568,218 @@ impl TelemetryPoller {
     }
 }
 
-/// Collect telemetry from a worker via SSH.
-///
-/// Executes `rch-telemetry collect` on the remote worker and parses the result.
-/// Returns the endpoint used by the on-demand API so publication can reject a
-/// result whose worker ID was retargeted while SSH was in flight.
+/// Completed telemetry retains its original endpoint, administrative generation
+/// and deadline until the on-demand API commits it to the cache.
+pub(crate) struct CollectedTelemetry {
+    endpoint: WorkerEndpointSnapshot,
+    telemetry: WorkerTelemetry,
+    received_at: DateTime<Utc>,
+    observed_at: tokio::time::Instant,
+    admission: crate::workers::BackgroundProbe,
+    deadline: tokio::time::Instant,
+}
+
+/// Collect telemetry from a worker via SSH. The existing separate connection
+/// and command allowances share one bounded lifetime through publication.
 pub(crate) async fn collect_telemetry_from_worker(
     worker: &WorkerState,
     ssh_timeout: Duration,
-) -> anyhow::Result<(WorkerEndpointSnapshot, WorkerTelemetry)> {
+) -> anyhow::Result<CollectedTelemetry> {
     collect_telemetry_from_worker_pooled(worker, ssh_timeout, None).await
 }
 
-/// Collect telemetry from a worker via SSH, optionally reusing a shared SSH
-/// connection pool (warm ControlMaster) when `ssh_pool` is `Some`.
+/// Collect telemetry using the optional shared warm connection pool.
 pub(crate) async fn collect_telemetry_from_worker_pooled(
     worker: &WorkerState,
     ssh_timeout: Duration,
     ssh_pool: Option<Arc<rch_common::SshPool>>,
-) -> anyhow::Result<(WorkerEndpointSnapshot, WorkerTelemetry)> {
-    let mut admission = worker
-        .background_probe()
-        .await
-        .context("worker background connections are suspended")?;
-    // Snapshot the worker config and RELEASE the lock before any SSH work.
-    // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
-    // blocks writers — and any reader queued behind a pending writer, including
-    // the in-memory worker-selection path — for the full SSH duration. Under a
-    // poll burst that surfaced as multi-second "worker_selection latency
-    // exceeded panic threshold" stalls. Cloning + dropping the guard here keeps
-    // selection lock-free while telemetry SSH is in flight.
-    let endpoint = worker.endpoint_snapshot().await;
-    let telemetry = admission
-        .run(collect_telemetry_for_endpoint(
-            endpoint.config.clone(),
-            ssh_timeout,
-            ssh_pool,
-        ))
-        .await
-        .context("telemetry collection cancelled by worker state change")??;
+) -> anyhow::Result<CollectedTelemetry> {
+    collect_telemetry_from_worker_with(worker, ssh_timeout, move |endpoint, timeout, deadline| {
+        collect_telemetry_for_endpoint(endpoint, timeout, ssh_pool, deadline)
+    })
+    .await
+}
+
+async fn collect_telemetry_from_worker_with<F, Fut>(
+    worker: &WorkerState,
+    ssh_timeout: Duration,
+    collect: F,
+) -> anyhow::Result<CollectedTelemetry>
+where
+    F: FnOnce(rch_common::WorkerConfig, Duration, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
+{
+    let ssh_timeout = scale_duration(ssh_timeout);
     anyhow::ensure!(
-        admission.is_current(),
-        "worker changed during telemetry collection"
+        !ssh_timeout.is_zero(),
+        "Telemetry collection timed out before admission"
     );
-    Ok((endpoint, telemetry))
+    // Disconnect retains its fixed local cleanup allowance. Remote durations
+    // arrive already scaled, and an extreme caller cannot exceed the control cap.
+    let budget = ssh_timeout
+        .saturating_mul(2)
+        .saturating_add(Duration::from_secs(1))
+        .min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .context("Telemetry deadline exceeds the supported clock range")?;
+    let collection = async {
+        let mut admission = worker
+            .background_probe()
+            .await
+            .context("worker background connections are suspended")?;
+        // Release configuration before SSH so a slow poll never holds up
+        // worker selection or endpoint reconfiguration.
+        let endpoint = worker.endpoint_snapshot().await;
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Telemetry collection timed out before connection"
+        );
+        let telemetry = admission
+            .run(collect(endpoint.config.clone(), ssh_timeout, deadline))
+            .await
+            .context("telemetry collection cancelled by worker state change")??;
+        let received_at = Utc::now();
+        let observed_at = tokio::time::Instant::now();
+        anyhow::ensure!(
+            admission.is_current() && tokio::time::Instant::now() < deadline,
+            "Telemetry collection expired or its worker changed"
+        );
+        Ok::<_, anyhow::Error>(CollectedTelemetry {
+            endpoint,
+            telemetry,
+            received_at,
+            observed_at,
+            admission,
+            deadline,
+        })
+    };
+    let result = tokio::time::timeout_at(deadline, collection)
+        .await
+        .context("Telemetry collection timed out")??;
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "Telemetry collection timed out"
+    );
+    Ok(result)
+}
+
+/// Commit on-demand evidence using the collection's original budget.
+pub(crate) async fn publish_collected_telemetry(
+    worker: &WorkerState,
+    store: &TelemetryStore,
+    collected: CollectedTelemetry,
+) -> anyhow::Result<WorkerTelemetry> {
+    publish_telemetry_before(worker, store, &collected, TelemetrySource::OnDemand, None).await?;
+    Ok(collected.telemetry)
+}
+
+/// Acquire all publication destinations before changing either telemetry or
+/// command-failure evidence. Expiry/cancellation while queued changes neither.
+async fn publish_telemetry_before(
+    worker: &WorkerState,
+    store: &TelemetryStore,
+    collected: &CollectedTelemetry,
+    source: TelemetrySource,
+    circuit_config: Option<&rch_common::CircuitBreakerConfig>,
+) -> anyhow::Result<()> {
+    let CollectedTelemetry {
+        endpoint,
+        telemetry,
+        received_at,
+        observed_at,
+        admission,
+        deadline,
+    } = collected;
+    let deadline = *deadline;
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "Telemetry publication timed out"
+    );
+    let mut received = ReceivedTelemetry::new(telemetry.clone(), source);
+    received.received_at = *received_at;
+    let mut pending = Some(StoredTelemetry {
+        received,
+        observed_at: *observed_at,
+        endpoint: Some(endpoint.clone()),
+    });
+    let publication = async {
+        loop {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Telemetry publication timed out"
+            );
+            anyhow::ensure!(
+                admission.is_current(),
+                "worker lifecycle changed during telemetry publication"
+            );
+            let published = {
+                let _endpoint = worker
+                    .lock_current_endpoint(endpoint)
+                    .await
+                    .context("worker endpoint changed during telemetry collection")?;
+                let _publication = worker
+                    .lock_network_publication(admission)
+                    .await
+                    .context("worker lifecycle changed during telemetry collection")?;
+                let mut circuit = if circuit_config.is_some() {
+                    Some(
+                        worker
+                            .lock_command_outcome_before(deadline)
+                            .await
+                            .context("Telemetry circuit publication timed out")?,
+                    )
+                } else {
+                    None
+                };
+                let mut transition = None;
+                store
+                    .try_publish_before(&mut pending, deadline, || {
+                        if !admission.is_current() {
+                            return false;
+                        }
+                        if let (Some(circuit), Some(config)) =
+                            (circuit.as_deref_mut(), circuit_config)
+                        {
+                            let previous = circuit.state();
+                            let new = circuit.apply_command_outcome(true, config);
+                            transition = Some((previous, new));
+                        }
+                        true
+                    })
+                    .then_some(transition)
+            };
+            if let Some(transition) = published {
+                return Ok::<_, anyhow::Error>(transition);
+            }
+            // Cache contention must not pin the configuration, administrative
+            // transition, or circuit guards while this task backs off.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(Duration::from_millis(5).min(remaining)).await;
+        }
+    };
+    let transition = tokio::time::timeout_at(deadline, publication)
+        .await
+        .context("Telemetry publication timed out")??;
+    // The cache/circuit commit above contains no await. Notifications and
+    // asynchronous persistence happen only after every worker guard is released.
+    if let Some((previous, new)) = transition
+        && previous != new
+    {
+        info!(
+            worker = endpoint.config.id.as_str(),
+            "Worker circuit state: {:?} -> {:?} (telemetry poll succeeded)", previous, new,
+        );
+    }
+    store.notify_ingested(telemetry);
+    Ok(())
 }
 
 async fn collect_telemetry_for_endpoint(
     worker_config: rch_common::WorkerConfig,
     ssh_timeout: Duration,
     ssh_pool: Option<Arc<rch_common::SshPool>>,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<WorkerTelemetry> {
     let worker_id = worker_config.id.clone();
     // Worker IDs come from operator-supplied config (workers.toml), not from
@@ -571,12 +805,14 @@ async fn collect_telemetry_for_endpoint(
     // fall back to a throwaway connect+exec+disconnect (mirrors the pattern in
     // TelemetryPoller::run_remote for the on-demand / no-pool paths).
     let result = if let Some(pool) = &ssh_pool {
-        pool.run_with_timeout(&worker_config, &command, options.command_timeout)
+        pool.run_with_timeout_until(&worker_config, &command, options.command_timeout, deadline)
             .await
     } else {
         let mut client = SshClient::new(worker_config, options);
-        client.connect().await?;
-        let result = client.execute(&command).await;
+        client.connect_until(deadline).await?;
+        let result = client
+            .execute_with_timeout_until(&command, ssh_timeout, deadline)
+            .await;
         let _ = client.disconnect().await;
         result
     };
@@ -609,20 +845,23 @@ async fn collect_telemetry_for_endpoint(
     Ok(telemetry)
 }
 
-/// Total attempts (1 initial + retries) for a single worker poll per cycle.
-const TELEMETRY_POLL_ATTEMPTS: u32 = 2;
+/// Bound retained diagnostics even when fast failures allow many retries.
+const MAX_TELEMETRY_FAILURE_DETAILS: usize = 4;
 /// Backoff between poll attempts. Short, so a transient SSH connect failure
 /// under contention is retried after the burst clears, without dropping the
 /// worker past the stale threshold until the next cycle.
 const TELEMETRY_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+/// Local evidence finalization may follow an exhausted remote deadline. This
+/// fixed allowance never starts SSH or renews the remote retry budget.
+const TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE: Duration = Duration::from_secs(1);
 
 /// Poll one worker and ingest its telemetry. Returns `true` iff telemetry was
 /// collected and ingested this call.
 ///
 /// Each attempt is bounded by a hard timeout (the SSH layer's own timeout is not
-/// always honored); a single transient failure is retried once. Without the
-/// retry, one failed re-poll under concurrent SSH load drops the worker past the
-/// stale threshold — the root cause of fluctuating fleet telemetry freshness.
+/// always honored); transient failures retry within one elapsed-time budget.
+/// This lets brief SSH contention clear without starting a new deadline on
+/// every retry or waiting for the next fleet poll cycle.
 /// One failed poll attempt's evidence (bead pn1xb: a worker used to be
 /// able to sit telemetry-dark indefinitely with ZERO log lines while a
 /// no-fresh-telemetry verdict gated scheduling — the failure log must
@@ -634,7 +873,7 @@ struct PollAttemptFailure {
     error: String,
 }
 
-/// Render every attempt's evidence into one warn line.
+/// Render the retained recent attempts into one bounded warn line.
 fn render_poll_failures(failures: &[PollAttemptFailure]) -> String {
     failures
         .iter()
@@ -663,13 +902,20 @@ async fn poll_worker(
     } else {
         "throwaway-ssh"
     };
-    let ssh_timeout = config.ssh_timeout;
-    poll_worker_with(worker, store, config, transport, move |endpoint| {
-        collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone())
-    })
+    let ssh_timeout = scale_duration(config.ssh_timeout);
+    poll_worker_with_deadline(
+        worker,
+        store,
+        config,
+        transport,
+        move |endpoint, deadline| {
+            collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone(), deadline)
+        },
+    )
     .await
 }
 
+#[cfg(test)]
 async fn poll_worker_with<F, Fut>(
     worker: Arc<WorkerState>,
     store: Arc<TelemetryStore>,
@@ -681,96 +927,200 @@ where
     F: FnMut(rch_common::WorkerConfig) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
 {
-    // Acquire after the fleet concurrency permit, rather than trusting the
-    // earlier scheduling snapshot. Disabling a queued worker must never start
-    // SSH, and disabling an active poll cancels its transport and retries.
-    let Some(mut admission) = worker.background_probe().await else {
+    poll_worker_with_deadline(
+        worker,
+        store,
+        config,
+        transport,
+        move |endpoint, _deadline| collect(endpoint),
+    )
+    .await
+}
+
+async fn poll_worker_with_deadline<F, Fut>(
+    worker: Arc<WorkerState>,
+    store: Arc<TelemetryStore>,
+    config: TelemetryPollerConfig,
+    transport: &'static str,
+    mut collect: F,
+) -> bool
+where
+    F: FnMut(rch_common::WorkerConfig, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<WorkerTelemetry>>,
+{
+    let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
+    let retry_budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+    let poll_started = tokio::time::Instant::now();
+    let Some(poll_deadline) = poll_started.checked_add(retry_budget) else {
         return false;
     };
+    // Acquire after the fleet concurrency permit, under the original budget.
+    // Disabling a queued worker must never start SSH or reset its deadline.
+    let preparation = async {
+        let admission = worker.background_probe().await?;
+        let endpoint = worker.endpoint_snapshot().await;
+        Some((admission, endpoint))
+    };
+    let Some((mut admission, endpoint)) = tokio::time::timeout_at(poll_deadline, preparation)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    if tokio::time::Instant::now() >= poll_deadline {
+        return false;
+    }
     // Every retry belongs to this exact endpoint generation. A reload must
     // neither mix old failures with a new host nor admit late old telemetry.
-    let endpoint = worker.endpoint_snapshot().await;
     let worker_id = &endpoint.config.id;
-    let per_attempt = poll_hard_timeout(config.ssh_timeout);
+    let mut attempts = 0_u32;
     let mut failures: Vec<PollAttemptFailure> = Vec::new();
 
-    for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
-        if worker.lock_current_endpoint(&endpoint).await.is_none() {
+    loop {
+        if tokio::time::Instant::now() >= poll_deadline {
+            break;
+        }
+        if tokio::time::timeout_at(poll_deadline, worker.lock_current_endpoint(&endpoint))
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
             return false;
         }
-        let started = std::time::Instant::now();
+        let remaining = retry_budget.saturating_sub(poll_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = per_attempt.min(remaining);
+        let started = tokio::time::Instant::now();
+        let Some(attempt_deadline) = started.checked_add(attempt_timeout) else {
+            return false;
+        };
+        let attempt_deadline = attempt_deadline.min(poll_deadline);
+        if !admission.is_current() {
+            return false;
+        }
+        if tokio::time::Instant::now() >= attempt_deadline {
+            break;
+        }
+        attempts = attempts.saturating_add(1);
         let Some(outcome) = admission
-            .run(tokio::time::timeout(
-                per_attempt,
-                collect(endpoint.config.clone()),
+            .run(tokio::time::timeout_at(
+                attempt_deadline,
+                collect(endpoint.config.clone(), attempt_deadline),
             ))
             .await
         else {
             return false;
         };
-        let Some(endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
-            debug!(
-                worker = worker_id.as_str(),
-                "Discarding telemetry from replaced endpoint"
-            );
-            return false;
-        };
-        let Some(publication) = worker.lock_network_publication(&admission).await else {
-            return false;
-        };
-        match outcome {
+        let failure = match outcome {
             Ok(Ok(telemetry)) => {
-                debug!(
-                    worker = worker_id.as_str(),
-                    attempt,
-                    cpu = %telemetry.cpu.overall_percent,
-                    memory = %telemetry.memory.used_percent,
-                    "Telemetry collected via SSH"
-                );
-                store.ingest_for_endpoint(telemetry, TelemetrySource::SshPoll, &endpoint);
-                record_poll_command_outcome(&worker, worker_id, true, &config.circuit).await;
-                return true;
+                let collected = CollectedTelemetry {
+                    endpoint: endpoint.clone(),
+                    telemetry,
+                    received_at: Utc::now(),
+                    observed_at: tokio::time::Instant::now(),
+                    admission: admission.clone(),
+                    deadline: attempt_deadline,
+                };
+                match publish_telemetry_before(
+                    &worker,
+                    &store,
+                    &collected,
+                    TelemetrySource::SshPoll,
+                    Some(&config.circuit),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            worker = worker_id.as_str(),
+                            attempt = attempts,
+                            "Telemetry collected and published via SSH"
+                        );
+                        return true;
+                    }
+                    Err(error) => {
+                        if !admission.is_current() {
+                            return false;
+                        }
+                        if collected.observed_at < attempt_deadline {
+                            // A timely valid command result is not a worker
+                            // failure when local publication cannot complete.
+                            // Retain the previous cache/circuit evidence and
+                            // let the next poll retry with its own admission.
+                            warn!(
+                                worker = worker_id.as_str(),
+                                attempt = attempts,
+                                error = %error,
+                                "Telemetry collected on time but local publication failed"
+                            );
+                            return false;
+                        }
+                        PollAttemptFailure {
+                            attempt: attempts,
+                            transport,
+                            elapsed: started.elapsed(),
+                            error: format!("{error:#}"),
+                        }
+                    }
+                }
             }
-            Ok(Err(e)) => failures.push(PollAttemptFailure {
-                attempt,
+            Ok(Err(e)) => PollAttemptFailure {
+                attempt: attempts,
                 transport,
                 elapsed: started.elapsed(),
                 // The collector's errors carry exit code + stderr for
                 // command failures (see collect_telemetry_from_worker_pooled).
                 error: format!("{e:#}"),
-            }),
-            Err(_) => failures.push(PollAttemptFailure {
-                attempt,
+            },
+            Err(_) => PollAttemptFailure {
+                attempt: attempts,
                 transport,
                 elapsed: started.elapsed(),
-                error: format!("hard timeout after {per_attempt:?}"),
-            }),
+                error: format!("hard timeout after {attempt_timeout:?}"),
+            },
+        };
+        if failures.len() == MAX_TELEMETRY_FAILURE_DETAILS {
+            failures.remove(0);
         }
-        drop(publication);
-        drop(endpoint_guard);
-        if attempt < TELEMETRY_POLL_ATTEMPTS
-            && admission
-                .run(tokio::time::sleep(TELEMETRY_RETRY_BACKOFF))
-                .await
-                .is_none()
+        failures.push(failure);
+        let remaining = retry_budget.saturating_sub(poll_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        if admission
+            .run(tokio::time::sleep(TELEMETRY_RETRY_BACKOFF.min(remaining)))
+            .await
+            .is_none()
         {
             return false;
         }
     }
 
-    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
-        return false;
-    };
-    let Some(_publication) = worker.lock_network_publication(&admission).await else {
-        return false;
-    };
     warn!(
         worker = worker_id.as_str(),
-        attempts = TELEMETRY_POLL_ATTEMPTS,
+        attempts,
+        budget_s = retry_budget.as_secs_f64(),
         "Telemetry poll failed: {}",
         render_poll_failures(&failures)
     );
-    record_poll_command_outcome(&worker, worker_id, false, &config.circuit).await;
+    if attempts != 0
+        && let Some(deadline) = poll_deadline.checked_add(TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE)
+    {
+        record_poll_failure_before(
+            &worker,
+            &store,
+            &endpoint,
+            &admission,
+            poll_started,
+            deadline,
+            &config.circuit,
+        )
+        .await;
+    }
     false
 }
 
@@ -784,22 +1134,81 @@ where
 /// re-admitted it. Exhausting every poll attempt is therefore recorded as a
 /// command failure (blocks a half-open close; opens the circuit on its own
 /// threshold), and a successful poll clears that evidence.
-async fn record_poll_command_outcome(
+async fn record_poll_failure_before(
     worker: &WorkerState,
-    worker_id: &rch_common::WorkerId,
-    success: bool,
-    circuit: &rch_common::CircuitBreakerConfig,
-) {
-    let (previous, new) = worker.record_command_outcome(success, circuit).await;
+    store: &TelemetryStore,
+    endpoint: &WorkerEndpointSnapshot,
+    admission: &crate::workers::BackgroundProbe,
+    poll_started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    circuit_config: &rch_common::CircuitBreakerConfig,
+) -> bool {
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    let publication = async {
+        loop {
+            if tokio::time::Instant::now() >= deadline || !admission.is_current() {
+                return None;
+            }
+            let transition = {
+                let _endpoint = worker.lock_current_endpoint(endpoint).await?;
+                let _network = worker.lock_network_publication(admission).await?;
+                let mut circuit = worker.lock_command_outcome_before(deadline).await?;
+                let recent = match store.recent.try_read() {
+                    Ok(recent) => Some(recent),
+                    Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                };
+                if let Some(recent) = recent {
+                    if tokio::time::Instant::now() >= deadline || !admission.is_current() {
+                        return None;
+                    }
+                    // A successful sample observed during this poll supersedes
+                    // its failure. The monotonic receipt time is preserved
+                    // through handoff and cache contention.
+                    let superseded =
+                        recent
+                            .get(endpoint.config.id.as_str())
+                            .is_some_and(|entries| {
+                                entries.iter().any(|entry| {
+                                    entry.belongs_to(endpoint) && entry.observed_at >= poll_started
+                                })
+                            });
+                    if superseded
+                        || tokio::time::Instant::now() >= deadline
+                        || !admission.is_current()
+                    {
+                        return None;
+                    }
+                    let previous = circuit.state();
+                    let new = circuit.apply_command_outcome(false, circuit_config);
+                    Some((previous, new))
+                } else {
+                    None
+                }
+            };
+            if transition.is_some() {
+                return transition;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(Duration::from_millis(5).min(remaining)).await;
+        }
+    };
+    let Some((previous, new)) = tokio::time::timeout_at(deadline, publication)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
     if previous != new {
         info!(
-            worker = worker_id.as_str(),
-            "Worker circuit state: {:?} -> {:?} (telemetry poll {})",
-            previous,
-            new,
-            if success { "succeeded" } else { "exhausted" }
+            worker = endpoint.config.id.as_str(),
+            "Worker circuit state: {:?} -> {:?} (telemetry poll exhausted)", previous, new,
         );
     }
+    true
 }
 
 #[cfg(test)]
@@ -1246,6 +1655,756 @@ mod tests {
             tags: vec![],
             tools: Vec::new(),
         }
+    }
+
+    async fn assert_telemetry_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    struct HeldTelemetryCache {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldTelemetryCache {
+        fn new(store: Arc<TelemetryStore>) -> Self {
+            let (ready, acquired) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _cache = store.recent.write().unwrap_or_else(|e| e.into_inner());
+                ready.send(()).expect("cache lock receiver");
+                released
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test must release the cache lock");
+            });
+            acquired
+                .recv_timeout(Duration::from_secs(10))
+                .expect("cache lock acquisition");
+            Self {
+                release: Some(release),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for HeldTelemetryCache {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonblocking_endpoint_telemetry_distinguishes_contention_and_preserves_age() {
+        let worker = WorkerState::new(create_worker_config("recovery-cache"));
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        assert!(store.try_latest_for_endpoint(&endpoint).unwrap().is_none());
+        store.ingest_for_endpoint(
+            make_telemetry("recovery-cache", 42.0, 20.0),
+            TelemetrySource::SshPoll,
+            &endpoint,
+        );
+        let (before, observed_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+
+        let blocked = HeldTelemetryCache::new(store.clone());
+        assert!(matches!(
+            store.try_latest_for_endpoint(&endpoint),
+            Err(TelemetryCacheBusy)
+        ));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drop(blocked);
+
+        let (after, still_observed_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+        assert_eq!(after.received_at, before.received_at);
+        assert_eq!(after.telemetry.cpu.overall_percent, 42.0);
+        assert_eq!(still_observed_at, observed_at);
+        assert_eq!(still_observed_at.elapsed(), Duration::from_secs(20));
+
+        // Match the existing getter's poison-recovery policy; poisoning is
+        // not reported as contention and does not replace the stored clocks.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = store.recent.write().unwrap();
+            panic!("fixture poisons the telemetry cache");
+        }));
+        assert!(poisoned.is_err());
+        let (recovered, recovered_at) = store.try_latest_for_endpoint(&endpoint).unwrap().unwrap();
+        assert_eq!(recovered.received_at, before.received_at);
+        assert_eq!(recovered_at, observed_at);
+
+        let mut replacement = create_worker_config("recovery-cache");
+        replacement.host = "replacement.example".into();
+        assert!(worker.update_config(replacement).await);
+        let replacement = worker.endpoint_snapshot().await;
+        assert!(
+            store
+                .try_latest_for_endpoint(&replacement)
+                .unwrap()
+                .is_none(),
+            "an old endpoint sample cannot qualify the replacement"
+        );
+    }
+
+    async fn test_collected_telemetry(
+        worker: &WorkerState,
+        cpu: f64,
+        allowance: Duration,
+    ) -> CollectedTelemetry {
+        let endpoint = worker.endpoint_snapshot().await;
+        let admission = worker.background_probe().await.unwrap();
+        CollectedTelemetry {
+            telemetry: make_telemetry(endpoint.config.id.as_str(), cpu, 20.0),
+            received_at: Utc::now(),
+            observed_at: tokio::time::Instant::now(),
+            endpoint,
+            admission,
+            deadline: tokio::time::Instant::now() + allowance,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_telemetry_bounds_admission_and_never_starts_after_expiry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let worker = WorkerState::new(create_worker_config("queued-on-demand"));
+        let invoked = AtomicBool::new(false);
+        assert!(
+            collect_telemetry_from_worker_with(&worker, Duration::ZERO, |_, _, _| {
+                invoked.store(true, Ordering::SeqCst);
+                std::future::ready(Ok(make_telemetry("queued-on-demand", 10.0, 20.0)))
+            })
+            .await
+            .is_err()
+        );
+        assert!(!invoked.load(Ordering::SeqCst));
+
+        for timeout in [Duration::from_secs(1), Duration::MAX] {
+            let blocked = worker.config.write().await;
+            let budget = scale_duration(timeout)
+                .saturating_mul(2)
+                .saturating_add(Duration::from_secs(1))
+                .min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+            let mut collection = Box::pin(collect_telemetry_from_worker_with(
+                &worker,
+                timeout,
+                |_, _, _| {
+                    invoked.store(true, Ordering::SeqCst);
+                    std::future::ready(Ok(make_telemetry("queued-on-demand", 10.0, 20.0)))
+                },
+            ));
+            assert_telemetry_pending(collection.as_mut()).await;
+            tokio::time::advance(budget).await;
+            drop(blocked);
+            assert!(collection.await.is_err());
+            assert!(!invoked.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_telemetry_preserves_receipt_time_across_handoff() {
+        let worker = WorkerState::new(create_worker_config("receipt-time"));
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let circuit = rch_common::CircuitBreakerConfig::default();
+        worker.record_command_outcome(false, &circuit).await;
+        let began = tokio::time::Instant::now();
+        let phase = scale_duration(Duration::from_secs(10));
+        let budget = phase
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(1))
+            .min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+        let collected = collect_telemetry_from_worker_with(
+            &worker,
+            Duration::from_secs(10),
+            |endpoint, timeout, deadline| async move {
+                assert_eq!(timeout, phase, "the phase must be scaled exactly once");
+                assert_eq!(deadline, began + budget);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(make_telemetry(endpoint.id.as_str(), 42.0, 20.0))
+            },
+        )
+        .await
+        .unwrap();
+        let received_at = collected.received_at;
+        let observed_at = collected.observed_at;
+        assert_eq!(observed_at, began + Duration::from_secs(1));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let telemetry = publish_collected_telemetry(&worker, &store, collected)
+            .await
+            .unwrap();
+        assert_eq!(telemetry.cpu.overall_percent, 42.0);
+        assert_eq!(
+            store.latest("receipt-time").unwrap().received_at,
+            received_at
+        );
+        assert_eq!(
+            store.recent.read().unwrap()["receipt-time"]
+                .back()
+                .unwrap()
+                .observed_at,
+            observed_at
+        );
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            1,
+            "on-demand collection does not rewrite periodic command evidence"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_publication_rejects_expired_circuit_wait_and_recovers() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let worker = WorkerState::new(create_worker_config("queued-publication"));
+            let store = TelemetryStore::new(Duration::from_secs(300), None);
+            let circuit = rch_common::CircuitBreakerConfig::default();
+            worker.record_command_outcome(false, &circuit).await;
+            let endpoint = worker.endpoint_snapshot().await;
+            store.ingest_for_endpoint(
+                make_telemetry("queued-publication", 10.0, 20.0),
+                TelemetrySource::SshPoll,
+                &endpoint,
+            );
+            let allowance = Duration::from_secs(2);
+            let collected = test_collected_telemetry(&worker, 90.0, allowance).await;
+            let blocked = worker
+                .lock_command_outcome_before(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await
+                .unwrap();
+            let mut publication = Box::pin(publish_telemetry_before(
+                &worker,
+                &store,
+                &collected,
+                TelemetrySource::SshPoll,
+                Some(&circuit),
+            ));
+            assert_telemetry_pending(publication.as_mut()).await;
+            tokio::time::advance(allowance + lateness).await;
+            drop(blocked);
+            assert!(publication.await.is_err());
+            assert_eq!(
+                store
+                    .latest("queued-publication")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
+                10.0
+            );
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1
+            );
+
+            let fresh = test_collected_telemetry(&worker, 20.0, allowance).await;
+            publish_telemetry_before(
+                &worker,
+                &store,
+                &fresh,
+                TelemetrySource::SshPoll,
+                Some(&circuit),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .latest("queued-publication")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
+                20.0
+            );
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timely_telemetry_with_blocked_publication_retains_evidence_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for destination in ["cache", "circuit"] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let worker = Arc::new(WorkerState::new(create_worker_config("local-contention")));
+                let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+                let config = TelemetryPollerConfig {
+                    ssh_timeout: Duration::from_secs(1),
+                    ..TelemetryPollerConfig::default()
+                };
+                worker.record_command_outcome(false, &config.circuit).await;
+                let endpoint = worker.endpoint_snapshot().await;
+                store.ingest_for_endpoint(
+                    make_telemetry("local-contention", 10.0, 20.0),
+                    TelemetrySource::SshPoll,
+                    &endpoint,
+                );
+                let previous = store.latest("local-contention").unwrap();
+                // Ensure the previous sample cannot supersede this poll's
+                // failure merely because paused receipt times are equal.
+                tokio::time::advance(Duration::from_millis(1)).await;
+                let blocked_circuit = if destination == "circuit" {
+                    Some(
+                        worker
+                            .lock_command_outcome_before(
+                                tokio::time::Instant::now() + Duration::from_secs(1),
+                            )
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let blocked_cache =
+                    (destination == "cache").then(|| HeldTelemetryCache::new(store.clone()));
+                let attempts = AtomicUsize::new(0);
+                let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
+                let started = tokio::time::Instant::now();
+                let mut poll = Box::pin(poll_worker_with(
+                    worker.clone(),
+                    store.clone(),
+                    config.clone(),
+                    "local-publication-test",
+                    |endpoint| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(make_telemetry(endpoint.id.as_str(), 90.0, 20.0)))
+                    },
+                ));
+                assert_telemetry_pending(poll.as_mut()).await;
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                tokio::time::advance(per_attempt + lateness).await;
+                drop(blocked_circuit);
+                drop(blocked_cache);
+                assert!(!poll.await, "{destination}: expired local publication");
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(started.elapsed(), per_attempt + lateness);
+                let retained = store.latest("local-contention").unwrap();
+                assert_eq!(retained.received_at, previous.received_at);
+                assert_eq!(retained.telemetry.cpu.overall_percent, 10.0);
+                assert_eq!(
+                    worker.circuit_stats().await.consecutive_command_failures(),
+                    1,
+                    "{destination}: local contention must not penalize the worker",
+                );
+
+                assert!(
+                    poll_worker_with(
+                        worker.clone(),
+                        store.clone(),
+                        config,
+                        "fresh-publication-test",
+                        |endpoint| {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            std::future::ready(Ok(make_telemetry(endpoint.id.as_str(), 20.0, 20.0)))
+                        },
+                    )
+                    .await
+                );
+                assert_eq!(attempts.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    store
+                        .latest("local-contention")
+                        .unwrap()
+                        .telemetry
+                        .cpu
+                        .overall_percent,
+                    20.0
+                );
+                assert_eq!(
+                    worker.circuit_stats().await.consecutive_command_failures(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_cache_contention_expires_or_cancels_without_partial_publication() {
+        for action in ["expire", "disable", "drop"] {
+            let worker = WorkerState::new(create_worker_config("busy-cache"));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let circuit = rch_common::CircuitBreakerConfig::default();
+            worker.record_command_outcome(false, &circuit).await;
+            store.ingest(
+                make_telemetry("busy-cache", 10.0, 20.0),
+                TelemetrySource::SshPoll,
+            );
+            let allowance = Duration::from_secs(2);
+            let collected = test_collected_telemetry(&worker, 90.0, allowance).await;
+            let blocked = HeldTelemetryCache::new(store.clone());
+            let mut publication = Box::pin(publish_collected_telemetry(&worker, &store, collected));
+            assert_telemetry_pending(publication.as_mut()).await;
+            match action {
+                "expire" => {
+                    tokio::time::advance(allowance).await;
+                    assert!(publication.await.is_err());
+                }
+                "disable" => {
+                    tokio::time::timeout(
+                        Duration::from_millis(10),
+                        worker.disable(Some("maintenance".into())),
+                    )
+                    .await
+                    .expect("cache backoff must release administrative guards");
+                    assert!(publication.await.is_err());
+                }
+                "drop" => drop(publication),
+                _ => unreachable!(),
+            }
+            drop(blocked);
+            assert_eq!(
+                store
+                    .latest("busy-cache")
+                    .unwrap()
+                    .telemetry
+                    .cpu
+                    .overall_percent,
+                10.0
+            );
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_poll_failure_has_only_a_bounded_local_publication_window() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let worker = WorkerState::new(create_worker_config("queued-failure"));
+            let store = TelemetryStore::new(Duration::from_secs(300), None);
+            let circuit = rch_common::CircuitBreakerConfig::default();
+            let endpoint = worker.endpoint_snapshot().await;
+            let admission = worker.background_probe().await.unwrap();
+            let poll_started = tokio::time::Instant::now();
+            let blocked = worker
+                .lock_command_outcome_before(poll_started + Duration::from_secs(30))
+                .await
+                .unwrap();
+            let deadline = poll_started + TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE;
+            let mut publication = Box::pin(record_poll_failure_before(
+                &worker,
+                &store,
+                &endpoint,
+                &admission,
+                poll_started,
+                deadline,
+                &circuit,
+            ));
+            assert_telemetry_pending(publication.as_mut()).await;
+            tokio::time::advance(TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE + lateness).await;
+            drop(blocked);
+            assert!(!publication.await);
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                0
+            );
+            assert!(
+                record_poll_failure_before(
+                    &worker,
+                    &store,
+                    &endpoint,
+                    &admission,
+                    poll_started,
+                    tokio::time::Instant::now() + TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE,
+                    &circuit,
+                )
+                .await
+            );
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_older_failed_poll_cannot_replace_newer_success_evidence() {
+        let worker = WorkerState::new(create_worker_config("superseded-failure"));
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let circuit = rch_common::CircuitBreakerConfig::default();
+        let endpoint = worker.endpoint_snapshot().await;
+        let admission = worker.background_probe().await.unwrap();
+        let poll_started = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let collected = test_collected_telemetry(&worker, 42.0, Duration::from_secs(2)).await;
+        publish_telemetry_before(
+            &worker,
+            &store,
+            &collected,
+            TelemetrySource::SshPoll,
+            Some(&circuit),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !record_poll_failure_before(
+                &worker,
+                &store,
+                &endpoint,
+                &admission,
+                poll_started,
+                tokio::time::Instant::now() + TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE,
+                &circuit,
+            )
+            .await
+        );
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+        assert_eq!(
+            store
+                .latest("superseded-failure")
+                .unwrap()
+                .telemetry
+                .cpu
+                .overall_percent,
+            42.0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_poll_cache_backoff_does_not_block_administrative_cancellation() {
+        let worker = WorkerState::new(create_worker_config("cancel-failure"));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let circuit = rch_common::CircuitBreakerConfig::default();
+        let endpoint = worker.endpoint_snapshot().await;
+        let admission = worker.background_probe().await.unwrap();
+        let poll_started = tokio::time::Instant::now();
+        let blocked = HeldTelemetryCache::new(store.clone());
+        let mut publication = Box::pin(record_poll_failure_before(
+            &worker,
+            &store,
+            &endpoint,
+            &admission,
+            poll_started,
+            poll_started + TELEMETRY_FAILURE_PUBLICATION_ALLOWANCE,
+            &circuit,
+        ));
+        assert_telemetry_pending(publication.as_mut()).await;
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            worker.disable(Some("maintenance".into())),
+        )
+        .await
+        .expect("failure cache backoff must release administrative guards");
+        assert!(!publication.await);
+        drop(blocked);
+        assert!(store.latest("cancel-failure").is_none());
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+    }
+
+    #[test]
+    fn telemetry_retry_budget_preserves_full_attempt_allowance_without_overflow() {
+        assert_eq!(
+            poll_retry_budget(Duration::from_secs(20)),
+            Duration::from_millis(51_500)
+        );
+        assert_eq!(poll_hard_timeout(Duration::MAX), Duration::MAX);
+        assert_eq!(poll_retry_budget(Duration::MAX), Duration::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_at_deadline_never_refreshes_or_clears_failure_evidence() {
+        for ssh_timeout in [Duration::from_secs(20), Duration::MAX] {
+            let worker = Arc::new(WorkerState::new(create_worker_config("late-poll")));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let config = TelemetryPollerConfig {
+                ssh_timeout,
+                ..TelemetryPollerConfig::default()
+            };
+            let per_attempt = scale_duration(poll_hard_timeout(ssh_timeout));
+            let budget = scale_duration(poll_retry_budget(ssh_timeout));
+            let started = tokio::time::Instant::now();
+            let success = poll_worker_with(
+                worker.clone(),
+                store.clone(),
+                config,
+                "late-test-transport",
+                |endpoint| async move {
+                    tokio::time::sleep(per_attempt).await;
+                    Ok(make_telemetry(endpoint.id.as_str(), 90.0, 90.0))
+                },
+            )
+            .await;
+            assert!(!success, "a deadline-boundary result was published");
+            assert_eq!(started.elapsed(), budget);
+            assert!(store.latest("late-poll").is_none());
+            assert!(store.last_received_at("late-poll").is_none());
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1,
+                "the exhausted poll must retain command-failure evidence"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_can_recover_with_timely_evidence_after_a_late_attempt() {
+        let worker = Arc::new(WorkerState::new(create_worker_config("late-then-ready")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let config = TelemetryPollerConfig::default();
+        let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
+        let budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let success = poll_worker_with(
+            worker.clone(),
+            store.clone(),
+            config,
+            "recovered-test-transport",
+            |endpoint| {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt == 1 {
+                        tokio::time::sleep(per_attempt).await;
+                    }
+                    Ok(make_telemetry(
+                        endpoint.id.as_str(),
+                        if attempt == 1 { 90.0 } else { 10.0 },
+                        20.0,
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(success);
+        assert_eq!(attempts, 2, "late data must not end the poll successfully");
+        assert!(started.elapsed() < budget);
+        let received = store.latest("late-then-ready").unwrap();
+        assert!((received.telemetry.cpu.overall_percent - 10.0).abs() < f64::EPSILON);
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_recovers_after_more_than_two_transient_failures() {
+        let worker = Arc::new(WorkerState::new(create_worker_config("busy-poll")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        assert!(
+            poll_worker_with(
+                worker.clone(),
+                store.clone(),
+                TelemetryPollerConfig::default(),
+                "busy-test-transport",
+                |endpoint| {
+                    attempts += 1;
+                    std::future::ready(if attempts <= 2 {
+                        Err(anyhow::anyhow!("SSH temporarily busy"))
+                    } else {
+                        Ok(make_telemetry(endpoint.id.as_str(), 10.0, 20.0))
+                    })
+                },
+            )
+            .await
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(started.elapsed(), TELEMETRY_RETRY_BACKOFF * 2);
+        assert!(store.latest("busy-poll").is_some());
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_hung_and_fast_failures_share_one_elapsed_budget() {
+        for hung in [false, true] {
+            let worker = Arc::new(WorkerState::new(create_worker_config("exhausted-poll")));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let config = TelemetryPollerConfig::default();
+            let budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+            let started = tokio::time::Instant::now();
+            let mut attempts = 0;
+            assert!(
+                !poll_worker_with(
+                    worker.clone(),
+                    store.clone(),
+                    config,
+                    "failing-test-transport",
+                    |_| {
+                        attempts += 1;
+                        async move {
+                            if hung {
+                                std::future::pending().await
+                            } else {
+                                Err(anyhow::anyhow!("SSH remains unavailable"))
+                            }
+                        }
+                    },
+                )
+                .await
+            );
+            assert!(attempts >= 2);
+            if !hung {
+                assert!(attempts > 2, "fast failures must use the remaining budget");
+            }
+            assert!(started.elapsed() >= budget);
+            assert!(started.elapsed() <= budget + Duration::from_millis(1));
+            assert!(store.latest("exhausted-poll").is_none());
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1,
+                "a whole exhausted poll contributes one command failure"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_during_telemetry_backoff_cancels_future_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let worker = Arc::new(WorkerState::new(create_worker_config("backoff-poll")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let worker = worker.clone();
+            let store = store.clone();
+            let started = started.clone();
+            let attempts = attempts.clone();
+            tokio::spawn(async move {
+                poll_worker_with(
+                    worker,
+                    store,
+                    TelemetryPollerConfig::default(),
+                    "retry-test-transport",
+                    move |_| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        std::future::ready(Err(anyhow::anyhow!("retryable SSH failure")))
+                    },
+                )
+                .await
+            })
+        };
+        started.notified().await;
+        worker.disable(Some("maintenance".into())).await;
+        assert!(!task.await.unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(store.latest("backoff-poll").is_none());
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0,
+            "administrative cancellation must not publish failure evidence"
+        );
     }
 
     #[tokio::test]

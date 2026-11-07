@@ -44,6 +44,9 @@
 //! rabs-cas's H015 crash matrix.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1271,7 +1274,7 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
     // The first path in RABS by which a cache hit becomes files on disk
     // (bd-iy2e0): gate -> reload the committed manifest from CAS bytes
     // -> materialize its outputs into a live worktree.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::private_tempdir();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord
@@ -1279,7 +1282,8 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
         .expect("authority");
 
     // The artifact a worker produced, really in the byte store.
-    let artifact = b"the compiled rlib bytes a worker uploaded".repeat(64);
+    let artifact =
+        test_util::closed_rlib_fixture(&b"the compiled rlib bytes a worker uploaded".repeat(64));
     let object = {
         let mut store = cas.store().lock().expect("store lock");
         let declared = digest_set(&artifact, DigestRequest::default(), None)
@@ -1295,6 +1299,7 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
             DurabilityPolicy::FULL,
         )
         .expect("put artifact");
+        test_util::record_rlib_fixture_closure(&mut *store, &declared, &artifact);
         ObjectId(declared)
     };
 
@@ -1400,7 +1405,8 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
     let authority = bootstrap
         .acquire_boot_authority(&cluster_id())
         .expect("authority");
-    let artifact = b"the compiled rlib bytes a worker uploaded".repeat(64);
+    let artifact =
+        test_util::closed_rlib_fixture(&b"the compiled rlib bytes a worker uploaded".repeat(64));
     let object = {
         let mut store = cas.store().lock().expect("store lock");
         let declared = digest_set(&artifact, DigestRequest::default(), None)
@@ -1416,6 +1422,7 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
             DurabilityPolicy::FULL,
         )
         .expect("put artifact");
+        test_util::record_rlib_fixture_closure(&mut *store, &declared, &artifact);
         ObjectId(declared)
     };
     let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
@@ -1670,7 +1677,7 @@ fn a_hit_whose_outputs_differ_from_the_callers_work_is_refused() {
         .acquire_boot_authority(&cluster_id())
         .expect("authority");
 
-    let artifact = b"a committed rlib".to_vec();
+    let artifact = test_util::closed_rlib_fixture(b"a committed rlib");
     let object = {
         let mut store = cas.store().lock().expect("store lock");
         let declared = digest_set(&artifact, DigestRequest::default(), None)
@@ -1686,6 +1693,7 @@ fn a_hit_whose_outputs_differ_from_the_callers_work_is_refused() {
             DurabilityPolicy::FULL,
         )
         .expect("put artifact");
+        test_util::record_rlib_fixture_closure(&mut *store, &declared, &artifact);
         ObjectId(declared)
     };
     let (offer, manifest_bytes) = offer_serving_object(&authority, &object);

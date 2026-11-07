@@ -14,6 +14,10 @@ use rch_common::{
 use rch_common::{SshClient, SshOptions};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::source_topology_probe;
+#[cfg(any(unix, test))]
+use crate::source_topology_probe::{SourceTopologyOutcome, SourceTopologyProbe};
 use crate::status_types::{
     DaemonFullStatusResponse, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
     SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
@@ -76,7 +80,7 @@ fn format_named_tool_matrix(capabilities: &WorkerCapabilities) -> String {
 }
 
 #[cfg(unix)]
-async fn probe_connected_worker_capabilities(client: &mut SshClient) -> Result<WorkerCapabilities> {
+async fn probe_connected_worker_capabilities(client: &SshClient) -> Result<WorkerCapabilities> {
     let output = client
         .execute("if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities; else ~/.local/bin/rch-wkr capabilities; fi")
         .await
@@ -89,6 +93,46 @@ async fn probe_connected_worker_capabilities(client: &mut SshClient) -> Result<W
         );
     }
     serde_json::from_str(&output.stdout).context("worker capability JSON was invalid")
+}
+
+#[cfg(any(unix, test))]
+fn probe_readiness(
+    capability_error: Option<&str>,
+    missing_components: &[String],
+    declared_toolchain: Option<&str>,
+    topology: &SourceTopologyProbe,
+) -> (String, Option<String>, Option<String>) {
+    if topology.outcome.is_defect() || topology.outcome == SourceTopologyOutcome::Unavailable {
+        let status = if topology.outcome.is_defect() {
+            "topology_incompatible"
+        } else {
+            "topology_unknown"
+        };
+        return (
+            status.to_string(),
+            Some(topology.describe()),
+            Some(ErrorCode::WorkerHealthCheckFailed.code_string()),
+        );
+    }
+    if let Some(error) = capability_error {
+        (
+            "capability_unknown".to_string(),
+            Some(error.to_string()),
+            Some(ErrorCode::WorkerMissingToolchain.code_string()),
+        )
+    } else if !missing_components.is_empty() {
+        let toolchain = declared_toolchain.unwrap_or("<unknown>");
+        (
+            "capability_missing".to_string(),
+            Some(format!(
+                "missing rustup component(s) for {toolchain}: {}",
+                missing_components.join(", ")
+            )),
+            Some(ErrorCode::WorkerMissingToolchain.code_string()),
+        )
+    } else {
+        ("ok".to_string(), None, None)
+    }
 }
 
 fn missing_declared_components(
@@ -1053,6 +1097,7 @@ pub async fn workers_probe(
     }
 
     let daemon_status = query_worker_disk_status().await;
+    let requested_topology = source_topology_probe::load_requested_topology();
     let mut results = Vec::new();
 
     if !ctx.is_json() {
@@ -1088,8 +1133,14 @@ pub async fn workers_probe(
                     Ok(true) => {
                         let latency =
                             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        let capability_result =
-                            probe_connected_worker_capabilities(&mut client).await;
+                        let (capability_result, source_topology) = tokio::join!(
+                            probe_connected_worker_capabilities(&client),
+                            source_topology_probe::probe_connected(
+                                &client,
+                                worker,
+                                &requested_topology,
+                            ),
+                        );
                         let capabilities = capability_result.as_ref().ok().cloned();
                         let disk = disk_info_from_probe(capabilities.as_ref(), daemon_worker);
                         let missing_components = capabilities.as_ref().map_or_else(
@@ -1104,25 +1155,12 @@ pub async fn workers_probe(
                         );
                         let capability_error =
                             capability_result.as_ref().err().map(ToString::to_string);
-                        let (status, error, error_code) = if let Some(error) = capability_error {
-                            (
-                                "capability_unknown".to_string(),
-                                Some(error),
-                                Some(ErrorCode::WorkerMissingToolchain.code_string()),
-                            )
-                        } else if !missing_components.is_empty() {
-                            let toolchain = declared_toolchain.as_deref().unwrap_or("<unknown>");
-                            (
-                                "capability_missing".to_string(),
-                                Some(format!(
-                                    "missing rustup component(s) for {toolchain}: {}",
-                                    missing_components.join(", ")
-                                )),
-                                Some(ErrorCode::WorkerMissingToolchain.code_string()),
-                            )
-                        } else {
-                            ("ok".to_string(), None, None)
-                        };
+                        let (status, error, error_code) = probe_readiness(
+                            capability_error.as_deref(),
+                            &missing_components,
+                            declared_toolchain.as_deref(),
+                            &source_topology,
+                        );
                         results.push(WorkerProbeResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),
@@ -1131,6 +1169,7 @@ pub async fn workers_probe(
                             error: error.clone(),
                             error_code: error_code.clone(),
                             capabilities: capabilities.clone(),
+                            source_topology: Some(source_topology.clone()),
                             missing_components: missing_components.clone(),
                             disk: disk.clone(),
                         });
@@ -1143,10 +1182,15 @@ pub async fn workers_probe(
                                     format_worker_disk(&disk)
                                 );
                             } else {
+                                let label = match status.as_str() {
+                                    "topology_incompatible" => "TOPOLOGY_INCOMPATIBLE",
+                                    "topology_unknown" => "TOPOLOGY_UNKNOWN",
+                                    "capability_unknown" => "CAPABILITY_UNKNOWN",
+                                    _ => "CAPABILITY_MISSING",
+                                };
                                 println!(
                                     "{} ({}ms) [{}]  {}",
-                                    StatusIndicator::Warning
-                                        .with_label(style, "CAPABILITY_MISSING"),
+                                    StatusIndicator::Warning.with_label(style, label),
                                     style.muted(&latency.to_string()),
                                     style.highlight(error_code.as_deref().unwrap_or("RCH-E205")),
                                     format_worker_disk(&disk)
@@ -1155,6 +1199,11 @@ pub async fn workers_probe(
                                     println!("    {}", style.warning(error));
                                 }
                             }
+                            println!(
+                                "    {} {}",
+                                style.key("Source namespace:"),
+                                style.value(&source_topology.describe())
+                            );
                             if let Some(capabilities) = capabilities.as_ref() {
                                 println!(
                                     "    {} {}",
@@ -1189,6 +1238,7 @@ pub async fn workers_probe(
                             error: Some("Health check failed".to_string()),
                             error_code: Some(code),
                             capabilities: None,
+                            source_topology: None,
                             missing_components: Vec::new(),
                             disk: disk_info_from_probe(None, daemon_worker),
                         });
@@ -1212,6 +1262,7 @@ pub async fn workers_probe(
                             error: Some(report.clone()),
                             error_code: Some(code.clone()),
                             capabilities: None,
+                            source_topology: None,
                             missing_components: Vec::new(),
                             disk: disk_info_from_probe(None, daemon_worker),
                         });
@@ -1240,6 +1291,7 @@ pub async fn workers_probe(
                     error: Some(report.clone()),
                     error_code: Some(code.clone()),
                     capabilities: None,
+                    source_topology: None,
                     missing_components: Vec::new(),
                     disk: disk_info_from_probe(None, daemon_worker),
                 });
@@ -1279,7 +1331,7 @@ pub(crate) fn summarize_probe_results(results: &[WorkerProbeResult]) -> WorkerPr
     for result in results {
         match result.status.as_str() {
             "ok" | "healthy" => summary.healthy += 1,
-            "unhealthy" => summary.unhealthy += 1,
+            "unhealthy" | "topology_incompatible" => summary.unhealthy += 1,
             "capability_missing" | "capability_unknown" => summary.capability_missing += 1,
             _ => summary.failed += 1,
         }
@@ -2193,9 +2245,95 @@ mod probe_summary_tests {
             error: error.map(String::from),
             error_code: error_code.map(String::from),
             capabilities: None,
+            source_topology: None,
             missing_components: Vec::new(),
             disk: WorkerDiskInfo::default(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_namespace_conflict_overrides_healthy_worker_defaults_in_probe_json() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().join("worker-projects");
+        let canonical = fixture.path().join("dispatcher-projects");
+        let alias = fixture.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::create_dir(&canonical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let physical_resolved = std::fs::canonicalize(&physical).unwrap();
+        let requested = rch_common::SourceTopology {
+            canonical_root: canonical.to_str().unwrap().to_string(),
+            alias_root: alias.to_str().unwrap().to_string(),
+        };
+        let topology = source_topology_probe::probe_local_for_test(&requested, fixture.path());
+        let (status, error, error_code) = probe_readiness(None, &[], None, &topology);
+        assert_eq!(status, "topology_incompatible");
+        let mut result = mk(&status, error_code.as_deref(), error.as_deref());
+        result.capabilities = Some(WorkerCapabilities {
+            projects_root_ok: Some(true),
+            projects_root_topology: Some(rch_common::SourceTopology {
+                canonical_root: physical.to_str().unwrap().to_string(),
+                alias_root: requested.alias_root.clone(),
+            }),
+            ..Default::default()
+        });
+        result.source_topology = Some(topology);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["capabilities"]["projects_root_ok"], true);
+        assert_eq!(json["source_topology"]["outcome"], "conflicting_alias_base");
+        assert_eq!(
+            json["source_topology"]["topology"]["canonical_root"],
+            requested.canonical_root
+        );
+        assert_eq!(
+            json["source_topology"]["alias_physical"],
+            physical_resolved.to_str().unwrap()
+        );
+        let summary = summarize_probe_results(&[result]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.unhealthy, 1);
+        assert_eq!(summary.by_error_code.get("RCH-E202"), Some(&1));
+
+        // A matching dispatcher mapping on this same worker remains ready.
+        let matching = rch_common::SourceTopology {
+            canonical_root: physical.to_str().unwrap().to_string(),
+            alias_root: requested.alias_root,
+        };
+        let probe = source_topology_probe::probe_local_for_test(&matching, fixture.path());
+        assert_eq!(
+            probe_readiness(None, &[], None, &probe),
+            ("ok".to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn unavailable_namespace_cannot_report_a_healthy_worker() {
+        let probe = SourceTopologyProbe::unavailable(None, "dispatcher config is invalid");
+        let (status, error, error_code) = probe_readiness(None, &[], None, &probe);
+        assert_eq!(status, "topology_unknown");
+        assert!(
+            error
+                .as_deref()
+                .unwrap()
+                .contains("dispatcher config is invalid")
+        );
+        let result = mk(&status, error_code.as_deref(), error.as_deref());
+        let summary = summarize_probe_results(&[result]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn skipped_namespace_does_not_hide_missing_runtime_capabilities() {
+        let mut probe = SourceTopologyProbe::unavailable(None, "Windows single-root layout");
+        probe.outcome = SourceTopologyOutcome::Skipped;
+        let (status, _, _) =
+            probe_readiness(None, &["rust-src".to_string()], Some("nightly"), &probe);
+        assert_eq!(status, "capability_missing");
+        let (status, _, _) = probe_readiness(Some("capability command failed"), &[], None, &probe);
+        assert_eq!(status, "capability_unknown");
     }
 
     #[test]

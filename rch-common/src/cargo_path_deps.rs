@@ -923,6 +923,7 @@ impl<'a> SelectedCargoTree<'a> {
                         if path.parent() == Some(candidate.as_path())
                             && let Some(name) = path.file_name().and_then(|name| name.to_str())
                             && wildcard_match(&component, name)
+                            && !matches!(self.entries.get(path), Some(SelectedCargoEntry::File(_)))
                         {
                             next.insert(self.resolve(&candidate, name)?);
                         }
@@ -3892,7 +3893,7 @@ fn expand_member_pattern(base: &Path, pattern: &str) -> Result<Vec<PathBuf>, std
                     let Some(file_name) = file_name.to_str() else {
                         continue;
                     };
-                    if wildcard_match(segment, file_name) {
+                    if wildcard_match(segment, file_name) && !entry.file_type()?.is_file() {
                         next_candidates.push(entry.path());
                     }
                 }
@@ -4178,6 +4179,8 @@ mod tests {
             ),
             ("crates/app/src/lib.rs", ""),
             ("crates/dep/Cargo.toml", "[package]\nname='dep'\n"),
+            ("crates/.DS_Store", "ignored Finder metadata"),
+            ("crates/README.md", "workspace documentation"),
         ]);
         validate_selected_cargo_tree(&entries).unwrap();
         assert_eq!(
@@ -4185,6 +4188,17 @@ mod tests {
                 .unwrap(),
             Path::new("crates/dep/Cargo.toml")
         );
+        for literal in ["crates/.DS_Store", "crates/README.md"] {
+            let mut explicit = entries.clone();
+            explicit.insert(
+                PathBuf::from("Cargo.toml"),
+                SelectedCargoEntry::File(Some(format!("[workspace]\nmembers=['{literal}']\n"))),
+            );
+            assert!(
+                validate_selected_cargo_tree(&explicit).is_err(),
+                "an explicitly named file must remain an invalid workspace member"
+            );
+        }
     }
 
     #[test]
@@ -5099,6 +5113,38 @@ mod tests {
         let manifest = workspace.join("Cargo.toml");
         let policy = fixture.policy();
         let expected = BTreeSet::from([app.canonicalize().unwrap(), probe.canonicalize().unwrap()]);
+        for package in [&app, &probe] {
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(package.join("src/lib.rs"), "").unwrap();
+        }
+        for file in [".DS_Store", "README.md"] {
+            fs::write(workspace.join("crates").join(file), "workspace data").unwrap();
+        }
+        let cargo_metadata = || {
+            Command::new("cargo")
+                .args(["metadata", "--offline", "--no-deps", "--format-version=1"])
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .env("CARGO_HOME", fixture.root.join("cargo-home"))
+                .output()
+                .expect("run real Cargo workspace glob oracle")
+        };
+        let oracle = cargo_metadata();
+        assert!(
+            oracle.status.success(),
+            "Cargo accepts regular data files beside glob members: {}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&oracle.stdout).unwrap();
+        assert_eq!(metadata["workspace_members"].as_array().unwrap().len(), 2);
+        for literal in ["crates/.DS_Store", "crates/README.md"] {
+            let error = expand_workspace_members(&workspace, &[literal.into()], &[], &manifest)
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &CargoPathDependencyErrorKind::MissingPathDependency
+            );
+        }
 
         let graph = resolve_from_manifest_fallback(&manifest, &policy).unwrap();
         assert_eq!(
@@ -5139,6 +5185,13 @@ mod tests {
         // The error names the canonical path (macOS tempdirs live under the
         // /var -> /private/var symlink).
         let missing_manifest = missing.canonicalize().unwrap().join("Cargo.toml");
+        let oracle = cargo_metadata();
+        assert_eq!(
+            oracle.status.code(),
+            Some(101),
+            "a matched directory with no manifest must still fail Cargo: {}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
         assert!(
             error
                 .dependency_path()

@@ -12,8 +12,11 @@ import concurrent.futures
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
+import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -22,21 +25,48 @@ import tempfile
 import time
 import uuid
 
+def parse_timing_scale(value):
+    """Validate transported policy before forking or admitting any workload."""
+    if (not isinstance(value, str) or len(value) > 128
+            or re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) is None):
+        raise ValueError("RCH_TIMING_SCALE must be a finite number in [1, 10]")
+    scale = float(value)
+    if not math.isfinite(scale) or not 1.0 <= scale <= 10.0:
+        raise ValueError("RCH_TIMING_SCALE must be a finite number in [1, 10]")
+    return scale
+
+
+TIMING_SCALE = parse_timing_scale(os.environ.get("RCH_TIMING_SCALE", "1"))
 POLL_SECONDS = 0.25
-FREE_SAMPLE_DEADLINE = 1.0
+FREE_SAMPLE_DEADLINE = 1.0 * TIMING_SCALE
 SCAN_INTERVAL = 2.0
-SCAN_DEADLINE = 30.0
-HEARTBEAT_DEADLINE = 3.0
+SCAN_DEADLINE = 30.0 * TIMING_SCALE
+HEARTBEAT_DEADLINE = 3.0 * TIMING_SCALE
+RESERVATION_LOCK_DEADLINE = 2.0 * TIMING_SCALE
+ADMISSION_DEADLINE = 5.0 * TIMING_SCALE
+FINALIZATION_DEADLINE = 2.0 * TIMING_SCALE
+BOOTSTRAP_ALLOWANCE = 10.0 * TIMING_SCALE
 EXIT_BUDGET = 120
 MAX_LEDGER_BYTES = 2 * 1024 * 1024
 MAX_RECEIPT_BYTES = 8192
+# Extra learning metadata is bounded independently of the existing output
+# scan. Oversized or changing trees still receive the ordinary disk guards;
+# they simply cannot attest a smaller, pool-dependent reservation.
+MAX_INCREMENTAL_ENTRIES = 100_000
+# A worker's shared Cargo cache can hold 600,000 entries, and one cold walk took
+# 30 seconds on an idle worker. Every build walks its outputs each SCAN_INTERVAL
+# under SCAN_DEADLINE, so walking a cache that size stops builds on a busy worker
+# and exhausts the entries above. Past this bound the cache keeps its reservation
+# and floor protection, but its existing and new bytes are not charged to a build.
+MAX_WALKED_CACHE_ENTRIES = 25_000
 DISK_MARKER_SUFFIX = "_DISK_BUDGET:"
 
 
 class BudgetFailure(Exception):
-    def __init__(self, reason, free=0, growth=0, detail=""):
+    def __init__(self, reason, free=0, growth=0, detail="", required_growth_bytes=None):
         super().__init__(detail or reason)
         self.reason, self.free, self.growth, self.detail = reason, free, growth, detail
+        self.required_growth_bytes = required_growth_bytes
 
 
 def positive_int(value):
@@ -45,6 +75,39 @@ def positive_int(value):
 
 def nonnegative_int(value):
     return type(value) is int and 0 <= value <= (1 << 63) - 1
+
+
+def growth_buffer(budget):
+    return min(256 * 1024 * 1024, max(1, budget // 16))
+
+
+def validate_warm_policy(policy, budget):
+    if policy is None:
+        return
+
+    def digest(value):
+        return (isinstance(value, list) and len(value) == 32
+                and all(type(byte) is int and 0 <= byte <= 255 for byte in value)
+                and any(value))
+
+    def pool(value):
+        return (isinstance(value, dict)
+                and set(value) == {"identity", "state", "retained_bytes"}
+                and digest(value["identity"]) and digest(value["state"])
+                and positive_int(value["retained_bytes"]))
+
+    if (not positive_int(budget)
+            or not isinstance(policy, dict)
+            or set(policy) != {"cold_growth_bytes", "pools"}
+            or not positive_int(policy["cold_growth_bytes"])
+            or policy["cold_growth_bytes"] <= budget
+            or not isinstance(policy["pools"], list) or len(policy["pools"]) != 8
+            or not any(value is not None for value in policy["pools"])
+            or any(value is not None and not pool(value) for value in policy["pools"])):
+        raise BudgetFailure("monitor_unavailable", detail="invalid warm disk policy")
+    identities = [tuple(value["identity"]) for value in policy["pools"] if value is not None]
+    if len(identities) != len(set(identities)):
+        raise BudgetFailure("monitor_unavailable", detail="duplicate warm disk pool identity")
 
 
 def boot_identity():
@@ -58,7 +121,7 @@ def boot_identity():
             boot = stream.read().strip()
     elif sys.platform == "darwin":
         boot = subprocess.check_output(
-            ["sysctl", "-n", "kern.bootsessionuuid"], timeout=1, text=True
+            ["sysctl", "-n", "kern.bootsessionuuid"], timeout=TIMING_SCALE, text=True
         ).strip().lower()
     else:
         raise BudgetFailure("monitor_unavailable", detail="unsupported worker process platform")
@@ -114,7 +177,7 @@ def process_snapshot(heartbeat=lambda: None):
             ["ps", "-axo", "pid=,ppid=,pgid=,stat="], stdout=subprocess.PIPE, text=True
         )
         try:
-            output, _ = census.communicate(timeout=1)
+            output, _ = census.communicate(timeout=TIMING_SCALE)
         except BaseException:
             census.kill()
             census.communicate()
@@ -143,7 +206,7 @@ def darwin_leader_start(group, boot):
     # Native witness rejects dead/zombie leaders and rechecks birth and group
     # membership. A whole-machine ps census adds no owner identity evidence.
     witness = subprocess.check_output(
-        ["rch-wkr", "process-identity", str(group)], timeout=1, text=True
+        ["rch-wkr", "process-identity", str(group)], timeout=TIMING_SCALE, text=True
     ).split()
     if len(witness) != 3 or witness[0] != boot or int(witness[2]) != group:
         raise BudgetFailure("monitor_unavailable", detail="unverified Darwin group identity")
@@ -203,31 +266,165 @@ def verify_output_bindings(identities):
         raise BudgetFailure("monitor_unavailable", detail="output root changed during execution")
 
 
-def measure_outputs(paths):
-    """Allocated bytes, with no symlink traversal and cross-root inode dedup."""
-    total, seen = 0, set()
+def validate_cargo_cache_plan(plan, required=False):
+    if type(required) is not bool:
+        raise BudgetFailure("monitor_unavailable", detail="invalid Cargo cache requirement")
+    if plan is None and not required:
+        return
+    if (not isinstance(plan, dict)
+            or set(plan) != {"name", "additional_home", "verified"}
+            or type(plan["verified"]) is not bool
+            or not isinstance(plan["name"], str)
+            or not plan["name"].startswith("rch-cargo-cache-")
+            or not 16 < len(plan["name"]) <= 255
+            or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in plan["name"])
+            or plan["additional_home"] is not None
+            and (not isinstance(plan["additional_home"], str)
+                 or not os.path.isabs(plan["additional_home"])
+                 or "\0" in plan["additional_home"])):
+        raise BudgetFailure("monitor_unavailable", detail="missing or invalid original-command Cargo cache scope")
+    if not plan["verified"]:
+        raise BudgetFailure(
+            "monitor_unavailable",
+            detail="Cargo cache scope is unresolved; use a literal absolute CARGO_HOME and supported env prefix",
+        )
+
+
+def prepare_cargo_cache_roots(plan):
+    """Bind the worker's isolated home and only Cargo's known cache redirects.
+
+    The transfer shell resolves RCH_CH_BASE before client env forwarding and
+    before cd. Never expand a client path or walk arbitrary cache symlinks.
+    At most six individual directories are created before admission; missing
+    ancestor trees are refused rather than seeded outside the reservation.
+    """
+    if plan is None:
+        return [], {}
+    validate_cargo_cache_plan(plan)
+    base = os.environ.get("RCH_CH_BASE", "")
+    if (not os.path.isabs(base) or os.path.realpath(base) != base
+            or not os.path.isdir(base)):
+        raise BudgetFailure("monitor_unavailable", detail="worker Cargo cache base is not a resolved physical directory")
+    homes = [os.path.join(base, plan["name"])]
+    if plan["additional_home"] is not None:
+        homes.append(plan["additional_home"])
+    aliases = {}
+    for home in dict.fromkeys(homes):
+        for logical in (home, os.path.join(home, "registry"), os.path.join(home, "git")):
+            physical = os.path.realpath(logical)
+            if not os.path.isdir(os.path.dirname(physical)):
+                raise BudgetFailure("monitor_unavailable", detail="Cargo cache parent must already exist before admission")
+            try:
+                os.mkdir(physical)
+            except FileExistsError:
+                pass
+            if not stat.S_ISDIR(os.stat(physical, follow_symlinks=False).st_mode):
+                raise BudgetFailure("monitor_unavailable", detail="Cargo cache output root is not a physical directory")
+            aliases[logical] = physical
+    verify_cargo_cache_bindings(aliases)
+    return list(dict.fromkeys(aliases.values())), aliases
+
+
+def cache_walk_is_bounded(roots):
+    """Stop counting at the bound, so a large cache costs one small walk per build."""
+    entries, visited, pending = 0, set(), list(roots)
+    while pending:
+        path = pending.pop()
+        # Roots nest, and each directory's entries count only once.
+        if path in visited:
+            continue
+        visited.add(path)
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError), os.scandir(path) as listing:
+            for entry in listing:
+                entries += 1
+                if entries > MAX_WALKED_CACHE_ENTRIES:
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+    return True
+
+
+def verify_cargo_cache_bindings(aliases):
+    for logical, physical in aliases.items():
+        if os.path.realpath(logical) != physical:
+            raise BudgetFailure("monitor_unavailable", detail="Cargo cache redirect changed during execution")
+
+
+class OutputScan:
+    def __init__(self, total, records=None, pool_state=None, pool_bytes=0, added=None):
+        self.total, self.records = total, records
+        self.pool_state, self.pool_bytes = pool_state, pool_bytes
+        self.added = added
+
+
+def output_signature(info):
+    # A modified/reused inode cannot retain its old allocation credit. Merely
+    # subtracting its starting size would miss replacement output after cleanup.
+    # Atime is deliberately absent: reading a retained artifact is not a write.
+    return (info.st_blocks * 512, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def measure_outputs(paths, target=None, baseline_records=None):
+    """Allocated bytes and bounded inode evidence; never follow symlinks.
+
+    Scan the target first so overlapping source/output roots cannot remove
+    entries from its fingerprint through cross-root inode deduplication. Pool
+    names and signatures are sorted only after collecting a bounded snapshot.
+    Runtime additions stream against the immutable baseline even after the
+    optional current snapshot exceeds its bound or loses fingerprint evidence.
+    """
+    total, pool_bytes, seen = 0, 0, set()
+    added = 0 if baseline_records is not None else None
+    records, pool_entries = {}, []
     devices = {identity[0] for identity in output_bindings(paths).values()}
 
-    def visit(name, parent=None):
-        nonlocal total
+    def incomplete():
+        nonlocal records, pool_entries
+        records, pool_entries = None, None
+
+    def visit(name, parent=None, relative=None):
+        nonlocal total, pool_bytes, added
         try:
             info = os.stat(name, dir_fd=parent, follow_symlinks=False)
             identity = (info.st_dev, info.st_ino)
+            signature = output_signature(info)
+            if relative is not None and pool_entries is not None:
+                if len(pool_entries) >= MAX_INCREMENTAL_ENTRIES:
+                    incomplete()
+                else:
+                    pool_entries.append((relative, *identity, *signature))
             if identity in seen:
                 return
             if info.st_dev not in devices:
                 raise BudgetFailure("monitor_unavailable", detail="unmonitored filesystem inside output root")
             seen.add(identity)
-            total += info.st_blocks * 512
+            total += signature[0]
+            if added is not None and baseline_records.get(identity) != signature:
+                added += signature[0]
+            if relative is not None:
+                pool_bytes += signature[0]
+            if records is not None:
+                if len(records) >= MAX_INCREMENTAL_ENTRIES:
+                    incomplete()
+                else:
+                    records[identity] = signature
             if stat.S_ISDIR(info.st_mode):
                 descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
                 try:
                     current = os.fstat(descriptor)
                     if (current.st_dev, current.st_ino) != identity:
                         raise BudgetFailure("monitor_unavailable", detail="output directory changed during scan")
+                    if output_signature(current) != signature:
+                        incomplete()
                     with os.scandir(descriptor) as entries:
                         for entry in entries:
-                            visit(entry.name, descriptor)
+                            child = None if relative is None else relative + "/" + entry.name
+                            visit(entry.name, descriptor, child)
+                    # A tree that changed while enumerated cannot certify an
+                    # exact retained-pool proof, even if its byte total fits.
+                    if output_signature(os.fstat(descriptor)) != signature:
+                        incomplete()
                 finally:
                     os.close(descriptor)
         except OSError as error:
@@ -235,10 +432,19 @@ def measure_outputs(paths):
             # disappearing managed root is separately rejected by its binding.
             if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
                 raise
+            incomplete()
     try:
-        for path in paths:
-            visit(path)
-        return total
+        ordered = paths if target is None else list(dict.fromkeys([target] + paths))
+        for path in ordered:
+            visit(path, relative="." if path == target else None)
+        pool_state = None
+        if target is not None and pool_entries is not None:
+            fingerprint = hashlib.sha256(b"rch-pool-state-v1\0")
+            for entry in sorted(pool_entries):
+                fingerprint.update(json.dumps(entry, separators=(",", ":")).encode("ascii"))
+                fingerprint.update(b"\n")
+            pool_state = list(fingerprint.digest())
+        return OutputScan(total, records, pool_state, pool_bytes, added)
     finally:
         # Recursion captures this function's own cell. Break that cycle on
         # success AND failure so every scan releases its inode table promptly,
@@ -277,7 +483,7 @@ class Registry:
         descriptor = os.open(self.root + "/lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             private_regular(descriptor)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + RESERVATION_LOCK_DEADLINE
             while True:
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -327,7 +533,7 @@ class Registry:
         # or the ledger limit requires it, using the authoritative census.
         with self.locked():
             records = self.read()
-            free = monitor.sample()
+            free, sampled_at = monitor.sample()
             if set(free) != monitor.devices:
                 raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
 
@@ -339,7 +545,7 @@ class Registry:
             if len(records) >= 4096 or not fits():
                 groups = alive_groups(process_snapshot())
                 records = [entry for entry in records if reservation_alive(entry, monitor.boot, groups)]
-                free = monitor.sample()
+                free, sampled_at = monitor.sample()
                 if set(free) != monitor.devices:
                     raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
             if len(records) >= 4096:
@@ -357,18 +563,21 @@ class Registry:
                 "devices": sorted(monitor.devices), "budget": monitor.budget, "floor": monitor.floor,
             })
             atomic_json(self.root + "/ledger.json", {"version": 1, "entries": records})
-            return free, floors
+            return free, floors, sampled_at
 
 
 class Monitor:
-    def __init__(self, budget, floor, target, paths, outputs=None):
+    def __init__(self, budget, floor, target, paths, outputs=None, cargo_cache=None):
         self.budget, self.floor = budget, floor
-        self.outputs = list(dict.fromkeys(outputs if outputs is not None else [target]))
+        self.target = target
+        self.boot, self.group = boot_identity(), os.getpgrp()
+        cache_outputs, self.cargo_cache_bindings = prepare_cargo_cache_roots(cargo_cache)
+        walked_cache = cache_outputs if cache_walk_is_bounded(cache_outputs) else []
+        self.outputs = list(dict.fromkeys([target] + (outputs or []) + walked_cache))
         # Every managed output volume needs both a reservation and ongoing
         # floor protection, even when a caller omitted it from its probe list.
-        self.paths = list(dict.fromkeys(paths + [target] + self.outputs))
+        self.paths = list(dict.fromkeys(paths + [target] + self.outputs + cache_outputs))
         self.bindings = output_bindings(self.outputs)
-        self.boot, self.group = boot_identity(), os.getpgrp()
         if self.group <= 1:
             raise BudgetFailure("monitor_unavailable", detail="build has no isolated process group")
         snapshot = process_snapshot()
@@ -380,34 +589,96 @@ class Monitor:
             self.controls.add(parent)
             parent = snapshot[parent]["parent"]
         self.parent = os.getppid()
-        self.devices = set(self.sample())
-        self.baseline = self.scan()
+        self.devices = set(self.sample()[0])
+        identity = ["rch-pool-identity-v1", os.path.abspath(target), self.boot,
+                    *self.bindings[target]]
+        self.pool_identity = list(hashlib.sha256(
+            json.dumps(identity, separators=(",", ":")).encode("ascii")
+        ).digest())
+        initial = self.scan()
+        self.baseline, self.baseline_records = initial.total, initial.records
+        self.baseline_pool = self.pool_observation(initial)
+        self.final_pool, self.admitted_pool = self.baseline_pool, None
+        self.incremental_reliable = initial.records is not None and self.baseline_pool is not None
+        self.peak_added, self.unproven_baseline, self.strict_tracking = 0, 0, False
         self.peak_output, self.peak_growth = self.baseline, 0
         self.free = {}
+        self.free_start, self.free_min = {}, {}
         self.floors = {device: floor for device in self.devices}
         self.previous = None
 
     def sample(self):
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         verify_output_bindings(self.bindings)
         samples = filesystem_sample(self.paths)
+        # Bind the clock to receipt of the probe, before validation or the
+        # supervisor can be delayed. Consumption time invents a write burst
+        # when an older sample is followed immediately by a fresh one.
+        sampled_at = time.monotonic()
         verify_output_bindings(self.bindings)
-        return samples
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
+        return samples, sampled_at
 
     def scan(self):
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         verify_output_bindings(self.bindings)
-        total = measure_outputs(self.outputs)
+        result = measure_outputs(self.outputs, self.target, getattr(self, "baseline_records", None))
         verify_output_bindings(self.bindings)
-        return total
+        verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
+        return result
+
+    def pool_observation(self, scan):
+        if scan.pool_state is None:
+            return None
+        return {"identity": self.pool_identity, "state": scan.pool_state,
+                "retained_bytes": scan.pool_bytes}
+
+    def require_runtime_tracking(self, required):
+        if type(required) is not bool:
+            raise BudgetFailure("monitor_unavailable", detail="invalid required output tracking mode")
+        if required and self.baseline_records is None:
+            raise BudgetFailure("monitor_unavailable", detail="bounded initial output tracking is unavailable")
+        self.strict_tracking = self.strict_tracking or required
+
+    def require_warm_pool(self, policy):
+        validate_warm_policy(policy, self.budget)
+        if policy is None:
+            return
+        if self.baseline_pool is None or self.baseline_pool not in policy["pools"]:
+            raise BudgetFailure(
+                "cold_required", detail="retained output pool no longer matches its warm reservation",
+                required_growth_bytes=policy["cold_growth_bytes"],
+            )
+        # Only the attested target pool has already been funded. Source sync,
+        # caches, and other roots cannot borrow its retained-artifact credit.
+        # Keep a growth buffer available before installing the reservation;
+        # a changed source baseline must request cold admission, not silently
+        # consume the whole allowance that was selected for this build.
+        unproven = self.baseline - self.baseline_pool["retained_bytes"]
+        if unproven + growth_buffer(self.budget) >= self.budget:
+            raise BudgetFailure(
+                "cold_required",
+                detail=f"unproven output baseline ({unproven} bytes) leaves insufficient warm growth allowance",
+                required_growth_bytes=policy["cold_growth_bytes"],
+            )
+        self.unproven_baseline = unproven
+        self.strict_tracking = True
+        self.peak_growth = max(self.peak_growth, unproven)
+        # Admission proof survives a later loss of optional learning metadata.
+        # Losing that metadata must not turn confirmed completion into replay.
+        self.admitted_pool = self.baseline_pool
 
     def admit(self):
-        self.free, self.floors = Registry().admit(self)
-        self.previous = (time.monotonic(), self.free)
+        self.free, self.floors, sampled_at = Registry().admit(self)
+        self.free_start, self.free_min = dict(self.free), dict(self.free)
+        self.previous = (sampled_at, self.free)
 
     def observe_free(self, samples, now):
         if set(samples) != self.devices:
             raise BudgetFailure("monitor_unavailable", detail="monitored filesystem identity changed")
         for device, free in samples.items():
-            base = min(256 * 1024 * 1024, max(1, self.budget // 16))
+            self.free_min[device] = min(self.free_min.get(device, free), free)
+            base = growth_buffer(self.budget)
             margin = base
             if self.previous is not None:
                 previous_time, previous_samples = self.previous
@@ -417,9 +688,34 @@ class Monitor:
                 raise BudgetFailure("free_floor", free, self.peak_growth, "protected floor or observed write-rate buffer reached")
         self.free, self.previous = samples, (now, samples)
 
-    def observe_output(self, total):
-        self.peak_output = max(self.peak_output, total)
-        self.peak_growth = max(self.peak_growth, max(0, total - self.baseline))
+    def observe_output(self, scan):
+        self.peak_output = max(self.peak_output, scan.total)
+        net_growth = max(0, scan.total - self.baseline)
+        self.final_pool = self.pool_observation(scan)
+        if scan.records is None or self.final_pool is None:
+            self.incremental_reliable = False
+        added = scan.added
+        if added is None and self.baseline_records is not None and scan.records is not None:
+            added = sum(signature[0] for identity, signature in scan.records.items()
+                        if self.baseline_records.get(identity) != signature)
+        if added is None and self.strict_tracking:
+            # Never turn an already-small reservation into net-only tracking.
+            # Unknown attribution receives no retained credit. Confirmed
+            # completion remains possible if this conservative charge fits.
+            self.incremental_reliable = False
+            added = scan.total
+        if added is not None:
+            self.peak_added = max(self.peak_added, added)
+            # Old-artifact cleanup cannot erase the new output's reservation
+            # charge. Other jobs' overlapping output may be charged too, never
+            # divided into unsupported per-writer attribution.
+        # Preserve the unproven baseline charge even if a later scan loses
+        # bounded evidence. Changed unproven inodes may be charged once at
+        # admission and again as new output; that conservative aggregate can
+        # exceed the largest simultaneously allocated output snapshot.
+        self.peak_growth = max(
+            self.peak_growth, self.unproven_baseline + max(net_growth, self.peak_added)
+        )
         if self.peak_growth > self.budget:
             raise BudgetFailure("growth", min(self.free.values(), default=0), self.peak_growth, "allocated build output exceeded its reservation")
 
@@ -456,6 +752,8 @@ def receipts_for_failure(marker, failure, budget, floor, started, monitor):
         "detail": failure.detail[:240],
         "peak_output_bytes": monitor.peak_output if monitor is not None else None,
     }
+    if failure.reason == "cold_required":
+        receipt["required_growth_bytes"] = failure.required_growth_bytes
     receipts = [(marker, receipt)]
     if started and monitor is not None:
         receipts.append(usage_receipt(marker, monitor, False))
@@ -463,9 +761,19 @@ def receipts_for_failure(marker, failure, budget, floor, started, monitor):
 
 
 def usage_receipt(marker, monitor, complete, exit_code=None):
+    incremental = None
+    if monitor.incremental_reliable:
+        incremental = {
+            "version": 1, "baseline_output_bytes": monitor.baseline,
+            "peak_added_output_bytes": monitor.peak_added,
+            "peak_free_drop_bytes": sum(max(0, start - monitor.free_min[device])
+                                        for device, start in monitor.free_start.items()),
+            "baseline_pool": monitor.baseline_pool, "final_pool": monitor.final_pool,
+        }
     return (marker[:-len(DISK_MARKER_SUFFIX)] + "_DISK_USAGE:", {
         "max_growth_bytes": monitor.budget, "min_free_bytes": monitor.floor,
         "peak_output_bytes": monitor.peak_output, "peak_growth_bytes": monitor.peak_growth,
+        "incremental": incremental, "admitted_pool": monitor.admitted_pool,
         "complete": complete, "exit_code": exit_code,
     })
 
@@ -505,6 +813,26 @@ def bounded_result(future, deadline, heartbeat):
     return future.result()
 
 
+def acknowledge_completion(descriptor, guardian):
+    # Progress can be coalesced when the pipe is full; the final C cannot be
+    # dropped. Give the live guardian one bounded, scaled window to drain it.
+    # A retry never renews that window or accepts a replacement parent.
+    deadline = time.monotonic() + HEARTBEAT_DEADLINE
+    while True:
+        if os.getppid() != guardian:
+            raise BudgetFailure("interrupted", detail="disk guardian disappeared before completion acknowledgement")
+        if time.monotonic() >= deadline:
+            raise BudgetFailure("monitor_unavailable", detail="completion acknowledgement deadline reached")
+        try:
+            written = os.write(descriptor, b"C")
+        except BlockingIOError:
+            time.sleep(min(0.025, max(0, deadline - time.monotonic())))
+            continue
+        if written != 1 or os.getppid() != guardian or time.monotonic() >= deadline:
+            raise BudgetFailure("monitor_unavailable", detail="completion acknowledgement remained unconfirmed")
+        return
+
+
 def finish_descendants(monitor, heartbeat):
     deadline = None
     while True:
@@ -521,7 +849,7 @@ def finish_descendants(monitor, heartbeat):
         # than expiring it before the first signal. The guardian still fences
         # a stalled census, and completion still requires an empty census.
         if deadline is None:
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + FINALIZATION_DEADLINE
         for record in descendants:
             # Pin the process on Linux so a recycled numeric PID cannot receive
             # a signal between membership inspection and signal delivery.
@@ -543,7 +871,7 @@ def finish_descendants(monitor, heartbeat):
         time.sleep(0.025)
 
 
-def supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds=0, receipt_initialized=False):
+def supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False, cargo_cache=None, cargo_cache_required=False):
     monitor = child = None
     started = receipt_owned = False
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -559,11 +887,15 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                 descriptor = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 os.close(descriptor)
             receipt_owned = True
+        validate_warm_policy(warm_policy, budget)
+        validate_cargo_cache_plan(cargo_cache, cargo_cache_required)
         monitor = bounded_result(
-            executor.submit(Monitor, budget, floor, target, paths, outputs),
+            executor.submit(Monitor, budget, floor, target, paths, outputs, cargo_cache),
             time.monotonic() + SCAN_DEADLINE, heartbeat,
         )
-        bounded_result(executor.submit(monitor.admit), time.monotonic() + 5, heartbeat)
+        monitor.require_warm_pool(warm_policy)
+        monitor.require_runtime_tracking(require_incremental_tracking)
+        bounded_result(executor.submit(monitor.admit), time.monotonic() + ADMISSION_DEADLINE, heartbeat)
 
         def interrupted(signum, frame):
             raise BudgetFailure("interrupted", detail="supervisor received signal " + str(signum))
@@ -589,7 +921,7 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
             if timeout_seconds and now - execution_started >= timeout_seconds:
                 raise BudgetFailure("deadline", detail="remote execution deadline reached")
             if free_future.done():
-                monitor.observe_free(free_future.result(), now)
+                monitor.observe_free(*free_future.result())
                 free_future = executor.submit(monitor.sample)
                 free_started = now
             elif now - free_started > FREE_SAMPLE_DEADLINE:
@@ -605,7 +937,9 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                 scan_started, next_scan = now, now + SCAN_INTERVAL
             time.sleep(POLL_SECONDS)
         finish_descendants(monitor, heartbeat)
-        monitor.observe_free(bounded_result(free_future, free_started + FREE_SAMPLE_DEADLINE, heartbeat), time.monotonic())
+        monitor.observe_free(*bounded_result(
+            free_future, free_started + FREE_SAMPLE_DEADLINE, heartbeat,
+        ))
         if scan_future is not None:
             monitor.observe_output(bounded_result(scan_future, scan_started + SCAN_DEADLINE, heartbeat))
         monitor.observe_output(bounded_result(executor.submit(monitor.scan), time.monotonic() + SCAN_DEADLINE, heartbeat))
@@ -613,9 +947,9 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         # (or the entire command). A final output scan can also take seconds
         # while unrelated jobs consume this filesystem. Only a NEW probe after
         # writers stop and scanning finishes can attest the completion floor.
-        monitor.observe_free(bounded_result(
+        monitor.observe_free(*bounded_result(
             executor.submit(monitor.sample), time.monotonic() + FREE_SAMPLE_DEADLINE, heartbeat,
-        ), time.monotonic())
+        ))
         # Completion means the foreground command ended, remaining writers
         # stopped, and final output and free-space checks passed. A nonzero exit
         # remains a complete measurement; callers gate successful learning on
@@ -656,7 +990,7 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         executor.shutdown(wait=False)
 
 
-def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, command, mode, timeout_seconds=0, receipt_initialized=False):
+def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, command, mode, timeout_seconds=0, receipt_initialized=False, warm_policy=None, require_incremental_tracking=False, cargo_cache=None, cargo_cache_required=False):
     if mode == "standalone":
         os.setsid()
     elif mode != "tracked":
@@ -676,9 +1010,16 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
                 os.write(write_fd, value)
 
         parent_guardian = os.getppid()
-        result = supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds, receipt_initialized)
-        os.write(write_fd, b"C")
-        os._exit(result)
+        result = supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds, receipt_initialized, warm_policy, require_incremental_tracking, cargo_cache, cargo_cache_required)
+        try:
+            acknowledge_completion(write_fd, parent_guardian)
+            os._exit(result)
+        except BaseException:
+            # C might already be queued when a deadline, signal, or parent
+            # check fails. Never pair that byte with a normal exception exit:
+            # the guardian still requires C AND normal supervisor completion.
+            kill_owned_group(group)
+            raise
     os.close(write_fd)
     cancelled, started, completed = False, False, False
 
@@ -696,6 +1037,10 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
         finally:
             kill_owned_group(group)
 
+    def check_interruption():
+        if cancelled or os.getppid() != parent:
+            stop("cancelled" if cancelled else "parent_lost")
+
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     last_heartbeat = time.monotonic()
@@ -710,14 +1055,30 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
             pass
         pid, status = os.waitpid(supervisor, os.WNOHANG)
         if pid:
+            # An abnormal supervisor exit requires immediate containment;
+            # draining progress must never extend that safety boundary.
+            if not os.WIFEXITED(status):
+                stop("supervisor_exit_unconfirmed", wait_status=status)
             # The exit can race the preceding pipe read. Consume its explicit
-            # completion acknowledgement before accepting a normal exit code.
-            with contextlib.suppress(BlockingIOError):
-                completed = completed or b"C" in os.read(read_fd, 4096)
-            if os.WIFEXITED(status) and completed:
+            # completion acknowledgement even behind a full heartbeat backlog.
+            # Our only writer has exited, so this normally drains immediately;
+            # keep a finite bound even if an unexpected writer retained the fd.
+            drain_deadline = time.monotonic() + HEARTBEAT_DEADLINE
+            while not completed and time.monotonic() < drain_deadline:
+                check_interruption()
+                try:
+                    data = os.read(read_fd, 4096)
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                started = started or b"S" in data
+                completed = b"C" in data
+            check_interruption()
+            if completed and time.monotonic() < drain_deadline:
                 return os.WEXITSTATUS(status)
             stop("supervisor_exit_unconfirmed", wait_status=status)
-        deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + 10
+        deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + BOOTSTRAP_ALLOWANCE
         age = time.monotonic() - last_heartbeat
         if cancelled or os.getppid() != parent or age > deadline:
             # Also fences a wedged fsync/receipt or process-identity probe. A
@@ -749,7 +1110,10 @@ def main(argv):
     receipt_initialized = plan.get("receipt_initialized", False)
     if type(receipt_initialized) is not bool:
         raise ValueError("invalid receipt initialization mode")
-    return run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, argv[6:], mode, timeout_seconds, receipt_initialized)
+    require_incremental_tracking = plan.get("require_incremental_tracking", False)
+    if type(require_incremental_tracking) is not bool:
+        raise ValueError("invalid required output tracking mode")
+    return run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, argv[6:], mode, timeout_seconds, receipt_initialized, plan.get("warm_policy"), require_incremental_tracking, plan.get("cargo_cache"), plan.get("cargo_cache_required", False))
 
 
 if __name__ == "__main__":

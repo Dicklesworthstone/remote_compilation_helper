@@ -396,6 +396,81 @@ fn read_ahead_preserves_complete_wide_and_empty_file_datasets() {
 }
 
 #[test]
+fn large_read_scans_preserve_native_callbacks_and_independent_captured_files() {
+    let source = private();
+    fixture(source.path());
+    let compiler = vec![43; 3 * 1024 * 1024 + 17];
+    let runtime = vec![71; 2 * 1024 * 1024 + 3];
+    write(source.path(), "bin/rustc", &compiler, 0o755);
+    write(source.path(), "lib/runtime.so", &runtime, 0o644);
+    write(source.path(), "lib/zero", b"", 0o644);
+    let owner = std::thread::current().id();
+    let checks = Cell::new(0);
+    let stopped = || {
+        assert_eq!(std::thread::current().id(), owner);
+        checks.set(checks.get() + 1);
+        false
+    };
+    let expected =
+        fingerprint_toolchain(source.path(), &ToolchainLimits::default(), stopped).unwrap();
+    let parent = private();
+    let retained = capture_toolchain(
+        source.path(),
+        &parent.path().join("large"),
+        Some(&expected),
+        &ToolchainLimits::default(),
+        stopped,
+    )
+    .unwrap();
+    assert_eq!(*retained.identity(), expected);
+    assert_eq!(
+        fs::read(retained.root().join("bin/rustc")).unwrap(),
+        compiler
+    );
+    assert_eq!(
+        fs::read(retained.root().join("lib/runtime.so")).unwrap(),
+        runtime
+    );
+    for path in ["bin/rustc", "lib/runtime.so", "lib/zero"] {
+        let original = fs::metadata(source.path().join(path)).unwrap();
+        let copied = fs::metadata(retained.root().join(path)).unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (copied.dev(), copied.ino())
+        );
+    }
+    let reopened = rabs_sandbox::toolchain_dataset::open_toolchain(
+        retained.root(),
+        &expected,
+        &ToolchainLimits::default(),
+        stopped,
+    )
+    .unwrap();
+    assert_eq!(reopened.files().unwrap(), retained.files().unwrap());
+    retained.verify(stopped).unwrap();
+    retained
+        .verify_source_unchanged(source.path(), stopped)
+        .unwrap();
+    assert!(checks.get() > 1);
+
+    // Every later byte scan remains independent: successful parallel reads
+    // cannot turn a saved file digest into permission to reuse changed bytes.
+    fs::set_permissions(
+        retained.root().join("lib/runtime.so"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    fs::write(retained.root().join("lib/runtime.so"), &runtime).unwrap();
+    fs::set_permissions(
+        retained.root().join("lib/runtime.so"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    assert!(retained.verify(stopped).is_err());
+    assert!(reopened.verify(stopped).is_err());
+}
+
+#[test]
 fn queued_toolchain_files_cannot_hide_mutation_replacement_or_cancellation() {
     for change in ["content", "replacement", "cancel"] {
         let source = private();

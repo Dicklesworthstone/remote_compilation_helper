@@ -43,6 +43,14 @@ connects captured Cargo checks and builds to the external-dependency cache, with
 isolated worker execution for eligible Rust archives. Its commands and narrower
 graph requirements are described below.
 
+For clients on separate hosts,
+[`cargo rabs --rabs-canonical-remote`](#submit-from-separate-hosts-to-the-shared-coordinator)
+uploads captured inputs to one pinned, mutually authenticated coordinator. Cargo
+runs at that coordinator, and eligible dependency compilations from independent
+clients share its existing worker pool and action ownership. Each client receives
+its own verified output tree. The native `rabsd --canonical-compile-remote`
+entrypoint remains available for explicit one-off profiles.
+
 ## Profile and prerequisites
 
 Linux is required on the preparing host and worker. Install matching `cargo-rabs`
@@ -58,10 +66,11 @@ Clippy installation.
 For `doc`, the captured dataset also requires ordinary executable `bin/rustdoc`.
 Both `RUSTDOC` and `RUSTC` are bound to that dataset's canonical executables.
 
-For an installed Rustup toolchain, either canonical **launcher** profile can
+For an installed Rustup toolchain, any canonical **launcher** profile can
 replace `"toolchain_root": "/absolute/toolchain"` with `"toolchain": "rustup"`.
-Specify exactly one of these fields. `cargo rabs --rabs-canonical ...` and
-`cargo rabs --rabs-canonical-local ...` resolve `rustup which rustc` once in the
+Specify exactly one of these fields. `cargo rabs --rabs-canonical ...`,
+`cargo rabs --rabs-canonical-local ...` and
+`cargo rabs --rabs-canonical-remote ...` resolve `rustup which rustc` once in the
 caller's original working directory and environment. This honors the selected
 `RUSTUP_TOOLCHAIN`, including `cargo +nightly rabs`, and Rustup's directory
 overrides and toolchain files at the invocation location. It does not select a
@@ -73,6 +82,7 @@ command selects that installed toolchain explicitly:
 ```sh
 cargo rabs --rabs-canonical PROFILE.json -- +nightly-2026-08-31 build --workspace
 cargo rabs --rabs-canonical-local LOCAL.json -- +nightly-2026-08-31 check --workspace
+cargo rabs --rabs-canonical-remote REMOTE.json -- +nightly-2026-08-31 build --workspace
 ```
 
 The launcher passes this selection to `rustup which --toolchain NAME rustc` in
@@ -105,6 +115,13 @@ and isolated networking. An installed bubblewrap and a successful basic user/PID
 namespace smoke test are insufficient. A host that cannot construct the complete
 base namespace does not advertise canonical execution or receive those builds;
 the worker does not substitute a broader mount view or weaker isolation.
+
+ELF runtime discovery requires GNU Coreutils `timeout`. The probe prefers
+`/usr/bin/gnutimeout` when installed, otherwise it checks `/usr/bin/timeout`;
+a different implementation is refused explicitly. The independent watchdog
+survives an abrupt owner death, while native supervision also bounds both
+output streams and group cleanup. Capability discovery and loader execution
+share the existing five-second budget. This does not change host utilities.
 
 Create an operation parent outside the source/toolchain trees, owned by the user
 and mode 0700. Existing directories are not silently chmodded. Use this profile:
@@ -2306,6 +2323,458 @@ recoverable background job. Service shutdown stops admission, cancels and joins
 its active operations and shared remote executions, then releases coordinator
 authority.
 
+### Submit from separate hosts to the shared coordinator
+
+The installed native commands expose the shared canonical runtime to explicitly
+enrolled clients over pinned mutual TLS:
+
+```sh
+rabsd --canonical-compile-remote-service ./remote-service.json
+rabsd --canonical-compile-remote ./remote-build.json
+```
+
+Run the first command on the coordinator and the second on a client. Each client
+captures its approved source/dependency closure and complete toolchain, then
+uploads the exact bytes requested by the coordinator's verified input plan. The
+coordinator allocates private input and operation directories and runs the
+existing canonical Cargo driver. Cargo plans at the
+same stable paths used by local canonical operations. Eligible concurrent
+dependency requests from different clients can join one shared execution, while
+each operation keeps its own source observations, Cargo process, target,
+wrapper endpoint and cancellation owner. Results are installed independently at
+each client's explicit output destination.
+
+Install matching `rabsd` builds on the clients and coordinator, and a matching
+`rabs-wrap` on the coordinator. Both sides require Linux. The coordinator must
+pass the complete production namespace probe, and the captured toolchain must
+support nightly Cargo unit-graph planning and run on that coordinator. The
+existing source, dependency, environment and execution-host restrictions still
+apply. Configure dependency workers on the coordinator using
+[the existing pinned worker setup](#send-canonical-dependency-compilations-to-workers)
+to share eligible remote metadata and archive compilations. Worker identities,
+credentials and listeners are selected by the service operator.
+
+#### Enroll client and coordinator certificates
+
+Provision a trusted CA, a coordinator server certificate, and a separate client
+certificate/key for each enrolled edge host. The coordinator certificate must
+cover the client's configured `server_name`. Certificate-chain validation and
+explicit SPKI SHA-256 pins are both required: the client pins the coordinator,
+and the service accepts only its enrolled client keys.
+
+Obtain each pin from the corresponding trusted certificate:
+
+```sh
+openssl x509 -in /credentials/coordinator.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+
+openssl x509 -in /credentials/edge-a.pem -pubkey -noout |
+  openssl pkey -pubin -outform DER |
+  openssl dgst -sha256
+```
+
+Copy only the resulting 64 lowercase hexadecimal characters, without the
+OpenSSL label, into the appropriate profile. Replace all example addresses,
+paths and pin placeholders below. Keep certificate private keys outside captured
+source and toolchain roots. The profile's `tls` fields configure this dedicated
+client-to-coordinator transport; dependency-worker TLS remains separately
+configured through `RABS_COORD_TLS_CA`, `RABS_COORD_TLS_CERT` and
+`RABS_COORD_TLS_KEY` on the coordinator.
+
+#### Start the coordinator
+
+Create three pairwise disjoint, owned private directories. Existing directories
+must already have mode 0700; the service does not repair their permissions.
+Keep the operation root short enough for its operation-scoped Unix sockets:
+
+```sh
+mkdir -m 700 /home/builder/rabs-remote-state \
+  /home/builder/rabs-remote-inputs /tmp/rabs-remote-ops
+```
+
+Save the complete service profile as `remote-service.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-service-v1",
+  "listen": "192.0.2.10:45300",
+  "state_root": "/home/builder/rabs-remote-state",
+  "input_root": "/home/builder/rabs-remote-inputs",
+  "operation_root": "/tmp/rabs-remote-ops",
+  "wrapper": "/usr/local/bin/rabs-wrap",
+  "tls": {
+    "ca": "/credentials/ca.pem",
+    "certificate": "/credentials/coordinator.pem",
+    "private_key": "/credentials/coordinator.key"
+  },
+  "allowed_edge_pins": [
+    "REPLACE_WITH_EDGE_A_64_LOWERCASE_HEX_DIGITS"
+  ],
+  "max_roots": 4,
+  "max_queued_roots": 16,
+  "queue_timeout_seconds": 300,
+  "source_cache_bytes": 536870912,
+  "toolchain_cache_bytes": 8589934592,
+  "toolchain_cache_entries": 4,
+  "target_cache": {
+    "runtime_epoch": "builder-image-2026.10",
+    "max_bytes": 1073741824,
+    "max_families": 8
+  },
+  "jobs_per_root": 2
+}
+```
+
+`listen` is an IP address and port bound on the coordinator. The three storage
+roots must have ordinary absolute paths and no symlink ancestry. The wrapper
+must be an ordinary executable outside those mutable roots. `allowed_edge_pins`
+accepts 1–256 distinct nonzero client-key pins. `max_roots` accepts 1–32 and
+`jobs_per_root` accepts 1–4096, with at most 4096 aggregate jobs. Each admitted
+operation holds its root slot across input transfer, execution and final
+delivery, bounding simultaneous work even while inputs are uploading.
+
+`max_queued_roots` accepts 0–128 and defaults to 0. Set it above zero to let
+authenticated clients wait in FIFO order when the active roots are occupied.
+The example admits four operations and allows sixteen additional sessions.
+Total connections, including TLS handshakes, are bounded by the sum of those
+limits. At the coordinator, a request waiting for an operation slot retains only
+its connection and bounded declaration. It receives no input tree or compiler
+tokens and cannot start uploading or execute Cargo until a slot becomes
+available. The client keeps its already captured inputs while waiting.
+
+`queue_timeout_seconds` accepts 1–1800 and defaults to 300. The queue deadline
+is fixed when a validated request enters admission; progress polls do not renew
+it. The same fixed deadline bounds SDK selection, verification and source-cache
+prefill before Ready, including any wait for another admitted operation's cold
+SDK upload. Acquiring a root slot does not reset that deadline. Client
+cancellation, disconnection, timeout or
+service shutdown releases that caller's waiting state without cancelling another
+caller. The Cargo frontend waits on the same authenticated connection and starts
+uploading only after Ready grants its input phase. It does not resubmit the
+operation. Ready starts a fresh, fixed 35-minute input-transfer budget; cached
+source preparation does not consume it. If all connection slots are occupied,
+the service still closes excess connections before
+authentication, without a plaintext response.
+
+Simultaneous admitted operations with the same authenticated client key and
+complete SDK identity share one cold upload. One caller uploads; existing
+followers receive Queued/Poll replies until its SDK is completely sealed and
+verified, then receive Ready with SDK reuse. Followers retain their operation
+permits but create no source or SDK input trees while waiting. If the uploader
+disappears, a surviving follower may become the uploader before Ready, within
+its original deadline. This never retries a Cargo execution.
+
+Cold upload sharing also works when persistent SDK caching is disabled or full.
+The pending registry contains at most 32 weak entries, independently of retained
+cache capacity. A completed flight is removed from that registry before existing
+followers receive its exact lease; later requests must use the ordinary cache or
+start a new upload. Only active admitted operations retain an uncached shared SDK.
+The registry cannot prolong its lifetime, and neither source trees nor command
+results are shared. Root-queue capacity and this waiting state are separate:
+`max_queued_roots: 0` still allows an already admitted operation to wait for a
+matching SDK upload.
+
+The service can retain already uploaded SDKs for subsequent operations.
+`toolchain_cache_bytes` defaults to 0 (disabled) and accepts at most 64 GiB;
+`toolchain_cache_entries` defaults to 4 and accepts 1–32. The example enables
+an 8 GiB, four-image cache. Both limits apply to retained SDKs, including images
+still leased by operations or downstream uploads. Idle images may be evicted;
+a full or disabled cache still admits a normal private upload. These are
+logical retained-byte and image-count limits, separate from active operation
+input limits and filesystem free-space admission.
+
+Reuse requires the same enrolled TLS client key and complete toolchain dataset
+identity. The service verifies the cached image again before selecting reuse.
+Concurrent requests for the same retained image can share one in-progress byte
+scan; each caller independently checks its owner and complete retained generation
+before and after that scan. Completed checks are never memoized, and cancelling
+one caller does not cancel another caller's wait or authorize partial results.
+The client then transfers the requested source bytes without SDK entries or SDK
+chunks. Every operation keeps its own source, runtime and output directories; a cached
+SDK retains only its dedicated compiler directory. Changes to the retained SDK
+or its ownership invalidate that generation and refuse the affected operation.
+A cache failure never causes a second execution, reconnection or local fallback.
+
+This cache lasts for the service process. A service restart requires a new SDK
+upload; no directory is adopted from a pathname or an old on-disk marker. The
+client still captures and validates its local SDK on each invocation. Reuse
+removes repeated SDK network transfer and reconstruction; it does not eliminate
+local capture or verification, and no end-to-end speedup is claimed here.
+
+The optional `source_cache_bytes` setting retains verified source-file bytes for
+later requests. It defaults to 0 (disabled), accepts at most 8 GiB, and uses one
+aggregate budget of at most 4096 objects across all enrolled clients. The example
+enables 512 MiB. Objects are scoped by the client key authenticated by TLS and
+their content digest; another client key cannot reuse those bytes. The service
+owns a private pool for its process lifetime. A restart starts a fresh pool and
+does not adopt old cache directories. This budget is separate from SDK retention,
+Cargo target state and active operations' private input trees.
+
+Every request still sends its complete `SourceManifest`. Ready includes a
+`SourcePlan` binding that manifest's digest to a strictly increasing list of
+missing nonempty-file indices in canonical manifest order. The coordinator
+imports verified cache hits into a fresh private receiver before sending Ready.
+The client validates the plan, checks **every captured source member**, including
+omitted and empty files, and uploads only the requested members. Each operation
+still requires a complete fresh server-side seal before execution; imported bytes
+and mutable execution files never share writable inodes. Source chunks outside
+the frozen missing-file plan are terminal protocol errors.
+
+Verified per-file checkpoints can seed later transfers even if an upload stops
+before the complete tree is sealed. They are byte-reuse hints, never execution
+or action-cache authority. Missing, evicted, corrupt or unavailable cache objects
+request ordinary upload before import begins. Once an import has started, a
+verification or cancellation failure cannot be converted into a cache miss in
+that receiver. Optional cache-write contention or storage failure can skip
+retention, but cannot hide invalid source bytes or authorize a partial tree.
+
+The optional server `target_cache` object retains Cargo's private compilation
+state across remote operations and service restarts. It uses the existing
+[persistent target cache](#persistent-reuse-and-command-results), including its
+required host `runtime_epoch`, exact compatibility checks, private copies,
+transaction recovery and producer verification. Omit the object to start every
+remote operation with a cold Cargo target. Its default retention is 1 GiB and
+eight families; the limits are 8 GiB and 32 families. These are one aggregate
+budget for the service, shared across enrolled clients, independently of the
+SDK cache and active operation storage.
+
+Remote target families also bind the client key authenticated by TLS. A
+different client key or a local canonical command cannot restore another
+client's target, even when source and compiler identities match. The client
+cannot provide this scope, a cache directory, or target-cache policy through its
+remote settings. Every operation still declares its complete source, seals a
+fresh input tree, uses an independent runtime workspace and target, and executes
+the selected Cargo command. Timestamp restoration only touches that runtime copy; the original
+received source remains available for final verification. Compiler-only checks
+retain the existing eligible source-edit behavior; codegen, Clippy and graphs
+with project executors keep the complete captured source identity.
+
+Successful restore can let Cargo report existing units as Fresh. Current
+coordinator publication, qualification and producer ancestry are rechecked
+before execution and completion. Stored target bytes never become a cached
+command result or bypass final artifact delivery verification. Changing the
+host tools or libraries visible through `/usr` requires a new `runtime_epoch`.
+
+Set the coordinator's dependency-worker environment before starting the service.
+For example, a single worker uses its own listener, separate from the remote
+client listener above:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/worker-ca.pem \
+RABS_COORD_TLS_CERT=/credentials/worker-coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/worker-coordinator.key \
+RABS_DEPENDENCY_WORKER_LISTEN=192.0.2.10:7092 \
+RABS_DEPENDENCY_WORKER_ID=leaf-worker \
+RABS_DEPENDENCY_WORKER_SPKI_SHA256=REPLACE_WITH_WORKER_64_LOWERCASE_HEX_DIGITS \
+  rabsd --canonical-compile-remote-service ./remote-service.json
+```
+
+The worker must run its normal outward connection loop against the dependency
+listener. A pool uses `RABS_DEPENDENCY_WORKERS_JSON` in place of the three
+singleton worker fields. The service owns that configuration and its shared
+coordinator authority for its whole lifetime. Client requests cannot choose
+worker endpoints, coordinator storage paths, wrapper executables or mount rules.
+
+#### Submit a captured client operation
+
+On the client, create a private staging root and a separate private output
+parent outside the source, toolchain and optional Cargo-cache roots. The final
+output destination must be absent; do not create it in advance:
+
+```sh
+mkdir -m 700 /home/dev/rabs-remote-staging /home/dev/rabs-remote-results
+```
+
+Save this complete client profile as `remote-build.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-v1",
+  "coordinator": "192.0.2.10:45300",
+  "server_name": "rabs-coordinator.internal",
+  "coordinator_pin": "REPLACE_WITH_COORDINATOR_64_LOWERCASE_HEX_DIGITS",
+  "tls": {
+    "ca": "/home/dev/credentials/ca.pem",
+    "certificate": "/home/dev/credentials/edge-a.pem",
+    "private_key": "/home/dev/credentials/edge-a.key"
+  },
+  "source_root": "/home/dev/projects/approved-anchor",
+  "toolchain_root": "/opt/rust/native-nightly-toolchain",
+  "staging_root": "/home/dev/rabs-remote-staging",
+  "output_destination": "/home/dev/rabs-remote-results/build-001",
+  "cargo_home_source": "/home/dev/.cargo",
+  "settings": {
+    "command": "build",
+    "manifest": "app/Cargo.toml",
+    "source_selection": "cargo-unit-graph-v1",
+    "selection": {
+      "workspace": true
+    },
+    "jobs": 2,
+    "timeout_seconds": 1800,
+    "env": {
+      "APP_VERSION": "2026.11"
+    }
+  }
+}
+```
+
+Invoke the installed client:
+
+```sh
+rabsd --canonical-compile-remote ./remote-build.json
+```
+
+`coordinator` selects the remote host and port. `server_name` is checked against
+the coordinator certificate even when connecting by IP. All filesystem paths
+in the client profile are absolute and refer to that client. The captured source
+and toolchain are admitted as sealed datasets; the coordinator does not need
+access to those original host paths. With SDK retention enabled, a verified
+same-client cache hit transfers only the source dataset. The required `output_destination` names a
+new directory whose immediate parent is owned and private.
+
+`settings` uses the same logical command, manifest, selection and literal
+environment contract as the canonical local profile. Defaults are `check`,
+`Cargo.toml`, one job and 1800 seconds. Jobs must fit the service's per-root
+grant. Omitting `selection` for Check retains its library-only default; an
+explicit empty selection uses Cargo's ordinary default members and targets.
+The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
+compilation with `"no_run": true`. Run and executing Bench require inherited
+stdin and are refused by this protocol, including when stdin is redirected.
+Test bodies still execute for each request and retain their actual exit status.
+
+For a vendored source graph, omit `cargo_home_source` and `source_selection`,
+then add `"vendor": "vendor"` inside `settings`. For an entirely local graph,
+omit both dependency-source choices. The
+[selected source-preparation rules](#select-native-source-preparation) apply
+when `source_selection` is enabled. The entire approved source anchor remains
+the capture boundary. Client application environment is supplied only through
+`settings.env`; worker, loader and canonical execution controls remain reserved.
+
+#### Submit through Cargo with a reusable remote profile
+
+The Cargo frontend accepts the native client profile above. For repeated
+invocations, replace `output_destination` with `output_root`, an owned private
+parent for fresh results. The launcher also accepts `"toolchain": "rustup"`
+instead of `toolchain_root`, using the caller's selected installed toolchain.
+For example, save this launcher profile as `remote-cargo.json`:
+
+```json
+{
+  "version": "canonical-compile-remote-v1",
+  "coordinator": "192.0.2.10:45300",
+  "server_name": "rabs-coordinator.internal",
+  "coordinator_pin": "REPLACE_WITH_COORDINATOR_64_LOWERCASE_HEX_DIGITS",
+  "tls": {
+    "ca": "/home/dev/credentials/ca.pem",
+    "certificate": "/home/dev/credentials/edge-a.pem",
+    "private_key": "/home/dev/credentials/edge-a.key"
+  },
+  "source_root": "/home/dev/projects/approved-anchor",
+  "toolchain": "rustup",
+  "staging_root": "/home/dev/rabs-remote-staging",
+  "output_root": "/home/dev/rabs-remote-results",
+  "cargo_home_source": "/home/dev/.cargo",
+  "settings": {
+    "manifest": "app/Cargo.toml",
+    "source_selection": "cargo-unit-graph-v1",
+    "jobs": 2,
+    "timeout_seconds": 1800,
+    "env": {
+      "APP_VERSION": "2026.11"
+    }
+  }
+}
+```
+
+Use the same client prerequisites, credentials and private parent directories
+described above. The private key must remain outside the captured source,
+toolchain and optional Cargo-home roots. Invoke the installed Cargo launcher:
+
+```sh
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- check --workspace
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- build -p app --release
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- test -p app -- --test-threads=1
+cargo rabs --rabs-canonical-remote ./remote-cargo.json -- bench --no-run
+```
+
+Check, Build, Clippy, Doc, Test and nonexecuting Bench use the canonical Cargo
+selection parser, including package, target, feature and profile choices.
+Clippy requires the captured Clippy tools; Doc and executing doctests require
+the captured rustdoc executable. Run and Bench without `--no-run` refuse before dispatch
+because the remote protocol does not forward stdin.
+
+The command line replaces any saved `settings.command` and
+`settings.selection`; other settings remain in effect. With no Cargo command,
+the launcher selects `check` with an explicit empty selection, so Cargo chooses
+its ordinary default members and targets. It does not inherit application
+environment variables into `settings.env`.
+
+Each invocation retains a mode-0600 native `profile.json` inside a new
+mode-0700 `staging_root/<command>-<token>` directory. Its capture directory is
+private, and its output destination is the absent
+`output_root/<command>-<token>` path. The launcher reports the retained profile
+on stderr and invokes `rabsd --canonical-compile-remote` exactly once, preserving
+the native client's output streams and exit status. It leaves the reusable
+profile unchanged. Launcher-only `output_root` and `toolchain` fields are
+resolved before the native client reads the retained profile.
+
+Alternatively, retain an explicit `output_destination` for a one-off operation;
+it must be absent, and it cannot be combined with `output_root`. The launcher
+does not clear an earlier result. The selected launcher profile remains available
+for inspection after failure or interruption; remote operations are not resumable.
+A failure does not trigger a local fallback or automatic resubmission.
+
+#### Results, ownership and current limits
+
+The client preserves Cargo's numeric exit status and separate stdout/stderr
+streams. A successful Build or Doc, or Test/Bench with `no_run`, transfers the
+completed ordinary-file target tree and installs it at `output_destination`.
+Successful Check, Clippy and executing Test return their status and diagnostics
+without materializing that destination. The destination field remains required
+for every profile, and an existing destination refuses instead of being merged
+or overwritten. Choose a fresh destination for each intentional new operation.
+
+Artifact delivery is limited to **512 MiB and 4096 regular files**. The complete
+file set, lengths, executable identities and hashes are verified before atomic
+publication. Symlinks, special files, external hardlinks, ambiguous paths and
+oversized trees refuse delivery; the service never substitutes a successful
+partial tree. Internal hardlink aliases become independent files. Files arrive
+read-only, with mode 0444 or 0555 according to their executable bit, inside a
+private 0700 target root. Empty directories, timestamps and hardlink topology
+are not transported. These are detached build artifacts; this format does not
+grant reusable Cargo target-state or action-cache authority on the client.
+
+Client disconnection cancels and drains that operation. It removes only that
+operation's interest in a shared dependency execution; another client's retained
+subscription can continue. Losing the last subscriber cancels the shared
+producer through the existing ownership path. Service shutdown stops admission
+and joins operations and shared executions before releasing coordinator
+authority. The service verifies the same installed build identity as the client
+and cannot downgrade a client's required release-authorization policy.
+Install matching client and coordinator binaries: source-file delta negotiation
+and SDK upload/reuse selection use wire version `canonical-compile-remote-v3`,
+while existing client and service JSON profile versions remain unchanged. Older wire versions refuse
+before upload or execution.
+
+This remote protocol has no detached-job resume or automatic operation
+retry after admission. A transport failure after acceptance can leave execution
+or final delivery uncertain. An interruption after the local atomic rename can
+leave the requested output already installed even when the client reports an
+error. Preserve that result and inspect it; do not automatically submit another
+operation or fall back to a local compiler because an acknowledgment was lost.
+Failed receive staging is retained privately.
+
+Cargo and each operation's rustc endpoint run at the coordinator. The client
+does not run an independent local Cargo driver against a distributed action
+coordinator. This route extends the existing shared dependency runtime across
+authenticated client hosts; complete M6 fleet scheduling, a measured multi-host
+build storm and its performance targets still require their own qualification.
+The Cargo frontend submits through this same native protocol. It does not add
+a detached-job resume mechanism or change the service's admission and artifact
+delivery limits.
+
 ### Persistent reuse and command results
 
 The direct driver or persistent service exclusively owns
@@ -2319,7 +2788,8 @@ also capture their toolchain there; the service instead holds its bounded shared
 toolchain images under the locked state root.
 
 To retain Cargo's own private target state between local canonical commands,
-add this optional object to the same profile:
+add this optional object to the same profile. Remote canonical services accept
+the same object in their server profile:
 
 ```json
 "target_cache": {

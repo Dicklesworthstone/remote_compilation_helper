@@ -25,6 +25,7 @@ use rch_common::orphan_quarantine::{
     probe_verified_dead,
 };
 use rch_common::ssh::{SshClient, SshOptions};
+use rch_common::timing::{scale_duration, shell_prefix};
 use rch_common::{BuildLocation, WorkerConfig, WorkerId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,14 +58,19 @@ pub struct SshOrphanProber;
 
 impl OrphanProber for SshOrphanProber {
     async fn probe(&self, worker: WorkerConfig, evidence: QuarantineEvidence) -> Option<String> {
+        let budget = scale_duration(PROBE_TIMEOUT);
         let options = SshOptions {
-            command_timeout: PROBE_TIMEOUT,
-            connect_timeout: PROBE_TIMEOUT,
+            command_timeout: budget,
+            connect_timeout: budget,
             ..Default::default()
         };
         let mut client = SshClient::new(worker, options);
         client.connect().await.ok()?;
-        let script = kill_probe_script(&evidence.pgid_file, evidence.build_id);
+        let script = format!(
+            "{}{}",
+            shell_prefix(),
+            kill_probe_script(&evidence.pgid_file, evidence.build_id)
+        );
         let command = format!("sh -c {}", shell_escape::escape(script.into()));
         let result = client.execute(&command).await.ok()?;
         // The probe always exits 0; anything else is a channel failure.
@@ -203,7 +209,9 @@ impl<P: OrphanProber + 'static> OrphanQuarantineService<P> {
             }
             let Some(Ok(Some(stdout))) = revision
                 .run(tokio::time::timeout(
-                    PROBE_TIMEOUT,
+                    // One total budget covers connection and observation.
+                    // Per-stage limits remain subordinate to this deadline.
+                    scale_duration(PROBE_TIMEOUT),
                     self.prober.probe(config, evidence.clone()),
                 ))
                 .await

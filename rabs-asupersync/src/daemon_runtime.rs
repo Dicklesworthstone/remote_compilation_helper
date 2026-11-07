@@ -28,6 +28,7 @@ use crate::region_tree::RegionSpec;
 use asupersync::cx::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -228,6 +229,22 @@ impl Default for DaemonRunOptions {
     }
 }
 
+/// One JSON line announcing a subsystem whose work failed.
+fn failure_line(name: &str, reason: &str) -> String {
+    let mut escaped = String::with_capacity(reason.len());
+    for c in reason.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => escaped.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => escaped.push(c),
+        }
+    }
+    format!(
+        "{{\"v\":1,\"kind\":\"rabsd-subsystem-failed\",\"subsystem\":\"{name}\",\"reason\":\"{escaped}\"}}"
+    )
+}
+
 /// The obligation each subsystem region holds for its lifetime.
 fn lifetime_obligation(name: &str) -> ObligationKind {
     match name {
@@ -242,6 +259,7 @@ async fn subsystem_body(
     mut shutdown: asupersync::signal::ShutdownReceiver,
     behavior: SubsystemBehavior,
     work: Option<SubsystemWork>,
+    controller: Arc<ShutdownController>,
 ) -> SubsystemOutcome {
     cx.trace(&format!("rabsd subsystem {name} ready"));
     let mut obligations = ObligationSet::default();
@@ -255,6 +273,15 @@ async fn subsystem_body(
             Ok(())
         }
     };
+    if let Err(reason) = &work_result {
+        // A region whose work failed (e.g. the edge refusing an unsafe socket
+        // directory) never serves again. Waiting for an external signal kept
+        // the process alive, silent and not listening; wrappers already fail
+        // open to local compilation, so say why now and stop the daemon. The
+        // receipt still records the failure as an abandoned obligation.
+        let _ = writeln!(std::io::stderr().lock(), "{}", failure_line(name, reason));
+        controller.shutdown();
+    }
 
     let _ = cx.checkpoint();
     let (obligations_clean, abandoned) = match (behavior, work_result) {
@@ -368,9 +395,10 @@ pub fn run_daemon_controlled(
                         "janitor" => janitor_work.take(),
                         _ => None,
                     };
+                    let controller = Arc::clone(&root_controller);
                     let handle = cx
                         .spawn(move |cx| {
-                            subsystem_body(name, cx, shutdown, subsystem_behavior, work)
+                            subsystem_body(name, cx, shutdown, subsystem_behavior, work, controller)
                         })
                         .map_err(|e| DaemonError::SubsystemSpawn {
                             name,
@@ -482,6 +510,40 @@ mod tests {
         );
         let names: Vec<&str> = receipt.subsystems.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, DAEMON_SUBSYSTEMS.to_vec(), "model order held live");
+    }
+
+    #[test]
+    fn a_failed_subsystem_stops_the_daemon_instead_of_idling_silently() {
+        // No run_for and no signal listener: before, nothing would ever end
+        // this run once the edge refused its endpoint.
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.edge_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async { Err("endpoint /tmp/x.sock: unsafe \"parent\"\nmode 1777".to_owned()) })
+        }));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(run_daemon_controlled(
+                opts,
+                Arc::new(ShutdownController::new()),
+            ));
+        });
+        let receipt = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a failed subsystem must end the daemon run")
+            .expect("daemon runs");
+        assert!(!receipt.clean());
+        let edge = &receipt.subsystems[0];
+        assert_eq!(edge.name, "edge");
+        assert!(edge.abandoned[0].contains("unsafe"), "{edge:?}");
+        assert!(receipt.subsystems[1..].iter().all(|s| s.obligations_clean));
+        // The announcement is one valid JSON object, whatever the reason holds.
+        let line = failure_line("edge", "a \"quoted\" \\ path\nnext");
+        assert_eq!(
+            line,
+            "{\"v\":1,\"kind\":\"rabsd-subsystem-failed\",\"subsystem\":\"edge\",\
+             \"reason\":\"a \\\"quoted\\\" \\\\ path\\u000anext\"}"
+        );
     }
 
     #[test]

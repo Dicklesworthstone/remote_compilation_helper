@@ -39,6 +39,16 @@ pub(crate) fn quote_shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Start an RCH-owned worker child without letting its Cargo shim offload the
+/// job again. Override inherited values together, including on opaque scripts
+/// and the disk supervisor, so every descendant sees the same loop-break
+/// contract. This does not change the worker process's own environment.
+pub(crate) fn managed_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.envs(rch_common::MANAGED_CARGO_ENV);
+    command
+}
+
 /// Sentinel exit code returned when worker-side dependency prepare
 /// (`bun install` / `npm install`) fails or times out *before* the user command
 /// runs. Distinct from a real build/test exit 1 so the client can report
@@ -487,6 +497,10 @@ pub async fn execute_with_disk_budget(
     let mut disk_receipt = None;
     let mut cmd = if let Some(budget) = disk_budget {
         anyhow::ensure!(budget.max_growth_bytes > 0, "positive disk budget required");
+        anyhow::ensure!(
+            budget.warm_policy.is_none(),
+            "conditional warm budgets require dispatcher-owned admission"
+        );
         let root = std::fs::canonicalize(workdir)?;
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
@@ -556,7 +570,7 @@ pub async fn execute_with_disk_budget(
         } else {
             command.to_owned()
         };
-        let mut guarded = Command::new("python3");
+        let mut guarded = managed_command("python3");
         guarded
             .args([
                 "-I",
@@ -578,7 +592,7 @@ pub async fn execute_with_disk_budget(
         disk_receipt = Some((receipt, marker, budget));
         guarded
     } else {
-        let mut shell = Command::new("sh");
+        let mut shell = managed_command("sh");
         shell.args(["-c", command]);
         shell
     };
@@ -757,6 +771,7 @@ mod tests {
         let budget = Some(rch_common::BuildDiskBudget {
             max_growth_bytes: 8 << 20,
             min_free_bytes: 0,
+            warm_policy: None,
         });
         execute_with_disk_budget(
             directory.path().to_str().unwrap(),
@@ -789,6 +804,7 @@ mod tests {
             Some(rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 62,
+                warm_policy: None,
             }),
         )
         .await
@@ -811,6 +827,7 @@ mod tests {
                 Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 1 << 20,
                     min_free_bytes: 1 << 20,
+                    warm_policy: None,
                 }),
             ),
         )

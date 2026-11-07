@@ -289,10 +289,11 @@ mod linux {
     use std::fs::{self, File, FileTimes, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
     use std::path::Component;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     const MAX_PROBE_BYTES: u64 = 64 * 1024;
     const MAX_CPUINFO_BYTES: u64 = 4 * 1024 * 1024;
@@ -1039,14 +1040,252 @@ mod linux {
         Ok(flat)
     }
 
-    fn probe(targets: &[PathBuf], search: &[PathBuf]) -> Result<Vec<u8>, RuntimeCohortError> {
-        // Fixed tools and a clean environment: daemon PATH/LD_* never select
-        // the probe or change its resolution. GNU timeout owns the ldd process
-        // group and kills it at the deadline. Capped concurrent readers bound
-        // output without blocking one pipe behind the other.
-        let mut command = Command::new("/usr/bin/timeout");
+    struct ProbeChild {
+        child: Child,
+        unreaped: bool,
+    }
+
+    impl ProbeChild {
+        fn finish(&mut self) -> io::Result<ExitStatus> {
+            use rustix::process::{Pid, Signal, kill_process_group};
+            // The leader has not been reaped: its PID still pins this group's
+            // identity, including while it is a zombie. Never signal a cached
+            // numeric PID after wait() makes it available for reuse.
+            let signal = kill_process_group(Pid::from_child(&self.child), Signal::KILL);
+            if signal.is_err_and(|error| error != rustix::io::Errno::SRCH) {
+                let _ = self.child.kill();
+            }
+            let status = self.child.wait();
+            self.unreaped = false;
+            match signal {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => status,
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+
+    impl Drop for ProbeChild {
+        fn drop(&mut self) {
+            if self.unreaped {
+                let _ = self.finish();
+            }
+        }
+    }
+
+    fn read_probe_lane(reader: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<bool> {
+        let maximum = usize::try_from(MAX_PROBE_BYTES)
+            .map_err(|_| io::Error::other("runtime observation byte limit is unrepresentable"))?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if bytes.len() > maximum {
+                        return Err(io::Error::other("runtime observation byte limit exceeded"));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn capture_probe_process(command: &mut Command, budget: Duration) -> io::Result<Output> {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
         command
-            .args(["--signal=KILL", "5s", "/usr/bin/ldd", "--"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut owner = ProbeChild {
+            child: command.spawn()?,
+            unreaped: true,
+        };
+        let mut stdout = owner
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing probe stdout"))?;
+        let mut stderr = owner
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("missing probe stderr"))?;
+        fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
+        fcntl_setfl(&stderr, fcntl_getfl(&stderr)? | OFlags::NONBLOCK)?;
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        let (mut stdout_eof, mut stderr_eof) = (false, false);
+        let completion = (|| -> io::Result<()> {
+            loop {
+                if started.elapsed() >= budget {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "ELF loader probe exceeded its deadline",
+                    ));
+                }
+                if !stdout_eof {
+                    stdout_eof = read_probe_lane(&mut stdout, &mut output)?;
+                }
+                if !stderr_eof {
+                    stderr_eof = read_probe_lane(&mut stderr, &mut errors)?;
+                }
+                match waitid(
+                    WaitId::Pid(Pid::from_child(&owner.child)),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                ) {
+                    Ok(Some(_)) if stdout_eof && stderr_eof => return Ok(()),
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(error) => {
+                        // An external reaper can invalidate numeric signal
+                        // ownership. Refuse and close our nonblocking pipes.
+                        if error == rustix::io::Errno::CHILD {
+                            owner.unreaped = false;
+                        }
+                        return Err(error.into());
+                    }
+                }
+                std::thread::sleep(
+                    Duration::from_millis(2).min(budget.saturating_sub(started.elapsed())),
+                );
+            }
+        })();
+        let status = if owner.unreaped {
+            owner.finish()
+        } else {
+            Err(io::Error::other("loader probe lost child ownership"))
+        };
+        // Close every group writer before returning. A successful leader
+        // whose descendant still holds a pipe cannot turn partial output into
+        // a successful observation; both EOFs share the original deadline.
+        completion?;
+        let status = status?;
+        Ok(Output {
+            status,
+            stdout: output,
+            stderr: errors,
+        })
+    }
+
+    fn capture_probe(command: &mut Command, budget: Duration) -> io::Result<Output> {
+        let started = Instant::now();
+        let watchdog = if Path::new("/usr/bin/gnutimeout").try_exists()? {
+            "/usr/bin/gnutimeout"
+        } else {
+            "/usr/bin/timeout"
+        };
+        let mut version = Command::new(watchdog);
+        version
+            .arg("--version")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("LANG", "C");
+        let identity = capture_probe_process(&mut version, budget)?;
+        if !identity.status.success()
+            || !identity.stderr.is_empty()
+            || !identity.stdout.starts_with(b"timeout (GNU coreutils)")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ELF runtime probes require GNU Coreutils timeout (gnutimeout or timeout)",
+            ));
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ELF loader probe exceeded its deadline",
+            ));
+        }
+        // This independent watchdog survives an abrupt death of its Rust
+        // owner. Native draining alone cannot enforce a deadline after SIGKILL.
+        // Its budget shares the original deadline with capability discovery.
+        let mut watched = Command::new(watchdog);
+        watched
+            .arg("--signal=KILL")
+            .arg(format!("{}s", remaining.as_secs_f64()))
+            .arg(command.get_program())
+            .args(command.get_args())
+            .env_clear();
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                watched.env(name, value);
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            watched.current_dir(directory);
+        }
+        capture_probe_process(&mut watched, remaining)
+    }
+
+    fn ldd_bash_interpreter(program: &Path) -> io::Result<Option<&'static str>> {
+        // A symlinked or executable-only binary is still a supported direct
+        // invocation. Inspection only selects the optional Bash isolation; it
+        // must not replace that existing execution path with a new refusal.
+        if !fs::symlink_metadata(program)?.is_file() {
+            return Ok(None);
+        }
+        let file = match crate::regular_input::open(program) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut header = Vec::new();
+        file.take(256).read_to_end(&mut header)?;
+        Ok(match header.split(|byte| *byte == b'\n').next() {
+            Some(b"#!/bin/bash") => Some("/bin/bash"),
+            Some(b"#!/usr/bin/bash") => Some("/usr/bin/bash"),
+            _ => None,
+        })
+    }
+
+    fn probe(targets: &[PathBuf], search: &[PathBuf]) -> Result<Vec<u8>, RuntimeCohortError> {
+        let started = Instant::now();
+        // Fixed tool and clean environment: daemon PATH/LD_* never select the
+        // probe or change resolution. Own bounded draining and retain a GNU
+        // watchdog for parent death, all under the original five-second budget.
+        let search = if search.is_empty() {
+            None
+        } else {
+            Some(std::env::join_paths(search).map_err(|_| invalid("invalid loader search path"))?)
+        };
+        let shell = if search.is_some() {
+            ldd_bash_interpreter(Path::new("/usr/bin/ldd"))?
+        } else {
+            None
+        };
+        let mut command = if let (Some(shell), Some(search)) = (shell, search.as_ref()) {
+            // A compiler's search path can contain a different ABI for a
+            // library used by Bash or timeout but never by that compiler.
+            // Load the control tools in the clean host environment first,
+            // then source the fixed ldd script in the already-loaded shell.
+            // Only its ELF loader children inherit the exact compiler search.
+            // The path is opaque argv data, never interpolated shell source.
+            let mut command = Command::new(shell);
+            command
+                .args(["--noprofile", "--norc", "-c"])
+                .arg("export LD_LIBRARY_PATH=\"$1\"; shift; . /usr/bin/ldd -- \"$@\"")
+                .arg("/usr/bin/ldd")
+                .arg(search);
+            command
+        } else {
+            // Preserve the existing invocation for binary and other-script
+            // ldd implementations; never source an unrecognized executable.
+            let mut command = Command::new("/usr/bin/ldd");
+            command.arg("--");
+            command
+        };
+        command
             .args(targets)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -1055,37 +1294,31 @@ mod linux {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if !search.is_empty() {
-            command.env(
-                "LD_LIBRARY_PATH",
-                std::env::join_paths(search).map_err(|_| invalid("invalid loader search path"))?,
+        if shell.is_none()
+            && let Some(search) = &search
+        {
+            command.env("LD_LIBRARY_PATH", search);
+        }
+        let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ELF loader probe exceeded its deadline",
+            )
+            .into());
+        }
+        let output = capture_probe(&mut command, remaining)?;
+        if !output.status.success() {
+            return Err(
+                io::Error::other(format!("ELF loader probe failed: {}", output.status)).into(),
             );
         }
-        let mut child = command.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| invalid("missing probe stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| invalid("missing probe stderr"))?;
-        let output_reader = std::thread::spawn(move || bounded_read(stdout, MAX_PROBE_BYTES));
-        let error_reader = std::thread::spawn(move || bounded_read(stderr, MAX_PROBE_BYTES));
-        let status = child.wait();
-        let output = output_reader.join();
-        let errors = error_reader.join();
-        let output = output.map_err(|_| invalid("probe stdout reader panicked"))??;
-        let errors = errors.map_err(|_| invalid("probe stderr reader panicked"))??;
-        if !status?.success() {
-            return Err(invalid("ELF loader probe failed or exceeded its deadline"));
-        }
-        if !errors.is_empty() {
+        if !output.stderr.is_empty() {
             return Err(invalid(
                 "ELF loader probe reported unresolved runtime evidence",
             ));
         }
-        without_probe_headers(&output, targets)
+        without_probe_headers(&output.stdout, targets)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1968,6 +2201,213 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn loader_capture_preserves_fast_child_status_and_both_streams() {
+            for number in 0..32 {
+                let code = if number % 2 == 0 { "0" } else { "7" };
+                let mut command = Command::new("/bin/sh");
+                command.env_clear().args([
+                    "-c",
+                    "printf stdout; printf stderr >&2; exit \"$1\"",
+                    "probe",
+                    code,
+                ]);
+                let output = capture_probe(&mut command, Duration::from_secs(5)).unwrap();
+                assert_eq!(output.status.code(), Some(code.parse().unwrap()));
+                assert_eq!(output.stdout, b"stdout");
+                assert_eq!(output.stderr, b"stderr");
+            }
+        }
+
+        #[test]
+        fn loader_capture_accepts_empty_streams_and_reports_spawn_failure() {
+            let output = capture_probe(
+                Command::new("/bin/true").env_clear(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+            let missing = capture_probe(
+                &mut Command::new("/nonexistent-rabs-loader-probe"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(missing.status.code(), Some(127));
+            assert!(missing.stdout.is_empty());
+            assert!(!missing.stderr.is_empty());
+            let error = capture_probe_process(
+                &mut Command::new("/nonexistent-rabs-loader-probe"),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+
+        #[test]
+        fn loader_capture_rejects_overflow_on_either_real_pipe() {
+            for script in ["printf '%070000d' 0", "printf '%070000d' 0 >&2"] {
+                let mut command = Command::new("/bin/sh");
+                command.env_clear().args(["-c", script]);
+                let error = capture_probe(&mut command, Duration::from_secs(5)).unwrap_err();
+                assert!(error.to_string().contains("byte limit exceeded"), "{error}");
+            }
+        }
+
+        #[test]
+        fn loader_capture_deadline_drains_live_and_exited_leaders_without_accepting_open_pipes() {
+            for ending in ["wait", "exit 0"] {
+                let owner = tempfile::tempdir().unwrap();
+                let marker = owner.path().join("child-pid");
+                let mut command = Command::new("/bin/sh");
+                command
+                    .env_clear()
+                    .args([
+                        "-c",
+                        &format!("/bin/sleep 60 & printf '%s' \"$!\" > \"$1\"; {ending}"),
+                        "probe",
+                    ])
+                    .arg(&marker);
+                let error = capture_probe(&mut command, Duration::from_secs(1)).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{ending}: {error}");
+                let child: u32 = fs::read_to_string(marker).unwrap().parse().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    match fs::read_to_string(format!("/proc/{child}/stat")) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                        Ok(status)
+                            if status.rsplit_once(')').is_some_and(|(_, fields)| {
+                                matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+                            }) =>
+                        {
+                            break;
+                        }
+                        other => assert!(
+                            Instant::now() < deadline,
+                            "probe descendant survived group cleanup: {other:?}"
+                        ),
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        #[test]
+        fn ldd_bash_detection_preserves_other_executable_kinds() {
+            let owner = tempfile::tempdir().unwrap();
+            let program = owner.path().join("ldd");
+            fs::write(&program, b"#!/bin/bash\nexit 0\n").unwrap();
+            assert_eq!(ldd_bash_interpreter(&program).unwrap(), Some("/bin/bash"));
+            fs::write(&program, b"#!/usr/bin/bash\nexit 0\n").unwrap();
+            assert_eq!(
+                ldd_bash_interpreter(&program).unwrap(),
+                Some("/usr/bin/bash")
+            );
+            let alias = owner.path().join("ldd-alias");
+            std::os::unix::fs::symlink(&program, &alias).unwrap();
+            assert_eq!(ldd_bash_interpreter(&alias).unwrap(), None);
+            assert_eq!(ldd_bash_interpreter(owner.path()).unwrap(), None);
+            for bytes in [b"\x7fELF".as_slice(), b"#!/bin/sh\nexit 0\n"] {
+                fs::write(&program, bytes).unwrap();
+                assert_eq!(ldd_bash_interpreter(&program).unwrap(), None);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires glibc's Bash ldd with an observer-only shared library; real ELF isolation"]
+        fn runtime_observation_isolates_bash_dependencies_from_compiler_search() {
+            let shell = ldd_bash_interpreter(Path::new("/usr/bin/ldd"))
+                .unwrap()
+                .expect("this native fixture requires the Bash implementation of ldd");
+            let owner = tempfile::tempdir().unwrap();
+            // A literal shell metacharacter in a path also checks that the
+            // search list and target names remain opaque argv values.
+            let root = owner.path().join("toolchain-$(false)");
+            fs::create_dir_all(root.join("bin")).unwrap();
+            let search = root.join("lib");
+            fs::create_dir(&search).unwrap();
+            let compiler = root.join("bin/rustc");
+            fs::copy("/usr/bin/true", &compiler).unwrap();
+            let compiler_libraries = libraries(
+                &probe(std::slice::from_ref(&compiler), &[]).unwrap(),
+                Some(&root),
+            )
+            .unwrap();
+            let shell_libraries =
+                libraries(&probe(&[PathBuf::from(shell)], &[]).unwrap(), None).unwrap();
+            let control_only = shell_libraries
+                .iter()
+                .find(|library| {
+                    library.name.starts_with("lib")
+                        && library.name.contains(".so")
+                        && compiler_libraries
+                            .iter()
+                            .all(|compiler_library| compiler_library.name != library.name)
+                })
+                .expect("this native fixture requires a library used only by the observer shell");
+            let selected = compiler_libraries
+                .iter()
+                .find(|library| library.name.starts_with("lib") && library.name.contains(".so"))
+                .unwrap();
+            // Real ELF bytes, with an ABI unrelated to the observer's DSO.
+            // The compiler never asks for this name; every retained DSO still
+            // has a valid loader closure, including this copied library.
+            fs::copy(&selected.path, search.join(&control_only.name)).unwrap();
+            let targets = probe_targets(&compiler, &root).unwrap();
+            let run_compiler = || {
+                Command::new(&compiler)
+                    .env_clear()
+                    .env("LD_LIBRARY_PATH", &search)
+                    .output()
+                    .unwrap()
+            };
+            let direct = run_compiler();
+            assert!(direct.status.success(), "{direct:?}");
+
+            // Plant the exact old observer setup, independently of the new
+            // branch: Bash must fail to load its own ABI, not the compiler's.
+            let mut previous = Command::new("/usr/bin/ldd");
+            previous
+                .arg("--")
+                .args(&targets)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
+                .env("LD_LIBRARY_PATH", &search);
+            let failed = capture_probe(&mut previous, Duration::from_secs(5)).unwrap();
+            assert!(
+                !failed.status.success(),
+                "fixture did not trigger the old failure"
+            );
+            assert!(
+                String::from_utf8_lossy(&failed.stderr).contains(&control_only.name),
+                "{failed:?}"
+            );
+
+            let baseline = observe(&compiler, &root, &[], owner.path()).unwrap();
+            assert_eq!(
+                observe(
+                    &compiler,
+                    &root,
+                    std::slice::from_ref(&search),
+                    owner.path()
+                )
+                .unwrap(),
+                baseline,
+                "an observer-only ABI collision cannot change the compiler's runtime cohort"
+            );
+
+            // The search is still authoritative for actual compiler needs.
+            // A broken selected library must fail both real execution and the
+            // production probe, never disappear with the observer's imports.
+            fs::write(search.join(&selected.name), b"invalid selected runtime").unwrap();
+            let failed = run_compiler();
+            assert!(!failed.status.success(), "{failed:?}");
+            assert!(probe(&targets, std::slice::from_ref(&search)).is_err());
+        }
 
         #[test]
         fn elf_interpreter_refuses_malformed_tables_and_paths() {

@@ -203,6 +203,7 @@ pub fn bind_rustc_environment(
         }
     }
     let mut additions = BTreeMap::new();
+    let mut promoted = Vec::new();
     for line in text.lines() {
         let Some(Directive::Rustc { kind, value }) = parse_line(line.trim()) else {
             continue;
@@ -248,6 +249,21 @@ pub fn bind_rustc_environment(
             continue;
         }
         if plan.execution_env.iter().any(|(key, _)| key == name) {
+            // Cargo presented this export with exactly this value (checked
+            // above). An ambient name is unkeyed until something names it;
+            // the build script just did, so its value keys the action.
+            // Controls (jobserver, wrapper, shell bookkeeping) stay refused.
+            if matches!(
+                crate::live_dependency::env_role(name),
+                crate::live_dependency::EnvRole::Ambient
+            ) && plan
+                .execution_env
+                .iter()
+                .any(|(key, bound)| key == name && bound == value)
+            {
+                promoted.push((name.to_owned(), value.to_owned()));
+                continue;
+            }
             return Err(LiveRefusal::RefusedEnv(name.to_owned()));
         }
         if additions
@@ -265,6 +281,11 @@ pub fn bind_rustc_environment(
     for (name, value) in additions {
         plan.keyed_env.push((name.clone(), value.clone()));
         plan.execution_env.push((name, value));
+    }
+    for binding in promoted {
+        if !plan.keyed_env.contains(&binding) {
+            plan.keyed_env.push(binding);
+        }
     }
     plan.keyed_env.sort();
     plan.execution_env.sort();
@@ -478,6 +499,39 @@ mod environment_binding_tests {
         let again = plan.clone();
         bind_rustc_environment(&mut plan, Some(record), &env).unwrap();
         assert_eq!(plan, again, "idempotent binding cannot duplicate a name");
+    }
+
+    #[test]
+    fn narrowed_plans_key_build_script_exports_but_not_undeclared_ambient_values() {
+        let record = b"cargo:rustc-env=BUILD_LABEL=left side=right\n";
+        let narrowed = |label: &str, undeclared: &str| {
+            let (mut plan, env) = fixture(&[("BUILD_LABEL", label), ("UNDECLARED", undeclared)]);
+            plan.narrow_to_source_env_reads(&[]);
+            assert!(!plan.keyed_env.iter().any(|(n, _)| n == "BUILD_LABEL"));
+            bind_rustc_environment(&mut plan, Some(record), &env).unwrap();
+            plan
+        };
+        let plan = narrowed("left side=right", "private");
+        assert!(
+            plan.keyed_env
+                .contains(&("BUILD_LABEL".into(), "left side=right".into()))
+        );
+        assert!(!plan.keyed_env.iter().any(|(n, _)| n == "UNDECLARED"));
+        assert!(
+            plan.execution_env
+                .contains(&("UNDECLARED".into(), "private".into()))
+        );
+        assert_eq!(
+            key(&plan, record).unwrap().action_key,
+            key(&narrowed("left side=right", "other"), record)
+                .unwrap()
+                .action_key,
+            "an ambient value the build script did not export does not split keys"
+        );
+        // Cargo presenting a different value than the record is refused.
+        let (mut stale, env) = fixture(&[("BUILD_LABEL", "other")]);
+        stale.narrow_to_source_env_reads(&[]);
+        assert!(bind_rustc_environment(&mut stale, Some(record), &env).is_err());
     }
 
     #[test]

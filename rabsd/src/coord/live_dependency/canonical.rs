@@ -5,6 +5,8 @@
 //! capability. It is constructed by the driver, never decoded from a wrapper
 //! frame, and owns the operation directory until every request has drained.
 
+#[cfg(target_os = "linux")]
+use crate::coord::canonical_local::remote_toolchains::ReceivedToolchain;
 #[cfg(test)]
 use rabs_key::live_dependency::DependencySourceKind;
 use rabs_key::live_dependency::workspace_dependency_cache::CommittedDependencyPolicy;
@@ -50,6 +52,9 @@ struct Mount {
 pub struct CanonicalPaths {
     // Close captured filesystem descriptors before the operation directory.
     captured_toolchain: Option<Arc<PreparedToolchain>>,
+    #[cfg(target_os = "linux")]
+    received_toolchain: Option<Arc<ReceivedToolchain>>,
+    input_owner: Option<Arc<tempfile::TempDir>>,
     _owner: Arc<tempfile::TempDir>,
     shared_toolchain: Option<Arc<RetainedToolchain>>,
     mounts: Vec<Mount>,
@@ -149,6 +154,55 @@ impl CanonicalPaths {
         mappings: Vec<(PathBuf, PathBuf)>,
         shared_toolchain: Option<Arc<RetainedToolchain>>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_owned(
+            owner,
+            mappings,
+            shared_toolchain,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// A remote operation retains uploaded inputs separately from its short
+    /// runtime root. Only read-only source/compiler mounts may use that owner;
+    /// writable HOME, Cargo home and targets remain under the runtime owner.
+    #[cfg(test)]
+    pub(crate) fn new_with_input_owner(
+        owner: Arc<tempfile::TempDir>,
+        input_owner: Arc<tempfile::TempDir>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_owned(
+            owner,
+            mappings,
+            None,
+            Some(input_owner),
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Remote SDK reuse retains a distinct typed compiler lease. Only the
+    /// exact read-only toolchain mount may leave the source/runtime owners;
+    /// caching an SDK never retains an earlier client's source or outputs.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_with_received_toolchain(
+        owner: Arc<tempfile::TempDir>,
+        input_owner: Arc<tempfile::TempDir>,
+        toolchain: Arc<ReceivedToolchain>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_owned(owner, mappings, None, Some(input_owner), Some(toolchain))
+    }
+
+    fn new_owned(
+        owner: Arc<tempfile::TempDir>,
+        mappings: Vec<(PathBuf, PathBuf)>,
+        shared_toolchain: Option<Arc<RetainedToolchain>>,
+        input_owner: Option<Arc<tempfile::TempDir>>,
+        #[cfg(target_os = "linux")] received_toolchain: Option<Arc<ReceivedToolchain>>,
+    ) -> Result<Arc<Self>, String> {
         let owned = owner.path();
         if !ordinary_absolute(owned) {
             return Err("canonical operation root is not an ordinary absolute path".into());
@@ -159,6 +213,21 @@ impl CanonicalPaths {
             || root.mode() & 0o077 != 0
         {
             return Err("canonical operation root must be an owned private directory".into());
+        }
+        if let Some(inputs) = &input_owner {
+            let path = inputs.path();
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !ordinary_absolute(path)
+                || !metadata.is_dir()
+                || metadata.uid() != root.uid()
+                || metadata.mode() & 0o077 != 0
+                || path.starts_with(owned)
+                || owned.starts_with(path)
+            {
+                return Err(
+                    "canonical input owner must be a disjoint owned private directory".into(),
+                );
+            }
         }
         if let Some(toolchain) = &shared_toolchain {
             let parent = toolchain.owner_path();
@@ -175,6 +244,22 @@ impl CanonicalPaths {
                 .verify_retained_generation(|| false)
                 .map_err(|error| error.to_string())?;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(toolchain) = &received_toolchain {
+            let parent = toolchain.owner().path();
+            if shared_toolchain.is_some()
+                || parent.starts_with(owned)
+                || owned.starts_with(parent)
+                || input_owner.as_ref().is_none_or(|inputs| {
+                    parent.starts_with(inputs.path()) || inputs.path().starts_with(parent)
+                })
+            {
+                return Err("received compiler must retain a distinct SDK owner".into());
+            }
+            toolchain
+                .verify(|| false)
+                .map_err(|error| error.to_string())?;
+        }
         let mut visible = BTreeSet::new();
         let mut mounts: Vec<Mount> = Vec::new();
         for (logical, backing) in mappings {
@@ -187,7 +272,27 @@ impl CanonicalPaths {
                     }
                     toolchain.owner_path()
                 }
-                _ => owned,
+                _ => input_owner
+                    .as_ref()
+                    .filter(|inputs| {
+                        matches!(
+                            logical.to_str(),
+                            Some("/__rabs/workspace" | "/__rabs/toolchain")
+                        ) && backing.starts_with(inputs.path())
+                    })
+                    .map_or(owned, |inputs| inputs.path()),
+            };
+            #[cfg(target_os = "linux")]
+            let mount_owner = match &received_toolchain {
+                Some(toolchain) if logical == Path::new("/__rabs/toolchain") => {
+                    if backing != toolchain.root() {
+                        return Err(
+                            "canonical compiler mount differs from its received lease".into()
+                        );
+                    }
+                    toolchain.owner().path()
+                }
+                _ => mount_owner,
             };
             if !ROOTS.iter().any(|root| logical == Path::new(root))
                 || !visible.insert(logical.clone())
@@ -229,7 +334,10 @@ impl CanonicalPaths {
         }
         Ok(Arc::new(Self {
             _owner: owner,
+            input_owner,
             shared_toolchain,
+            #[cfg(target_os = "linux")]
+            received_toolchain,
             captured_toolchain: None,
             mounts,
             closed_dependency_execution_required: false,
@@ -245,8 +353,8 @@ impl CanonicalPaths {
         self.shared_toolchain.as_ref()
     }
 
-    /// Reuse the standalone driver's already captured compiler tree. The
-    /// ordinary mount checks above keep this image under the operation owner;
+    /// Reuse the driver's already captured compiler tree. The ordinary mount
+    /// checks keep this image under the operation or retained input owner;
     /// neither a wrapper path nor a second capture can select its generation.
     pub(crate) fn with_captured_toolchain(
         mut self: Arc<Self>,
@@ -255,10 +363,21 @@ impl CanonicalPaths {
         let Some(toolchain) = toolchain else {
             return Ok(self);
         };
+        let owned = toolchain.root().starts_with(self._owner.path())
+            || self
+                .input_owner
+                .as_ref()
+                .is_some_and(|owner| toolchain.root().starts_with(owner.path()));
+        #[cfg(target_os = "linux")]
+        let owned = owned
+            || self
+                .received_toolchain
+                .as_ref()
+                .is_some_and(|received| Arc::ptr_eq(&toolchain, received.image()));
         if self.shared_toolchain.is_some()
             || self.captured_toolchain.is_some()
             || self.physical(Path::new("/__rabs/toolchain"))? != toolchain.root()
-            || !toolchain.root().starts_with(self._owner.path())
+            || !owned
         {
             return Err("captured compiler differs from its owned canonical mount".into());
         }
@@ -273,6 +392,54 @@ impl CanonicalPaths {
 
     pub(crate) fn captured_toolchain(&self) -> Option<&Arc<PreparedToolchain>> {
         self.captured_toolchain.as_ref()
+    }
+
+    /// Recheck the exact compiler image and, for a reused remote SDK, its
+    /// separate directory witness at execution and delivery boundaries.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_captured_toolchain(
+        &self,
+        stopped: &impl Fn() -> bool,
+    ) -> std::io::Result<()> {
+        if let Some(received) = &self.received_toolchain {
+            received.verify(stopped)
+        } else if let Some(captured) = &self.captured_toolchain {
+            captured.verify_retained_generation(stopped)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A compiler-only lease can outlive this operation's paths. Retain the
+    /// actual validated SDK mount owner, independently of operation identity.
+    pub(super) fn captured_toolchain_owner(&self) -> Result<&Arc<tempfile::TempDir>, String> {
+        let image = self
+            .captured_toolchain
+            .as_ref()
+            .ok_or("canonical operation has no captured compiler owner")?;
+        let backing = self.physical(Path::new("/__rabs/toolchain"))?;
+        if backing != image.root() {
+            return Err("captured compiler differs from its owned canonical mount".into());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(received) = &self.received_toolchain {
+            if !Arc::ptr_eq(image, received.image()) || backing != received.root() {
+                return Err("captured compiler differs from its retained SDK lease".into());
+            }
+            received
+                .verify(|| false)
+                .map_err(|error| error.to_string())?;
+            return Ok(received.owner());
+        }
+        if let Some(inputs) = &self.input_owner
+            && backing.starts_with(inputs.path())
+        {
+            return Ok(inputs);
+        }
+        if backing.starts_with(self._owner.path()) {
+            return Ok(&self._owner);
+        }
+        Err("captured compiler lost its retained directory owner".into())
     }
 
     /// Original operation identity retained by remote keying. This owner is
@@ -449,29 +616,28 @@ impl CanonicalPaths {
         Ok(())
     }
 
-    /// Complete-workspace cache classes require a selected ordinary leaf
-    /// library in the exact build/check mode and a graph that cannot execute
-    /// project code. The wrapper supplies neither membership nor absence proof.
+    /// Qualify a selected ordinary leaf library in its exact build/check mode
+    /// for independently isolated worker execution. Other Cargo units may run
+    /// project code: their presence does not change this action's sealed input
+    /// view. The wrapper supplies neither membership nor execution evidence;
+    /// remote keying/capture must still retain the closed worker proof, and
+    /// `require_local_capture` remains a separate operation-wide refusal.
     pub(crate) fn require_workspace_closed_library(
         &self,
         plan: &DependencyActionPlan,
     ) -> Result<(), String> {
         rabs_key::live_dependency::workspace_cache::validate_closed_workspace_library_plan(plan)
             .map_err(|error| error.to_string())?;
-        self.require_workspace_execution(plan)?;
-        if self.closed_dependency_execution_required {
-            return Err(
-                "closed workspace library caching requires a Cargo graph without project executors"
-                    .into(),
-            );
-        }
-        Ok(())
+        self.require_workspace_execution(plan)
     }
 
     /// The exact committed policy validates source origin and compiler shape.
-    /// Workspace consumers also retain selected-unit and executor-free graph
-    /// authority. Immutable dependencies use their retained package mounts and
-    /// require isolated execution plus committed inputs at the remote boundary.
+    /// Workspace consumers also retain exact selected-unit authority. This
+    /// qualifies only the selected closed action, including when other units
+    /// may execute project code; it never authorizes local completion. Immutable
+    /// dependencies use their retained package mounts. Every consumer still
+    /// requires isolated execution plus exact committed input owners at the
+    /// remote boundary.
     pub(crate) fn require_committed_dependency_library(
         &self,
         plan: &DependencyActionPlan,
@@ -486,12 +652,6 @@ impl CanonicalPaths {
                 plan.source_kind
                     == rabs_key::live_dependency::DependencySourceKind::WorkspaceTerminalMetadata,
             )?;
-            if self.closed_dependency_execution_required {
-                return Err(
-                    "committed workspace caching requires a Cargo graph without project executors"
-                        .into(),
-                );
-            }
         } else {
             for root in [&plan.source_root, &plan.package_root] {
                 let physical = self.physical(Path::new(root))?;
@@ -946,6 +1106,69 @@ mod tests {
         )
         .unwrap();
         assert!(paths.with_captured_toolchain(Some(image)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn received_compiler_exports_only_its_separate_sdk_owner() {
+        use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
+
+        let original = crate::test_util::private_tempdir();
+        std::fs::write(original.path().join("compiler"), b"received SDK bytes").unwrap();
+        let sdk_owner = Arc::new(crate::test_util::private_tempdir());
+        let image = Arc::new(
+            capture_toolchain(
+                original.path(),
+                &sdk_owner.path().join("toolchain"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let received = Arc::new(
+            ReceivedToolchain::new(Arc::clone(&sdk_owner), Arc::clone(&image), || false).unwrap(),
+        );
+        let (runtime, _) = fixture();
+        let (source, _) = fixture();
+        let runtime_path = runtime.path().to_path_buf();
+        let source_path = source.path().to_path_buf();
+        let sdk_path = sdk_owner.path().to_path_buf();
+        let mappings = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let backing = match *logical {
+                    "/__rabs/workspace" => source.path().join(index.to_string()),
+                    "/__rabs/toolchain" => image.root().to_path_buf(),
+                    _ => runtime.path().join(index.to_string()),
+                };
+                (PathBuf::from(logical), backing)
+            })
+            .collect();
+        let paths = CanonicalPaths::new_with_received_toolchain(
+            Arc::clone(&runtime),
+            Arc::clone(&source),
+            Arc::clone(&received),
+            mappings,
+        )
+        .unwrap()
+        .with_captured_toolchain(Some(Arc::clone(&image)))
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            paths.captured_toolchain_owner().unwrap(),
+            &sdk_owner,
+        ));
+        let escaped_owner = Arc::clone(paths.captured_toolchain_owner().unwrap());
+        let escaped_image = Arc::clone(paths.captured_toolchain().unwrap());
+        drop((paths, runtime, source, received, image, sdk_owner));
+        assert!(!runtime_path.exists());
+        assert!(!source_path.exists());
+        assert!(sdk_path.join("toolchain/compiler").is_file());
+        escaped_image.verify_retained_generation(|| false).unwrap();
+        drop(escaped_image);
+        drop(escaped_owner);
+        assert!(!sdk_path.exists());
     }
 
     #[test]
@@ -1582,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_workspace_libraries_require_the_selected_output_mode_and_no_project_executors() {
+    fn closed_workspace_libraries_keep_selected_action_authority_with_project_executors() {
         use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
 
         for (command, mode) in [
@@ -1609,6 +1832,14 @@ mod tests {
                 &execution,
             )
             .unwrap();
+            let committed = if mode == "build" {
+                rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_rlib(&execution)
+            } else {
+                rabs_key::live_dependency::workspace_dependency_cache::plan_committed_workspace_metadata(&execution)
+            }
+            .unwrap();
+            let committed_policy =
+                CommittedDependencyPolicy::from_source_kind(committed.source_kind).unwrap();
             assert!(paths.require_workspace_closed_library(&closed).is_err());
             let mixed = rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library(&execution).unwrap();
             let policy = CommittedDependencyPolicy::from_source_kind(mixed.source_kind).unwrap();
@@ -1706,21 +1937,214 @@ mod tests {
                 "a selected {mode} unit cannot authorize the other compiler output class"
             );
             let guarded = paths.require_closed_dependency_execution().unwrap();
-            assert!(guarded.require_workspace_closed_library(&closed).is_err());
+            guarded.require_workspace_closed_library(&closed).unwrap();
+            guarded
+                .require_committed_dependency_library(&committed, committed_policy)
+                .unwrap();
+            guarded
+                .require_committed_dependency_library(&mixed, policy)
+                .unwrap();
+            guarded
+                .require_committed_dependency_library(&mixed, dag_policy)
+                .unwrap();
+            assert!(guarded.require_local_capture().is_err());
             assert!(
                 guarded
-                    .require_committed_dependency_library(&mixed, policy)
+                    .require_workspace_closed_library(&execution)
                     .is_err()
             );
             assert!(
                 guarded
-                    .require_committed_dependency_library(&mixed, dag_policy)
+                    .require_workspace_closed_library(&other_mode)
                     .is_err()
             );
+            for mutation in 0..6 {
+                for original in [&closed, &committed, &mixed] {
+                    let mut other = original.clone();
+                    match mutation {
+                        0 => other.invocation.crate_name = Some("unselected".into()),
+                        1 => other.invocation.features.clear(),
+                        2 => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+                        3 => other.package_root = "/__rabs/workspace/other".into(),
+                        4 => other.invocation.crate_types = vec!["rlib".into()],
+                        _ => {
+                            other.invocation.source = Some(
+                                rabs_key::invocation::SourceInput::Path("other/src/lib.rs".into()),
+                            );
+                        }
+                    }
+                    assert!(guarded.require_workspace_closed_library(&other).is_err());
+                    for policy in [committed_policy, policy, dag_policy] {
+                        assert!(
+                            guarded
+                                .require_committed_dependency_library(&other, policy)
+                                .is_err(),
+                            "{mode}, {policy:?}, mutation {mutation}"
+                        );
+                    }
+                }
+            }
             assert!(
                 guarded.require_workspace_execution(&execution).is_ok(),
                 "project executors retain fresh remote execution"
             );
+        }
+    }
+
+    #[test]
+    fn executor_graphs_qualify_only_the_exact_selected_terminal_metadata_root() {
+        use rabs_key::live_dependency::workspace_dependency_cache::plan_terminal_workspace_metadata;
+
+        for (kind, crate_type, test_harness, test_cfg) in [
+            ("bin", Some("bin"), false, false),
+            ("example", Some("bin"), false, false),
+            ("test", None, true, false),
+            ("bench", None, false, true),
+        ] {
+            let paths = workspace_target_paths(kind, "bin", true, true, None)
+                .require_closed_dependency_execution()
+                .unwrap();
+            let execution =
+                workspace_metadata_plan_with_test_cfg(crate_type, test_harness, test_cfg);
+            let terminal = plan_terminal_workspace_metadata(&execution).unwrap();
+            assert!(paths.require_local_capture().is_err());
+            assert!(paths.require_workspace_closed_library(&terminal).is_err());
+            for policy in [
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            ] {
+                paths
+                    .require_committed_dependency_library(&terminal, policy)
+                    .unwrap();
+                let prerequisite = workspace_target_paths(kind, "bin", true, false, None)
+                    .require_closed_dependency_execution()
+                    .unwrap();
+                assert!(
+                    prerequisite
+                        .require_committed_dependency_library(&terminal, policy)
+                        .is_err(),
+                    "{kind}, {policy:?}: a prerequisite is not a selected terminal root"
+                );
+                for mutation in 0..4 {
+                    let mut other = terminal.clone();
+                    match mutation {
+                        0 => other.invocation.features.clear(),
+                        1 => other.invocation.emit.push("link".into()),
+                        2 => other.invocation.crate_name = Some("unselected".into()),
+                        _ => {
+                            other.invocation.source = Some(
+                                rabs_key::invocation::SourceInput::Path("app/src/main.rs".into()),
+                            );
+                        }
+                    }
+                    assert!(
+                        paths
+                            .require_committed_dependency_library(&other, policy)
+                            .is_err(),
+                        "{kind}, {policy:?}, mutation {mutation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn executor_graphs_qualify_generated_leaves_but_keep_native_searches_fresh() {
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library;
+        use rabs_key::live_dependency::{DependencySourceKind, remote_workspace_execution_shape};
+
+        for native in 0..3 {
+            let paths = workspace_target_paths("lib", "lib", false, true, None)
+                .require_closed_dependency_execution()
+                .unwrap();
+            let mut execution = workspace_plan();
+            let generated = "/__rabs/out/cargo/debug/build/project-abc/out";
+            let physical = paths.physical(Path::new(generated)).unwrap();
+            std::fs::create_dir_all(&physical).unwrap();
+            std::fs::write(physical.join("config.rs"), b"pub const VALUE: u32 = 42;\n").unwrap();
+            execution.generated_root = Some(generated.into());
+            execution
+                .execution_env
+                .push(("OUT_DIR".into(), generated.into()));
+            execution.execution_env.sort();
+            execution.keyed_env = execution.execution_env.clone();
+            if native > 0 {
+                std::fs::write(
+                    physical.join("libgenerated.a"),
+                    crate::test_util::closed_rlib_fixture(b"retained native input"),
+                )
+                .unwrap();
+                execution
+                    .invocation
+                    .lib_search
+                    .push(format!("native={generated}"));
+                if native == 2 {
+                    execution
+                        .invocation
+                        .native_libs
+                        .push("static=generated".into());
+                }
+            }
+            // These are valid fresh worker execution shapes, not malformed
+            // plans that happen to fail both the old and new cache boundary.
+            paths.require_workspace_execution(&execution).unwrap();
+            remote_workspace_execution_shape(&execution, &[], "/__rabs/toolchain").unwrap();
+            assert!(paths.require_local_capture().is_err());
+            if native == 0 {
+                let generated = plan_closed_workspace_library(&execution).unwrap();
+                assert_eq!(
+                    generated.source_kind,
+                    DependencySourceKind::WorkspaceGeneratedMetadata
+                );
+                paths.require_workspace_closed_library(&generated).unwrap();
+                let mut unselected = generated.clone();
+                unselected.invocation.features.clear();
+                assert!(paths.require_workspace_closed_library(&unselected).is_err());
+                let mut no_generated = generated;
+                no_generated.generated_root = None;
+                no_generated
+                    .execution_env
+                    .retain(|(name, _)| name != "OUT_DIR");
+                no_generated.keyed_env = no_generated.execution_env.clone();
+                assert!(
+                    paths
+                        .require_workspace_closed_library(&no_generated)
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    plan_closed_workspace_library(&execution).is_err(),
+                    "search-only native inputs must also retain fresh execution"
+                );
+            }
+            assert!(plan_mixed_workspace_library(&execution).is_err());
+            let mut relabeled = execution.clone();
+            relabeled.source_kind = DependencySourceKind::WorkspaceClosedMetadata;
+            assert!(paths.require_workspace_closed_library(&relabeled).is_err());
+            for (source_kind, policies) in [
+                (
+                    DependencySourceKind::WorkspaceCommittedMetadata,
+                    &[CommittedDependencyPolicy::WorkspaceMetadata][..],
+                ),
+                (
+                    DependencySourceKind::WorkspaceMixedMetadata,
+                    &[
+                        CommittedDependencyPolicy::MixedWorkspaceMetadata,
+                        CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    ][..],
+                ),
+            ] {
+                relabeled.source_kind = source_kind;
+                for policy in policies {
+                    assert!(
+                        paths
+                            .require_committed_dependency_library(&relabeled, *policy)
+                            .is_err(),
+                        "native={native}, {policy:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1813,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_workspace_metadata_requires_selected_check_and_executor_free_graph() {
+    fn committed_workspace_metadata_requires_selected_check_even_with_project_executors() {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
         };
@@ -1880,9 +2304,13 @@ mod tests {
             );
         }
         let guarded = paths.require_closed_dependency_execution().unwrap();
+        guarded
+            .require_committed_dependency_library(&metadata, policy)
+            .unwrap();
+        assert!(guarded.require_local_capture().is_err());
         assert!(
             guarded
-                .require_committed_dependency_library(&metadata, policy)
+                .require_committed_dependency_library(&archive, policy)
                 .is_err()
         );
         guarded.require_workspace_execution(&execution).unwrap();
@@ -2170,6 +2598,106 @@ mod tests {
         assert!(CanonicalPaths::new(owner, mappings).is_err());
     }
 
+    #[test]
+    fn separate_input_owner_only_authorizes_source_and_compiler_mounts() {
+        let (owner, _) = fixture();
+        let (inputs, _) = fixture();
+        let (foreign, _) = fixture();
+        let mappings: Vec<_> = ROOTS
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let parent = if matches!(index, 0 | 2) {
+                    inputs.path()
+                } else {
+                    owner.path()
+                };
+                (PathBuf::from(logical), parent.join(index.to_string()))
+            })
+            .collect();
+        let paths = CanonicalPaths::new_with_input_owner(
+            Arc::clone(&owner),
+            Arc::clone(&inputs),
+            mappings.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(paths.operation_owner(), &owner));
+        assert_eq!(
+            paths.physical(Path::new("/__rabs/workspace")).unwrap(),
+            inputs.path().join("0")
+        );
+        for index in [1, 3, 4] {
+            let mut forged = mappings.clone();
+            forged[index].1 = inputs.path().join(index.to_string());
+            assert!(
+                CanonicalPaths::new_with_input_owner(
+                    Arc::clone(&owner),
+                    Arc::clone(&inputs),
+                    forged,
+                )
+                .is_err(),
+                "writable {} escaped the runtime owner",
+                ROOTS[index]
+            );
+        }
+        for index in [0, 2] {
+            let mut forged = mappings.clone();
+            forged[index].1 = foreign.path().join(index.to_string());
+            assert!(
+                CanonicalPaths::new_with_input_owner(
+                    Arc::clone(&owner),
+                    Arc::clone(&inputs),
+                    forged,
+                )
+                .is_err(),
+                "unowned {} was accepted",
+                ROOTS[index]
+            );
+        }
+        // Cargo-home projection may independently copy the workspace into
+        // runtime storage while the captured compiler stays under uploads.
+        let mut projected = mappings;
+        projected[0].1 = owner.path().join("0");
+        let projected =
+            CanonicalPaths::new_with_input_owner(Arc::clone(&owner), inputs, projected).unwrap();
+        assert_eq!(
+            projected.physical(Path::new("/__rabs/workspace")).unwrap(),
+            owner.path().join("0")
+        );
+    }
+
+    #[test]
+    fn separate_input_owner_refuses_equal_nested_and_nonprivate_custody() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (owner, _) = fixture();
+        let nested = Arc::new(
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(owner.path())
+                .unwrap(),
+        );
+        for (runtime, inputs) in [
+            (Arc::clone(&owner), Arc::clone(&owner)),
+            (Arc::clone(&owner), Arc::clone(&nested)),
+            (Arc::clone(&nested), Arc::clone(&owner)),
+        ] {
+            let error =
+                CanonicalPaths::new_with_input_owner(runtime, inputs, Vec::new()).unwrap_err();
+            assert!(
+                error.contains("disjoint owned private directory"),
+                "{error}"
+            );
+        }
+        let (inputs, _) = fixture();
+        std::fs::set_permissions(inputs.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = CanonicalPaths::new_with_input_owner(owner, inputs, Vec::new()).unwrap_err();
+        assert!(
+            error.contains("disjoint owned private directory"),
+            "{error}"
+        );
+    }
+
     struct GeneratedFixture {
         _owner: Arc<tempfile::TempDir>,
         paths: Arc<CanonicalPaths>,
@@ -2264,12 +2792,307 @@ mod tests {
             }
         }
 
+        fn workspace(mut self, archive: bool, dag: bool) -> Self {
+            use rabs_key::live_dependency::plan_canonical_workspace_execution;
+            use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+            use rabs_key::live_dependency::workspace_dependency_cache::plan_generated_workspace_dag_library;
+            use rabs_sandbox::cargo_check::{CompilationCommand, validate_compilation_unit_graph};
+
+            let package = "/__rabs/workspace/app";
+            let source = self.paths.physical(Path::new(package)).unwrap();
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("Cargo.toml"),
+                b"[package]\nname='generated'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='lib.rs'\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("lib.rs"),
+                b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+            )
+            .unwrap();
+            let mut argv = vec![
+                "/__rabs/toolchain/bin/rustc".into(),
+                "--crate-name=generated".into(),
+                "--crate-type=lib".into(),
+                if archive {
+                    "--emit=dep-info,metadata,link".into()
+                } else {
+                    "--emit=dep-info,metadata".into()
+                },
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                format!("--out-dir={}", self.plan.out_dir),
+                "app/lib.rs".into(),
+            ];
+            if dag {
+                // This selected-unit/retained-tree fixture does not mint the
+                // separate committed installation capability for this extern.
+                // Real store-backed producer witnesses are tested in committed.rs.
+                argv.push(format!(
+                    "--extern=upstream={}/libupstream.rmeta",
+                    self.plan.out_dir
+                ));
+            }
+            let mut env = self.plan.execution_env.clone();
+            for (name, value) in &mut env {
+                if name == "CARGO_MANIFEST_DIR" {
+                    *value = package.into();
+                }
+            }
+            env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: "/__rabs/workspace",
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let graph = serde_json::json!({"version":1,"roots":[0],"units":[{
+                "pkg_id":"path+file:///__rabs/workspace/app#generated@0.1.0",
+                "target":{"kind":["lib"],"crate_types":["lib"],"name":"generated",
+                    "src_path":"/__rabs/workspace/app/lib.rs","edition":"2021"},
+                "profile":{"name":"dev"},"platform":null,
+                "mode":if archive { "build" } else { "check" },
+                "features":[],"dependencies":[]
+            }]});
+            let graph = validate_compilation_unit_graph(
+                &graph,
+                if archive {
+                    CompilationCommand::Build
+                } else {
+                    CompilationCommand::Check
+                },
+            )
+            .unwrap();
+            self.paths = self
+                .paths
+                .with_workspace_units(graph.workspace_units(), None)
+                .unwrap()
+                .require_closed_dependency_execution()
+                .unwrap();
+            self.plan = if dag {
+                plan_generated_workspace_dag_library(&fresh)
+            } else {
+                plan_closed_workspace_library(&fresh)
+            }
+            .unwrap();
+            self.physical = self.paths.project_plan(&self.plan).unwrap();
+            self.binding = self
+                .paths
+                .generated_root(&self.plan, &self.physical)
+                .unwrap()
+                .unwrap();
+            self
+        }
+
         fn capture(
             &self,
             facts: &Arc<crate::edge::live_facts::LiveFacts>,
         ) -> Result<Arc<crate::edge::live_facts::PackageFacts>, crate::edge::live_facts::FactsMiss>
         {
             facts.package_canonical(&self.physical, Some(&self.binding), &[])
+        }
+    }
+
+    #[test]
+    fn generated_workspace_profiles_retain_original_tree_and_cargo_record_generations() {
+        use crate::edge::live_facts::LiveFacts;
+        use rabs_key::live_dependency::DependencySourceKind;
+
+        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
+            for mutation in [
+                "generated-bytes",
+                "same-byte-file",
+                "added-member",
+                "empty-directory",
+                "source-member",
+                "stdout",
+                "same-byte-record",
+                "root-output",
+                "output-alias",
+            ] {
+                let fixture = GeneratedFixture::new(true, archive).workspace(archive, dag);
+                assert_eq!(
+                    fixture.plan.source_kind,
+                    match (archive, dag) {
+                        (true, false) => DependencySourceKind::WorkspaceGeneratedRlib,
+                        (false, false) => DependencySourceKind::WorkspaceGeneratedMetadata,
+                        (true, true) => DependencySourceKind::WorkspaceGeneratedDagRlib,
+                        (false, true) => DependencySourceKind::WorkspaceGeneratedDagMetadata,
+                    }
+                );
+                if dag {
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(
+                            &fixture.plan,
+                            CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert!(
+                        fixture
+                            .paths
+                            .require_workspace_closed_library(&fixture.plan)
+                            .is_err()
+                    );
+                } else {
+                    fixture
+                        .paths
+                        .require_workspace_closed_library(&fixture.plan)
+                        .unwrap();
+                }
+                assert!(fixture.paths.require_local_capture().is_err());
+                let facts = LiveFacts::new();
+                let captured = fixture.capture(&facts).unwrap();
+                captured
+                    .verify_unchanged(Path::new(&fixture.physical.source_root))
+                    .unwrap();
+                captured
+                    .verify_generated_disjoint(&fixture.physical)
+                    .unwrap();
+                assert_eq!(captured.generated_files.len(), 1);
+                assert_eq!(
+                    captured.build_script_output.as_deref(),
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n".as_slice())
+                );
+                assert!(
+                    !captured
+                        .source_directory_enumerations(&fixture.plan)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    captured
+                        .generated_directory_enumerations(&fixture.plan)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let generated = fixture.binding.physical();
+                match mutation {
+                    "generated-bytes" => {
+                        std::fs::write(generated.join("value.rs"), b"pub const VALUE: u32 = 23;\n")
+                    }
+                    "same-byte-file" => {
+                        let replacement = fixture._owner.path().join("replacement.rs");
+                        std::fs::write(
+                            &replacement,
+                            std::fs::read(generated.join("value.rs")).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::rename(replacement, generated.join("value.rs"))
+                    }
+                    "added-member" => {
+                        std::fs::write(generated.join("new.rs"), b"new generated input")
+                    }
+                    "empty-directory" => std::fs::create_dir(generated.join("new-empty")),
+                    "source-member" => std::fs::write(
+                        Path::new(&fixture.physical.source_root).join("new-shared-input"),
+                        b"new source input",
+                    ),
+                    "stdout" => {
+                        std::fs::write(&fixture.stdout, b"cargo::rustc-env=BUILD_LABEL=changed\n")
+                    }
+                    "same-byte-record" => {
+                        let replacement = fixture._owner.path().join("replacement-output");
+                        std::fs::write(&replacement, std::fs::read(&fixture.stdout).unwrap())
+                            .unwrap();
+                        std::fs::rename(replacement, &fixture.stdout)
+                    }
+                    "root-output" => {
+                        std::fs::write(&fixture.record, b"/__rabs/out/cargo/debug/build/other/out")
+                    }
+                    "output-alias" => std::fs::hard_link(
+                        generated.join("value.rs"),
+                        Path::new(&fixture.physical.out_dir).join(&fixture.plan.output_names()[0]),
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert!(
+                    captured
+                        .verify_unchanged(Path::new(&fixture.physical.source_root))
+                        .is_err(),
+                    "archive={archive}, dag={dag}, {mutation}: original generated proof refreshed itself"
+                );
+                if mutation == "output-alias" {
+                    assert!(
+                        captured
+                            .verify_generated_disjoint(&fixture.physical)
+                            .is_err()
+                    );
+                }
+                if mutation == "root-output" {
+                    assert!(fixture.capture(&facts).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_workspace_dags_keep_selected_units_native_exclusions_and_local_refusal() {
+        for archive in [false, true] {
+            let fixture = GeneratedFixture::new(true, archive).workspace(archive, true);
+            let policy =
+                CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind).unwrap();
+            fixture
+                .paths
+                .require_committed_dependency_library(&fixture.plan, policy)
+                .unwrap();
+            assert!(fixture.paths.require_local_capture().is_err());
+            for other in [
+                CommittedDependencyPolicy::WorkspaceRlib,
+                CommittedDependencyPolicy::WorkspaceMetadata,
+                CommittedDependencyPolicy::WorkspaceDagRlib,
+                CommittedDependencyPolicy::WorkspaceDagMetadata,
+                if archive {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                } else {
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                },
+            ] {
+                assert!(
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(&fixture.plan, other)
+                        .is_err()
+                );
+            }
+            for mutation in 0..8 {
+                let mut other = fixture.plan.clone();
+                match mutation {
+                    0 => other.invocation.crate_name = Some("unselected".into()),
+                    1 => other.invocation.features.push("unselected-feature".into()),
+                    2 => other.target_triple = "aarch64-unknown-linux-gnu".into(),
+                    3 => other.package_root = "/__rabs/workspace/other".into(),
+                    4 => {
+                        other.invocation.source = Some(rabs_key::invocation::SourceInput::Path(
+                            "other/lib.rs".into(),
+                        ))
+                    }
+                    5 => other.invocation.passthrough.push("--test".into()),
+                    6 => other
+                        .invocation
+                        .lib_search
+                        .push(format!("native={}", other.generated_root.as_ref().unwrap())),
+                    _ => {
+                        other.generated_root = None;
+                        other.execution_env.retain(|(name, _)| name != "OUT_DIR");
+                        other.keyed_env = other.execution_env.clone();
+                    }
+                }
+                assert!(
+                    fixture
+                        .paths
+                        .require_committed_dependency_library(&other, policy)
+                        .is_err(),
+                    "archive={archive}, mutation={mutation}"
+                );
+            }
         }
     }
 

@@ -3,15 +3,17 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::DaemonContext;
+use crate::admission::{ExecutionRequirements, TOOLCHAIN_PREFLIGHT_TTL};
 use crate::disk_pressure::{
     DiskCapacityObservation, DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment,
-    evaluate_pressure_policy,
+    PressureState, refresh_pressure_policy,
 };
-use crate::health::probe_worker_capabilities;
+use crate::health::probe_worker_capabilities_until;
 use rch_common::bypass_record::AdminDisableStore;
+use rch_common::timing::scale_duration;
 use rch_common::{
-    CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
-    WorkerStatus,
+    CircuitBreakerConfig, CircuitState, CircuitStats, RequiredRuntime, WorkerCapabilities,
+    WorkerConfig, WorkerId, WorkerStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -436,6 +438,9 @@ struct EndpointTransport {
     probe: Arc<Mutex<()>>,
     recovery: Arc<Mutex<()>>,
     changes: watch::Sender<u64>,
+    /// Shared by current inventory and historical owners of this endpoint.
+    /// A transport loss invalidates every pre-outage disk observation.
+    disk_capacity_generation: Arc<AtomicU64>,
 }
 
 impl EndpointTransport {
@@ -445,6 +450,7 @@ impl EndpointTransport {
             probe: Arc::new(Mutex::new(())),
             recovery: Arc::new(Mutex::new(())),
             changes: watch::channel(0).0,
+            disk_capacity_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -463,6 +469,7 @@ impl EndpointTransport {
     }
 
     fn revoke(&self) {
+        self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         self.changes
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -494,6 +501,42 @@ impl EndpointTransport {
         network
             .is_current()
             .then(|| self.record_result_locked(&mut state, connected, normal_interval, circuit))
+    }
+
+    async fn record_probe_result_until(
+        &self,
+        network: &BackgroundProbe,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+        deadline: tokio::time::Instant,
+    ) -> Option<(bool, bool)> {
+        let observed_at = tokio::time::Instant::now();
+        if observed_at >= deadline {
+            return None;
+        }
+        let positive_evidence = connected.then_some(TransportProbeDeadline {
+            started_at: observed_at,
+            interval: normal_interval,
+        });
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
+            .await
+            .ok()?;
+        if tokio::time::Instant::now() >= deadline
+            || !network.is_current()
+            || positive_evidence.is_some_and(|evidence| evidence.remaining().is_zero())
+        {
+            return None;
+        }
+        let outcome = self.record_result_locked(&mut state, connected, normal_interval, circuit);
+        // Publication contention consumes the proof's lifetime. Keep the
+        // existing intervals without renewing freshness or delaying a recovered
+        // endpoint's next probe beyond the observation's original due time.
+        state.positive_evidence = positive_evidence;
+        if connected && outcome.0 {
+            state.next_probe = positive_evidence;
+        }
+        Some(outcome)
     }
 
     fn record_result_locked(
@@ -626,22 +669,53 @@ impl BackgroundProbe {
                 .is_none_or(|(changes, revision)| *changes.borrow() == *revision)
     }
 
-    pub(crate) async fn run<F: std::future::Future>(&mut self, operation: F) -> Option<F::Output> {
-        if !self.is_current() {
+    /// Fence one synchronous commit against both worker and shared-transport
+    /// revocation. The operation must not await or reborrow either watch: a
+    /// queued writer could otherwise block that nested read indefinitely.
+    fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let current = self.changes.borrow();
+        if *current != self.revision {
             return None;
         }
-        let result = tokio::select! {
-            biased;
-            _ = self.changes.changed() => None,
-            () = async {
-                match &mut self.transport {
-                    Some((changes, _)) => { let _ = changes.changed().await; }
-                    None => std::future::pending().await,
-                }
-            } => None,
-            result = operation => Some(result),
-        };
-        self.is_current().then_some(result).flatten()
+        let transport = self
+            .transport
+            .as_ref()
+            .map(|(changes, revision)| (changes.borrow(), *revision));
+        if transport
+            .as_ref()
+            .is_some_and(|(current, revision)| **current != *revision)
+        {
+            return None;
+        }
+        Some(operation())
+    }
+
+    /// Boxes `operation` before any state machine captures it: as an
+    /// `async fn` parameter it was stored twice (argument and select arm),
+    /// and every probe caller inlined both copies up the selection, health
+    /// and cleanup chains until debug test stacks overflowed (bd-4ncr5).
+    pub(crate) fn run<F: std::future::Future>(
+        &mut self,
+        operation: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> {
+        let operation = Box::pin(operation);
+        async move {
+            if !self.is_current() {
+                return None;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = self.changes.changed() => None,
+                () = async {
+                    match &mut self.transport {
+                        Some((changes, _)) => { let _ = changes.changed().await; }
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                result = operation => Some(result),
+            };
+            self.is_current().then_some(result).flatten()
+        }
     }
 }
 
@@ -695,14 +769,70 @@ impl OwnedRecoveryPermit {
         .await
     }
 
+    /// Preserve one cancellation deadline through admission, historical
+    /// transport proof, publication, and the authorized recovery operation.
+    pub(crate) async fn run_until<F: std::future::Future>(
+        &mut self,
+        operation: F,
+        deadline: tokio::time::Instant,
+    ) -> Option<F::Output> {
+        let endpoint = self.endpoint.clone();
+        let timeout = self.policy.probe_timeout;
+        self.run_with_probe_before(
+            operation,
+            crate::health::probe_owned_recovery_transport_until(&endpoint, timeout, deadline),
+            Some(deadline),
+        )
+        .await
+    }
+
     async fn run_with_probe<F: std::future::Future, P: std::future::Future<Output = bool>>(
         &mut self,
         operation: F,
         probe: P,
     ) -> Option<F::Output> {
+        self.run_with_probe_before(operation, probe, None).await
+    }
+
+    async fn run_with_probe_before<
+        F: std::future::Future,
+        P: std::future::Future<Output = bool>,
+    >(
+        &mut self,
+        operation: F,
+        probe: P,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<F::Output> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return None;
+        }
+        let operation = self.run_with_probe_admitted(operation, probe, deadline);
+        match deadline {
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                result = operation => result.filter(|_| tokio::time::Instant::now() < deadline),
+            },
+            None => operation.await,
+        }
+    }
+
+    async fn run_with_probe_admitted<
+        F: std::future::Future,
+        P: std::future::Future<Output = bool>,
+    >(
+        &mut self,
+        operation: F,
+        probe: P,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<F::Output> {
+        let in_budget = || deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline);
+        if !in_budget() {
+            return None;
+        }
         let _operation = self.transport.recovery.clone().try_lock_owned().ok()?;
         if let Some(current) = &mut self.current {
-            if !current.is_current() || self.transport.state.lock().await.down {
+            if !current.is_current() || self.transport.state.lock().await.down || !in_budget() {
                 return None;
             }
             return current.run(operation).await;
@@ -711,6 +841,9 @@ impl OwnedRecoveryPermit {
         let mut network = self.transport.revision_guard();
         let needs_probe = {
             let state = self.transport.state.lock().await;
+            if !in_budget() {
+                return None;
+            }
             !(state.connected
                 && !state.down
                 && state
@@ -724,9 +857,10 @@ impl OwnedRecoveryPermit {
             };
             {
                 let mut state = self.transport.state.lock().await;
-                if state
-                    .next_probe
-                    .is_some_and(|deadline| !deadline.remaining().is_zero())
+                if !in_budget()
+                    || state
+                        .next_probe
+                        .is_some_and(|deadline| !deadline.remaining().is_zero())
                 {
                     return None;
                 }
@@ -741,19 +875,43 @@ impl OwnedRecoveryPermit {
                     self.policy.normal_interval
                 }));
             }
+            if !in_budget() {
+                return None;
+            }
             let connected = network.run(probe).await?;
-            self.transport
-                .record_probe_result(
-                    &network,
-                    connected,
-                    self.policy.normal_interval,
-                    &self.policy.circuit,
-                )
-                .await?;
+            if !in_budget() {
+                return None;
+            }
+            match deadline {
+                Some(deadline) => {
+                    self.transport
+                        .record_probe_result_until(
+                            &network,
+                            connected,
+                            self.policy.normal_interval,
+                            &self.policy.circuit,
+                            deadline,
+                        )
+                        .await?;
+                }
+                None => {
+                    self.transport
+                        .record_probe_result(
+                            &network,
+                            connected,
+                            self.policy.normal_interval,
+                            &self.policy.circuit,
+                        )
+                        .await?;
+                }
+            }
             if !connected {
                 return None;
             }
             drop(flight);
+        }
+        if !in_budget() {
+            return None;
         }
         network.run(operation).await
     }
@@ -828,7 +986,7 @@ pub struct WorkerState {
     /// Serialize daemon-side capability requests from health, operators and selection.
     capability_probe: tokio::sync::Mutex<()>,
     /// Cached per-toolchain preflight verdicts.
-    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightStatus>>,
+    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightEvidence>>,
     /// Latest daemon-side pressure policy assessment for this worker.
     pressure_assessment: RwLock<PressureAssessment>,
     /// Disk budget shared by all workers created by the same daemon pool.
@@ -863,6 +1021,16 @@ pub(crate) struct CapabilityProbeContext {
     started_at: Instant,
     generation: u64,
     network_revision: u64,
+    transport_generation: u64,
+    current_transport_generation: Arc<AtomicU64>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl CapabilityProbeContext {
+    pub(crate) fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
 }
 
 /// Configuration and identity of the endpoint a network operation actually used.
@@ -1001,6 +1169,9 @@ impl WorkerState {
     }
 
     fn revoke_background_network(&self) {
+        // Reconnecting or re-enabling cannot renew a pre-outage capacity
+        // sample, including a clone already handed to admission/history.
+        self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         self.network_changes
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -1484,8 +1655,9 @@ impl WorkerState {
     ///
     /// All admission evidence is collected before the CAS. Retaining the
     /// config, pressure, and lifecycle read guards through the CAS prevents
-    /// administrative or capacity changes from racing that commit. Cancellation
-    /// while awaiting those guards never changes slot accounting.
+    /// administrative, pressure, or capacity changes from racing that commit.
+    /// Recheck Critical pressure here even if selection previously admitted the
+    /// worker. Cancellation while awaiting those guards never changes accounting.
     pub async fn reserve_slots(&self, count: u32) -> bool {
         if count == 0 {
             return false;
@@ -1493,11 +1665,11 @@ impl WorkerState {
         let config = self.config.read().await;
         let pressure = self.pressure_assessment.read().await;
         let lifecycle = self.lifecycle.read().await;
-        if !lifecycle.is_schedulable() {
+        if !lifecycle.is_schedulable() || pressure.state == PressureState::Critical {
             return false;
         }
         let total_slots = self.slots_for(config.total_slots, &pressure);
-        self.reserve_slots_accounting(count, total_slots)
+        self.reserve_slots_accounting(count, total_slots, None)
     }
 
     /// Reserve slots against the exact endpoint selected for a build and carry
@@ -1505,17 +1677,30 @@ impl WorkerState {
     ///
     /// There is no await after slot accounting succeeds. The caller can therefore
     /// synchronously publish durable ownership before cancellation becomes
-    /// observable again. A retarget, retirement, stale lifecycle, or insufficient
-    /// capacity is refused before accounting changes.
+    /// observable again. A retarget, retirement, stale lifecycle, Critical
+    /// pressure, unsatisfied execution requirements, or insufficient capacity is
+    /// refused before accounting changes.
     pub(crate) async fn reserve_slots_for_endpoint(
         &self,
         count: u32,
         endpoint: &WorkerEndpointSnapshot,
+        requirements: &ExecutionRequirements<'_>,
     ) -> Option<WorkerSlotAdmission> {
         if count == 0 {
             return None;
         }
         let config = self.config.read().await;
+        // Match publish_capabilities' capability-before-pressure order and
+        // retain this guard through the CAS. Every execution requirement must
+        // still hold when a refresh publishes after selection. The optional
+        // toolchain guard similarly fences a newly failed preflight without
+        // cloning the inventory or doing remote work under these locks.
+        let capabilities = self.capabilities.read().await;
+        let toolchain_preflight = if requirements.preflight_toolchain().is_some() {
+            Some(self.toolchain_preflight.read().await)
+        } else {
+            None
+        };
         let pressure = self.pressure_assessment.read().await;
         let lifecycle = self.lifecycle.read().await;
         let disk_capacity = self.disk_capacity_observation.read().await.clone();
@@ -1527,19 +1712,38 @@ impl WorkerState {
                 .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
             && endpoint.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
             && same_endpoint(&config, &endpoint.config);
-        if !endpoint_current || !lifecycle.is_schedulable() {
+        if !endpoint_current
+            || !lifecycle.is_schedulable()
+            || pressure.state == PressureState::Critical
+            || !requirements.capabilities_satisfied(&capabilities)
+        {
             return None;
         }
-
         let total_slots = self.slots_for(config.total_slots, &pressure);
-        self.reserve_slots_accounting(count, total_slots)
+        let preflight_provenance = match requirements.preflight_toolchain() {
+            Some(toolchain_name) => {
+                let evidence = toolchain_preflight.as_ref()?.get(toolchain_name)?;
+                if !evidence.verdict.usable || !evidence.verdict.is_fresh(TOOLCHAIN_PREFLIGHT_TTL) {
+                    return None;
+                }
+                Some(&evidence.provenance)
+            }
+            None => None,
+        };
+
+        self.reserve_slots_accounting(count, total_slots, preflight_provenance)
             .then_some(WorkerSlotAdmission { disk_capacity })
     }
 
     /// Synchronous accounting boundary shared by ordinary and endpoint-bound
     /// admission. Successful ownership is returned in the same poll that
     /// changes the counter; there is no cancellable post-commit validation.
-    fn reserve_slots_accounting(&self, count: u32, total_slots: u32) -> bool {
+    fn reserve_slots_accounting(
+        &self,
+        count: u32,
+        total_slots: u32,
+        preflight_provenance: Option<&BackgroundProbe>,
+    ) -> bool {
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
             if !self.connection_is_ready() {
@@ -1551,12 +1755,21 @@ impl WorkerState {
             if next > total_slots {
                 return false;
             }
-            match self.used_slots.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
+            // Check readiness before acquiring watch guards. Retain the
+            // preflight's original epochs across this CAS only, and recheck
+            // them on every retry. Reconnection cannot revive old evidence.
+            let commit = || {
+                self.used_slots
+                    .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
+            };
+            let result = match preflight_provenance {
+                Some(provenance) => match provenance.with_current(commit) {
+                    Some(result) => result,
+                    None => return false,
+                },
+                None => commit(),
+            };
+            match result {
                 Ok(_) => return true,
                 Err(actual) => current = actual,
             }
@@ -1696,6 +1909,57 @@ impl WorkerState {
         (previous, new)
     }
 
+    /// Acquire command-evidence publication within the caller's original
+    /// deadline. Callers retain endpoint then network guards before this lock
+    /// and commit without another await once all destination locks are held.
+    pub(crate) async fn lock_command_outcome_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<tokio::sync::RwLockWriteGuard<'_, CircuitStats>> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        let guard = tokio::time::timeout_at(deadline, self.circuit.write())
+            .await
+            .ok()?;
+        (tokio::time::Instant::now() < deadline).then_some(guard)
+    }
+
+    /// Acquire every live recovery destination before its durable commit.
+    /// Callers retain store, endpoint, then network-publication guards. Match
+    /// command failure's circuit-before-error order; lifecycle is acquired last.
+    /// The callback must commit synchronously, without awaiting or reborrowing
+    /// the admission watches, so cancellation cannot retire a durable quarantine
+    /// and then abandon its matching live transition.
+    pub(crate) async fn with_recovery_state_before<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        provenance: &BackgroundProbe,
+        commit: impl FnOnce(&mut WorkerLifecycle, &mut CircuitStats, &mut Option<String>) -> T,
+    ) -> Option<T> {
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
+            return None;
+        }
+        let acquire = async {
+            let circuit = self.circuit.write().await;
+            let last_error = self.last_error_msg.write().await;
+            let lifecycle = self.lifecycle.write().await;
+            (lifecycle, circuit, last_error)
+        };
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => None,
+            (mut lifecycle, mut circuit, mut last_error) = acquire => {
+                provenance.with_current(|| {
+                    if tokio::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    Some(commit(&mut lifecycle, &mut circuit, &mut last_error))
+                }).flatten()
+            }
+        }
+    }
+
     /// Record a failed operation for circuit breaker.
     pub async fn record_failure(&self, error_msg: Option<String>) {
         let mut circuit = self.circuit.write().await;
@@ -1773,11 +2037,15 @@ impl WorkerState {
 
     pub(crate) async fn capability_probe_context(&self) -> CapabilityProbeContext {
         let config = self.config.read().await;
+        let transport = self.transport();
         CapabilityProbeContext {
             config: config.clone(),
             started_at: Instant::now(),
             generation: self.disk_capacity_generation.load(Ordering::Acquire),
             network_revision: *self.network_changes.borrow(),
+            transport_generation: transport.disk_capacity_generation.load(Ordering::Acquire),
+            current_transport_generation: Arc::clone(&transport.disk_capacity_generation),
+            deadline: None,
         }
     }
 
@@ -1789,59 +2057,72 @@ impl WorkerState {
         context: CapabilityProbeContext,
         capabilities: WorkerCapabilities,
     ) -> bool {
-        let config = self.config.read().await;
-        let _publication = self.network_transition.lock().await;
-        if *self.network_changes.borrow() != context.network_revision {
+        let deadline = context.deadline;
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return false;
         }
-        if config.id != context.config.id
-            || config.host != context.config.host
-            || config.user != context.config.user
-            || config.identity_file != context.config.identity_file
-        {
-            return false;
-        }
-        let generation = context.generation.wrapping_add(1);
-        if self
-            .disk_capacity_generation
-            .compare_exchange(
-                context.generation,
+        let publication = async {
+            let config = self.config.read().await;
+            let _publication = self.network_transition.lock().await;
+            // Match reservation's capability-before-pressure-and-disk order.
+            // Acquire every destination before changing generation or any
+            // cached snapshot: cancellation while queued keeps old evidence.
+            let mut cached = self.capabilities.write().await;
+            let mut pressure = self.pressure_assessment.write().await;
+            let mut disk = self.disk_capacity_observation.write().await;
+            if *self.network_changes.borrow() != context.network_revision
+                || context.current_transport_generation.load(Ordering::Acquire)
+                    != context.transport_generation
+            {
+                return false;
+            }
+            if config.id != context.config.id
+                || config.host != context.config.host
+                || config.user != context.config.user
+                || config.identity_file != context.config.identity_file
+            {
+                return false;
+            }
+            let pressure_config = DiskPressurePolicyConfig::configured();
+            let next_pressure = refresh_pressure_policy(&capabilities, &pressure, &pressure_config);
+            let generation = context.generation.wrapping_add(1);
+            let observation = DiskCapacityObservation::from_capabilities(
+                config.id.to_string(),
+                &capabilities,
                 generation,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
+                Arc::clone(&self.disk_capacity_generation),
+                context.transport_generation,
+                context.current_transport_generation,
+                context.started_at,
+            );
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return false;
+            }
+            if self
+                .disk_capacity_generation
+                .compare_exchange(
+                    context.generation,
+                    generation,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            // No await follows the commit. Readers cannot observe a cancelled
+            // publication's new disk generation paired with old capabilities.
+            *disk = observation;
+            *cached = capabilities;
+            *pressure = next_pressure;
+            true
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, publication)
+                .await
+                .unwrap_or(false),
+            None => publication.await,
         }
-        let observation = DiskCapacityObservation::from_capabilities(
-            config.id.to_string(),
-            &capabilities,
-            generation,
-            Arc::clone(&self.disk_capacity_generation),
-            context.started_at,
-        );
-        *self.disk_capacity_observation.write().await = observation;
-        let pressure_config = DiskPressurePolicyConfig::configured();
-        let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
-        *self.capabilities.write().await = capabilities;
-
-        let now_ms = current_unix_ms();
-        let mut current = self.pressure_assessment.write().await;
-        if pressure.state != crate::disk_pressure::PressureState::Critical
-            && refresh_preserved_pressure_age(&mut current, &pressure_config, now_ms)
-        {
-            current.disk_free_gb = pressure.disk_free_gb;
-            current.disk_total_gb = pressure.disk_total_gb;
-            current.disk_free_ratio = pressure.disk_free_ratio;
-            current.build_disk_free_gb = pressure.build_disk_free_gb;
-            current.build_disk_total_gb = pressure.build_disk_total_gb;
-            current.evaluated_at_unix_ms = now_ms;
-            return true;
-        }
-
-        *current = pressure;
-        true
     }
 
     /// Get worker capabilities.
@@ -1853,24 +2134,65 @@ impl WorkerState {
         self.disk_capacity_observation.read().await.clone()
     }
 
-    /// Cache a toolchain preflight verdict for selection-time routing.
+    /// Seed a current verdict in tests without running a remote probe.
+    #[cfg(test)]
     pub async fn record_toolchain_preflight(
         &self,
         toolchain: String,
         usable: bool,
         reason: Option<String>,
     ) {
-        self.toolchain_preflight.write().await.insert(
+        let mut cache = self.toolchain_preflight.write().await;
+        cache.insert(
             toolchain,
-            ToolchainPreflightStatus {
-                usable,
-                reason,
-                checked_at_unix_ms: current_unix_ms(),
+            ToolchainPreflightEvidence {
+                verdict: ToolchainPreflightStatus {
+                    usable,
+                    reason,
+                    checked_at_unix_ms: current_unix_ms(),
+                },
+                provenance: self.network_revision_guard(),
             },
         );
     }
 
-    /// Retrieve a cached toolchain preflight verdict.
+    /// Publish a completed verdict only within its original network epochs and
+    /// budget. Waiting for the cache lock cannot renew revoked or late evidence.
+    pub(crate) async fn record_toolchain_preflight_before(
+        &self,
+        toolchain: String,
+        usable: bool,
+        reason: Option<String>,
+        provenance: &BackgroundProbe,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
+            return false;
+        }
+        let Ok(mut cache) =
+            tokio::time::timeout_at(deadline, self.toolchain_preflight.write()).await
+        else {
+            return false;
+        };
+        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
+            return false;
+        }
+        cache.insert(
+            toolchain,
+            ToolchainPreflightEvidence {
+                verdict: ToolchainPreflightStatus {
+                    usable,
+                    reason,
+                    checked_at_unix_ms: current_unix_ms(),
+                },
+                provenance: provenance.clone(),
+            },
+        );
+        true
+    }
+
+    /// Retrieve a verdict only while its original worker and transport epochs
+    /// remain current. Recovery requires a new probe for successes and failures.
     pub async fn toolchain_preflight_status(
         &self,
         toolchain: &str,
@@ -1879,7 +2201,8 @@ impl WorkerState {
             .read()
             .await
             .get(toolchain)
-            .cloned()
+            .filter(|evidence| evidence.provenance.is_current())
+            .map(|evidence| evidence.verdict.clone())
     }
 
     /// Update the latest disk-pressure policy assessment.
@@ -1890,6 +2213,11 @@ impl WorkerState {
     /// Get the latest disk-pressure policy assessment.
     pub async fn pressure_assessment(&self) -> PressureAssessment {
         self.pressure_assessment.read().await.clone()
+    }
+
+    /// Check current capability evidence for a command's required runtime.
+    pub async fn has_runtime(&self, required: RequiredRuntime) -> bool {
+        self.capabilities.read().await.has_runtime(required)
     }
 
     /// Check if this worker has Bun installed.
@@ -2166,6 +2494,14 @@ impl WorkerState {
                 )
             })
     }
+}
+
+/// A completed preflight retains the permission that admitted its remote I/O.
+/// Keep one entry per toolchain; revoked entries are replaced on the next probe.
+#[derive(Debug, Clone)]
+struct ToolchainPreflightEvidence {
+    verdict: ToolchainPreflightStatus,
+    provenance: BackgroundProbe,
 }
 
 /// Cached result of checking a concrete Rust toolchain on a worker.
@@ -2691,29 +3027,6 @@ fn current_unix_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn refresh_preserved_pressure_age(
-    assessment: &mut PressureAssessment,
-    config: &DiskPressurePolicyConfig,
-    now_ms: i64,
-) -> bool {
-    if !assessment.telemetry_fresh {
-        return false;
-    }
-
-    let Some(previous_age_secs) = assessment.telemetry_age_secs else {
-        return false;
-    };
-
-    let elapsed_secs = now_ms
-        .saturating_sub(assessment.evaluated_at_unix_ms)
-        .max(0) as u64
-        / 1_000;
-    let age_secs = previous_age_secs.saturating_add(elapsed_secs);
-    assessment.telemetry_age_secs = Some(age_secs);
-    assessment.telemetry_fresh = age_secs <= config.telemetry_stale_after.as_secs();
-    assessment.telemetry_fresh
-}
-
 // ============================================================================
 // Worker API Response Types
 // ============================================================================
@@ -2879,7 +3192,9 @@ fn source_topology_revalidation_command(fences: &[crate::history::SourceTopology
     // every previously refused mapping.
     let mut command = format!(
         "set -eu\nrch_source_topology_matches() (\nset -- check \"$1\" \"$2\"\n{}\n)\n",
-        include_str!("../../rch/src/hook/source_namespace_paths.sh"),
+        // rchd's own copy, so the published package builds; the hook's file
+        // stays canonical and a test below fails when the two drift.
+        include_str!("source_namespace_paths.sh"),
     );
     for (index, fence) in fences.iter().enumerate() {
         let topology = &fence.mismatch.topology;
@@ -2942,6 +3257,26 @@ fn revalidated_source_topologies(output: &rch_common::CommandResult, count: usiz
     parsed.unwrap_or_default()
 }
 
+// False means the shared deadline expired. Timely but invalid output contributes
+// no indices; neither case may discard acknowledgments from an earlier batch.
+fn acknowledge_source_topology_batch(
+    output: &rch_common::CommandResult,
+    range: std::ops::Range<usize>,
+    deadline: tokio::time::Instant,
+    revalidated: &mut Vec<usize>,
+) -> bool {
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    let indices = revalidated_source_topologies(output, range.len());
+    // Parsing is part of the observation, including for an already-ready result.
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    revalidated.extend(indices.into_iter().map(|index| range.start + index));
+    true
+}
+
 async fn revalidate_source_topologies(
     worker: &Arc<WorkerState>,
     history: &crate::history::BuildHistory,
@@ -2962,13 +3297,18 @@ async fn revalidate_source_topologies(
     if batches.is_empty() {
         return;
     }
+    let Some(deadline) =
+        tokio::time::Instant::now().checked_add(scale_duration(Duration::from_secs(20)))
+    else {
+        return;
+    };
     let mut revalidated = Vec::new();
     let probe = async {
         let mut client = rch_common::SshClient::new(
             endpoint.config.clone(),
             rch_common::SshOptions {
-                connect_timeout: Duration::from_secs(10),
-                command_timeout: Duration::from_secs(15),
+                connect_timeout: scale_duration(Duration::from_secs(10)),
+                command_timeout: scale_duration(Duration::from_secs(15)),
                 control_master: false,
                 ..Default::default()
             },
@@ -2976,12 +3316,13 @@ async fn revalidate_source_topologies(
         client.connect().await?;
         let result = async {
             for (range, command) in batches {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
                 let output = client.execute(&command).await?;
-                revalidated.extend(
-                    revalidated_source_topologies(&output, range.len())
-                        .into_iter()
-                        .map(|index| range.start + index),
-                );
+                if !acknowledge_source_topology_batch(&output, range, deadline, &mut revalidated) {
+                    break;
+                }
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -2990,10 +3331,10 @@ async fn revalidate_source_topologies(
         result
     };
     // Preserve fully acknowledged earlier batches even if a later read-only
-    // probe fails or exceeds the overall budget. Incomplete output proves
-    // nothing and never contributes an index to this list.
+    // probe fails or exceeds the overall budget. Incomplete or late output
+    // proves nothing and never contributes an index to this list.
     if permit
-        .run(tokio::time::timeout(Duration::from_secs(20), probe))
+        .run(tokio::time::timeout_at(deadline, probe))
         .await
         .is_none()
         || revalidated.is_empty()
@@ -3049,24 +3390,28 @@ async fn refresh_worker_capabilities_concurrently(
 async fn refresh_worker_capabilities_for_worker(
     worker: Arc<WorkerState>,
 ) -> WorkerCapabilitiesRefreshInfo {
-    let probe = tokio::time::timeout(
-        CAPABILITIES_REFRESH_WORKER_BUDGET,
-        // On-demand capability refresh (the `rch workers capabilities` API path)
-        // uses a throwaway SSH session — it is a low-frequency operator query, not
-        // one of the ~30s periodic poll loops the shared pool exists to de-flood.
-        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT, None),
-    )
-    .await;
+    let probe_timeout = scale_duration(CAPABILITIES_REFRESH_PROBE_TIMEOUT);
+    let worker_budget = scale_duration(CAPABILITIES_REFRESH_WORKER_BUDGET);
+    let Some(deadline) = tokio::time::Instant::now().checked_add(worker_budget) else {
+        return WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+            "capabilities probe deadline exceeds the monotonic clock range",
+        );
+    };
+    // Carry the operator response deadline through collection and publication;
+    // a ready inner future must not publish after this shorter outer budget.
+    let probe = probe_worker_capabilities_until(&worker, probe_timeout, None, deadline).await;
 
     match probe {
-        Ok(Some(_capabilities)) => WorkerCapabilitiesRefreshInfo::live_probe(),
-        Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+        Some(_capabilities) => WorkerCapabilitiesRefreshInfo::live_probe(),
+        None if tokio::time::Instant::now() >= deadline => {
+            WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+                "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
+                worker_budget.as_secs_f64()
+            ))
+        }
+        None => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
             "capabilities probe failed; returning cached capability snapshot",
         ),
-        Err(_) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
-            "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
-            CAPABILITIES_REFRESH_WORKER_BUDGET.as_secs()
-        )),
     }
 }
 
@@ -3399,6 +3744,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_packaged_topology_predicate_matches_the_hook_script() {
+        assert!(
+            include_str!("source_namespace_paths.sh")
+                == include_str!("../../rch/src/hook/source_namespace_paths.sh"),
+            "rchd/src/source_namespace_paths.sh is stale: copy rch/src/hook/source_namespace_paths.sh over it"
+        );
+    }
+
+    #[test]
     fn source_topology_revalidation_batches_bound_ssh_arguments_and_keep_exact_indices() {
         let endpoint =
             WorkerEndpointIdentity::from_config(&recovered_worker_config("many-layouts", 8));
@@ -3588,6 +3942,121 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn source_topology_acknowledgments_require_time_remaining() {
+        let output = rch_common::CommandResult {
+            exit_code: 0,
+            stdout: "0\n1\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n".into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        for scale in [1.0, 2.0, 10.0] {
+            let timing = rch_common::timing::TimingScale::try_from(scale).unwrap();
+            let budget = timing.duration(Duration::from_secs(20));
+            let deadline = tokio::time::Instant::now().checked_add(budget).unwrap();
+            let mut revalidated = Vec::new();
+            tokio::time::advance(budget - Duration::from_millis(1)).await;
+            assert!(acknowledge_source_topology_batch(
+                &output,
+                10..12,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            assert!(!acknowledge_source_topology_batch(
+                &output,
+                20..22,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(!acknowledge_source_topology_batch(
+                &output,
+                30..32,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [10, 11]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_topology_acknowledgments_preserve_earlier_valid_evidence() {
+        let output = |exit_code, stdout: &str| rch_common::CommandResult {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        let ready = output(0, "0\n1\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n");
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(20))
+            .unwrap();
+        let mut revalidated = Vec::new();
+        assert!(acknowledge_source_topology_batch(
+            &ready,
+            0..2,
+            deadline,
+            &mut revalidated,
+        ));
+        for invalid in [
+            output(1, "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+            output(0, "0\n"),
+            output(0, "2\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n"),
+        ] {
+            assert!(acknowledge_source_topology_batch(
+                &invalid,
+                2..4,
+                deadline,
+                &mut revalidated,
+            ));
+            assert_eq!(revalidated, [0, 1]);
+        }
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(!acknowledge_source_topology_batch(
+            &ready,
+            2..4,
+            deadline,
+            &mut revalidated,
+        ));
+        assert_eq!(revalidated, [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_ready_source_topology_acknowledgment_cannot_win_timeout_race() {
+        let output = rch_common::CommandResult {
+            exit_code: 0,
+            stdout: "0\nRCH_SOURCE_TOPOLOGY_REVALIDATION_COMPLETE\n".into(),
+            stderr: String::new(),
+            duration_ms: 0,
+        };
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(20))
+            .unwrap();
+        let mut revalidated = Vec::new();
+        assert!(acknowledge_source_topology_batch(
+            &output,
+            7..8,
+            deadline,
+            &mut revalidated,
+        ));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        // A ready future can finish even when the enclosing timeout is due.
+        // Either timeout ordering must leave the late batch unacknowledged.
+        let result = tokio::time::timeout_at(deadline, async {
+            let output = std::future::ready(&output).await;
+            acknowledge_source_topology_batch(output, 20..21, deadline, &mut revalidated)
+        })
+        .await;
+        assert!(!result.unwrap_or(false));
+        assert_eq!(revalidated, [7]);
+    }
+
     fn recovered_worker_config(id: &str, slots: u32) -> WorkerConfig {
         WorkerConfig {
             id: WorkerId::new(id),
@@ -3598,6 +4067,25 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+        }
+    }
+
+    fn execution_request(required_runtime: RequiredRuntime) -> rch_common::SelectionRequest {
+        rch_common::SelectionRequest {
+            project: "admission-fixture".into(),
+            command: None,
+            command_priority: rch_common::CommandPriority::Normal,
+            estimated_cores: 1,
+            disk_headroom_gib: 0,
+            disk_observation_version: 0,
+            preferred_workers: Vec::new(),
+            toolchain: None,
+            required_runtime,
+            classification_duration_us: None,
+            job_mode: false,
+            required_tools: Vec::new(),
+            source_topology: None,
+            hook_pid: None,
         }
     }
 
@@ -3651,7 +4139,11 @@ mod tests {
 
         assert!(
             worker
-                .reserve_slots_for_endpoint(2, &selected)
+                .reserve_slots_for_endpoint(
+                    2,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
                 .await
                 .is_none()
         );
@@ -3664,11 +4156,612 @@ mod tests {
         let selected = worker.endpoint_snapshot().await;
         let before = worker.disk_capacity_observation().await;
         let admission = worker
-            .reserve_slots_for_endpoint(2, &selected)
+            .reserve_slots_for_endpoint(
+                2,
+                &selected,
+                &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+            )
             .await
             .expect("current healthy endpoint should reserve");
         assert_eq!(admission.disk_capacity.is_some(), before.is_some());
         assert_eq!(worker.used_slots(), 2);
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_waits_for_current_runtime_evidence() {
+        let _guard = rch_common::test_guard!();
+        for owned_slots in [0, 3] {
+            for required in [RequiredRuntime::Rust, RequiredRuntime::Zig] {
+                let worker = WorkerState::new(recovered_worker_config("runtime-race", 8));
+                let request = execution_request(required);
+                let requirements = ExecutionRequirements::new(&request);
+                let available = WorkerCapabilities {
+                    rustc_version: Some("rustc fixture".into()),
+                    rustup_toolchains: vec!["nightly-fixture".into()],
+                    rustup_components: vec!["nightly-fixture:clippy".into()],
+                    node_version: Some("node fixture".into()),
+                    zig_version: Some("zig fixture".into()),
+                    cargo_zigbuild_version: Some("cargo-zigbuild fixture".into()),
+                    ..Default::default()
+                };
+                worker.set_capabilities(available.clone()).await;
+                if owned_slots > 0 {
+                    assert!(worker.reserve_slots(owned_slots).await);
+                }
+                let selected = worker.endpoint_snapshot().await;
+                assert!(worker.has_runtime(required).await);
+
+                // Pause the real reservation at the capability lock, after an
+                // eligible endpoint was selected. No sleeps or scheduler races
+                // are needed to publish a refusal before admission resumes.
+                let mut publication = worker.capabilities.write().await;
+                let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+                tokio::pin!(pending);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert_eq!(worker.used_slots(), owned_slots);
+                publication.rustc_version = None;
+                publication
+                    .probe_warnings
+                    .push("Cargo execution check failed: fixture wrapper refusal".into());
+                drop(publication);
+
+                assert!(pending.await.is_none(), "{required:?}");
+                assert_eq!(worker.used_slots(), owned_slots);
+                let unavailable = worker.capabilities().await;
+                assert_eq!(unavailable.rustup_toolchains, available.rustup_toolchains);
+                assert_eq!(unavailable.rustup_components, available.rustup_components);
+                for independent in [RequiredRuntime::Node, RequiredRuntime::None] {
+                    assert!(
+                        worker
+                            .reserve_slots_for_endpoint(
+                                1,
+                                &selected,
+                                &ExecutionRequirements::new(&execution_request(independent)),
+                            )
+                            .await
+                            .is_some(),
+                        "{independent:?} remains usable"
+                    );
+                    assert_eq!(worker.used_slots(), owned_slots + 1);
+                    worker.release_slots(1).await;
+                }
+
+                worker.set_capabilities(available).await;
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_some(),
+                    "fresh successful evidence restores admission for {required:?}"
+                );
+                assert_eq!(worker.used_slots(), owned_slots + 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_retains_runtime_guard_until_accounting() {
+        let _guard = rch_common::test_guard!();
+        let worker = WorkerState::new(recovered_worker_config("runtime-publication", 8));
+        worker
+            .set_capabilities(WorkerCapabilities::mock_with_rust())
+            .await;
+        let selected = worker.endpoint_snapshot().await;
+        let pressure = worker.pressure_assessment.write().await;
+        let request = execution_request(RequiredRuntime::Rust);
+        let requirements = ExecutionRequirements::new(&request);
+        let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+        tokio::pin!(pending);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            worker.capabilities.try_write().is_err(),
+            "admission must retain capability evidence while awaiting the remaining guards"
+        );
+
+        let publication = worker.set_capabilities(WorkerCapabilities::default());
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(worker.used_slots(), 0);
+        drop(pressure);
+
+        // The reservation already holds the positive evidence, so its CAS
+        // linearizes before the waiting publisher. Neither side deadlocks.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("reservation completes before capability publication")
+                .is_some()
+        );
+        tokio::time::timeout(Duration::from_secs(1), publication)
+            .await
+            .expect("publication resumes after admission releases its guards");
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected, &requirements)
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 1, "existing ownership is preserved");
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_rechecks_every_execution_requirement() {
+        let _guard = rch_common::test_guard!();
+        for case in [
+            "tool", "node", "bun", "clippy", "rustfmt", "channel", "version",
+        ] {
+            let worker = WorkerState::new(recovered_worker_config("requirements-race", 8));
+            let mut request = execution_request(RequiredRuntime::Rust);
+            let available = WorkerCapabilities {
+                rustc_version: Some("rustc 1.90.0 (fixture)".into()),
+                node_version: Some("v26.7.0".into()),
+                bun_version: Some("1.3.0".into()),
+                tools_present: vec!["clang".into(), "node@26.7.0".into(), "bun@1.3.0".into()],
+                rustup_toolchains: vec!["nightly-2026-08-31-x86_64-unknown-linux-gnu".into()],
+                rustup_components: vec![
+                    "nightly-2026-08-31-x86_64-unknown-linux-gnu:clippy".into(),
+                    "nightly-2026-08-31-x86_64-unknown-linux-gnu:rustfmt".into(),
+                ],
+                ..Default::default()
+            };
+            let mut unavailable = available.clone();
+            match case {
+                "tool" => {
+                    request.required_runtime = RequiredRuntime::None;
+                    request.required_tools.push("clang".into());
+                    unavailable.tools_present.retain(|tool| tool != "clang");
+                    unavailable.tools_absent.push("clang".into());
+                }
+                "node" => {
+                    request.required_runtime = RequiredRuntime::Node;
+                    request.required_tools.push("node@26.7.0".into());
+                    unavailable.node_version = Some("v22.0.0".into());
+                }
+                "bun" => {
+                    request.required_runtime = RequiredRuntime::Bun;
+                    request.required_tools.push("bun@1.3.0".into());
+                    unavailable.bun_version = Some("1.2.9".into());
+                }
+                "clippy" | "rustfmt" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "nightly",
+                        Some("2026-08-31".into()),
+                        "nightly-2026-08-31",
+                    ));
+                    request.command = Some(if case == "clippy" {
+                        "cargo clippy --workspace".into()
+                    } else {
+                        request.project.push_str("::clean-overlay::fixture");
+                        "cargo fmt --check".into()
+                    });
+                    unavailable
+                        .rustup_components
+                        .retain(|component| !component.ends_with(&format!(":{case}")));
+                }
+                "channel" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "stable",
+                        None,
+                        "rustc 1.90.0 (fixture)",
+                    ));
+                    unavailable.rustc_version = Some("rustc 1.91.0-nightly (fixture)".into());
+                }
+                "version" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "1.90.0",
+                        None,
+                        "rustc 1.90.0 (fixture)",
+                    ));
+                    unavailable.rustc_version = Some("rustc 1.90.1 (fixture)".into());
+                }
+                _ => unreachable!(),
+            }
+            let requirements = ExecutionRequirements::new(&request);
+            worker.set_capabilities(available.clone()).await;
+            if let Some(toolchain) = requirements.preflight_toolchain() {
+                worker
+                    .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                    .await;
+            }
+            let selected = worker.endpoint_snapshot().await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(3, &selected, &requirements)
+                    .await
+                    .is_some(),
+                "{case}: initial evidence admits an existing owner"
+            );
+
+            // Selection succeeded, then a real inventory update queues ahead
+            // of admission. Runtime presence stays true in every case: checking
+            // only has_runtime would spend another slot on an unusable worker.
+            let mut publication = worker.capabilities.write().await;
+            let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(unavailable.has_runtime(request.required_runtime), "{case}");
+            *publication = unavailable;
+            drop(publication);
+            assert!(
+                pending.await.is_none(),
+                "{case}: stale selection is refused"
+            );
+            assert_eq!(
+                worker.used_slots(),
+                3,
+                "{case}: existing owner is untouched"
+            );
+
+            let independent = execution_request(if case == "node" {
+                RequiredRuntime::Bun
+            } else {
+                RequiredRuntime::Node
+            });
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(
+                        1,
+                        &selected,
+                        &ExecutionRequirements::new(&independent)
+                    )
+                    .await
+                    .is_some(),
+                "{case}: unrelated commands remain available"
+            );
+            worker.release_slots(1).await;
+            worker.set_capabilities(available).await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &requirements)
+                    .await
+                    .is_some(),
+                "{case}: fresh successful evidence restores admission"
+            );
+            assert_eq!(worker.used_slots(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_requires_current_toolchain_preflight() {
+        let _guard = rch_common::test_guard!();
+        for case in ["missing", "expired", "failed", "transport-failed"] {
+            let worker = WorkerState::new(recovered_worker_config("preflight-race", 8));
+            worker
+                .set_capabilities(WorkerCapabilities::mock_with_rust())
+                .await;
+            let mut request = execution_request(RequiredRuntime::Rust);
+            request.toolchain = Some(rch_common::ToolchainInfo::new(
+                "nightly",
+                Some("2026-08-31".into()),
+                "nightly-2026-08-31",
+            ));
+            let requirements = ExecutionRequirements::new(&request);
+            let toolchain = requirements.preflight_toolchain().unwrap();
+            worker
+                .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                .await;
+            let selected = worker.endpoint_snapshot().await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(3, &selected, &requirements)
+                    .await
+                    .is_some()
+            );
+
+            let mut publication = worker.toolchain_preflight.write().await;
+            let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            match case {
+                "missing" => {
+                    let verdict = publication.remove(toolchain).unwrap();
+                    publication.insert("another-toolchain".into(), verdict);
+                }
+                "expired" => {
+                    publication
+                        .get_mut(toolchain)
+                        .unwrap()
+                        .verdict
+                        .checked_at_unix_ms = current_unix_ms()
+                        .saturating_sub(duration_millis_i64(TOOLCHAIN_PREFLIGHT_TTL) + 1000);
+                }
+                "failed" | "transport-failed" => {
+                    let verdict = &mut publication.get_mut(toolchain).unwrap().verdict;
+                    verdict.usable = false;
+                    verdict.reason = Some(if case == "failed" {
+                        "toolchain_preflight_command_failed:1:wrapper refused".into()
+                    } else {
+                        "toolchain_preflight_connect_failed:fixture timeout".into()
+                    });
+                }
+                _ => unreachable!(),
+            }
+            drop(publication);
+            assert!(pending.await.is_none(), "{case}");
+            assert_eq!(worker.used_slots(), 3, "{case}: no additional ownership");
+            assert!(worker.has_runtime(RequiredRuntime::Rust).await);
+
+            // No toolchain requirement means this cache cannot condemn a
+            // command, and a later successful probe can restore the pinned one.
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(
+                        1,
+                        &selected,
+                        &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                    )
+                    .await
+                    .is_some()
+            );
+            worker.release_slots(1).await;
+            worker
+                .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                .await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &requirements)
+                    .await
+                    .is_some()
+            );
+            assert_eq!(worker.used_slots(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_retains_preflight_guard_until_accounting() {
+        let _guard = rch_common::test_guard!();
+        let worker = WorkerState::new(recovered_worker_config("preflight-publication", 8));
+        worker
+            .set_capabilities(WorkerCapabilities::mock_with_rust())
+            .await;
+        let mut request = execution_request(RequiredRuntime::Rust);
+        request.toolchain = Some(rch_common::ToolchainInfo::new(
+            "nightly",
+            Some("2026-08-31".into()),
+            "nightly-2026-08-31",
+        ));
+        let requirements = ExecutionRequirements::new(&request);
+        let toolchain = requirements.preflight_toolchain().unwrap();
+        worker
+            .record_toolchain_preflight(toolchain.to_owned(), true, None)
+            .await;
+        let selected = worker.endpoint_snapshot().await;
+        let pressure = worker.pressure_assessment.write().await;
+        let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+        tokio::pin!(pending);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(worker.capabilities.try_write().is_err());
+        assert!(worker.toolchain_preflight.try_write().is_err());
+
+        let publication = worker.record_toolchain_preflight(
+            toolchain.to_owned(),
+            false,
+            Some("toolchain_preflight_command_failed:1:wrapper refused".into()),
+        );
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(worker.used_slots(), 0);
+        drop(pressure);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("positive admission precedes waiting publication")
+                .is_some()
+        );
+        tokio::time::timeout(Duration::from_secs(1), publication)
+            .await
+            .expect("preflight publication resumes after accounting");
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected, &requirements)
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 1, "existing ownership is preserved");
+    }
+
+    #[tokio::test]
+    async fn recovered_worker_requires_new_toolchain_evidence_without_losing_slots() {
+        for transition in [
+            "disable-enable",
+            "transport-failure",
+            "shared-transport-failure",
+        ] {
+            for old_usable in [false, true] {
+                let worker = WorkerState::new(recovered_worker_config("preflight-recovery", 8));
+                worker
+                    .set_capabilities(WorkerCapabilities::mock_with_rust())
+                    .await;
+                let mut request = execution_request(RequiredRuntime::Rust);
+                request.toolchain = Some(rch_common::ToolchainInfo::new(
+                    "nightly",
+                    Some("2026-08-31".into()),
+                    "nightly-2026-08-31",
+                ));
+                let requirements = ExecutionRequirements::new(&request);
+                let toolchain = requirements.preflight_toolchain().unwrap();
+                worker
+                    .record_toolchain_preflight(
+                        toolchain.to_owned(),
+                        old_usable,
+                        (!old_usable)
+                            .then(|| "toolchain_preflight_command_failed:1:old failure".into()),
+                    )
+                    .await;
+                assert!(worker.reserve_slots(3).await);
+                let selected = worker.endpoint_snapshot().await;
+                let original = worker.background_probe().await.unwrap();
+                let heartbeat = Duration::from_secs(30);
+                let circuit = CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                };
+                match transition {
+                    "disable-enable" => {
+                        worker.disable(Some("maintenance".into())).await;
+                        worker.enable().await;
+                    }
+                    "transport-failure" => {
+                        worker
+                            .record_transport_result(false, heartbeat, &circuit)
+                            .await;
+                    }
+                    "shared-transport-failure" => {
+                        // Historical recovery revokes the shared endpoint
+                        // without changing this worker's local watch revision.
+                        worker
+                            .transport()
+                            .record_result(false, heartbeat, &circuit)
+                            .await;
+                        assert_eq!(*original.changes.borrow(), original.revision);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!original.is_current(), "{transition}, usable={old_usable}");
+                assert!(!worker.background_network_allowed().await);
+                worker
+                    .record_transport_result(true, heartbeat, &circuit)
+                    .await;
+                assert!(worker.background_network_allowed().await);
+                assert!(worker.lock_current_endpoint(&selected).await.is_some());
+                assert!(worker.has_runtime(RequiredRuntime::Rust).await);
+                assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_none(),
+                    "{transition}, usable={old_usable}: recovery cannot revive old evidence"
+                );
+                assert_eq!(worker.used_slots(), 3, "existing ownership is preserved");
+
+                // Transport is healthy and unrelated work is eligible, but the
+                // pinned toolchain must publish new evidence before admission.
+                assert!(worker.reserve_slots(1).await);
+                worker.release_slots(1).await;
+                let fresh = worker.background_probe().await.unwrap();
+                assert!(
+                    worker
+                        .record_toolchain_preflight_before(
+                            toolchain.to_owned(),
+                            true,
+                            None,
+                            &fresh,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                );
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_some()
+                );
+                assert_eq!(worker.used_slots(), 4);
+                assert_eq!(worker.toolchain_preflight.read().await.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_pressure_after_selection_cannot_spend_remaining_slots() {
+        let worker = WorkerState::new(recovered_worker_config("pressure-race", 8));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert!(worker.reserve_slots(1).await);
+        let selected = worker.endpoint_snapshot().await;
+
+        // The endpoint and absolute slot capacity are unchanged, but an
+        // operator's unconditional ratio rule makes this worker Critical after
+        // selection. Admission must recheck that verdict before its CAS.
+        let strict = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_critical_ratio_cap_gb: None,
+            ..Default::default()
+        });
+        worker
+            .set_pressure_assessment(crate::disk_pressure::evaluate_pressure_policy(
+                &caps, None, &strict,
+            ))
+            .await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Critical
+        );
+        assert_eq!(worker.available_slots().await, 1);
+        assert!(!worker.reserve_slots(1).await);
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(
+                    1,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "the existing owner keeps its reservation"
+        );
+
+        // Re-evaluating recovery permits new work without resetting usage.
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(
+                    1,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
+                .await
+                .is_some()
+        );
+        assert_eq!(worker.used_slots(), 2);
+        assert!(!worker.reserve_slots(1).await);
         worker.release_slots(2).await;
     }
 
@@ -3810,6 +4903,208 @@ mod tests {
             failure_threshold: 3,
             open_cooldown_secs: 900,
             ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_recovery_deadline_fences_queued_admission_and_allows_fresh_retry() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let pool = WorkerPool::new();
+            let endpoint = recovered_worker_config("historical-caller-deadline", 8);
+            let mut permit = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            let transport = pool.endpoint_transports.get(&endpoint);
+            let blocked = transport.state.lock().await;
+            let attempted = AtomicBool::new(false);
+            let executed = AtomicBool::new(false);
+            let allowance = Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now() + allowance;
+            let operation = permit.run_with_probe_before(
+                async {
+                    executed.store(true, Ordering::SeqCst);
+                    7
+                },
+                async {
+                    attempted.store(true, Ordering::SeqCst);
+                    true
+                },
+                Some(deadline),
+            );
+            tokio::pin!(operation);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(allowance + lateness).await;
+            drop(blocked);
+            assert!(operation.await.is_none());
+            assert!(!attempted.load(Ordering::SeqCst));
+            assert!(!executed.load(Ordering::SeqCst));
+            let state = transport.state.lock().await;
+            assert!(state.next_probe.is_none());
+            assert!(state.positive_evidence.is_none());
+            assert_eq!(state.failures, 0);
+            drop(state);
+            let mut fresh = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            assert_eq!(
+                fresh.run_with_probe(async { 9 }, async { true }).await,
+                Some(9)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_recovery_deadline_stops_a_ready_pending_operation() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let pool = WorkerPool::new();
+            let endpoint = recovered_worker_config("historical-pending-operation", 8);
+            let mut permit = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let started = AtomicBool::new(false);
+            let executed = AtomicBool::new(false);
+            let allowance = Duration::from_secs(2);
+            let operation = permit.run_with_probe_before(
+                async {
+                    started.store(true, Ordering::SeqCst);
+                    let _ = pending.await;
+                    executed.store(true, Ordering::SeqCst);
+                    7
+                },
+                async { true },
+                Some(tokio::time::Instant::now() + allowance),
+            );
+            tokio::pin!(operation);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(started.load(Ordering::SeqCst));
+            tokio::time::advance(allowance + lateness).await;
+            release.send(()).unwrap();
+            assert!(operation.await.is_none());
+            assert!(!executed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_probe_publication_cannot_refresh_after_queued_state_lock_expires() {
+        for connected in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let transport = EndpointTransport::new();
+                let network = transport.revision_guard();
+                let blocked = transport.state.lock().await;
+                let circuit = CircuitBreakerConfig::default();
+                let budget = Duration::from_secs(2);
+                let publication = transport.record_probe_result_until(
+                    &network,
+                    connected,
+                    Duration::from_secs(30),
+                    &circuit,
+                    tokio::time::Instant::now() + budget,
+                );
+                tokio::pin!(publication);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(budget + lateness).await;
+                drop(blocked);
+                assert!(publication.await.is_none());
+                let state = transport.state.lock().await;
+                assert!(state.positive_evidence.is_none());
+                assert_eq!(state.failures, 0);
+                assert!(!state.down);
+                assert!(network.is_current());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_probe_publication_preserves_the_observed_proof_age() {
+        let transport = EndpointTransport::new();
+        let network = transport.revision_guard();
+        let circuit = CircuitBreakerConfig::default();
+        let mut blocked = transport.state.lock().await;
+        blocked.down = true;
+        blocked.failures = 3;
+        let observed_at = tokio::time::Instant::now();
+        let publication = transport.record_probe_result_until(
+            &network,
+            true,
+            Duration::from_secs(30),
+            &circuit,
+            observed_at + Duration::from_secs(120),
+        );
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drop(blocked);
+        assert_eq!(publication.await, Some((true, false)));
+        let state = transport.state.lock().await;
+        let proof = state.positive_evidence.unwrap();
+        assert_eq!(proof.started_at, observed_at);
+        assert_eq!(proof.remaining(), Duration::from_secs(10));
+        assert_eq!(state.failures, 0);
+        assert!(state.connected);
+        assert!(!state.down);
+        assert_eq!(
+            state.next_probe.unwrap().remaining(),
+            Duration::from_secs(10),
+            "the next probe retains the observation's original due time"
+        );
+        drop(state);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let state = transport.state.lock().await;
+        assert!(state.positive_evidence.unwrap().remaining().is_zero());
+        assert!(state.next_probe.unwrap().remaining().is_zero());
+        drop(state);
+        assert!(transport.historical_recovery_eligible().await);
+        assert!(network.is_current());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_historical_proof_is_refused_even_with_caller_budget_remaining() {
+        for delay in [Duration::from_secs(30), Duration::from_secs(31)] {
+            let transport = EndpointTransport::new();
+            let network = transport.revision_guard();
+            let circuit = CircuitBreakerConfig::default();
+            let mut blocked = transport.state.lock().await;
+            blocked.down = true;
+            blocked.failures = 3;
+            blocked.next_probe = Some(TransportProbeDeadline::new(Duration::from_secs(120)));
+            let observed_at = tokio::time::Instant::now();
+            let publication = transport.record_probe_result_until(
+                &network,
+                true,
+                Duration::from_secs(30),
+                &circuit,
+                observed_at + Duration::from_secs(120),
+            );
+            tokio::pin!(publication);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(delay).await;
+            drop(blocked);
+            assert!(publication.await.is_none());
+            let state = transport.state.lock().await;
+            assert_eq!(state.failures, 3);
+            assert!(state.down);
+            assert!(!state.connected);
+            assert!(state.positive_evidence.is_none());
+            assert_eq!(
+                state.next_probe.unwrap().remaining(),
+                Duration::from_secs(120) - delay
+            );
+            assert!(network.is_current());
         }
     }
 
@@ -5238,6 +6533,7 @@ mod tests {
         let first = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(first.check("disk-worker", 0).is_ok());
@@ -5265,6 +6561,7 @@ mod tests {
         let second = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         assert!(matches!(
@@ -5294,6 +6591,7 @@ mod tests {
         let before_reload = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: worker.disk_capacity_observation().await,
         };
         let mut config = recovered_worker_config("disk-worker", 8);
@@ -5308,6 +6606,143 @@ mod tests {
                 .disk_capacity_observation()
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capability_publication_requires_time_remaining_after_all_destination_locks() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        for scale in [1.0, 2.0, 10.0] {
+            let policy = rch_common::timing::TimingScale::try_from(scale).unwrap();
+            let allowance = policy.duration(Duration::from_secs(2));
+            for elapsed in [
+                allowance - Duration::from_millis(1),
+                allowance,
+                allowance + Duration::from_millis(1),
+            ] {
+                let worker = WorkerState::new(recovered_worker_config("disk-deadline", 8));
+                let capabilities = |free| WorkerCapabilities {
+                    build_disk_free_gb: Some(free),
+                    build_disk_total_gb: Some(100.0),
+                    ..Default::default()
+                };
+                worker.set_capabilities(capabilities(51.0)).await;
+                let old_budget = DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    floor_gib: 0,
+                    warm_policy: None,
+                    capacity: worker.disk_capacity_observation().await,
+                };
+                let context = worker
+                    .capability_probe_context()
+                    .await
+                    .with_deadline(tokio::time::Instant::now() + allowance);
+                // Queue at the last destination lock. Neither capabilities,
+                // disk generation nor capacity may change before this lock.
+                let disk_guard = worker.disk_capacity_observation.write().await;
+                let mut publication =
+                    Box::pin(worker.publish_capabilities(context, capabilities(90.0)));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(elapsed).await;
+                drop(disk_guard);
+                let accepted = publication.await;
+                assert_eq!(accepted, elapsed < allowance, "scale={scale}");
+                if accepted {
+                    assert_eq!(
+                        old_budget.check("disk-deadline", 0),
+                        Err(DiskHeadroomRejection::Stale)
+                    );
+                    assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(90.0));
+                } else {
+                    assert!(
+                        matches!(
+                            old_budget.check("disk-deadline", 0),
+                            Err(DiskHeadroomRejection::Insufficient { .. })
+                        ),
+                        "expiry must retain the previous complete capacity observation"
+                    );
+                    assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+                }
+                let current_budget = DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    floor_gib: 0,
+                    warm_policy: None,
+                    capacity: worker.disk_capacity_observation().await,
+                };
+                assert_eq!(
+                    current_budget.check("disk-deadline", 0).is_ok(),
+                    accepted,
+                    "an expired generous observation must never fund new admission"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_capability_publication_preserves_old_evidence_and_allows_recovery() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        let worker = WorkerState::new(recovered_worker_config("disk-cancelled", 8));
+        let capabilities = |free| WorkerCapabilities {
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(100.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(capabilities(51.0)).await;
+        let old_budget = DiskHeadroomAdmission {
+            requested_gib: 64,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        let context = worker
+            .capability_probe_context()
+            .await
+            .with_deadline(tokio::time::Instant::now() + Duration::from_secs(20));
+        let disk_guard = worker.disk_capacity_observation.write().await;
+        let mut publication = Box::pin(worker.publish_capabilities(context, capabilities(90.0)));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Drop the owned future itself, while its final lock is still queued.
+        drop(publication);
+        drop(disk_guard);
+        assert!(matches!(
+            old_budget.check("disk-cancelled", 0),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+        assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+
+        let fresh_context = worker
+            .capability_probe_context()
+            .await
+            .with_deadline(tokio::time::Instant::now() + Duration::from_secs(1));
+        assert!(
+            worker
+                .publish_capabilities(fresh_context, capabilities(90.0))
+                .await
+        );
+        assert_eq!(
+            old_budget.check("disk-cancelled", 0),
+            Err(DiskHeadroomRejection::Stale),
+            "only the later complete publication may revoke the old token"
+        );
+        assert!(
+            DiskHeadroomAdmission {
+                requested_gib: 64,
+                floor_gib: 0,
+                warm_policy: None,
+                capacity: worker.disk_capacity_observation().await,
+            }
+            .check("disk-cancelled", 0)
+            .is_ok()
         );
     }
 
@@ -5339,12 +6774,62 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: 64,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: worker.disk_capacity_observation().await,
             }
             .check("disk-worker", 0),
             Err(DiskHeadroomRejection::Stale),
             "probe duration is part of age"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_pressure_does_not_fund_stale_large_disk_capacity() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+        let worker = WorkerState::new(test_config("stale-large-disk"));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        let mut delayed = worker.capability_probe_context().await;
+        delayed.started_at = Instant::now() - Duration::from_secs(91);
+        assert!(worker.publish_capabilities(delayed, caps.clone()).await);
+        let mut cpu_refresh = worker.pressure_assessment().await;
+        cpu_refresh.telemetry_age_secs = Some(0);
+        cpu_refresh.telemetry_fresh = true;
+        cpu_refresh.disk_io_util_pct = Some(0.0);
+        cpu_refresh.memory_pressure = Some(10.0);
+        cpu_refresh.evaluated_at_unix_ms = current_unix_ms();
+        worker.set_pressure_assessment(cpu_refresh).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+        let mut budget = DiskHeadroomAdmission {
+            requested_gib: 20,
+            floor_gib: 10,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert_eq!(
+            budget.check("stale-large-disk", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            budget.check("stale-large-disk", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        budget.capacity = worker.disk_capacity_observation().await;
+        assert!(budget.check("stale-large-disk", 0).is_ok());
+        assert!(matches!(
+            budget.check("stale-large-disk", 1),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
     }
 
     #[tokio::test]
@@ -5570,6 +7055,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                     timing: None,
                     cancellation: None,
                 },
@@ -7173,6 +8659,7 @@ mod tests {
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),
+                telemetry_received_at_unix_ms: None,
                 telemetry_fresh: true,
                 evaluated_at_unix_ms: current_unix_ms(),
             })
@@ -7186,7 +8673,8 @@ mod tests {
 
         let pressure = state.pressure_assessment().await;
         assert_eq!(pressure.state, crate::disk_pressure::PressureState::Healthy);
-        assert_eq!(pressure.reason_code, "all_pressure_rules_within_threshold");
+        assert_eq!(pressure.reason_code, "pressure_healthy");
+        assert_eq!(pressure.policy_rule, "all_pressure_rules_within_threshold");
         assert_eq!(pressure.disk_free_gb, Some(90.0));
         assert_eq!(pressure.disk_total_gb, Some(120.0));
         assert_eq!(pressure.disk_free_ratio, Some(0.75));
@@ -7213,6 +8701,7 @@ mod tests {
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),
+                telemetry_received_at_unix_ms: None,
                 telemetry_fresh: true,
                 evaluated_at_unix_ms: current_unix_ms(),
             })
@@ -7229,12 +8718,387 @@ mod tests {
             pressure.state,
             crate::disk_pressure::PressureState::Critical
         );
-        assert_eq!(
-            pressure.reason_code,
-            "disk_critical_without_fresh_telemetry"
-        );
+        assert_eq!(pressure.reason_code, "disk_free_below_critical_gb");
         assert_eq!(pressure.disk_free_gb, Some(2.0));
-        assert!(!pressure.telemetry_fresh);
+        assert!(pressure.telemetry_fresh);
+        assert_eq!(pressure.disk_io_util_pct, Some(0.0));
+        assert_eq!(pressure.memory_pressure, Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_restores_large_disk_capacity_without_erasing_owners() {
+        let worker = WorkerState::new(test_config("large-disk-recovery"));
+        let caps = |free| WorkerCapabilities {
+            disk_free_gb: Some(free),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps(30.0)).await;
+        assert!(worker.reserve_slots(1).await);
+
+        let mut low = crate::disk_pressure::evaluate_pressure_policy(
+            &caps(8.0),
+            None,
+            &DiskPressurePolicyConfig::default(),
+        );
+        low.telemetry_fresh = true;
+        low.telemetry_age_secs = Some(5);
+        low.disk_io_util_pct = Some(0.0);
+        low.memory_pressure = Some(10.0);
+        worker.set_pressure_assessment(low).await;
+        assert_eq!(worker.available_slots().await, 0);
+        assert_eq!(worker.used_slots(), 1);
+
+        // Fresh CPU/IO evidence must not freeze the old disk Critical verdict
+        // when a new capability probe demonstrates recovery above the cap.
+        worker.set_capabilities(caps(30.0)).await;
+        let recovered = worker.pressure_assessment().await;
+        assert_eq!(recovered.state, PressureState::Warning);
+        assert_eq!(recovered.reason_code, "disk_ratio_below_warning");
+        assert!(recovered.telemetry_fresh);
+        assert_eq!(recovered.memory_pressure, Some(10.0));
+        assert!(recovered.telemetry_age_secs.unwrap() >= 5);
+        assert_eq!(worker.effective_total_slots().await, 2);
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 1);
+        assert!(worker.reserve_slots(1).await);
+        assert!(!worker.reserve_slots(1).await);
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_does_not_erase_fresh_memory_or_io_pressure() {
+        for (free, total, io, memory, reason) in [
+            (30.0, 900.0, 0.0, 98.0, "memory_pressure_critical"),
+            (
+                24.0,
+                200.0,
+                99.0,
+                10.0,
+                "disk_io_saturated_with_low_headroom",
+            ),
+        ] {
+            let worker = WorkerState::new(test_config(reason));
+            let mut previous = crate::disk_pressure::evaluate_pressure_policy(
+                &WorkerCapabilities {
+                    disk_free_gb: Some(2.0),
+                    disk_total_gb: Some(total),
+                    ..Default::default()
+                },
+                None,
+                &DiskPressurePolicyConfig::default(),
+            );
+            previous.disk_io_util_pct = Some(io);
+            previous.memory_pressure = Some(memory);
+            previous.telemetry_age_secs = Some(5);
+            previous.telemetry_fresh = true;
+            worker.set_pressure_assessment(previous).await;
+            worker
+                .set_capabilities(WorkerCapabilities {
+                    disk_free_gb: Some(free),
+                    disk_total_gb: Some(total),
+                    build_disk_free_gb: Some(free),
+                    build_disk_total_gb: Some(total),
+                    ..Default::default()
+                })
+                .await;
+            let pressure = worker.pressure_assessment().await;
+            assert_eq!(pressure.state, PressureState::Critical, "{reason}");
+            assert_eq!(pressure.reason_code, reason);
+            assert!(pressure.telemetry_fresh);
+            assert_eq!(pressure.memory_pressure, Some(memory));
+            assert_eq!(pressure.disk_io_util_pct, Some(io));
+            assert!(worker.available_slots().await > 0);
+            assert!(!worker.reserve_slots(1).await, "{reason}");
+            assert_eq!(worker.used_slots(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_ages_previous_telemetry_instead_of_rejuvenating_it() {
+        let worker = WorkerState::new(test_config("aged-pressure"));
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: PressureState::Critical,
+                memory_pressure: Some(98.0),
+                disk_io_util_pct: Some(0.0),
+                telemetry_age_secs: Some(89),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms() - 2_001,
+                ..Default::default()
+            })
+            .await;
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            worker.set_capabilities(caps.clone()).await;
+            let pressure = worker.pressure_assessment().await;
+            assert_eq!(pressure.state, PressureState::Warning);
+            assert!(!pressure.telemetry_fresh);
+            assert!(pressure.telemetry_age_secs.unwrap() >= 91);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_publication_waits_for_every_destination_before_committing() {
+        for destination in ["circuit", "error", "lifecycle"] {
+            for elapsed in [
+                Duration::from_millis(19),
+                Duration::from_millis(20),
+                Duration::from_millis(21),
+            ] {
+                let worker = WorkerState::new(test_config("recovery-publication"));
+                assert!(worker.reserve_slots(1).await);
+                worker.enter_bypass(BypassFailureClass::Ssh).await;
+                worker.open_circuit().await;
+                worker.set_error("original failure".into()).await;
+                let original = worker.lifecycle().await;
+                let provenance = worker.network_revision_guard();
+                let circuit = if destination == "circuit" {
+                    Some(worker.circuit.write().await)
+                } else {
+                    None
+                };
+                let error = if destination == "error" {
+                    Some(worker.last_error_msg.write().await)
+                } else {
+                    None
+                };
+                let lifecycle = if destination == "lifecycle" {
+                    Some(worker.lifecycle.write().await)
+                } else {
+                    None
+                };
+                let committed = std::cell::Cell::new(false);
+                let mut publication = Box::pin(worker.with_recovery_state_before(
+                    tokio::time::Instant::now() + Duration::from_millis(20),
+                    &provenance,
+                    |lifecycle, circuit, error| {
+                        committed.set(true);
+                        lifecycle.recover_to_canary().unwrap();
+                        lifecycle.promote_from_canary().unwrap();
+                        circuit.close();
+                        *error = None;
+                    },
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert!(!committed.get());
+                tokio::time::advance(elapsed).await;
+                drop((circuit, error, lifecycle));
+                let timely = elapsed < Duration::from_millis(20);
+                assert_eq!(publication.await.is_some(), timely, "{destination}");
+                assert_eq!(committed.get(), timely, "{destination}");
+                assert_eq!(
+                    worker.used_slots(),
+                    1,
+                    "recovery never retires a build owner"
+                );
+                if timely {
+                    assert!(worker.lifecycle().await.is_schedulable());
+                    assert_eq!(worker.circuit_stats().await.state(), CircuitState::Closed);
+                    assert_eq!(worker.last_error().await, None);
+                } else {
+                    assert_eq!(worker.lifecycle().await, original);
+                    assert_eq!(worker.circuit_stats().await.state(), CircuitState::Open);
+                    assert_eq!(
+                        worker.last_error().await.as_deref(),
+                        Some("original failure")
+                    );
+                    assert!(
+                        worker
+                            .with_recovery_state_before(
+                                tokio::time::Instant::now() + Duration::from_millis(20),
+                                &provenance,
+                                |lifecycle, circuit, error| {
+                                    lifecycle.recover_to_canary().unwrap();
+                                    lifecycle.promote_from_canary().unwrap();
+                                    circuit.close();
+                                    *error = None;
+                                },
+                            )
+                            .await
+                            .is_some()
+                    );
+                    assert!(worker.lifecycle().await.is_schedulable());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_or_revoked_recovery_publication_retains_all_old_evidence() {
+        for revoke in [false, true] {
+            let worker = WorkerState::new(test_config("recovery-revoked"));
+            worker.enter_bypass(BypassFailureClass::Ssh).await;
+            worker.open_circuit().await;
+            worker.set_error("retained failure".into()).await;
+            let original = worker.lifecycle().await;
+            let provenance = worker.network_revision_guard();
+            let lifecycle = worker.lifecycle.write().await;
+            let committed = std::cell::Cell::new(false);
+            let mut publication = Box::pin(worker.with_recovery_state_before(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &provenance,
+                |_, _, _| committed.set(true),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if revoke {
+                worker
+                    .network_changes
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                drop(lifecycle);
+                assert!(publication.await.is_none());
+            } else {
+                drop(publication);
+                drop(lifecycle);
+            }
+            assert!(!committed.get());
+            assert_eq!(worker.lifecycle().await, original);
+            assert_eq!(worker.circuit_stats().await.state(), CircuitState::Open);
+            assert_eq!(
+                worker.last_error().await.as_deref(),
+                Some("retained failure")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toolchain_cache_publication_does_not_refresh_evidence_after_waiting_past_deadline() {
+        let worker = WorkerState::new(test_config("toolchain-cache-deadline"));
+        worker
+            .record_toolchain_preflight("stable".into(), false, Some("previous refusal".into()))
+            .await;
+        let original = worker.toolchain_preflight_status("stable").await.unwrap();
+        let provenance = worker.network_revision_guard();
+        for usable in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let guard = worker.toolchain_preflight.write().await;
+                let budget = Duration::from_secs(2);
+                let mut publication = Box::pin(worker.record_toolchain_preflight_before(
+                    "stable".into(),
+                    usable,
+                    Some("late replacement".into()),
+                    &provenance,
+                    tokio::time::Instant::now() + budget,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(budget + lateness).await;
+                drop(guard);
+                assert!(!publication.await);
+                let cached = worker.toolchain_preflight_status("stable").await.unwrap();
+                assert!(!cached.usable);
+                assert_eq!(cached.reason, original.reason);
+                assert_eq!(cached.checked_at_unix_ms, original.checked_at_unix_ms);
+            }
+        }
+        assert!(
+            worker
+                .record_toolchain_preflight_before(
+                    "stable".into(),
+                    true,
+                    None,
+                    &provenance,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        );
+        assert!(
+            worker
+                .toolchain_preflight_status("stable")
+                .await
+                .unwrap()
+                .usable
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_toolchain_cache_publication_rejects_revoked_original_permission() {
+        for shared_transport in [false, true] {
+            for usable in [false, true] {
+                let worker = WorkerState::new(test_config("queued-preflight"));
+                let provenance = worker.background_probe().await.unwrap();
+                let transition = worker.lock_network_publication(&provenance).await.unwrap();
+                let cache = worker.toolchain_preflight.write().await;
+                let mut publication = Box::pin(worker.record_toolchain_preflight_before(
+                    "stable".into(),
+                    usable,
+                    (!usable).then(|| "toolchain_preflight_command_failed:1:old failure".into()),
+                    &provenance,
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+
+                let heartbeat = Duration::from_secs(30);
+                let circuit = CircuitBreakerConfig::default();
+                if shared_transport {
+                    worker
+                        .transport()
+                        .record_result(false, heartbeat, &circuit)
+                        .await;
+                    assert_eq!(*provenance.changes.borrow(), provenance.revision);
+                } else {
+                    worker.require_connection_probe();
+                }
+                worker
+                    .record_transport_result(true, heartbeat, &circuit)
+                    .await;
+                assert!(worker.background_network_allowed().await);
+                assert!(!provenance.is_current());
+                drop(cache);
+                assert!(
+                    !publication.await,
+                    "shared={shared_transport}, usable={usable}: queued evidence retains its original epoch"
+                );
+                drop(transition);
+                assert!(worker.toolchain_preflight.read().await.is_empty());
+
+                let fresh = worker.background_probe().await.unwrap();
+                assert!(
+                    worker
+                        .record_toolchain_preflight_before(
+                            "stable".into(),
+                            !usable,
+                            usable.then(|| {
+                                "toolchain_preflight_command_failed:1:fresh failure".into()
+                            }),
+                            &fresh,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                );
+                assert_eq!(
+                    worker
+                        .toolchain_preflight_status("stable")
+                        .await
+                        .unwrap()
+                        .usable,
+                    !usable
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -7765,5 +9629,79 @@ mod tests {
     async fn test_pool_default() {
         let pool = WorkerPool::default();
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_transport_failure_invalidates_disk_capacity_until_fresh_probe() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
+        let worker = WorkerState::new(recovered_worker_config("shared-disk-worker", 8));
+        let caps = WorkerCapabilities {
+            disk_free_gb: Some(30.0),
+            disk_total_gb: Some(900.0),
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        assert!(worker.reserve_slots(1).await);
+        let before_failure = worker.capability_probe_context().await;
+        let mut budget = DiskHeadroomAdmission {
+            requested_gib: 8,
+            floor_gib: 10,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert!(budget.check("shared-disk-worker", 12).is_ok());
+        let heartbeat = Duration::from_secs(30);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+
+        // Historical recovery can revoke this shared endpoint directly,
+        // without invoking the current Worker's disconnect callback.
+        worker
+            .transport()
+            .record_result(false, heartbeat, &circuit)
+            .await;
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        worker
+            .record_transport_result(true, heartbeat, &circuit)
+            .await;
+        assert!(
+            !worker
+                .publish_capabilities(before_failure, caps.clone())
+                .await
+        );
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert_eq!(worker.used_slots(), 1);
+
+        worker.set_capabilities(caps).await;
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Stale),
+            "fresh telemetry cannot revive a previously captured admission token"
+        );
+        budget.capacity = worker.disk_capacity_observation().await;
+        assert!(budget.check("shared-disk-worker", 12).is_ok());
+        budget.requested_gib = 9;
+        assert_eq!(
+            budget.check("shared-disk-worker", 12),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 30,
+                required_gib: 31,
+            })
+        );
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 1);
     }
 }

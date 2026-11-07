@@ -217,8 +217,8 @@ fn report() -> rabs_wkr::session::CapabilityReport {
 
 fn pressure() -> rabs_wkr::session::PressureSample {
     rabs_wkr::session::PressureSample {
-        load_x100: 0,
-        free_disk_mib: 100,
+        load_x100: Some(0),
+        free_disk_mib: Some(100),
     }
 }
 

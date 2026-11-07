@@ -17,7 +17,9 @@ use rabs_protocol::result_identity::{LogicalOutput, OutputRole};
 use std::os::unix::ffi::OsStrExt;
 
 const HEAD: &[u8] = b"verified committed metadata fixture";
-const TAIL: &[u8] = b"verified committed archive fixture";
+static TAIL: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    crate::test_util::closed_rlib_fixture(b"verified committed archive fixture")
+});
 const DEP_INFO: &[u8] = b"/__rabs/out/libfixture.rmeta:\n";
 
 type MetadataReadyCallback<'a> = &'a mut dyn FnMut(&[PathBuf]) -> Result<(), String>;
@@ -86,7 +88,12 @@ impl Fixture {
                 .unwrap();
         }
         let head = put(&cas, HEAD);
-        let tail = put(&cas, TAIL);
+        let tail = put(&cas, TAIL.as_slice());
+        crate::test_util::record_rlib_fixture_closure(
+            &mut *cas.store().lock().unwrap(),
+            &tail.0,
+            TAIL.as_slice(),
+        );
         let dep_info = put(&cas, DEP_INFO);
         let (base, _) = offer_serving_object(&authority, &tail);
         let mut manifest = base.manifest.clone();
@@ -236,6 +243,94 @@ impl Fixture {
         };
         *count
     }
+
+    fn expire_archive_closure(&self) {
+        let object = &self
+            .offer
+            .manifest
+            .logical_outputs
+            .iter()
+            .find(|output| output.virtual_path.as_bytes().ends_with(b".rlib"))
+            .unwrap()
+            .object
+            .0;
+        // Explicit persisted-state fault: retain the old receipt but remove
+        // its current-version authority without changing any artifact bytes.
+        let _store = self.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&self.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(
+            engine
+                .execute(
+                    "UPDATE decision_receipts SET kind = ?1 \
+                     WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                    &[
+                        SqlValue::Text("native-rlib-closure-v0".into()),
+                        SqlValue::Text("native-rlib-closure-v1".into()),
+                        SqlValue::Text(digest_key(object)),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn old_archive_closure_refuses_preview_and_metadata_before_any_exposure() {
+    for producer in [false, true] {
+        let fixture = Fixture::with_comparisons(if producer { 0 } else { 2 });
+        let destination = fixture.root.path().join("old-native-closure");
+        if !producer {
+            assert_eq!(
+                fixture
+                    .coord
+                    .serve_for_subscriber(
+                        &fixture.offer.manifest.action_key,
+                        &destination,
+                        &fixture.expected(&destination),
+                        now_micros(),
+                        ServeMode::Preview,
+                    )
+                    .unwrap(),
+                ServeOutcome::Servable
+            );
+        }
+        fixture.expire_archive_closure();
+        if !producer {
+            assert!(matches!(
+                fixture
+                    .coord
+                    .serve_for_subscriber(
+                        &fixture.offer.manifest.action_key,
+                        &destination,
+                        &fixture.expected(&destination),
+                        now_micros(),
+                        ServeMode::Preview,
+                    )
+                    .unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::NativeArchive(_))
+            ));
+        }
+        let mut calls = 0;
+        let mut ready = |_: &[PathBuf]| {
+            calls += 1;
+            Ok(())
+        };
+        let result = if producer {
+            fixture.produce(&destination, Some(&mut ready))
+        } else {
+            fixture.install(&destination, Some(&mut ready))
+        };
+        assert!(matches!(
+            result,
+            Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::NativeArchive(_)
+            ))
+        ));
+        assert_eq!(calls, 0);
+        assert!(!destination.exists());
+        assert_eq!(fixture.installs(), 0);
+    }
 }
 
 #[test]
@@ -274,7 +369,7 @@ fn metadata_callback_unlocks_store_and_holds_every_destination_until_tail_finish
     assert_eq!(calls, 1);
     assert_eq!(
         std::fs::read(destination.join("libfixture.rlib")).unwrap(),
-        TAIL
+        TAIL.as_slice()
     );
     assert_eq!(
         fixture.installs(),
@@ -421,7 +516,14 @@ fn unchanged_metadata_only_head_finishes_after_ack_without_an_archive_tail() {
 }
 
 fn assert_delivery_faults(producer: bool) {
-    for fault in ["receiver", "authority", "manifest", "evidence", "tail"] {
+    for fault in [
+        "receiver",
+        "authority",
+        "manifest",
+        "evidence",
+        "native-closure",
+        "tail",
+    ] {
         let fixture = Fixture::with_comparisons(if producer { 0 } else { 2 });
         let destination = fixture.root.path().join(fault);
         let mut ready = |_: &[PathBuf]| {
@@ -460,6 +562,7 @@ fn assert_delivery_faults(producer: bool) {
                         )
                         .unwrap();
                 }
+                "native-closure" => fixture.expire_archive_closure(),
                 "tail" => {
                     let source = fixture
                         .cas
@@ -546,7 +649,7 @@ fn published_producer_pipelines_without_spending_or_creating_cache_replay_author
     assert_eq!(calls, 1);
     assert_eq!(
         std::fs::read(destination.join("libfixture.rlib")).unwrap(),
-        TAIL
+        TAIL.as_slice()
     );
     assert_eq!(fixture.installs(), 0);
     assert!(

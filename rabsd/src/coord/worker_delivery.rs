@@ -29,9 +29,9 @@ use rabs_sandbox::artifact_tree::{
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactReport};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost,
-    DependencyExecutionMode,
+    CANONICAL_NATIVE_MODIFIERS_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY,
+    CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost, DependencyExecutionMode,
 };
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
@@ -147,7 +147,6 @@ pub(crate) fn negotiated_dependency_context(
         }
     }
     if version != DEPENDENCY_CONTEXT_VERSION
-        && selected == DependencyExecutionMode::Metadata
         && let Some(arguments) = request.get("args")
     {
         let mut argv = vec![
@@ -169,11 +168,12 @@ pub(crate) fn negotiated_dependency_context(
         }
         let invocation = rabs_key::invocation::parse(&argv, None)
             .map_err(|error| invalid(&format!("dependency execution invocation: {error:?}")))?;
-        if !invocation.native_libs.is_empty()
-            || invocation
-                .lib_search
-                .iter()
-                .any(|search| search.starts_with("native="))
+        if selected == DependencyExecutionMode::Metadata
+            && (!invocation.native_libs.is_empty()
+                || invocation
+                    .lib_search
+                    .iter()
+                    .any(|search| search.starts_with("native=")))
         {
             // Use the same argv parser as planning and worker validation. An
             // ordinary metadata capability does not imply this newer input
@@ -187,6 +187,23 @@ pub(crate) fn negotiated_dependency_context(
                             .any(|profile| profile == CANONICAL_NATIVE_METADATA_CAPABILITY)
                     }),
                 "worker lacks the required canonical static native metadata capability",
+            )?;
+        }
+        if rabs_key::live_dependency::remote::requires_generated_native_archive_modifiers(
+            &invocation,
+        ) {
+            // Native modifiers change archive selection and bundling. Older
+            // workers accept bare static libraries but do not model these
+            // spellings. Require the extension in every canonical mode before
+            // upload or admission; the selected worker still validates the
+            // complete modifier grammar and retained archive closure.
+            require(
+                supports(
+                    hello,
+                    "dependency_native_inputs",
+                    CANONICAL_NATIVE_MODIFIERS_CAPABILITY,
+                ),
+                "worker lacks the required canonical static native modifiers capability",
             )?;
         }
     }
@@ -2884,6 +2901,267 @@ mod tests {
                     negotiated_dependency_context(&hello, &request, DeliveryMode::Execute).is_ok()
                 );
             }
+        }
+    }
+
+    const CANONICAL_NATIVE_MODIFIER_PROFILES: [(&str, &str); 5] = [
+        (CANONICAL_DEPENDENCY_CONTEXT_VERSION, "metadata"),
+        (CANONICAL_DEPENDENCY_CONTEXT_VERSION, "rlib"),
+        (CANONICAL_WORKSPACE_CONTEXT_VERSION, "metadata"),
+        (CANONICAL_WORKSPACE_CONTEXT_VERSION, "rlib"),
+        (
+            CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
+            "closed-metadata",
+        ),
+    ];
+
+    #[test]
+    fn static_native_modifier_projection_requires_its_own_capability_in_every_mode() {
+        for (version, mode) in CANONICAL_NATIVE_MODIFIER_PROFILES {
+            for (roots, arguments) in [
+                (
+                    json!([]),
+                    json!([
+                        "-Lnative=/__rabs/out/cargo/debug/build/consumer/out",
+                        "-lstatic:+bundle=own",
+                        "lib.rs"
+                    ]),
+                ),
+                (
+                    json!([{"path":"/__rabs/out/cargo/debug/build/provider/out",
+                        "prefix":"native/0000", "directories":[]}]),
+                    json!([
+                        "-L",
+                        "native=/__rabs/out/cargo/debug/build/provider/out",
+                        "-l",
+                        "static:+bundle,+verbatim,+whole-archive=vendor-native.a",
+                        "lib.rs"
+                    ]),
+                ),
+                (
+                    json!([{"path":"/__rabs/out/cargo/debug/build/provider/out",
+                        "prefix":"native/0000", "directories":[]}]),
+                    json!([
+                        "-Lnative=/__rabs/out/cargo/debug/build/consumer/out",
+                        "-lstatic:+bundle=own",
+                        "-Lnative=/__rabs/out/cargo/debug/build/provider/out",
+                        "-l",
+                        "static:+verbatim,-whole-archive=vendor-native.a",
+                        "lib.rs"
+                    ]),
+                ),
+            ] {
+                // Placement has no source bytes or request ID yet. The same
+                // required capability must follow generated, foreign and mixed
+                // roots, including attached and separate native-library flags.
+                let projection = json!({
+                    "program":"rustc", "args":arguments,
+                    "dependency_execution_host":"linux-x86_64-v1",
+                    "dependency_context":{
+                        "version":version, "execution_mode":mode, "native_roots":roots,
+                    },
+                });
+                let mut hello =
+                    fixture(Path::new("/unused-native-modifier-projection")).replies[0].clone();
+                hello["dependency_contexts"] = json!([version]);
+                hello["dependency_execution_modes"] = json!([mode]);
+                for unsupported in [
+                    json!([
+                        CANONICAL_NATIVE_METADATA_CAPABILITY,
+                        CANONICAL_NATIVE_ROOTS_CAPABILITY
+                    ]),
+                    json!([
+                        CANONICAL_NATIVE_METADATA_CAPABILITY,
+                        CANONICAL_NATIVE_ROOTS_CAPABILITY,
+                        "canonical-generated-static-modifiers-v0"
+                    ]),
+                    json!([
+                        CANONICAL_NATIVE_METADATA_CAPABILITY,
+                        CANONICAL_NATIVE_ROOTS_CAPABILITY,
+                        {"profile":CANONICAL_NATIVE_MODIFIERS_CAPABILITY}
+                    ]),
+                ] {
+                    hello["dependency_native_inputs"] = unsupported;
+                    let error =
+                        validate_worker_execution_capabilities(&hello, &projection).unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("static native modifiers capability"),
+                        "{version}/{mode}: {error}"
+                    );
+                }
+                hello["dependency_native_inputs"] = json!([
+                    CANONICAL_NATIVE_METADATA_CAPABILITY,
+                    CANONICAL_NATIVE_ROOTS_CAPABILITY,
+                    CANONICAL_NATIVE_MODIFIERS_CAPABILITY
+                ]);
+                validate_worker_execution_capabilities(&hello, &projection).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn static_native_modifiers_preserve_native_requirements_and_bare_static_compatibility() {
+        for (version, mode) in CANONICAL_NATIVE_MODIFIER_PROFILES {
+            let mut projection = json!({
+                "program":"rustc",
+                "args":["-Lnative=/__rabs/out/cargo/debug/build/provider/out",
+                    "-lstatic:+bundle=provider", "lib.rs"],
+                "dependency_execution_host":"linux-x86_64-v1",
+                "dependency_context":{
+                    "version":version, "execution_mode":mode,
+                    "native_roots":[{"path":"/__rabs/out/cargo/debug/build/provider/out",
+                        "prefix":"native/0000", "directories":[]}]
+                }
+            });
+            let mut hello =
+                fixture(Path::new("/unused-native-modifier-requirements")).replies[0].clone();
+            hello["dependency_contexts"] = json!([version]);
+            hello["dependency_execution_modes"] = json!([mode]);
+            hello["dependency_native_inputs"] = json!([
+                CANONICAL_NATIVE_METADATA_CAPABILITY,
+                CANONICAL_NATIVE_MODIFIERS_CAPABILITY
+            ]);
+            assert!(
+                validate_worker_execution_capabilities(&hello, &projection)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("propagated native roots capability")
+            );
+            hello["dependency_native_inputs"] = json!([
+                CANONICAL_NATIVE_ROOTS_CAPABILITY,
+                CANONICAL_NATIVE_MODIFIERS_CAPABILITY
+            ]);
+            let result = validate_worker_execution_capabilities(&hello, &projection);
+            if mode == "metadata" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("static native metadata capability")
+                );
+            } else {
+                result.unwrap();
+            }
+
+            hello["dependency_native_inputs"] = json!([
+                CANONICAL_NATIVE_METADATA_CAPABILITY,
+                CANONICAL_NATIVE_ROOTS_CAPABILITY
+            ]);
+            projection["args"] = json!([
+                "-Lnative=/__rabs/out/cargo/debug/build/provider/out",
+                "-l",
+                "static=provider",
+                "lib.rs"
+            ]);
+            validate_worker_execution_capabilities(&hello, &projection).unwrap();
+            // A literal cfg value resembling -l is not a native-library flag.
+            // Capability projection must use the invocation parser, not scan
+            // arbitrary arguments for a native modifier substring.
+            projection["args"] = json!([
+                "--cfg",
+                "native_hint=\"-lstatic:+verbatim=vendor-native.a\"",
+                "lib.rs"
+            ]);
+            projection["dependency_context"]["native_roots"] = json!([]);
+            hello
+                .as_object_mut()
+                .unwrap()
+                .remove("dependency_native_inputs");
+            validate_worker_execution_capabilities(&hello, &projection).unwrap();
+        }
+    }
+
+    #[test]
+    fn static_native_modifier_handshake_precedes_upload_and_preserves_raw_argv() {
+        use super::super::source_delivery::SourcePeer;
+
+        for (version, mode) in CANONICAL_NATIVE_MODIFIER_PROFILES {
+            let source = tempfile::tempdir().unwrap();
+            let (upload, mut request) = source_request(source.path());
+            request["dependency_context"] = json!({"version":version,"execution_mode":mode});
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
+            request["args"] = json!([
+                "-L",
+                "native=/__rabs/out/cargo/debug/build/consumer/out",
+                "-l",
+                "static:+bundle,+verbatim,-whole-archive=vendor-native.a",
+                "-lstatic:-verbatim,+whole-archive=other",
+                "lib.rs"
+            ]);
+            for supported in [false, true] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("delivery");
+                let mut peer = fixture(&destination);
+                source_replies(&mut peer, &request);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!([mode]);
+                peer.replies[0]["dependency_native_inputs"] = json!([
+                    CANONICAL_NATIVE_METADATA_CAPABILITY,
+                    if supported {
+                        CANONICAL_NATIVE_MODIFIERS_CAPABILITY
+                    } else {
+                        "canonical-generated-static-modifiers-v0"
+                    }
+                ]);
+                let result = receive_execution(
+                    &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+                    &request,
+                    "worker",
+                    &destination,
+                );
+                if supported {
+                    let delivered = result.unwrap();
+                    assert!(delivered.acknowledgments_confirmed);
+                    assert_eq!(peer.sent[0]["dependency_context"], version);
+                    assert_eq!(peer.sent[0]["dependency_execution_mode"], mode);
+                    assert_eq!(peer.sent[4], request);
+                    assert_eq!(
+                        delivered.receipt["request_sha256"],
+                        hash(&serde_json::to_vec(&request).unwrap())
+                    );
+                } else {
+                    let failure = result.unwrap_err();
+                    assert!(!failure.execution_may_have_run);
+                    assert!(
+                        failure
+                            .detail
+                            .contains("static native modifiers capability")
+                    );
+                    assert!(!destination.exists());
+                    assert!(
+                        peer.sent.is_empty(),
+                        "no grant, upload or execution before negotiation"
+                    );
+                    assert_eq!(peer.replies.len(), 9, "only the hello may have been read");
+                }
+            }
+
+            // Reconciliation retrieves the previously sealed request; it must
+            // not demand a restarted worker's current execution capabilities.
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("resumed");
+            let mut peer = resumable(&destination);
+            peer.replies[0]["canonical"] = json!(false);
+            let delivered = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &destination,
+                DeliveryMode::Resume,
+            )
+            .unwrap();
+            assert!(delivered.acknowledgments_confirmed);
+            assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+            assert!(peer.sent[0].get("dependency_context").is_none());
+            assert!(
+                !peer
+                    .sent
+                    .iter()
+                    .any(|frame| frame["kind"] == "canonical-exec")
+            );
         }
     }
 

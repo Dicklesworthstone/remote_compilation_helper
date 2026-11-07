@@ -12,6 +12,8 @@
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
 //! - `--canonical-compile-local` — canonical local Cargo commands with dependency caching
 //! - `--canonical-compile-service` — one persistent coordinator for concurrent canonical builds
+//! - `--canonical-compile-remote-service` — pinned-mTLS canonical coordinator for remote clients
+//! - `--canonical-compile-remote` — upload captured inputs and receive a canonical build result
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
@@ -474,6 +476,19 @@ fn main() {
                  Set service_socket in a canonical local profile to attach to that running service.\n\
                  Independent builds share one coordinator and worker pool, with private targets and scoped cancellation.\n\
                  Busy or unavailable services fail without local fallback. Run and executing Bench require standalone profiles.\n\
+                 REMOTE CANONICAL SERVICE: rabsd --canonical-compile-remote-service <service.json>\n\
+                 service version canonical-compile-remote-service-v1 requires listen, state_root, input_root, operation_root,\n\
+                 wrapper, tls (ca/certificate/private_key), allowed_edge_pins, max_roots and jobs_per_root.\n\
+                 REMOTE CANONICAL CLIENT: rabsd --canonical-compile-remote <profile.json>\n\
+                 client version canonical-compile-remote-v1 requires coordinator, server_name, coordinator_pin, tls,\n\
+                 source_root, toolchain_root, staging_root, output_destination and settings (command/selection/jobs/env).\n\
+                 Captures inputs on the client, runs Cargo at the shared coordinator, and returns verified ordinary-file outputs.\n\
+                 Dedicated pinned mutual TLS and matching build identities are required; release policy cannot be downgraded.\n\
+                 State/input/operation roots and the client output parent must be private; output_destination must be new.\n\
+                 Returned outputs are limited to 512 MiB and 4096 files. Unsupported trees refuse without partial installation.\n\
+                 Check is the default; Run and executing Bench require stdin forwarding and are refused.\n\
+                 Disconnect cancels that operation; there is no operation resume or automatic retry after admission.\n\
+                 See docs/rabs-canonical-cargo.md for complete profiles, dependency-worker setup and output semantics.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
@@ -520,6 +535,56 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL, RABS_PREPARED_CONCURRENCY."
             );
             return;
+        }
+        Some(
+            remote_mode @ ("--canonical-compile-remote-service" | "--canonical-compile-remote"),
+        ) => {
+            if args.len() != 2 {
+                eprintln!("usage: rabsd {remote_mode} <profile.json>");
+                std::process::exit(2);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let config = match load_config() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!("rabsd: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                let path = std::path::Path::new(&args[1]);
+                let result = if remote_mode == "--canonical-compile-remote-service" {
+                    rabsd::coord::canonical_local::remote_service::run_service_profile(
+                        path,
+                        config.release_authorization,
+                        config.build_identity,
+                    )
+                    .map(|()| 0)
+                } else {
+                    rabsd::coord::canonical_local::remote_service::run_client_profile(
+                        path,
+                        config.release_authorization,
+                        config.build_identity,
+                    )
+                };
+                let code = match result {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("rabsd {remote_mode}: {error}");
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("rabsd {remote_mode} requires Linux support");
+                std::process::exit(2);
+            }
         }
         Some("--canonical-compile-service") => {
             if args.len() != 2 {

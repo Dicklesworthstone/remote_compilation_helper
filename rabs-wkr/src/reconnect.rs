@@ -246,6 +246,23 @@ pub(super) fn run(
             return 1;
         }
     };
+    // Keep this owner outside every runtime task and across reconnects. Slow
+    // filesystem pressure probes cannot block protocol progress or accumulate
+    // another thread per connection. Its final drop joins only after session
+    // cleanup has returned, and wakes an idle sampler without waiting its period.
+    let staging = super::worker_cargo_home();
+    let pressure = match super::PressureSampler::spawn(
+        move || rabs_wkr::session::sample_pressure(&staging),
+        super::PRESSURE_SAMPLE_INTERVAL,
+    ) {
+        Ok(sampler) => Some(sampler),
+        Err(error) => {
+            // Pressure is advisory; report it as unknown if no sampling thread
+            // can be created, without inventing an idle worker observation.
+            eprintln!("rabs-wkr: pressure sampler unavailable: {error}");
+            None
+        }
+    };
     let controller = Arc::new(ShutdownController::new());
     controller.listen_for_signals();
     let runtime = match RuntimeBuilder::current_thread().build() {
@@ -265,6 +282,10 @@ pub(super) fn run(
         let endpoint = coordinator.clone();
         let capability = Arc::clone(&report);
         let resources = resources.clone();
+        let pressure_monitor = pressure.as_ref().map_or_else(
+            super::PressureMonitor::default,
+            super::PressureSampler::monitor,
+        );
         let shutdown = controller.subscribe();
         let before_delivery = DeliveryProgress::read(&journal);
         let (outcome, returned_journal, healthy_for) =
@@ -284,6 +305,7 @@ pub(super) fn run(
                                 &mut journal,
                                 &mut health,
                                 resources,
+                                pressure_monitor,
                             ),
                         )
                         .await;
@@ -325,8 +347,10 @@ pub(super) fn run(
         if controller.is_shutting_down() {
             return shutdown_exit(&report, &journal);
         }
-        let completed_delivery =
-            outcome.is_ok() && before_delivery.advanced_to(DeliveryProgress::read(&journal));
+        // A later socket error does not undo a durably accepted result. The
+        // new journal frontier proves delivery and excludes stale ACKs,
+        // uncertain execution and results whose release did not persist.
+        let completed_delivery = before_delivery.advanced_to(DeliveryProgress::read(&journal));
         let delay = backoff.next(healthy_for, completed_delivery);
         eprintln!(
             "{}",
@@ -814,8 +838,8 @@ mod tests {
                                 )
                             },
                             || PressureSample {
-                                load_x100: 0,
-                                free_disk_mib: 100,
+                                load_x100: Some(0),
+                                free_disk_mib: Some(100),
                             },
                         )
                         .await
@@ -970,7 +994,7 @@ mod tests {
                             }
                         })
                     },
-                    || PressureSample { load_x100:0, free_disk_mib:100 },
+                    || PressureSample { load_x100:Some(0), free_disk_mib:Some(100) },
                 );
                 assert!(drain_on_shutdown(&cx, controller.subscribe(), driver).await.is_err());
                 let status = journal.status(42);

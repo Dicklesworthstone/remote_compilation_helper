@@ -131,9 +131,6 @@ const EXIT_ARTIFACT_TRANSFER_FAILED: i32 = 102;
 /// config) keep [`EXIT_BUILD_ERROR`].
 const EXIT_REMOTE_REQUIRED_REFUSED: i32 = 103;
 
-const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
-const RCH_CARGO_WRAPPER_ORIGIN_ENV: &str = "RCH_CARGO_WRAPPER_ORIGIN";
-const RCH_CARGO_WRAPPER_ORIGIN_RCH: &str = "rch";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 
 /// Opt-out knob for remote target-dir REUSE. When set to a truthy value the hook
@@ -356,7 +353,6 @@ enum RemotePipelineFailurePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceNamespacePreflightStage {
-    TopologyProbe,
     NamespaceInitialization,
 }
 
@@ -473,6 +469,38 @@ fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
         )
 }
 
+/// Only an exact prelaunch refusal, followed by acknowledged ownership release,
+/// may spend one cold retry. A started or uncertain execution is never replayed.
+fn cold_disk_retry_gib(
+    error: &anyhow::Error,
+    worker: &rch_common::SelectedWorker,
+    release_acknowledged: bool,
+    already_retried: bool,
+) -> Option<u32> {
+    if !release_acknowledged || already_retried || requires_recovery_before_release(error) {
+        return None;
+    }
+    let budget = worker.disk_budget?;
+    let policy = budget.warm_policy?;
+    let failure = error.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()?;
+    if !policy.valid_for_budget(budget.max_growth_bytes)
+        || failure.reason != "cold_required"
+        || failure.started
+        || failure.growth_bytes != 0
+        || failure.worker_id != worker.id.as_str()
+        || failure.max_growth_bytes != budget.max_growth_bytes
+        || failure.required_growth_bytes != Some(policy.cold_growth_bytes)
+    {
+        return None;
+    }
+    u32::try_from(
+        policy
+            .cold_growth_bytes
+            .div_ceil(rch_common::BuildDiskBudget::GIB),
+    )
+    .ok()
+}
+
 fn source_topology_preflight_failure<'a>(
     error: &'a anyhow::Error,
     worker_id: &WorkerId,
@@ -502,6 +530,7 @@ fn remote_release_faults<'a>(
             source_busy: false,
             source_topology_mismatch: None,
             disk_peak_output_bytes: result.disk_peak_output_bytes,
+            disk_observation: result.disk_observation,
         },
         Err(error) if !requires_recovery_before_release(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
@@ -518,7 +547,7 @@ fn remote_release_faults<'a>(
                 .filter(|failure| failure.worker_id == worker_id.as_str())
             {
                 return daemon_ipc::ReleaseFaults {
-                    worker_fault: true,
+                    worker_fault: failure.reason != "cold_required",
                     worker_disk_full: failure.reason == "free_floor",
                     worker_disk_roots: &failure.roots,
                     disk_peak_output_bytes: failure.peak_output_bytes,
@@ -536,6 +565,7 @@ fn remote_release_faults<'a>(
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: None,
+                    disk_observation: None,
                 },
                 None => daemon_ipc::ReleaseFaults {
                     live_checkout_refused,
@@ -939,29 +969,11 @@ fn env_flag_enabled(value: &str) -> bool {
 
 /// The rustup toolchain explicitly requested inside a delegated command: an
 /// env-style `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind
-/// `env`) or a `cargo +<name>` selector (issue #63). Returns the first match.
-fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
-    let mut prev_is_cargo = false;
-    for token in tokens {
-        let token = token.trim_matches(['\'', '"']);
-        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
-            let value = value.trim_matches(['\'', '"']);
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if prev_is_cargo
-            && let Some(value) = token.strip_prefix('+')
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-        prev_is_cargo = token == "cargo"
-            || token
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "cargo");
-    }
-    None
+/// `env`) or a higher-priority `cargo +<name>` selector (issues #63, #133).
+fn rustup_toolchain_from_command_tokens(
+    tokens: &[String],
+) -> Result<Option<String>, rch_common::UnresolvedCommandToolchain> {
+    rch_common::rustup_toolchain_from_command(&join_exec_command(tokens))
 }
 
 /// rchd's select-worker refusal while a restart holds admission closed.
@@ -1191,8 +1203,7 @@ fn exec_worker_preferences(
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
-        .env(RCH_CARGO_WRAPPER_BYPASS_ENV, "1")
-        .env(RCH_CARGO_WRAPPER_ORIGIN_ENV, RCH_CARGO_WRAPPER_ORIGIN_RCH)
+        .envs(rch_common::MANAGED_CARGO_ENV)
         .arg("-c")
         .arg(command);
     child
@@ -1650,8 +1661,9 @@ fn exit_with_local_run(
 // `compilation.allow_local_fallback` so the orchestrator is not flooded.
 // ---------------------------------------------------------------------------
 
-/// Env override for the maximum number of remote workers to try for one build
-/// (the first attempt plus capacity-ranked retries). Clamped to at least 1.
+/// Env override for the maximum number of remote build attempts
+/// (the first attempt plus capacity-ranked retries). Confirmed topology-only
+/// refusals do not consume an attempt. Clamped to at least 1.
 const RCH_MAX_REMOTE_ATTEMPTS_ENV: &str = "RCH_MAX_REMOTE_ATTEMPTS";
 /// Default cap on remote attempts per build (first worker + up to two retries).
 const DEFAULT_MAX_REMOTE_ATTEMPTS: u32 = 3;
@@ -1795,6 +1807,34 @@ struct RetryableRemoteFault {
     on_exhaust: RemoteFaultExhaustAction,
 }
 
+/// Topology preflight can reject a worker without granting source ownership or
+/// starting the command. Keep that execution attempt available for another
+/// worker; `tried_workers` still bounds relocation to distinct eligible workers.
+struct RemoteRetryBudget {
+    attempt: u32,
+    max_attempts: u32,
+    source_content_receipt: bool,
+}
+
+impl RemoteRetryBudget {
+    fn next_attempt(&self, fault: &RetryableRemoteFault) -> Option<u32> {
+        // Receipt mode is tied to one worker and root set, independently of
+        // whether that worker reached command execution.
+        if self.source_content_receipt {
+            return None;
+        }
+        if matches!(
+            &fault.on_exhaust,
+            RemoteFaultExhaustAction::RefuseSourceTopology { .. }
+        ) {
+            return Some(self.attempt);
+        }
+        self.attempt
+            .checked_add(1)
+            .filter(|attempt| *attempt <= self.max_attempts)
+    }
+}
+
 /// Terminal action taken once capacity-aware retries are exhausted.
 enum RemoteFaultExhaustAction {
     /// No source or execution grant was issued, and this worker cannot satisfy
@@ -1841,6 +1881,8 @@ enum RetryWorkerSelection {
 /// permanent refusal on one worker cannot hide a recoverable alternative.
 #[allow(clippy::too_many_arguments)]
 async fn try_retry_on_bigger_worker(
+    budget: &mut RemoteRetryBudget,
+    fault: &RetryableRemoteFault,
     socket_path: &str,
     project: &str,
     estimated_cores: u32,
@@ -1858,6 +1900,9 @@ async fn try_retry_on_bigger_worker(
     release_acknowledged: bool,
     reporter: &HookReporter,
 ) -> anyhow::Result<RetryWorkerSelection> {
+    let Some(next_attempt) = budget.next_attempt(fault) else {
+        return Ok(RetryWorkerSelection::Exhausted);
+    };
     let status = match crate::status_display::query_daemon_full_status_at_socket(socket_path).await
     {
         Ok(status) => status,
@@ -1902,6 +1947,7 @@ async fn try_retry_on_bigger_worker(
             Some(response)
                 if response.worker.is_some() || selection_cancelled_before_start(&response) =>
             {
+                budget.attempt = next_attempt;
                 return Ok(RetryWorkerSelection::Selected {
                     response: Box::new(response),
                     worker_id: chosen,
@@ -2383,8 +2429,8 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
-    /// The two namespace preflight RPCs run before RecoverySession::begin,
-    /// source/pair acquisition, transfer or execution. Record their failed
+    /// The combined namespace preflight RPC runs before RecoverySession::begin,
+    /// source/pair acquisition, transfer or execution. Record its failed
     /// phase before daemon release, without inventing source cleanup or a
     /// terminal result that could conflict with a concurrent daemon cancellation.
     /// Only this durable, identity-checked transition permits the typed retry
@@ -5153,30 +5199,31 @@ pub async fn run_exec(
     // `capability_missing:rustup_component:<unknown>:clippy` and the build
     // silently ran locally. Derive the toolchain for Rust-shaped job commands
     // exactly like the classified rail does.
-    let job_needs_rust_toolchain = job
-        && matches!(
-            required_runtime_for_kind(classify_command(&command).kind),
-            RequiredRuntime::Rust
-        );
-    let needs_rust_toolchain = clean_overlay_fmt_check
-        || matches!(
-            required_runtime_for_kind(classification.kind),
-            RequiredRuntime::Rust
-        )
-        || job_needs_rust_toolchain;
+    let required_runtime = if clean_overlay_fmt_check {
+        RequiredRuntime::Rust
+    } else if job {
+        required_runtime_for_job(&command)
+    } else {
+        required_runtime_for_kind(classification.kind)
+    };
+    let needs_rust_toolchain = required_runtime.needs_rust_toolchain();
     let toolchain = if needs_rust_toolchain {
-        if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
+        match rustup_toolchain_from_command_tokens(&command_parts) {
             // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
             // command outranks the ambient project toolchain (rustup's own
             // precedence), so preflight and the component gate must check the
             // toolchain the remote cargo will actually use (issue #63).
-            parse_channel_string(&name).ok()
-        } else if let Some(spec) = clean_overlay_spec.as_ref() {
-            detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
-        } else {
-            project_root
-                .as_ref()
-                .and_then(|root| detect_toolchain(root).ok())
+            Ok(Some(name)) => parse_channel_string(&name).ok(),
+            Ok(None) => {
+                if let Some(spec) = clean_overlay_spec.as_ref() {
+                    detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
+                } else {
+                    project_root
+                        .as_ref()
+                        .and_then(|root| detect_toolchain(root).ok())
+                }
+            }
+            Err(_) => None,
         }
     } else {
         None
@@ -5201,12 +5248,6 @@ pub async fn run_exec(
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
     );
 
-    // Determine required runtime
-    let required_runtime = if clean_overlay_fmt_check {
-        RequiredRuntime::Rust
-    } else {
-        required_runtime_for_kind(classification.kind)
-    };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
     // A CLI pin is a singleton admission constraint, never the environment /
@@ -5387,17 +5428,21 @@ pub async fn run_exec(
     // A source-content receipt is bound to one selected worker and one remote
     // root set. Retrying on another worker would emit multiple competing proof
     // envelopes for one invocation, so proof mode is deliberately single-shot.
-    let max_attempts = if source_content_receipt {
-        1
-    } else {
-        max_remote_attempts()
+    let mut retry_budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: if source_content_receipt {
+            1
+        } else {
+            max_remote_attempts()
+        },
+        source_content_receipt,
     };
     let mut tried_workers: Vec<WorkerId> = Vec::new();
+    let mut cold_disk_retried = false;
     // The worker set requested for the CURRENT `response`. Attempt 1 uses the
     // operator's env pin (`RCH_WORKER(S)`); each retry pins the chosen bigger
     // worker so the daemon reserves exactly it.
     let mut current_query_preferred = preferred_workers.clone();
-    let mut attempt: u32 = 1;
     let mut response = response;
 
     // bd-5pmwm: the barrier can close after the pre-check, or while this build
@@ -5622,8 +5667,11 @@ pub async fn run_exec(
             worker.host,
             worker.slots_available,
             worker.speed_score,
-            if attempt > 1 {
-                format!(" [remote retry {attempt}/{max_attempts}]")
+            if retry_budget.attempt > 1 {
+                format!(
+                    " [remote retry {}/{}]",
+                    retry_budget.attempt, retry_budget.max_attempts
+                )
             } else {
                 String::new()
             }
@@ -5792,6 +5840,65 @@ pub async fn run_exec(
                     )?,
                 });
                 std::process::exit(130);
+            }
+        }
+
+        // Pool state is verified by the supervisor before starting the command.
+        // If it changed since learning, obtain a NEW, fully funded reservation;
+        // never increase the worker's allowance behind durable admission's back.
+        if let Err(error) = result.as_ref()
+            && (!source_content_receipt
+                || error.is::<transfer_orchestration::ColdDiskPreparationRequired>())
+            && let Some(cold_gib) =
+                cold_disk_retry_gib(error, &worker, release_acknowledged, cold_disk_retried)
+        {
+            cold_disk_retried = true;
+            durable_lease.ensure_released_for_retry()?;
+            reporter.verbose(&format!(
+                "[RCH] target pool changed on {}; requesting a cold disk reservation",
+                worker.id
+            ));
+            // Completion fences the old capacity sample even for a prelaunch
+            // refusal. Use the existing daemon probe path; an unsuccessful
+            // refresh cannot waive the selector's strict freshness check.
+            if let Err(error) = crate::commands::send_daemon_command_to_socket(
+                Path::new(&config.general.socket_path),
+                "GET /workers/capabilities?refresh=true\n",
+            )
+            .await
+            {
+                warn!(%error, "Could not refresh capacity before cold disk admission");
+            }
+            let preferred = vec![worker.id.clone()];
+            if let Some(next_response) =
+                dispatch_retry_selection(&durable_lease, release_acknowledged, async || {
+                    daemon_ipc::query_daemon_cold(
+                        &config.general.socket_path,
+                        &selection_project,
+                        estimated_cores,
+                        cold_gib.max(config.compilation.disk_headroom_gib),
+                        &remote_command,
+                        toolchain.as_ref(),
+                        required_runtime,
+                        command_priority,
+                        0,
+                        Some(std::process::id()),
+                        Some(&wrapper_id),
+                        wait_for_worker,
+                        &preferred,
+                        classification.kind == Some(CompilationKind::Job),
+                        &required_tools,
+                        Some(&source_topology),
+                    )
+                    .await
+                })
+                .await?
+                && (next_response.worker.is_some()
+                    || selection_cancelled_before_start(&next_response))
+            {
+                current_query_preferred = preferred;
+                response = next_response;
+                continue;
             }
         }
 
@@ -6339,42 +6446,47 @@ pub async fn run_exec(
             .ensure_released_for_retry()
             .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
-        let retry_selection = if attempt < max_attempts {
-            try_retry_on_bigger_worker(
-                &config.general.socket_path,
-                &selection_project,
-                estimated_cores,
-                config.compilation.disk_headroom_gib,
-                &remote_command,
-                toolchain.as_ref(),
-                required_runtime,
-                command_priority,
-                &tried_workers,
-                &preferred_workers,
-                classification.kind == Some(CompilationKind::Job),
-                &required_tools,
-                &source_topology,
-                &durable_lease,
-                release_acknowledged,
-                &reporter,
-            )
-            .await?
-        } else {
-            RetryWorkerSelection::Exhausted
-        };
+        let retry_selection = try_retry_on_bigger_worker(
+            &mut retry_budget,
+            &fault,
+            &config.general.socket_path,
+            &selection_project,
+            estimated_cores,
+            config.compilation.disk_headroom_gib,
+            &remote_command,
+            toolchain.as_ref(),
+            required_runtime,
+            command_priority,
+            &tried_workers,
+            &preferred_workers,
+            classification.kind == Some(CompilationKind::Job),
+            &required_tools,
+            &source_topology,
+            &durable_lease,
+            release_acknowledged,
+            &reporter,
+        )
+        .await?;
         match retry_selection {
             RetryWorkerSelection::Selected {
                 response: next_response,
                 worker_id: next_worker,
             } => {
-                attempt += 1;
                 warn!(
                     "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
-                    fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
+                    fault.log_reason,
+                    fault.failed_worker,
+                    next_worker,
+                    retry_budget.attempt,
+                    retry_budget.max_attempts
                 );
                 reporter.summary(&format!(
                     "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
-                    next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
+                    next_worker,
+                    retry_budget.attempt,
+                    retry_budget.max_attempts,
+                    fault.log_reason,
+                    fault.failed_worker
                 ));
                 current_query_preferred = vec![next_worker];
                 response = *next_response;
@@ -6449,8 +6561,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed and no higher-capacity worker was available after {} attempt(s); surfacing exit {}",
-                    tried_workers.len(),
-                    code
+                    retry_budget.attempt, code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
@@ -6488,8 +6599,7 @@ pub async fn run_exec(
             } => {
                 warn!(
                     "Remote build failed (worker environment) and no other worker was available after {} attempt(s); surfacing exit {}",
-                    tried_workers.len(),
-                    code
+                    retry_budget.attempt, code
                 );
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
@@ -6766,9 +6876,9 @@ use remote_result::{
 // imported here; the sibling `transfer_orchestration` imports the dir-naming / env
 // overrides directly from `super::cargo_target_dir`.
 mod cargo_target_dir;
+pub(crate) use cargo_target_dir::{cargo_disk_home_override, sanitize_cargo_home_token};
 use cargo_target_dir::{
     resolve_forwarded_cargo_target_dir, rewrite_cargo_target_dir_command_for_remote,
-    sanitize_cargo_home_token,
 };
 
 // The remote artifact-pattern selection cluster (which files travel back from a
@@ -7860,6 +7970,21 @@ fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<St
     }
 }
 
+/// Only directly classified Rust jobs inherit Cargo/toolchain admission.
+/// Opaque jobs retain their explicit-tool requirements and original command.
+fn required_runtime_for_job(command: &str) -> RequiredRuntime {
+    let classification = classify_command(command);
+    if classification.command_prefix.is_some() {
+        return RequiredRuntime::None;
+    }
+    let runtime = required_runtime_for_kind(classification.kind);
+    if runtime.needs_rust_toolchain() {
+        runtime
+    } else {
+        RequiredRuntime::None
+    }
+}
+
 /// Map a classification kind to required runtime.
 pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> RequiredRuntime {
     match kind {
@@ -7881,7 +8006,7 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             // with `error: no such command: 'zigbuild'` — which is not a rustup
             // message, so `is_toolchain_failure` doesn't recognize it and the
             // nonzero exit is surfaced to the user verbatim instead of falling open
-            // to local. Zig gets its own runtime so selection gates on `has_zig()`.
+            // to local. Zig's runtime requires usable Rust/Cargo plus both helpers.
             CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,

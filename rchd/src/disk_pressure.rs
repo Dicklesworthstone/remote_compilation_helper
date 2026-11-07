@@ -7,7 +7,6 @@
 
 use crate::telemetry::TelemetryStore;
 use crate::workers::{WorkerPool, WorkerState};
-use chrono::Utc;
 use rch_common::WorkerCapabilities;
 use rch_telemetry::protocol::ReceivedTelemetry;
 use serde::Serialize;
@@ -99,6 +98,10 @@ pub struct PressureAssessment {
     pub telemetry_age_secs: Option<u64>,
     /// Whether telemetry sample is fresh per policy threshold.
     pub telemetry_fresh: bool,
+    /// Retain the original sample time across disk-only reevaluations. Rounded
+    /// public ages must not accumulate error or renew old memory/I/O evidence.
+    #[serde(skip)]
+    pub(crate) telemetry_received_at_unix_ms: Option<i64>,
     /// Epoch milliseconds when this policy decision was evaluated.
     pub evaluated_at_unix_ms: i64,
 }
@@ -119,6 +122,7 @@ impl Default for PressureAssessment {
             memory_pressure: None,
             telemetry_age_secs: None,
             telemetry_fresh: false,
+            telemetry_received_at_unix_ms: None,
             evaluated_at_unix_ms: current_unix_ms(),
         }
     }
@@ -161,6 +165,10 @@ pub struct DiskCapacityObservation {
     observed_at: Instant,
     generation: u64,
     current_generation: Arc<AtomicU64>,
+    /// Transport failures can be reported by historical owners without going
+    /// through the current WorkerState. Bind that shared endpoint epoch too.
+    transport_generation: u64,
+    current_transport_generation: Arc<AtomicU64>,
 }
 
 impl DiskCapacityObservation {
@@ -169,6 +177,8 @@ impl DiskCapacityObservation {
         capabilities: &WorkerCapabilities,
         generation: u64,
         current_generation: Arc<AtomicU64>,
+        transport_generation: u64,
+        current_transport_generation: Arc<AtomicU64>,
         observed_at: Instant,
     ) -> Option<Self> {
         // Pressure may describe /tmp instead of build storage. Older workers
@@ -191,7 +201,15 @@ impl DiskCapacityObservation {
             observed_at,
             generation,
             current_generation,
+            transport_generation,
+            current_transport_generation,
         })
+    }
+
+    fn generations_are_current(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) == self.generation
+            && self.current_transport_generation.load(Ordering::Acquire)
+                == self.transport_generation
     }
 
     /// Free build-disk GiB, only while this sample is the worker's current,
@@ -200,8 +218,8 @@ impl DiskCapacityObservation {
         (self.worker_id == worker_id
             && self.observed_at.elapsed()
                 <= DiskPressurePolicyConfig::default().telemetry_stale_after
-            && self.current_generation.load(Ordering::Acquire) == self.generation)
-            .then_some(self.free_gib)
+            && self.generations_are_current())
+        .then_some(self.free_gib)
     }
 
     pub(crate) fn observed_at(&self) -> Instant {
@@ -217,6 +235,8 @@ impl DiskCapacityObservation {
                 build_disk_total_gb: Some(free_gib.max(1.0)),
                 ..Default::default()
             },
+            1,
+            Arc::new(AtomicU64::new(1)),
             1,
             Arc::new(AtomicU64::new(1)),
             Instant::now(),
@@ -236,6 +256,9 @@ pub struct DiskHeadroomAdmission {
     /// Charge the largest active floor once for the worker, not once per job.
     pub floor_gib: u64,
     pub capacity: Option<DiskCapacityObservation>,
+    /// The allowance may only be used after the worker matches a retained
+    /// pool. This condition follows the reservation into durable ownership.
+    pub warm_policy: Option<rch_common::BuildDiskWarmPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +266,32 @@ pub(crate) enum DiskHeadroomRejection {
     Unknown,
     Stale,
     Insufficient { free_gib: u64, required_gib: u64 },
+}
+
+/// Advisory waiting classification. Only `Available` can fund admission;
+/// hypothetical capacity after other owners retire never releases their budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskHeadroomAvailability {
+    Available,
+    Reserved(DiskHeadroomRejection),
+    AwaitingProbe(DiskHeadroomRejection),
+    Unavailable(DiskHeadroomRejection),
+}
+
+impl DiskHeadroomAvailability {
+    pub(crate) fn rejection(self) -> Option<DiskHeadroomRejection> {
+        match self {
+            Self::Available => None,
+            Self::Reserved(reason) | Self::AwaitingProbe(reason) | Self::Unavailable(reason) => {
+                Some(reason)
+            }
+        }
+    }
+
+    pub(crate) fn can_wait(self, existing_waiter: bool) -> bool {
+        matches!(self, Self::Reserved(_))
+            || (existing_waiter && matches!(self, Self::AwaitingProbe(_)))
+    }
 }
 
 impl DiskHeadroomRejection {
@@ -284,6 +333,12 @@ impl DiskHeadroomAdmission {
         reserved_gib: u64,
         capacity_after: Option<Instant>,
     ) -> Result<(), DiskHeadroomRejection> {
+        if self.warm_policy.is_some_and(|policy| {
+            !policy
+                .valid_for_budget(u64::from(self.requested_gib) * rch_common::BuildDiskBudget::GIB)
+        }) {
+            return Err(DiskHeadroomRejection::Unknown);
+        }
         if self.requested_gib == 0 && self.floor_gib == 0 {
             return Ok(());
         }
@@ -294,7 +349,7 @@ impl DiskHeadroomAdmission {
             .ok_or(DiskHeadroomRejection::Unknown)?;
         if capacity.observed_at.elapsed()
             > DiskPressurePolicyConfig::default().telemetry_stale_after
-            || capacity.current_generation.load(Ordering::Acquire) != capacity.generation
+            || !capacity.generations_are_current()
             || capacity_after.is_some_and(|cutoff| capacity.observed_at <= cutoff)
         {
             return Err(DiskHeadroomRejection::Stale);
@@ -385,7 +440,9 @@ pub struct DiskPressurePolicyConfig {
     /// Critical free-ratio threshold.
     pub critical_free_ratio: f64,
     /// When set, the critical ratio rule applies only at or below this many
-    /// free GB (`[selection] disk_critical_ratio_cap_gb`, bd-xxck3).
+    /// free GiB (`[selection] disk_critical_ratio_cap_gb`). The default cap
+    /// avoids zeroing large disks with ample absolute capacity (bd-lnbuz).
+    /// `None` explicitly retains the unconditional ratio rule.
     pub critical_free_ratio_cap_gb: Option<f64>,
     /// A `/tmp` that is the tightest mount but holds no build trees is
     /// Critical only below this many free GB; its ratio rules give at most
@@ -403,14 +460,15 @@ pub struct DiskPressurePolicyConfig {
 
 impl Default for DiskPressurePolicyConfig {
     fn default() -> Self {
+        let selection = rch_common::SelectionConfig::default();
         Self {
             poll_interval: Duration::from_secs(30),
             telemetry_stale_after: Duration::from_secs(90),
             warning_free_gb: 25.0,
             critical_free_gb: 10.0,
             warning_free_ratio: 0.12,
-            critical_free_ratio: 0.05,
-            critical_free_ratio_cap_gb: None,
+            critical_free_ratio: selection.disk_critical_free_ratio,
+            critical_free_ratio_cap_gb: selection.disk_critical_ratio_cap_gb,
             tmp_critical_free_gb: 2.0,
             warning_disk_io_util_pct: 85.0,
             critical_disk_io_util_pct: 95.0,
@@ -425,7 +483,8 @@ static CONFIGURED_POLICY: std::sync::OnceLock<DiskPressurePolicyConfig> =
 
 impl DiskPressurePolicyConfig {
     /// The default policy with the operator's `[selection]` disk overrides.
-    /// Out-of-range values keep the default and are logged.
+    /// An invalid ratio keeps the default. An invalid cap fails safe to the
+    /// stricter unconditional ratio rule, and both cases are logged.
     pub fn from_selection(selection: &rch_common::SelectionConfig) -> Self {
         let mut policy = Self::default();
         let ratio = selection.disk_critical_free_ratio;
@@ -442,7 +501,7 @@ impl DiskPressurePolicyConfig {
             Some(cap) => {
                 tracing::warn!(
                     cap,
-                    "ignoring selection.disk_critical_ratio_cap_gb below critical_free_gb"
+                    "invalid selection.disk_critical_ratio_cap_gb; using the stricter uncapped ratio rule (cap must be finite and at least critical_free_gb)"
                 );
                 None
             }
@@ -638,6 +697,73 @@ pub fn evaluate_pressure_policy(
     latest: Option<&ReceivedTelemetry>,
     config: &DiskPressurePolicyConfig,
 ) -> PressureAssessment {
+    let memory_pressure = latest.map(|entry| entry.telemetry.memory.admission_pressure());
+    let disk_io_util_pct = latest.and_then(|entry| {
+        entry
+            .telemetry
+            .disk
+            .as_ref()
+            .map(|disk| disk.max_io_utilization_pct)
+    });
+    evaluate_pressure_with_metrics(
+        capabilities,
+        latest.map(|entry| entry.received_at.timestamp_millis()),
+        true,
+        disk_io_util_pct,
+        memory_pressure,
+        config,
+    )
+}
+
+/// Reevaluate a new disk probe against the retained, still-fresh memory/I/O
+/// evidence. A disk recovery must retire the old disk verdict immediately,
+/// without erasing a memory/I/O refusal or renewing telemetry freshness.
+pub(crate) fn refresh_pressure_policy(
+    capabilities: &WorkerCapabilities,
+    previous: &PressureAssessment,
+    config: &DiskPressurePolicyConfig,
+) -> PressureAssessment {
+    let received_at = previous.telemetry_received_at_unix_ms.or_else(|| {
+        // Assessments created without an original timestamp still must not
+        // renew their evidence. Derive it once from the recorded age.
+        let age_ms = i64::try_from(previous.telemetry_age_secs?.checked_mul(1_000)?).ok()?;
+        previous.evaluated_at_unix_ms.checked_sub(age_ms)
+    });
+    let mut next = evaluate_pressure_with_metrics(
+        capabilities,
+        received_at,
+        previous.telemetry_fresh,
+        previous.disk_io_util_pct,
+        previous.memory_pressure,
+        config,
+    );
+    if next.telemetry_fresh
+        && next.reason_code == "disk_metrics_unavailable"
+        && previous.state == PressureState::Critical
+    {
+        // A failed disk probe is not evidence of recovery. In particular it
+        // must not erase a still-fresh I/O refusal that depended on headroom.
+        next.state = previous.state;
+        next.confidence = previous.confidence;
+        next.reason_code.clone_from(&previous.reason_code);
+        next.policy_rule.clone_from(&previous.policy_rule);
+    }
+    next
+}
+
+fn evaluate_pressure_with_metrics(
+    capabilities: &WorkerCapabilities,
+    telemetry_received_at_unix_ms: Option<i64>,
+    freshness_permitted: bool,
+    disk_io_util_pct: Option<f64>,
+    memory_pressure: Option<f64>,
+    config: &DiskPressurePolicyConfig,
+) -> PressureAssessment {
+    let evaluated_at_unix_ms = current_unix_ms();
+    let telemetry_age_secs = telemetry_received_at_unix_ms
+        .map(|received_at| evaluated_at_unix_ms.saturating_sub(received_at).max(0) as u64 / 1_000);
+    let telemetry_fresh = freshness_permitted
+        && telemetry_age_secs.is_some_and(|age| age <= config.telemetry_stale_after.as_secs());
     let disk_free_gb = capabilities.disk_free_gb;
     let disk_total_gb = capabilities.disk_total_gb;
     let disk_free_ratio = match (disk_free_gb, disk_total_gb) {
@@ -657,24 +783,6 @@ pub fn evaluate_pressure_policy(
         }
         _ => (None, None),
     };
-
-    let now = Utc::now();
-    let telemetry_age_secs = latest.map(|entry| {
-        let age = now.signed_duration_since(entry.received_at).num_seconds();
-        if age <= 0 { 0 } else { age as u64 }
-    });
-    let telemetry_fresh = telemetry_age_secs
-        .map(|age| age <= config.telemetry_stale_after.as_secs())
-        .unwrap_or(false);
-
-    let memory_pressure = latest.map(|entry| entry.telemetry.memory.admission_pressure());
-    let disk_io_util_pct = latest.and_then(|entry| {
-        entry
-            .telemetry
-            .disk
-            .as_ref()
-            .map(|disk| disk.max_io_utilization_pct)
-    });
 
     // GH #117: the worker's tightest sample is the fullest of the project
     // roots and `/tmp`, and its build sample the fullest of the roots alone,
@@ -699,32 +807,46 @@ pub fn evaluate_pressure_policy(
 
     // A zero or non-finite reading is a failed probe, not a full disk: it
     // must not classify as critical via a defaulted 0.0 ratio.
-    let verdict =
-        if judged_free_ratio.is_none() || judged_total_gb.is_some_and(|total| !total.is_finite()) {
+    let verdict = if judged_free_ratio.is_none()
+        || judged_total_gb.is_some_and(|total| !total.is_finite())
+    {
+        if telemetry_fresh
+            && memory_pressure.is_some_and(|pressure| pressure >= config.critical_memory_pressure)
+        {
+            // Missing disk data cannot make independent, fresh evidence
+            // of dangerous memory pressure disappear.
+            (
+                PressureState::Critical,
+                PressureConfidence::High,
+                "memory_pressure_critical".to_string(),
+                "memory_pressure>=critical_memory_pressure".to_string(),
+            )
+        } else {
             (
                 PressureState::TelemetryGap,
                 PressureConfidence::Low,
                 "disk_metrics_unavailable".to_string(),
                 "fail_open_missing_disk_metrics".to_string(),
             )
-        } else if telemetry_fresh {
-            classify_with_fresh_telemetry(
-                judged_free_gb.unwrap_or_default(),
-                judged_total_gb.unwrap_or_default(),
-                judged_free_ratio.unwrap_or_default(),
-                disk_io_util_pct,
-                memory_pressure,
-                config,
-            )
-        } else {
-            classify_without_fresh_telemetry(
-                judged_free_gb.unwrap_or_default(),
-                judged_total_gb.unwrap_or_default(),
-                judged_free_ratio.unwrap_or_default(),
-                config,
-            )
-        };
-    let (state, confidence, reason_code, policy_rule) =
+        }
+    } else if telemetry_fresh {
+        classify_with_fresh_telemetry(
+            judged_free_gb.unwrap_or_default(),
+            judged_total_gb.unwrap_or_default(),
+            judged_free_ratio.unwrap_or_default(),
+            disk_io_util_pct,
+            memory_pressure,
+            config,
+        )
+    } else {
+        classify_without_fresh_telemetry(
+            judged_free_gb.unwrap_or_default(),
+            judged_total_gb.unwrap_or_default(),
+            judged_free_ratio.unwrap_or_default(),
+            config,
+        )
+    };
+    let (state, confidence, reason_code, mut policy_rule) =
         match (tmp_is_tightest, disk_free_gb, disk_free_ratio) {
             (true, Some(tmp_free_gb), Some(tmp_free_ratio)) => worse_verdict(
                 verdict,
@@ -732,6 +854,19 @@ pub fn evaluate_pressure_policy(
             ),
             _ => verdict,
         };
+
+    // Explain why a low percentage did not zero this worker. The existing
+    // status and capabilities surfaces already carry this rule, so operators
+    // can inspect the effective cap without inferring it from slot counts.
+    if state != PressureState::Critical
+        && judged_free_ratio.is_some_and(|ratio| ratio <= config.critical_free_ratio)
+        && let (Some(free), Some(cap)) = (judged_free_gb, config.critical_free_ratio_cap_gb)
+        && free > cap
+    {
+        policy_rule.push_str(&format!(
+            "; critical ratio capped: disk_free_gb={free} > selection.disk_critical_ratio_cap_gb={cap}"
+        ));
+    }
 
     PressureAssessment {
         state,
@@ -747,7 +882,8 @@ pub fn evaluate_pressure_policy(
         memory_pressure,
         telemetry_age_secs,
         telemetry_fresh,
-        evaluated_at_unix_ms: current_unix_ms(),
+        telemetry_received_at_unix_ms,
+        evaluated_at_unix_ms,
     }
 }
 
@@ -830,6 +966,19 @@ fn critical_ratio_breached(
             .is_none_or(|cap| disk_free_gb <= cap)
 }
 
+fn critical_ratio_rule(config: &DiskPressurePolicyConfig) -> String {
+    match config.critical_free_ratio_cap_gb {
+        Some(cap) => format!(
+            "disk_free_ratio<={} && disk_free_gb<={cap} (selection.disk_critical_ratio_cap_gb={cap})",
+            config.critical_free_ratio
+        ),
+        None => format!(
+            "disk_free_ratio<={} (selection.disk_critical_ratio_cap_gb=uncapped)",
+            config.critical_free_ratio
+        ),
+    }
+}
+
 fn classify_with_fresh_telemetry(
     disk_free_gb: f64,
     disk_total_gb: f64,
@@ -852,7 +1001,7 @@ fn classify_with_fresh_telemetry(
             PressureState::Critical,
             PressureConfidence::High,
             "disk_ratio_below_critical".to_string(),
-            "disk_free_ratio<=critical_free_ratio".to_string(),
+            critical_ratio_rule(config),
         );
     }
     if disk_io_util_pct
@@ -935,14 +1084,20 @@ fn classify_without_fresh_telemetry(
     config: &DiskPressurePolicyConfig,
 ) -> (PressureState, PressureConfidence, String, String) {
     let absolute_gb = absolute_gb_thresholds_apply(disk_total_gb, config);
-    if (absolute_gb && disk_free_gb <= config.critical_free_gb)
-        || critical_ratio_breached(disk_free_gb, disk_free_ratio, config)
-    {
+    if absolute_gb && disk_free_gb <= config.critical_free_gb {
         return (
             PressureState::Critical,
             PressureConfidence::Medium,
             "disk_critical_without_fresh_telemetry".to_string(),
-            "disk_threshold_breach_without_telemetry".to_string(),
+            "disk_free_gb<=critical_free_gb; without_fresh_telemetry".to_string(),
+        );
+    }
+    if critical_ratio_breached(disk_free_gb, disk_free_ratio, config) {
+        return (
+            PressureState::Critical,
+            PressureConfidence::Medium,
+            "disk_critical_without_fresh_telemetry".to_string(),
+            format!("{}; without_fresh_telemetry", critical_ratio_rule(config)),
         );
     }
     if (absolute_gb && disk_free_gb <= config.warning_free_gb)
@@ -974,7 +1129,7 @@ fn current_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration as ChronoDuration;
+    use chrono::{Duration as ChronoDuration, Utc};
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
     use rch_telemetry::collect::memory::{MemoryPressureStall, MemoryTelemetry};
@@ -987,6 +1142,7 @@ mod tests {
         let disk = DiskHeadroomAdmission {
             requested_gib: 80,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(sample),
         };
         for cutoff in [observed_at, observed_at + Duration::from_nanos(1)] {
@@ -1011,6 +1167,7 @@ mod tests {
         let admission = |free, age| DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
+            warm_policy: None,
             capacity: Some(DiskCapacityObservation::fixture("worker", free, age)),
         };
         assert!(matches!(
@@ -1043,6 +1200,7 @@ mod tests {
             DiskHeadroomAdmission {
                 requested_gib: 1,
                 floor_gib: 0,
+                warm_policy: None,
                 capacity: None
             }
             .check("worker", 0),
@@ -1059,6 +1217,114 @@ mod tests {
             snapshot.check("worker", 0),
             Err(DiskHeadroomRejection::Stale)
         );
+    }
+
+    #[test]
+    fn declared_disk_budget_revocation_invalidates_already_cloned_capacity() {
+        for shared_transport in [false, true] {
+            let sample = DiskCapacityObservation::fixture("worker", 30.0, Duration::ZERO);
+            let cloned = sample.clone();
+            let admission = DiskHeadroomAdmission {
+                requested_gib: 20,
+                floor_gib: 10,
+                warm_policy: None,
+                capacity: Some(sample.clone()),
+            };
+            assert_eq!(cloned.current_free_gib("worker"), Some(30));
+            assert!(admission.check("worker", 0).is_ok());
+
+            // Either a worker-local disconnect or a historical owner's shared
+            // transport failure must invalidate every already-issued clone.
+            let generation = if shared_transport {
+                &sample.current_transport_generation
+            } else {
+                &sample.current_generation
+            };
+            generation.fetch_add(1, Ordering::AcqRel);
+            for revoked in [&sample, &cloned] {
+                assert_eq!(revoked.current_free_gib("worker"), None);
+            }
+            assert_eq!(
+                admission.check("worker", 0),
+                Err(DiskHeadroomRejection::Stale),
+                "shared_transport={shared_transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_disk_budget_needs_new_epoch_sample_after_recovery() {
+        let caps = WorkerCapabilities {
+            build_disk_free_gb: Some(30.0),
+            build_disk_total_gb: Some(900.0),
+            ..Default::default()
+        };
+        for shared_transport in [false, true] {
+            let old = DiskCapacityObservation::fixture("worker", 30.0, Duration::ZERO);
+            let old_admission = DiskHeadroomAdmission {
+                requested_gib: 20,
+                floor_gib: 10,
+                warm_policy: None,
+                capacity: Some(old.clone()),
+            };
+            let generation = if shared_transport {
+                &old.current_transport_generation
+            } else {
+                &old.current_generation
+            };
+            generation.fetch_add(1, Ordering::AcqRel);
+
+            // Publication after revocation cannot refresh a probe's captured
+            // epoch, even if it constructs the observation at a later instant.
+            let delayed = DiskCapacityObservation::from_capabilities(
+                "worker".into(),
+                &caps,
+                old.generation,
+                Arc::clone(&old.current_generation),
+                old.transport_generation,
+                Arc::clone(&old.current_transport_generation),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(delayed.current_free_gib("worker"), None);
+            assert_eq!(
+                DiskHeadroomAdmission {
+                    capacity: Some(delayed),
+                    ..old_admission.clone()
+                }
+                .check("worker", 0),
+                Err(DiskHeadroomRejection::Stale)
+            );
+
+            let fresh = DiskCapacityObservation::from_capabilities(
+                "worker".into(),
+                &caps,
+                old.current_generation.load(Ordering::Acquire),
+                Arc::clone(&old.current_generation),
+                old.current_transport_generation.load(Ordering::Acquire),
+                Arc::clone(&old.current_transport_generation),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(fresh.current_free_gib("worker"), Some(30));
+            let recovered = DiskHeadroomAdmission {
+                capacity: Some(fresh),
+                ..old_admission.clone()
+            };
+            assert!(recovered.check("worker", 0).is_ok());
+            assert_eq!(
+                recovered.check("worker", 1),
+                Err(DiskHeadroomRejection::Insufficient {
+                    free_gib: 30,
+                    required_gib: 31,
+                })
+            );
+            assert_eq!(old.current_free_gib("worker"), None);
+            assert_eq!(
+                old_admission.check("worker", 0),
+                Err(DiskHeadroomRejection::Stale)
+            );
+        }
     }
 
     #[test]
@@ -1086,6 +1352,8 @@ mod tests {
                     &caps,
                     1,
                     Arc::new(AtomicU64::new(1)),
+                    1,
+                    Arc::new(AtomicU64::new(1)),
                     Instant::now()
                 )
                 .is_none(),
@@ -1099,6 +1367,7 @@ mod tests {
         let mut admission = DiskHeadroomAdmission {
             requested_gib: rch_common::BuildDiskBudget::growth_budget_gib(21.0),
             floor_gib: 13,
+            warm_policy: None,
             capacity: Some(DiskCapacityObservation::fixture(
                 "hz3",
                 33.0,
@@ -1444,41 +1713,183 @@ mod tests {
         );
     }
 
-    /// A nearly-empty small filesystem (a half-of-RAM tmpfs /tmp reported as
-    /// the worst mount) must not trip the absolute free-GB thresholds it can
-    /// never satisfy — ratio rules govern small mounts.
+    /// bd-lnbuz: the same large worker must be usable by an unconfigured
+    /// dispatcher, while an operator can still request the stricter policy.
     #[test]
     fn ratio_cap_judges_large_disks_by_absolute_headroom() {
-        // 30 GB free of 900 GB is 3.3%: below the 5% ratio, well above 25 GB.
-        let caps = test_capabilities(30.0, 900.0);
         let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let stale = test_received_telemetry(30.0, 40.0, 600);
         let default = DiskPressurePolicyConfig::default();
-        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &default);
-        assert_eq!(assessment.state, PressureState::Critical);
-        assert_eq!(assessment.reason_code, "disk_ratio_below_critical");
-
-        let capped = DiskPressurePolicyConfig {
-            critical_free_ratio_cap_gb: Some(25.0),
-            ..DiskPressurePolicyConfig::default()
+        let uncapped = DiskPressurePolicyConfig {
+            critical_free_ratio_cap_gb: None,
+            ..default.clone()
         };
-        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &capped);
-        assert_ne!(assessment.state, PressureState::Critical);
-        let assessment = evaluate_pressure_policy(&caps, None, &capped);
-        assert_ne!(assessment.state, PressureState::Critical);
-        // At or below the cap the ratio rule still applies.
-        let low = test_capabilities(20.0, 900.0);
-        let assessment = evaluate_pressure_policy(&low, Some(&telemetry), &capped);
-        assert_eq!(assessment.state, PressureState::Critical);
-        assert_eq!(assessment.reason_code, "disk_ratio_below_critical");
+        assert_eq!(default.critical_free_ratio_cap_gb, Some(25.0));
+        for total in [774.0, 900.0, 1900.0] {
+            let caps = test_capabilities(30.0, total);
+            for (latest, fresh) in [
+                (Some(&telemetry), true),
+                (Some(&stale), false),
+                (None, false),
+            ] {
+                let assessment = evaluate_pressure_policy(&caps, latest, &default);
+                assert_eq!(assessment.state, PressureState::Warning, "{total}");
+                assert!(
+                    assessment
+                        .policy_rule
+                        .contains("selection.disk_critical_ratio_cap_gb=25"),
+                    "{}",
+                    assessment.policy_rule
+                );
+                assert_eq!(assessment.telemetry_fresh, fresh);
+
+                let strict = evaluate_pressure_policy(&caps, latest, &uncapped);
+                assert_eq!(strict.state, PressureState::Critical, "{total}");
+                assert!(strict.policy_rule.contains("uncapped"));
+            }
+        }
     }
 
     #[test]
-    fn selection_overrides_feed_the_policy_and_bad_values_keep_defaults() {
+    fn capped_ratio_keeps_exhaustion_boundaries_and_operator_overrides() {
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        for (cap, free, expected) in [
+            (Some(25.0), 8.0, PressureState::Critical),
+            (Some(25.0), 10.0, PressureState::Critical),
+            (Some(25.0), 25.0, PressureState::Critical),
+            (Some(25.0), 25.01, PressureState::Warning),
+            (Some(15.0), 15.0, PressureState::Critical),
+            (Some(15.0), 15.01, PressureState::Warning),
+            (Some(15.0), 30.0, PressureState::Warning),
+            (Some(30.0), 30.0, PressureState::Critical),
+            (None, 30.0, PressureState::Critical),
+            (None, 45.0, PressureState::Critical),
+            (None, 45.01, PressureState::Warning),
+        ] {
+            let policy = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+                disk_critical_ratio_cap_gb: cap,
+                ..Default::default()
+            });
+            for latest in [Some(&telemetry), None] {
+                let result =
+                    evaluate_pressure_policy(&test_capabilities(free, 900.0), latest, &policy);
+                assert_eq!(result.state, expected, "cap={cap:?}, free={free}");
+            }
+        }
+
+        // Changing the ratio still changes admission independently of the cap.
+        let policy = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_critical_free_ratio: 0.03,
+            ..Default::default()
+        });
+        for (free, expected) in [
+            (15.0, PressureState::Critical),
+            (20.0, PressureState::Warning),
+        ] {
+            let result = evaluate_pressure_policy(
+                &test_capabilities(free, 500.0),
+                Some(&telemetry),
+                &policy,
+            );
+            assert_eq!(result.state, expected);
+        }
+    }
+
+    #[test]
+    fn cap_does_not_bypass_tmp_memory_or_io_critical_pressure() {
+        let policy = DiskPressurePolicyConfig::default();
+        let caps = caps_with_build_disk((0.5, 16.0), Some((30.0, 900.0)));
+        assert_eq!(
+            evaluate_pressure_policy(&caps, None, &policy).reason_code,
+            "tmp_free_below_floor"
+        );
+
+        let caps = test_capabilities(30.0, 900.0);
+        let telemetry = test_received_telemetry(30.0, 95.0, 5);
+        let memory = evaluate_pressure_policy(&caps, Some(&telemetry), &policy);
+        assert_eq!(memory.state, PressureState::Critical);
+        assert_eq!(memory.reason_code, "memory_pressure_critical");
+
+        // An operator's smaller cap must not disable the independent I/O gate.
+        let policy = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_critical_ratio_cap_gb: Some(15.0),
+            ..Default::default()
+        });
+        let telemetry = test_received_telemetry(97.0, 40.0, 5);
+        let io =
+            evaluate_pressure_policy(&test_capabilities(20.0, 900.0), Some(&telemetry), &policy);
+        assert_eq!(io.state, PressureState::Critical);
+        assert_eq!(io.reason_code, "disk_io_saturated_with_low_headroom");
+    }
+
+    #[test]
+    fn invalid_disk_refresh_cannot_clear_fresh_critical_evidence() {
+        let policy = DiskPressurePolicyConfig::default();
+        let missing = WorkerCapabilities::default();
+        let memory = test_received_telemetry(30.0, 95.0, 5);
+        let result = evaluate_pressure_policy(&missing, Some(&memory), &policy);
+        assert_eq!(result.state, PressureState::Critical);
+        assert_eq!(result.reason_code, "memory_pressure_critical");
+
+        let io = test_received_telemetry(97.0, 40.0, 5);
+        let previous =
+            evaluate_pressure_policy(&test_capabilities(20.0, 300.0), Some(&io), &policy);
+        assert_eq!(previous.reason_code, "disk_io_saturated_with_low_headroom");
+        let refreshed = refresh_pressure_policy(&missing, &previous, &policy);
+        assert_eq!(refreshed.state, PressureState::Critical);
+        assert_eq!(refreshed.reason_code, previous.reason_code);
+        assert_eq!(refreshed.disk_free_gb, None);
+
+        // A valid recovery sample can retire the old low-headroom I/O rule.
+        let recovered =
+            refresh_pressure_policy(&test_capabilities(30.0, 900.0), &refreshed, &policy);
+        assert_eq!(recovered.state, PressureState::Warning);
+    }
+
+    #[test]
+    fn repeated_pressure_refreshes_age_telemetry_instead_of_renewing_it() {
+        let policy = DiskPressurePolicyConfig::default();
+        let caps = test_capabilities(60.0, 900.0);
+        let telemetry = test_received_telemetry(30.0, 95.0, 0);
+        let mut assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &policy);
+        assert_eq!(assessment.state, PressureState::Critical);
+        let received_at = current_unix_ms() - 89_000;
+        assessment.telemetry_received_at_unix_ms = Some(received_at);
+        assessment.telemetry_age_secs = Some(89);
+        for _ in 0..5 {
+            assessment.evaluated_at_unix_ms = current_unix_ms() - 1;
+            assessment = refresh_pressure_policy(&caps, &assessment, &policy);
+            assert!(assessment.telemetry_fresh);
+            assert_eq!(assessment.state, PressureState::Critical);
+            assert_eq!(assessment.telemetry_received_at_unix_ms, Some(received_at));
+        }
+
+        // Actual elapsed time, not the number of refreshes, expires evidence.
+        assessment.telemetry_received_at_unix_ms = Some(current_unix_ms() - 91_000);
+        assessment = refresh_pressure_policy(&caps, &assessment, &policy);
+        assert!(!assessment.telemetry_fresh);
+        assert!(assessment.telemetry_age_secs.unwrap() >= 91);
+        assert_eq!(assessment.state, PressureState::Warning);
+        assert_eq!(
+            assessment.reason_code,
+            "disk_warning_without_fresh_telemetry"
+        );
+
+        // Even a wall-clock discontinuity cannot promote explicitly stale
+        // evidence back to fresh during a later capability publication.
+        assessment.telemetry_age_secs = Some(0);
+        assessment.telemetry_received_at_unix_ms = Some(current_unix_ms() + 1_000);
+        assessment.evaluated_at_unix_ms = current_unix_ms() + 1_000;
+        assert!(!refresh_pressure_policy(&caps, &assessment, &policy).telemetry_fresh);
+    }
+
+    #[test]
+    fn selection_overrides_feed_the_policy_and_bad_values_fail_safe() {
         let default = DiskPressurePolicyConfig::default();
         let unset =
             DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig::default());
         assert_eq!(unset.critical_free_ratio, default.critical_free_ratio);
-        assert_eq!(unset.critical_free_ratio_cap_gb, None);
+        assert_eq!(unset.critical_free_ratio_cap_gb, Some(25.0));
 
         let tuned = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
             disk_critical_free_ratio: 0.03,
@@ -1492,6 +1903,7 @@ mod tests {
             (0.0, Some(5.0)),
             (0.2, Some(f64::NAN)),
             (f64::NAN, Some(-1.0)),
+            (f64::INFINITY, Some(f64::INFINITY)),
         ] {
             let bad = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
                 disk_critical_free_ratio: ratio,
@@ -1503,6 +1915,11 @@ mod tests {
                 "{ratio}"
             );
             assert_eq!(bad.critical_free_ratio_cap_gb, None, "{cap:?}");
+            assert_eq!(
+                evaluate_pressure_policy(&test_capabilities(30.0, 900.0), None, &bad).state,
+                PressureState::Critical,
+                "invalid cap must never relax the ratio gate"
+            );
         }
 
         let parsed: rch_common::RchConfig = toml::from_str(

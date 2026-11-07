@@ -86,6 +86,16 @@ impl<'a> ConfigDisplay<'a> {
             "general.socket_path",
         );
 
+        // Slow-path timing policy
+        lines.push(format!("{} [timeouts]", Icons::tree_branch(self.context)));
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "scale",
+            &self.config.timeouts.scale.to_string(),
+            "timeouts.scale",
+        );
+
         // Compilation section
         lines.push(format!(
             "{} [compilation]",
@@ -326,6 +336,15 @@ impl<'a> ConfigDisplay<'a> {
             "general.socket_path",
         );
 
+        console.print_plain("");
+        console.print_plain("[timeouts]");
+        self.print_plain_value(
+            console,
+            "scale",
+            &self.config.timeouts.scale.to_string(),
+            "timeouts.scale",
+        );
+
         // Compilation section
         console.print_plain("");
         console.print_plain("[compilation]");
@@ -484,8 +503,8 @@ mod tests {
     use super::*;
     use crate::commands::{
         ConfigCircuitSection, ConfigCompilationSection, ConfigEnvironmentSection,
-        ConfigGeneralSection, ConfigOutputSection, ConfigSelfHealingSection, ConfigTransferSection,
-        ConfigValueSourceInfo,
+        ConfigGeneralSection, ConfigOutputSection, ConfigSelfHealingSection, ConfigTimeoutsSection,
+        ConfigTransferSection, ConfigValueSourceInfo,
     };
     use rch_common::OutputVisibility;
 
@@ -498,6 +517,7 @@ mod tests {
                 log_level: "info".to_string(),
                 socket_path: "/tmp/rch.sock".to_string(),
             },
+            timeouts: ConfigTimeoutsSection { scale: 1.0 },
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.8,
                 min_local_time_ms: 1000,

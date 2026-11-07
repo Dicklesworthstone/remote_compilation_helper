@@ -311,7 +311,7 @@ class SourceAdmission105Tests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(message)
 
-    def start_retry(self, attempts=3):
+    def start_retry(self, retry_seconds=3):
         # Production retry loop, not a Python retry substitute. Its source-lock
         # descriptor is opened INSIDE the fresh attempt subshell, as in ssh.rs.
         command = shlex.join(self.fixture.command("bb", self.roots, "try-acquire"))
@@ -323,10 +323,11 @@ class SourceAdmission105Tests(unittest.TestCase):
             f"printf 'attempt\n' >> {shlex.quote(str(self.attempts))}\n"
             f"exec {command} <<'RCH_TEST_ROOTS'\n{payload}RCH_TEST_ROOTS\n"
             "); }\n"
-            f"rch_admission_attempts={attempts}\n{retry}"
+            f"rch_admission_retry_seconds={retry_seconds}\n{retry}"
         )
         child = subprocess.Popen(["sh"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=self.fixture.env)
+                                 stderr=subprocess.PIPE,
+                                 env={**self.fixture.env, "RCH_TIMING_SCALE": "1"})
         child.stdin.write(script.encode())
         child.stdin.close()
         child.stdin = None
@@ -517,11 +518,14 @@ class SourceAdmission105Tests(unittest.TestCase):
         self.assertEqual(self.fixture.path("bb", self.roots).read_bytes(), root_bytes(self.roots))
         self.assertTrue((self.fixture.registry / "released" / self.fixture.path("aa", self.roots).name).exists())
 
-    def test_live_owner_exhausts_bounded_attempts_without_losing_ownership(self):
+    def test_live_owner_expires_retry_window_without_losing_ownership(self):
         self.accepted(self.fixture.run("aa", self.roots))
-        child = self.start_retry(attempts=2)
+        started = time.monotonic()
+        child = self.start_retry(retry_seconds=2)
         self.finish(child, 75)
-        self.assertEqual(len(self.attempts.read_text().splitlines()), 2)
+        self.assertGreaterEqual(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertGreaterEqual(len(self.attempts.read_text().splitlines()), 1)
         self.assertFalse(self.fixture.path("bb", self.roots).exists())
         self.assertEqual(self.fixture.path("aa", self.roots).read_bytes(), root_bytes(self.roots))
 
@@ -545,8 +549,9 @@ class SourceAdmission105Tests(unittest.TestCase):
         result = subprocess.run(
             ["sh"], input=(
                 "rch_source_attempt() { ( set -eu; false; echo UNSAFE; ); }\n"
-                f"rch_admission_attempts=2\n{retry}"
+                f"rch_admission_retry_seconds=2\n{retry}"
             ).encode(), capture_output=True, timeout=5, check=False,
+            env={**os.environ, "RCH_TIMING_SCALE": "1"},
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, b"", "failed setup must never reach admission")

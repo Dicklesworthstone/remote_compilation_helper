@@ -94,6 +94,10 @@ pub struct WorkerProbeResult {
     /// Exact runtime/toolchain capability inventory returned by `rch-wkr`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<WorkerCapabilities>,
+    /// Fresh check of this dispatcher's canonical/alias roots, independent of
+    /// the worker-default topology in its capability inventory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_topology: Option<crate::source_topology_probe::SourceTopologyProbe>,
     /// Project-declared rustup components absent from this worker's matching
     /// toolchain. Non-empty means connectivity succeeded but command admission
     /// must not report the worker as ready.
@@ -108,9 +112,9 @@ pub struct WorkerProbeResult {
 pub struct WorkerProbeSummary {
     /// Total workers probed.
     pub total: usize,
-    /// Workers that answered the health check successfully.
+    /// Workers that passed connectivity, runtime and applicable namespace checks.
     pub healthy: usize,
-    /// Workers that reachable but failed the health check.
+    /// Reachable workers that failed health or dispatcher namespace checks.
     pub unhealthy: usize,
     /// Reachable workers missing a project-declared toolchain component.
     pub capability_missing: usize,
@@ -230,6 +234,7 @@ pub struct DaemonLogsResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigShowResponse {
     pub general: ConfigGeneralSection,
+    pub timeouts: ConfigTimeoutsSection,
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
     pub environment: ConfigEnvironmentSection,
@@ -276,6 +281,12 @@ pub struct ConfigGeneralSection {
     pub force_remote: bool,
     pub log_level: String,
     pub socket_path: String,
+}
+
+/// Bounded slow-path timeout policy.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConfigTimeoutsSection {
+    pub scale: f64,
 }
 
 /// Compilation configuration section.

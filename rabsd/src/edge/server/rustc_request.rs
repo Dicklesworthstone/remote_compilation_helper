@@ -575,6 +575,14 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     if let Err(reason) = package.verify_generated_disjoint(&physical_plan) {
         return refuse(&reason);
     }
+    // dependency-env-v3 for the local lane: key ambient variables only when
+    // this package's captured sources name them, so agent sessions that
+    // differ in terminal/SSH/multiplexer/Cargo-config variables share keys.
+    // Unnamed tracked reads still refuse publication after execution. The
+    // remote lane keeps its exact environment contract.
+    if !remote_requested {
+        plan.narrow_to_source_env_reads(&package.source_env_reads);
+    }
     // This record comes from the generated-tree capture, never a wire field.
     // Keying below binds these same bytes; PackageFacts revalidates the run
     // record and generated inputs before serving and after execution.
@@ -657,6 +665,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     // A refusal keeps the original fresh workspace plan, before any action or
     // worker attempt exists. The captured full-workspace image is identical for
     // both profiles; its class label never supplies cache authority by itself.
+    // Qualification belongs to this selected, independently isolated action.
+    // Other project executors in the operation do not veto remote cache use;
+    // the operation-wide local-completion refusal is preserved below through
+    // unavailable workers, warming, and every remote failure/fallback path.
     let mut committed_workspace_inputs = None;
     if workspace_requested
         && let Some(paths) = &live.canonical
@@ -689,6 +701,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+            CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
         ] {
             let candidate = match policy {
                 CommittedDependencyPolicy::WorkspaceRlib => {
@@ -696,6 +710,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 }
                 CommittedDependencyPolicy::WorkspaceMetadata => {
                     workspace_dependency_cache::plan_committed_workspace_metadata(&plan)
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+                    workspace_dependency_cache::plan_generated_workspace_dag_library(&plan)
                 }
                 CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                 | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
@@ -1161,8 +1179,9 @@ async fn acknowledge_capture(
 }
 
 /// Two-phase completion on the actual admitted session. Preparation copies
-/// every output into immutable CAS objects before requesting acknowledgment;
-/// publication only consumes those captured objects, never the target paths.
+/// every output into private read-only stages before requesting
+/// acknowledgment, so Cargo waits for copies only; publication makes those
+/// stages durable CAS objects and never rereads the target paths.
 pub(super) async fn complete_on_lane(
     lane: &super::Limit,
     live: Arc<LiveEdge>,

@@ -94,6 +94,7 @@ pub mod telemetry_explain;
 pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
+pub mod timing;
 pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
@@ -101,6 +102,19 @@ pub mod types;
 
 /// Standard-library-only worker guard shared by SSH and direct execution.
 pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
+
+/// Paired loop-break markers for an RCH-managed Cargo child process.
+///
+/// Install both only after execution has been admitted: on a worker command,
+/// a worker-owned benchmark, or an allowed local fallback. Never promote a
+/// caller's bypass flag into permission to run locally, or set these on the
+/// dispatcher process itself. Shim v9 rejects a bare bypass under remote-required
+/// policy; the origin is a cooperative provenance marker, not authentication.
+pub const MANAGED_CARGO_ENV: [(&str, &str); 2] = [
+    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+];
+
 pub mod ui;
 pub mod util;
 pub mod worker_config_validation;
@@ -279,18 +293,22 @@ pub use ssh_utils::{
 #[cfg(unix)]
 pub use ssh::{KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use test_change::{TestChangeGuard, TestCodeChange};
-pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
+pub use toolchain::{
+    ToolchainInfo, UnresolvedCommandToolchain, rustup_toolchain_from_command,
+    wrap_command_with_color, wrap_command_with_toolchain,
+};
 pub use transfer_hardening::{
     FirstFailure, RetryDecision, RsyncFailureClass, classify_rsync_outcome, is_ephemeral_path,
 };
 pub use types::{
     AffinityConfig, ApiConfig, BoxRole, BuildCancellationMetadata, BuildCancellationWorkerHealth,
-    BuildDiskBudget, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord,
-    BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
-    CommandTimingBreakdown, CompilationConfig, CompilationMetrics, CompilationTimer,
-    CompilationTimingBreakdown, DashboardConfig, DoctorConfig, DoctorWebhookEndpoint,
-    DoctorWebhookFormat, DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig,
-    FleetConfig, GeneralConfig, MetricsAggregator, OS_TAG_PREFIX, OutputConfig, OutputVisibility,
+    BuildDiskBudget, BuildDiskObservation, BuildDiskPool, BuildDiskWarmPolicy, BuildHeartbeatPhase,
+    BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig,
+    CircuitState, CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown,
+    CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
+    DashboardConfig, DoctorConfig, DoctorWebhookEndpoint, DoctorWebhookFormat,
+    DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig,
+    GeneralConfig, MetricsAggregator, OS_TAG_PREFIX, OutputConfig, OutputVisibility,
     PathTopologyConfig, RchConfig, ReleaseRequest, RemoteBuildJobs, RequiredRuntime, RetryConfig,
     SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionConfig,
     SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,

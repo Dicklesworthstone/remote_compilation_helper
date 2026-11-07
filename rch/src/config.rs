@@ -142,7 +142,7 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 //
 // Invalidation:
 //   - Source-file metadata mismatch (config.toml / .rch/config.toml).
-//   - CACHE_SCHEMA_VERSION bump (any change to RchConfig shape).
+//   - CACHE_SCHEMA_VERSION bump (any change to RchConfig shape or defaults).
 //   - `RCH_DISABLE_CONFIG_CACHE=1` env var (testing / debugging).
 //   - Cache file unparseable / corrupt (fall through to TOML, rewrite cache).
 //
@@ -154,11 +154,13 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 // (`XDG_RUNTIME_DIR`, then the user cache dir), so the cache records whether
 // that value came from the default and a reader recomputes it (#69).
 
-/// Bumped manually whenever RchConfig (or any nested type) changes shape.
+/// Bumped manually whenever RchConfig (or any nested type) changes shape or defaults.
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 6;
+// Version 8 adds the validated [timeouts] section. Only on-disk values are
+// cached; RCH_TIMING_SCALE is resolved independently on every load.
+const CACHE_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -492,6 +494,7 @@ pub fn load_config() -> Result<RchConfig> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
     {
+        rch_common::timing::install(config.timeouts.scale);
         return Ok(config);
     }
 
@@ -518,6 +521,7 @@ pub fn load_config() -> Result<RchConfig> {
     };
 
     let mut config = apply_env_overrides(config);
+    apply_timing_env_overrides(&mut config, None, None)?;
 
     // br-4zf3p: CLI overrides for self-healing have highest priority
     // (CLI > env > config > defaults). Recorded by main.rs at startup.
@@ -532,6 +536,7 @@ pub fn load_config() -> Result<RchConfig> {
             .into_owned();
     }
 
+    rch_common::timing::install(config.timeouts.scale);
     Ok(config)
 }
 
@@ -729,6 +734,8 @@ struct PartialRchConfig {
     #[serde(default)]
     general: PartialGeneralConfig,
     #[serde(default)]
+    timeouts: PartialTimeoutsConfig,
+    #[serde(default)]
     compilation: PartialCompilationConfig,
     #[serde(default)]
     selection: PartialSelectionConfig,
@@ -760,6 +767,11 @@ struct PartialRchConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialTimeoutsConfig {
+    scale: Option<rch_common::timing::TimingScale>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialPathTopologyConfig {
     canonical_root: Option<String>,
     alias_root: Option<String>,
@@ -785,6 +797,10 @@ struct PartialGeneralConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialSelectionConfig {
     disk_gb_per_slot: Option<f64>,
+    disk_critical_free_ratio: Option<f64>,
+    // Only presence is needed for attribution. Full config loading validates
+    // and decodes both the numeric cap and the explicit "uncapped" spelling.
+    disk_critical_ratio_cap_gb: Option<toml::Value>,
     #[serde(default)]
     weights: PartialSelectionWeights,
 }
@@ -901,7 +917,9 @@ pub fn load_config_with_sources() -> Result<LoadedConfig> {
         None
     };
 
-    load_config_with_sources_from_paths(user_path, project_path, None)
+    let loaded = load_config_with_sources_from_paths(user_path, project_path, None)?;
+    rch_common::timing::install(loaded.config.timeouts.scale);
+    Ok(loaded)
 }
 
 fn load_config_with_sources_from_paths(
@@ -944,6 +962,7 @@ fn load_config_with_sources_from_paths(
     }
 
     apply_env_overrides_inner(&mut config, Some(&mut sources), env_overrides);
+    apply_timing_env_overrides(&mut config, Some(&mut sources), env_overrides)?;
 
     // br-4zf3p: CLI flags are highest priority and apply to every code path
     // that loads a config. Mirror the apply_to call from `load_config()`.
@@ -1489,6 +1508,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "general.force_remote",
         "general.log_level",
         "general.socket_path",
+        "timeouts.scale",
         "compilation.confidence_threshold",
         "compilation.min_local_time_ms",
         "compilation.remote_speedup_threshold",
@@ -1504,6 +1524,8 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.allow_local_fallback",
         "compilation.remote_build_jobs",
         "selection.disk_gb_per_slot",
+        "selection.disk_critical_free_ratio",
+        "selection.disk_critical_ratio_cap_gb",
         "selection.weights.disk",
         "transfer.compression_level",
         "transfer.exclude_patterns",
@@ -1549,6 +1571,10 @@ fn apply_layer(
     source: &ConfigValueSource,
     _defaults: &RchConfig,
 ) {
+    if let Some(scale) = layer.timeouts.scale {
+        config.timeouts.scale = scale;
+        set_source(sources, "timeouts.scale", source.clone());
+    }
     if let Some(role) = layer.general.role {
         config.general.role = role;
         set_source(sources, "general.role", source.clone());
@@ -1642,6 +1668,21 @@ fn apply_layer(
     if let Some(disk_gb_per_slot) = layer.selection.disk_gb_per_slot {
         config.selection.disk_gb_per_slot = disk_gb_per_slot;
         set_source(sources, "selection.disk_gb_per_slot", source.clone());
+    }
+    if let Some(ratio) = layer.selection.disk_critical_free_ratio {
+        config.selection.disk_critical_free_ratio = ratio;
+        set_source(
+            sources,
+            "selection.disk_critical_free_ratio",
+            source.clone(),
+        );
+    }
+    if layer.selection.disk_critical_ratio_cap_gb.is_some() {
+        set_source(
+            sources,
+            "selection.disk_critical_ratio_cap_gb",
+            source.clone(),
+        );
     }
     if let Some(disk) = layer.selection.weights.disk {
         config.selection.weights.disk = disk;
@@ -1949,6 +1990,9 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
 
     // Merge general section
     merge_general(&mut base.general, &overlay.general, &default.general);
+    if overlay.timeouts != default.timeouts {
+        base.timeouts = overlay.timeouts;
+    }
 
     // Merge compilation section
     merge_compilation(
@@ -2362,6 +2406,38 @@ fn derived_scratch_alias_root(
         return None;
     }
     Some(format!("{canonical}.rch-alias"))
+}
+
+/// Timing overrides are fallible: malformed values must never silently change
+/// a remote safety deadline. This runs after each cache read, not when writing it.
+fn apply_timing_env_overrides(
+    config: &mut RchConfig,
+    sources: Option<&mut ConfigSourceMap>,
+    env_overrides: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    let name = rch_common::timing::TIMING_SCALE_ENV;
+    let value = if let Some(map) = env_overrides {
+        map.get(name).cloned()
+    } else {
+        match std::env::var(name) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(rch_common::timing::TimingScaleError.into());
+            }
+        }
+    };
+    if let Some(value) = value {
+        config.timeouts = config.timeouts.with_override(Some(&value))?;
+        if let Some(sources) = sources {
+            set_source(
+                sources,
+                "timeouts.scale",
+                ConfigValueSource::EnvVar(name.to_string()),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn apply_env_overrides_inner(
@@ -4013,6 +4089,103 @@ identity_file = "/tmp/id_ed25519"
     }
 
     #[test]
+    fn timing_scale_tracks_default_user_project_and_environment_sources() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        let no_env = HashMap::new();
+        let defaults = load_config_with_sources_from_paths(None, None, Some(&no_env)).unwrap();
+        assert_eq!(defaults.config.timeouts.scale.env_value(), "1");
+        assert_eq!(
+            defaults.sources.get("timeouts.scale"),
+            Some(&ConfigValueSource::Default)
+        );
+
+        std::fs::write(&user_path, "[timeouts]\nscale = 4\n").unwrap();
+        let user =
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&no_env)).unwrap();
+        assert_eq!(user.config.timeouts.scale.env_value(), "4");
+        assert_eq!(
+            user.sources.get("timeouts.scale"),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
+
+        for value in ["2.5", "1"] {
+            std::fs::write(&project_path, format!("[timeouts]\nscale = {value}\n")).unwrap();
+            let project = load_config_with_sources_from_paths(
+                Some(&user_path),
+                Some(&project_path),
+                Some(&no_env),
+            )
+            .unwrap();
+            assert_eq!(project.config.timeouts.scale.env_value(), value);
+            assert_eq!(
+                project.sources.get("timeouts.scale"),
+                Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+            );
+        }
+
+        let env = HashMap::from([("RCH_TIMING_SCALE".to_string(), "3.5".to_string())]);
+        let overridden =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), Some(&env))
+                .unwrap();
+        assert_eq!(overridden.config.timeouts.scale.env_value(), "3.5");
+        assert_eq!(
+            overridden.sources.get("timeouts.scale"),
+            Some(&ConfigValueSource::EnvVar("RCH_TIMING_SCALE".to_string()))
+        );
+        let env_only = load_config_with_sources_from_paths(None, None, Some(&env)).unwrap();
+        assert_eq!(env_only.config.timeouts.scale.env_value(), "3.5");
+    }
+
+    #[test]
+    fn timing_scale_rejects_invalid_file_and_environment_values() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let no_env = HashMap::new();
+        for value in ["nan", "inf", "-inf", "0", "-1", "0.5", "11"] {
+            std::fs::write(&path, format!("[timeouts]\nscale = {value}\n")).unwrap();
+            assert!(
+                load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err(),
+                "accepted invalid file scale {value}"
+            );
+            let env = HashMap::from([("RCH_TIMING_SCALE".to_string(), value.to_string())]);
+            assert!(
+                load_config_with_sources_from_paths(None, None, Some(&env)).is_err(),
+                "accepted invalid environment scale {value}"
+            );
+        }
+        let env = HashMap::from([("RCH_TIMING_SCALE".to_string(), String::new())]);
+        assert!(load_config_with_sources_from_paths(None, None, Some(&env)).is_err());
+    }
+
+    #[test]
+    fn cached_timing_policy_reapplies_environment_without_memoizing_it() {
+        let _guard = test_guard!();
+        let on_disk: RchConfig = toml::from_str("[timeouts]\nscale = 2\n").unwrap();
+        let cached = serde_json::to_vec(&on_disk).unwrap();
+        for (value, expected) in [(Some("4"), "4"), (Some("1"), "1"), (None, "2")] {
+            let mut loaded: RchConfig = serde_json::from_slice(&cached).unwrap();
+            let mut env = HashMap::new();
+            if let Some(value) = value {
+                env.insert("RCH_TIMING_SCALE".to_string(), value.to_string());
+            }
+            apply_timing_env_overrides(&mut loaded, None, Some(&env)).unwrap();
+            assert_eq!(loaded.timeouts.scale.env_value(), expected);
+        }
+        assert_eq!(
+            serde_json::from_slice::<RchConfig>(&cached)
+                .unwrap()
+                .timeouts
+                .scale
+                .env_value(),
+            "2"
+        );
+    }
+
+    #[test]
     fn disk_headroom_config_preserves_project_override_and_explicit_zero() {
         let _guard = test_guard!();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4440,6 +4613,83 @@ max_concurrent_workers = 3
             project.sources.get(key),
             Some(&ConfigValueSource::ProjectConfig(project_path))
         );
+    }
+
+    #[test]
+    fn disk_ratio_policy_sources_preserve_explicit_overrides_and_unrelated_layers() {
+        let _guard = test_guard!();
+        let ratio_key = "selection.disk_critical_free_ratio";
+        let cap_key = "selection.disk_critical_ratio_cap_gb";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+
+        let defaults = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("missing config uses defaults");
+        assert_eq!(
+            defaults.config.selection.disk_critical_ratio_cap_gb,
+            Some(25.0)
+        );
+        assert_eq!(defaults.sources[cap_key], ConfigValueSource::Default);
+        assert_eq!(defaults.sources[ratio_key], ConfigValueSource::Default);
+
+        for (value, expected_cap) in [
+            ("15.0", Some(15.0)),
+            ("30.0", Some(30.0)),
+            ("\"uncapped\"", None),
+        ] {
+            std::fs::write(
+                &user_path,
+                format!(
+                    "[selection]\ndisk_critical_free_ratio = 0.03\ndisk_critical_ratio_cap_gb = {value}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(&project_path, "[compilation]\nmin_local_time_ms = 2001\n").unwrap();
+            let layered =
+                load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                    .unwrap();
+            assert_eq!(
+                layered.config.selection.disk_critical_ratio_cap_gb,
+                expected_cap
+            );
+            assert_eq!(layered.config.selection.disk_critical_free_ratio, 0.03);
+            assert_eq!(
+                layered.sources[cap_key],
+                ConfigValueSource::UserConfig(user_path.clone())
+            );
+            assert_eq!(
+                layered.sources[ratio_key],
+                ConfigValueSource::UserConfig(user_path.clone())
+            );
+            let cached: RchConfig =
+                serde_json::from_slice(&serde_json::to_vec(&layered.config).unwrap()).unwrap();
+            assert_eq!(cached.selection.disk_critical_ratio_cap_gb, expected_cap);
+
+            // Explicit defaults must override the user policy, including an
+            // unconditional ratio, and name the project as their source.
+            std::fs::write(
+                &project_path,
+                "[selection]\ndisk_critical_free_ratio = 0.05\ndisk_critical_ratio_cap_gb = 25.0\n",
+            )
+            .unwrap();
+            let project =
+                load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                    .unwrap();
+            assert_eq!(
+                project.config.selection.disk_critical_ratio_cap_gb,
+                Some(25.0)
+            );
+            assert_eq!(project.config.selection.disk_critical_free_ratio, 0.05);
+            assert_eq!(
+                project.sources[cap_key],
+                ConfigValueSource::ProjectConfig(project_path.clone())
+            );
+            assert_eq!(
+                project.sources[ratio_key],
+                ConfigValueSource::ProjectConfig(project_path.clone())
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //!    existing representation — then fsync the containing directory
 //!    before durability is reported;
 //! 5. record the object + location (with the profile's encoding tag)
-//!    in the metadata store; the staging file is removed last (the
+//!    in one metadata transaction; the staging file is removed last (the
 //!    race LOSER also cleans its temp).
 //!
 //! A publish that finds the path already present VERIFIES the existing
@@ -593,12 +593,12 @@ fn publish_staged_observed_inner(
         return Err(PutError::CrashInjected(FaultPoint::DirectorySynced));
     }
 
-    // 5. Record object + location; encoding tag is the profile. The
-    // location claims durability only when the policy actually was the
-    // full profile (H032).
-    store.record_object(declared, logical_size)?;
-    store.add_location(
+    // 5. Record object + location in one transaction; encoding tag is the
+    // profile. The location claims durability only when the policy actually
+    // was the full profile (H032).
+    store.record_object_location(
         declared,
+        logical_size,
         &target.to_string_lossy(),
         None,
         profile,
@@ -816,9 +816,9 @@ fn handle_existing(
         if let Some(observation) = observation {
             observation.validate(target, file_digest)?;
         }
-        store.record_object(declared, logical_size)?;
-        store.add_location(
+        store.record_object_location(
             declared,
+            logical_size,
             &target.to_string_lossy(),
             None,
             profile,

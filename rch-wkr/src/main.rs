@@ -258,6 +258,7 @@ async fn run_worker(cli: Cli) -> Result<()> {
                     Some(rch_common::BuildDiskBudget {
                         max_growth_bytes,
                         min_free_bytes,
+                        warm_policy: None,
                     })
                 }
                 _ => rch_common::BuildDiskBudget::cold_for_command(&command),
@@ -561,6 +562,19 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     {
         let version_str = String::from_utf8_lossy(&output.stdout);
         capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
+    }
+
+    // A compiler version alone does not establish that builds can run. A
+    // dual-role worker may also have both the PATH shim and the direct
+    // toolchain Cargo wrapper installed. Exercise both with the exact managed
+    // child environment used by `execute`, before advertising Rust capacity.
+    if capabilities.rustc_version.is_some()
+        && let Err(error) = probe_worker_cargo().await
+    {
+        capabilities.rustc_version = None;
+        warnings.push(format!(
+            "worker Cargo execution check failed: {error:#}; check the worker's Cargo/toolchain installation and reinstall its RCH shims if needed (managed execution requires RCH_CARGO_WRAPPER_BYPASS=1 with RCH_CARGO_WRAPPER_ORIGIN=rch)"
+        ));
     }
 
     let (toolchains, components, inventory_warnings) = probe_rustup_inventory().await;
@@ -1128,12 +1142,58 @@ async fn cached_rustup_inventory(
     Ok((cache.toolchains, components, warnings))
 }
 
-/// Retain rustup's environment setup for linked/custom toolchains. Cancellation
-/// kills and reaps the owned foreground rustup process; this does not promise
-/// to terminate descendants created by rustup on every operating system.
+/// Check Cargo using the same child-environment constructor as real worker
+/// execution. Bound all three commands together so a broken shim cannot hang
+/// the capability refresh or consume unbounded memory with diagnostic output.
+async fn probe_worker_cargo() -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let output_budget = std::sync::atomic::AtomicUsize::new(16 * 1024);
+    // Unlike inventory discovery, execution must work with the job's actual
+    // PATH. A fallback search could bypass a broken shim or mask a missing
+    // PATH entry that would still make every admitted Cargo job fail.
+    let mut command = executor::managed_command("cargo");
+    command.arg("--version");
+    bounded_probe_command(command, "PATH Cargo", deadline, &output_budget).await?;
+
+    // Rustup is only discovering the direct worker-side toolchain path here;
+    // its usual service-environment fallback cannot replace the PATH Cargo
+    // execution check above.
+    if let Some(rustup) = resolve_tool_binary("rustup") {
+        let mut command = executor::managed_command(&rustup.path);
+        command.args(["which", "cargo"]);
+        let output =
+            bounded_probe_command(command, "rustup which cargo", deadline, &output_budget).await?;
+        let selected = output.trim();
+        anyhow::ensure!(
+            !selected.is_empty()
+                && !selected.contains(['\n', '\r'])
+                && std::path::Path::new(selected).is_absolute(),
+            "rustup which cargo did not return one absolute executable path"
+        );
+        let mut command = executor::managed_command(selected);
+        command.arg("--version");
+        bounded_probe_command(command, "toolchain Cargo", deadline, &output_budget).await?;
+    }
+    Ok(())
+}
+
+/// Retain rustup's environment setup for linked/custom toolchains.
 async fn inventory_command(
     executable: &std::path::Path,
     args: &[&str],
+    deadline: tokio::time::Instant,
+    output_budget: &std::sync::atomic::AtomicUsize,
+) -> Result<String> {
+    let mut command = tokio::process::Command::new(executable);
+    command.args(args);
+    bounded_probe_command(command, "inventory", deadline, output_budget).await
+}
+
+/// Cancellation kills and reaps the owned foreground probe process; this does
+/// not promise to terminate descendants created by a tool on every platform.
+async fn bounded_probe_command(
+    mut command: tokio::process::Command,
+    probe: &str,
     deadline: tokio::time::Instant,
     output_budget: &std::sync::atomic::AtomicUsize,
 ) -> Result<String> {
@@ -1141,31 +1201,30 @@ async fn inventory_command(
     use std::process::Stdio;
     anyhow::ensure!(
         tokio::time::Instant::now() < deadline,
-        "inventory deadline reached before spawn"
+        "{probe} deadline reached before spawn"
     );
     anyhow::ensure!(
         output_budget.load(std::sync::atomic::Ordering::Relaxed) > 0,
-        "inventory output limit exhausted before spawn"
+        "{probe} output limit exhausted before spawn"
     );
-    let mut child = tokio::process::Command::new(executable)
-        .args(args)
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("spawn inventory command")?;
-    let stdout = child.stdout.take().context("missing inventory stdout")?;
-    let stderr = child.stderr.take().context("missing inventory stderr")?;
+        .with_context(|| format!("spawn {probe} command"))?;
+    let stdout = child.stdout.take().context("missing probe stdout")?;
+    let stderr = child.stderr.take().context("missing probe stderr")?;
     let result = tokio::time::timeout_at(deadline, async {
         let (stdout, stderr, status) = tokio::try_join!(
-            read_inventory_output(stdout, output_budget),
-            read_inventory_output(stderr, output_budget),
+            read_probe_output(stdout, probe, output_budget),
+            read_probe_output(stderr, probe, output_budget),
             async { child.wait().await.map_err(anyhow::Error::from) },
         )?;
         anyhow::ensure!(
             status.success(),
-            "inventory command exited {status}: {}{}",
+            "{probe} command exited {status}: {}{}",
             String::from_utf8_lossy(&stderr[..stderr.len().min(2048)]),
             if stderr.len() > 2048 {
                 " (diagnostic truncated)"
@@ -1173,24 +1232,25 @@ async fn inventory_command(
                 ""
             }
         );
-        String::from_utf8(stdout).context("inventory output is not UTF-8")
+        String::from_utf8(stdout).with_context(|| format!("{probe} output is not UTF-8"))
     })
     .await;
     let error = match result {
         Ok(Ok(stdout)) => return Ok(stdout),
         Ok(Err(error)) => error,
-        Err(_) => anyhow::anyhow!("inventory command timed out"),
+        Err(_) => anyhow::anyhow!("{probe} command timed out"),
     };
     let _ = child.start_kill();
     let reaped = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
-        return Err(error.context("owned inventory child reap was not confirmed"));
+        return Err(error.context(format!("owned {probe} child reap was not confirmed")));
     }
     Err(error)
 }
 
-async fn read_inventory_output(
+async fn read_probe_output(
     mut pipe: impl tokio::io::AsyncRead + Unpin,
+    probe: &str,
     budget: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<u8>> {
     use std::sync::atomic::Ordering;
@@ -1208,7 +1268,7 @@ async fn read_inventory_output(
             })
             .map_err(|_| {
                 budget.store(0, Ordering::Relaxed);
-                anyhow::anyhow!("inventory output exceeds shared byte limit")
+                anyhow::anyhow!("{probe} output exceeds shared byte limit")
             })?;
         output.extend_from_slice(&buffer[..count]);
     }

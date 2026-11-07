@@ -211,6 +211,7 @@ mod tests {
         BufReader::new(ConsultStream {
             stream,
             deadline: Instant::now(),
+            panic_fence: super::super::PanicFence::default(),
         })
     }
 

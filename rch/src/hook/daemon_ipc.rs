@@ -369,16 +369,10 @@ fn unresolved_toolchain_refusal(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
 ) -> Option<SelectionResponse> {
-    if required_runtime != RequiredRuntime::Rust {
+    if !required_runtime.needs_rust_toolchain() {
         return None;
     }
-    if toolchain.is_some_and(|info| {
-        !info.channel.is_empty()
-            && !info
-                .rustup_toolchain()
-                .chars()
-                .any(|ch| ch.is_whitespace() || ch.is_control())
-    }) {
+    if toolchain.is_some_and(ToolchainInfo::is_valid_rustup_argument) {
         return None;
     }
     Some(SelectionResponse {
@@ -392,6 +386,13 @@ fn unresolved_toolchain_refusal(
         build_id: None,
         diagnostics: None,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionQueryIntent {
+    Admit,
+    ColdRetry,
+    Preview,
 }
 
 /// Query the daemon for a worker (reserves slots and opens a durable build).
@@ -430,7 +431,51 @@ pub(crate) async fn query_daemon(
         preferred_workers,
         job_mode,
         required_tools,
-        false,
+        SelectionQueryIntent::Admit,
+        source_topology,
+    )
+    .await
+}
+
+/// Obtain an unconditional cold reservation after an acknowledged prelaunch
+/// refusal. The numeric headroom remains a minimum: it must not be the signal
+/// that disables warm admission, since ordinary callers also set that minimum.
+#[allow(clippy::too_many_arguments)] // Mirrors the owning selection query.
+pub(crate) async fn query_daemon_cold(
+    socket_path: &str,
+    project: &str,
+    cores: u32,
+    disk_headroom_gib: u32,
+    command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+    command_priority: CommandPriority,
+    classification_duration_us: u64,
+    hook_pid: Option<u32>,
+    local_wrapper_id: Option<&str>,
+    wait_for_worker: bool,
+    preferred_workers: &[WorkerId],
+    job_mode: bool,
+    required_tools: &[String],
+    source_topology: Option<&rch_common::SourceTopology>,
+) -> anyhow::Result<SelectionResponse> {
+    query_daemon_with_mode(
+        socket_path,
+        project,
+        cores,
+        disk_headroom_gib,
+        command,
+        toolchain,
+        required_runtime,
+        command_priority,
+        classification_duration_us,
+        hook_pid,
+        local_wrapper_id,
+        wait_for_worker,
+        preferred_workers,
+        job_mode,
+        required_tools,
+        SelectionQueryIntent::ColdRetry,
         source_topology,
     )
     .await
@@ -467,7 +512,7 @@ pub(crate) async fn query_daemon_dry_run(
         preferred_workers,
         false,
         &[],
-        true,
+        SelectionQueryIntent::Preview,
         source_topology,
     )
     .await
@@ -524,9 +569,10 @@ async fn query_daemon_with_mode(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
-    dry_run: bool,
+    intent: SelectionQueryIntent,
     source_topology: Option<&rch_common::SourceTopology>,
 ) -> anyhow::Result<SelectionResponse> {
+    let dry_run = intent == SelectionQueryIntent::Preview;
     if let Some(topology) = source_topology {
         topology.validate().map_err(anyhow::Error::msg)?;
     }
@@ -567,6 +613,18 @@ async fn query_daemon_with_mode(
 
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
+    // Only the durable exec path can acknowledge release and obtain a cold
+    // reservation after an exact prelaunch pool refusal. Legacy hooks keep
+    // conservative cold admission until they support that transition.
+    // Explicit cold retries omit capability even if concurrent learning raises
+    // the cold requirement above the requested minimum. An ordinary positive
+    // minimum must not disable verified retained-pool credit.
+    if intent != SelectionQueryIntent::ColdRetry && (local_wrapper_id.is_some() || dry_run) {
+        query.push_str(&format!(
+            "&disk_observation_version={}",
+            rch_common::BuildDiskObservation::VERSION
+        ));
+    }
     if disk_headroom_gib > 0 {
         query.push_str(&format!("&disk_headroom_gib={disk_headroom_gib}"));
     }
@@ -822,6 +880,7 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) source_topology_mismatch: Option<&'a rch_common::SourceTopologyMismatch>,
     /// Attributable output high water, even when the job exceeded its budget.
     pub(crate) disk_peak_output_bytes: Option<u64>,
+    pub(crate) disk_observation: Option<rch_common::BuildDiskObservation>,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -879,6 +938,18 @@ pub(crate) async fn release_worker_with_fault(
     }
     if let Some(peak) = faults.disk_peak_output_bytes {
         request.push_str(&format!("&disk_peak_output_bytes={peak}"));
+    }
+    if let Some(observation) = faults.disk_observation {
+        anyhow::ensure!(
+            faults
+                .disk_peak_output_bytes
+                .is_some_and(|peak| observation.valid_for_peak(peak)),
+            "invalid incremental disk observation"
+        );
+        request.push_str(&format!(
+            "&disk_observation={}",
+            urlencoding_encode(&serde_json::to_string(&observation)?)
+        ));
     }
     if faults.worker_fault {
         request.push_str("&worker_fault=1");
@@ -1271,6 +1342,115 @@ mod daemon_io_timeout_tests {
 mod bounded_ipc_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn warm_capability_distinguishes_minimum_headroom_from_cold_retry() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("warm-capability.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let body = serde_json::to_string(&SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        })
+        .unwrap();
+        let server = async {
+            let mut requests = Vec::new();
+            for _ in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                requests.push(request);
+                writer
+                    .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            requests
+        };
+        let client = async {
+            for (wrapper, headroom) in [
+                (None, 0),
+                (Some("warm-capability-wrapper"), 0),
+                (Some("warm-capability-wrapper"), 1),
+            ] {
+                query_daemon(
+                    path.to_str().unwrap(),
+                    "project",
+                    1,
+                    headroom,
+                    "make",
+                    None,
+                    RequiredRuntime::None,
+                    CommandPriority::Normal,
+                    0,
+                    None,
+                    wrapper,
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            // Explicit cold intent stays unconditional even if the minimum
+            // is smaller than newly learned cold history during selection.
+            for headroom in [1, 103] {
+                query_daemon_cold(
+                    path.to_str().unwrap(),
+                    "project",
+                    1,
+                    headroom,
+                    "make",
+                    None,
+                    RequiredRuntime::None,
+                    CommandPriority::Normal,
+                    0,
+                    None,
+                    Some("warm-capability-wrapper"),
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            query_daemon_dry_run(
+                path.to_str().unwrap(),
+                "project",
+                1,
+                1,
+                "make",
+                None,
+                RequiredRuntime::None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        };
+        let (requests, ()) = tokio::join!(server, client);
+        assert!(!requests[0].contains("disk_observation_version="));
+        assert!(requests[1].contains("&disk_observation_version=1"));
+        assert!(requests[2].contains("&disk_observation_version=1"));
+        assert!(requests[2].contains("disk_headroom_gib=1"));
+        assert!(!requests[3].contains("disk_observation_version="));
+        assert!(requests[3].contains("disk_headroom_gib=1"));
+        assert!(!requests[4].contains("disk_observation_version="));
+        assert!(requests[4].contains("disk_headroom_gib=103"));
+        assert!(requests[5].contains("&disk_observation_version=1"));
+        assert!(requests[5].contains("disk_headroom_gib=1"));
+        assert!(requests[5].contains("dry_run=1"));
+    }
+
     #[test]
     fn tool_requirement_routes_never_fall_back_to_legacy_selection() {
         for (budget, resume, expected) in [
@@ -1286,17 +1466,25 @@ mod bounded_ipc_tests {
     }
 
     #[tokio::test]
-    async fn unresolved_rust_queries_never_connect_or_create_a_queue_owner() {
+    async fn unresolved_rust_and_zig_queries_never_connect_or_create_a_queue_owner() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selection.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        for toolchain in [
-            None,
-            Some(ToolchainInfo::new("", None, "")),
-            Some(ToolchainInfo::new("nightly bad", None, "")),
-            Some(ToolchainInfo::new("nightly\0", None, "")),
-        ] {
+        for (runtime, toolchain) in [RequiredRuntime::Rust, RequiredRuntime::Zig]
+            .into_iter()
+            .flat_map(|runtime| {
+                [
+                    None,
+                    Some(ToolchainInfo::new("", None, "")),
+                    Some(ToolchainInfo::new("nightly bad", None, "")),
+                    Some(ToolchainInfo::new("nightly\0", None, "")),
+                    Some(ToolchainInfo::new("--help", None, "")),
+                ]
+                .into_iter()
+                .map(move |toolchain| (runtime, toolchain))
+            })
+        {
             for wait in [false, true] {
                 let response = query_daemon(
                     path.to_str().unwrap(),
@@ -1305,7 +1493,7 @@ mod bounded_ipc_tests {
                     0,
                     "cargo build",
                     toolchain.as_ref(),
-                    RequiredRuntime::Rust,
+                    runtime,
                     CommandPriority::Normal,
                     0,
                     None,
@@ -1337,7 +1525,7 @@ mod bounded_ipc_tests {
                 0,
                 "cargo build",
                 toolchain.as_ref(),
-                RequiredRuntime::Rust,
+                runtime,
                 &[],
                 None,
             )
@@ -1356,11 +1544,20 @@ mod bounded_ipc_tests {
     }
 
     #[test]
-    fn toolchain_preflight_is_rust_specific_and_does_not_rewrite_an_identity() {
-        assert!(unresolved_toolchain_refusal(None, RequiredRuntime::None).is_none());
+    fn toolchain_preflight_is_cargo_specific_and_does_not_rewrite_an_identity() {
+        for runtime in [
+            RequiredRuntime::None,
+            RequiredRuntime::Bun,
+            RequiredRuntime::Node,
+            RequiredRuntime::Nix,
+            RequiredRuntime::Go,
+        ] {
+            assert!(unresolved_toolchain_refusal(None, runtime).is_none());
+        }
         for name in ["stable", "nightly-2026-08-31", "custom-with-checks"] {
             let info = ToolchainInfo::new(name, None, "diagnostic compiler version");
             assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Rust).is_none());
+            assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Zig).is_none());
             assert_eq!(info.rustup_toolchain(), name);
         }
         let info = ToolchainInfo::new("nightly", Some("2026-08-31\n".into()), "");
@@ -1701,6 +1898,7 @@ mod bounded_ipc_tests {
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                    disk_observation: None,
                 },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {

@@ -2,7 +2,13 @@
 # holds its metadata mutex and checks lexical/physical source owners before
 # calling create. Neither mode repairs ownership or replaces an existing path.
 set -eu
-[ "$#" -eq 3 ] || exit 73
+case "$#" in
+    3) namespace_report=0 ;;
+    4)
+        [ "$1" = check ] && [ "$4" = --report-json ] || exit 73
+        namespace_report=1 ;;
+    *) exit 73 ;;
+esac
 mode=$1
 canonical=$2
 alias=$3
@@ -61,8 +67,72 @@ namespace_matches() {
 }
 
 if [ "$mode" = check ]; then
-    namespace_matches
-    exit $?
+    if [ "$namespace_report" -eq 0 ]; then
+        namespace_matches
+        exit $?
+    fi
+    # Doctor/probe request a report for the dispatcher's exact roots. Keep
+    # ordinary admission checks silent and unchanged. The report is only an
+    # observation: it neither creates paths nor grants source ownership.
+    namespace_status=0
+    namespace_matches 2>/dev/null || namespace_status=$?
+    canonical_physical=$(namespace_realpath "$canonical" 2>/dev/null) || canonical_physical=''
+    alias_physical=$(namespace_realpath "$alias" 2>/dev/null) || alias_physical=''
+    exec python3 -I -S -B -c '
+import json, os, stat, sys
+canonical, alias, canonical_physical, alias_physical, checked = sys.argv[1:]
+
+def directory_state(path):
+    try:
+        return "directory" if stat.S_ISDIR(os.stat(path).st_mode) else "not_directory"
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unavailable"
+
+states = [directory_state(path) for path in (canonical, alias)]
+outcome = "unavailable"
+if "unavailable" not in states:
+    if states[0] != "directory":
+        outcome = "canonical_" + states[0]
+    elif states[1] != "directory":
+        outcome = "alias_" + states[1]
+    elif canonical_physical and alias_physical:
+        if canonical_physical != alias_physical:
+            outcome = "conflicting_alias_base"
+        elif checked == "0":
+            outcome = "compatible"
+
+report = dict(canonical=canonical, alias=alias,
+              canonical_physical=canonical_physical or None,
+              alias_physical=alias_physical or None, outcome=outcome)
+encoded = "RCH_SOURCE_TOPOLOGY_CHECK_V1 " + json.dumps(report, ensure_ascii=True)
+if len(encoded) > 65535:
+    sys.exit(2)
+print(encoded)
+sys.exit(0 if outcome == "compatible" else 2 if outcome == "unavailable" else 1)
+' "$canonical" "$alias" "$canonical_physical" "$alias_physical" "$namespace_status"
+fi
+
+# A wholly absent canonical base beside an alias symlink to a real directory is
+# one namespace with a name missing. Restore that name as a link. Creating a
+# directory here would mint a second physical tree and turn a repairable gap
+# into a permanent conflict. A real directory at the alias is not that case: it
+# may hold other work and is never a link target. Best effort and create-only:
+# when the link cannot be made, the conflict check below refuses as it always has.
+if [ ! -e "$canonical" ] && [ ! -L "$canonical" ] && [ -L "$alias" ] && [ -d "$alias" ]; then
+    alias_physical=$(namespace_realpath "$alias") || namespace_refuse 'unresolvable alias base'
+    case "$canonical/" in
+        "$alias_physical"/*) ;;
+        *)
+            mkdir -p -- "$(dirname -- "$canonical")" 2>/dev/null || :
+            if command -v gln >/dev/null 2>&1; then
+                gln -sT -- "$alias_physical" "$canonical" 2>/dev/null || :
+            else
+                ln -sT -- "$alias_physical" "$canonical" 2>/dev/null || :
+            fi
+            ;;
+    esac
 fi
 
 # Refuse a conflicting existing alias before even creating the canonical base.

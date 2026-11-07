@@ -13,6 +13,12 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
         include_str!("../src/hook/source_namespace_control.sh"),
     )
     .expect("write compiled control program");
+    let admission = fixture.path().join("admission.sh");
+    std::fs::write(
+        &admission,
+        include_str!("../src/hook/source_claim_admission.sh"),
+    )
+    .expect("write compiled admission program");
     for suite in [
         "scripts/tests/test_source_namespace_control.py",
         "scripts/test_namespace_group_teardown.py",
@@ -22,6 +28,7 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
         let output = std::process::Command::new("python3")
             .arg(root.join(suite))
             .env("RCH_TEST_SOURCE_NAMESPACE_CONTROL", &control)
+            .env("RCH_TEST_SOURCE_NAMESPACE_ADMISSION", &admission)
             .output()
             .expect("execute native namespace control tests");
         assert!(

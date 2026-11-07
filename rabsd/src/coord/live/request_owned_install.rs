@@ -66,6 +66,8 @@ impl CoordLive {
             .lock()
             .map_err(|_| decline(ServeError::StoreUnavailable))?;
         require_active_owner(&mut *store, coordinator).map_err(decline)?;
+        crate::coord::native_archives::require_manifest(&mut *store, result.manifest())
+            .map_err(decline)?;
         let plan = match output_install::prepare(
             &mut *store,
             result.manifest(),
@@ -135,6 +137,8 @@ impl CoordLive {
             .lock()
             .map_err(|_| decline(ServeError::StoreUnavailable))?;
         require_active_owner(&mut *store, coordinator).map_err(decline)?;
+        crate::coord::native_archives::require_manifest(&mut *store, result.manifest())
+            .map_err(decline)?;
         let mut files = output_install::install_prepared(&mut *store, &plan, prepared).map_err(
             |error| {
                 let reason = format!("request-owned install: {error}");
@@ -175,6 +179,10 @@ impl CoordLive {
                         .map_err(|_| ServeError::StoreUnavailable.to_string())?;
                     require_active_owner(&mut *store, coordinator)
                         .map_err(|error| error.to_string())?;
+                    crate::coord::native_archives::require_manifest(
+                        &mut *store,
+                        result.manifest(),
+                    )?;
                 }
                 let prepared = match output_install::stage_for_install(tail, &plan) {
                     Ok(prepared) => prepared,
@@ -198,6 +206,7 @@ impl CoordLive {
                     .map_err(|_| ServeError::StoreUnavailable.to_string())?;
                 require_active_owner(&mut *store, coordinator)
                     .map_err(|error| error.to_string())?;
+                crate::coord::native_archives::require_manifest(&mut *store, result.manifest())?;
                 output_install::install_prepared(&mut *store, &plan, prepared)
                     .map_err(|error| error.to_string())
             };

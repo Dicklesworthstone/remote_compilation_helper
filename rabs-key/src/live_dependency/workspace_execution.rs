@@ -241,6 +241,9 @@ pub fn remote_workspace_execution_isolation_policy(
     if !plan.native_roots.is_empty() {
         policy.str(remote::CANONICAL_FOREIGN_NATIVE_ISOLATION_EXTENSION);
     }
+    if remote::requires_generated_native_archive_modifiers(&plan.invocation) {
+        policy.str(remote::CANONICAL_NATIVE_ARCHIVE_MODIFIERS_ISOLATION_EXTENSION);
+    }
     Ok(compute(POLICY_DOMAIN, &policy.finish()))
 }
 
@@ -1208,6 +1211,61 @@ mod tests {
     }
 
     #[test]
+    fn native_workspace_modifiers_keep_distinct_fresh_execution_identity() {
+        for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+            let (argv, env) = native_request(emit);
+            let bare = from_request(&argv, &env, WORKSPACE);
+            let manifest = native_inputs(&bare);
+            let original = key(&bare, &manifest).unwrap();
+            let mut keys = std::collections::HashSet::new();
+            keys.insert(original.action_key.bytes);
+            for library in [
+                "static:+bundle=answer",
+                "static:+whole-archive=answer",
+                "static:+bundle,+whole-archive=answer",
+                "static:-whole-archive=answer",
+                "static:+bundle,-verbatim=answer",
+                "static:+verbatim=libanswer.a",
+                "static:-whole-archive,+bundle,+verbatim=libanswer.a",
+                "static:+whole-archive,+bundle,+verbatim=libanswer.a",
+                "static:+verbatim,+whole-archive,+bundle=libanswer.a",
+            ] {
+                let mut changed = argv.clone();
+                *changed.last_mut().unwrap() = format!("-l{library}");
+                let plan = from_request(&changed, &env, WORKSPACE);
+                let current = key(&plan, &manifest).unwrap();
+                assert!(keys.insert(current.action_key.bytes), "{library}");
+                assert_ne!(
+                    original.descriptor.sandbox_semantic_policy,
+                    current.descriptor.sandbox_semantic_policy
+                );
+                assert_ne!(
+                    original.descriptor.normalized_invocation,
+                    current.descriptor.normalized_invocation
+                );
+                assert!(
+                    remote_workspace_execution_shape(&plan, &directories(&plan), TOOLCHAIN).is_ok()
+                );
+                assert!(remote::remote_dependency_isolation_policy(&plan).is_err());
+                assert!(
+                    remote::remote_dependency_key(
+                        &plan,
+                        &toolchain(),
+                        &directories(&plan),
+                        &manifest,
+                        Some(b""),
+                        TOOLCHAIN,
+                        &[39; 32],
+                        &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                    )
+                    .is_err(),
+                    "workspace modifiers never grant dependency publication authority"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_workspace_scope_refuses_unbound_searches_modifiers_and_mutated_plans() {
         for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
             let (argv, env) = native_request(emit);
@@ -1230,9 +1288,13 @@ mod tests {
                 "-ldylib=answer",
                 "-lframework=answer",
                 "-lanswer",
-                "-lstatic:+bundle=answer",
                 "-lstatic:-bundle=answer",
-                "-lstatic:+whole-archive=answer",
+                "-lstatic:+bundle,-bundle=answer",
+                "-lstatic:+bundle,+bundle=answer",
+                "-lstatic:+whole-archive,-bundle=answer",
+                "-lstatic:+whole-archive,-whole-archive=answer",
+                "-lstatic:+verbatim,-verbatim=libanswer.a",
+                "-lstatic:+as-needed=answer",
                 "-lstatic=answer:renamed",
                 "-Ctarget-cpu=native",
                 "--emit=dep-info,metadata",

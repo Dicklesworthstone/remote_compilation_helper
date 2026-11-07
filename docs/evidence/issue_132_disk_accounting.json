@@ -1,0 +1,864 @@
+{
+  "followup_native_validation": {
+    "implementation_commit": "6943790888290c2a16e1de19bba0d1782e8393f3",
+    "base_commit": "4d7927d327ca190c32b31127b4d0134b7f9b237a",
+    "source_sha256_at_final_attempt": {
+      "rch-common/build_disk_monitor.py": "ce914cd4dff8440850ffe23e76d064ccacc0e137afa090a0e8e37278120fb00a",
+      "rch-common/src/admission_preview.rs": "a9b9c367a0411a3f1cea7f2a9a9708836a32fa82cd200eabea76c2e5ae972a30",
+      "rch-common/tests/build_disk_monitor_test.py": "09d416f7c6e355e61276332d1908cad7dcecab8f89266b2837e8391199cdd361",
+      "rch/src/hook.rs": "b87bfcf956f81df6990ebd8795dc977940652e53ab654e6f6563f195632167f5",
+      "rch/src/hook/cargo_target_dir.rs": "9a2737a014df71add0581b67b5d0b99c2c1aaf83ad78dac0f6ae0316cba018e6",
+      "rch/src/hook/daemon_ipc.rs": "2abd2dc547f492f53c8a1897fb00572dcbf9072f47541b246dafecf6ea323753",
+      "rch/src/hook/daemon_ipc/selection_safety_tests.rs": "82286313bfa9db69f16a0e6210ffe3ed1261769f1b3cc6a1dda79e270b87f15b",
+      "rch/src/hook/transfer_orchestration.rs": "51ecdb16b11dd98fa143dbb14567cb60ce341af5784723695e0302d1dbad0012",
+      "rch/src/transfer.rs": "57fe409d4c3de85d7e26f3b5ae33081fad3814d6cc9387e4dbb15f56d8fa5899",
+      "rchd/src/api.rs": "82c6e5c04736fc69a89f9543a319f31ef76b6d4371cfb5043d331c04c6597138",
+      "rchd/src/disk_pressure.rs": "142181add42bdf4f9e68bfee6b07057f0b0dbb274cd7ae9a31443e772fe586ca",
+      "rchd/src/history.rs": "321bd7fe1a61a71de15033aee07f4ed37d70b1e7aba73bd935e2d52dc001f128",
+      "rchd/src/selection.rs": "c808d6b8fea8f80ed0557d069f06187017a43cd459d5c591bb341124076ada22",
+      "scripts/bench_disk_accounting.py": "2760285ba5a0ab9b531655389c86ac9769a1734759f82c8ec36915468244e513"
+    },
+    "statuses": {
+      "cargo-fetch-exclusive-resume": {
+        "command": [
+          "cargo",
+          "fetch",
+          "--locked",
+          "--target",
+          "x86_64-unknown-linux-gnu"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 5716447232,
+          "limit": 8589934592,
+          "clean_inactive_file": 638787584,
+          "estimated_headroom": 3512274944,
+          "oom_kill": 10
+        },
+        "exit": 0,
+        "underlying_exit": 0,
+        "seconds": 9.28255177200026,
+        "resource_after": {
+          "current": 6766989312,
+          "limit": 8589934592,
+          "clean_inactive_file": 1119109120,
+          "estimated_headroom": 2942054400,
+          "oom_kill": 10
+        },
+        "peak_cgroup_current": 6927134720,
+        "minimum_estimated_headroom": 2778963968,
+        "interruption": []
+      },
+      "cargo-fetch-exclusive": {
+        "command": [
+          "cargo",
+          "fetch",
+          "--locked",
+          "--target",
+          "x86_64-unknown-linux-gnu"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 6734774272,
+          "limit": 8589934592,
+          "clean_inactive_file": 899313664,
+          "estimated_headroom": 2754473984,
+          "oom_kill": 8
+        },
+        "exit": 125,
+        "underlying_exit": -2,
+        "seconds": 19.90937223500032,
+        "resource_after": {
+          "current": 8427585536,
+          "limit": 8589934592,
+          "clean_inactive_file": 787005440,
+          "estimated_headroom": 949354496,
+          "oom_kill": 8
+        },
+        "peak_cgroup_current": 8589934592,
+        "minimum_estimated_headroom": 792662016,
+        "interruption": [
+          {
+            "memory": {
+              "current": 8589848576,
+              "limit": 8589934592,
+              "clean_inactive_file": 792576000,
+              "estimated_headroom": 792662016,
+              "oom_kill": 8
+            },
+            "filesystem_free": 24228171776
+          }
+        ]
+      },
+      "common-check-native": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "rch-common",
+          "--lib"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 8000425984,
+          "limit": 8589934592,
+          "clean_inactive_file": 2831486976,
+          "estimated_headroom": 3420995584,
+          "oom_kill": 10
+        },
+        "exit": 125,
+        "underlying_exit": -2,
+        "seconds": 49.588218988000335,
+        "resource_after": {
+          "current": 8526172160,
+          "limit": 8589934592,
+          "clean_inactive_file": 788357120,
+          "estimated_headroom": 852119552,
+          "oom_kill": 10
+        },
+        "peak_cgroup_current": 8589934592,
+        "minimum_estimated_headroom": 789041152,
+        "interruption": [
+          {
+            "memory": {
+              "current": 8589869056,
+              "limit": 8589934592,
+              "clean_inactive_file": 788975616,
+              "estimated_headroom": 789041152,
+              "oom_kill": 10
+            },
+            "filesystem_free": 22074970112
+          }
+        ]
+      },
+      "daemon-check-baseline": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "rchd",
+          "--bin",
+          "rchd"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target"
+        },
+        "resource_before": {
+          "current": 8589795328,
+          "limit": 8589934592,
+          "clean_inactive_file": 36052992,
+          "estimated_headroom": 36192256,
+          "oom_kill": 0
+        },
+        "exit": 125,
+        "reason": "less than 1 GiB estimated cgroup headroom",
+        "seconds": 0
+      },
+      "daemon-check-capacity-ready": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "rchd",
+          "--bin",
+          "rchd"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target"
+        },
+        "resource_before": {
+          "current": 8517545984,
+          "limit": 8589934592,
+          "clean_inactive_file": 2936504320,
+          "estimated_headroom": 3008892928,
+          "oom_kill": 2
+        },
+        "exit": 125,
+        "underlying_exit": -2,
+        "seconds": 46.626297066999996,
+        "resource_after": {
+          "current": 7866183680,
+          "limit": 8589934592,
+          "clean_inactive_file": 782925824,
+          "estimated_headroom": 1506676736,
+          "oom_kill": 2
+        },
+        "peak_cgroup_current": 8590020608,
+        "minimum_estimated_headroom": 782004224,
+        "interruption": [
+          {
+            "memory": {
+              "current": 8589877248,
+              "limit": 8589934592,
+              "clean_inactive_file": 781946880,
+              "estimated_headroom": 782004224,
+              "oom_kill": 2
+            },
+            "filesystem_free": 42057027584
+          }
+        ]
+      },
+      "daemon-check-capacity4": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "rchd",
+          "--bin",
+          "rchd"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true"
+        },
+        "resource_before": {
+          "current": 3845537792,
+          "limit": 8589934592,
+          "clean_inactive_file": 1843777536,
+          "estimated_headroom": 6588174336,
+          "oom_kill": 4
+        },
+        "exit": 125,
+        "underlying_exit": -2,
+        "seconds": 16.345648672999914,
+        "resource_after": {
+          "current": 8568995840,
+          "limit": 8589934592,
+          "clean_inactive_file": 733429760,
+          "estimated_headroom": 754368512,
+          "oom_kill": 4
+        },
+        "peak_cgroup_current": 8589934592,
+        "minimum_estimated_headroom": 733163520,
+        "interruption": [
+          {
+            "memory": {
+              "current": 8589795328,
+              "limit": 8589934592,
+              "clean_inactive_file": 733024256,
+              "estimated_headroom": 733163520,
+              "oom_kill": 4
+            },
+            "filesystem_free": 32259416064
+          }
+        ]
+      },
+      "daemon-check-pinned-cache": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "rchd",
+          "--bin",
+          "rchd"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 8589922304,
+          "limit": 8589934592,
+          "clean_inactive_file": 966856704,
+          "estimated_headroom": 966868992,
+          "oom_kill": 6
+        },
+        "exit": 125,
+        "reason": "less than 1 GiB estimated cgroup headroom",
+        "seconds": 0
+      },
+      "exact-dependency-shallow-fetch": {
+        "command": [
+          "git",
+          "--git-dir=/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home/git/db/asupersync-b12181f74b36652e",
+          "-c",
+          "http.userAgent=remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)",
+          "fetch",
+          "--no-tags",
+          "--depth=1",
+          "https://github.com/Dicklesworthstone/asupersync.git",
+          "78b64636e99fea4ea2d868096576021dd3b8e519:refs/commit/78b64636e99fea4ea2d868096576021dd3b8e519"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 5919928320,
+          "limit": 8589934592,
+          "clean_inactive_file": 584454144,
+          "estimated_headroom": 3254460416,
+          "oom_kill": 6
+        },
+        "exit": 0,
+        "underlying_exit": 0,
+        "seconds": 17.62287324099998,
+        "resource_after": {
+          "current": 6179221504,
+          "limit": 8589934592,
+          "clean_inactive_file": 2205192192,
+          "estimated_headroom": 4615905280,
+          "oom_kill": 6
+        },
+        "peak_cgroup_current": 6288875520,
+        "minimum_estimated_headroom": 3254460416,
+        "interruption": []
+      },
+      "workspace-check-final": {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "--workspace",
+          "--all-targets"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 8589819904,
+          "limit": 8589934592,
+          "clean_inactive_file": 24449024,
+          "estimated_headroom": 24563712,
+          "oom_kill": 11
+        },
+        "exit": 125,
+        "reason": "less than 1 GiB estimated cgroup headroom",
+        "seconds": 0
+      },
+      "workspace-clippy-final": {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 8286261248,
+          "limit": 8589934592,
+          "clean_inactive_file": 569643008,
+          "estimated_headroom": 873316352,
+          "oom_kill": 12
+        },
+        "exit": 125,
+        "reason": "less than 1 GiB estimated cgroup headroom",
+        "seconds": 0
+      },
+      "workspace-format-final": {
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "cwd": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper",
+        "settings": {
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "RUSTFLAGS": "-Zthreads=1",
+          "CARGO_TARGET_DIR": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/target",
+          "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+          "CARGO_HOME": "/workspace/scratch/a57a6a5e1f3e/rch-native-validation-20261105/cargo-home"
+        },
+        "resource_before": {
+          "current": 8569315328,
+          "limit": 8589934592,
+          "clean_inactive_file": 740933632,
+          "estimated_headroom": 761552896,
+          "oom_kill": 12
+        },
+        "exit": 125,
+        "reason": "less than 1 GiB estimated cgroup headroom",
+        "seconds": 0
+      }
+    },
+    "qualification": {
+      "completed_native_source_check": false,
+      "native_regression_tests_executed": false,
+      "workspace_check": "resource-preflight-blocked",
+      "workspace_strict_clippy": "resource-preflight-blocked",
+      "workspace_cargo_fmt_check": "resource-preflight-blocked",
+      "toolchain": "nightly-2026-08-31",
+      "git_exact_pin": "78b64636e99fea4ea2d868096576021dd3b8e519",
+      "dependency_fetch": "completed --locked",
+      "notes": [
+        "Only our process group was interrupted by the resource guard. Unrelated processes were not signalled.",
+        "No source production files, project manifests, or Cargo.lock edited by native validation.",
+        "No resource safety threshold or test assertion was weakened.",
+        "No own Cargo or waiter session remains active.",
+        "No live-worker qualification performed."
+      ]
+    }
+  },
+  "followup_2026_11_05": {
+    "scope": "Executed original/candidate accounting and scan microbenchmark on local files. Production functions loaded unmodified from captured source bytes. Observer identity is synthetic; this does not qualify process supervision, durable worker admission, SSH, or live remote Cargo admission.",
+    "sources": {
+      "baseline": {
+        "path": "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s/original.py",
+        "sha256": "c2058c9f06c7f268c288f7d389f0d352c3252c7e3c238b583d08285ce2a94bb8"
+      },
+      "candidate": {
+        "path": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper/rch-common/build_disk_monitor.py",
+        "sha256": "ce914cd4dff8440850ffe23e76d064ccacc0e137afa090a0e8e37278120fb00a"
+      }
+    },
+    "fixture_root": "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s/rch-accounting-bench-fu1nlgon",
+    "cases": {
+      "warm": {
+        "baseline": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 17829888,
+          "peak_growth_bytes": 1048576
+        },
+        "candidate": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 17829888,
+          "peak_growth_bytes": 1052672,
+          "peak_added_output_bytes": 1052672,
+          "peak_free_drop_bytes": 1048576,
+          "incremental_receipt_available": true
+        },
+        "measured_free_delta_bytes": 1048576,
+        "scope": "Allocated files and actual statvfs samples."
+      },
+      "cold": {
+        "baseline": {
+          "starting_allocated_bytes": 4096,
+          "peak_total_output_bytes": 1052672,
+          "peak_growth_bytes": 1048576
+        },
+        "candidate": {
+          "starting_allocated_bytes": 4096,
+          "peak_total_output_bytes": 1052672,
+          "peak_growth_bytes": 1052672,
+          "peak_added_output_bytes": 1052672,
+          "peak_free_drop_bytes": 1048576,
+          "incremental_receipt_available": true
+        },
+        "measured_free_delta_bytes": 1048576,
+        "scope": "Allocated files and actual statvfs samples."
+      },
+      "cleanup": {
+        "baseline": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 16781312,
+          "peak_growth_bytes": 0
+        },
+        "candidate": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 16781312,
+          "peak_growth_bytes": 1052672,
+          "peak_added_output_bytes": 1052672,
+          "peak_free_drop_bytes": 0,
+          "incremental_receipt_available": true
+        },
+        "measured_free_delta_bytes": -15728640,
+        "scope": "Allocated files and actual statvfs samples."
+      },
+      "overlap": {
+        "baseline": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 19927040,
+          "peak_growth_bytes": 3145728
+        },
+        "candidate": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 19927040,
+          "peak_growth_bytes": 3149824,
+          "peak_added_output_bytes": 3149824,
+          "peak_free_drop_bytes": 3149824,
+          "incremental_receipt_available": true
+        },
+        "measured_free_delta_bytes": 3149824,
+        "scope": "Three real child writers with overlapping lifetimes write to one shared target. Both observers cover all writers; no per-writer attribution claim."
+      },
+      "retained_modified": {
+        "baseline": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 16781312,
+          "peak_growth_bytes": 0
+        },
+        "candidate": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 16781312,
+          "peak_growth_bytes": 16777216,
+          "peak_added_output_bytes": 16777216,
+          "peak_free_drop_bytes": 0,
+          "incremental_receipt_available": true
+        },
+        "measured_free_delta_bytes": 0,
+        "scope": "Allocated files and actual statvfs samples."
+      },
+      "unpooled_baseline": {
+        "baseline": {
+          "starting_allocated_bytes": 20979712,
+          "peak_total_output_bytes": 22028288,
+          "peak_growth_bytes": 1048576
+        },
+        "candidate": {
+          "starting_allocated_bytes": 20979712,
+          "peak_total_output_bytes": 22028288,
+          "peak_growth_bytes": 5251072,
+          "peak_added_output_bytes": 1052672,
+          "peak_free_drop_bytes": 1216512,
+          "incremental_receipt_available": true
+        },
+        "proven_target_retained_bytes": 16781312,
+        "unproven_baseline_bytes": 4198400,
+        "scope": "Real target 16 MiB plus separate output root 4 MiB, then 1 MiB added. Production require_warm_pool uses a synthetic observer identity: this is an accounting proof fixture, not verified worker admission."
+      },
+      "cargo_cache_cleanup": {
+        "baseline": {
+          "starting_allocated_bytes": 16781312,
+          "peak_total_output_bytes": 16781312,
+          "peak_growth_bytes": 0,
+          "output_guard_result": "allowed"
+        },
+        "candidate": {
+          "starting_allocated_bytes": 16793600,
+          "peak_total_output_bytes": 16793600,
+          "peak_growth_bytes": 8404992,
+          "peak_added_output_bytes": 8392704,
+          "peak_free_drop_bytes": 0,
+          "incremental_receipt_available": true,
+          "output_guard_result": "growth"
+        },
+        "budget_bytes": 4194304,
+        "cache_write_bytes": 8388608,
+        "final_actual_allocated_bytes": 8404992,
+        "measured_free_delta_bytes": -8388608,
+        "cache_roots": [
+          "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s/rch-accounting-bench-fu1nlgon/cargo-cache-cleanup/worker-cache-base/rch-cargo-cache-benchmark",
+          "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s/rch-accounting-bench-fu1nlgon/cargo-cache-cleanup/worker-cache-base/rch-cargo-cache-benchmark/registry",
+          "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s/rch-accounting-bench-fu1nlgon/cargo-cache-cleanup/worker-cache-base/rch-cargo-cache-benchmark/git"
+        ],
+        "scope": "Actual 16 MiB retained target is truncated and 8 MiB is written into a separate durable Cargo home under a 4 MiB budget. Original target-only accounting and candidate cache-root accounting observe the same files. Production cache resolver and output guard execute; observer identity remains synthetic and no guarded workload is launched."
+      }
+    },
+    "scan_performance": {
+      "files": 2048,
+      "runs_per_variant": 15,
+      "raw_ms": {
+        "baseline": [
+          9.746241,
+          8.932411,
+          8.148756,
+          9.548655,
+          8.728785,
+          7.383119,
+          5.829819,
+          7.280204,
+          5.744612,
+          4.842881,
+          6.71074,
+          5.912815,
+          5.073026,
+          4.52212,
+          3.881579
+        ],
+        "candidate": [
+          21.847703,
+          23.441152,
+          19.777529,
+          21.445779,
+          19.545441,
+          15.033617,
+          15.827047,
+          17.039725,
+          15.383888,
+          11.154824,
+          16.179687,
+          17.018073,
+          10.686701,
+          10.516876,
+          9.717398
+        ]
+      },
+      "median_ms": {
+        "baseline": 6.71074,
+        "candidate": 16.179687
+      },
+      "scope": "One complete output scan including candidate signatures and hash. No end-to-end performance claim."
+    },
+    "actual_disk_pressure": {
+      "probe": "/workspace/scratch/a57a6a5e1f3e/rch-followup-benchmark-knQL7s",
+      "available_bytes_by_device": {
+        "27": 22658437120
+      },
+      "floor_bytes": 1048576,
+      "observed_guard_result": "allowed",
+      "scope": "Production floor observation with actual statvfs; process launch excluded."
+    },
+    "process_facility": {
+      "baseline": "BudgetFailure: unverified process namespace",
+      "candidate": "BudgetFailure: unverified process namespace"
+    }
+  },
+  "scope": "Executed original/candidate accounting and scan microbenchmark on local files. Production functions loaded unmodified from captured source bytes. Observer identity is synthetic; this does not qualify process supervision, durable worker admission, SSH, or live remote Cargo admission.",
+  "sources": {
+    "baseline": {
+      "path": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper/rch-common/build_disk_monitor.py",
+      "sha256": "c2058c9f06c7f268c288f7d389f0d352c3252c7e3c238b583d08285ce2a94bb8"
+    },
+    "candidate": {
+      "path": "/dev/shm/rch-issue132-a57a6a5e1f3e/rch-common/build_disk_monitor.py",
+      "sha256": "ef184fb890c782d8a433cc0c3b8ec551ca4d10f6002ef8710724b1523e94b7ec"
+    }
+  },
+  "fixture_root": "/dev/rch132-final-benchmark/rch-accounting-bench-a_jhzbvu",
+  "cases": {
+    "warm": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 17825792,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 17825792,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 1048576,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "cold": {
+      "baseline": {
+        "starting_allocated_bytes": 0,
+        "peak_total_output_bytes": 1048576,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 0,
+        "peak_total_output_bytes": 1048576,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 1048576,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "cleanup": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 0
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 1048576,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 0,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": -15728640,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "overlap": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 19922944,
+        "peak_growth_bytes": 3145728
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 19922944,
+        "peak_growth_bytes": 3145728,
+        "peak_added_output_bytes": 3145728,
+        "peak_free_drop_bytes": 3149824,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 3149824,
+      "scope": "Three real child writers with overlapping lifetimes write to one shared target. Both observers cover all writers; no per-writer attribution claim."
+    },
+    "retained_modified": {
+      "baseline": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 0
+      },
+      "candidate": {
+        "starting_allocated_bytes": 16777216,
+        "peak_total_output_bytes": 16777216,
+        "peak_growth_bytes": 16777216,
+        "peak_added_output_bytes": 16777216,
+        "peak_free_drop_bytes": 0,
+        "incremental_receipt_available": true
+      },
+      "measured_free_delta_bytes": 0,
+      "scope": "Allocated files and actual statvfs samples."
+    },
+    "unpooled_baseline": {
+      "baseline": {
+        "starting_allocated_bytes": 20971520,
+        "peak_total_output_bytes": 22020096,
+        "peak_growth_bytes": 1048576
+      },
+      "candidate": {
+        "starting_allocated_bytes": 20971520,
+        "peak_total_output_bytes": 22020096,
+        "peak_growth_bytes": 5242880,
+        "peak_added_output_bytes": 1048576,
+        "peak_free_drop_bytes": 1048576,
+        "incremental_receipt_available": true
+      },
+      "proven_target_retained_bytes": 16777216,
+      "unproven_baseline_bytes": 4194304,
+      "scope": "Real target 16 MiB plus separate output root 4 MiB, then 1 MiB added. Production require_warm_pool uses a synthetic observer identity: this is an accounting proof fixture, not verified worker admission."
+    }
+  },
+  "scan_performance": {
+    "files": 2048,
+    "runs_per_variant": 15,
+    "raw_ms": {
+      "baseline": [
+        4.577801,
+        4.139774,
+        5.63914,
+        5.227701,
+        4.630499,
+        5.237285,
+        4.709595,
+        5.068335,
+        4.654124,
+        5.076038,
+        4.499615,
+        5.515526,
+        4.800489,
+        5.472753,
+        4.633623
+      ],
+      "candidate": [
+        14.377503,
+        15.113932,
+        26.99903,
+        15.60693,
+        13.600747,
+        14.597339,
+        13.326502,
+        13.867631,
+        13.290459,
+        14.561956,
+        13.172524,
+        15.516917,
+        13.668246,
+        14.788681,
+        13.640956
+      ]
+    },
+    "median_ms": {
+      "baseline": 4.800489,
+      "candidate": 14.377503
+    },
+    "scope": "One complete output scan including candidate signatures and hash. No end-to-end performance claim."
+  },
+  "actual_disk_pressure": {
+    "probe": "/workspace/scratch/a57a6a5e1f3e/remote_compilation_helper/rch-common",
+    "available_bytes_by_device": {
+      "27": 0
+    },
+    "floor_bytes": 1048576,
+    "observed_guard_result": "free_floor",
+    "scope": "Production floor observation with actual statvfs; process launch excluded."
+  },
+  "process_facility": {
+    "baseline": "BudgetFailure: unverified process namespace",
+    "candidate": "BudgetFailure: unverified process namespace"
+  }
+}

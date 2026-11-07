@@ -20,6 +20,22 @@ use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
 const COPY_MODE: u32 = 0o600;
 const BUFFER_BYTES: usize = 64 * 1024;
+// Tiny files can fit in an inode without allocating a data block. A varied
+// block-sized payload also avoids making a repeated-byte compression shortcut
+// the only evidence that this filesystem can accept publication data.
+const SUITABILITY_PAYLOAD: [u8; 4096] = {
+    let mut bytes = [0; 4096];
+    let mut state = 0x7263_682d_7072_6f62_u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes[index] = state.to_le_bytes()[0];
+        index += 1;
+    }
+    bytes
+};
 // Reuse the bytes we must read to validate the source and retained prefix.
 // Bounded per artifact, never per inventory; large outputs still stream.
 const VERIFIED_SOURCE_CACHE_BYTES: u64 = 1024 * 1024;
@@ -143,15 +159,39 @@ fn verify_temporary_with_uid(
 
 /// Short-lived pre-execution suitability probe in the nearest existing ancestor
 /// of a local output root. Reuses the exact exclusive creation and identity/UID
-/// predicates that final publication enforces, and unlinks the probe ONLY when
-/// those predicates prove our held descriptor still owns `temporary`.
+/// predicates that final publication enforces. An empty-file create does not
+/// establish that payload writes or their durability barriers work: a full or
+/// quota-limited destination can still admit it. Write, sync and read back a
+/// bounded payload, then unlink ONLY when our held descriptor and exact written
+/// prefix still own `temporary`. This is a suitability hint, not a reservation
+/// of the space a future output will need.
 /// Wrong-UID, modified-mode, multi-link, or replaced entries remain retained
 /// as diagnostic evidence.
 pub(super) fn probe_output_directory(
     parent: &Path,
     identity: &str,
     expected_uid: u32,
+    observe: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    probe_output_directory_with_io(
+        parent,
+        identity,
+        expected_uid,
+        observe,
+        File::write_at,
+        File::sync_all,
+    )
+}
+
+/// Fault injection retains the real directory, ownership checks and readback.
+/// Production always supplies the ordinary positional write and sync calls.
+pub(super) fn probe_output_directory_with_io(
+    parent: &Path,
+    identity: &str,
+    expected_uid: u32,
     mut observe: impl FnMut(&Path) -> Result<()>,
+    mut write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+    mut sync: impl FnMut(&File) -> io::Result<()>,
 ) -> Result<()> {
     super::publication_runtime::checkpoint()?;
     let directory = File::open(parent)?;
@@ -183,6 +223,7 @@ pub(super) fn probe_output_directory(
         file: &'a File,
         original: &'a Metadata,
         expected_uid: u32,
+        written: usize,
         cleaned: bool,
     }
     impl ProbeGuard<'_> {
@@ -192,10 +233,30 @@ pub(super) fn probe_output_directory(
                 self.temporary,
                 self.file,
                 self.original,
-                0,
+                self.written as u64,
                 COPY_MODE,
                 self.expected_uid,
-            )
+            )?;
+            if self.written != 0 {
+                let mut readback = [0; SUITABILITY_PAYLOAD.len()];
+                self.file
+                    .read_exact_at(&mut readback[..self.written], 0)
+                    .context("read publication suitability probe")?;
+                anyhow::ensure!(
+                    readback[..self.written] == SUITABILITY_PAYLOAD[..self.written],
+                    "publication suitability probe contents changed; evidence retained"
+                );
+                verify_temporary_with_uid(
+                    self.directory,
+                    self.temporary,
+                    self.file,
+                    self.original,
+                    self.written as u64,
+                    COPY_MODE,
+                    self.expected_uid,
+                )?;
+            }
+            Ok(())
         }
         fn cleanup(mut self) -> Result<()> {
             self.verify()?;
@@ -219,17 +280,67 @@ pub(super) fn probe_output_directory(
             }
         }
     }
-    let guard = ProbeGuard {
+    let mut guard = ProbeGuard {
         directory: &directory,
         temporary: &temporary,
         probe_name: &probe_name,
         file: &file,
         original: &original,
         expected_uid,
+        written: 0,
         cleaned: false,
     };
     file.set_permissions(Permissions::from_mode(COPY_MODE))?;
     guard.verify()?;
+    while guard.written < SUITABILITY_PAYLOAD.len() {
+        super::publication_runtime::checkpoint()?;
+        guard.verify()?;
+        let remaining = &SUITABILITY_PAYLOAD[guard.written..];
+        match write(&file, remaining, guard.written as u64) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "publication suitability probe write made no progress",
+                ))
+                .with_context(|| {
+                    format!(
+                        "write publication suitability probe in {}",
+                        parent.display()
+                    )
+                });
+            }
+            Ok(written) => {
+                anyhow::ensure!(
+                    written <= remaining.len(),
+                    "publication suitability probe write exceeded its bound; evidence retained"
+                );
+                // Record every completed short write before the next failure
+                // or cancellation. Cleanup may remove only this exact prefix.
+                guard.written += written;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "write publication suitability probe in {}",
+                        parent.display()
+                    )
+                });
+            }
+        }
+    }
+    guard.verify()?;
+    super::publication_runtime::checkpoint()?;
+    sync(&file)
+        .with_context(|| format!("sync publication suitability probe in {}", parent.display()))?;
+    super::publication_runtime::checkpoint()?;
+    guard.verify()?;
+    sync(&directory).with_context(|| {
+        format!(
+            "sync publication destination directory {}",
+            parent.display()
+        )
+    })?;
     observe(&temporary)?;
     super::publication_runtime::checkpoint()?;
     guard.cleanup()

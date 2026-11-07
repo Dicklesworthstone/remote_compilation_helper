@@ -240,7 +240,7 @@ impl Drop for ListenerOwner {
 /// Admission of complete operations, before source capture. This bounds the
 /// work that can reach the existing Cargo root-permit broker; it never grants
 /// compiler tokens or replaces the coordinator's action/worker scheduling.
-struct OperationAdmissions {
+pub(super) struct OperationAdmissions {
     maximum: usize,
     capacity: usize,
     state: Mutex<AdmissionState>,
@@ -254,7 +254,7 @@ struct AdmissionState {
 }
 
 impl OperationAdmissions {
-    fn new(maximum: usize, queued: usize) -> Arc<Self> {
+    pub(super) fn new(maximum: usize, queued: usize) -> Arc<Self> {
         Arc::new(Self {
             maximum,
             capacity: maximum + queued,
@@ -262,7 +262,7 @@ impl OperationAdmissions {
         })
     }
 
-    fn enqueue(self: &Arc<Self>) -> io::Result<WaitingOperation> {
+    pub(super) fn enqueue(self: &Arc<Self>) -> io::Result<WaitingOperation> {
         let mut state = self
             .state
             .lock()
@@ -342,14 +342,14 @@ impl OperationAdmissions {
     }
 }
 
-struct WaitingOperation {
+pub(super) struct WaitingOperation {
     admissions: Arc<OperationAdmissions>,
     ticket: u64,
     queued: bool,
 }
 
 impl WaitingOperation {
-    fn try_start(&mut self) -> io::Result<Option<AdmittedOperation>> {
+    pub(super) fn try_start(&mut self) -> io::Result<Option<AdmittedOperation>> {
         let mut state = self
             .admissions
             .state
@@ -381,7 +381,7 @@ impl Drop for WaitingOperation {
     }
 }
 
-struct AdmittedOperation(Arc<OperationAdmissions>);
+pub(super) struct AdmittedOperation(Arc<OperationAdmissions>);
 
 impl Drop for AdmittedOperation {
     fn drop(&mut self) {

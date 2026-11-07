@@ -44,6 +44,9 @@
 //! intra-transaction boundaries that are H015's.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use std::collections::BTreeSet;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -89,7 +92,7 @@ const PHASES: [&str; 4] = [
 
 /// The artifact bytes the committed action serves.
 fn artifact() -> Vec<u8> {
-    b"the compiled rlib bytes a worker uploaded".repeat(64)
+    test_util::closed_rlib_fixture(&b"the compiled rlib bytes a worker uploaded".repeat(64))
 }
 
 /// Put the artifact bytes in the byte store and return their identity.
@@ -109,6 +112,7 @@ fn put_artifact(cas: &LiveCas) -> ObjectId {
         DurabilityPolicy::FULL,
     )
     .expect("put artifact");
+    test_util::record_rlib_fixture_closure(&mut *store, &declared, &bytes);
     ObjectId(declared)
 }
 
@@ -353,7 +357,7 @@ fn t004_the_harness_rejects_a_child_that_did_not_crash_where_it_was_told() {
 #[test]
 fn t004_every_publication_phase_survives_a_real_process_death() {
     for phase in PHASES {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = test_util::private_tempdir();
         let state_dir = dir.path().to_path_buf();
 
         crash_at(phase, &state_dir);

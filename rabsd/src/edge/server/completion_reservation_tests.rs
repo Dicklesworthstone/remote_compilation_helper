@@ -204,6 +204,8 @@ fn handoff(ack: Ack) {
     let capacity = Limit::new(8);
     let peer_capacity = capacity.clone();
     let cas = Arc::clone(&fixture.cas);
+    let before = fixture.locations();
+    let at_receipt = before.clone();
     let path = fixture.root.join("capture.sock");
     let (finished, finish) = mpsc::channel();
     let runtime = RuntimeBuilder::current_thread().build().unwrap();
@@ -223,15 +225,30 @@ fn handoff(ack: Ack) {
             let receipt: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(receipt["kind"], "rustc-captured");
             assert_eq!(receipt["publication_authorized"], false);
-            // Captured bytes are durable, but there is no publication before
-            // consent and no metadata mutex held by the acknowledgment waiter.
+            // Cargo waits only for private copies (bd-lxmfd): before consent
+            // there is no publication, no new CAS location (so no fsync or
+            // pin was spent), and no metadata mutex held by the ACK waiter.
+            {
+                let mut store = cas.store().try_lock().unwrap();
+                assert!(store.list_publications().unwrap().is_empty());
+                let mut locations: Vec<_> = store
+                    .reconciliation_scan()
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| (row.object_key, row.store_path))
+                    .collect();
+                locations.sort();
+                assert_eq!(
+                    locations, at_receipt,
+                    "capture stored objects before the receipt"
+                );
+            }
             assert!(
-                cas.store()
-                    .try_lock()
+                std::fs::read_dir(cas.layout().root().join("staging"))
                     .unwrap()
-                    .list_publications()
-                    .unwrap()
-                    .is_empty()
+                    .next()
+                    .is_some(),
+                "the receipt must follow complete private copies"
             );
             let mut occupied = Vec::new();
             while let Some(permit) = peer_capacity.acquire() {
@@ -280,16 +297,29 @@ fn handoff(ack: Ack) {
         .unwrap()
         .list_publications()
         .unwrap();
+    let after = fixture.locations();
+    let staging_left = std::fs::read_dir(fixture.cas.layout().root().join("staging"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        staging_left, 0,
+        "every private stage is consumed or removed"
+    );
     match ack {
         Ack::Matching => {
             assert_eq!(result["outcome"], "committed", "{result}");
             assert_eq!(publications.len(), 1);
             assert_eq!(publications[0].0, action);
+            // Publication stored the staged closure after consent; the commit
+            // gate refuses any closure that is not durably located (H032).
+            assert!(after.len() > before.len(), "{after:?}");
         }
         Ack::WrongCapture | Ack::Disconnect => {
             assert_eq!(result["outcome"], "not-published", "{result}");
             assert_eq!(result["detail"], "output capture was not acknowledged");
             assert!(publications.is_empty());
+            // An unacknowledged capture leaves nothing in the CAS at all.
+            assert_eq!(after, before);
             // The old attempt has settled; it must not strand singleflight.
             drop(fixture.begin());
         }

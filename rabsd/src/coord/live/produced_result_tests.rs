@@ -13,7 +13,9 @@ use rabs_cas::test_support::{
 };
 use rabs_protocol::result_identity::ObjectId;
 
-const ARTIFACT: &[u8] = b"current producer's verified compiler output";
+static ARTIFACT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    crate::test_util::closed_rlib_fixture(b"current producer's verified compiler output")
+});
 const CLUSTER: &str = "current-producer-tests";
 
 struct Fixture {
@@ -73,7 +75,12 @@ impl Fixture {
                 )
                 .unwrap();
         }
-        let object = put(&cas, ARTIFACT);
+        let object = put(&cas, ARTIFACT.as_slice());
+        crate::test_util::record_rlib_fixture_closure(
+            &mut *cas.store().lock().unwrap(),
+            &object.0,
+            ARTIFACT.as_slice(),
+        );
         let (offer, bytes) = offer_serving_object(&authority, &object);
         assert_eq!(put(&cas, &bytes), offer.manifest_id);
         install_offer_closure(&mut *cas.store().lock().unwrap(), &offer);
@@ -154,7 +161,7 @@ fn current_producer_pins_exact_manifest_and_does_not_grant_later_cache_replay() 
     ));
     assert_eq!(
         std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-        ARTIFACT
+        ARTIFACT.as_slice()
     );
     assert!(
         fixture

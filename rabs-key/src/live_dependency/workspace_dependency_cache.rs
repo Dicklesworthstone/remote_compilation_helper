@@ -7,6 +7,18 @@
 //! pure facts bind that witness into the key; they never grant installation or
 //! publication authority. The coordinator revalidates the original file
 //! generation and the current durable producer lineage at each live boundary.
+//! Workspace V2 contracts qualify each isolated compiler action independently
+//! of other project executors in its Cargo operation. Their local completion
+//! claims remain untrusted; immutable dependency DAG contracts are unchanged.
+//! Separately versioned generated workspace DAG classes additionally retain
+//! the complete own OUT_DIR and exact completed Cargo build-script record.
+
+mod generated;
+
+pub use generated::plan_generated_workspace_dag_library;
+pub(super) use generated::{
+    GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
+};
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
 use super::workspace_cache::validate_pure_workspace_rlib;
@@ -24,31 +36,33 @@ use rabs_protocol::input_evidence::ActionInputManifest;
 use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, OutputRole, TypedDigest};
 
-// Epoch 5 belongs to the independently developed closed leaf-metadata class.
-const KEY_EPOCH: u32 = 6;
+// Epochs 16/17 belong to the V2 closed workspace leaf classes. Workspace
+// contracts require fresh evidence; immutable DAG epochs 10/11 are unchanged.
+const KEY_EPOCH: u32 = 18;
 const PROJECTION_EPOCH: u32 = 1;
-const POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-rlib.isolation.v1";
-const SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-committed-rlib.semantics.v1";
-const SEMANTICS: &str = "completed independently supervised pure Rust archive; complete sealed workspace and exact environment; every loadable Rust candidate bound to exact committed workspace producer action, descriptor, manifest and logical output; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; no provisional, adopted, local fallback or request-owned producer authority; transitive current producer safety at commit and replay; existing capture and independent sample gates";
-const METADATA_KEY_EPOCH: u32 = 7;
-const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.isolation.v1";
-const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.semantics.v1";
-const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; canonical-workspace-closed-metadata-v1 explicitly negotiated in ClosedMetadata mode without procfs or entropy devices; complete sealed workspace and exact environment; every loadable Rust candidate bound to exact committed workspace producer action, descriptor, manifest and logical output; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; no provisional, adopted, local fallback or request-owned producer authority; transitive current producer safety at commit and replay; separate metadata class, capture and independent sample gates";
-const MIXED_RLIB_KEY_EPOCH: u32 = 8;
-const MIXED_METADATA_KEY_EPOCH: u32 = 9;
-const MIXED_RLIB_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-mixed-rlib.isolation.v1";
+const POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-rlib.isolation.v2";
+const SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-committed-rlib.semantics.v2";
+const SEMANTICS: &str = "completed independently supervised pure Rust archive; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; complete sealed workspace and exact environment; every loadable Rust candidate bound to exact committed workspace producer action, descriptor, manifest and logical output; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; no provisional, adopted, local fallback or request-owned producer authority; transitive current producer safety at commit and replay; existing capture and independent sample gates";
+const METADATA_KEY_EPOCH: u32 = 19;
+const METADATA_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.isolation.v2";
+const METADATA_SEMANTICS_DOMAIN: &str = "rabs.canonical-workspace-committed-metadata.semantics.v2";
+const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; canonical-workspace-closed-metadata-v1 explicitly negotiated in ClosedMetadata mode without procfs or entropy devices; complete sealed workspace and exact environment; every loadable Rust candidate bound to exact committed workspace producer action, descriptor, manifest and logical output; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; no provisional, adopted, local fallback or request-owned producer authority; transitive current producer safety at commit and replay; separate metadata class, capture and independent sample gates";
+const MIXED_RLIB_KEY_EPOCH: u32 = 20;
+const MIXED_METADATA_KEY_EPOCH: u32 = 21;
+const MIXED_RLIB_POLICY_DOMAIN: &str = "rabs.canonical-workspace-committed-mixed-rlib.isolation.v2";
 const MIXED_METADATA_POLICY_DOMAIN: &str =
-    "rabs.canonical-workspace-committed-mixed-metadata.isolation.v1";
+    "rabs.canonical-workspace-committed-mixed-metadata.isolation.v2";
 const MIXED_RLIB_SEMANTICS_DOMAIN: &str =
-    "rabs.canonical-workspace-committed-mixed-rlib.semantics.v1";
+    "rabs.canonical-workspace-committed-mixed-rlib.semantics.v2";
 const MIXED_METADATA_SEMANTICS_DOMAIN: &str =
-    "rabs.canonical-workspace-committed-mixed-metadata.semantics.v1";
-const MIXED_RLIB_SEMANTICS: &str = "completed independently supervised pure Rust archive; complete sealed workspace and exact environment; every loadable candidate bound to exact committed archive-workspace producer or separately qualified canonical remote immutable dependency archive leaf; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; exact producer action, descriptor, manifest, output role and whole object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
-const MIXED_METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; explicitly negotiated ClosedMetadata namespace without procfs or entropy devices; complete sealed workspace and exact environment; every loadable candidate bound to exact committed workspace producer or separately qualified canonical remote immutable dependency leaf; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; metadata producers authorize only metadata outputs, archive producers may authorize metadata and whole archives; exact producer action, descriptor, manifest, output role and object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
+    "rabs.canonical-workspace-committed-mixed-metadata.semantics.v2";
+const MIXED_RLIB_SEMANTICS: &str = "completed independently supervised pure Rust archive; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; complete sealed workspace and exact environment; every loadable candidate bound to exact committed archive-workspace producer or separately qualified canonical remote immutable dependency archive leaf; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; exact producer action, descriptor, manifest, output role and whole object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
+const MIXED_METADATA_SEMANTICS: &str = "completed independently supervised pure Rust metadata check; selected Cargo unit may share an operation with other project executors, whose local completion claims grant no authority; the isolated compiler action cannot execute project code; explicitly negotiated ClosedMetadata namespace without procfs or entropy devices; complete sealed workspace and exact environment; every loadable candidate bound to exact committed workspace producer or separately qualified canonical remote immutable dependency leaf; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; metadata producers authorize only metadata outputs, archive producers may authorize metadata and whole archives; exact producer action, descriptor, manifest, output role and object identity; empty external-leaf ancestry and per-intermediate workspace producer policy; no provisional, adopted, local fallback or request-owned producer authority; current transitive producer safety, authenticated drained capture and independent mixed-class samples";
 
-pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-committed-rlib-v1: \
-    driver-retained Cargo-selected ordinary library build in a graph without \
-    project executors; canonical-workspace-exec-v3 namespace in Rlib mode; \
+pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-committed-rlib-v2: \
+    driver-retained Cargo-selected ordinary library build; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-exec-v3 namespace in Rlib mode; \
     complete immutable canonical workspace with every immediate directory \
     listing; exact argv, cwd, environment and output placement; complete retained \
     toolchain and measured ELF runtime; no procfs or entropy devices, only \
@@ -60,16 +74,17 @@ pub(super) const ISOLATION_PROFILE: &str = "canonical-workspace-committed-rlib-v
     exact empty search metadata remains keyed and materialized without producer \
     authority; explicit empty externs refuse; \
     whole explicit rlib bytes retained, existing versioned metadata shadowing \
-    projection unchanged; no generated/native inputs, project executors, proc \
+    projection unchanged; no generated/native inputs, project code execution, proc \
     macros, incremental state, final links or local wrapper completion authority; \
     no unresolved or adopted producer lineage; original file generations and \
     transitive current producer serving and class safety revalidated; exact \
     dep-info, tracked-control-variable veto and authenticated drained receipt; \
     existing publication, independent samples, release and private installation gates";
 
-pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committed-metadata-v1: \
-    driver-retained Cargo-selected ordinary library check in a graph without \
-    project executors; canonical-workspace-closed-metadata-v1 explicitly \
+pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committed-metadata-v2: \
+    driver-retained Cargo-selected ordinary library check; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-closed-metadata-v1 explicitly \
     negotiated in ClosedMetadata mode independently of ordinary Metadata or \
     Rlib execution authority; complete immutable canonical workspace with every \
     immediate directory listing; exact argv, cwd, environment and output \
@@ -83,7 +98,7 @@ pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committ
     and materialized without producer authority; explicit empty externs refuse; \
     whole explicit rlib bytes retained, existing \
     versioned metadata shadowing projection unchanged; no generated/native \
-    inputs, project executors, proc macros, incremental state, archive, binary \
+    inputs, project code execution, proc macros, incremental state, archive, binary \
     or harness output, final links or local wrapper completion authority; no \
     unresolved, provisional, adopted, fallback or request-owned producer lineage; \
     original file generations and transitive current producer serving and class \
@@ -91,9 +106,10 @@ pub(super) const METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committ
     authenticated drained receipt; separate metadata publication class and \
     independent samples, release and private installation gates";
 
-pub(super) const MIXED_RLIB_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-rlib-v1: \
-    driver-retained ordinary library build in a Cargo graph without project \
-    executors; canonical-workspace-exec-v3 Rlib namespace with complete immutable \
+pub(super) const MIXED_RLIB_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-rlib-v2: \
+    driver-retained Cargo-selected ordinary library build; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-exec-v3 Rlib namespace with complete immutable \
     workspace and every immediate directory listing; exact argv, cwd, environment \
     and output placement; complete retained toolchain and measured ELF runtime; \
     no procfs or entropy devices, private null device, fresh output, HOME and temp; \
@@ -111,15 +127,16 @@ pub(super) const MIXED_RLIB_ISOLATION_PROFILE: &str = "canonical-workspace-commi
     consumers; exact producer output roles and whole object identities; original \
     file generations, current qualification and transitive producer safety \
     rechecked at publication and delivery; each intermediate retains its own \
-    ancestry policy; no project executors, generated/native inputs, proc macros, \
+    ancestry policy; no project code execution, generated/native inputs, proc macros, \
     incremental state, final links, provisional adoption, local completion, \
     fallback or request-owned producer authority; exact dep-info and tracked \
     environment veto, authenticated drained receipt and independent mixed-class \
     samples, release and private installation gates";
 
-pub(super) const MIXED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-metadata-v1: \
-    driver-retained ordinary library check in a Cargo graph without project \
-    executors; canonical-workspace-closed-metadata-v1 explicitly negotiated in \
+pub(super) const MIXED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-committed-mixed-metadata-v2: \
+    driver-retained Cargo-selected ordinary library check; other units in the \
+    operation may execute project code without granting local completion \
+    authority; independently isolated compiler action; canonical-workspace-closed-metadata-v1 explicitly negotiated in \
     ClosedMetadata mode; complete immutable workspace and every immediate \
     directory listing; exact argv, cwd, environment and output placement; complete \
     retained toolchain and measured ELF runtime; no procfs or entropy devices, \
@@ -137,16 +154,18 @@ pub(super) const MIXED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-c
     ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole \
     Materializable rlib; original file generations, current qualification and \
     transitive producer safety rechecked at publication and delivery; each \
-    intermediate retains its own ancestry policy; no project executors, \
+    intermediate retains its own ancestry policy; no project code execution, \
     generated/native inputs, proc macros, incremental state, archive or harness \
     outputs, final links, provisional adoption, local completion, fallback or \
     request-owned producer authority; exact dep-info and tracked environment veto, \
     authenticated drained receipt and independent mixed-class samples, release \
     and private installation gates";
 
-pub(super) const TERMINAL_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-terminal-metadata-v1: \
+pub(super) const TERMINAL_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-terminal-metadata-v2: \
     driver-retained exact Cargo-selected binary, example, standard test or custom \
-    harness check root in a graph without project executors; explicitly negotiated \
+    harness check root; other units in the operation may execute project code \
+    without granting local completion authority; independently isolated compiler \
+    action cannot execute project code; explicitly negotiated \
     canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs \
     or entropy devices; complete immutable workspace files and every directory \
     listing, exact argv including crate-type presence, test/cfg flags, cwd and \
@@ -190,34 +209,41 @@ pub struct CommittedWorkspaceDependency {
 /// existing mixed workspace source scope and use new descriptor identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommittedDependencyPolicy {
-    /// Existing workspace-only archive producer contract, epoch 6.
+    /// Isolated workspace-only archive producer contract, epoch 18.
     WorkspaceRlib,
-    /// Existing workspace-only metadata producer contract, epoch 7.
+    /// Isolated workspace-only metadata producer contract, epoch 19.
     WorkspaceMetadata,
-    /// Existing workspace/archive and qualified immutable-leaf contract, epoch 8.
+    /// Isolated workspace/archive and qualified immutable-leaf contract, epoch 20.
     MixedWorkspaceRlib,
-    /// Existing workspace/metadata and qualified immutable-leaf contract, epoch 9.
+    /// Isolated workspace/metadata and qualified immutable-leaf contract, epoch 21.
     MixedWorkspaceMetadata,
     /// Immutable archive with a complete committed producer inventory, epoch 10.
     ImmutableDagRlib,
     /// Immutable metadata with a complete committed producer inventory, epoch 11.
     ImmutableDagMetadata,
-    /// Workspace archive admitting committed immutable dependency DAGs, epoch 12.
+    /// Workspace archive admitting committed immutable dependency DAGs, epoch 22.
     WorkspaceDagRlib,
-    /// Workspace metadata admitting committed immutable dependency DAGs, epoch 13.
+    /// Workspace metadata admitting committed immutable dependency DAGs, epoch 23.
     WorkspaceDagMetadata,
     /// Selected terminal check with an exactly empty Rust candidate inventory,
-    /// independently classified from producer-bearing checks, epoch 14.
+    /// independently classified from producer-bearing checks, epoch 24.
     WorkspaceTerminalLeafMetadata,
     /// Selected terminal check with complete committed producer ancestry,
-    /// never a producer for another action, epoch 15.
+    /// never a producer for another action, epoch 25.
     WorkspaceTerminalMetadata,
+    /// Workspace archive with complete own generated inputs and an exact
+    /// committed workspace/immutable producer DAG, epoch 28.
+    GeneratedWorkspaceDagRlib,
+    /// Closed workspace metadata with complete own generated inputs and an
+    /// exact committed workspace/immutable producer DAG, epoch 29.
+    GeneratedWorkspaceDagMetadata,
 }
 
 impl CommittedDependencyPolicy {
-    /// Original policy for existing committed workspace source classes. New
-    /// DAG policies require an explicit retained capability; a source kind
-    /// alone never selects them.
+    /// Required policy for source classes with a unique committed-input
+    /// contract. Pure workspace DAGs still share the older mixed source scope
+    /// and need an explicit policy capability. Identifying any expected policy,
+    /// including a generated DAG, never supplies that retained capability.
     #[must_use]
     pub const fn from_source_kind(kind: DependencySourceKind) -> Option<Self> {
         match kind {
@@ -225,6 +251,12 @@ impl CommittedDependencyPolicy {
             DependencySourceKind::WorkspaceCommittedMetadata => Some(Self::WorkspaceMetadata),
             DependencySourceKind::WorkspaceMixedRlib => Some(Self::MixedWorkspaceRlib),
             DependencySourceKind::WorkspaceMixedMetadata => Some(Self::MixedWorkspaceMetadata),
+            DependencySourceKind::WorkspaceGeneratedDagRlib => {
+                Some(Self::GeneratedWorkspaceDagRlib)
+            }
+            DependencySourceKind::WorkspaceGeneratedDagMetadata => {
+                Some(Self::GeneratedWorkspaceDagMetadata)
+            }
             // The source kind requires a retained policy capability. Only that
             // capability may select the separately qualified empty-input class.
             DependencySourceKind::WorkspaceTerminalMetadata => {
@@ -242,13 +274,15 @@ impl CommittedDependencyPolicy {
             Self::WorkspaceRlib
             | Self::MixedWorkspaceRlib
             | Self::ImmutableDagRlib
-            | Self::WorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
+            | Self::WorkspaceDagRlib
+            | Self::GeneratedWorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
             Self::WorkspaceMetadata
             | Self::MixedWorkspaceMetadata
             | Self::ImmutableDagMetadata
             | Self::WorkspaceDagMetadata
             | Self::WorkspaceTerminalLeafMetadata
-            | Self::WorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
+            | Self::WorkspaceTerminalMetadata
+            | Self::GeneratedWorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
@@ -259,6 +293,9 @@ impl CommittedDependencyPolicy {
     /// A different source/mode, noncanonical layout, or unsupported inputs.
     pub fn validate_plan(self, plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
         match self {
+            Self::GeneratedWorkspaceDagRlib | Self::GeneratedWorkspaceDagMetadata => {
+                generated::validate_plan(plan, self)
+            }
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
             Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
@@ -340,36 +377,36 @@ const IMMUTABLE_DAG_METADATA: DagContract = DagContract {
     profile: "canonical-immutable-committed-dag-metadata-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Metadata namespace and established dep-info read-closure contract; exact canonical argv and semantic environment, complete retained toolchain and matched ELF runtime; exact ordered read-only Rust candidate inventory and whole explicit archives; every loadable candidate bound to an operation-owned installed generation and exact committed immutable producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; qualified immutable leaves or committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; H028 carries every loadable candidate and current transitive serving, class and quarantine gates apply at commit and delivery; no unregistered, unresolved, adopted, local fallback or request-owned authority; no generated/native inputs, proc macros, incremental state or codegen output; authenticated drained capture, exact diagnostics and tracked-control veto, independent class samples and existing release and installation gates",
 };
 const WORKSPACE_DAG_RLIB: DagContract = DagContract {
-    epoch: 12,
+    epoch: 22,
     class: ActionClass::RustcWorkspaceCompile,
-    isolation_domain: "rabs.canonical-workspace-committed-dag-rlib.isolation.v1",
-    semantics_domain: "rabs.canonical-workspace-committed-dag-rlib.semantics.v1",
-    dependencies_domain: "rabs.canonical-workspace-committed-dag-rlib.dependencies.v1",
-    profile: "canonical-workspace-committed-dag-rlib-v1: selected ordinary library in an executor-free canonical Cargo graph; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; existing canonical-workspace-exec-v3 Rlib namespace with no procfs or entropy devices; complete ordered retained candidate inventory and whole explicit archive bytes; every loadable candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; closed, mixed or DAG workspace archive producers plus qualified immutable archive leaves and committed immutable archive DAGs; every intermediate retains its own producer policy, metadata-only producer authority is excluded; exact H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, final links, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
+    isolation_domain: "rabs.canonical-workspace-committed-dag-rlib.isolation.v2",
+    semantics_domain: "rabs.canonical-workspace-committed-dag-rlib.semantics.v2",
+    dependencies_domain: "rabs.canonical-workspace-committed-dag-rlib.dependencies.v2",
+    profile: "canonical-workspace-committed-dag-rlib-v2: driver-retained Cargo-selected ordinary library; other units in the operation may execute project code without granting local completion authority; independently isolated compiler action cannot execute project code; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; existing canonical-workspace-exec-v3 Rlib namespace with no procfs or entropy devices; complete ordered retained candidate inventory and whole explicit archive bytes; every loadable candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; closed, mixed or DAG workspace archive producers plus qualified immutable archive leaves and committed immutable archive DAGs; every intermediate retains its own producer policy, metadata-only producer authority is excluded; exact H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, final links, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
 };
 const WORKSPACE_DAG_METADATA: DagContract = DagContract {
-    epoch: 13,
+    epoch: 23,
     class: ActionClass::RustcWorkspaceCompile,
-    isolation_domain: "rabs.canonical-workspace-committed-dag-metadata.isolation.v1",
-    semantics_domain: "rabs.canonical-workspace-committed-dag-metadata.semantics.v1",
-    dependencies_domain: "rabs.canonical-workspace-committed-dag-metadata.dependencies.v1",
-    profile: "canonical-workspace-committed-dag-metadata-v1: selected ordinary check in an executor-free canonical Cargo graph; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; explicitly negotiated canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs or entropy devices; every ordered loadable Rust candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; closed, mixed or DAG workspace producers plus qualified immutable leaves and committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; every intermediate retains its own narrower producer policy; complete H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, archive or harness outputs, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
+    isolation_domain: "rabs.canonical-workspace-committed-dag-metadata.isolation.v2",
+    semantics_domain: "rabs.canonical-workspace-committed-dag-metadata.semantics.v2",
+    dependencies_domain: "rabs.canonical-workspace-committed-dag-metadata.dependencies.v2",
+    profile: "canonical-workspace-committed-dag-metadata-v2: driver-retained Cargo-selected ordinary check; other units in the operation may execute project code without granting local completion authority; independently isolated compiler action cannot execute project code; complete immutable workspace files and directory topology, exact argv and environment, complete retained toolchain and matched ELF runtime; explicitly negotiated canonical-workspace-closed-metadata-v1 ClosedMetadata namespace without procfs or entropy devices; every ordered loadable Rust candidate has its original operation-owned installation generation and exact committed producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; closed, mixed or DAG workspace producers plus qualified immutable leaves and committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; every intermediate retains its own narrower producer policy; complete H028 ancestry and current transitive serving/class safety at commit and every delivery phase; no generated/native inputs, proc macros, incremental state, archive or harness outputs, local or request-owned completion, unresolved or adopted lineage; authenticated drained capture, exact diagnostics and dep-info, separate class samples and existing release and installation gates",
 };
 
 const WORKSPACE_TERMINAL_LEAF_METADATA: DagContract = DagContract {
-    epoch: 14,
+    epoch: 24,
     class: ActionClass::RustcWorkspaceCompile,
-    isolation_domain: "rabs.canonical-workspace-terminal-leaf-metadata.isolation.v1",
-    semantics_domain: "rabs.canonical-workspace-terminal-leaf-metadata.semantics.v1",
-    dependencies_domain: "rabs.canonical-workspace-terminal-leaf-metadata.dependencies.v1",
+    isolation_domain: "rabs.canonical-workspace-terminal-leaf-metadata.isolation.v2",
+    semantics_domain: "rabs.canonical-workspace-terminal-leaf-metadata.semantics.v2",
+    dependencies_domain: "rabs.canonical-workspace-terminal-leaf-metadata.dependencies.v2",
     profile: TERMINAL_METADATA_ISOLATION_PROFILE,
 };
 const WORKSPACE_TERMINAL_METADATA: DagContract = DagContract {
-    epoch: 15,
+    epoch: 25,
     class: ActionClass::RustcWorkspaceCompile,
-    isolation_domain: "rabs.canonical-workspace-terminal-metadata.isolation.v1",
-    semantics_domain: "rabs.canonical-workspace-terminal-metadata.semantics.v1",
-    dependencies_domain: "rabs.canonical-workspace-terminal-metadata.dependencies.v1",
+    isolation_domain: "rabs.canonical-workspace-terminal-metadata.isolation.v2",
+    semantics_domain: "rabs.canonical-workspace-terminal-metadata.semantics.v2",
+    dependencies_domain: "rabs.canonical-workspace-terminal-metadata.dependencies.v2",
     profile: TERMINAL_METADATA_ISOLATION_PROFILE,
 };
 
@@ -383,6 +420,8 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
             Some(&WORKSPACE_TERMINAL_LEAF_METADATA)
         }
         CommittedDependencyPolicy::WorkspaceTerminalMetadata => Some(&WORKSPACE_TERMINAL_METADATA),
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => Some(&generated::RLIB),
+        CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => Some(&generated::METADATA),
         _ => None,
     }
 }
@@ -530,8 +569,9 @@ pub fn validate_committed_workspace_metadata_plan(
 }
 
 /// Refine a fresh workspace plan into the separately keyed mixed-producer
-/// class. The canonical driver must still retain the selected executor-free
-/// graph and exact committed installation capability for every candidate.
+/// class. The canonical driver must still retain the exact selected unit,
+/// independently isolated execution and committed installation capability for
+/// every candidate, regardless of other project executors in its operation.
 ///
 /// # Errors
 /// A nonfresh plan or an invocation outside ordinary closed library compilation.
@@ -736,6 +776,10 @@ pub fn remote_committed_dependency_shape(
 ) -> Result<(), RemoteDependencyRefusal> {
     policy.validate_plan(plan)?;
     match policy {
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+            generated::shape(plan, policy, directories, dependencies, toolchain_root)
+        }
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
         | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
             remote::remote_execution_shape(plan, directories, toolchain_root)?;
@@ -848,7 +892,8 @@ pub fn remote_mixed_workspace_library_isolation_policy(
 }
 
 /// Isolation identity selected by the retained producer capability, never by
-/// mutable source kind alone. The four existing identities remain unchanged.
+/// mutable source kind alone. Workspace V2 contracts do not change immutable
+/// DAG identities or either negotiated worker execution namespace.
 ///
 /// # Errors
 /// Source origin or invocation mode does not match the exact policy.
@@ -884,6 +929,8 @@ pub fn is_committed_workspace_rlib_descriptor(descriptor: &ActionDescriptor) -> 
     descriptor.action_class == ActionClass::RustcWorkspaceCompile
         && descriptor.key_epoch == KEY_EPOCH
         && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.dependency_inputs.domain
+            == "rabs.canonical-workspace-committed-rlib.dependencies.v2"
         && descriptor.sandbox_semantic_policy == isolation_policy()
         && descriptor.execution_semantics == execution_semantics()
 }
@@ -895,6 +942,8 @@ pub fn is_committed_workspace_metadata_descriptor(descriptor: &ActionDescriptor)
     descriptor.action_class == ActionClass::RustcWorkspaceCompile
         && descriptor.key_epoch == METADATA_KEY_EPOCH
         && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.dependency_inputs.domain
+            == "rabs.canonical-workspace-committed-metadata.dependencies.v2"
         && descriptor.sandbox_semantic_policy == metadata_isolation_policy()
         && descriptor.execution_semantics == metadata_execution_semantics()
 }
@@ -905,6 +954,8 @@ pub fn is_mixed_workspace_rlib_descriptor(descriptor: &ActionDescriptor) -> bool
     descriptor.action_class == ActionClass::RustcWorkspaceCompile
         && descriptor.key_epoch == MIXED_RLIB_KEY_EPOCH
         && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.dependency_inputs.domain
+            == "rabs.canonical-workspace-committed-mixed-rlib.dependencies.v2"
         && descriptor.sandbox_semantic_policy
             == mixed_isolation_policy(RemoteDependencyOutputClass::Rlib)
         && descriptor.execution_semantics
@@ -917,6 +968,8 @@ pub fn is_mixed_workspace_metadata_descriptor(descriptor: &ActionDescriptor) -> 
     descriptor.action_class == ActionClass::RustcWorkspaceCompile
         && descriptor.key_epoch == MIXED_METADATA_KEY_EPOCH
         && descriptor.projection_epoch == PROJECTION_EPOCH
+        && descriptor.dependency_inputs.domain
+            == "rabs.canonical-workspace-committed-mixed-metadata.dependencies.v2"
         && descriptor.sandbox_semantic_policy
             == mixed_isolation_policy(RemoteDependencyOutputClass::Metadata)
         && descriptor.execution_semantics
@@ -958,6 +1011,8 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::WorkspaceDagMetadata,
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
         CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -975,12 +1030,39 @@ pub fn committed_dependency_descriptor_policy(
     None
 }
 
-/// Identify a claimed DAG namespace even when its exact descriptor is invalid.
-/// Coordinators use this after exact classification to prevent an altered DAG
-/// descriptor falling through to generic dependency-class authority.
+/// Identify a claimed committed namespace even when its exact descriptor is
+/// invalid or predates the current workspace policy. Coordinators use this
+/// after exact classification so retired V1 evidence cannot fall through to
+/// generic immutable-dependency authority after an epoch or class alteration.
+/// Closed workspace leaf epochs 16/17 and generated leaf epochs 26/27 have no
+/// producer capability and are handled by their separate exact recognizer.
 #[must_use]
 pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> bool {
     (10..=15).contains(&descriptor.key_epoch)
+        || (18..=25).contains(&descriptor.key_epoch)
+        || (28..=29).contains(&descriptor.key_epoch)
+        || [
+            descriptor.sandbox_semantic_policy.domain,
+            descriptor.execution_semantics.domain,
+            descriptor.dependency_inputs.domain,
+        ]
+        .into_iter()
+        .any(|domain| {
+            [
+                "rabs.canonical-workspace-committed-rlib.",
+                "rabs.canonical-workspace-committed-metadata.",
+                "rabs.canonical-workspace-committed-mixed-rlib.",
+                "rabs.canonical-workspace-committed-mixed-metadata.",
+                "rabs.canonical-workspace-committed-dag-rlib.",
+                "rabs.canonical-workspace-committed-dag-metadata.",
+                "rabs.canonical-workspace-terminal-leaf-metadata.",
+                "rabs.canonical-workspace-terminal-metadata.",
+                "rabs.canonical-workspace-generated-dag-rlib.",
+                "rabs.canonical-workspace-generated-dag-metadata.",
+            ]
+            .into_iter()
+            .any(|prefix| domain.starts_with(prefix))
+        })
         || [
             &IMMUTABLE_DAG_RLIB,
             &IMMUTABLE_DAG_METADATA,
@@ -988,6 +1070,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
             &WORKSPACE_DAG_METADATA,
             &WORKSPACE_TERMINAL_LEAF_METADATA,
             &WORKSPACE_TERMINAL_METADATA,
+            &generated::RLIB,
+            &generated::METADATA,
         ]
         .into_iter()
         .any(|contract| {
@@ -1129,6 +1213,24 @@ pub fn remote_committed_dependency_key(
     retained_toolchain_sha256: &[u8; 32],
     runtime: &TypedDigest,
 ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+    if matches!(
+        policy,
+        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+    ) {
+        return generated::key(
+            plan,
+            policy,
+            toolchain,
+            directories,
+            dependencies,
+            inputs,
+            build_script_output,
+            toolchain_root,
+            retained_toolchain_sha256,
+            runtime,
+        );
+    }
     remote_committed_dependency_shape(plan, policy, directories, dependencies, toolchain_root)?;
     if matches!(
         policy,
@@ -1312,7 +1414,7 @@ fn remote_terminal_workspace_metadata_key(
         encoder.str(name).str(value);
     });
     key.descriptor.environment = compute(
-        "rabs.canonical-workspace-terminal-metadata.environment.v1",
+        "rabs.canonical-workspace-terminal-metadata.environment.v2",
         &environment.finish(),
     );
     let mut invocation = CanonicalEncoder::new();
@@ -1331,7 +1433,7 @@ fn remote_terminal_workspace_metadata_key(
         encoder.str(flag);
     });
     key.descriptor.normalized_invocation = compute(
-        "rabs.canonical-workspace-terminal-metadata.invocation.v1",
+        "rabs.canonical-workspace-terminal-metadata.invocation.v2",
         &invocation.finish(),
     );
     key.descriptor.key_epoch = contract.epoch;
@@ -1411,16 +1513,16 @@ fn remote_committed_workspace_key(
     key.descriptor.dependency_inputs = compute(
         match (mixed, output) {
             (true, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-mixed-rlib.dependencies.v1"
+                "rabs.canonical-workspace-committed-mixed-rlib.dependencies.v2"
             }
             (true, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-mixed-metadata.dependencies.v1"
+                "rabs.canonical-workspace-committed-mixed-metadata.dependencies.v2"
             }
             (false, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-rlib.dependencies.v1"
+                "rabs.canonical-workspace-committed-rlib.dependencies.v2"
             }
             (false, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-metadata.dependencies.v1"
+                "rabs.canonical-workspace-committed-metadata.dependencies.v2"
             }
         },
         &provenance.finish(),
@@ -1432,16 +1534,16 @@ fn remote_committed_workspace_key(
     key.descriptor.environment = compute(
         match (mixed, output) {
             (true, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-mixed-rlib.environment.v1"
+                "rabs.canonical-workspace-committed-mixed-rlib.environment.v2"
             }
             (true, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-mixed-metadata.environment.v1"
+                "rabs.canonical-workspace-committed-mixed-metadata.environment.v2"
             }
             (false, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-rlib.environment.v1"
+                "rabs.canonical-workspace-committed-rlib.environment.v2"
             }
             (false, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-metadata.environment.v1"
+                "rabs.canonical-workspace-committed-metadata.environment.v2"
             }
         },
         &environment.finish(),
@@ -1464,16 +1566,16 @@ fn remote_committed_workspace_key(
     key.descriptor.normalized_invocation = compute(
         match (mixed, output) {
             (true, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-mixed-rlib.invocation.v1"
+                "rabs.canonical-workspace-committed-mixed-rlib.invocation.v2"
             }
             (true, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-mixed-metadata.invocation.v1"
+                "rabs.canonical-workspace-committed-mixed-metadata.invocation.v2"
             }
             (false, RemoteDependencyOutputClass::Rlib) => {
-                "rabs.canonical-workspace-committed-rlib.invocation.v1"
+                "rabs.canonical-workspace-committed-rlib.invocation.v2"
             }
             (false, RemoteDependencyOutputClass::Metadata) => {
-                "rabs.canonical-workspace-committed-metadata.invocation.v1"
+                "rabs.canonical-workspace-committed-metadata.invocation.v2"
             }
         },
         &invocation.finish(),
@@ -1769,6 +1871,200 @@ mod tests {
     }
 
     #[test]
+    fn workspace_v2_profiles_require_fresh_evidence_and_keep_exact_input_closures() {
+        use CommittedDependencyPolicy::{
+            MixedWorkspaceMetadata, MixedWorkspaceRlib, WorkspaceDagMetadata, WorkspaceDagRlib,
+            WorkspaceMetadata, WorkspaceRlib, WorkspaceTerminalLeafMetadata,
+            WorkspaceTerminalMetadata,
+        };
+
+        for (
+            policy,
+            previous_epoch,
+            current_epoch,
+            old_isolation,
+            old_semantics,
+            old_dependencies,
+        ) in [
+            (
+                WorkspaceRlib,
+                6,
+                18,
+                "rabs.canonical-workspace-committed-rlib.isolation.v1",
+                "rabs.canonical-workspace-committed-rlib.semantics.v1",
+                "rabs.canonical-workspace-committed-rlib.dependencies.v1",
+            ),
+            (
+                WorkspaceMetadata,
+                7,
+                19,
+                "rabs.canonical-workspace-committed-metadata.isolation.v1",
+                "rabs.canonical-workspace-committed-metadata.semantics.v1",
+                "rabs.canonical-workspace-committed-metadata.dependencies.v1",
+            ),
+            (
+                MixedWorkspaceRlib,
+                8,
+                20,
+                "rabs.canonical-workspace-committed-mixed-rlib.isolation.v1",
+                "rabs.canonical-workspace-committed-mixed-rlib.semantics.v1",
+                "rabs.canonical-workspace-committed-mixed-rlib.dependencies.v1",
+            ),
+            (
+                MixedWorkspaceMetadata,
+                9,
+                21,
+                "rabs.canonical-workspace-committed-mixed-metadata.isolation.v1",
+                "rabs.canonical-workspace-committed-mixed-metadata.semantics.v1",
+                "rabs.canonical-workspace-committed-mixed-metadata.dependencies.v1",
+            ),
+            (
+                WorkspaceDagRlib,
+                12,
+                22,
+                "rabs.canonical-workspace-committed-dag-rlib.isolation.v1",
+                "rabs.canonical-workspace-committed-dag-rlib.semantics.v1",
+                "rabs.canonical-workspace-committed-dag-rlib.dependencies.v1",
+            ),
+            (
+                WorkspaceDagMetadata,
+                13,
+                23,
+                "rabs.canonical-workspace-committed-dag-metadata.isolation.v1",
+                "rabs.canonical-workspace-committed-dag-metadata.semantics.v1",
+                "rabs.canonical-workspace-committed-dag-metadata.dependencies.v1",
+            ),
+            (
+                WorkspaceTerminalLeafMetadata,
+                14,
+                24,
+                "rabs.canonical-workspace-terminal-leaf-metadata.isolation.v1",
+                "rabs.canonical-workspace-terminal-leaf-metadata.semantics.v1",
+                "rabs.canonical-workspace-terminal-leaf-metadata.dependencies.v1",
+            ),
+            (
+                WorkspaceTerminalMetadata,
+                15,
+                25,
+                "rabs.canonical-workspace-terminal-metadata.isolation.v1",
+                "rabs.canonical-workspace-terminal-metadata.semantics.v1",
+                "rabs.canonical-workspace-terminal-metadata.dependencies.v1",
+            ),
+        ] {
+            let dependencies = if policy == WorkspaceTerminalLeafMetadata {
+                Vec::new()
+            } else {
+                vec![candidate("libupstream.rmeta")]
+            };
+            let plan = match policy {
+                WorkspaceRlib => plan_committed_workspace_rlib(&execution(false)).unwrap(),
+                WorkspaceMetadata => metadata_plan(false, "one"),
+                WorkspaceTerminalLeafMetadata | WorkspaceTerminalMetadata => {
+                    plan_terminal_workspace_metadata(&terminal_execution(
+                        &["--crate-type=bin"],
+                        !dependencies.is_empty(),
+                        "one",
+                    ))
+                    .unwrap()
+                }
+                _ => plan_mixed_workspace_library(&execution_with_output(
+                    false,
+                    "one",
+                    policy.output_class() == RemoteDependencyOutputClass::Metadata,
+                ))
+                .unwrap(),
+            };
+            let captured = inputs(&plan);
+            let keyed = policy_key(&plan, policy, &dependencies, &captured).unwrap();
+            assert_eq!(keyed.descriptor.key_epoch, current_epoch, "{policy:?}");
+            assert!(plan.source_kind.as_str().ends_with("-v2"));
+            assert_eq!(
+                committed_dependency_descriptor_policy(&keyed.descriptor),
+                Some(policy),
+            );
+            assert!(uses_committed_dependency_namespace(&keyed.descriptor));
+            assert!(
+                !super::super::workspace_cache::uses_closed_workspace_library_namespace(
+                    &keyed.descriptor,
+                )
+            );
+            for domain in [
+                keyed.descriptor.sandbox_semantic_policy.domain,
+                keyed.descriptor.execution_semantics.domain,
+                keyed.descriptor.dependency_inputs.domain,
+            ] {
+                assert!(domain.ends_with(".v2"), "{policy:?}: {domain}");
+            }
+            // A new epoch alone cannot reinterpret old policy or producer
+            // evidence. Each old field, and the complete old namespace, fails.
+            for change in 0..5 {
+                let mut old = keyed.descriptor.clone();
+                match change {
+                    0 => old.key_epoch = previous_epoch,
+                    1 => old.sandbox_semantic_policy.domain = old_isolation,
+                    2 => old.execution_semantics.domain = old_semantics,
+                    3 => old.dependency_inputs.domain = old_dependencies,
+                    _ => {
+                        old.key_epoch = previous_epoch;
+                        old.sandbox_semantic_policy.domain = old_isolation;
+                        old.execution_semantics.domain = old_semantics;
+                        old.dependency_inputs.domain = old_dependencies;
+                    }
+                }
+                assert_eq!(
+                    committed_dependency_descriptor_policy(&old),
+                    None,
+                    "{policy:?}/{change}"
+                );
+                assert!(
+                    uses_committed_dependency_namespace(&old),
+                    "{policy:?}/{change}"
+                );
+                assert_ne!(compute_action_key(&old).final_key, keyed.action_key);
+                // Even after adopting a generic dependency class and epoch,
+                // its typed provenance cannot be treated as ordinary immutable
+                // capture merely because exact workspace classification failed.
+                old.action_class = ActionClass::RustcDependencyCompile;
+                old.key_epoch = super::super::LIVE_DEPENDENCY_KEY_EPOCH;
+                assert_eq!(committed_dependency_descriptor_policy(&old), None);
+                assert!(uses_committed_dependency_namespace(&old));
+            }
+            // This change widens command reach, not source projection: both
+            // the compiled source and an unrelated workspace sibling still key.
+            for index in [2, 3] {
+                let mut changed = captured.clone();
+                changed.inputs[index].object = ObjectId(digest(b"new retained source bytes"));
+                assert_ne!(
+                    policy_key(&plan, policy, &dependencies, &changed)
+                        .unwrap()
+                        .action_key,
+                    keyed.action_key,
+                );
+            }
+            let mut incomplete = captured.clone();
+            incomplete.directory_enumerations.pop();
+            assert!(policy_key(&plan, policy, &dependencies, &incomplete).is_err());
+            for change in 0..3 {
+                let mut changed = plan.clone();
+                match change {
+                    0 => {
+                        changed.generated_root =
+                            Some("/__rabs/out/cargo/debug/build/consumer/out".into())
+                    }
+                    1 => changed
+                        .invocation
+                        .native_libs
+                        .push("static=unclosed".into()),
+                    _ => changed
+                        .native_roots
+                        .push("/__rabs/out/cargo/debug/build/provider/out".into()),
+                }
+                assert!(policy_key(&changed, policy, &dependencies, &captured).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn terminal_metadata_keys_bind_shapes_source_environment_and_exact_producers() {
         let mut keys = Vec::new();
         for flags in [
@@ -1802,7 +2098,7 @@ mod tests {
                 );
                 assert_eq!(
                     key.descriptor.key_epoch,
-                    if dependencies.is_empty() { 14 } else { 15 }
+                    if dependencies.is_empty() { 24 } else { 25 }
                 );
                 assert!(uses_committed_dependency_namespace(&key.descriptor));
                 assert!(!is_committed_workspace_metadata_descriptor(&key.descriptor));
@@ -2074,7 +2370,7 @@ mod tests {
                     committed_dependency_descriptor_policy(&typed.descriptor),
                     Some(policy)
                 );
-                assert!(!uses_committed_dependency_namespace(&typed.descriptor));
+                assert!(uses_committed_dependency_namespace(&typed.descriptor));
             }
         }
         assert_eq!(
@@ -2111,6 +2407,14 @@ mod tests {
                 let captured = immutable_inputs(&plan);
                 let dag = policy_key(&plan, policy, &dependencies, &captured).unwrap();
                 assert_eq!(dag.descriptor.key_epoch, if metadata { 11 } else { 10 });
+                assert!(
+                    dag.descriptor
+                        .sandbox_semantic_policy
+                        .domain
+                        .ends_with(".v1")
+                );
+                assert!(dag.descriptor.execution_semantics.domain.ends_with(".v1"));
+                assert!(dag.descriptor.dependency_inputs.domain.ends_with(".v1"));
                 assert_eq!(
                     dag.descriptor.action_class,
                     ActionClass::RustcDependencyCompile
@@ -2134,6 +2438,12 @@ mod tests {
                 assert_eq!(
                     committed_dependency_descriptor_policy(&ordinary.descriptor),
                     None
+                );
+                assert!(!uses_committed_dependency_namespace(&ordinary.descriptor));
+                assert!(
+                    !super::super::workspace_cache::uses_closed_workspace_library_namespace(
+                        &ordinary.descriptor,
+                    )
                 );
                 assert!(
                     policy_key(
@@ -2350,7 +2660,7 @@ mod tests {
             };
             let captured = inputs(&plan);
             let dag = policy_key(&plan, policy, &dependencies, &captured).unwrap();
-            assert_eq!(dag.descriptor.key_epoch, if metadata { 13 } else { 12 });
+            assert_eq!(dag.descriptor.key_epoch, if metadata { 23 } else { 22 });
             assert_eq!(
                 committed_dependency_descriptor_policy(&dag.descriptor),
                 Some(policy)
@@ -2473,8 +2783,11 @@ mod tests {
             } else {
                 key(&prior, &dependencies, &input).unwrap()
             };
-            assert_eq!(actual.descriptor.key_epoch, if metadata { 9 } else { 8 });
-            assert_eq!(previous.descriptor.key_epoch, if metadata { 7 } else { 6 });
+            assert_eq!(actual.descriptor.key_epoch, if metadata { 21 } else { 20 });
+            assert_eq!(
+                previous.descriptor.key_epoch,
+                if metadata { 19 } else { 18 }
+            );
             assert_ne!(actual.action_key, previous.action_key);
             assert_ne!(
                 actual.descriptor.dependency_inputs,
@@ -2690,7 +3003,7 @@ mod tests {
         assert!(is_committed_workspace_rlib_descriptor(
             &committed.descriptor
         ));
-        assert_eq!(committed.descriptor.key_epoch, 6);
+        assert_eq!(committed.descriptor.key_epoch, 18);
         let fresh_key = remote_workspace_execution_key(
             &fresh,
             &toolchain(),
@@ -2868,11 +3181,11 @@ mod tests {
         let input = inputs(&metadata);
         let keyed = metadata_key(&metadata, &dependencies, &input).unwrap();
         let archive_key = key(&archive, &dependencies, &input).unwrap();
-        assert_eq!(keyed.descriptor.key_epoch, 7);
-        assert_eq!(archive_key.descriptor.key_epoch, 6);
+        assert_eq!(keyed.descriptor.key_epoch, 19);
+        assert_eq!(archive_key.descriptor.key_epoch, 18);
         assert_eq!(
             metadata.source_kind.as_str(),
-            "canonical-workspace-committed-metadata-v1"
+            "canonical-workspace-committed-metadata-v2"
         );
         assert!(is_committed_workspace_metadata_descriptor(
             &keyed.descriptor

@@ -520,13 +520,22 @@ pub(super) fn select_for_install(
     store: &mut dyn RabsMetadataStore,
     plan: &PreparedOutputs,
 ) -> Result<SelectedActionOutputs, ServeError> {
-    SelectedActionOutputs::select(
-        store,
-        &plan.outputs,
-        MaterializationMode::VerifiedCowReflink,
-        plan.freshness,
-    )
-    .map_err(ServeError::Materialize)
+    // Metadata-only results need prompt delivery. Probing CoW isolation and
+    // cloning each metadata file can cost more than copying its bytes.
+    // PrivateCopy still hashes every staged byte and retains the same guards.
+    // Keep verified CoW available for output sets containing archive payloads.
+    let mode = if plan.outputs.iter().all(|output| {
+        matches!(
+            output.role,
+            OutputRole::ProvisionalMetadata | OutputRole::DepInfo
+        )
+    }) {
+        MaterializationMode::PrivateCopy
+    } else {
+        MaterializationMode::VerifiedCowReflink
+    };
+    SelectedActionOutputs::select(store, &plan.outputs, mode, plan.freshness)
+        .map_err(ServeError::Materialize)
 }
 
 #[allow(clippy::result_large_err)]
@@ -535,6 +544,13 @@ pub(super) fn stage_for_install(
     plan: &PreparedOutputs,
 ) -> Result<PreparedActionOutputs, PreparationFailure> {
     selected.stage(&|output, staged| {
+        // Receipts authorize early metadata from an already checked result;
+        // this independently validates the exact private archive bytes about
+        // to be installed after CAS copying and digest verification.
+        if output.virtual_path.as_bytes().ends_with(b".rlib") {
+            rabs_sandbox::native_archive::validate_rlib_native_closure_file(staged)
+                .map_err(std::io::Error::other)?;
+        }
         if let Some(derived) = plan.dep_info.get(&output.destination) {
             let mut staged = staged.try_clone()?;
             staged.rewind()?;
@@ -1135,6 +1151,7 @@ mod tests {
         let mut manifest = rabs_cas::test_support::sample_manifest();
         manifest.result_kind = ResultKind::Success;
         manifest.artifact_bundle_root = None;
+        let archive = crate::test_util::closed_rlib_fixture(b"archive");
         manifest.logical_outputs = vec![
             LogicalOutput {
                 role: OutputRole::ProvisionalMetadata,
@@ -1144,7 +1161,7 @@ mod tests {
             LogicalOutput {
                 role: OutputRole::Materializable,
                 virtual_path: RawBytes::from("libunit.rlib"),
-                object: put(b"archive"),
+                object: put(&archive),
             },
             LogicalOutput {
                 role: OutputRole::DepInfo,
@@ -1226,7 +1243,7 @@ mod tests {
         assert_eq!(files, vec![destination.join("libunit.rlib")]);
         assert_eq!(
             std::fs::read(destination.join("libunit.rlib")).unwrap(),
-            b"archive"
+            archive
         );
         assert_eq!(
             std::fs::read(destination.join("unit.d")).unwrap(),

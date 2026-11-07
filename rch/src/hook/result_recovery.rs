@@ -969,6 +969,10 @@ os.stat = raced_stat
         session.tree_retired().unwrap();
         session.pair_released().unwrap();
         session.sources_released().unwrap();
+        // Explicit recovery otherwise asks the worker whether an older failed
+        // delivery hides a cancellation. Record that this one has none to find.
+        session.recipe.source_cancellation_settled = Some(true);
+        session.persist().unwrap();
         session.retired().unwrap();
         session
             .writer

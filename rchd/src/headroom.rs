@@ -19,7 +19,7 @@
 #![allow(dead_code)] // Initial integration; consumers land in follow-on beads.
 
 use crate::history::BuildHistory;
-use rch_common::{BuildLocation, WorkerId};
+use rch_common::{BuildDiskObservation, BuildDiskPool, BuildLocation, WorkerId};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -384,6 +384,8 @@ impl HeadroomEstimator {
 
 /// Samples retained per project and command, including its high-water marks.
 const FOOTPRINT_SAMPLES: usize = 8;
+/// Bound both the retained lane proofs and their independent high-water books.
+const FOOTPRINT_POOLS: usize = 8;
 /// A footprint older than this no longer describes the project.
 const FOOTPRINT_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 /// Growth below this is measurement noise (free space is sampled in whole GiB).
@@ -428,6 +430,23 @@ pub fn legacy_footprint_key(project_id: &str, command: &str) -> String {
     format!("{}\u{1f}{kind}", footprint_project(project_id))
 }
 
+/// Incremental evidence never crosses an endpoint or exact command boundary.
+/// Its versioned namespace is separate from legacy total-output evidence.
+pub(crate) fn warm_footprint_key(
+    project_id: &str,
+    command: &str,
+    endpoint: &crate::workers::WorkerEndpointIdentity,
+) -> String {
+    serde_json::to_string(&(
+        BuildDiskObservation::VERSION,
+        "warm_pool",
+        footprint_project(project_id),
+        command.trim(),
+        endpoint,
+    ))
+    .expect("warm footprint key serializes")
+}
+
 pub fn cold_build_footprint_gib(command: &str) -> Option<f64> {
     rch_common::BuildDiskBudget::cold_growth_gib(command).map(f64::from)
 }
@@ -436,8 +455,9 @@ pub fn cold_build_footprint_gib(command: &str) -> Option<f64> {
 struct FootprintSample {
     growth_gib: f64,
     observed_unix: i64,
-    /// Only an attributed total peak output measurement on a successful build
-    /// can establish a requirement below the conservative cold estimate.
+    /// A complete, successful attributed observation. Total-output samples
+    /// establish cold evidence; incremental samples live in a separate pool
+    /// entry and only apply with its verified retained-pool condition.
     #[serde(default)]
     complete: bool,
 }
@@ -450,14 +470,75 @@ impl FootprintSample {
     }
 }
 
-/// Recent output measurements and conservative lower bounds from worker df.
-/// Partial builds, shared-filesystem cleanup, and warm incremental deltas do
-/// not establish a complete footprint. Retain the high-water marks so repeated
-/// small builds cannot erase evidence of a larger output pool.
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolFootprint {
+    identity: [u8; 32],
+    /// Only a successful, complete receipt may create an anchor. A failed or
+    /// cancelled attempt removes it without erasing larger observed growth.
+    anchor: Option<BuildDiskPool>,
+    observed_unix: i64,
+    /// An anchor alone is not a measurement of an incremental execution.
+    qualified: bool,
+    samples: VecDeque<FootprintSample>,
+}
+
+impl PoolFootprint {
+    fn fresh_at(&self, now_unix: i64) -> bool {
+        (0..=FOOTPRINT_MAX_AGE_SECS).contains(&now_unix.saturating_sub(self.observed_unix))
+    }
+}
+
+fn record_footprint_sample(
+    samples: &mut VecDeque<FootprintSample>,
+    growth_gib: f64,
+    now_unix: i64,
+    complete: bool,
+) {
+    samples.retain(|sample| sample.valid_at(now_unix));
+    samples.push_back(FootprintSample {
+        growth_gib,
+        observed_unix: now_unix,
+        complete,
+    });
+    if samples.len() > FOOTPRINT_SAMPLES {
+        let high_water = samples
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
+            .map(|(index, _)| index);
+        let complete_high_water = samples
+            .iter()
+            .enumerate()
+            .filter(|(_, sample)| sample.complete)
+            .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
+            .map(|(index, _)| index);
+        let excess = samples.len() - FOOTPRINT_SAMPLES;
+        let mut removed = 0;
+        let mut index = 0;
+        samples.retain(|_| {
+            let keep = Some(index) == high_water
+                || Some(index) == complete_high_water
+                || removed == excess;
+            index += 1;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+    }
+}
+
+/// Recent cold output measurements and conditional incremental observations.
+/// Partial builds and worker df changes cannot establish a complete footprint.
+/// Warm estimates require separate pool evidence. Retain high-water marks so
+/// repeated small builds cannot erase evidence of a larger allocation.
 #[derive(Debug, Default, Serialize, serde::Deserialize)]
 pub struct FootprintBook {
     #[serde(default)]
     entries: HashMap<String, VecDeque<FootprintSample>>,
+    #[serde(default)]
+    pools: HashMap<String, VecDeque<PoolFootprint>>,
 }
 
 impl FootprintBook {
@@ -486,41 +567,117 @@ impl FootprintBook {
             return false;
         }
         let samples = self.entries.entry(key.to_string()).or_default();
-        samples.retain(|sample| sample.valid_at(now_unix));
-        samples.push_back(FootprintSample {
-            growth_gib,
+        record_footprint_sample(samples, growth_gib, now_unix, complete);
+        true
+    }
+
+    /// Preserve a successful pool snapshot, and learn incremental growth only
+    /// when this invocation began at the exact previous successful snapshot.
+    /// This prevents a cold build, a cleared pool, or a legacy receipt from
+    /// independently establishing a small warm allowance.
+    pub(crate) fn record_pool(
+        &mut self,
+        key: &str,
+        observation: &BuildDiskObservation,
+        now_unix: i64,
+        success: bool,
+    ) {
+        let pools = self.pools.entry(key.to_owned()).or_default();
+        pools.retain(|pool| pool.fresh_at(now_unix));
+        let previous = pools
+            .iter()
+            .position(|pool| pool.identity == observation.baseline_pool.identity)
+            .and_then(|index| pools.remove(index));
+        let mut pool = previous.unwrap_or_else(|| PoolFootprint {
+            identity: observation.baseline_pool.identity,
+            anchor: None,
             observed_unix: now_unix,
-            complete,
+            qualified: false,
+            samples: VecDeque::new(),
         });
-        if samples.len() > FOOTPRINT_SAMPLES {
-            let high_water = samples
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
-                .map(|(index, _)| index);
-            let complete_high_water = samples
-                .iter()
-                .enumerate()
-                .filter(|(_, sample)| sample.complete)
-                .max_by(|(_, a), (_, b)| a.growth_gib.total_cmp(&b.growth_gib))
-                .map(|(index, _)| index);
-            // One linear pass also bounds an oversized persisted window; do
-            // not repeatedly shift its queue while holding the history lock.
-            let excess = samples.len() - FOOTPRINT_SAMPLES;
-            let mut removed = 0;
-            let mut index = 0;
-            samples.retain(|_| {
-                let keep = Some(index) == high_water
-                    || Some(index) == complete_high_water
-                    || removed == excess;
-                index += 1;
-                if !keep {
-                    removed += 1;
-                }
-                keep
-            });
+        let matches_anchor = pool.anchor == Some(observation.baseline_pool);
+        let growth_gib = (observation.additional_bytes() as f64
+            / rch_common::BuildDiskBudget::GIB as f64)
+            .max(FOOTPRINT_MIN_GROWTH_GIB);
+        if matches_anchor {
+            // Failed executions are lower bounds. They cannot qualify the
+            // pool, but their larger allocations must survive later successes.
+            record_footprint_sample(&mut pool.samples, growth_gib, now_unix, success);
+        }
+        pool.observed_unix = now_unix;
+        pool.anchor = success.then_some(observation.final_pool);
+        pool.qualified = success && matches_anchor;
+        pools.push_back(pool);
+        while pools.len() > FOOTPRINT_POOLS {
+            pools.pop_front();
+        }
+    }
+
+    /// A completion without usable measurement cannot attest which pool it
+    /// changed. Retire all current anchors for the exact endpoint/command,
+    /// retaining the high-water samples for subsequent qualified executions.
+    pub(crate) fn invalidate_pools(&mut self, key: &str) -> bool {
+        let Some(pools) = self.pools.get_mut(key) else {
+            return false;
+        };
+        for pool in pools {
+            pool.anchor = None;
+            pool.qualified = false;
         }
         true
+    }
+
+    /// Return only current, qualified proofs, using the largest additional
+    /// allocation bound across every candidate. The worker must match one
+    /// exact proof before it may execute on this conditional allowance.
+    pub(crate) fn warm_estimate(
+        &self,
+        key: &str,
+        now_unix: i64,
+    ) -> Option<(f64, [Option<BuildDiskPool>; FOOTPRINT_POOLS])> {
+        let candidates = self.pools.get(key)?;
+        let mut proofs: [Option<BuildDiskPool>; FOOTPRINT_POOLS] = [None; FOOTPRINT_POOLS];
+        let mut count = 0;
+        let mut high_water = 0.0_f64;
+        for pool in candidates {
+            let Some(anchor) = pool.anchor else {
+                continue;
+            };
+            if !pool.qualified
+                || !pool.fresh_at(now_unix)
+                || !anchor.is_valid()
+                || anchor.retained_bytes == 0
+                || anchor.identity != pool.identity
+            {
+                continue;
+            }
+            let mut complete = false;
+            let mut largest = 0.0_f64;
+            for sample in pool
+                .samples
+                .iter()
+                .filter(|sample| sample.valid_at(now_unix))
+            {
+                complete |= sample.complete;
+                largest = largest.max(sample.growth_gib);
+            }
+            if !complete {
+                continue;
+            }
+            // Oversized or duplicate persisted evidence grants no warm credit.
+            if count == FOOTPRINT_POOLS
+                || proofs[..count]
+                    .iter()
+                    .flatten()
+                    .any(|previous| previous.identity == anchor.identity)
+            {
+                return None;
+            }
+            proofs[count] = Some(anchor);
+            count += 1;
+            high_water = high_water.max(largest);
+        }
+        (count > 0).then_some((high_water, proofs))
     }
 
     /// The largest unexpired growth for this key. The maximum (not the mean)
@@ -555,6 +712,13 @@ impl FootprintBook {
             samples.retain(|sample| sample.valid_at(now_unix));
         }
         self.entries.retain(|_, samples| !samples.is_empty());
+        for pools in self.pools.values_mut() {
+            pools.retain(|pool| pool.fresh_at(now_unix));
+            for pool in pools {
+                pool.samples.retain(|sample| sample.valid_at(now_unix));
+            }
+        }
+        self.pools.retain(|_, pools| !pools.is_empty());
     }
 }
 
@@ -1175,5 +1339,227 @@ mod tests {
         assert_eq!(footprint_requirement_gib(2.0), 4.0);
         assert_eq!(footprint_requirement_gib(64.0), 80.0);
         assert_eq!(footprint_requirement_gib(f64::NAN), f64::from(u32::MAX));
+    }
+
+    fn pool_snapshot(identity: u8, state: u8, gib: u64) -> BuildDiskPool {
+        BuildDiskPool {
+            identity: [identity; 32],
+            state: [state; 32],
+            retained_bytes: gib * rch_common::BuildDiskBudget::GIB,
+        }
+    }
+
+    fn pool_observation(
+        baseline_pool: BuildDiskPool,
+        final_pool: BuildDiskPool,
+        added: u64,
+        free_drop: u64,
+    ) -> BuildDiskObservation {
+        BuildDiskObservation {
+            version: BuildDiskObservation::VERSION,
+            baseline_output_bytes: baseline_pool.retained_bytes,
+            peak_added_output_bytes: added,
+            peak_free_drop_bytes: free_drop,
+            baseline_pool,
+            final_pool,
+        }
+    }
+
+    #[test]
+    fn warm_pool_requires_a_successful_anchor_and_matching_incremental_receipt() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        let empty = pool_snapshot(1, 1, 0);
+        let retained = pool_snapshot(1, 2, 81);
+        let cold = pool_observation(empty, retained, retained.retained_bytes, 0);
+        book.record_pool("k", &cold, now, true);
+        assert_eq!(book.warm_estimate("k", now), None, "cold only anchors");
+
+        let incremental = pool_observation(retained, retained, 300 * 1024 * 1024, 0);
+        book.record_pool("k", &incremental, now + 1, true);
+        let (growth, pools) = book.warm_estimate("k", now + 1).unwrap();
+        assert_eq!(
+            growth, 1.0,
+            "small complete observations retain a 1 GiB minimum"
+        );
+        assert_eq!(pools[0], Some(retained));
+        assert_eq!(pools.iter().flatten().count(), 1);
+        assert_eq!(book.estimate_gib("k", now + 1), None);
+    }
+
+    #[test]
+    fn warm_pool_changed_or_cleared_state_requires_a_new_successful_anchor() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        let original = pool_snapshot(1, 2, 81);
+        let same = pool_observation(original, original, 0, 0);
+        book.record_pool("k", &same, now, true);
+        book.record_pool("k", &same, now + 1, true);
+        assert!(book.warm_estimate("k", now + 1).is_some());
+
+        // Equal retained bytes with a different content stamp are not a match.
+        let repopulated = pool_snapshot(1, 3, 81);
+        let rebuilt = pool_observation(repopulated, repopulated, 0, 0);
+        book.record_pool("k", &rebuilt, now + 2, true);
+        assert_eq!(book.warm_estimate("k", now + 2), None);
+        book.record_pool("k", &rebuilt, now + 3, true);
+        assert_eq!(
+            book.warm_estimate("k", now + 3).unwrap().1[0],
+            Some(repopulated)
+        );
+
+        let cleared = pool_snapshot(1, 4, 0);
+        book.record_pool(
+            "k",
+            &pool_observation(cleared, cleared, 0, 0),
+            now + 4,
+            true,
+        );
+        book.record_pool(
+            "k",
+            &pool_observation(cleared, cleared, 0, 0),
+            now + 5,
+            true,
+        );
+        assert_eq!(
+            book.warm_estimate("k", now + 5),
+            None,
+            "an empty pool is cold"
+        );
+    }
+
+    #[test]
+    fn failed_warm_pool_receipts_invalidate_trust_without_erasing_larger_growth() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        let retained = pool_snapshot(1, 2, 81);
+        let small = pool_observation(retained, retained, 0, 0);
+        book.record_pool("k", &small, now, true);
+        book.record_pool("k", &small, now + 1, true);
+        let failed = pool_observation(retained, retained, 20 * rch_common::BuildDiskBudget::GIB, 0);
+        book.record_pool("k", &failed, now + 2, false);
+        assert_eq!(book.warm_estimate("k", now + 2), None);
+        book.record_pool("k", &small, now + 3, true);
+        assert_eq!(
+            book.warm_estimate("k", now + 3),
+            None,
+            "recovery first anchors"
+        );
+        for offset in 4..32 {
+            book.record_pool("k", &small, now + offset, true);
+        }
+        assert_eq!(book.warm_estimate("k", now + 32).unwrap().0, 20.0);
+        assert_eq!(book.pools["k"][0].samples.len(), FOOTPRINT_SAMPLES);
+        assert!(book.invalidate_pools("k"));
+        assert_eq!(book.warm_estimate("k", now + 32), None);
+    }
+
+    #[test]
+    fn warm_pool_uses_both_attributed_growth_and_peak_free_space_drop() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        let before = pool_snapshot(1, 2, 81);
+        let after_cleanup = pool_snapshot(1, 3, 70);
+        book.record_pool("k", &pool_observation(before, before, 0, 0), now, true);
+        let observation = pool_observation(
+            before,
+            after_cleanup,
+            8 * rch_common::BuildDiskBudget::GIB,
+            12 * rch_common::BuildDiskBudget::GIB,
+        );
+        book.record_pool("k", &observation, now + 1, true);
+        assert_eq!(book.warm_estimate("k", now + 1).unwrap().0, 12.0);
+        // Cleanup may increase free space throughout an invocation; observed
+        // attributed additions still cannot be subtracted from the allowance.
+        let next = pool_observation(
+            after_cleanup,
+            after_cleanup,
+            16 * rch_common::BuildDiskBudget::GIB,
+            0,
+        );
+        book.record_pool("k", &next, now + 2, true);
+        assert_eq!(book.warm_estimate("k", now + 2).unwrap().0, 16.0);
+    }
+
+    #[test]
+    fn warm_pool_history_is_bounded_fresh_and_persistent() {
+        let now = 1_800_000_000;
+        let mut book = FootprintBook::default();
+        for identity in 1..=12 {
+            let retained = pool_snapshot(identity, 1, 81);
+            let observation = pool_observation(
+                retained,
+                retained,
+                u64::from(identity) * rch_common::BuildDiskBudget::GIB,
+                0,
+            );
+            book.record_pool("k", &observation, now, true);
+            // Multiple receipts may share one clock second. Keep time monotonic
+            // across identities so future-sample rejection is not this fixture's
+            // eviction mechanism.
+            book.record_pool("k", &observation, now, true);
+        }
+        assert_eq!(book.pools["k"].len(), FOOTPRINT_POOLS);
+        let (growth, pools) = book.warm_estimate("k", now + 1).unwrap();
+        assert_eq!(growth, 12.0);
+        assert_eq!(pools.iter().flatten().count(), FOOTPRINT_POOLS);
+        assert_eq!(pools[0].unwrap().identity, [5; 32]);
+        let encoded = serde_json::to_vec(&book).unwrap();
+        let mut restored: FootprintBook = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.warm_estimate("k", now + 1), Some((growth, pools)));
+        assert_eq!(restored.warm_estimate("k", now - 1), None);
+        assert_eq!(
+            restored.warm_estimate("k", now + FOOTPRINT_MAX_AGE_SECS + 2),
+            None
+        );
+        restored.prune(now + FOOTPRINT_MAX_AGE_SECS + 2);
+        assert!(restored.pools.is_empty());
+    }
+
+    #[test]
+    fn old_total_output_history_never_becomes_warm_evidence() {
+        let old: FootprintBook = serde_json::from_str(
+            r#"{"entries":{"legacy":[{"growth_gib":95.0,"observed_unix":1800000000,"complete":true}]}}"#,
+        ).unwrap();
+        assert_eq!(old.estimate_gib("legacy", 1_800_000_000), Some(95.0));
+        assert_eq!(old.warm_estimate("legacy", 1_800_000_000), None);
+    }
+
+    #[test]
+    fn warm_pool_keys_bind_exact_command_project_and_endpoint() {
+        let endpoint = crate::workers::WorkerEndpointIdentity {
+            id: WorkerId::new("worker"),
+            host: "old-host".into(),
+            user: "builder".into(),
+            identity_file: "key".into(),
+            declared_os: Some("linux".into()),
+        };
+        let key = warm_footprint_key("project", "cargo check", &endpoint);
+        assert_ne!(key, footprint_key("project", "cargo check"));
+        assert_ne!(key, warm_footprint_key("other", "cargo check", &endpoint));
+        assert_ne!(
+            key,
+            warm_footprint_key("project", "cargo check --all-features", &endpoint)
+        );
+        for changed in [
+            crate::workers::WorkerEndpointIdentity {
+                host: "new-host".into(),
+                ..endpoint.clone()
+            },
+            crate::workers::WorkerEndpointIdentity {
+                user: "other".into(),
+                ..endpoint.clone()
+            },
+            crate::workers::WorkerEndpointIdentity {
+                identity_file: "other-key".into(),
+                ..endpoint.clone()
+            },
+            crate::workers::WorkerEndpointIdentity {
+                declared_os: Some("macos".into()),
+                ..endpoint.clone()
+            },
+        ] {
+            assert_ne!(key, warm_footprint_key("project", "cargo check", &changed));
+        }
     }
 }

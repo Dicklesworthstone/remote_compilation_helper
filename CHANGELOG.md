@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.34` (2026-10-16).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.36` (2026-11-05).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,168 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.36 — 2026-11-05
+
+A short release, about 95 commits after 2.1.35, that fixes what that version's fleet rollout exposed. Builds were
+failing after they had already succeeded, clean-overlay jobs died before Cargo on most workers, locks and leases left behind
+by older versions could strand a worker or block a restart, and cancellation failed on full disks.
+
+**Operational change:** the default 5% critical-disk rule now has a 25 GiB absolute cap (`bd-lnbuz`). A worker with a large
+disk no longer counts as critical at 45 GiB free on a 900 GiB volume, so expect such workers to take jobs they used to
+refuse. The absolute floor, per-build storage admission and explicit `disk_critical_ratio_cap_gb` settings are unchanged.
+
+- **A finished build no longer fails on an old directory mode.** Artifact staging runs after the remote build, and 2.1.35
+  refused a default retrieval directory that an older client had left group-writable. The caller saw "completion is
+  unconfirmed" with exit 1 although Cargo had succeeded, and only a later recovery delivered the artifacts. Journals show 82
+  such jobs in the 48 hours before the fix. rch now repairs its own directory. A writable `transfer.retrieval_staging_dir`
+  chosen by an operator keeps its mode and is refused by name, before anything is created under it
+  ([`1d404d0e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1d404d0e4f390463e45b22d330d6fe69459f27bb)).
+- **Clean-overlay jobs reach Cargo again.** The Git archive cache in 2.1.35 refused any parent directory it could not fully
+  trust, and the transfer treated that refusal as fatal. That covered a group-writable `/data/tmp/rch` and a root login under
+  a directory owned by another user, so 4 of 4 sampled workers failed before Cargo started. Reuse is optional, so the job now
+  skips the cache and uses the ordinary upload
+  ([`d7d5f595`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d7d5f595d63e2bf49885a54497651421b4263df4)).
+- **Old locks and leases no longer strand a worker** (`bd-8xuus`, `bd-byuxs`). Cancel locks that an older version left
+  group-writable are healed, and a separate explicit-owner migration, dry-run by default, clears the same bits through
+  verified descriptors. An empty lease journal left by an old disk-full event no longer makes restart readiness permanently
+  unknown, which had blocked every drained restart. Neither path deletes anything
+  ([`d133ae12`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d133ae1257a0e549a92865b2e56f3ca60b1d9e19),
+  [`be6af239`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be6af2398a7e11a585237b536cb196b4af2b4655)).
+- **Upgrades drain with the client that speaks the running daemon's protocol** (`bd-306ep`). The installer places the new
+  daemon and worker first, drains with the installed client, then replaces the client, and it stops if the drain fails. It
+  also checks a release archive is complete before changing any installed binary
+  ([`1f21cff0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1f21cff0501f66a2af6d739e75b96f141b87e094),
+  [`5d97a23e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5d97a23ec0fee1aa5eaab96873737f292a60b562),
+  [`2a7224d3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a7224d34dd4264e9725d37543ad2c4dc2627db5)).
+- **Cancellation needs far less disk** (`bd-fwc2h`). Control capture stays in memory when Python is available, and
+  cancellation reuses durable records instead of allocating new ones. Commands run through that in-memory path see the
+  same inherited descriptors as the file-backed one. Source-ownership calls in this release still create a scratch
+  directory under `TMPDIR`, so a worker with no room left there can still refuse them until some space is freed
+  ([`ef0d2261`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ef0d226131b228ec88d34049db37fdf17380396d),
+  [`8a8f58b8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8a8f58b84ee33de3085af0e0264610ca64d37cbb),
+  [`8f2c13c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8f2c13c77d3f33e413e60cf10cba0e727a5f423d)).
+- **A missing project root is restored, not doubled** (`bd-r2gcc`). When a worker's canonical root is gone but its alias is
+  still a symlink to the real tree, the name comes back as a link. Before, preflight created a second real directory, and
+  the worker then refused that project permanently until someone repaired it by hand. A real directory at the alias keeps
+  its old refusal and is never linked to. macOS workers need GNU `ln` (`gln`) for this repair; without it they refuse as
+  before
+  ([`3d50a044`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3d50a044c2cf71629e52ac82518b77d0c3e17acb),
+  [`6000c2af`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6000c2afe3ec9992655c6b4be9d5b9cc0e4d2bf6),
+  [`93bf8e11`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/93bf8e11cf55a8e90b9e314832e2a9cc420830b7)).
+- **`rch workers probe` and `rch doctor` check the dispatcher's real source namespace** (`bd-r2gcc`). They report the exact
+  canonical and alias roots this dispatcher uses
+  ([`f78a856e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f78a856ecbfd0dc0d866c737ca042843c2a32a02)).
+- **An incompatible worker no longer uses up a build's retries** (`bd-r2gcc`). A source-topology refusal stays on the current
+  attempt, so the build can still reach a compatible worker
+  ([`44ef74bb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/44ef74bbd4f29355e3dc6ac781783fe1c3a76d8a)).
+- **Disk admission is stricter about stale evidence and kinder to warm builds** (`bd-lnbuz`, #132). Capacity from before a
+  transport failure is revoked, verified warm Cargo pools are admitted on their additional space, and feasible requests
+  queue behind owned reservations instead of failing. Cargo cache writes now count toward a build, except that a shared cache
+  past 25,000 entries stays out of each build's two-second output walk: it keeps reservation and floor protection, and
+  downloads into it are bounded by the free-space floor rather than the growth budget
+  ([`d2339e33`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d2339e336b15886919dbb52052f2a76ec37ea312),
+  [`d8f2a060`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d8f2a060e8b4573d989759e4f213fa8bed35d087),
+  [`69437908`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6943790888290c2a16e1de19bba0d1782e8393f3),
+  [`e371a687`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e371a6876c8748a082906376e4257403f69bb735)).
+- **Output directories are proven writable before remote work starts** (`bd-0xuvl`). The probe now writes, syncs and reads
+  back real data instead of creating an empty file
+  ([`f6b30954`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f6b30954607c9f6924c71fd749a9ae9d633a1371)).
+- **Fewer SSH round trips per job** (#132). Preflight checks share one bounded channel, empty artifact pulls are skipped, and
+  completion probes no longer block progress
+  ([`9f0302f2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f0302f2647094292c85b7af6eba289b4104d1f1),
+  [`366f4a89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/366f4a89004dfccc605d5d0b4fe40fa3ef046911)).
+- **Pure workers stop logging a reload ERROR at startup** (`bd-madif`)
+  ([`27074221`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/270742214c90ec9190d2465585ac99eb37e676a2)).
+
+RABS remains opt-in; this release carries its ongoing work and changes nothing unless you enable it.
+
+**Known issues:** none of the Darwin-worker limitations noted in earlier releases were retested end to end for this one.
+
+Scope window: `v2.1.35..v2.1.36`.
+
+## 2.1.35 — 2026-11-04
+
+The first release since 2.1.34 on 2026-10-16, about 660 commits later. Most of it helps a shared worker
+fleet recover by itself from full disks, a full `/tmp`, incompatible workers, interrupted builds and
+restarted daemons.
+
+**Operational change:** rchd's automatic cache cleanup now runs on workers whose ssh user is not root.
+It never completed there before, so expect it to start removing idle build data under the worker's
+remote base (`/data/tmp/rch` by default): data older than a day, and more when a worker is low on disk.
+`.sbh-protect` and `.rch-retention-v1` markers still hold a directory, and `/data/projects` is not scanned.
+
+- **Cache cleanup on non-root workers** (`bd-4x4qa`). The activity guard gave up on the first process
+  whose working directory it could not read, which as a non-root user is nearly every process. One
+  dispatcher logged low-disk cleanup failing 70, 51 and 44 times on three workers over 3 days, removing
+  nothing, with free space down to 0.0-0.6 GB. It now rescans through `sudo -n`. Only a scan that finished
+  proves a directory idle, and a refused or missing sudo stays unknown
+  ([`45636413`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4563641360bb4c31445ac5d5ad900781587b7861)).
+- **Full `/tmp` no longer takes a worker out of the pool** (`bd-3n17z`). The worker source registry moved
+  from `/tmp` to `/var/tmp` with retention and headroom checks. A health probe's scratch write in a full
+  tmpfs used to mark the worker unreachable
+  ([`757aa3c1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/757aa3c1b7349818a8f196744798f44656b8269f)).
+- **Incompatible source topology is classified and excluded** (#130). A worker whose project root conflicts
+  with the requested alias stays excluded from selection across restarts, separately from temporary source
+  contention. A pinned or exhausted request gets a permanent refusal naming the worker and path, and does
+  not run locally
+  ([`11142f95`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/11142f95d2f4aea525c1585bc31085efa0e8fbfc),
+  [`4511b1fe`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4511b1fe419dfa7c569d36155410fa353128a6ff)).
+- **Source pairs are released when they should be.** A platform rejection (RCH-E327) no longer leaves a
+  project fenced on the worker for about 25 minutes (`bd-dxsx5`,
+  [`283d636a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/283d636afe63f5be5883c9701d3e1657b830bbc4)). Interrupted
+  and cancelled source pairs recover without losing their release proof (#111,
+  [`358f0c60`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/358f0c60d7f635cd58ded9a7a022b4fcb4fc7390),
+  [`7e67a097`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7e67a097f1d32ca14e3060c72660d9ad91c17500),
+  [`af1d7a20`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/af1d7a20dd5ef7844c0fbd6026ca178917feefab)).
+- **Retained jobs stop duplicating delivered output** (`bd-ra5aw`). The local staging copy goes away once
+  delivery has finished, and verified copy-on-write publication is allowed before duplicate-space admission
+  ([`d8be96b3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d8be96b3357934881bafa86628111541240dd058),
+  [`846de71c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/846de71cea4bfb9a0ab2748d39d703c803507f98),
+  [`f70e4fb5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f70e4fb5deefdb2a95b0ecc8718ef9a866c14ab2)).
+- **Disk budgets are enforced, not assumed.** Project build budgets and protected worker headroom are checked
+  at admission, and a build's completion requires a fresh capacity reading
+  ([`ea4ed66e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ea4ed66e644d084c9553b046bbfc198d24876d16),
+  [`f90d1469`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f90d1469c5c7b690ce3e1b73f4c3dd932dd0731c),
+  [`52fff122`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/52fff122bef99deb36a675dbdc14496d6f966fd8)).
+- **`rch admit` asks the daemon.** A typed, read-only placement preview answers over HTTP and the Unix socket,
+  so the recommendation reflects live admission
+  ([`a29aa1e6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a29aa1e67383cbfa67a793abef0f712ccaf972b3),
+  [`0a0afdda`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0a0afdda0560c58187126764c39dfd41f751c382),
+  [`2a36aac5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a36aac53e2838e66cfb4536014a999ad97ef048)).
+- **Restarts keep ownership.** Leases use a durable owner identity across restart and recovery, old-boot
+  owners are recognized before reserved PID checks, and admin disable state survives inventory changes and
+  worker replacement (#118,
+  [`7c3cd6d2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7c3cd6d289fbc0ed5490ddb4a46561e217fa7d66),
+  [`1a7a390d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1a7a390dc9095b31fa03e47a34707055abdb24f7),
+  [`4f3ba69a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4f3ba69afd66f91cca1bc7e59661e2376c49c76d),
+  [`e2d6d7ee`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e2d6d7eef6ee6c82d603cacfe02645fa1c20bc7b)).
+- **Clean overlays do more.** Selected deletions and renames, pinned Git submodules, runs from repository
+  subdirectories, verified warm Git archives, source-content receipts, and managed Nextest, Zigbuild and xwin
+  ([`0f64cd7e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0f64cd7ea4cf6f030fc31244185a454aba5e8fce),
+  [`e9d7019a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e9d7019a7b8e972a9ff7e539c9cb6e1b90f3891b),
+  [`1d82150d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1d82150d0291c1d45c54ea8d28de718c440cc2f5),
+  [`6fc27713`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6fc27713cf2ebdaaf921c8cb519435b7646b8393),
+  [`c78bd939`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c78bd9398918d55c3134831728fa0059d20cde26),
+  [`5ca053c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5ca053c2c1e98d83fd720044b1d65e1d6bb360a0),
+  [`d711b990`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d711b9908d50c3032639087346eec6853d16d5d9)).
+- **Smaller additions.** One project can use several sibling build lanes on a worker
+  ([`c74a4dfa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c74a4dfa6a90a633524e255577bcd39eb4c2ffdf)); `rch exec
+  --require-remote` refuses local fallback per call (#123,
+  [`3c7d1b37`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3c7d1b37fab9b3ced0f264fee757f89ef933b7b8)); `rch diagnose`
+  lists every considered worker and why it lost (#125,
+  [`a1e3558c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a1e3558ca674e8709ed62904f5031051dca5cc20)); root packages
+  resolve workspace inheritance (#131,
+  [`c58c17ad`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c58c17ad46e3d642af5d02151c310317955221f3)); macOS inode
+  columns and btrfs's zero inode counts read correctly (#126,
+  [`6f1558ff`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6f1558ffa4b55484e5e99e51f0f3e83d353dc882),
+  [`568d684d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/568d684dfad707cc9dbd99d9807cb412fdee9a92)); the installer
+  reports every failed check and no longer aborts under macOS `/bin/bash`
+  ([`f6b960d3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f6b960d3afbecfd4578688bc1d75b2a7165c4ba2),
+  [`d7252239`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d72522393079c4e98432c13706516ee65104e121)).
+
+Known issues are tracked as `bd-satto` (namespace setup refusing with `Killed` while a worker's disk stalls),
+`bd-t19ig` (test fixtures sensitive to umask 002) and `bd-p56r0` (socket tests under rch's deep worker `TMPDIR`).
 
 ## 2.1.34 — 2026-10-16
 

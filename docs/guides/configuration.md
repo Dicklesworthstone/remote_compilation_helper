@@ -45,6 +45,128 @@ Sections and fields:
   `"~/.cache/rch/rch.sock"`; falls back to `"/tmp/rch.sock"`) — Unix socket path
   used to communicate with the daemon.
 
+### `[timeouts]`
+
+- `scale` (number, default `1.0`, inclusive range `1.0..=10.0`) — Multiplies
+  bounded slow-path control deadlines for healthy workers whose SSH, filesystem
+  scans and locks take longer under load. Both integer and fractional TOML
+  values are accepted. `RCH_TIMING_SCALE` overrides the file setting. Empty,
+  malformed, non-finite and out-of-range values are errors rather than silently
+  falling back to a different policy.
+
+```toml
+[timeouts]
+scale = 2.5
+```
+
+The client resolves defaults, user TOML, project TOML and the environment in that
+order. An explicit project `scale = 1` resets a larger user value. The on-disk
+configuration cache stores only the file layers; each invocation reapplies the
+current environment. The client explicitly exports its validated value to
+embedded remote helpers, so workers need no environment setup for that job.
+
+The daemon resolves its own user `config.toml` and `RCH_TIMING_SCALE` at startup,
+including starts without a configuration file. Restart `rchd` after changing
+its timing policy. A project setting or a variable supplied only to `rch exec`
+affects that invocation, not the daemon already running in another process.
+To use one fleet policy for both, set it in the user configuration and restart
+the daemon, or provide the variable to both processes.
+
+Health monitoring and recovery of recorded workers share the same scaled
+`worker_timeout_secs` allowance. SSH connection-pool reuse checks also use the
+scale. Toolchain and capability checks keep their original elapsed deadline
+through connection setup, lock waits and publication. A late or cancelled
+capability check retains the previous complete snapshot; it cannot advertise
+new capacity or reset that snapshot's age. A late toolchain verdict cannot
+refresh a cached worker exclusion.
+
+Periodic and on-demand telemetry retain their original collection deadline
+through SSH and publication. A periodic poll commits its sample and clears
+command-failure evidence together after checking the worker's endpoint and
+administrative generation. On-demand publication preserves its existing
+circuit behavior. Waiting for a busy telemetry cache cannot give an old sample
+a new freshness window or clear a failure after the probe deadline. If a timely
+remote sample cannot be published locally, the poll leaves existing evidence
+unchanged instead of recording a worker command failure. Exhausted remote
+polls have a fixed one-second local window to record failure; that window starts
+at the remote deadline, permits no more SSH work and cannot overwrite a newer
+successful observation.
+
+Cancellation uses one overall deadline starting before recovery admission.
+Connection inspection, the remote stop attempt and local settlement consume
+that same allowance. Historical recovery checks also retain that deadline while
+waiting to publish transport evidence. Queued publication consumes the proof's
+lifetime; when a down endpoint recovers, its next probe remains due at the
+proof's original expiry. A response at or after expiry remains unconfirmed; the
+existing process identity, exact receipt and reservation-retention rules still
+apply. A timely remote confirmation stays
+recorded if later local settlement expires, while incomplete overall
+cancellation retains ownership. Durable completion and fallback disk receipts
+both use the scaled ten-second read allowance and terminate their owned local
+transport on timeout.
+
+The disk monitor's mandatory completion acknowledgment uses the existing scaled
+heartbeat allowance when its pipe is full. The guardian also drains queued
+heartbeats before accepting that acknowledgment and normal supervisor exit.
+Parent loss, cancellation, abnormal exit and uncertain delivery still stop the
+owned process group.
+
+Automatic recovery of a dead client's lease scales its five-minute control
+allowance and retains a fixed thirty seconds of local exit slack, within the
+one-hour cap. Admission, historical transport verification, SSH inspection,
+the recovery client and final journal confirmation consume one original
+deadline. The child receives the daemon's resolved timing scale and a
+whole-second timeout derived from the remaining allowance; the parent enforces
+the exact elapsed boundary. Readiness scans also bound queued lock waits while
+retaining candidates and their ownership for a later scan. These limits govern
+recovery control work and do not change compiler or test lifetimes.
+
+Recovery of temporarily bypassed workers keeps one captured allowance across
+its concurrency queue, admission, SSH setup, capability probes and optional
+canary. Telemetry retains its original, unscaled freshness limit through local
+publication and the canary; a longer control allowance cannot make an old
+sample current. An exhausted remote phase has a fixed one-second allowance for
+local failure bookkeeping, with no further SSH work.
+
+Full worker rejoin stages the durable record removal before the final evidence
+check and acquires all live eligibility and circuit guards before committing.
+Expired or cancelled queued work retains quarantine. The final check uses the
+original deadline, telemetry expiry, endpoint and administrative authority.
+Once the atomic replacement commits under valid evidence, its outcome remains
+explicit even if the directory flush takes longer; unconfirmed durability
+retains the live quarantine for a later recovery attempt.
+
+The affected operations are worker toolchain/capability/telemetry probes,
+embedded disk-monitor admission and heartbeat observations, source-namespace
+control, cancellation observation and settlement, and completion-receipt
+retries. Their enclosing transport budgets must allow the same scaled work.
+Retry windows remain bounded by elapsed time. The shared duration policy caps
+each scaled control budget at one hour, even at scale 1.0; oversized configured
+base budgets and multiplication overflow cannot create an unbounded deadline.
+Fractional values remain fractional inside the control deadlines. OpenSSH's
+integer-only `ConnectTimeout` rounds upward: a five-second connection budget
+at scale `2.5` becomes `12.5s` internally and `13s` in the SSH argument.
+The enclosing elapsed deadline still applies; rounding the transport argument
+does not grant extra time to publish a result.
+
+The scale does not change compiler/test lifetimes, signal-escalation grace,
+queue limits, periodic polling cadence, worker-exclusion cooldowns, resource or
+disk thresholds, or process-ownership evidence. A larger deadline cannot
+authorize a signal, declare an unknown process dead, bypass disk admission or
+release a reservation without its existing confirmation. Source acquisition,
+source release, completion receipts and telemetry reject evidence arriving at
+or after their elapsed deadline. An incomplete ownership acknowledgment remains
+a failure even when the transport exits successfully.
+
+Scope binding and launch admission may retry an unknown observation while their
+original deadline is open. They recheck cancellation and process identity and
+keep the execution gate closed until positive evidence is available. Retries
+refuse a stopped or backward-moving observation clock. Cancellation settlement
+also stays bounded and retains the process record when cleanup is unconfirmed.
+
+Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
+`show --sources`, `diff` or `export` to manage and inspect this setting.
+
 ### `[compilation]`
 - `confidence_threshold` (float, default `0.85`) — Minimum classifier confidence
   to intercept a command.
@@ -62,8 +184,18 @@ Sections and fields:
   coverage output. Use `rch config show` to see the full effective list.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
-- `ssh_control_persist_secs` (u64, optional) — Sets `ssh -o ControlPersist=<N>s` for
-  remote execution (ControlMaster). Use `0` to disable persistence (`ControlPersist=no`).
+- `ssh_control_persist_secs` (u64, optional) — Positive values opt Unix dispatches
+  into one supervised foreground SSH connection, shared by preparation, transfers,
+  execution and cleanup. The active dispatch pins the connection until cleanup;
+  a completed dispatch reaps it instead of leaving a background ControlPersist
+  process. Unset or `0` keeps one-shot transports. Windows workers and automatic
+  recovery also retain their one-shot transports. Enable it for high-latency
+  workers. A dispatch makes many short SSH requests, and without it each one
+  pays a fresh handshake: several seconds per request on an intercontinental
+  link, against about half a second on a reused connection. One such setup
+  (#132) cut the fixed per-`rch exec` overhead from about 60 s to about 24 s.
+  The connection still lasts for one dispatch only, so each `rch exec` pays one
+  handshake.
 - `sync_timeout_ms` (u64, optional; `1000..=3600000`) — Per-attempt timeout for
   uploading source to the worker. When unset, RCH uses a payload-aware default:
   30 seconds plus one second per MiB at a conservative 1 MiB/s floor, capped at
@@ -176,6 +308,12 @@ JSON reports `outcome: "refused"`,
 `fallback_reason: "source_topology_incompatible"`, and the stable error marker;
 the initialization failure identifies the worker and the configured/physical
 paths. No compiler exit is invented for a command that never started.
+
+These confirmed preflight refusals do not spend the execution retry budget
+(`RCH_MAX_REMOTE_ATTEMPTS`, default `3`). Each rejected worker is excluded from
+the invocation, so relocation remains bounded by the eligible worker set.
+Actual execution and other pipeline failures still consume attempts, and
+`--source-content-receipt` remains restricted to its single selected worker.
 
 The daemon saves namespace-initialization refusals across restarts. It excludes only the
 recorded endpoint/mapping pair: another worker, or a different compatible mapping
@@ -409,6 +547,7 @@ applied in your version, verify with `rch config show --sources` or `rch --help`
 These are read by the hook configuration loader:
 
 - `RCH_ENABLED`
+- `RCH_TIMING_SCALE` (validated `[timeouts].scale` override, finite `1.0..=10.0`)
 - `RCH_LOG_LEVEL`
 - `RCH_SOCKET_PATH`
 - `RCH_CONFIDENCE_THRESHOLD`

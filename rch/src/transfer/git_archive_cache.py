@@ -92,15 +92,21 @@ def directory_metadata(info, final=False, private=False):
         info.st_uid == os.geteuid() if final else info.st_uid in (0, os.geteuid()),
         "foreign directory owner",
     )
-    # Root-owned sticky temporary bases are supported, but a writable ordinary
+    # Sticky temporary bases owned by root or by this uid are supported: only
+    # those owners can replace this uid's entries there. A writable ordinary
     # ancestor would let another uid substitute the namespace around the grant.
     require(
-        not (info.st_mode & 0o022)
-        or (info.st_uid == 0 and info.st_mode & stat.S_ISVTX and not final),
+        not (info.st_mode & 0o022) or (info.st_mode & stat.S_ISVTX and not final),
         "writable directory namespace",
     )
     if private:
         require(not (info.st_mode & 0o077), "cache directory is not private")
+
+
+def trusted_ancestor(info):
+    return info.st_uid in (0, os.geteuid()) and (
+        not (info.st_mode & 0o022) or bool(info.st_mode & stat.S_ISVTX)
+    )
 
 
 def regular_metadata(info):
@@ -143,6 +149,11 @@ def open_directory(path, stack, create=False):
         if stat.S_ISLNK(named.st_mode) and not final:
             # Existing RCH transports support aliases such as Darwin /tmp.
             # This optimization does not follow them or mutate through them.
+            raise BypassCache("BYPASS_UNAVAILABLE")
+        if not final and stat.S_ISDIR(named.st_mode) and not trusted_ancestor(named):
+            # Reuse is optional and the ordinary upload is not. Pool parents are
+            # often group-writable, or owned by another uid when the worker logs
+            # in as root; neither may fail a job the upload can still serve.
             raise BypassCache("BYPASS_UNAVAILABLE")
         directory_metadata(named, final)
         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)

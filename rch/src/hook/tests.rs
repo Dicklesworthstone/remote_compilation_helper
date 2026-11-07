@@ -3589,7 +3589,7 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
     let command = local_fallback_command("cargo test -p rch");
 
     let has_bypass = command.get_envs().any(|(key, value)| {
-        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_BYPASS_ENV)
+        key == std::ffi::OsStr::new("RCH_CARGO_WRAPPER_BYPASS")
             && value == Some(std::ffi::OsStr::new("1"))
     });
     assert!(
@@ -3597,8 +3597,8 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
         "local fallback must bypass the PATH cargo wrapper to avoid recursive rch exec"
     );
     let has_origin = command.get_envs().any(|(key, value)| {
-        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_ENV)
-            && value == Some(std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_RCH))
+        key == std::ffi::OsStr::new("RCH_CARGO_WRAPPER_ORIGIN")
+            && value == Some(std::ffi::OsStr::new("rch"))
     });
     assert!(
         has_origin,
@@ -3656,6 +3656,52 @@ fn remote_required_fallback_refuses_before_building_local_shell_command() {
         local_fallback_command_for_policy(command, false).is_ok(),
         "ordinary local fallback behavior remains available when remote is not required"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_authorized_local_fallback_executes_the_strict_cargo_shim() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = test_guard!();
+    let root = tempfile::tempdir().unwrap();
+    let write_executable = |name: &str, body: &str| {
+        let path = root.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let shim = write_executable("cargo", &crate::commands::shim::test_cargo_shim_body());
+    let real = write_executable(
+        "real-cargo",
+        "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$RCH_CARGO_WRAPPER_BYPASS\" \
+\"$RCH_CARGO_WRAPPER_ORIGIN\" \"$*\"\nexit 37\n",
+    );
+    write_executable(
+        "rch",
+        "#!/bin/sh\nprintf 'unexpected offload\\n' >&2\nexit 95\n",
+    );
+    let requested = format!(
+        "{} test --locked",
+        shell_escape::escape(shim.to_str().unwrap().into())
+    );
+    assert!(matches!(
+        local_fallback_command_for_policy(&requested, true),
+        Err(LocalFallbackRefusal::RemoteRequired)
+    ));
+    // Explicit local placement is already authorized by the policy caller.
+    // Even an inherited strict-remote flag must not make this recurse.
+    let output = local_fallback_command_for_policy(&requested, false)
+        .unwrap()
+        .env("HOME", root.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", root.path().display()))
+        .env("RCH_REAL_CARGO", real)
+        .env("RCH_REQUIRE_REMOTE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(output.stdout, b"1:rch:test --locked\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -3827,6 +3873,16 @@ fn topology_tempdir() -> (CanonicalTempDir, PathTopologyPolicy) {
         },
         policy,
     )
+}
+
+/// A project the dependency planner can read. Planning proves materialization
+/// of the primary root, so a directory without a manifest stops at RCH-E415.
+fn write_minimal_cargo_manifest(project_dir: &Path) {
+    std::fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = \"remote_compilation_helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write project manifest");
 }
 
 async fn spawn_mock_daemon(socket_path: &str, response: SelectionResponse) {
@@ -6028,8 +6084,16 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             output.shutdown().await.unwrap();
         }
     };
+    let mut budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: 3,
+        source_content_receipt: false,
+    };
+    let fault = retry_budget_test_fault("previous-worker", false);
     let client = async {
         try_retry_on_bigger_worker(
+            &mut budget,
+            &fault,
             socket.to_str().unwrap(),
             "job-project",
             3,
@@ -6063,7 +6127,260 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     };
     assert!(selection_cancelled_before_start(&response));
     assert_eq!(worker_id, WorkerId::new("next-worker"));
+    assert_eq!(budget.attempt, 2);
     assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
+}
+
+fn retry_budget_test_fault(worker: &str, topology_refusal: bool) -> RetryableRemoteFault {
+    RetryableRemoteFault {
+        log_reason: "fixture worker refusal".into(),
+        failed_worker: WorkerId::new(worker),
+        on_exhaust: if topology_refusal {
+            RemoteFaultExhaustAction::RefuseSourceTopology {
+                summary: "fixture topology mismatch".into(),
+            }
+        } else {
+            RemoteFaultExhaustAction::ExitWithCode {
+                code: 137,
+                summary: "fixture worker failure".into(),
+                error_code: None,
+            }
+        },
+    }
+}
+
+#[test]
+fn topology_retry_budget_preserves_remaining_attempts_after_real_failures() {
+    let mut budget = RemoteRetryBudget {
+        attempt: 1,
+        max_attempts: 3,
+        source_content_receipt: false,
+    };
+    for (topology, expected) in [
+        (true, Some(1)),
+        (false, Some(2)),
+        (true, Some(2)),
+        (true, Some(2)),
+        (false, Some(3)),
+        (true, Some(3)),
+        (false, None),
+    ] {
+        let next = budget.next_attempt(&retry_budget_test_fault("worker", topology));
+        assert_eq!(next, expected);
+        if let Some(next) = next {
+            budget.attempt = next;
+        }
+    }
+    budget.attempt = u32::MAX;
+    budget.max_attempts = u32::MAX;
+    assert!(
+        budget
+            .next_attempt(&retry_budget_test_fault("worker", false))
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+fn retry_budget_test_status(socket: &Path, workers: &[&str]) -> serde_json::Value {
+    let workers: Vec<_> = workers
+        .iter()
+        .map(|id| {
+            serde_json::json!({"id": id, "host": "unused.invalid", "user": "test",
+                "status": "healthy", "circuit_state": "closed", "used_slots": 0,
+                "total_slots": 16, "speed_score": 90.0, "last_error": null})
+        })
+        .collect();
+    serde_json::json!({
+        "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-budget", "socket_path": socket,
+            "started_at": "2026-10-07T00:00:00Z", "workers_total": workers.len(),
+            "workers_healthy": workers.len(), "slots_total": 16 * workers.len(),
+            "slots_available": 16 * workers.len()},
+        "workers": workers, "active_builds": [], "recent_builds": [], "issues": [],
+        "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
+            "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_is_exhausted() {
+    let _guard = test_guard!();
+    let directory = tempfile::Builder::new()
+        .prefix("rch-retry-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let socket = directory.join("budget.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker_ids = ["alias-1", "alias-2", "alias-3", "compatible"];
+    let status = retry_budget_test_status(&socket, &worker_ids);
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
+    let server_writer = writer.clone();
+    let server = async move {
+        // Four relocations, then one exhausted inventory and one pinned
+        // inventory. Neither terminal inventory may send a selection query.
+        for exchange in 0..10 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut output) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let body = if exchange >= 8 || exchange % 2 == 0 {
+                assert_eq!(request, "GET /status\n");
+                status.to_string()
+            } else {
+                let index = exchange / 2;
+                let worker_id = worker_ids[index];
+                assert!(request.starts_with("GET /select-worker?"), "{request}");
+                assert!(request.contains(&format!("&worker={worker_id}")));
+                assert_eq!(read_retry_lease(&server_writer).phase, "selection_pending");
+                serde_json::to_string(&SelectionResponse {
+                    worker: Some(rch_common::SelectedWorker {
+                        id: WorkerId::new(worker_id),
+                        host: "not-contacted.invalid".into(),
+                        user: "test".into(),
+                        identity_file: "/unused/key".into(),
+                        slots_available: 16,
+                        speed_score: 90.0,
+                        declared_os: None,
+                        project_lane: 0,
+                        disk_budget: None,
+                    }),
+                    build_id: Some(42 + u64::try_from(index).unwrap()),
+                    reason: SelectionReason::Success,
+                    diagnostics: None,
+                })
+                .unwrap()
+            };
+            output
+                .write_all(format!("HTTP/1.0 200 OK\r\n\r\n{body}").as_bytes())
+                .await
+                .unwrap();
+            output.shutdown().await.unwrap();
+        }
+    };
+    let client = async {
+        let mut budget = RemoteRetryBudget {
+            attempt: 1,
+            max_attempts: 1,
+            source_content_receipt: false,
+        };
+        let mut tried = vec![WorkerId::new("previous-worker")];
+        for expected in worker_ids {
+            let fault = retry_budget_test_fault(tried.last().unwrap().as_str(), true);
+            let result = try_retry_on_bigger_worker(
+                &mut budget,
+                &fault,
+                socket.to_str().unwrap(),
+                "project",
+                1,
+                0,
+                "true",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                &tried,
+                &[],
+                true,
+                &[],
+                &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                &writer,
+                true,
+                &HookReporter::new(OutputVisibility::None),
+            )
+            .await
+            .unwrap();
+            let RetryWorkerSelection::Selected {
+                response,
+                worker_id,
+            } = result
+            else {
+                panic!("topology refusals spent the build budget before {expected}");
+            };
+            assert_eq!(worker_id.as_str(), expected);
+            assert!(!tried.contains(&worker_id));
+            assert_eq!(budget.attempt, 1);
+            writer
+                .admit(response.build_id.unwrap(), &worker_id)
+                .unwrap();
+            // Supplied settled outcomes exercise real journal/selection I/O,
+            // not remote execution or a real worker filesystem verdict.
+            writer.record_exit(EXIT_BUILD_ERROR).unwrap();
+            tried.push(worker_id);
+        }
+        for (tried, pinned) in [
+            (tried.clone(), Vec::new()),
+            (
+                vec![WorkerId::new("alias-1")],
+                vec![WorkerId::new("alias-1")],
+            ),
+        ] {
+            let previous = writer.snapshot();
+            let result = try_retry_on_bigger_worker(
+                &mut budget,
+                &retry_budget_test_fault("compatible", true),
+                socket.to_str().unwrap(),
+                "project",
+                1,
+                0,
+                "true",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                &tried,
+                &pinned,
+                true,
+                &[],
+                &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                &writer,
+                true,
+                &HookReporter::new(OutputVisibility::None),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RetryWorkerSelection::Exhausted));
+            assert_eq!(budget.attempt, 1);
+            assert_eq!(writer.snapshot(), previous);
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_budget_exhaustion_and_receipt_mode_do_not_query_the_daemon() {
+    let _guard = test_guard!();
+    let directory = tempfile::tempdir().unwrap().keep();
+    let socket = directory.join("no-dispatch.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
+    let topology = rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default());
+    let reporter = HookReporter::new(OutputVisibility::None);
+    for (topology_refusal, receipt) in [(false, false), (false, true), (true, true)] {
+        let mut budget = RemoteRetryBudget {
+            attempt: 1,
+            max_attempts: 1,
+            source_content_receipt: receipt,
+        };
+        let fault = retry_budget_test_fault("previous-worker", topology_refusal);
+        let previous = writer.snapshot();
+        let result = tokio::select! {
+            result = try_retry_on_bigger_worker(
+                &mut budget, &fault, socket.to_str().unwrap(), "project", 1, 0,
+                "true", None, RequiredRuntime::None, CommandPriority::Normal,
+                &[], &[], true, &[],
+                &topology, &writer, true, &reporter,
+            ) => result.unwrap(),
+            _ = listener.accept() => panic!("exhausted or single-shot retry contacted the daemon"),
+        };
+        assert!(matches!(result, RetryWorkerSelection::Exhausted));
+        assert_eq!(budget.attempt, 1);
+        assert_eq!(writer.snapshot(), previous);
+    }
 }
 
 #[tokio::test]
@@ -7933,132 +8250,127 @@ async fn namespace_preflight_reply_fixture(
 async fn namespace_preflight_failure_retries_only_after_confirmed_release() {
     let _guard = test_guard!();
     let retained = tempfile::tempdir().unwrap().keep();
-    for stage in [
-        SourceNamespacePreflightStage::TopologyProbe,
-        SourceNamespacePreflightStage::NamespaceInitialization,
-    ] {
-        for next_admitted in [false, true] {
-            let writer = queued_selection_test_lease(
-                retained.join(format!("{stage:?}-{next_admitted}.json")),
-            );
-            let worker = WorkerId::new("namespace-worker");
-            writer.admit(41, &worker).unwrap();
-            let wrapper = writer.wrapper_id();
-            let error = writer.source_namespace_preflight_failed(
-                &worker,
-                Some(41),
-                Some(&wrapper),
-                stage,
-                anyhow::anyhow!("SSH command timed out after 20s")
-                    .context("namespace transport failed"),
-            );
-            assert!(is_ssh_command_timeout_error(&error));
-            let failure = error
-                .downcast_ref::<SourceNamespacePreflightFailure>()
-                .unwrap()
-                .clone();
-            assert_eq!(failure.local_wrapper_id, wrapper);
-            assert_eq!(failure.worker_id, worker);
-            assert_eq!(failure.build_id, 41);
-            assert_eq!(failure.stage, stage);
-            assert_eq!(
-                classify_remote_pipeline_failure(&error),
-                RemotePipelineFailurePolicy::AllowLocalFallback
-            );
-            // Outer unconfirmed evidence always overrides retry eligibility.
-            let unconfirmed = error.context(crate::transfer::RemoteExecutionUnconfirmed);
-            assert_eq!(
-                classify_remote_pipeline_failure(&unconfirmed),
-                RemotePipelineFailurePolicy::FailClosedNoLocalFallback
-            );
-            let previous = writer.snapshot();
-            assert_eq!(read_retry_lease(&writer), previous);
-            assert_eq!(previous.exit_code, None);
-            assert_eq!(previous.phase, "source_namespace_preflight_failed");
-            assert!(previous.recovery.is_none());
-            assert!(!previous.terminal_acknowledged);
-            let bytes = std::fs::read(&writer.path).unwrap();
+    let stage = SourceNamespacePreflightStage::NamespaceInitialization;
+    for next_admitted in [false, true] {
+        let writer =
+            queued_selection_test_lease(retained.join(format!("{stage:?}-{next_admitted}.json")));
+        let worker = WorkerId::new("namespace-worker");
+        writer.admit(41, &worker).unwrap();
+        let wrapper = writer.wrapper_id();
+        let error = writer.source_namespace_preflight_failed(
+            &worker,
+            Some(41),
+            Some(&wrapper),
+            stage,
+            anyhow::anyhow!("SSH command timed out after 20s")
+                .context("namespace transport failed"),
+        );
+        assert!(is_ssh_command_timeout_error(&error));
+        let failure = error
+            .downcast_ref::<SourceNamespacePreflightFailure>()
+            .unwrap()
+            .clone();
+        assert_eq!(failure.local_wrapper_id, wrapper);
+        assert_eq!(failure.worker_id, worker);
+        assert_eq!(failure.build_id, 41);
+        assert_eq!(failure.stage, stage);
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::AllowLocalFallback
+        );
+        // Outer unconfirmed evidence always overrides retry eligibility.
+        let unconfirmed = error.context(crate::transfer::RemoteExecutionUnconfirmed);
+        assert_eq!(
+            classify_remote_pipeline_failure(&unconfirmed),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        let previous = writer.snapshot();
+        assert_eq!(read_retry_lease(&writer), previous);
+        assert_eq!(previous.exit_code, None);
+        assert_eq!(previous.phase, "source_namespace_preflight_failed");
+        assert!(previous.recovery.is_none());
+        assert!(!previous.terminal_acknowledged);
+        let bytes = std::fs::read(&writer.path).unwrap();
 
-            assert!(
-                dispatch_retry_selection(&writer, false, async || {
-                    panic!("an unconfirmed daemon release must prevent reselection")
-                })
-                .await
-                .is_err()
-            );
-            assert_eq!(writer.snapshot(), previous);
-            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
-
-            let error = confirm_source_namespace_preflight_release(
-                &writer,
-                &failure,
-                false,
-                "/not-contacted-preflight.sock",
-            )
-            .await
-            .unwrap_err();
-            assert!(is_remote_execution_unconfirmed(&error));
-            assert_eq!(writer.snapshot(), previous);
-            assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
-            let reply = namespace_preflight_completion_reply(&previous, false);
-            assert_eq!(
-                namespace_preflight_reply_fixture(
-                    &writer,
-                    &failure,
-                    format!("HTTP/1.1 200 OK\r\n\r\n{reply}").into_bytes(),
-                )
-                .await
-                .unwrap(),
-                SourceNamespacePreflightCompletion::Failed
-            );
-            let previous = writer.snapshot();
-            assert_eq!(previous.exit_code, Some(EXIT_BUILD_ERROR));
-            assert_eq!(read_retry_lease(&writer), previous);
-
-            let response = dispatch_retry_selection(&writer, true, async || {
-                assert_retry_pending(&writer, &previous);
-                if next_admitted {
-                    Ok(SelectionResponse {
-                        worker: Some(SelectedWorker {
-                            id: WorkerId::new("next-worker"),
-                            host: "not-contacted.invalid".into(),
-                            user: "test".into(),
-                            identity_file: "/unused/key".into(),
-                            slots_available: 4,
-                            speed_score: 90.0,
-                            declared_os: None,
-                            project_lane: 0,
-                            disk_budget: None,
-                        }),
-                        build_id: Some(42),
-                        reason: SelectionReason::Success,
-                        diagnostics: None,
-                    })
-                } else {
-                    Ok(retry_unassigned_response())
-                }
+        assert!(
+            dispatch_retry_selection(&writer, false, async || {
+                panic!("an unconfirmed daemon release must prevent reselection")
             })
             .await
-            .unwrap()
-            .unwrap();
+            .is_err()
+        );
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+
+        let error = confirm_source_namespace_preflight_release(
+            &writer,
+            &failure,
+            false,
+            "/not-contacted-preflight.sock",
+        )
+        .await
+        .unwrap_err();
+        assert!(is_remote_execution_unconfirmed(&error));
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        let reply = namespace_preflight_completion_reply(&previous, false);
+        assert_eq!(
+            namespace_preflight_reply_fixture(
+                &writer,
+                &failure,
+                format!("HTTP/1.1 200 OK\r\n\r\n{reply}").into_bytes(),
+            )
+            .await
+            .unwrap(),
+            SourceNamespacePreflightCompletion::Failed
+        );
+        let previous = writer.snapshot();
+        assert_eq!(previous.exit_code, Some(EXIT_BUILD_ERROR));
+        assert_eq!(read_retry_lease(&writer), previous);
+
+        let response = dispatch_retry_selection(&writer, true, async || {
+            assert_retry_pending(&writer, &previous);
             if next_admitted {
-                assert_retry_pending(&writer, &previous);
-                writer
-                    .admit(response.build_id.unwrap(), &response.worker.unwrap().id)
-                    .unwrap();
-                let next = read_retry_lease(&writer);
-                assert_eq!(next.identity.remote_build_id, Some(42));
-                assert_eq!(next.worker_id.as_deref(), Some("next-worker"));
-                assert!(next.recovery.is_none() && next.exit_code.is_none());
-                assert!(!next.terminal_acknowledged);
+                Ok(SelectionResponse {
+                    worker: Some(SelectedWorker {
+                        id: WorkerId::new("next-worker"),
+                        host: "not-contacted.invalid".into(),
+                        user: "test".into(),
+                        identity_file: "/unused/key".into(),
+                        slots_available: 4,
+                        speed_score: 90.0,
+                        declared_os: None,
+                        project_lane: 0,
+                        disk_budget: None,
+                    }),
+                    build_id: Some(42),
+                    reason: SelectionReason::Success,
+                    diagnostics: None,
+                })
             } else {
-                assert_eq!(writer.snapshot(), previous);
-                writer.acknowledge_terminal().unwrap();
-                let terminal = read_retry_lease(&writer);
-                assert!(terminal.terminal_acknowledged);
-                assert_eq!(terminal.exit_code, Some(EXIT_BUILD_ERROR));
-                assert!(terminal.recovery.is_none());
+                Ok(retry_unassigned_response())
             }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        if next_admitted {
+            assert_retry_pending(&writer, &previous);
+            writer
+                .admit(response.build_id.unwrap(), &response.worker.unwrap().id)
+                .unwrap();
+            let next = read_retry_lease(&writer);
+            assert_eq!(next.identity.remote_build_id, Some(42));
+            assert_eq!(next.worker_id.as_deref(), Some("next-worker"));
+            assert!(next.recovery.is_none() && next.exit_code.is_none());
+            assert!(!next.terminal_acknowledged);
+        } else {
+            assert_eq!(writer.snapshot(), previous);
+            writer.acknowledge_terminal().unwrap();
+            let terminal = read_retry_lease(&writer);
+            assert!(terminal.terminal_acknowledged);
+            assert_eq!(terminal.exit_code, Some(EXIT_BUILD_ERROR));
+            assert!(terminal.recovery.is_none());
         }
     }
 }
@@ -8521,7 +8833,7 @@ async fn namespace_preflight_receipts_fail_closed_without_recording_an_outcome()
         &worker,
         Some(41),
         Some(&wrapper),
-        SourceNamespacePreflightStage::TopologyProbe,
+        SourceNamespacePreflightStage::NamespaceInitialization,
         anyhow::anyhow!("SSH command timed out after 20s"),
     );
     let failure = error
@@ -8955,6 +9267,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             result_dirs: Vec::new(),
             disk_roots: vec!["/build-volume/target".into()],
             disk_peak_output_bytes: None,
+            disk_observation: None,
             cargo_stdout: None,
         });
         let faults = remote_release_faults(&result, &worker);
@@ -9005,6 +9318,7 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         result_dirs: Vec::new(),
         disk_roots: Vec::new(),
         disk_peak_output_bytes: None,
+        disk_observation: None,
         cargo_stdout: None,
     });
     assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
@@ -9041,6 +9355,7 @@ fn clean_overlay_disk_budget_diagnostic_survives_saturated_ui_and_unconfirmed_co
     let budget = rch_common::BuildDiskBudget {
         max_growth_bytes: 10 * rch_common::BuildDiskBudget::GIB,
         min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+        warm_policy: None,
     };
     let pipeline = TransferPipeline::new(
         PathBuf::from("/tmp/disk-diagnostic-capture"),
@@ -9162,6 +9477,7 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
                 max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
                 min_free_bytes: 13 * rch_common::BuildDiskBudget::GIB,
                 peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                required_growth_bytes: None,
                 detail: "guard stopped before ENOSPC".into(),
             };
             let error = anyhow::Error::new(failure.clone());
@@ -9204,6 +9520,95 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
             );
         }
     }
+}
+
+#[test]
+fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
+    let gib = rch_common::BuildDiskBudget::GIB;
+    let pool = rch_common::BuildDiskPool {
+        identity: [1; 32],
+        state: [2; 32],
+        retained_bytes: 80 * gib,
+    };
+    let worker = rch_common::SelectedWorker {
+        id: WorkerId::new("warm-worker"),
+        host: "worker.example".into(),
+        user: "builder".into(),
+        identity_file: "/test/key".into(),
+        slots_available: 8,
+        speed_score: 50.0,
+        declared_os: None,
+        project_lane: 0,
+        disk_budget: Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 3 * gib,
+            min_free_bytes: 10 * gib,
+            warm_policy: Some(rch_common::BuildDiskWarmPolicy {
+                cold_growth_bytes: 105 * gib,
+                pools: [Some(pool), None, None, None, None, None, None, None],
+            }),
+        }),
+    };
+    let refusal = crate::transfer::RemoteBuildDiskBudgetExceeded {
+        worker_id: worker.id.as_str().into(),
+        roots: vec!["/worker/pool".into()],
+        reason: "cold_required".into(),
+        started: false,
+        free_bytes: 220 * gib,
+        growth_bytes: 0,
+        max_growth_bytes: 3 * gib,
+        min_free_bytes: 10 * gib,
+        peak_output_bytes: Some(81 * gib),
+        required_growth_bytes: Some(105 * gib),
+        detail: "pool changed before launch".into(),
+    };
+    let error = anyhow::Error::new(refusal.clone());
+    assert_eq!(cold_disk_retry_gib(&error, &worker, true, false), Some(105));
+    assert_eq!(cold_disk_retry_gib(&error, &worker, false, false), None);
+    assert_eq!(cold_disk_retry_gib(&error, &worker, true, true), None);
+    let result = Err(anyhow::Error::new(refusal.clone()));
+    let faults = remote_release_faults(&result, &worker.id);
+    assert!(
+        !faults.worker_fault,
+        "a changed pool is not an unhealthy worker"
+    );
+    assert!(!faults.worker_disk_full);
+    for invalid in [
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            started: true,
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            worker_id: "other".into(),
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            growth_bytes: 1,
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            required_growth_bytes: Some(4 * gib),
+            ..refusal.clone()
+        },
+        crate::transfer::RemoteBuildDiskBudgetExceeded {
+            reason: "free_floor".into(),
+            ..refusal.clone()
+        },
+    ] {
+        assert_eq!(
+            cold_disk_retry_gib(&anyhow::Error::new(invalid), &worker, true, false),
+            None
+        );
+    }
+    let unconfirmed =
+        anyhow::Error::new(refusal).context(crate::transfer::RemoteExecutionUnconfirmed);
+    assert_eq!(
+        cold_disk_retry_gib(&unconfirmed, &worker, true, false),
+        None
+    );
+    assert_eq!(
+        classify_remote_pipeline_failure(&unconfirmed),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
 }
 
 #[test]
@@ -9356,7 +9761,15 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
         return;
     }
     use std::os::unix::fs::PermissionsExt as _;
-    let root = tempfile::tempdir().unwrap().keep();
+    // The clean-overlay guard below refuses a `.cargo/config*` in any ancestor
+    // of `source`. rch points TMPDIR inside the project it builds, and this
+    // repository has a `.cargo/config.toml`, so a default temp dir fails the
+    // guarded command with RCH-E413 when this test runs through rch.
+    let root = tempfile::Builder::new()
+        .prefix("rch-worker-cache-wrappers-")
+        .tempdir_in("/tmp")
+        .unwrap()
+        .keep();
     let bin = root.join("bin");
     let source = root.join("source");
     std::fs::create_dir(&bin).unwrap();
@@ -9397,6 +9810,8 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
         assert_eq!(output.stdout, b"cargo-body:check:--locked\n");
         assert_eq!(output.stderr, b"preparation-entered\n");
     }
+    // The tree is kept only for a failing run.
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -13017,6 +13432,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let custom_target_dir_path = project_dir.join(".rch-test-target-cache");
     let custom_target_dir = custom_target_dir_path.to_string_lossy().to_string();
 
@@ -13131,6 +13547,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
     let worker = SelectedWorker {
@@ -13327,6 +13744,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
 
@@ -13436,6 +13854,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
     temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
+    write_minimal_cargo_manifest(&project_dir);
 
     let prev_cwd = std::env::current_dir().ok();
     std::env::set_current_dir(&project_dir).expect("cd into project dir");
@@ -17879,44 +18298,64 @@ fn test_structured_log_output_per_tier() {
 /// `<unknown>` for a pinned clippy run.
 #[test]
 fn rustup_toolchain_from_command_tokens_parses_env_prefix_and_selector() {
-    let tokens = |cmd: &str| -> Vec<String> { cmd.split_whitespace().map(String::from).collect() };
+    let tokens = |command: &str| shell_words::split(command).unwrap();
+    for (command, expected) in [
+        (
+            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 CARGO_TARGET_DIR=/data/p/.rch-target cargo clippy --workspace -- -D warnings",
+            Some("nightly-2026-08-25"),
+        ),
+        ("RUSTUP_TOOLCHAIN=stable cargo clippy", Some("stable")),
+        ("cargo +nightly-2026-08-25 clippy", Some("nightly-2026-08-25")),
+        ("/usr/bin/cargo +beta build", Some("beta")),
+        ("env RUSTUP_TOOLCHAIN=stable cargo '+nightly' clippy", Some("nightly")),
+        ("cargo build --features +weird", None),
+        ("cargo test -- RUSTUP_TOOLCHAIN=payload", None),
+        ("go build ./...", None),
+    ] {
+        assert_eq!(
+            rustup_toolchain_from_command_tokens(&tokens(command)),
+            Ok(expected.map(str::to_owned)),
+            "{command}"
+        );
+    }
+    // Whole-command argv takes the same normalization path as execution.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&[
+            "env 'RUSTUP_TOOLCHAIN=stable' cargo '+nightly' build".to_owned(),
+        ]),
+        Ok(Some("nightly".to_owned()))
+    );
+    for command in [
+        "cargo +--help build",
+        "env RUSTUP_TOOLCHAIN=--help cargo build",
+        "RUSTUP_TOOLCHAIN= cargo clippy",
+        "env -u RUSTUP_TOOLCHAIN cargo build",
+        "env -S 'cargo +nightly' build",
+        "env env RUSTUP_TOOLCHAIN=nightly cargo +beta build",
+        "timeout 10 cargo +nightly build",
+    ] {
+        assert!(
+            rustup_toolchain_from_command_tokens(&tokens(command)).is_err(),
+            "unresolved must not become ambient: {command}"
+        );
+    }
+}
 
-    // The exact shape from issue #63.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens(
-            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 \
-             CARGO_TARGET_DIR=/data/p/.rch-target cargo clippy --workspace -- -D warnings"
-        )),
-        Some("nightly-2026-08-25".to_string())
-    );
-    // Bare env-assignment prefix (no `env`).
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN=stable cargo clippy")),
-        Some("stable".to_string())
-    );
-    // `cargo +<tc>` selector, including a path-qualified cargo.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("cargo +nightly-2026-08-25 clippy")),
-        Some("nightly-2026-08-25".to_string())
-    );
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("/usr/bin/cargo +beta build")),
-        Some("beta".to_string())
-    );
-    // A `+`-prefixed token NOT following cargo is an argument, not a selector.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("cargo build --features +weird")),
-        None
-    );
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("go build ./...")),
-        None
-    );
-    // Empty assignment is ignored.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN= cargo clippy")),
-        None
-    );
+#[test]
+fn rust_and_zig_jobs_require_toolchains_without_reinterpreting_opaque_jobs() {
+    for (command, expected) in [
+        ("cargo build", RequiredRuntime::Rust),
+        ("cargo +nightly clippy", RequiredRuntime::Rust),
+        ("cargo zigbuild", RequiredRuntime::Zig),
+        ("cargo +nightly zigbuild", RequiredRuntime::Zig),
+        ("rustc main.rs", RequiredRuntime::Rust),
+        ("bash ./build.sh", RequiredRuntime::None),
+        ("python3 build.py", RequiredRuntime::None),
+        ("go build ./...", RequiredRuntime::None),
+        ("echo preparing && cargo build", RequiredRuntime::None),
+    ] {
+        assert_eq!(required_runtime_for_job(command), expected, "{command}");
+    }
 }
 
 /// Issue #63(c): explicit `--job` admission counts as strict-remote once

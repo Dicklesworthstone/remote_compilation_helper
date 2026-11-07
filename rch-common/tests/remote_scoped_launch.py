@@ -130,7 +130,7 @@ rch_policy_enter_scope() {
 }
 rch_scope_operation() {
     # Explicit admission-observation fault injection. The real launcher still
-    # owns the gate, records, child birth checks, cancellation and retry cap.
+    # owns the gate, records, child birth checks, cancellation and retry deadline.
     # Keep cleanup on the ordinary backend so a failed admission can be
     # distinguished from an unconfirmed stop of the setup process.
     if [ "$1" = state ] && { [ "$0" = rch-build ] || [ "$0" = rch-process-health ]; } &&
@@ -142,6 +142,18 @@ rch_scope_operation() {
         fi
         rch_fixture_attempt=$((rch_fixture_attempt + 1))
         printf '%s\n' "$rch_fixture_attempt" > "$RCH_TEST_ROOT/admission-attempts"
+        if [ -n "${RCH_TEST_ADMISSION_TICKS:-}" ]; then
+            rch_fixture_clock_offset=0
+            if [ -f "$RCH_TEST_ROOT/admission-clock-offset" ]; then
+                read -r rch_fixture_clock_offset < "$RCH_TEST_ROOT/admission-clock-offset" || return 2
+            fi
+            printf '%s\n' "$((rch_fixture_clock_offset + RCH_TEST_ADMISSION_TICKS))" \
+                > "$RCH_TEST_ROOT/admission-clock-offset" || return 2
+        fi
+        if [ "${RCH_TEST_ADMISSION_FREEZE:-0}" = 1 ] &&
+            [ ! -e "$RCH_TEST_ROOT/admission-frozen-clock" ]; then
+            printf '%s\n' "$rch_launch_now" > "$RCH_TEST_ROOT/admission-frozen-clock" || return 2
+        fi
         if [ -e "$__sl_control/go" ]; then
             printf 'gate opened before admission proof\n' > "$RCH_TEST_ROOT/unsafe-admission"
         fi
@@ -359,6 +371,61 @@ class ScriptTransport(unittest.TestCase):
         return subprocess.run([SHELL, "-c", script, "rch-observer", *args],
                               capture_output=True, timeout=10, **options)
 
+    @staticmethod
+    def timing_env(scale):
+        env = dict(os.environ)
+        env.pop("RCH_TIMING_SCALE", None)
+        if scale is not None:
+            env["RCH_TIMING_SCALE"] = scale
+        return env
+
+    def test_worker_scale_validates_fractional_caps_and_default(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + "\nrch_timing_budget 5; printf '%s:' \"$rch_timing_scaled\"\n"
+        command += "rch_timing_budget 200; printf '%s\\n' \"$rch_timing_scaled\"\n"
+        for scale, expected in ((None, b"5:200\n"), ("1", b"5:200\n"),
+                                ("2", b"10:400\n"), ("1.25", b"7:250\n"),
+                                ("10", b"50:2000\n")):
+            with self.subTest(scale=scale):
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (0, expected, b""))
+
+    def test_invalid_worker_scale_refuses_before_command_evaluation(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        for scale in ("", "0", "0.99", "-1", "10.1", "NaN", "inf", "-inf",
+                      "1e9999", "1e-9999", " 2", "2 ", "1_0",
+                      "1;printf INJECTED", "$(printf INJECTED)"):
+            with self.subTest(scale=scale):
+                result = self.invoke(core + "\nprintf UNEXPECTED\n",
+                                     env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout), (125, b""))
+                self.assertIn(b"invalid RCH_TIMING_SCALE", result.stderr)
+                self.assertNotIn(b"INJECTED", result.stderr)
+
+    def test_scaled_control_capture_admits_delayed_success(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + "\nrch_control_capture 1s /bin/sh -c 'sleep 1.4; printf ready'\n"
+        for scale, succeeds in (("1", False), ("2", True), ("1.25", True)):
+            with self.subTest(scale=scale):
+                started = time.monotonic()
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertEqual(result.stdout, b"ready" if succeeds else b"")
+
+    def test_scaled_capture_cannot_disable_near_exhausted_deadline(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + """
+rch_observation_clock_checked || exit 99
+rch_observation_deadline=$((rch_observation_now + 50))
+rch_control_capture 1s /bin/sh -c 'printf UNEXPECTED'
+"""
+        for scale in ("1", "2", "1.25", "10"):
+            with self.subTest(scale=scale):
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout), (125, b""))
+
     def test_one_literal_hydrates_the_exact_child_program(self):
         source = protocol(instrument=False)
         core = (SOURCE / "remote_process.sh").read_text()
@@ -518,27 +585,57 @@ class ScopedLaunch(unittest.TestCase):
                 self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
                 self.assertNotIn("IDENTITY_UNAVAILABLE", (job / "stderr").read_text())
 
+    def admission_clock_protocol(self) -> str:
+        # Keep real child identities, receipts, resource observations, gates,
+        # cancellation and cleanup. Only the supervisor clock is controlled.
+        launch = (SOURCE / "remote_scoped_launch.sh").read_text()
+        self.assertEqual(launch.count("rch_scope_launch_clock() {"), 1)
+        adapted = launch.replace(
+            "rch_scope_launch_clock() {", "rch_fixture_launch_clock() {",
+        ) + r'''
+rch_scope_launch_clock() {
+    rch_fixture_launch_clock || return 1
+    case "$0" in
+        rch-build|rch-process-health)
+            if [ -f "$RCH_TEST_ROOT/admission-frozen-clock" ]; then
+                read -r rch_launch_now < "$RCH_TEST_ROOT/admission-frozen-clock" || return 1
+            elif [ -f "$RCH_TEST_ROOT/admission-clock-offset" ]; then
+                read -r rch_fixture_clock_offset < "$RCH_TEST_ROOT/admission-clock-offset" || return 1
+                rch_launch_now=$((rch_launch_now + rch_fixture_clock_offset))
+            fi;;
+    esac
+}
+'''
+        source = protocol()
+        self.assertEqual(source.count(launch), 1)
+        return source.replace(launch, adapted)
+
     def test_transient_unknown_admission_retries_before_running_payload_once(self) -> None:
-        # Issue #129: most reported jobs never passed admission. A pair of
-        # unavailable scope observations must not abandon a healthy third
-        # observation or run the payload before the proof is available.
-        proc, job, record = self.start(code=23, env={
-            **self.env, "RCH_TEST_ADMISSION_FAILURES": "2",
-        })
-        self.finish(proc, job, 23)
-        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
-        self.assertFalse((self.root / "unsafe-admission").exists())
-        self.assertEqual(len((job / "executions").read_text().splitlines()), 1)
-        self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
-        self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
-        self.assertEqual(self.recover(record).returncode, 0)
+        for failures in (2, 4):
+            with self.subTest(failures=failures):
+                (self.root / "admission-attempts").write_text("0\n")
+                proc, job, record = self.start(str(40 + failures), code=23, env={
+                    **self.env, "RCH_TIMING_SCALE": "1",
+                    "RCH_TEST_ADMISSION_FAILURES": str(failures),
+                })
+                self.finish(proc, job, 23)
+                self.assertFalse((self.root / "unsafe-admission").exists())
+                self.assertEqual(len((job / "executions").read_text().splitlines()), 1)
+                self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
+                self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
+                self.assertEqual(self.recover(record).returncode, 0)
 
     def test_persistent_unknown_admission_is_bounded_and_never_runs_payload(self) -> None:
-        proc, job, record = self.start(env={
-            **self.env, "RCH_TEST_ADMISSION_FAILURES": "99",
-        })
+        proc, job, record = self.start(
+            script=self.admission_clock_protocol(),
+            env={
+                **self.env, "RCH_TIMING_SCALE": "1",
+                "RCH_TEST_ADMISSION_FAILURES": "99",
+                "RCH_TEST_ADMISSION_TICKS": "1200",
+            },
+        )
         self.finish(proc, job, 255)
-        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
+        self.assertEqual((self.root / "admission-clock-offset").read_text(), "6000\n")
         self.assertFalse((self.root / "unsafe-admission").exists())
         self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
         self.assertFalse((job / "executions").exists())
@@ -557,6 +654,55 @@ class ScopedLaunch(unittest.TestCase):
         self.assertEqual(replay.returncode, 255, replay.stderr)
         self.assertEqual(replay.stdout, "")
         self.assertIn("RCH_SCOPED_LAUNCH_ALREADY_OWNED", replay.stderr)
+
+    def test_scaled_unknown_admission_expires_without_opening_gate(self) -> None:
+        for index, (scale, ticks, expected_offset) in enumerate(
+            (("2", "2400", "12000\n"), ("10", "12000", "60000\n")),
+            start=201,
+        ):
+            with self.subTest(scale=scale):
+                (self.root / "admission-attempts").write_text("0\n")
+                (self.root / "admission-clock-offset").write_text("0\n")
+                proc, job, record = self.start(
+                    str(index), script=self.admission_clock_protocol(),
+                    env={
+                        **self.env, "RCH_TIMING_SCALE": scale,
+                        "RCH_TEST_ADMISSION_FAILURES": "99",
+                        "RCH_TEST_ADMISSION_TICKS": ticks,
+                    },
+                )
+                self.finish(proc, job, 255)
+                self.assertEqual(
+                    (self.root / "admission-clock-offset").read_text(),
+                    expected_offset,
+                )
+                self.assertFalse((self.root / "unsafe-admission").exists())
+                self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+                self.assertFalse((job / "executions").exists())
+                self.assertFalse((job / "artifact").exists())
+                before = (record.stat().st_ino, record.read_bytes())
+                self.assertEqual(self.recover(record).returncode, 0)
+                self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
+
+    def test_frozen_admission_clock_cannot_wait_or_open_gate(self) -> None:
+        proc, job, record = self.start(
+            script=self.admission_clock_protocol(),
+            env={
+                **self.env, "RCH_TIMING_SCALE": "10",
+                "RCH_TEST_ADMISSION_FAILURES": "99",
+                "RCH_TEST_ADMISSION_FREEZE": "1",
+            },
+        )
+        self.finish(proc, job, 255)
+        self.assertEqual((self.root / "admission-attempts").read_text(), "1\n")
+        self.assertTrue((self.root / "admission-frozen-clock").exists())
+        self.assertFalse((self.root / "unsafe-admission").exists())
+        self.assertFalse((Path(str(record) + ".supervisor.v1") / "go").exists())
+        self.assertFalse((job / "executions").exists())
+        self.assertFalse((job / "artifact").exists())
+        before = (record.stat().st_ino, record.read_bytes())
+        self.assertEqual(self.recover(record).returncode, 0)
+        self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
 
     def test_known_empty_admission_is_not_retried_as_transient_unknown(self) -> None:
         proc, job, record = self.start(env={
@@ -636,8 +782,9 @@ rch_scope_launch_clock() {
         self.assertEqual(self.recover(record).returncode, 0)
         self.assertEqual((record.stat().st_ino, record.read_bytes()), before)
 
-    def health_probe(self, env=None):
-        return subprocess.run([SHELL, "-c", protocol() + "\nrch_process_health_probe\n",
+    def health_probe(self, env=None, script=None):
+        source = protocol() if script is None else script
+        return subprocess.run([SHELL, "-c", source + "\nrch_process_health_probe\n",
                                "rch-health-observer"],
                               env={**self.env, "TMPDIR": str(self.root), **(env or {})},
                               capture_output=True, text=True, timeout=40)
@@ -650,10 +797,17 @@ rch_scope_launch_clock() {
                          "confirmed probe should retire its private scratch receipts")
 
     def test_health_probe_does_not_restore_capacity_after_failed_admission(self) -> None:
-        result = self.health_probe({"RCH_TEST_ADMISSION_FAILURES": "99"})
+        result = self.health_probe(
+            {
+                "RCH_TIMING_SCALE": "1",
+                "RCH_TEST_ADMISSION_FAILURES": "99",
+                "RCH_TEST_ADMISSION_TICKS": "1200",
+            },
+            script=self.admission_clock_protocol(),
+        )
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("RCH_PROCESS_HEALTH_V1", result.stdout)
-        self.assertEqual((self.root / "admission-attempts").read_text(), "3\n")
+        self.assertEqual((self.root / "admission-clock-offset").read_text(), "6000\n")
         retained = list(self.root.glob("rch-process-health.*/receipt"))
         self.assertEqual(len(retained), 1)
         self.assertFalse((Path(str(retained[0]) + ".supervisor.v1") / "go").exists())

@@ -23,9 +23,9 @@ use rabs_protocol::metadata_prefetch::VERSION as METADATA_PREFETCH_VERSION;
 use rabs_protocol::worker_standby::{self, WorkerStandby};
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_NATIVE_METADATA_CAPABILITY,
-    CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION,
-    CANONICAL_WORKSPACE_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost,
-    DependencyExecutionMode,
+    CANONICAL_NATIVE_MODIFIERS_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY,
+    CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION,
+    DEPENDENCY_CONTEXT_VERSION, DependencyExecutionHost, DependencyExecutionMode,
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{
@@ -43,9 +43,9 @@ use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
-    CanonicalExecRequest, ExecutionResources, UploadedInputs, execute_canonical_controlled,
-    execute_uploaded_canonical_controlled, parse_command_context, parse_dependency_context,
-    probe_capability, sample_load_x100, sample_pressure,
+    CanonicalExecRequest, ExecutionResources, PressureSample, UploadedInputs,
+    execute_canonical_controlled, execute_uploaded_canonical_controlled, parse_command_context,
+    parse_dependency_context, probe_capability,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceCache, SourceOwner};
@@ -57,6 +57,7 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::path::PathBuf;
 use std::pin::{Pin, pin};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,142 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 const OUTPUT_TRANSFER: &str = "ranges-v1";
 const INPUT_DEADLINE_EXCEEDED: &str = "input-upload-deadline-exceeded";
 const SESSION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+const PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct PressureState {
+    sample: Option<(Instant, PressureSample)>,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct SharedPressure {
+    state: Mutex<PressureState>,
+    stop: Condvar,
+}
+
+/// Reactor-side handle: never probes a filesystem or waits for the sampler.
+/// One fixed slot retains only the most recent completed observation.
+#[derive(Clone, Default)]
+struct PressureMonitor {
+    shared: Arc<SharedPressure>,
+}
+
+impl PressureMonitor {
+    fn snapshot(&self) -> PressureSample {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> PressureSample {
+        // Even the sampler's short publication lock must not delay a lease or
+        // cancellation. Contention and poisoned state mean unknown pressure.
+        let Ok(state) = self.shared.state.try_lock() else {
+            return PressureSample::default();
+        };
+        if state.stopped {
+            return PressureSample::default();
+        }
+        state
+            .sample
+            .filter(|(started, _)| {
+                now.checked_duration_since(*started)
+                    .is_some_and(|age| age < worker_standby::LOAD_MAX_AGE)
+            })
+            .map_or_else(PressureSample::default, |(_, sample)| sample)
+    }
+}
+
+/// The supervisor retains exactly one sampler across all connections. A slow
+/// probe cannot enqueue more work, retain unbounded results, or delay control
+/// traffic. Only this owner can stop/join the thread, outside the native reactor
+/// after session cleanup. A blocked kernel call can still delay that final join;
+/// it is never detached to manufacture a clean shutdown.
+struct PressureSampler {
+    monitor: PressureMonitor,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PressureSampler {
+    fn spawn(
+        mut probe: impl FnMut() -> PressureSample + Send + 'static,
+        interval: Duration,
+    ) -> io::Result<Self> {
+        let monitor = PressureMonitor::default();
+        let shared = Arc::clone(&monitor.shared);
+        let thread = std::thread::Builder::new()
+            .name("rabs-pressure".to_owned())
+            .spawn(move || {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if state.stopped {
+                        return;
+                    }
+                    drop(state);
+                    // Age from the probe's start, not publication: a stalled
+                    // disk query must not refresh an old CPU-load observation.
+                    let started = Instant::now();
+                    let sampled =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut probe));
+                    state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.stopped {
+                        return;
+                    }
+                    match sampled {
+                        Ok(sample) => state.sample = Some((started, sample)),
+                        Err(_) => {
+                            state.sample = None;
+                            state.stopped = true;
+                            drop(state);
+                            eprintln!(
+                                "rabs-wkr: pressure sampler panicked; measurements unavailable"
+                            );
+                            return;
+                        }
+                    }
+                    // Shutdown wakes this wait immediately. No sleeping worker
+                    // or queued request survives the supervisor's final join.
+                    let (next, _) = shared
+                        .stop
+                        .wait_timeout_while(state, interval, |state| !state.stopped)
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = next;
+                }
+            })?;
+        Ok(Self {
+            monitor,
+            thread: Some(thread),
+        })
+    }
+
+    fn monitor(&self) -> PressureMonitor {
+        self.monitor.clone()
+    }
+}
+
+impl Drop for PressureSampler {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .monitor
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.stopped = true;
+            state.sample = None;
+            self.monitor.shared.stop.notify_one();
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("rabs-wkr: pressure sampler join failed; measurements unavailable");
+        }
+    }
+}
+
+fn worker_cargo_home() -> PathBuf {
+    std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()))
+}
 
 /// A mode alone does not identify the namespace's path semantics. Preserve the
 /// exact version selected by authenticated admission until each request has
@@ -628,6 +765,39 @@ fn main() {
         println!("{info}");
         return;
     }
+    // Preserve native path bytes for this operator mode. It owns no worker
+    // incarnation or execution journal, and cannot run beside a supervisor
+    // holding the configured durable cache's ordinary exclusive lock.
+    let mut native_args = std::env::args_os().skip(1);
+    if native_args
+        .next()
+        .is_some_and(|arg| arg == "--warm-toolchain")
+    {
+        let Some(source) = native_args.next().filter(|_| native_args.next().is_none()) else {
+            eprintln!("usage: rabs-wkr --warm-toolchain <absolute-source-directory>");
+            std::process::exit(2);
+        };
+        let started = Instant::now();
+        let outcome =
+            rabs_wkr::session::ToolchainReuseScope::from_environment().and_then(|scope| {
+                scope.warm_toolchain(&PathBuf::from(source), || {
+                    started.elapsed() >= rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET
+                })
+            });
+        match outcome {
+            Ok(identity) => println!(
+                "{}",
+                serde_json::json!({"kind":"worker-toolchain-prewarmed",
+                    "sha256":source_transfer::hex(&identity.sha256),
+                    "files":identity.files,"bytes":identity.bytes})
+            ),
+            Err(error) => {
+                eprintln!("toolchain warming failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {
@@ -638,6 +808,9 @@ fn main() {
             println!(
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
                  USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once] [--source-cache-bytes N] [--target-cache-bytes N] [--target-cache-epoch NAME]\n\
+                 OR: rabs-wkr --warm-toolchain <absolute-source-directory>\n\
+                 Warm compiler inputs before startup using explicit RABS_WORKER_TOOLCHAIN_CACHE_DIR and nonzero RABS_WORKER_TOOLCHAIN_CACHE_BYTES; the cache must be unowned.\n\
+                 Warming retains full dataset verification, quotas and the existing 30-minute preparation bound; it neither executes a compiler nor caches a build result.\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Reconnects with bounded backoff after session loss; execution is never replayed.\n\
                  --once performs one session only, without reconnecting.\n\
@@ -943,6 +1116,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, line: &str) -> io::R
 /// Standby owns only an authenticated transport. Keep its liveness clocks
 /// outside the bounded application-admission phase, and retain this exact
 /// reader when the coordinator eventually sends a fresh challenge.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_worker_admission<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     reader: &mut FrameReader,
@@ -951,6 +1125,7 @@ async fn wait_for_worker_admission<S: AsyncRead + AsyncWrite + Unpin>(
     confirmed_standby_for: &mut Option<Duration>,
     idle_timeout: Duration,
     pong_timeout: Duration,
+    pressure: PressureMonitor,
 ) -> Result<String, String> {
     let mut standby = WorkerStandby::new();
     let mut standby_started = None;
@@ -1004,7 +1179,7 @@ async fn wait_for_worker_admission<S: AsyncRead + AsyncWrite + Unpin>(
                     .map_err(|error| format!("worker standby ping: {error}"))?;
                 let pong = serde_json::json!({
                     "kind":"standby-pong", "version":worker_standby::VERSION,
-                    "sequence":sequence, "load_x100":sample_load_x100(),
+                    "sequence":sequence, "load_x100":pressure.snapshot().load_x100,
                 })
                 .to_string();
                 standby_io(pong_timeout, "pong write", write_frame(stream, &pong)).await?;
@@ -2068,11 +2243,12 @@ fn worker_hello(
     report: &rabs_wkr::session::CapabilityReport,
     journal: &WorkerJournal,
     toolchain_file_cache_enabled: bool,
+    load_x100: Option<u64>,
 ) -> String {
     serde_json::json!({
         "kind": "worker-hello", "worker_id": report.worker_id,
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
-        "load_x100": sample_load_x100(),
+        "load_x100": load_x100,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "output_previews": [OUTPUT_PREVIEW_VERSION],
         "metadata_prefetches": if cfg!(target_os = "linux") { vec![METADATA_PREFETCH_VERSION] } else { Vec::<&str>::new() },
@@ -2083,7 +2259,7 @@ fn worker_hello(
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
-        "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY],
+        "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_NATIVE_MODIFIERS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
             .map(|mode| mode.as_str()).collect::<Vec<_>>(),
         "dependency_execution_hosts": DependencyExecutionHost::native().into_iter()
@@ -2141,6 +2317,7 @@ fn prepare_runtime_directory(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session_loop(
     cx: &Cx,
     coordinator: &str,
@@ -2149,6 +2326,7 @@ async fn session_loop(
     journal: &mut WorkerJournal,
     health: &mut reconnect::SessionHealth,
     resources: reconnect::RuntimeResources,
+    pressure: PressureMonitor,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
@@ -2176,6 +2354,7 @@ async fn session_loop(
                 report,
                 journal,
                 resources.toolchain_file_cache.is_some(),
+                pressure.snapshot().load_x100,
             ))
             .map_err(|e| format!("local worker hello: {e}"))?;
             if let Some(identity) = local_identity {
@@ -2214,6 +2393,7 @@ async fn session_loop(
         &mut health.confirmed_standby_for,
         worker_standby::IDLE_TIMEOUT,
         worker_standby::PONG_TIMEOUT,
+        pressure.clone(),
     )
     .await?;
     let (
@@ -2339,7 +2519,7 @@ async fn session_loop(
     )
     .await
     .map_err(|_| "worker session admission deadline exceeded".to_owned())??;
-    let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
+    let cargo_home = worker_cargo_home();
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
     for path in [&cargo_home, &home, &spills] {
@@ -2441,7 +2621,7 @@ async fn session_loop(
                 id, timeout, artifacts, retention, lease, execute,
             )
         },
-        || sample_pressure(&cargo_home),
+        || pressure.snapshot(),
     )
     .await;
     journal.clear_result_recipient();
@@ -2758,6 +2938,90 @@ mod tests {
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn pressure_snapshot_expires_from_probe_start_and_preserves_unknown_metrics() {
+        let monitor = PressureMonitor::default();
+        let started = Instant::now();
+        assert_eq!(monitor.snapshot_at(started), PressureSample::default());
+        let partial = PressureSample {
+            load_x100: Some(0),
+            free_disk_mib: None,
+        };
+        monitor.shared.state.lock().unwrap().sample = Some((started, partial));
+        assert_eq!(monitor.snapshot_at(started), partial);
+        assert_eq!(
+            monitor.snapshot_at(started + worker_standby::LOAD_MAX_AGE),
+            PressureSample::default(),
+        );
+        // A late completion is still aged from the start of its probe. Neither
+        // an unknown disk measurement nor a known idle CPU is synthesized.
+        monitor.shared.state.lock().unwrap().sample = Some((started, pressure()));
+        assert_eq!(
+            monitor.snapshot_at(started + worker_standby::LOAD_MAX_AGE),
+            PressureSample::default(),
+        );
+    }
+
+    #[test]
+    fn pressure_sampler_stop_wakes_idle_thread_and_invalidates_surviving_handles() {
+        let sampler = PressureSampler::spawn(pressure, Duration::from_secs(20)).unwrap();
+        let monitor = sampler.monitor();
+        let until = Instant::now() + Duration::from_secs(5);
+        while monitor.snapshot() != pressure() {
+            assert!(
+                Instant::now() < until,
+                "initial pressure probe did not finish"
+            );
+            std::thread::yield_now();
+        }
+        let (done, joined) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            drop(sampler);
+            done.send(()).unwrap();
+        });
+        let completed = joined.recv_timeout(Duration::from_secs(5));
+        // Join even on a failed timing assertion, so the test itself does not
+        // abandon the owned sampler it is checking.
+        shutdown.join().unwrap();
+        completed.expect("shutdown waited for the sampler's idle interval");
+        assert_eq!(monitor.snapshot(), PressureSample::default());
+    }
+
+    #[test]
+    fn pressure_sampler_failure_clears_last_sample_without_restarting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (entered, entering) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let sampler = PressureSampler::spawn(
+            move || {
+                if worker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return pressure();
+                }
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+                panic!("injected pressure probe failure");
+            },
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let monitor = sampler.monitor();
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(monitor.snapshot(), pressure());
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !monitor.shared.state.lock().unwrap().stopped {
+            assert!(
+                Instant::now() < until,
+                "failed pressure sampler did not stop"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(monitor.snapshot(), PressureSample::default());
+        drop(sampler);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn source_cache_settings_enable_bounded_default_and_allow_explicit_disable() {
@@ -3141,8 +3405,8 @@ mod tests {
     }
     fn pressure() -> rabs_wkr::session::PressureSample {
         rabs_wkr::session::PressureSample {
-            load_x100: 10,
-            free_disk_mib: 100,
+            load_x100: Some(10),
+            free_disk_mib: Some(100),
         }
     }
     fn result(id: u64) -> rabs_wkr::session::ExecResult {
@@ -3649,6 +3913,7 @@ mod tests {
                     &mut health.confirmed_standby_for,
                     worker_standby::IDLE_TIMEOUT,
                     worker_standby::PONG_TIMEOUT,
+                    PressureMonitor::default(),
                 ))
                 .unwrap(),
                 challenge,
@@ -3791,6 +4056,7 @@ mod tests {
                 &mut health.confirmed_standby_for,
                 worker_standby::IDLE_TIMEOUT,
                 worker_standby::PONG_TIMEOUT,
+                PressureMonitor::default(),
             ));
             (outcome, wire.replies(), health)
         }
@@ -3944,6 +4210,7 @@ mod tests {
                             &mut health.confirmed_standby_for,
                             Duration::from_millis(20),
                             Duration::from_millis(20),
+                            PressureMonitor::default(),
                         ),
                     )
                     .await
@@ -3974,6 +4241,7 @@ mod tests {
                     &mut confirmed_standby_for,
                     worker_standby::IDLE_TIMEOUT,
                     worker_standby::PONG_TIMEOUT,
+                    PressureMonitor::default(),
                 ));
                 poll_fn(|task| {
                     assert!(standby.as_mut().poll(task).is_pending());
@@ -4962,7 +5230,8 @@ mod tests {
             .admit(&request(80), DEFAULT_EXECUTION_TIMEOUT)
             .unwrap();
         let hello: serde_json::Value =
-            serde_json::from_str(&worker_hello(&report(), &journal, false)).unwrap();
+            serde_json::from_str(&worker_hello(&report(), &journal, false, None)).unwrap();
+        assert!(hello["load_x100"].is_null());
         assert_eq!(hello["boot_generation"], journal.boot_generation().0);
         assert_eq!(
             hello["incarnation"],
@@ -4971,7 +5240,8 @@ mod tests {
         assert_eq!(hello["request_high_water"], 80);
         assert_eq!(hello["toolchain_file_reuses"], serde_json::json!([]));
         let file_reuse: serde_json::Value =
-            serde_json::from_str(&worker_hello(&report(), &journal, true)).unwrap();
+            serde_json::from_str(&worker_hello(&report(), &journal, true, Some(0))).unwrap();
+        assert_eq!(file_reuse["load_x100"], 0);
         assert_eq!(
             file_reuse["toolchain_file_reuses"],
             serde_json::json!([TOOLCHAIN_FILE_REUSE_VERSION])

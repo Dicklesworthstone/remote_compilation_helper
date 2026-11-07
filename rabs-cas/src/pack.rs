@@ -334,9 +334,9 @@ pub fn record_pack_member_locations(
             .binary_search_by(|m| m.key.as_str().cmp(key.as_str()))
         {
             let member = &index.members[i];
-            store.record_object(digest, member.length)?;
-            store.add_location(
+            store.record_object_location(
                 digest,
+                member.length,
                 &format!("{pack_path}#{}", member.offset),
                 None,
                 PACK_PROFILE_V1,

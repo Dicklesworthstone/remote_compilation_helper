@@ -34,7 +34,7 @@ import json, os, signal, sys
 keys = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC", "RUSTUP_TOOLCHAIN",
         "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_MAKEFLAGS", "RABS_SOCKET_PATH",
         "RABS_STATE_DIR", "RABS_CONFIG", "RABS_BREAKER_FILE", "CARGO_TARGET_DIR",
-        "RABS_REUSE_CARGO_LAYOUT", "RABS_DEPENDENCY_WORKERS_JSON"]
+        "RABS_REUSE_CARGO_LAYOUT", "RABS_DEPENDENCY_WORKERS_JSON", "TMPDIR"]
 value = {"argv": [os.fsencode(x).hex() for x in sys.argv[1:]],
          "env": {k: os.environ[k] for k in keys if k in os.environ},
          "pid": os.getpid(), "cwd": os.getcwd()}
@@ -79,7 +79,7 @@ sys.exit(int(os.environ.get("TEST_RCH_STATUS", "0")))
 '''
 
 DAEMON = r'''
-import json, os, pathlib, socket, sys, time
+import json, os, pathlib, socket, sys, tempfile, time
 root = pathlib.Path(os.environ["TEST_ROOT"])
 path = os.environ["RABS_SOCKET_PATH"]
 mode = os.environ.get("TEST_CONFIG", "good")
@@ -102,6 +102,7 @@ with open(root / "starts", "a") as f:
     f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgrp(),
                         "live": os.environ.get("RABS_LIVE_DEPENDENCY"),
                         "layout": os.environ.get("RABS_REUSE_CARGO_LAYOUT"),
+                        "tmpdir": os.environ.get("TMPDIR"),
                         "pool": os.environ.get("RABS_DEPENDENCY_WORKERS_JSON")}) + "\n")
 if os.environ.get("TEST_START_GATE"):
     gate = pathlib.Path(os.environ["TEST_START_GATE"])
@@ -142,6 +143,15 @@ while running and time.monotonic() < end and root.exists():
         try:
             reader = peer.makefile("rb")
             request = json.loads(reader.readline())
+            if request.get("kind") == "test-tempfile":
+                # This fixture proves child environment/lifetime only. Real
+                # RABS cache delivery is qualified by the separate public run.
+                with tempfile.NamedTemporaryFile(dir=os.environ["TMPDIR"], delete=False) as staging:
+                    staging.write(b"daemon staging after source retirement")
+                    name = staging.name
+                peer.sendall(json.dumps({"kind":"test-tempfile", "path":name}).encode() + b'\n')
+                reader.close()
+                continue
             if request.get("kind") == "test-stop":
                 running = False
                 reader.close()
@@ -372,6 +382,37 @@ os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
         self.assertEqual(first["env"]["RUSTC_WRAPPER"], second["env"]["RUSTC_WRAPPER"])
         self.assertEqual(self.endpoint.stat().st_ino, identity)
         self.assertEqual(len(self.starts()), 1)
+
+    def test_daemon_staging_survives_retired_cargo_tmpdir_without_changing_cargo(self):
+        first_tmp = self.root / "first-job-tmp"
+        first_tmp.mkdir()
+        first = self.cargo_result(self.launch(["--rabs-require-daemon", "check"],
+                                             {"TMPDIR": str(first_tmp)}))
+        identity = rabs.socket_identity(self.endpoint)
+        first_tmp.rename(self.root / "retired-first-job-tmp")
+        second_tmp = self.root / "second-job-tmp"
+        second_tmp.mkdir()
+        second = self.cargo_result(self.launch(["--rabs-no-start", "--rabs-require-daemon", "check"],
+                                              {"TMPDIR": str(second_tmp)}))
+        self.assertEqual(first["env"]["TMPDIR"], str(first_tmp))
+        self.assertEqual(second["env"]["TMPDIR"], str(second_tmp))
+        self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+        self.assertEqual(len(self.starts()), 1)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(2)
+            peer.connect(str(self.endpoint))
+            peer.sendall(b'{"kind":"test-tempfile"}\n')
+            with peer.makefile("rb") as reader:
+                reply = json.loads(reader.readline())
+        self.assertEqual(reply["kind"], "test-tempfile")
+        staging = Path(reply["path"])
+        private = self.root / "state/cargo-launcher"
+        self.assertEqual(staging.parent, private)
+        self.assertEqual(self.starts()[0]["tmpdir"], str(private))
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(staging.stat().st_mode), 0o600)
+        self.assertEqual(staging.read_bytes(), b"daemon staging after source retirement")
+        self.assertFalse(first_tmp.exists())
 
     def test_explicit_layout_policy_is_preserved_for_daemon_and_cargo(self):
         value = self.cargo_result(self.launch(changes={"RABS_REUSE_CARGO_LAYOUT": "0"}))

@@ -47,7 +47,7 @@ mod tests {
     use crate::toolchain::{ToolchainInfo, wrap_command_with_toolchain_policy};
 
     #[test]
-    fn activation_preserves_rustup_cargo_selection_after_environment_controls() {
+    fn activation_consumes_the_cargo_selector_before_direct_rustup_handoff() {
         let tc = ToolchainInfo::new("nightly", Some("2026-08-31".into()), "");
         let suffix = "cargo +nightly build --manifest-path 'a b/Cargo.toml'";
         let prefix = "env -u RUSTC_WRAPPER RUSTFLAGS='-C debuginfo=0' ";
@@ -56,7 +56,7 @@ mod tests {
         assert_eq!(
             result,
             format!(
-                "{prefix}{} rustup run nightly-2026-08-31 {suffix}",
+                "{prefix}{} rustup run nightly cargo build --manifest-path 'a b/Cargo.toml'",
                 runner_for(&command).unwrap()
             )
         );
@@ -114,11 +114,11 @@ mod tests {
 
     #[test]
     fn opaque_arguments_and_toolchain_names_remain_shell_quoted() {
-        let tc = ToolchainInfo::new("nightly; echo injected", None, "");
+        let tc = ToolchainInfo::new("nightly;echo_injected", None, "");
         let command = "cargo build --features 'x y' > 'output file'";
         let wrapped = wrap_command_with_toolchain_policy(command, Some(&tc), true);
         assert!(wrapped.starts_with("sh -c "));
-        assert!(wrapped.ends_with(&format!("rustup run 'nightly; echo injected' {command}")));
+        assert!(wrapped.ends_with(&format!("rustup run 'nightly;echo_injected' {command}")));
         assert_eq!(wrapped.matches("rch-rabs-worker").count(), 1);
     }
 

@@ -764,6 +764,22 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
     );
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(trail(&daemon, mark), ["hit", "served"]);
+    // Agent-session variables the package never names are ambient under
+    // dependency-env-v3: another session (other multiplexer pane, session
+    // id, Cargo target dir) still gets the same served hit.
+    let mark = daemon.decisions().len();
+    let output = world.wrapped(
+        "leaf",
+        &world.out_dir("wt-f2"),
+        &[],
+        &[
+            ("TMUX_PANE", "%42"),
+            ("AGENT_SESSION_ID", "another-agent"),
+            ("CARGO_TARGET_DIR", "/elsewhere/target"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(trail(&daemon, mark), ["hit", "served"]);
 
     // 4b. Any added package file changes the complete-tree key.
     std::fs::write(world.package("leaf").join("src/unused.rs"), "// new\n").unwrap();

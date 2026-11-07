@@ -14,11 +14,13 @@ use super::{
     verify_live_receipt, verify_request,
 };
 use crate::coord::action_actor::{AttemptPurpose, MAX_RETRIES_PER_GENERATION};
+use crate::coord::remote_dependency_transport::locality::{ProducedObject, WorkerProcess};
 use crate::coord::worker_delivery::{Delivery, DeliveryFailure, SealedResult};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Field order is ownership order: release the admitted action/session and
 /// private delivery custody before returning physical capacity to the pool.
@@ -29,6 +31,18 @@ pub(super) struct Completed {
     pub(super) wire: Value,
     pub(super) continuation: Option<SealedResult>,
     _reservation: PoolReservation,
+}
+
+impl Completed {
+    pub(super) fn remember_produced_outputs(
+        &self,
+        process: WorkerProcess,
+        objects: &[ProducedObject],
+        now: Instant,
+    ) {
+        self._reservation
+            .remember_produced_outputs(process, objects, now);
+    }
 }
 
 fn may_retry(failure: &DeliveryFailure, cancelled: bool, remaining: u32) -> bool {
@@ -204,7 +218,11 @@ pub(super) fn deliver(
                 }
                 let next = remote
                     .workers
-                    .try_reserve_worker_excluding_for(&attempted, Some(&invocation.requirements))
+                    .try_reserve_worker_excluding_for(
+                        &attempted,
+                        Some(&invocation.requirements),
+                        Some(&invocation.source_demand),
+                    )
                     .map_err(|error| {
                         settled_failure(
                             &mut owned,

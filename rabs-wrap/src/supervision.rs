@@ -25,7 +25,25 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const GUARD_ARGUMENT: &str = "--rabs-internal-compiler-guard-v1";
+/// The coarsest observation period: ownership, liveness and exit are always
+/// re-checked at least this often.
 const POLL: Duration = Duration::from_millis(20);
+
+/// The period for re-observing something that started `elapsed` ago. Most
+/// dependency compiles, `kill` invocations and terminal sweeps finish within
+/// milliseconds, where a fixed [`POLL`] dominated the whole action (an exited
+/// compiler waited up to 20ms at each of four layers). Every check still runs
+/// on every iteration; only the pause before re-checking shrinks, and a
+/// long-running process settles to [`POLL`].
+pub(super) fn poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_millis(50) {
+        Duration::from_millis(1)
+    } else if elapsed < Duration::from_millis(500) {
+        Duration::from_millis(5)
+    } else {
+        POLL
+    }
+}
 const KILL_BUDGET: Duration = Duration::from_secs(2);
 const MAX_SCAN_ENTRIES: usize = 262_144;
 
@@ -492,6 +510,7 @@ pub(super) fn run_if_guard() {
             kill,
             reaped: false,
         };
+        let started = Instant::now();
         loop {
             let stat = read_stat(owned.child.id())?;
             if stat.parent != own.pid || stat.group != owned.child.id() {
@@ -507,7 +526,7 @@ pub(super) fn run_if_guard() {
             if compiler_waitable(owned.child.id())? {
                 return owned.finish();
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(poll_interval(started.elapsed()));
         }
     })();
     match result {
@@ -542,7 +561,8 @@ impl OwnedCompiler {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
-        let deadline = Instant::now() + KILL_BUDGET;
+        let started = Instant::now();
+        let deadline = started + KILL_BUDGET;
         loop {
             if let Some(status) = kill.try_wait()? {
                 return if status.success() {
@@ -561,13 +581,14 @@ impl OwnedCompiler {
                     "compiler group termination timed out",
                 ));
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(poll_interval(started.elapsed()));
         }
     }
 
     fn finish(&mut self) -> io::Result<ExitStatus> {
         self.kill_group()?;
-        let deadline = Instant::now() + KILL_BUDGET;
+        let started = Instant::now();
+        let deadline = started + KILL_BUDGET;
         let mut previous = None;
         loop {
             let current = quiescent_group_snapshot(
@@ -586,7 +607,10 @@ impl OwnedCompiler {
                 return Ok(status);
             }
             previous = current;
-            std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+            std::thread::sleep(
+                poll_interval(started.elapsed())
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }

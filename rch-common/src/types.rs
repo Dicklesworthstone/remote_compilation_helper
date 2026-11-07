@@ -90,8 +90,15 @@ pub enum RequiredRuntime {
     Nix,
     /// Requires the Go toolchain (`go` binary).
     Go,
-    /// Requires the zig cross-compilation toolchain (`cargo-zigbuild` + `zig`).
+    /// Requires Rust/Cargo and its cross-compilation helpers (`cargo-zigbuild` + `zig`).
     Zig,
+}
+
+impl RequiredRuntime {
+    /// Cargo cross-compilation still runs with the caller's Rust toolchain.
+    pub fn needs_rust_toolchain(self) -> bool {
+        matches!(self, Self::Rust | Self::Zig)
+    }
 }
 
 /// Per-command priority hint for worker selection.
@@ -149,6 +156,10 @@ pub struct SelectionRequest {
     /// this build's lifetime; zero leaves disk admission to the ordinary policy.
     #[serde(default, skip_serializing_if = "disk_headroom_disabled")]
     pub disk_headroom_gib: u32,
+    /// Worker receipt/conditional-admission version understood by this client.
+    /// Older clients must never receive a discounted budget they cannot fence.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub disk_observation_version: u32,
     /// Preferred worker IDs (e.g., from project config).
     #[serde(default)]
     pub preferred_workers: Vec<WorkerId>,
@@ -451,19 +462,64 @@ pub struct SelectionConfig {
         deserialize_with = "deserialize_disk_gb_per_slot"
     )]
     pub disk_gb_per_slot: f64,
-    /// Free-disk ratio at or below which rchd marks a worker Critical and
-    /// gives it no slots (bd-xxck3). Read by rchd at startup.
+    /// Free-disk ratio used by rchd's critical rule, together with
+    /// `disk_critical_ratio_cap_gb` (bd-xxck3). Read by rchd at startup.
     #[serde(default = "default_disk_critical_free_ratio")]
     pub disk_critical_free_ratio: f64,
-    /// When set, the ratio rule above trips only while free space is also at
-    /// or below this many GB, so a large disk is judged by absolute headroom
-    /// (5% of 900 GB is 45 GB). Unset keeps the ratio rule unconditional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The ratio rule above trips only while free space is also at or below
+    /// this many GiB (default: 25), so large disks retain usable headroom.
+    /// Explicit `None`, JSON null, or TOML `"uncapped"` keeps the ratio rule
+    /// unconditional. This does not disable the absolute floor or build budgets.
+    #[serde(
+        default = "default_disk_critical_ratio_cap_gb",
+        serialize_with = "serialize_disk_critical_ratio_cap_gb",
+        deserialize_with = "deserialize_disk_critical_ratio_cap_gb"
+    )]
     pub disk_critical_ratio_cap_gb: Option<f64>,
 }
 
 fn default_disk_critical_free_ratio() -> f64 {
     0.05
+}
+
+fn default_disk_critical_ratio_cap_gb() -> Option<f64> {
+    Some(25.0)
+}
+
+fn serialize_disk_critical_ratio_cap_gb<S>(
+    cap: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match cap {
+        Some(cap) => cap.serialize(serializer),
+        // TOML has no null. Omitting None would restore the default cap when
+        // a config edit, overlay or cache reload deserializes it (bd-lnbuz).
+        None => serializer.serialize_str("uncapped"),
+    }
+}
+
+fn deserialize_disk_critical_ratio_cap_gb<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RatioCap {
+        Gib(f64),
+        Mode(String),
+    }
+
+    match Option::<RatioCap>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RatioCap::Gib(cap)) => Ok(Some(cap)),
+        Some(RatioCap::Mode(mode)) if mode == "uncapped" => Ok(None),
+        Some(RatioCap::Mode(_)) => Err(serde::de::Error::custom(
+            "disk_critical_ratio_cap_gb must be a number or \"uncapped\"",
+        )),
+    }
 }
 
 impl Default for SelectionConfig {
@@ -478,7 +534,7 @@ impl Default for SelectionConfig {
             min_free_gb: default_min_free_gb(),
             disk_gb_per_slot: default_disk_gb_per_slot(),
             disk_critical_free_ratio: default_disk_critical_free_ratio(),
-            disk_critical_ratio_cap_gb: None,
+            disk_critical_ratio_cap_gb: default_disk_critical_ratio_cap_gb(),
         }
     }
 }
@@ -682,6 +738,93 @@ fn default_fallback_min_success_rate() -> f64 {
     0.5 // More lenient than normal min_success_rate (0.8)
 }
 
+/// Physical identity and exact retained state of one managed Cargo target.
+/// The worker computes both digests from bounded scans, without trusting a
+/// pathname or a directory's byte count as proof that its artifacts survived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskPool {
+    pub identity: [u8; 32],
+    pub state: [u8; 32],
+    pub retained_bytes: u64,
+}
+
+impl BuildDiskPool {
+    pub fn is_valid(&self) -> bool {
+        self.identity != [0; 32] && self.state != [0; 32] && self.retained_bytes <= i64::MAX as u64
+    }
+}
+
+/// Additional allocations observed without subtracting concurrent cleanup.
+/// Only a complete, exit-status-bound supervisor receipt may supply this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskObservation {
+    pub version: u32,
+    pub baseline_output_bytes: u64,
+    pub peak_added_output_bytes: u64,
+    pub peak_free_drop_bytes: u64,
+    pub baseline_pool: BuildDiskPool,
+    pub final_pool: BuildDiskPool,
+}
+
+impl BuildDiskObservation {
+    pub const VERSION: u32 = 1;
+
+    pub fn valid_for_peak(&self, peak_output_bytes: u64) -> bool {
+        self.version == Self::VERSION
+            && peak_output_bytes <= i64::MAX as u64
+            && self.baseline_output_bytes <= peak_output_bytes
+            && self.peak_added_output_bytes <= peak_output_bytes
+            && self.peak_free_drop_bytes <= i64::MAX as u64
+            && self.baseline_pool.is_valid()
+            && self.final_pool.is_valid()
+            && self.baseline_pool.identity == self.final_pool.identity
+            && self.baseline_pool.retained_bytes <= self.baseline_output_bytes
+            && self.final_pool.retained_bytes <= peak_output_bytes
+            && self.additional_bytes() <= i64::MAX as u64
+    }
+
+    /// Only the attested target pool receives retained allocation credit.
+    /// Source staging and other output/cache roots remain charged in full.
+    /// Other writers may inflate the free-space decline; it can raise this
+    /// bound, but never replace the attributed output scan.
+    pub fn additional_bytes(&self) -> u64 {
+        self.baseline_output_bytes
+            .saturating_sub(self.baseline_pool.retained_bytes)
+            .saturating_add(self.peak_added_output_bytes.max(self.peak_free_drop_bytes))
+    }
+}
+
+/// A warm allowance is conditional on one of these exact pool snapshots.
+/// Eight proofs cover bounded project lanes without an unbounded wire/ledger
+/// payload. A mismatch requires a new cold reservation before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildDiskWarmPolicy {
+    pub cold_growth_bytes: u64,
+    pub pools: [Option<BuildDiskPool>; 8],
+}
+
+impl BuildDiskWarmPolicy {
+    pub fn valid_for_budget(&self, max_growth_bytes: u64) -> bool {
+        max_growth_bytes > 0
+            && self.cold_growth_bytes > max_growth_bytes
+            && self.cold_growth_bytes <= i64::MAX as u64
+            && self.pools.iter().any(Option::is_some)
+            && self.pools.iter().enumerate().all(|(index, pool)| {
+                pool.is_none_or(|pool| {
+                    pool.is_valid()
+                        && pool.retained_bytes > 0
+                        && !self.pools[..index]
+                            .iter()
+                            .flatten()
+                            .any(|previous| previous.identity == pool.identity)
+                })
+            })
+    }
+}
+
 /// A job's additional allocation allowance and the worker's protected reserve.
 ///
 /// The daemon reserves growth atomically; the worker enforces these byte limits
@@ -690,6 +833,8 @@ fn default_fallback_min_success_rate() -> f64 {
 pub struct BuildDiskBudget {
     pub max_growth_bytes: u64,
     pub min_free_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_policy: Option<BuildDiskWarmPolicy>,
 }
 
 impl BuildDiskBudget {
@@ -764,6 +909,7 @@ impl BuildDiskBudget {
         Some(Self {
             max_growth_bytes: u64::from(Self::growth_budget_gib(f64::from(footprint))) * Self::GIB,
             min_free_bytes: 10 * Self::GIB,
+            warm_policy: None,
         })
     }
 }
@@ -916,6 +1062,10 @@ pub struct ReleaseRequest {
     /// Only a confirmed worker receipt may supply this measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_peak_output_bytes: Option<u64>,
+    /// Qualified additional allocation evidence, never inferred from an old
+    /// total-output or filesystem-delta sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_observation: Option<BuildDiskObservation>,
     /// Optional per-phase timing breakdown for the build pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CommandTimingBreakdown>,
@@ -1259,6 +1409,23 @@ impl WorkerCapabilities {
         self.rustc_version.is_some()
     }
 
+    /// Whether this snapshot can satisfy a command's required runtime.
+    /// Use the same predicate for selection, affinity fallback and final slot
+    /// admission so historical success cannot override fresh negative evidence.
+    /// `cargo zigbuild` also needs usable Rust/Cargo, not just its two helpers.
+    #[must_use]
+    pub fn has_runtime(&self, required: RequiredRuntime) -> bool {
+        match required {
+            RequiredRuntime::None => true,
+            RequiredRuntime::Rust => self.has_rust(),
+            RequiredRuntime::Bun => self.has_bun(),
+            RequiredRuntime::Node => self.has_node(),
+            RequiredRuntime::Nix => self.has_nix(),
+            RequiredRuntime::Go => self.has_go(),
+            RequiredRuntime::Zig => self.has_rust() && self.has_zig(),
+        }
+    }
+
     /// Check whether `component` is installed for `toolchain`.
     ///
     /// Rustup reports pinned toolchains with a host-triple suffix. The request
@@ -1284,7 +1451,8 @@ impl WorkerCapabilities {
         self.go_version.is_some()
     }
 
-    /// Check if this worker can run `cargo zigbuild` cross-compiles.
+    /// Check whether this worker has both helpers used by `cargo zigbuild`.
+    /// Usable Rust/Cargo is checked separately by [`Self::has_runtime`].
     ///
     /// Requires BOTH halves of the toolchain: the `cargo-zigbuild` cargo
     /// subcommand and the `zig` binary it drives as the linker. Either one
@@ -1481,6 +1649,9 @@ impl PathTopologyConfig {
 pub struct RchConfig {
     #[serde(default)]
     pub general: GeneralConfig,
+    /// Bounded slow-path control deadlines shared by client and daemon.
+    #[serde(default)]
+    pub timeouts: crate::timing::TimeoutsConfig,
     #[serde(default)]
     pub compilation: CompilationConfig,
     #[serde(default)]
@@ -4737,6 +4908,37 @@ retry_max = 2
     }
 
     #[test]
+    fn failed_cargo_probe_blocks_rust_runtimes_without_discarding_other_facts() {
+        // Successful probe JSON may retain inventories even when executable
+        // Cargo failed. Those inventories must not restore Rust eligibility.
+        let mut caps: WorkerCapabilities = serde_json::from_value(serde_json::json!({
+            "rustup_toolchains": ["nightly-fixture"],
+            "rustup_components": ["nightly-fixture:clippy"],
+            "node_version": "v22.0.0",
+            "zig_version": "0.14.0",
+            "cargo_zigbuild_version": "0.20.0",
+            "probe_warnings": ["worker Cargo execution check failed: toolchain Cargo refused"]
+        }))
+        .unwrap();
+
+        assert!(caps.has_zig(), "helper inventory remains available");
+        assert!(!caps.has_runtime(RequiredRuntime::Rust));
+        assert!(!caps.has_runtime(RequiredRuntime::Zig));
+        assert!(caps.has_runtime(RequiredRuntime::Node));
+        assert!(caps.has_runtime(RequiredRuntime::None));
+        assert!(caps.has_rustup_component("nightly-fixture", "clippy"));
+
+        // Fresh positive execution evidence restores both Cargo routes.
+        caps.rustc_version = Some("1.100.0-nightly".into());
+        caps.probe_warnings.clear();
+        let refreshed: WorkerCapabilities =
+            serde_json::from_slice(&serde_json::to_vec(&caps).unwrap()).unwrap();
+        assert!(refreshed.has_runtime(RequiredRuntime::Rust));
+        assert!(refreshed.has_runtime(RequiredRuntime::Zig));
+        assert!(refreshed.has_runtime(RequiredRuntime::Node));
+    }
+
+    #[test]
     fn test_worker_capabilities_components_are_toolchain_scoped_and_exact() {
         let _guard = test_guard!();
         let caps = WorkerCapabilities {
@@ -5412,6 +5614,137 @@ retry_max = 2
         for invalid in [f64::NAN, f64::INFINITY, -1.0] {
             assert_eq!(BuildDiskBudget::growth_budget_gib(invalid), u32::MAX);
         }
+    }
+
+    #[test]
+    fn incremental_disk_observations_reject_inconsistent_or_unversioned_evidence() {
+        let gib = BuildDiskBudget::GIB;
+        let baseline = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 * gib,
+        };
+        let observation = BuildDiskObservation {
+            version: BuildDiskObservation::VERSION,
+            baseline_output_bytes: 81 * gib,
+            peak_added_output_bytes: gib / 4,
+            peak_free_drop_bytes: gib / 2,
+            baseline_pool: baseline,
+            final_pool: BuildDiskPool {
+                state: [3; 32],
+                ..baseline
+            },
+        };
+        let peak = 82 * gib;
+        assert!(observation.valid_for_peak(peak));
+        assert_eq!(observation.additional_bytes(), gib + gib / 2);
+        let encoded = serde_json::to_string(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<BuildDiskObservation>(&encoded).unwrap(),
+            observation
+        );
+        for invalid in [
+            BuildDiskObservation {
+                version: 0,
+                ..observation
+            },
+            BuildDiskObservation {
+                version: 2,
+                ..observation
+            },
+            BuildDiskObservation {
+                baseline_output_bytes: peak + 1,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_added_output_bytes: peak + 1,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_free_drop_bytes: u64::MAX,
+                ..observation
+            },
+            BuildDiskObservation {
+                peak_free_drop_bytes: i64::MAX as u64,
+                ..observation
+            },
+            BuildDiskObservation {
+                final_pool: BuildDiskPool {
+                    identity: [9; 32],
+                    ..baseline
+                },
+                ..observation
+            },
+            BuildDiskObservation {
+                baseline_pool: BuildDiskPool {
+                    retained_bytes: peak,
+                    ..baseline
+                },
+                ..observation
+            },
+            BuildDiskObservation {
+                final_pool: BuildDiskPool {
+                    state: [0; 32],
+                    ..baseline
+                },
+                ..observation
+            },
+        ] {
+            assert!(!invalid.valid_for_peak(peak), "{invalid:?}");
+        }
+        // An aggregate free-space drop can exceed this job's output; it can
+        // only raise the estimate, never supply attributed complete output.
+        let shared = BuildDiskObservation {
+            peak_free_drop_bytes: 100 * gib,
+            ..observation
+        };
+        assert!(shared.valid_for_peak(peak));
+        assert_eq!(shared.additional_bytes(), 101 * gib);
+        let only_pool = BuildDiskObservation {
+            baseline_output_bytes: 80 * gib,
+            ..observation
+        };
+        assert_eq!(only_pool.additional_bytes(), gib / 2);
+    }
+
+    #[test]
+    fn conditional_disk_policy_is_bounded_and_never_silently_widens_a_reservation() {
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 4096,
+        };
+        let mut policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 100 * BuildDiskBudget::GIB,
+            pools: [None; 8],
+        };
+        let warm = 3 * BuildDiskBudget::GIB;
+        assert!(!policy.valid_for_budget(warm));
+        policy.pools[0] = Some(pool);
+        assert!(policy.valid_for_budget(warm));
+        assert!(!policy.valid_for_budget(0));
+        assert!(!policy.valid_for_budget(policy.cold_growth_bytes));
+        assert!(!policy.valid_for_budget(u64::MAX));
+        policy.pools[1] = Some(pool);
+        assert!(
+            !policy.valid_for_budget(warm),
+            "duplicate physical pools are invalid"
+        );
+        policy.pools[1] = Some(BuildDiskPool {
+            identity: [3; 32],
+            ..pool
+        });
+        assert!(policy.valid_for_budget(warm));
+        let mut wire = serde_json::to_value(policy).unwrap();
+        wire["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::Null);
+        assert!(serde_json::from_value::<BuildDiskWarmPolicy>(wire).is_err());
+        let legacy: BuildDiskBudget =
+            serde_json::from_str(r#"{"max_growth_bytes":4294967296,"min_free_bytes":10737418240}"#)
+                .unwrap();
+        assert!(legacy.warm_policy.is_none());
     }
 
     #[test]
@@ -7368,6 +7701,8 @@ retry_max = 2
         assert_eq!(config.max_load_per_core, Some(2.0));
         assert_eq!(config.min_free_gb, Some(10.0));
         assert_eq!(config.disk_gb_per_slot, 10.0);
+        assert_eq!(config.disk_critical_free_ratio, 0.05);
+        assert_eq!(config.disk_critical_ratio_cap_gb, Some(25.0));
     }
 
     #[test]
@@ -7395,6 +7730,60 @@ retry_max = 2
         }
         let default: SelectionConfig = toml::from_str("").unwrap();
         assert_eq!(default.disk_gb_per_slot, 10.0);
+    }
+
+    #[test]
+    fn selection_disk_ratio_cap_defaults_for_missing_and_partial_config() {
+        for contents in ["", "[selection]\n", "[selection]\ndisk_gb_per_slot = 5.0\n"] {
+            let config: RchConfig = toml::from_str(contents).unwrap();
+            assert_eq!(config.selection.disk_critical_ratio_cap_gb, Some(25.0));
+            assert_eq!(config.selection.disk_critical_free_ratio, 0.05);
+            assert_eq!(config.selection.min_free_gb, Some(10.0));
+        }
+        let selection: SelectionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(selection.disk_critical_ratio_cap_gb, Some(25.0));
+    }
+
+    #[test]
+    fn selection_disk_ratio_overrides_survive_toml_and_json_roundtrips() {
+        for cap in [Some(15.0), Some(25.0), Some(30.0), None] {
+            let selection = SelectionConfig {
+                disk_critical_free_ratio: 0.03,
+                disk_critical_ratio_cap_gb: cap,
+                ..SelectionConfig::default()
+            };
+            let toml = toml::to_string(&selection).unwrap();
+            let json = serde_json::to_string(&selection).unwrap();
+            if cap.is_none() {
+                assert!(toml.contains("disk_critical_ratio_cap_gb = \"uncapped\""));
+                assert!(json.contains("\"disk_critical_ratio_cap_gb\":\"uncapped\""));
+            }
+            for restored in [
+                toml::from_str::<SelectionConfig>(&toml).unwrap(),
+                serde_json::from_str::<SelectionConfig>(&json).unwrap(),
+            ] {
+                assert_eq!(restored.disk_critical_ratio_cap_gb, cap);
+                assert_eq!(restored.disk_critical_free_ratio, 0.03);
+            }
+        }
+
+        let explicit_null: SelectionConfig =
+            serde_json::from_str(r#"{"disk_critical_ratio_cap_gb":null}"#).unwrap();
+        assert_eq!(explicit_null.disk_critical_ratio_cap_gb, None);
+        let explicit_uncapped: SelectionConfig =
+            toml::from_str("disk_critical_ratio_cap_gb = \"uncapped\"").unwrap();
+        assert_eq!(explicit_uncapped.disk_critical_ratio_cap_gb, None);
+    }
+
+    #[test]
+    fn selection_disk_ratio_cap_rejects_unknown_modes() {
+        for value in ["\"\"", "\"none\"", "\"25\"", "true", "[]"] {
+            assert!(
+                toml::from_str::<SelectionConfig>(&format!("disk_critical_ratio_cap_gb = {value}"))
+                    .is_err(),
+                "invalid disk ratio cap {value}"
+            );
+        }
     }
 
     #[test]

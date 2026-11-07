@@ -47,13 +47,14 @@ pub struct CapabilityReport {
     pub slots: u32,
 }
 
-/// A live pressure sample (heartbeat payload).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Optional host measurements (heartbeat payload). Missing or expired probes
+/// never become a fabricated zero-load or zero-capacity observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PressureSample {
-    /// 1-minute load average × 100 (integer to stay serde-free).
-    pub load_x100: u64,
-    /// Free disk MiB on the worker's staging filesystem.
-    pub free_disk_mib: u64,
+    /// 1-minute load average × 100; `None` means unavailable or expired.
+    pub load_x100: Option<u64>,
+    /// Available disk MiB on the staging filesystem; `None` means unknown.
+    pub free_disk_mib: Option<u64>,
 }
 
 /// A canonical-execution request from the coordinator.
@@ -494,8 +495,8 @@ pub fn validate_dependency_execution(
 ) -> Result<(), String> {
     use rabs_key::invocation::SourceInput;
     use rabs_key::live_dependency::remote::{
-        RemoteDependencyOutputClass, remote_dependency_output_class,
-        validate_generated_native_inputs_with_roots,
+        RemoteDependencyOutputClass, generated_native_archive_filename,
+        remote_dependency_output_class, validate_generated_native_inputs_with_roots,
     };
     use std::collections::BTreeSet;
     use std::path::{Component, Path};
@@ -563,9 +564,8 @@ pub fn validate_dependency_execution(
             .map(|file| file.path.as_str())
             .collect::<BTreeSet<_>>();
         for library in &invocation.native_libs {
-            let name = library
-                .strip_prefix("static=")
-                .ok_or("native inputs require default-bundle static archives")?;
+            let filename = generated_native_archive_filename(library)
+                .map_err(|error| format!("dependency native archive: {error}"))?;
             let present = native_directories.iter().any(|directory| {
                 let Some((root, _, prefix)) = native_tree(directory) else {
                     return false;
@@ -573,9 +573,7 @@ pub fn validate_dependency_execution(
                 let Ok(relative) = Path::new(directory).strip_prefix(root) else {
                     return false;
                 };
-                let path = Path::new(prefix)
-                    .join(relative)
-                    .join(format!("lib{name}.a"));
+                let path = Path::new(prefix).join(relative).join(&filename);
                 path.to_str().is_some_and(|path| files.contains(path))
             });
             if !present {
@@ -838,43 +836,32 @@ pub fn sample_load_x100() -> Option<u64> {
         .and_then(|text| parse_load_x100(&text))
 }
 
-/// Sample this host's real pressure (heartbeat payload).
+/// Sample this host's real pressure outside the control reactor. Filesystem
+/// probes can block in the kernel; callers must retain and join their sampler.
 #[must_use]
 pub fn sample_pressure(staging_dir: &std::path::Path) -> PressureSample {
-    let load_x100 = sample_load_x100().unwrap_or(0);
-    // 0 means unknown where the platform probe is unavailable.
-    let free_disk_mib = free_disk_mib(staging_dir);
     PressureSample {
-        load_x100,
-        free_disk_mib,
+        load_x100: sample_load_x100(),
+        free_disk_mib: free_disk_mib(staging_dir),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn free_disk_mib(dir: &std::path::Path) -> u64 {
-    // POSIX df output guarantees one line per filesystem; avoid libc/unsafe.
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(dir)
-        .output();
-    output
-        .ok()
-        .and_then(|o| {
-            String::from_utf8(o.stdout).ok().and_then(|text| {
-                text.lines().nth(1).and_then(|line| {
-                    line.split_whitespace()
-                        .nth(3)
-                        .and_then(|kb| kb.parse::<u64>().ok())
-                })
-            })
-        })
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
+fn free_disk_mib(dir: &std::path::Path) -> Option<u64> {
+    // Query available blocks for this user without spawning an unbounded df
+    // child or parsing locale-dependent text. This syscall still belongs to
+    // the owned sampler, not the control reactor.
+    let capacity = rustix::fs::statvfs(dir).ok()?;
+    if capacity.f_frsize == 0 {
+        return None;
+    }
+    let available = u128::from(capacity.f_bavail) * u128::from(capacity.f_frsize);
+    u64::try_from(available / (1024 * 1024)).ok()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn free_disk_mib(_dir: &std::path::Path) -> u64 {
-    0
+fn free_disk_mib(_dir: &std::path::Path) -> Option<u64> {
+    None
 }
 
 /// Per-stream RESIDENT bound for canonical execution output (G007):
@@ -1225,6 +1212,12 @@ fn execute_canonical_inner(
         source.map(SourceOwner::manifest),
     ) {
         let _ = control.retain_outputs(Err(error));
+        return exec_error(request.request_id);
+    }
+    if let Some(cache) = source.and_then(|source| source.produced_input_cache(request.request_id))
+        && let Err(error) = control.retain_artifact_input_cache(cache)
+    {
+        let _ = control.retain_outputs(Err(format!("artifact input reuse selection: {error}")));
         return exec_error(request.request_id);
     }
     // Snapshot storage belongs to the same worker-selected filesystem as the
@@ -2012,6 +2005,18 @@ mod tests {
         ] {
             assert_eq!(parse_load_x100(invalid), None, "{invalid}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_pressure_uses_native_capacity_and_keeps_probe_failure_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(free_disk_mib(root.path()).is_some());
+        let missing = root.path().join("not-a-staging-directory");
+        assert_eq!(free_disk_mib(&missing), None);
+        assert_eq!(sample_pressure(&missing).free_disk_mib, None);
+        assert_eq!(PressureSample::default().load_x100, None);
+        assert_eq!(PressureSample::default().free_disk_mib, None);
     }
 
     #[cfg(target_os = "linux")]

@@ -287,7 +287,7 @@ use rch_common::ssh_utils::{
 };
 use rch_common::{
     ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RemoteBuildJobs, RetryConfig,
-    ToolchainInfo, TransferConfig, WorkerConfig, normalize_project_path_with_policy,
+    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, normalize_project_path_with_policy,
     wrap_command_with_color, wrap_command_with_toolchain,
 };
 #[cfg(unix)]
@@ -343,7 +343,7 @@ impl WorkerPlatform {
 /// POSIX `sh` (`mkdir`/`cd`) and `cargo.exe` (`CARGO_TARGET_DIR`) both accept
 /// this form, and it sidesteps rsync's `C:`-as-host parsing (Windows uses the
 /// tar transport instead). Empirically validated on a real Surface build host.
-pub(crate) const WINDOWS_DEFAULT_REMOTE_BASE: &str = "C:/rch";
+pub(crate) use rch_common::gc_roots::WINDOWS_REMOTE_BASE as WINDOWS_DEFAULT_REMOTE_BASE;
 
 /// Whether `path` is a Windows drive-letter absolute path like `C:/rch` or
 /// `C:\rch`. Windows workers use these as remote build roots, so a remote-path
@@ -391,6 +391,81 @@ where
         }
         output.extend_from_slice(&chunk[..read]);
     }
+}
+
+/// Capture a read-only completion probe while owning its local transport group.
+/// A streaming-channel close can drop this future during a receipt read; the
+/// direct SSH child and same-group proxy descendants must stop together. Drain
+/// output before reaping so the owned leader pins the group identity on drop.
+async fn completion_probe_output(
+    mut command: tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(not(unix))]
+    {
+        command.output().await
+    }
+    #[cfg(unix)]
+    {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = rch_common::ssh::OwnedProcessGroup::spawn(&mut command)?;
+        let mut stdout = process
+            .take_stdout()
+            .ok_or_else(|| std::io::Error::other("completion probe stdout missing"))?;
+        let mut stderr = process
+            .take_stderr()
+            .ok_or_else(|| std::io::Error::other("completion probe stderr missing"))?;
+        let (stdout, stderr) = tokio::try_join!(
+            async {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            },
+            async {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).await?;
+                Ok::<_, std::io::Error>(bytes)
+            },
+        )?;
+        let status = process.wait().await?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// One receipt deadline includes command setup, transport and confirmation.
+/// A ready future at the timer boundary is still expired evidence.
+async fn receipt_probe_before<T>(
+    deadline: TokioInstant,
+    probe: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    let deadline = deadline.min(TokioInstant::now() + rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let expired = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "completion receipt probe timed out",
+        )
+    };
+    if TokioInstant::now() >= deadline {
+        return Err(expired());
+    }
+    let output = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => return Err(expired()),
+        output = probe => output?,
+    };
+    if TokioInstant::now() >= deadline {
+        return Err(expired());
+    }
+    Ok(output)
 }
 
 async fn run_source_content_rsync_capture(
@@ -1113,6 +1188,9 @@ pub(crate) struct RemoteBuildDiskBudgetExceeded {
     pub started: bool,
     #[serde(default)]
     pub peak_output_bytes: Option<u64>,
+    /// A verified prelaunch pool mismatch needs a new daemon reservation.
+    #[serde(default)]
+    pub required_growth_bytes: Option<u64>,
     #[serde(default)]
     pub detail: String,
     #[serde(skip)]
@@ -1129,6 +1207,10 @@ struct RemoteBuildDiskUsage {
     peak_growth_bytes: u64,
     complete: bool,
     exit_code: Option<i32>,
+    #[serde(default)]
+    incremental: Option<rch_common::BuildDiskObservation>,
+    #[serde(default)]
+    admitted_pool: Option<rch_common::BuildDiskPool>,
 }
 
 pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
@@ -1350,7 +1432,11 @@ fn rsync_io_timeout_arg(limit: std::time::Duration) -> String {
 /// watchdog and the daemon kill path in `rchd::cancellation`).
 pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> String {
     // Shared with rchd, which re-runs the same probe to clear a quarantine.
-    rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id)
+    format!(
+        "{}{}",
+        rch_common::timing::shell_prefix(),
+        rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id),
+    )
 }
 
 /// Prints `RCH_PATH_ABSENT` only when `path` does not exist, not even as a
@@ -1740,7 +1826,8 @@ fn remote_build_watchdog_script() -> String {
 
 fn remote_build_watchdog_script_with_refusal(refusal: &str) -> String {
     format!(
-        "{}\nrch_remote_record \"$1\" \"$4\" || {{ {refusal}; }}\n{}",
+        "{}{}\nrch_remote_record \"$1\" \"$4\" || {{ {refusal}; }}\n{}",
+        rch_common::timing::shell_prefix(),
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
         r#"__p=$$; __t="$2"; __m="$3"; shift 4
 __cancelled=0; __w=; __watch_start=
@@ -1918,14 +2005,11 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
 /// exit 103; on a dispatcher it "succeeds" by bouncing the build to a third
 /// host, paying a second sync for no reason.
 ///
-/// This mirrors the local-fallback loop-break in [`crate::hook`], which sets the
-/// same variable on rch's own local re-exec. The shim checks it before anything
-/// else, so it short-circuits regardless of how the remote-required intent
-/// reached the worker.
-const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &[
-    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
-    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
-];
+/// Both markers are required by shim v9. Share the pair with the standalone
+/// worker and its benchmarks so no managed execution path emits a bare bypass.
+/// These assignments belong to the admitted remote command, never to the
+/// dispatcher's own environment or its local-fallback policy decision.
+const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &rch_common::MANAGED_CARGO_ENV;
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -3017,6 +3101,14 @@ impl GitArchiveCacheStatus {
     }
 }
 
+/// Original-argv evidence for the Cargo cache paths a worker may write.
+#[derive(Clone)]
+struct CargoDiskCache {
+    name: String,
+    additional_home: Option<String>,
+    verified: bool,
+}
+
 /// Transfer pipeline for remote compilation.
 #[derive(Clone)]
 pub struct TransferPipeline {
@@ -3027,6 +3119,12 @@ pub struct TransferPipeline {
     /// Whole selected source root when execution is rebased to a subdirectory.
     /// Disk supervision must keep accounting for writes above the command cwd.
     disk_source_root: Option<String>,
+    /// Cache roots proved from the original Cargo argv before it is wrapped in
+    /// source guards and opaque shells. Paths resolve on the selected worker.
+    cargo_disk_cache: Option<CargoDiskCache>,
+    /// Distinguish a checked non-Cargo command from an old direct caller whose
+    /// opaque command has never supplied cache-scope evidence.
+    cargo_disk_scope_captured: bool,
     /// Local project root.
     project_root: PathBuf,
     /// Caller-owned tree used to distinguish source from artifact roots. A
@@ -3200,6 +3298,9 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         let ssh_options = SshOptions {
+            connect_timeout: rch_common::timing::scale_duration(
+                SshOptions::default().connect_timeout,
+            ),
             server_alive_interval: Some(std::time::Duration::from_secs(
                 transfer_config.ssh_server_alive_interval_secs.unwrap_or(15),
             )),
@@ -3214,6 +3315,8 @@ impl TransferPipeline {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
             disk_budget: None,
             disk_source_root: None,
+            cargo_disk_cache: None,
+            cargo_disk_scope_captured: false,
             retrieval_reference_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
@@ -3257,6 +3360,19 @@ impl TransferPipeline {
     ) -> Self {
         self.retrieval_control = Some((cancel, started));
         self
+    }
+
+    fn check_retrieval_control(&self, config: &RetryConfig, operation: &str) -> Result<()> {
+        if let Some((cancel, started)) = &self.retrieval_control {
+            if *cancel.borrow() {
+                return Err(RetrievalCancelled.into());
+            }
+            anyhow::ensure!(
+                TokioInstant::now() < *started + Duration::from_millis(config.total_timeout_ms),
+                "{operation}: retrieval deadline exceeded"
+            );
+        }
+        Ok(())
     }
 
     async fn execute_retrieval_rsync(
@@ -3436,6 +3552,70 @@ impl TransferPipeline {
             self.pooled_target_prune_idle_hours,
             self.escaped_pooled_target_override_parent().as_deref(),
         )
+    }
+
+    /// Fund and guard source writes before the compiler's warm-pool check.
+    /// Only ordinary uploads use this wrapper; verifiers and retrieval retain
+    /// their existing read-only receiver. The upload has no target-pool credit
+    /// and cannot publish a receipt that acknowledges compiler completion.
+    fn source_upload_rsync_path(
+        &self,
+        escaped_remote_path: &str,
+        upload_prefix: Option<&str>,
+    ) -> String {
+        let warm_budget = self
+            .disk_budget
+            .filter(|budget| budget.warm_policy.is_some());
+        let receiver = match warm_budget {
+            Some(budget) => {
+                let source = self.remote_path();
+                let plan = serde_json::json!({
+                    "probe": [&source], "output": [&source],
+                    "receipt": null, "warm_policy": null,
+                    "require_incremental_tracking": true,
+                });
+                // The monitor and rsync inherit the original binary input
+                // stream. Server arguments are appended by rsync after this
+                // fragment and forwarded unchanged through the activity fence.
+                format!(
+                    "env RCH_TIMING_SCALE={} python3 -I -S -c {} {} {} {} {} {} standalone rsync",
+                    rch_common::timing::configured().env_value(),
+                    escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT)),
+                    budget.max_growth_bytes,
+                    budget.min_free_bytes,
+                    escape(Cow::Owned(format!(
+                        "{}_SOURCE_UPLOAD_DISK_BUDGET:",
+                        self.deadline_marker
+                    ))),
+                    escape(Cow::Borrowed(source.as_str())),
+                    escape(Cow::Owned(plan.to_string())),
+                )
+            }
+            None => "rsync".to_owned(),
+        };
+        let receiver = format!(
+            "{}mkdir -p {} && {receiver}",
+            self.source_sync_prune_prefix(escaped_remote_path),
+            escaped_remote_path,
+        );
+        let rsync_path = match upload_prefix {
+            Some(prefix) => self.source_rsync_path_at_with_prefix(
+                format!(
+                    "{} || exit 73; {receiver}",
+                    live_checkout_sync_guard(&self.remote_path())
+                ),
+                &self.remote_path(),
+                Some(prefix),
+            ),
+            None => self.source_rsync_path(receiver),
+        };
+        // --rsync-path itself is a single local exec argument. Leave room
+        // below Linux's per-argument limit even after nested shell quoting;
+        // an oversized wrapper must refuse before any remote source writes.
+        if warm_budget.is_some() && rsync_path.len() > 120 * 1024 {
+            return "sh -c 'printf \"%s\\n\" \"RCH: guarded source upload command exceeds safe argument bound\" >&2; exit 120' rch-source-upload".to_owned();
+        }
+        rsync_path
     }
 
     /// rsync appends its server argv to this shell fragment. Forward those
@@ -3690,6 +3870,8 @@ impl TransferPipeline {
         let Some((path, identity)) = &self.recovery_completion else {
             return Ok(None);
         };
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(10));
+        let deadline = TokioInstant::now() + budget;
         // A rename can be visible before its directory barrier succeeds. A
         // reconnect must re-establish both barriers before trusting that name.
         let script = format!(
@@ -3698,22 +3880,28 @@ impl TransferPipeline {
             sync_completion =
                 file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
+        let output = receipt_probe_before(
+            deadline,
             // This immutable identity-bound receipt is outside source-tree
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
-            self.worker_ssh_command_with_activity(
+            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
                 worker,
                 &["sh", "-c", &escape(Cow::from(script.as_str()))],
                 false,
-            )
-            .output(),
+                self.ssh_options
+                    .connect_timeout
+                    .min(deadline.saturating_duration_since(TokioInstant::now())),
+            )),
         )
-        .await??;
+        .await?;
         anyhow::ensure!(output.status.success(), "completion probe SSH failed");
         let text = std::str::from_utf8(&output.stdout)?.trim();
         if text.is_empty() {
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "completion receipt probe timed out"
+            );
             return Ok(None);
         }
         let (observed, status) = text
@@ -3724,6 +3912,10 @@ impl TransferPipeline {
         anyhow::ensure!(
             (0..=255).contains(&status),
             "invalid remote completion status"
+        );
+        anyhow::ensure!(
+            TokioInstant::now() < deadline,
+            "completion receipt probe timed out"
         );
         Ok(Some(status))
     }
@@ -3993,6 +4185,44 @@ impl TransferPipeline {
         self
     }
 
+    /// Capture cache provenance before the original argv becomes opaque inside
+    /// Cargo isolation and source-authority wrappers. The base remains worker
+    /// local; neither a client TMPDIR nor an inherited CARGO_HOME selects it.
+    pub(crate) fn with_cargo_disk_cache(mut self, command: &str, worker: &WorkerId) -> Self {
+        self.cargo_disk_scope_captured = true;
+        self.cargo_disk_cache = None;
+        if command.contains("cargo") {
+            // Cargo isolation historically also wraps non-Cargo commands whose
+            // arguments contain "cargo" (for example cargo_bridge.c). Preserve
+            // those commands while still guarding its bounded cache setup.
+            let known_non_cargo = rch_common::classify_command(command)
+                .kind
+                .is_some_and(|kind| kind.command_base() != "cargo");
+            let clears_environment = shell_words::split(command).is_ok_and(|tokens| {
+                tokens.iter().any(|token| {
+                    matches!(token.as_str(), "-i" | "--ignore-environment" | "-S")
+                        || token.starts_with("--split-string")
+                })
+            });
+            let home = if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment
+            {
+                Ok(None)
+            } else {
+                crate::hook::cargo_disk_home_override(command)
+            };
+            self.cargo_disk_cache = Some(CargoDiskCache {
+                name: format!(
+                    "{}{}",
+                    rch_common::RCH_CARGO_CACHE_PREFIX,
+                    crate::hook::sanitize_cargo_home_token(worker.as_str())
+                ),
+                verified: home.is_ok(),
+                additional_home: home.ok().flatten(),
+            });
+        }
+        self
+    }
+
     /// Force Layer 0 configuration-pack env pairs (bd-bqu38).
     ///
     /// These are resolved from the `[layer0]` config knobs by the caller and
@@ -4129,15 +4359,15 @@ impl TransferPipeline {
         retry
     }
 
-    async fn artifact_retry_config(
+    async fn artifact_retrieval_plan(
         &self,
         worker: &WorkerConfig,
         remote_path: &str,
         patterns: &[String],
-    ) -> Result<RetryConfig> {
+    ) -> Result<RetrievalPlan> {
         // Both artifact builders use the same flavour-specific integrity
         // policy. Only checksummed staging can earn allocation reuse credit.
-        self.retrieval_retry_config_inner(
+        self.retrieval_plan(
             || self.build_retrieve_command(worker, remote_path, patterns),
             Self::artifact_integrity_arg(self.resolved_rsync().flavor) == "--checksum",
         )
@@ -4145,7 +4375,10 @@ impl TransferPipeline {
     }
 
     async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
-        self.retrieval_retry_config_inner(command, false).await
+        // A declared result directory still needs its directory materialized,
+        // including when it is empty. Only implicit artifact collection may
+        // use the verified-empty selection to omit a second connection.
+        Ok(self.retrieval_plan(command, false).await?.retry_config)
     }
 
     /// Openrsync does not universally implement --checksum. Never fall back
@@ -4157,11 +4390,11 @@ impl TransferPipeline {
         }
     }
 
-    async fn retrieval_retry_config_inner(
+    async fn retrieval_plan(
         &self,
         command: impl Fn() -> Command,
         checksummed: bool,
-    ) -> Result<RetryConfig> {
+    ) -> Result<RetrievalPlan> {
         let fallback = self.effective_rsync_retry_config();
         let estimate = self
             .execute_retrieval_rsync(
@@ -4204,7 +4437,27 @@ impl TransferPipeline {
                         total_timeout_ms = retry.total_timeout_ms,
                         "Artifact retrieval budget from selected remote files"
                     );
-                    return Ok(retry);
+                    let empty_selection = (output.stderr.is_empty()
+                        && detect_partial_transfer(&String::from_utf8_lossy(&output.stdout))
+                            .is_none()
+                        && retrieval_space::RsyncStoragePlan::empty_selection(&output.stdout)
+                            .is_some())
+                    .then(|| ArtifactRetrieval {
+                        stats: SyncResult {
+                            bytes_transferred: parse_rsync_bytes(
+                                &String::from_utf8_lossy(&output.stdout),
+                                RsyncTransferDirection::Download,
+                            ),
+                            files_transferred: 0,
+                            duration_ms: 0,
+                        },
+                        manifest_regular_files: Vec::new(),
+                        matched_regular_files: Some(0),
+                    });
+                    return Ok(RetrievalPlan {
+                        retry_config: retry,
+                        empty_selection,
+                    });
                 }
                 warn!("Artifact size estimate missing; retaining configured retrieval budget");
             }
@@ -4212,6 +4465,9 @@ impl TransferPipeline {
                 "Artifact size estimate failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
+            // The receiver has already been stopped and reaped. Preserve the
+            // typed acknowledgment so same-job recovery can retry collection.
+            Err(error) if error.is::<RetrievalCancelled>() => return Err(error),
             Err(error) => warn!(
                 "Artifact size estimate failed: {error}; retaining configured retrieval budget"
             ),
@@ -4222,7 +4478,10 @@ impl TransferPipeline {
             self.project_root == self.retrieval_reference_root,
             "cannot establish artifact size for durable retrieval staging; outputs and ownership retained"
         );
-        Ok(fallback)
+        Ok(RetrievalPlan {
+            retry_config: fallback,
+            empty_selection: None,
+        })
     }
 
     fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
@@ -5585,10 +5844,23 @@ impl TransferPipeline {
             outputs.push(source_root);
         }
         let probes = outputs.clone();
+        let cargo_cache = self.cargo_disk_cache.as_ref().map(|cache| {
+            serde_json::json!({
+                "name": cache.name,
+                "additional_home": cache.additional_home,
+                "verified": cache.verified,
+            })
+        });
         let plan = serde_json::json!({
             "probe": probes, "output": outputs,
             "receipt": self.remote_disk_receipt_path(), "receipt_initialized": true,
             "timeout_seconds": timeout_seconds,
+            "warm_policy": budget.warm_policy,
+            "cargo_cache": cargo_cache,
+            // Old direct callers have no original-argv proof. An opaque Cargo
+            // shell cannot silently inherit the target's warm disk allowance.
+            "cargo_cache_required": self.cargo_disk_cache.is_some()
+                || (!self.cargo_disk_scope_captured && command.contains("cargo")),
         });
         let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
@@ -5603,8 +5875,10 @@ impl TransferPipeline {
         let refusal =
             self.disk_prestart_refusal("worker Python disk supervisor is unavailable", 120);
         let program = format!(
-            "if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
-            budget.max_growth_bytes, budget.min_free_bytes,
+            "{}if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
+            rch_common::timing::shell_prefix(),
+            budget.max_growth_bytes,
+            budget.min_free_bytes,
         );
         // This composition can exceed the single-argument limit independently
         // of the outer session wrapper, even when each embedded program fits.
@@ -5666,13 +5940,32 @@ exit \"$__rch_disk_status\"; }}"
         if failure.max_growth_bytes != budget.max_growth_bytes
             || failure.min_free_bytes != budget.min_free_bytes
             || (!failure.started && failure.growth_bytes != 0)
-            || failure
-                .peak_output_bytes
-                .is_some_and(|peak| peak < failure.growth_bytes)
+            || failure.peak_output_bytes.is_some_and(|peak| {
+                let bound = if budget.warm_policy.is_some() {
+                    peak.saturating_mul(2)
+                } else {
+                    peak
+                };
+                failure.growth_bytes > bound
+            })
             || !matches!(
                 failure.reason.as_str(),
-                "admission" | "growth" | "free_floor" | "monitor_unavailable" | "interrupted"
+                "admission"
+                    | "growth"
+                    | "free_floor"
+                    | "monitor_unavailable"
+                    | "interrupted"
+                    | "cold_required"
             )
+            || if failure.reason == "cold_required" {
+                failure.started
+                    || !budget.warm_policy.is_some_and(|policy| {
+                        policy.valid_for_budget(budget.max_growth_bytes)
+                            && failure.required_growth_bytes == Some(policy.cold_growth_bytes)
+                    })
+            } else {
+                failure.required_growth_bytes.is_some()
+            }
         {
             return None;
         }
@@ -5699,14 +5992,40 @@ exit \"$__rch_disk_status\"; }}"
             && usage
                 .exit_code
                 .is_some_and(|code| (0..=255).contains(&code))
-            && usage.peak_growth_bytes <= usage.peak_output_bytes
-            && usage.peak_growth_bytes <= usage.max_growth_bytes)
+            // A warm charge includes unproven baseline roots as well as new
+            // allocations. Rewriting one such inode can charge it twice;
+            // neither component can exceed the observed total-output peak.
+            && usage.peak_growth_bytes <= if budget.warm_policy.is_some() {
+                usage.peak_output_bytes.saturating_mul(2)
+            } else {
+                usage.peak_output_bytes
+            }
+            && usage.peak_growth_bytes <= usage.max_growth_bytes
+            && usage.incremental.is_none_or(|observation| {
+                observation.valid_for_peak(usage.peak_output_bytes)
+            })
+            && budget.warm_policy.is_none_or(|policy| {
+                policy.valid_for_budget(budget.max_growth_bytes)
+                    && usage.admitted_pool.is_some_and(|admitted| {
+                        admitted.retained_bytes <= usage.peak_output_bytes
+                            && policy.pools.iter().flatten().any(|pool| *pool == admitted)
+                            && usage.incremental.is_none_or(|observation| observation.baseline_pool == admitted)
+                    })
+            }))
             .then_some(usage)
     }
 
     pub(crate) fn parse_disk_usage_marker(&self, line: &str) -> Option<u64> {
         self.parse_complete_disk_usage(line)
             .map(|usage| usage.peak_output_bytes)
+    }
+
+    pub(crate) fn parse_disk_observation_marker(
+        &self,
+        line: &str,
+    ) -> Option<rch_common::BuildDiskObservation> {
+        self.parse_complete_disk_usage(line)
+            .and_then(|usage| usage.incremental)
     }
 
     pub(crate) fn parse_disk_usage_exit_code(&self, line: &str) -> Option<i32> {
@@ -5759,19 +6078,23 @@ exit \"$__rch_disk_status\"; }}"
         let Some(path) = self.remote_disk_receipt_path() else {
             return Ok(None);
         };
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(10));
+        let deadline = TokioInstant::now() + budget;
         let path = escape(Cow::Owned(path));
         let script =
             format!("if [ -f {path} ] && [ ! -L {path} ]; then head -c 8193 -- {path}; fi");
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.worker_ssh_command_with_activity(
+        let output = receipt_probe_before(
+            deadline,
+            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
                 worker,
                 &["sh", "-c", &escape(Cow::Owned(script))],
                 false,
-            )
-            .output(),
+                self.ssh_options
+                    .connect_timeout
+                    .min(deadline.saturating_duration_since(TokioInstant::now())),
+            )),
         )
-        .await??;
+        .await?;
         anyhow::ensure!(output.status.success(), "disk receipt probe failed");
         anyhow::ensure!(
             output.stdout.len() <= 8192,
@@ -5779,6 +6102,10 @@ exit \"$__rch_disk_status\"; }}"
         );
         let text = String::from_utf8(output.stdout)?;
         if text.is_empty() {
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "completion receipt probe timed out"
+            );
             return Ok(None);
         }
         anyhow::ensure!(
@@ -5787,6 +6114,10 @@ exit \"$__rch_disk_status\"; }}"
                     || self.parse_disk_usage_marker(line).is_some()
                     || (line.ends_with('\n') && self.is_deadline_marker(line))),
             "disk receipt is incomplete or belongs to another attempt"
+        );
+        anyhow::ensure!(
+            TokioInstant::now() < deadline,
+            "completion receipt probe timed out"
         );
         Ok(Some(text))
     }
@@ -6196,8 +6527,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg(rsync_io_timeout_arg(self.transfer_estimate_timeout()));
 
         let ssh_command = format!(
-            "{} -o ConnectTimeout=5",
-            self.build_rsync_ssh_command(worker)
+            "{} -o ConnectTimeout={}",
+            self.build_rsync_ssh_command(worker),
+            rch_common::timing::ceil_seconds(rch_common::timing::scale_duration(
+                Duration::from_secs(5),
+            ))
         );
 
         cmd.arg("-az");
@@ -6378,11 +6712,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // shell invocation includes the configured sweeps only without a
         // durable source grant (bd-wfumv); granted transfers sweep only their
         // TMPDIR under guards, and owned materializations sweep nothing.
-        cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
-            "{}mkdir -p {} && rsync",
-            self.source_sync_prune_prefix(escaped_remote_path),
-            escaped_remote_path
-        )));
+        cmd.arg("--rsync-path")
+            .arg(self.source_upload_rsync_path(escaped_remote_path, None));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -6461,23 +6792,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // same remote shell invocation includes the configured sweeps only
         // without a durable source grant (bd-wfumv); granted transfers sweep
         // only their TMPDIR under guards, owned materializations nothing.
-        let receiver = format!(
-            "{}mkdir -p {} && rsync",
-            self.source_sync_prune_prefix(escaped_remote_path),
-            escaped_remote_path
-        );
-        let rsync_path = match upload_prefix {
-            Some(prefix) => self.source_rsync_path_at_with_prefix(
-                format!(
-                    "{} || exit 73; {receiver}",
-                    live_checkout_sync_guard(&self.remote_path())
-                ),
-                &self.remote_path(),
-                Some(prefix),
-            ),
-            None => self.source_rsync_path(receiver),
-        };
-        cmd.arg("--rsync-path").arg(rsync_path);
+        cmd.arg("--rsync-path")
+            .arg(self.source_upload_rsync_path(escaped_remote_path, upload_prefix));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -6936,6 +7252,21 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         remote_args: &[&str],
         bind_activity: bool,
     ) -> Command {
+        self.worker_ssh_command_with_activity_and_connect_timeout(
+            worker,
+            remote_args,
+            bind_activity,
+            self.ssh_options.connect_timeout,
+        )
+    }
+
+    fn worker_ssh_command_with_activity_and_connect_timeout(
+        &self,
+        worker: &WorkerConfig,
+        remote_args: &[&str],
+        bind_activity: bool,
+        connect_timeout: Duration,
+    ) -> Command {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
         crate::commands::jobs::configure_automatic_recovery_ssh(&mut cmd);
@@ -6944,7 +7275,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -7788,7 +8119,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -7840,7 +8171,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         };
 
-        match tokio::time::timeout(REMOTE_TIMEOUT_KILL_BUDGET, attempt).await {
+        let cleanup_budget = rch_common::timing::scale_duration(REMOTE_TIMEOUT_KILL_BUDGET);
+        match tokio::time::timeout(cleanup_budget, attempt).await {
             Ok(Ok(stdout)) => match parse_remote_timeout_kill_output(&stdout) {
                 Some(RemoteTimeoutCleanup::Verified) => (
                     RemoteTimeoutCleanup::Verified,
@@ -7860,10 +8192,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Ok(Err(reason)) => (RemoteTimeoutCleanup::Unverified, reason),
             Err(_) => (
                 RemoteTimeoutCleanup::Unverified,
-                format!(
-                    "kill probe exceeded {}s budget",
-                    REMOTE_TIMEOUT_KILL_BUDGET.as_secs()
-                ),
+                format!("kill probe exceeded {}s budget", cleanup_budget.as_secs()),
             ),
         }
     }
@@ -7889,7 +8218,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
             "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
+            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
@@ -7986,8 +8315,6 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let command_timeout = self.ssh_options.command_timeout;
         const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
-        let mut completion_tick = tokio::time::interval(Duration::from_secs(3));
-        completion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut durable_status = None;
         // Seeing the completion receipt means the workload finished, not that
         // its output has arrived: the remote wrapper is still streaming the
@@ -8021,6 +8348,28 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let status = match tokio::time::timeout(command_timeout, async {
             let mut upload = Box::pin(upload);
+            // This probe is a fallback for a stuck streaming channel, not the
+            // completion clock. Keep it inside the select so an SSH round trip
+            // cannot stop output draining or delay an ordinary channel close.
+            // The first tick follows the upload by a full interval; probing at
+            // interval()'s immediate tick adds a needless connection to every
+            // no-op build. Dropping this future on channel close stops its owned
+            // local transport group, including same-group proxy descendants,
+            // without signalling the remote workload or the separate master.
+            let mut completion_probe = Box::pin(async {
+                let period = Duration::from_secs(3);
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + period,
+                    period,
+                );
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
+                        break status;
+                    }
+                }
+            });
             let mut uploaded = false;
             let mut streams_open = true;
             loop {
@@ -8046,13 +8395,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             continue;
                         }
                     },
-                    _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
-                        if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
-                            durable_status = Some(status);
-                            let now = tokio::time::Instant::now();
-                            drain_cap = Some(now + COMPLETION_DRAIN_CAP);
-                            drain_deadline = Some(now + COMPLETION_DRAIN_IDLE);
-                        }
+                    status = completion_probe.as_mut(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
+                        durable_status = Some(status);
+                        let now = tokio::time::Instant::now();
+                        drain_cap = Some(now + COMPLETION_DRAIN_CAP);
+                        drain_deadline = Some(now + COMPLETION_DRAIN_IDLE);
                         continue;
                     }
                     () = drain_expired => {
@@ -8085,6 +8432,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             }
 
+            drop(completion_probe);
             child.wait().await.context("Failed to wait for ssh command")
         })
         .await
@@ -8635,12 +8983,20 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let retry_config = self
-            .artifact_retry_config(worker, &remote_path, artifact_patterns)
+        let plan = self
+            .artifact_retrieval_plan(worker, &remote_path, artifact_patterns)
             .await?;
+        if let Some(mut empty) = plan.empty_selection {
+            // The payload process used to check control again after the
+            // dry-run. Retain that boundary without starting an empty copy.
+            self.check_retrieval_control(&plan.retry_config, "retrieve_artifacts")?;
+            empty.stats.duration_ms = start.elapsed().as_millis() as u64;
+            info!("Artifact selection is verified empty; skipping payload connection");
+            return Ok(empty);
+        }
         let output = self
             .execute_retrieval_rsync(
-                &retry_config,
+                &plan.retry_config,
                 "retrieve_artifacts",
                 || self.build_retrieve_command(worker, &remote_path, artifact_patterns),
                 |_| {},
@@ -9893,13 +10249,19 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         );
 
         let retrieval_start = std::time::Instant::now();
-        let retry_config = self
-            .artifact_retry_config(worker, &remote_path, artifact_patterns)
+        let plan = self
+            .artifact_retrieval_plan(worker, &remote_path, artifact_patterns)
             .await?;
+        if let Some(mut empty) = plan.empty_selection {
+            self.check_retrieval_control(&plan.retry_config, "retrieve_artifacts_streaming")?;
+            empty.stats.duration_ms = retrieval_start.elapsed().as_millis() as u64;
+            info!("Artifact selection is verified empty; skipping payload connection");
+            return Ok(empty);
+        }
         let output = if self.retrieval_control.is_some() {
             let output = self
                 .execute_retrieval_rsync(
-                    &retry_config,
+                    &plan.retry_config,
                     "retrieve_artifacts_streaming",
                     build_cmd,
                     &mut on_line,
@@ -9921,7 +10283,7 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
             combined
         } else {
             run_command_streaming_with_retry(
-                &retry_config,
+                &plan.retry_config,
                 "retrieve_artifacts_streaming",
                 None,
                 None,
@@ -10178,6 +10540,13 @@ pub struct ArtifactRetrieval {
     pub manifest_regular_files: Vec<String>,
     /// Regular-file count from `--stats`, when parseable.
     pub matched_regular_files: Option<u32>,
+}
+
+/// The same source-fenced dry run budgets a pull and may prove it has no
+/// payload at all. A missing/ambiguous proof always retains ordinary retrieval.
+struct RetrievalPlan {
+    retry_config: RetryConfig,
+    empty_selection: Option<ArtifactRetrieval>,
 }
 
 impl ArtifactRetrieval {
@@ -11572,6 +11941,419 @@ sys.stdout.buffer.write(b'complete')
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_refuses_unstarted_work_and_caps_pending_reads() {
+        let called = std::cell::Cell::new(false);
+        let now = TokioInstant::now();
+        for deadline in [now, now - Duration::from_secs(1)] {
+            let error = receipt_probe_before(deadline, async {
+                called.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(!called.get(), "expired receipt work must not be polled");
+        }
+        let started = TokioInstant::now();
+        let error = receipt_probe_before(
+            started + Duration::from_secs(7200),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), rch_common::timing::MAX_CONTROL_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_rejects_late_presence_and_absence() {
+        for receipt in [None, Some(0), Some(17)] {
+            let budget = Duration::from_secs(10);
+            let deadline = TokioInstant::now() + budget;
+            let error = receipt_probe_before(deadline, async {
+                tokio::time::sleep(budget).await;
+                Ok(receipt)
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_deadline_does_not_resume_a_ready_probe_after_expiry() {
+        let resumed = std::cell::Cell::new(false);
+        let (ready, pending) = tokio::sync::oneshot::channel();
+        let budget = Duration::from_secs(10);
+        let mut probe = Box::pin(receipt_probe_before(
+            TokioInstant::now() + budget,
+            async {
+                pending.await.unwrap();
+                resumed.set(true);
+                Ok(())
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(probe.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(budget).await;
+        ready.send(()).unwrap();
+        let error = probe.await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!resumed.get(), "expiry must win before polling newly ready work");
+    }
+
+    #[tokio::test]
+    async fn receipt_deadline_rejects_ready_output_after_executor_stall() {
+        let deadline = TokioInstant::now() + Duration::from_millis(10);
+        let error = receipt_probe_before(deadline, async {
+            // Model a loaded executor that cannot poll its timer on time.
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(Some(0))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Real local SSH-process fixtures exercise both public receipt readers.
+    /// The peer's delay is deterministic; this is not a live worker benchmark.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_and_completion_receipts_share_the_configured_slow_path() {
+        const CHILD: &str = "RCH_TEST_SCALED_RECEIPT_ROOT";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let retained = tempfile::tempdir().unwrap().keep();
+            let peer = retained.join("ssh");
+            std::fs::write(
+                &peer,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_TEST_SCALED_RECEIPT_ROOT
+case "$*" in
+  *'head -c 8193'*) kind=disk ;;
+  *) kind=completion ;;
+esac
+read -r pid rest </proc/self/stat
+printf '%s\n' "$pid" > "$root/$kind.pid"
+sleep "$(cat "$root/delay")"
+cat "$root/$kind.receipt"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(std::iter::once(retained.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            for scale in ["1", "2"] {
+                let root = retained.join(scale);
+                std::fs::create_dir(&root).unwrap();
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "transfer::tests::disk_and_completion_receipts_share_the_configured_slow_path",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, &root)
+                    .env("RCH_TIMING_SCALE", scale)
+                    .env("PATH", &path)
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(40), child.output())
+                    .await
+                    .expect("bounded receipt fixture")
+                    .unwrap();
+                assert!(output.status.success(), "scale={scale}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let policy = rch_common::timing::TimeoutsConfig::default()
+            .with_environment()
+            .unwrap();
+        rch_common::timing::install(policy.scale);
+        let pipeline = disk_budget_test_pipeline(&root, None, 20).with_recovery_completion(
+            root.join("completion").to_str().unwrap().into(),
+            "receipt-attempt".into(),
+        );
+        let usage = serde_json::json!({
+            "max_growth_bytes": 8 << 20, "min_free_bytes": 1 << 20,
+            "peak_output_bytes": 0, "peak_growth_bytes": 0,
+            "complete": true, "exit_code": 0,
+        });
+        let disk_receipt = format!("{}_DISK_USAGE:{usage}\n", pipeline.deadline_marker);
+        std::fs::write(root.join("delay"), b"12").unwrap();
+        std::fs::write(root.join("completion.receipt"), b"receipt-attempt 0\n").unwrap();
+        std::fs::write(root.join("disk.receipt"), &disk_receipt).unwrap();
+        let worker = estimate_test_worker();
+        let (completion, disk) = tokio::join!(
+            pipeline.read_recovery_completion(&worker),
+            pipeline.read_remote_disk_receipt(&worker),
+        );
+        if policy.scale == rch_common::timing::TimingScale::default() {
+            for error in [completion.unwrap_err(), disk.unwrap_err()] {
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::TimedOut,
+                );
+            }
+        } else {
+            assert_eq!(completion.unwrap(), Some(0));
+            assert_eq!(disk.unwrap(), Some(disk_receipt));
+        }
+        // Timeout/cancellation must release the owned local SSH processes.
+        // The separate pidfd regression below verifies descendant containment.
+        for kind in ["completion", "disk"] {
+            let pid = std::fs::read_to_string(root.join(format!("{kind}.pid"))).unwrap();
+            let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while process.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("receipt transport must be reaped");
+        }
+
+        std::fs::write(root.join("delay"), b"0").unwrap();
+        std::fs::write(root.join("completion.receipt"), b"another-attempt 0\n").unwrap();
+        std::fs::write(root.join("disk.receipt"), b"another-attempt_DISK_USAGE:{}\n").unwrap();
+        assert!(pipeline.read_recovery_completion(&worker).await.is_err());
+        assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
+        std::fs::write(root.join("disk.receipt"), vec![b'x'; 8193]).unwrap();
+        assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
+        std::fs::write(root.join("completion.receipt"), b"").unwrap();
+        std::fs::write(root.join("disk.receipt"), b"").unwrap();
+        assert_eq!(pipeline.read_recovery_completion(&worker).await.unwrap(), None);
+        assert_eq!(pipeline.read_remote_disk_receipt(&worker).await.unwrap(), None);
+    }
+
+    /// A completion probe can be cancelled while its local SSH process and a
+    /// ProxyCommand-like descendant are still alive. This runs real processes
+    /// through the production capture helper; it does not emulate a worker.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_probe_cancellation_stops_descendant_and_reaps_leader() {
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+        use std::os::fd::{AsFd, OwnedFd};
+        use std::time::Duration;
+
+        struct FixtureProcesses {
+            leader: OwnedFd,
+            descendant: OwnedFd,
+        }
+        impl Drop for FixtureProcesses {
+            fn drop(&mut self) {
+                // Also clean up the negative regression safely: these stable
+                // handles refer only to processes created by this fixture.
+                let _ = rustix::process::pidfd_send_signal(&self.descendant, Signal::KILL);
+                let _ = rustix::process::pidfd_send_signal(&self.leader, Signal::KILL);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let ready = directory.join("processes.json");
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .arg("-c")
+            .arg(
+                r#"import json, os, signal, sys
+descendant = os.fork()
+signal.alarm(120)
+if descendant == 0:
+    while True:
+        signal.pause()
+pending = sys.argv[1] + '.pending'
+with open(pending, 'x') as output:
+    json.dump([os.getpid(), descendant], output)
+os.rename(pending, sys.argv[1])
+while True:
+    signal.pause()
+"#,
+            )
+            .arg(&ready);
+        let mut capture = Box::pin(receipt_probe_before(
+            TokioInstant::now() + Duration::from_secs(60),
+            completion_probe_output(command),
+        ));
+        let identities = tokio::time::timeout(Duration::from_secs(5), async {
+            let announced = async {
+                loop {
+                    match std::fs::read(&ready) {
+                        Ok(bytes) => break serde_json::from_slice::<[i32; 2]>(&bytes).unwrap(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("read fixture process identities: {error}"),
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut capture => panic!("probe ended before cancellation: {result:?}"),
+                identities = announced => identities,
+            }
+        })
+        .await
+        .expect("probe must publish both live process identities");
+        let open =
+            |pid| rustix::process::pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty());
+        let processes = match (open(identities[0]), open(identities[1])) {
+            (Ok(leader), Ok(descendant)) => FixtureProcesses { leader, descendant },
+            (leader, descendant) => {
+                drop(capture);
+                panic!(
+                    "native cancellation regression requires pidfd observation: leader={leader:?}, descendant={descendant:?}"
+                );
+            }
+        };
+        let leader = tokio::io::unix::AsyncFd::new(processes.leader.as_fd()).unwrap();
+        let descendant = tokio::io::unix::AsyncFd::new(processes.descendant.as_fd()).unwrap();
+        assert!(
+            rustix::process::waitid(
+                WaitId::PidFd(processes.leader.as_fd()),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            )
+            .unwrap()
+            .is_none(),
+            "the owned leader must still be alive before cancellation"
+        );
+
+        // EOF in the execution channel drops this same in-flight future.
+        // Merely killing its direct child leaves the descendant's pipes open.
+        drop(capture);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let _ = tokio::try_join!(leader.readable(), descendant.readable()).unwrap();
+            loop {
+                match rustix::process::waitid(
+                    WaitId::PidFd(processes.leader.as_fd()),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                ) {
+                    Err(rustix::io::Errno::CHILD) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("observe direct-child reaping: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled probe must terminate its descendant and reap its direct child");
+    }
+
+    /// These are transport-scheduler regressions with a scripted SSH peer, not
+    /// real-worker latency measurements. The peer blocks its completion probe
+    /// until a stdout callback acknowledges progress, then separately leaves a
+    /// probe blocked after the execution channel closes. An inline probe await
+    /// deadlocks both cases; neither test depends on a tight wall-time race.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn completion_probe_never_blocks_stream_progress_or_channel_close() {
+        const CHILD: &str = "RCH_TEST_CONCURRENT_COMPLETION_PROBE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let directory = tempfile::tempdir().unwrap().keep();
+            let peer = directory.join("ssh");
+            std::fs::write(
+                &peer,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_TEST_CONCURRENT_COMPLETION_PROBE
+case "$*" in
+  *' sh -s')
+    cat >/dev/null
+    while [ ! -f "$root/probe-started" ]; do sleep 0.01; done
+    printf 'unblock-probe\n'
+    if [ "$RCH_TEST_COMPLETION_SCENARIO" = progress ]; then
+      while [ ! -f "$root/release-probe" ]; do sleep 0.01; done
+    fi
+    printf 'final diagnostic\n' >&2
+    exit 7
+    ;;
+  *)
+    read -r pid rest </proc/self/stat
+    printf '%s\n' "$pid" > "$root/probe.pid"
+    : > "$root/probe-started"
+    while [ ! -f "$root/release-probe" ]; do sleep 0.01; done
+    printf 'completion-test 7\n'
+    ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for scenario in ["progress", "close"] {
+                let root = directory.join(scenario);
+                std::fs::create_dir(&root).unwrap();
+                let path = std::env::join_paths(std::iter::once(directory.clone()).chain(
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+                ))
+                .unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "transfer::tests::completion_probe_never_blocks_stream_progress_or_channel_close",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, root)
+                    .env("RCH_TEST_COMPLETION_SCENARIO", scenario)
+                    .env("PATH", path)
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(output.status.success(), "{scenario}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let scenario = std::env::var("RCH_TEST_COMPLETION_SCENARIO").unwrap();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "completion".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(
+            root.join("completion").to_str().unwrap().into(),
+            "completion-test".into(),
+        )
+        .with_command_timeout(Duration::from_secs(8));
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let result = pipeline
+            .execute_over_ssh_streaming(
+                &estimate_test_worker(),
+                "unused-scripted-peer-input",
+                |line| {
+                    stdout.push_str(line);
+                    if scenario == "progress" && line == "unblock-probe\n" {
+                        std::fs::write(root.join("release-probe"), b"released").unwrap();
+                    }
+                },
+                |line| stderr.push_str(line),
+            )
+            .await
+            .expect("a blocked receipt read must not block execution-channel progress");
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(stdout, "unblock-probe\n");
+        assert_eq!(stderr, "final diagnostic\n");
+        let pid = std::fs::read_to_string(root.join("probe.pid")).unwrap();
+        let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed or cancelled probe must be reaped");
+    }
+
     /// The wrapper's stream must end with the command's last byte, however
     /// large the final burst, and carry its exit status.
     #[test]
@@ -11769,7 +12551,11 @@ sys.stdout.buffer.write(b'complete')
             escape(Cow::Borrowed(&opaque)),
         );
         let receipt = root.join("completion");
+        // Production records the cache scope from the original argv; the
+        // monitor rightly refuses an opaque Cargo command without one. The
+        // PATH prefix above only reaches this fixture's fake cargo.
         let pipeline = disk_budget_test_pipeline(&root, Some(901), 15)
+            .with_cargo_disk_cache("cargo check --locked", &WorkerId::new("rabs-bootstrap"))
             .with_recovery_completion(receipt.to_str().unwrap().into(), "rabs".into());
         let wrapped = wrap_command_with_toolchain(&workload, None);
         assert!(
@@ -11862,6 +12648,7 @@ sys.stdout.buffer.write(b'complete')
                 pipeline = pipeline.with_disk_budget(Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 8 << 20,
                     min_free_bytes,
+                    warm_policy: None,
                 }));
             }
             let command =
@@ -13621,6 +14408,7 @@ Number of files transferred: 42
         .with_disk_budget(Some(rch_common::BuildDiskBudget {
             max_growth_bytes: 8 << 20,
             min_free_bytes: 1 << 20,
+            warm_policy: None,
         }))
         .with_compilation_config(rch_common::CompilationConfig {
             build_timeout_sec: seconds,
@@ -13628,6 +14416,74 @@ Number of files transferred: 42
             remote_build_jobs: RemoteBuildJobs::Off,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn cargo_disk_cache_plan_preserves_original_scope_through_shell_wrappers() {
+        let worker = WorkerId::new("cache/worker");
+        let requested = "env -- CARGO_HOME='/worker/explicit cache' cargo check";
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/cache-plan-test"), None, 20)
+            .with_cargo_disk_cache(requested, &worker);
+        let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+        let command = pipeline.build_remote_command(&isolated, None);
+        assert!(command.contains("\"name\":\"rch-cargo-cache-cache-worker\""));
+        assert!(command.contains("\"additional_home\":\"/worker/explicit cache\""));
+        assert!(command.contains("\"verified\":true"));
+        assert!(command.contains("\"cargo_cache_required\":true"));
+        assert!(command.contains("pwd -P"));
+
+        let ordinary = disk_budget_test_pipeline(Path::new("/tmp/non-cargo-plan"), None, 20)
+            .with_cargo_disk_cache("gcc -c cargo_bridge.c", &worker);
+        assert!(ordinary.cargo_disk_cache.as_ref().unwrap().verified);
+        let ordinary = disk_budget_test_pipeline(Path::new("/tmp/non-cargo-plan"), None, 20)
+            .with_cargo_disk_cache("go test ./...", &worker);
+        assert!(ordinary.cargo_disk_cache.is_none());
+        let ordinary = ordinary.with_remote_path_override("/tmp/cargo-source-guard");
+        let guarded = ordinary
+            .build_remote_command("sh -c 'cd /tmp/cargo-source-guard && go test ./...'", None);
+        assert!(guarded.contains("\"cargo_cache_required\":false"));
+        assert!(guarded.contains("\"cargo_cache\":null"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cargo_disk_cache_unresolved_scope_refuses_before_workload_and_learning() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, original) in [
+            "env -u CARGO_HOME cargo check",
+            "CARGO_HOME=relative cargo check",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = retained.join(case.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let worker = WorkerId::new("cache-scope-refusal");
+            let pipeline = disk_budget_test_pipeline(&directory, None, 15)
+                .with_cargo_disk_cache(original, &worker);
+            let command = crate::hook::add_cargo_isolation(original, &worker);
+            let output = run_external_timeout_fixture(
+                &directory,
+                &pipeline.build_remote_command(&command, None),
+            )
+            .await;
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(120), "{stderr}");
+            let failure = stderr
+                .split_inclusive('\n')
+                .find_map(|line| pipeline.parse_disk_budget_marker(line))
+                .expect("typed prestart refusal");
+            assert!(!failure.started);
+            assert!(
+                failure.detail.contains("literal absolute CARGO_HOME"),
+                "{failure:?}"
+            );
+            assert!(
+                !stderr.contains("_DISK_USAGE:"),
+                "partial roots cannot teach a footprint"
+            );
+        }
     }
 
     #[test]
@@ -13728,6 +14584,232 @@ Number of files transferred: 42
         );
     }
 
+    #[test]
+    fn conditional_disk_receipts_bind_pool_proof_and_cold_readmission() {
+        use rch_common::{
+            BuildDiskBudget, BuildDiskObservation, BuildDiskPool, BuildDiskWarmPolicy,
+        };
+
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 << 30,
+        };
+        let policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 103 << 30,
+            pools: [Some(pool), None, None, None, None, None, None, None],
+        };
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/warm-disk-marker"), Some(1), 20)
+            .with_disk_budget(Some(BuildDiskBudget {
+                max_growth_bytes: 3 << 30,
+                min_free_bytes: 10 << 30,
+                warm_policy: Some(policy),
+            }));
+        let observation = BuildDiskObservation {
+            version: BuildDiskObservation::VERSION,
+            baseline_output_bytes: 81 << 30,
+            peak_added_output_bytes: 1 << 28,
+            peak_free_drop_bytes: 1 << 29,
+            baseline_pool: pool,
+            final_pool: BuildDiskPool {
+                state: [3; 32],
+                ..pool
+            },
+        };
+        let usage = serde_json::json!({
+            "max_growth_bytes": 3_u64 << 30, "min_free_bytes": 10_u64 << 30,
+            "peak_output_bytes": 82_u64 << 30, "peak_growth_bytes": 1 << 28,
+            "complete": true, "exit_code": 0,
+            "admitted_pool": pool, "incremental": observation,
+        });
+        let usage_line = |value: &serde_json::Value| {
+            format!("{}_DISK_USAGE:{value}\n", pipeline.deadline_marker)
+        };
+        assert_eq!(
+            pipeline.parse_disk_observation_marker(&usage_line(&usage)),
+            Some(observation)
+        );
+        for field in ["admitted_pool", "incremental"] {
+            let mut corrupt = usage.clone();
+            if field == "admitted_pool" {
+                corrupt[field]["state"] = serde_json::to_value([9_u8; 32]).unwrap();
+            } else {
+                corrupt[field]["baseline_pool"]["state"] =
+                    serde_json::to_value([9_u8; 32]).unwrap();
+            }
+            assert!(
+                pipeline
+                    .parse_disk_usage_marker(&usage_line(&corrupt))
+                    .is_none()
+            );
+        }
+        // Completion is independent of optional learning. A later oversized
+        // scan cannot erase an already validated admission or authorize replay.
+        let mut no_learning = usage.clone();
+        no_learning["incremental"] = serde_json::Value::Null;
+        assert_eq!(
+            pipeline.parse_disk_usage_exit_code(&usage_line(&no_learning)),
+            Some(0)
+        );
+        let mut impossible_peak = no_learning.clone();
+        impossible_peak["peak_output_bytes"] = serde_json::json!(1_u64 << 30);
+        assert!(
+            pipeline
+                .parse_disk_usage_exit_code(&usage_line(&impossible_peak))
+                .is_none()
+        );
+        no_learning["admitted_pool"] = serde_json::Value::Null;
+        assert!(
+            pipeline
+                .parse_disk_usage_exit_code(&usage_line(&no_learning))
+                .is_none()
+        );
+
+        let refusal = serde_json::json!({
+            "reason": "cold_required", "free_bytes": 220_u64 << 30,
+            "growth_bytes": 0, "max_growth_bytes": 3_u64 << 30,
+            "min_free_bytes": 10_u64 << 30, "started": false,
+            "detail": "pool changed", "peak_output_bytes": 82_u64 << 30,
+            "required_growth_bytes": 103_u64 << 30,
+        });
+        let refusal_line = |value: &serde_json::Value| {
+            format!("{}_DISK_BUDGET:{value}\n", pipeline.deadline_marker)
+        };
+        let parsed = pipeline
+            .parse_disk_budget_marker(&refusal_line(&refusal))
+            .unwrap();
+        assert!(!parsed.started);
+        assert_eq!(parsed.required_growth_bytes, Some(103 << 30));
+        for (field, value) in [
+            ("started", serde_json::json!(true)),
+            ("growth_bytes", serde_json::json!(1)),
+            ("required_growth_bytes", serde_json::json!(4_u64 << 30)),
+            ("reason", serde_json::json!("admission")),
+        ] {
+            let mut corrupt = refusal.clone();
+            corrupt[field] = value;
+            assert!(
+                pipeline
+                    .parse_disk_budget_marker(&refusal_line(&corrupt))
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disk_budget_real_shell_reuses_exact_pool_and_refuses_changed_pool_before_launch() {
+        use rch_common::{BuildDiskBudget, BuildDiskWarmPolicy};
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap().keep();
+        let pool = directory.join("retained-target");
+        std::fs::create_dir(&pool).unwrap();
+        let artifact = pool.join("retained-artifact");
+        std::fs::write(&artifact, vec![1_u8; 16 << 20]).unwrap();
+        let make_pipeline = |id, warm_policy| {
+            disk_budget_test_pipeline(&directory, Some(id), 15)
+                .with_remote_cargo_target_dir_override(pool.to_str().unwrap())
+                .with_disk_budget(Some(BuildDiskBudget {
+                    max_growth_bytes: 8 << 20,
+                    min_free_bytes: 1 << 20,
+                    warm_policy,
+                }))
+        };
+        let initial = make_pipeline(701, None);
+        let output = run_external_timeout_fixture(
+            &directory,
+            &initial.build_remote_command("printf observed", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        initial.ensure_remote_disk_budget(&result).unwrap();
+        let observation = result
+            .stderr
+            .split_inclusive('\n')
+            .find_map(|line| initial.parse_disk_observation_marker(line))
+            .expect("stable retained target must produce bounded incremental evidence");
+        assert!(observation.final_pool.retained_bytes >= 16 << 20);
+        assert!(observation.peak_added_output_bytes < 8 << 20);
+        let policy = BuildDiskWarmPolicy {
+            cold_growth_bytes: 64 << 20,
+            pools: [
+                Some(observation.final_pool),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        };
+        let warm = make_pipeline(702, Some(policy));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &warm.build_remote_command("printf warm-ok", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        warm.ensure_remote_disk_budget(&result).unwrap();
+        assert_eq!(result.stdout, "warm-ok");
+        assert_eq!(std::fs::metadata(&artifact).unwrap().len(), 16 << 20);
+
+        // Same path and byte count are insufficient: changing a retained inode
+        // invalidates its credit, even without replacing the pool directory.
+        std::fs::write(&artifact, vec![2_u8; 16 << 20]).unwrap();
+        let changed = make_pipeline(703, Some(policy));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &changed.build_remote_command("printf started > must-not-start", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        let error = changed.ensure_remote_disk_budget(&result).unwrap_err();
+        let refusal = error
+            .downcast_ref::<RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert_eq!(refusal.reason, "cold_required", "{result:?}");
+        assert!(!refusal.started);
+        assert_eq!(refusal.required_growth_bytes, Some(64 << 20));
+        assert!(!directory.join("must-not-start").exists());
+
+        // A separate cold reservation and a fresh attempt can now execute.
+        let cold = make_pipeline(704, None).with_disk_budget(Some(BuildDiskBudget {
+            max_growth_bytes: 64 << 20,
+            min_free_bytes: 1 << 20,
+            warm_policy: None,
+        }));
+        let output = run_external_timeout_fixture(
+            &directory,
+            &cold.build_remote_command("printf cold-ok", None),
+        )
+        .await;
+        let result = CommandResult {
+            exit_code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            duration_ms: 0,
+        };
+        cold.ensure_remote_disk_budget(&result).unwrap();
+        assert_eq!(result.stdout, "cold-ok");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disk_budget_real_shell_preserves_small_build_status_and_deadlines() {
@@ -13808,6 +14890,7 @@ Number of files transferred: 42
             rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 20,
+                warm_policy: None,
             },
         ));
         let output = run_external_timeout_fixture(
@@ -13857,6 +14940,7 @@ Number of files transferred: 42
             .with_disk_budget(Some(rch_common::BuildDiskBudget {
                 max_growth_bytes: 1 << 20,
                 min_free_bytes: 1 << 20,
+                warm_policy: None,
             }));
         let output = run_external_timeout_fixture(
             &source,
@@ -13903,6 +14987,7 @@ Number of files transferred: 42
                 Some(rch_common::BuildDiskBudget {
                     max_growth_bytes: 1 << 20,
                     min_free_bytes: 1 << 62,
+                    warm_policy: None,
                 }),
             );
             let command = pipeline.build_remote_command("printf started > workload-started", None);
@@ -13950,11 +15035,14 @@ Number of files transferred: 42
                 std::os::unix::fs::symlink(format!("/bin/{tool}"), bin.join(tool)).unwrap();
             }
             let pipeline = disk_budget_test_pipeline(&directory, build_id, 15);
+            let script = directory.join("command.sh");
+            std::fs::write(
+                &script,
+                pipeline.build_remote_command("printf started > workload-started", None),
+            )
+            .unwrap();
             let output = std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    &pipeline.build_remote_command("printf started > workload-started", None),
-                ])
+                .arg(&script)
                 .env_clear()
                 .env("HOME", &directory)
                 .env("PATH", &bin)
@@ -14102,10 +15190,13 @@ Number of files transferred: 42
     async fn run_external_timeout_fixture(directory: &Path, command: &str) -> std::process::Output {
         // These are actual stock shell/timeout processes, never Cargo/compiler
         // invocations. Keep fixtures and the exact generated command for review.
-        std::fs::write(directory.join("command.sh"), command).unwrap();
+        let script = directory.join("command.sh");
+        std::fs::write(&script, command).unwrap();
         let mut child = Command::new("/bin/sh");
+        // A file operand, not -c: the composed wrapper exceeds Linux's per-argument
+        // limit, which is why production feeds it to `sh -s` over stdin.
         child
-            .args(["-c", command])
+            .arg(&script)
             .current_dir(directory)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -15011,6 +16102,276 @@ Number of files transferred: 42
         assert!(
             !denied.exists(),
             "a rejected lease must precede destination setup"
+        );
+    }
+
+    #[cfg(unix)]
+    fn warm_source_upload_test_budget() -> rch_common::BuildDiskBudget {
+        rch_common::BuildDiskBudget {
+            max_growth_bytes: 3 << 30,
+            min_free_bytes: 10 << 30,
+            warm_policy: Some(rch_common::BuildDiskWarmPolicy {
+                cold_growth_bytes: 103 << 30,
+                pools: [
+                    Some(rch_common::BuildDiskPool {
+                        identity: [1; 32],
+                        state: [2; 32],
+                        retained_bytes: 80 << 30,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_upload_guard_is_bounded_with_real_authority_and_excludes_readers() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        // A wildcard exercises the additional literal-path shell wrapper.
+        let pipeline = flavour_test_pipeline(
+            RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            0,
+        )
+        .with_remote_path_override("/data/rch/source [literal] ' space")
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_disk_budget(Some(warm_source_upload_test_budget()));
+        let remote = pipeline.remote_path();
+        let escaped = escape(Cow::from(remote.as_str()));
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let upload_prefix =
+            crate::hook::ssh::source_authority_upload_prefix("ab12", &remote).unwrap();
+        for command in [
+            pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command_with_upload_prefix(
+                &worker,
+                &destination,
+                &escaped,
+                &[],
+                Some(&upload_prefix),
+            ),
+        ] {
+            let args = command_args(&command);
+            assert!(args.iter().all(|argument| argument.len() < 120 * 1024));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(receiver.contains("_SOURCE_UPLOAD_DISK_BUDGET:"));
+            assert!(receiver.contains(" standalone rsync"));
+            assert!(!receiver.contains("command exceeds safe argument bound"));
+        }
+
+        for command in [
+            pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &[],
+                SourceContentBarrier::Ordinary,
+            ),
+            pipeline.build_retrieve_command(&worker, &remote, &["target/**".into()]),
+            pipeline.build_retrieve_streaming_command(&worker, &remote, &["target/**".into()]),
+        ] {
+            assert!(
+                !command_args(&command)
+                    .iter()
+                    .any(|argument| argument.contains("_SOURCE_UPLOAD_DISK_BUDGET:"))
+            );
+        }
+        let cold = pipeline
+            .clone()
+            .with_disk_budget(Some(rch_common::BuildDiskBudget {
+                warm_policy: None,
+                ..warm_source_upload_test_budget()
+            }));
+        assert!(
+            !cold
+                .source_upload_rsync_path(&escaped, None)
+                .contains("_SOURCE_UPLOAD_DISK_BUDGET:")
+        );
+
+        // Future script growth or unusually large authority data fails before
+        // local exec, rather than crossing the operating-system argv limit.
+        let mut oversized = pipeline;
+        oversized.source_authority_prefix =
+            Some(format!("env RCH_TEST_OVERSIZED={}", "x".repeat(120 * 1024)));
+        let refused = oversized.source_upload_rsync_path(&escaped, None);
+        assert!(refused.len() < 1024);
+        assert!(refused.contains("command exceeds safe argument bound"));
+        assert!(!refused.contains("mkdir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_upload_guard_preserves_binary_stream_argv_and_source_fencing() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let _host = LiveCheckoutHostMarker::declared_in(&retained);
+        let bin = retained.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // This is a command-construction test, not a process-ownership proof.
+        // Capture the exact embedded supervisor and plan, then relay the
+        // command so a real shell can check rsync's binary protocol stream.
+        let capture = bin.join("python3");
+        std::fs::write(
+            &capture,
+            "#!/bin/sh\nset -eu\n\
+            [ \"$RCH_ACTIVITY_TEST\" = \"$RCH_TEST_EXPECTED_ACTIVITY\" ]\n\
+            printf '%s\\0' \"$@\" > \"$RCH_TEST_UPLOAD_ARGV\"\n\
+            shift 10\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let receiver = bin.join("rsync");
+        std::fs::write(
+            &receiver,
+            "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$@\" > \"$RCH_TEST_SERVER_ARGV\"\nexec cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let payload = b"\0rsync-binary-input\xff\n' $literal\0";
+        let worker = flavour_test_worker();
+        for mode in 0..3 {
+            let remote = retained.join(format!("source-{mode} [literal] ' space"));
+            let remote = remote.to_str().unwrap();
+            let mut pipeline = flavour_test_pipeline(
+                RsyncFlavor::Rsync {
+                    major: 3,
+                    minor: 2,
+                    patch: 7,
+                },
+                0,
+            )
+            .with_remote_path_override(remote)
+            .with_disk_budget(Some(warm_source_upload_test_budget()));
+            pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+            let escaped = escape(Cow::from(remote));
+            let destination = pipeline.rsync_remote_spec(&worker, remote);
+            let command = match mode {
+                0 => pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+                1 => pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+                _ => pipeline.build_sync_streaming_command_with_upload_prefix(
+                    &worker,
+                    &destination,
+                    &escaped,
+                    &[],
+                    Some("env RCH_ACTIVITY_TEST=shared"),
+                ),
+            };
+            let args = command_args(&command);
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            let server_args = [
+                "--server",
+                "-logDtpre.iLsfxCIvu",
+                "literal '$value; flag",
+                ".",
+                ".",
+            ];
+            let program = format!(
+                "{receiver} {}",
+                server_args
+                    .iter()
+                    .map(|argument| escape(Cow::from(*argument)).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(program.len() < 120 * 1024);
+            let captured = retained.join(format!("monitor-argv-{mode}"));
+            let forwarded = retained.join(format!("server-argv-{mode}"));
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", &program])
+                .env("PATH", &path)
+                .env(
+                    "RCH_TEST_EXPECTED_ACTIVITY",
+                    if mode == 2 { "shared" } else { "owned" },
+                )
+                .env("RCH_TEST_UPLOAD_ARGV", &captured)
+                .env("RCH_TEST_SERVER_ARGV", &forwarded)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, payload);
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let captured = std::fs::read(captured).unwrap();
+            let captured = captured
+                .strip_suffix(&[0])
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &captured[..3],
+                [b"-I".as_slice(), b"-S".as_slice(), b"-c".as_slice()]
+            );
+            assert_eq!(
+                captured[3],
+                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT.as_bytes()
+            );
+            assert_eq!(captured[4], (3_u64 << 30).to_string().as_bytes());
+            assert_eq!(captured[5], (10_u64 << 30).to_string().as_bytes());
+            assert_eq!(
+                captured[6],
+                format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", pipeline.deadline_marker).as_bytes()
+            );
+            assert_eq!(captured[7], remote.as_bytes());
+            let plan: serde_json::Value = serde_json::from_slice(captured[8]).unwrap();
+            assert_eq!(
+                plan,
+                serde_json::json!({"probe": [remote], "output": [remote], "receipt": null, "warm_policy": null, "require_incremental_tracking": true})
+            );
+            assert_eq!(captured[9], b"standalone");
+            assert_eq!(captured[10], b"rsync");
+            let mut expected = server_args.to_vec();
+            *expected.last_mut().unwrap() = remote;
+            let expected = expected
+                .iter()
+                .flat_map(|argument| argument.bytes().chain(std::iter::once(0)))
+                .collect::<Vec<_>>();
+            assert_eq!(std::fs::read(forwarded).unwrap(), expected);
+        }
+
+        let denied = retained.join("denied-source");
+        let mut pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_remote_path_override(denied.to_str().unwrap())
+            .with_disk_budget(Some(warm_source_upload_test_budget()));
+        pipeline.source_authority_prefix = Some("false".into());
+        let program = pipeline.source_upload_rsync_path(&escape(denied.to_string_lossy()), None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &program])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            !denied.exists(),
+            "source authority must precede setup and receiver"
         );
     }
 
@@ -17658,7 +19019,8 @@ Number of files transferred: 42
     /// A job already running on a worker must compile there, never offload
     /// onward. Without the loop-break the worker's own cargo shim re-offloads:
     /// a pure worker refuses local fallback (exit 103), a dispatcher bounces
-    /// the build to a third host. See REMOTE_LOOP_BREAK_ENV.
+    /// the build to a third host. Shim v9 also refuses a bare bypass without
+    /// the origin marker, even for --version (issue #133).
     #[test]
     fn test_remote_env_plan_injects_loop_break() {
         let pipeline = TransferPipeline::new(
@@ -17668,19 +19030,28 @@ Number of files transferred: 42
             TransferConfig::default(),
         );
 
-        let prefix = pipeline.build_env_prefix();
-        assert!(
-            prefix.prefix.contains("RCH_CARGO_WRAPPER_BYPASS=1"),
-            "remote command must carry the loop-break, got: {}",
-            prefix.prefix
-        );
-        assert!(
-            prefix
-                .applied
-                .iter()
-                .any(|k| k == "RCH_CARGO_WRAPPER_BYPASS"),
-            "loop-break should be reported as applied"
-        );
+        let prefix = pipeline
+            .build_remote_env_plan_with_environment(&pipeline.remote_path(), [])
+            .env_prefix;
+        for (key, value) in [
+            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+            ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+        ] {
+            assert!(
+                prefix.prefix.contains(&format!("{key}={value}")),
+                "remote command must carry the whole pair: {}",
+                prefix.prefix
+            );
+            assert_eq!(
+                prefix
+                    .applied
+                    .iter()
+                    .filter(|applied| *applied == key)
+                    .count(),
+                1,
+                "{key} must be reported exactly once"
+            );
+        }
     }
 
     /// A caller that exports the bypass OFF locally must not be able to re-arm
@@ -17689,6 +19060,7 @@ Number of files transferred: 42
     fn test_remote_loop_break_overrides_forwarded_value() {
         let mut overrides = HashMap::new();
         overrides.insert("RCH_CARGO_WRAPPER_BYPASS".to_string(), "0".to_string());
+        overrides.insert("RCH_CARGO_WRAPPER_ORIGIN".to_string(), "caller".to_string());
 
         let pipeline = TransferPipeline::new(
             PathBuf::from("/tmp/project"),
@@ -17696,7 +19068,11 @@ Number of files transferred: 42
             "hash".to_string(),
             TransferConfig::default(),
         )
-        .with_env_allowlist(vec!["RCH_CARGO_WRAPPER_BYPASS".to_string()])
+        .with_env_allowlist(vec![
+            "RCH_CARGO_WRAPPER_BYPASS".to_string(),
+            "RCH_CARGO_WRAPPER_ORIGIN".to_string(),
+            " RCH_CARGO_WRAPPER_ORIGIN ".to_string(),
+        ])
         .with_env_overrides(overrides);
 
         let prefix = pipeline.build_env_prefix();
@@ -17710,15 +19086,288 @@ Number of files transferred: 42
             "the disabling value must not survive, got: {}",
             prefix.prefix
         );
-        assert_eq!(
-            prefix
-                .applied
-                .iter()
-                .filter(|k| *k == "RCH_CARGO_WRAPPER_BYPASS")
-                .count(),
-            1,
-            "loop-break must be assigned exactly once"
+        assert!(
+            prefix.prefix.contains("RCH_CARGO_WRAPPER_ORIGIN=rch"),
+            "RCH must stamp its own origin: {}",
+            prefix.prefix
         );
+        assert!(!prefix.prefix.contains("RCH_CARGO_WRAPPER_ORIGIN=caller"));
+        for key in ["RCH_CARGO_WRAPPER_BYPASS", "RCH_CARGO_WRAPPER_ORIGIN"] {
+            assert_eq!(prefix.prefix.matches(&format!("{key}=")).count(), 1);
+            assert_eq!(
+                prefix
+                    .applied
+                    .iter()
+                    .filter(|applied| *applied == key)
+                    .count(),
+                1,
+                "each loop-break marker must be assigned exactly once"
+            );
+        }
+    }
+
+    /// Execute the generated remote command and the actual installed shim
+    /// scripts on a dual-role layout. Cargo and RCH are recording executables:
+    /// this tests the shell handoff, not a live fleet or compiler installation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_job_runs_installed_cargo_shims_with_paired_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+        for tracked in [false, true] {
+            for require_remote in [None, Some("1")] {
+                for exit_code in [0, 101] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path();
+                    let work = root.join("work");
+                    let home = root.join("home");
+                    let shims = home.join(".rch/shims");
+                    let sysroot = home.join(".rustup/toolchains/fixture");
+                    let toolchain_bin = sysroot.join("bin");
+                    let bin = root.join("bin");
+                    for path in [&work, &shims, &toolchain_bin, &bin] {
+                        std::fs::create_dir_all(path).unwrap();
+                    }
+                    let write_exe = |path: &Path, body: &str| {
+                        std::fs::write(path, body).unwrap();
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    };
+                    write_exe(
+                        &shims.join("cargo"),
+                        &crate::commands::shim::test_cargo_shim_body(),
+                    );
+                    write_exe(
+                        &toolchain_bin.join("cargo"),
+                        &crate::commands::shim::test_toolchain_wrap_body(),
+                    );
+                    write_exe(
+                        &bin.join("rustc"),
+                        "#!/bin/sh\nprintf '%s\\n' \"$RCH_TEST_SYSROOT\"\n",
+                    );
+                    write_exe(
+                        &bin.join("rch"),
+                        "#!/bin/sh\nprintf offload > \"$RCH_TEST_OFFLOAD\"\nexit 87\n",
+                    );
+                    write_exe(
+                        &toolchain_bin.join("cargo-rch-real"),
+                        concat!(
+                            "#!/bin/sh\n",
+                            "printf '%s\\0' \"${RCH_CARGO_WRAPPER_BYPASS-unset}\" ",
+                            "\"${RCH_CARGO_WRAPPER_ORIGIN-unset}\" \"$@\" >> \"$RCH_TEST_LOG\"\n",
+                            "printf 'cargo fixture\\n'\n",
+                            "exit \"${RCH_TEST_STATUS:-0}\"\n",
+                        ),
+                    );
+                    std::fs::write(
+                        work.join("job.sh"),
+                        concat!(
+                            "set -eu\n",
+                            "cargo --version\n",
+                            "sh -c 'cargo test --features \"feature with spaces\"'\n",
+                            "RCH_TEST_STATUS=\"$RCH_TEST_LAST_STATUS\" ",
+                            "\"$RCH_TEST_TOOLCHAIN_CARGO\" build --release\n",
+                        ),
+                    )
+                    .unwrap();
+                    let log = root.join("calls");
+                    let offload = root.join("unexpected-offload");
+                    let mut overrides = HashMap::from([
+                        ("HOME".to_string(), home.to_str().unwrap().to_string()),
+                        (
+                            "PATH".to_string(),
+                            format!("{}:{}:/usr/bin:/bin", shims.display(), bin.display()),
+                        ),
+                        (
+                            "RCH_TEST_SYSROOT".to_string(),
+                            sysroot.to_str().unwrap().to_string(),
+                        ),
+                        (
+                            "RCH_TEST_TOOLCHAIN_CARGO".to_string(),
+                            toolchain_bin.join("cargo").to_str().unwrap().to_string(),
+                        ),
+                        (
+                            "RCH_TEST_LOG".to_string(),
+                            log.to_str().unwrap().to_string(),
+                        ),
+                        (
+                            "RCH_TEST_OFFLOAD".to_string(),
+                            offload.to_str().unwrap().to_string(),
+                        ),
+                        ("RCH_TEST_LAST_STATUS".to_string(), exit_code.to_string()),
+                        ("RCH_CARGO_WRAPPER_BYPASS".to_string(), "0".to_string()),
+                        ("RCH_CARGO_WRAPPER_ORIGIN".to_string(), "caller".to_string()),
+                    ]);
+                    if let Some(value) = require_remote {
+                        overrides.insert("RCH_REQUIRE_REMOTE".to_string(), value.to_string());
+                    }
+                    let pipeline = TransferPipeline::new(
+                        work.clone(),
+                        "shim-worker".to_string(),
+                        "hash".to_string(),
+                        TransferConfig::default(),
+                    )
+                    .with_remote_path_override(work.to_str().unwrap())
+                    .with_env_allowlist(overrides.keys().cloned().collect())
+                    .with_env_overrides(overrides)
+                    .with_build_id(tracked.then_some(41))
+                    .with_compilation_kind(Some(CompilationKind::Job))
+                    .with_compilation_config(rch_common::CompilationConfig {
+                        build_timeout_sec: 15,
+                        test_timeout_sec: 15,
+                        remote_build_jobs: RemoteBuildJobs::Off,
+                        ..Default::default()
+                    });
+                    let script = root.join("remote-command.sh");
+                    std::fs::write(&script, pipeline.build_remote_command("sh ./job.sh", None))
+                        .unwrap();
+                    let output = std::process::Command::new("/usr/bin/timeout")
+                        .args(["--kill-after=5", "30", "/bin/sh"])
+                        .arg(&script)
+                        .current_dir(&work)
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("HOME", &home)
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(exit_code),
+                        "tracked={tracked}, require_remote={require_remote:?}: {output:?}"
+                    );
+                    assert!(
+                        !offload.exists(),
+                        "an admitted job must never offload again"
+                    );
+                    assert_eq!(
+                        std::fs::read(&log).unwrap().as_slice(),
+                        concat!(
+                            "1\0rch\0--version\0",
+                            "1\0rch\0test\0--features\0feature with spaces\0",
+                            "1\0rch\0build\0--release\0",
+                        )
+                        .as_bytes()
+                    );
+                    assert_eq!(
+                        output.stdout.as_slice(),
+                        b"cargo fixture\ncargo fixture\ncargo fixture\n"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Execute the actual remote launcher and installed shim bodies. Cargo and
+    /// rch are inert argv/exit sentinels: this proves the shell/environment
+    /// contract on a dual-role worker, not an SSH connection or a Rust build.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_job_cargo_uses_managed_origin_through_worker_supervision() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let shims = home.join(".rch/shims");
+        let tools = root.path().join("tools");
+        let toolchain = root.path().join("toolchain with spaces/bin");
+        for directory in [&shims, &tools, &toolchain] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let executable = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(
+            &shims.join("cargo"),
+            &crate::commands::shim::test_cargo_shim_body(),
+        );
+        executable(
+            &toolchain.join("cargo"),
+            &crate::commands::shim::test_toolchain_wrap_body(),
+        );
+        let real_cargo = toolchain.join("cargo-rch-real");
+        executable(
+            &real_cargo,
+            "#!/bin/sh\nprintf 'cargo-fixture:%s:%s:%s\\n' \
+\"$RCH_CARGO_WRAPPER_BYPASS\" \"$RCH_CARGO_WRAPPER_ORIGIN\" \"$*\"\n\
+if [ \"${1:-}\" = test ]; then exit \"$RCH_TEST_CARGO_EXIT\"; fi\n",
+        );
+        executable(
+            &tools.join("rch"),
+            "#!/bin/sh\nprintf 'unexpected recursive offload\\n' >&2\nexit 95\n",
+        );
+        let job = root.path().join("job.sh");
+        std::fs::write(
+            &job,
+            "set -eu\nHOME=$RCH_TEST_HOME\nPATH=$RCH_TEST_PATH\nexport HOME PATH\n\
+cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n",
+        )
+        .unwrap();
+        let workload = format!("bash {}", escape(Cow::from(job.to_str().unwrap())));
+        let path = format!("{}:{}:/usr/bin:/bin", shims.display(), tools.display());
+        for (index, (guarded, exit_code)) in [(false, 0), (false, 101), (true, 0), (true, 101)]
+            .into_iter()
+            .enumerate()
+        {
+            let project = root.path().join(format!("project-{index}"));
+            std::fs::create_dir(&project).unwrap();
+            let pipeline = if guarded {
+                disk_budget_test_pipeline(&project, Some(index as u64 + 1), 15)
+            } else {
+                cargo_home_boundary_pipeline(&project)
+            }
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_env_allowlist(vec![
+                "RCH_CARGO_WRAPPER_BYPASS".to_owned(),
+                "RCH_CARGO_WRAPPER_ORIGIN".to_owned(),
+            ])
+            .with_env_overrides(HashMap::from([
+                ("RCH_CARGO_WRAPPER_BYPASS".to_owned(), "0".to_owned()),
+                ("RCH_CARGO_WRAPPER_ORIGIN".to_owned(), "caller".to_owned()),
+            ]));
+            // Production also carries large supervisors on stdin/a script,
+            // never in a single exec argument (Linux MAX_ARG_STRLEN).
+            let script = root.path().join(format!("launch-{index}.sh"));
+            std::fs::write(&script, pipeline.build_remote_command(&workload, None)).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", &path)
+                .env("RCH_TEST_HOME", &home)
+                .env("RCH_TEST_PATH", &path)
+                .env("RCH_REAL_CARGO", &real_cargo)
+                .env("RCH_TEST_TOOLCHAIN_CARGO", toolchain.join("cargo"))
+                .env("RCH_TEST_CARGO_EXIT", exit_code.to_string())
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(exit_code),
+                "case {index}: {output:?}"
+            );
+            assert_eq!(
+                output.stdout,
+                b"cargo-fixture:1:rch:--version\ncargo-fixture:1:rch:--version\ncargo-fixture:1:rch:test --locked\n",
+                "case {index}: {output:?}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("recursive offload"));
+            if guarded {
+                pipeline
+                    .ensure_remote_disk_budget(&CommandResult {
+                        exit_code,
+                        stdout: String::from_utf8(output.stdout).unwrap(),
+                        stderr: String::from_utf8(output.stderr).unwrap(),
+                        duration_ms: 0,
+                    })
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -22000,6 +23649,356 @@ Total file size: 123 bytes";
             parse_rsync_selected_size("Total file size: 0 bytes"),
             Some(0)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn counted_artifact_peer(delay: &str) -> (PathBuf, TransferPipeline, WorkerConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let source = root.join("worker");
+        let caller = root.join("caller");
+        let stage = root.join("stage");
+        for directory in [&source, &caller, &stage] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(caller.join("Cargo.lock"), b"caller lockfile sentinel\n").unwrap();
+        std::fs::write(caller.join("source.rs"), b"caller source sentinel\n").unwrap();
+        let peer = root.join("counted-rsync");
+        let calls = escape(root.join("calls").to_string_lossy()).into_owned();
+        let warnings = escape(root.join("warnings").to_string_lossy()).into_owned();
+        let malformed = escape(root.join("malformed").to_string_lossy()).into_owned();
+        std::fs::write(
+            &peer,
+            format!(
+                r#"#!/bin/sh
+case "$1" in --version|-V) exec /usr/bin/rsync "$@" ;; esac
+phase=payload
+for arg do
+    if [ "$arg" = --dry-run ]; then phase=selection; fi
+done
+printf '%s\n' "$phase" >> {calls}
+sleep {delay}
+if [ -f {warnings} ]; then printf '%s\n' 'rsync: partial transfer: Permission denied (13)' >&2; fi
+if [ "$phase" = selection ] && [ -f {malformed} ]; then
+    printf '%s\n' 'Total file size: 0 bytes'
+    exit 0
+fi
+exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift; exec \"\$@\"' rch-local-peer"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pipeline = TransferPipeline::new(
+            caller,
+            "empty-artifacts".into(),
+            "empty-artifacts".into(),
+            TransferConfig {
+                rsync_bin: Some(peer.to_string_lossy().into_owned()),
+                retry: RetryConfig {
+                    max_attempts: 1,
+                    total_timeout_ms: 5_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .with_local_root(stage)
+        .with_remote_path_override(source.to_str().unwrap());
+        (root, pipeline, worker_with_os(None))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn artifact_peer_calls(root: &Path) -> usize {
+        std::fs::read_to_string(root.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_empty_artifacts_omit_one_remote_call_in_both_collectors() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0");
+        std::fs::create_dir_all(root.join("worker/target/debug")).unwrap();
+        std::fs::write(
+            root.join("worker/target/debug/cache.rmeta"),
+            b"worker cache",
+        )
+        .unwrap();
+        let patterns = default_rust_test_artifact_patterns();
+        for streaming in [false, true] {
+            let before = artifact_peer_calls(&root);
+            let result = if streaming {
+                pipeline
+                    .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                    .await
+            } else {
+                pipeline.retrieve_artifacts(&worker, &patterns).await
+            }
+            .unwrap();
+            assert_eq!(artifact_peer_calls(&root) - before, 1);
+            assert_eq!(result.matched_regular_files, Some(0));
+            assert!(result.manifest_regular_files.is_empty());
+            assert_eq!(result.stats.files_transferred, 0);
+            assert_eq!(std::fs::read_dir(root.join("stage")).unwrap().count(), 0);
+        }
+        assert_eq!(
+            std::fs::read(root.join("caller/Cargo.lock")).unwrap(),
+            b"caller lockfile sentinel\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("caller/source.rs")).unwrap(),
+            b"caller source sentinel\n"
+        );
+        // A declared directory is itself caller output, even with no files.
+        std::fs::create_dir(root.join("worker/reports")).unwrap();
+        let before = artifact_peer_calls(&root);
+        pipeline
+            .retrieve_result_dir(&worker, Path::new("reports"))
+            .await
+            .unwrap();
+        assert_eq!(artifact_peer_calls(&root) - before, 2);
+        assert!(root.join("stage/reports").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_empty_selection_rechecks_control_after_probe() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0");
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let pipeline = pipeline.with_retrieval_control(receiver.clone(), TokioInstant::now());
+        let plan = pipeline
+            .artifact_retrieval_plan(
+                &worker,
+                &pipeline.remote_path(),
+                &default_rust_test_artifact_patterns(),
+            )
+            .await
+            .unwrap();
+        assert!(plan.empty_selection.is_some());
+        assert_eq!(plan.retry_config.total_timeout_ms, 30_000);
+        assert_eq!(artifact_peer_calls(&root), 1);
+
+        // Exercise the exact synchronous gate used by both empty returns after
+        // obtaining a real empty proof. A recovery request can arrive after
+        // that process has exited and been reaped; it still needs its typed
+        // acknowledgment, without another process or an asynchronous gap.
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            pipeline
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap();
+        }
+        cancel.send(true).unwrap();
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            let error = pipeline
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap_err();
+            assert!(error.is::<RetrievalCancelled>());
+        }
+
+        // Distinct budgets make this a deterministic absolute-deadline
+        // regression: passing a larger probe allowance cannot authorize a
+        // result after the selected plan's deadline. Current size planning
+        // never shrinks its configured allowance, but the gate must enforce
+        // the plan it receives independently of that policy.
+        cancel.send(false).unwrap();
+        let expired = pipeline
+            .with_retrieval_control(receiver, TokioInstant::now() - Duration::from_secs(60));
+        let probe_allowance = RetryConfig {
+            total_timeout_ms: 120_000,
+            ..plan.retry_config.clone()
+        };
+        expired
+            .check_retrieval_control(&probe_allowance, "estimate_artifact_retrieval")
+            .unwrap();
+        for operation in ["retrieve_artifacts", "retrieve_artifacts_streaming"] {
+            let error = expired
+                .check_retrieval_control(&plan.retry_config, operation)
+                .unwrap_err();
+            assert!(error.to_string().contains("retrieval deadline exceeded"));
+        }
+        assert_eq!(artifact_peer_calls(&root), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_shortcut_preserves_zero_byte_reports_symlinks_and_checksum_noops() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        for streaming in [false, true] {
+            for case in ["empty-file", "report", "checksum-noop", "symlink"] {
+                let (root, pipeline, worker) = counted_artifact_peer("0");
+                let source = root.join("worker/junit.xml");
+                let destination = root.join("stage/junit.xml");
+                if case == "symlink" {
+                    std::fs::write(root.join("worker/report-target"), b"report").unwrap();
+                    std::os::unix::fs::symlink("report-target", &source).unwrap();
+                } else {
+                    let contents: &[u8] = if case == "empty-file" {
+                        b""
+                    } else {
+                        b"report\n"
+                    };
+                    std::fs::write(&source, contents).unwrap();
+                    if case == "checksum-noop" {
+                        std::fs::write(&destination, contents).unwrap();
+                        let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&destination)
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                }
+                let patterns = default_rust_test_artifact_patterns();
+                let result = if streaming {
+                    pipeline
+                        .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                        .await
+                } else {
+                    pipeline.retrieve_artifacts(&worker, &patterns).await
+                }
+                .unwrap();
+                assert_eq!(
+                    artifact_peer_calls(&root),
+                    2,
+                    "{case}, streaming={streaming}"
+                );
+                if case == "symlink" {
+                    assert_eq!(
+                        std::fs::read_link(&destination).unwrap(),
+                        Path::new("report-target")
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(&destination).unwrap(),
+                        std::fs::read(&source).unwrap()
+                    );
+                    assert_eq!(result.matched_regular_files, Some(1));
+                    assert_eq!(result.manifest_regular_files, ["junit.xml"]);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_shortcut_never_bypasses_uncertain_evidence_or_storage_reserve() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        for streaming in [false, true] {
+            for case in ["malformed", "warnings", "reserve", "cancel"] {
+                let (root, mut pipeline, worker) = counted_artifact_peer("0");
+                let (_cancel, receiver) = tokio::sync::watch::channel(case == "cancel");
+                if case == "reserve" {
+                    pipeline.transfer_config.retrieval_min_free_bytes = u64::MAX;
+                } else if case == "cancel" {
+                    pipeline = pipeline.with_retrieval_control(receiver, TokioInstant::now());
+                } else {
+                    std::fs::write(root.join(case), b"enabled").unwrap();
+                }
+                let patterns = default_rust_test_artifact_patterns();
+                let result = if streaming {
+                    pipeline
+                        .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                        .await
+                } else {
+                    pipeline.retrieve_artifacts(&worker, &patterns).await
+                };
+                if case == "cancel" {
+                    assert!(result.unwrap_err().is::<RetrievalCancelled>());
+                    assert_eq!(
+                        artifact_peer_calls(&root),
+                        0,
+                        "cancelled selection must not start"
+                    );
+                } else if case == "reserve" {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("insufficient controller retrieval storage")
+                    );
+                    assert_eq!(artifact_peer_calls(&root), 1);
+                } else if case == "warnings" {
+                    assert!(
+                        result.is_err(),
+                        "partial output must remain a delivery error"
+                    );
+                    assert_eq!(artifact_peer_calls(&root), 2);
+                } else {
+                    assert!(result.is_ok());
+                    assert_eq!(
+                        artifact_peer_calls(&root),
+                        2,
+                        "incomplete evidence must retain collection"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_artifact_latency_pairs_real_rsync_with_the_previous_two_call_path() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let (root, pipeline, worker) = counted_artifact_peer("0.25");
+        let patterns = default_rust_test_artifact_patterns();
+        let remote = pipeline.remote_path();
+        let mut previous_ms = Vec::new();
+        let mut optimized_ms = Vec::new();
+        for _ in 0..3 {
+            let before = artifact_peer_calls(&root);
+            let started = std::time::Instant::now();
+            // The incumbent always follows the existing budget/selection
+            // dry-run with a payload rsync, even when no files were selected.
+            let plan = pipeline
+                .artifact_retrieval_plan(&worker, &remote, &patterns)
+                .await
+                .unwrap();
+            assert!(plan.empty_selection.is_some());
+            let copied = pipeline
+                .execute_retrieval_rsync(
+                    &plan.retry_config,
+                    "previous_empty_artifact_collection",
+                    || pipeline.build_retrieve_command(&worker, &remote, &patterns),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(copied.status.success());
+            previous_ms.push(started.elapsed().as_millis());
+            assert_eq!(artifact_peer_calls(&root) - before, 2);
+
+            let before = artifact_peer_calls(&root);
+            let started = std::time::Instant::now();
+            let empty = pipeline
+                .retrieve_artifacts(&worker, &patterns)
+                .await
+                .unwrap();
+            optimized_ms.push(started.elapsed().as_millis());
+            assert_eq!(artifact_peer_calls(&root) - before, 1);
+            assert_eq!(empty.matched_regular_files, Some(0));
+        }
+        // Counts are the deterministic latency regression gate. These actual
+        // wall times are a paired local-rsync measurement with injected delay,
+        // not a claim about a real high-latency worker or a complete rch build.
+        eprintln!(
+            "empty-artifact native rsync, injected 250ms/call: previous_ms={previous_ms:?}, optimized_ms={optimized_ms:?}; remote calls 2 -> 1; retained={}",
+            root.display()
+        );
+        assert_eq!(std::fs::read_dir(root.join("stage")).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

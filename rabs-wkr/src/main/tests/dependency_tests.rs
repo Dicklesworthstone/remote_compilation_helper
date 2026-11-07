@@ -737,6 +737,92 @@ fn canonical_native_metadata_and_archive_requests_require_closed_generated_input
     }
 }
 
+fn native_request_archive_name(request: &mut Value, filename: &str, workspace: bool) {
+    use rabs_sandbox::source_transfer::SourceManifest;
+    let mut files = source_transfer::parse_manifest(&request["source_manifest"])
+        .unwrap()
+        .files()
+        .to_vec();
+    for file in &mut files {
+        if file.path.ends_with("/libnative.a") {
+            let (parent, _) = file.path.rsplit_once('/').unwrap();
+            file.path = format!("{parent}/{filename}");
+        } else if workspace && file.path == "package/src/lib.rs" {
+            file.path = "package/member/src/lib.rs".into();
+        }
+    }
+    let manifest = SourceManifest::new(files).unwrap();
+    request["source_manifest"] = json!({
+        "manifest_sha256":source_transfer::hex(&manifest.digest()),
+        "files":manifest.files().iter().map(|file| json!({
+            "path":file.path, "bytes":file.len,
+            "sha256":source_transfer::hex(&file.sha256), "executable":file.executable,
+        })).collect::<Vec<_>>()
+    });
+}
+
+#[test]
+fn canonical_native_modifiers_require_the_exact_retained_archive_in_every_live_class() {
+    for archive in [false, true] {
+        for family in ["dependency", "foreign", "workspace"] {
+            for (library, filename) in [
+                ("static:+bundle=native", "libnative.a"),
+                ("static:+whole-archive=native", "libnative.a"),
+                ("static:-whole-archive=native", "libnative.a"),
+                (
+                    "static:+bundle,-verbatim,+whole-archive=native",
+                    "libnative.a",
+                ),
+                ("static:+verbatim=native.objects.a", "native.objects.a"),
+                (
+                    "static:+bundle,+verbatim,+whole-archive=native.objects.a",
+                    "native.objects.a",
+                ),
+                (
+                    "static:-whole-archive,+verbatim,+bundle=native.objects.a",
+                    "native.objects.a",
+                ),
+            ] {
+                let mut wire = if family == "foreign" {
+                    canonical_foreign_native_request(archive)
+                } else {
+                    canonical_native_request(archive)
+                };
+                if family == "workspace" {
+                    wire["dependency_context"] =
+                        canonical_workspace_request(archive)["dependency_context"].clone();
+                    wire["args"][7] = json!("member/src/lib.rs");
+                }
+                *wire["args"].as_array_mut().unwrap().last_mut().unwrap() = json!(library);
+                native_request_archive_name(&mut wire, filename, family == "workspace");
+                let original = wire.clone();
+                let parsed = parse_exec_request(&wire).unwrap_or_else(|error| {
+                    panic!("{family}, archive={archive}, {library}: {error}")
+                });
+                assert_eq!(parsed.args.last().unwrap(), library);
+                assert_eq!(wire, original, "decoding must preserve exact request bytes");
+
+                // Rebuild a valid manifest with a different archive name. The
+                // refusal must be for lookup, not a corrupt manifest digest.
+                let mut absent = if family == "foreign" {
+                    canonical_foreign_native_request(archive)
+                } else {
+                    canonical_native_request(archive)
+                };
+                absent["dependency_context"] = wire["dependency_context"].clone();
+                absent["args"] = wire["args"].clone();
+                native_request_archive_name(&mut absent, "unselected.a", family == "workspace");
+                assert!(
+                    parse_exec_request(&absent)
+                        .unwrap_err()
+                        .contains("static native archive is absent"),
+                    "{family}, archive={archive}, {library}: another archive cannot satisfy lookup"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn workspace_native_inputs_require_the_bound_generated_tree_in_both_output_modes() {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
@@ -849,6 +935,13 @@ fn canonical_native_archives_refuse_system_dynamic_and_escaping_searches() {
             vec!["-l", "dylib=native"],
             vec!["-l", "framework=native"],
             vec!["-l", "static:-bundle=native"],
+            vec!["-l", "static:+bundle,-bundle=native"],
+            vec!["-l", "static:+bundle,+bundle=native"],
+            vec!["-l", "static:+verbatim=../libnative.a"],
+            vec!["-l", "static:+verbatim=/usr/lib/libnative.a"],
+            vec!["-l", "static:+verbatim=libnative.so"],
+            vec!["-l", "static:+whole-archive,-whole-archive=native"],
+            vec!["-l", "static:+as-needed=native"],
             vec!["-l", "static=native:renamed"],
             vec!["-l", "static=../native"],
             vec!["-L", "native=/usr/lib"],
@@ -1922,7 +2015,13 @@ fn closed_metadata_cannot_enter_an_ordinary_workspace_session_or_advance_its_jou
     let root = private_root();
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut report = report();
-    report.dependency_modes = vec![DependencyExecutionMode::ClosedMetadata];
+    // The ordinary metadata session must itself be available before testing
+    // that a closed-metadata request cannot enter it. Otherwise the session
+    // correctly refuses the unsupported selection before reading any frame.
+    report.dependency_modes = vec![
+        DependencyExecutionMode::Metadata,
+        DependencyExecutionMode::ClosedMetadata,
+    ];
     let mut wire = Wire::default();
     let peer = wire.clone();
     peer.frame(closed_workspace_metadata_request());
@@ -2136,7 +2235,7 @@ fn dependency_host_requirement_preserves_native_mode_and_context_admission() {
     }
     let root = private_root();
     let journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
-    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false)).unwrap();
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false, None)).unwrap();
     assert_eq!(
         hello["dependency_execution_hosts"],
         json!([native.as_str()])
@@ -2413,7 +2512,8 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
     );
     assert_eq!(replies[1]["status"], "unknown");
     assert_eq!(journal.high_water(), None);
-    let hello: Value = serde_json::from_str(&worker_hello(&report(), &journal, false)).unwrap();
+    let hello: Value =
+        serde_json::from_str(&worker_hello(&report(), &journal, false, None)).unwrap();
     assert_eq!(
         hello["dependency_contexts"],
         json!([
@@ -2437,7 +2537,8 @@ fn unnegotiated_dependency_request_never_burns_durable_admission() {
         hello["dependency_native_inputs"],
         json!([
             CANONICAL_NATIVE_METADATA_CAPABILITY,
-            CANONICAL_NATIVE_ROOTS_CAPABILITY
+            CANONICAL_NATIVE_ROOTS_CAPABILITY,
+            CANONICAL_NATIVE_MODIFIERS_CAPABILITY
         ]),
         "input syntax support never substitutes for measured namespace support"
     );
@@ -2451,7 +2552,7 @@ fn archive_mode_mismatch_refuses_before_input_or_durable_admission() {
     let mut report = report();
     report.canonical_namespace = false;
     report.dependency_modes = vec![DependencyExecutionMode::Rlib];
-    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false)).unwrap();
+    let hello: Value = serde_json::from_str(&worker_hello(&report, &journal, false, None)).unwrap();
     assert_eq!(hello["canonical"], false);
     assert_eq!(hello["dependency_execution_modes"], json!(["rlib"]));
     let mut wire = Wire::default();

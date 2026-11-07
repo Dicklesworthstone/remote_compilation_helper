@@ -18,6 +18,9 @@ use super::{
     render_compiler_transcript, verify_metadata_head,
 };
 use crate::coord::live::RequestOwnedInstallError;
+use crate::coord::remote_dependency_transport::locality::{
+    SourceDemand, WorkerProcess, captured_outputs,
+};
 use crate::coord::remote_dependency_transport::{
     PlacementReadiness, RemoteDependencyReservation, RemoteDependencyTransport,
 };
@@ -66,9 +69,7 @@ use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
-use rabs_sandbox::toolchain_transfer::{
-    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
-};
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -392,16 +393,17 @@ impl DependencyWorkerPool {
 
     #[cfg(test)]
     fn try_reserve(&self, key: &TypedDigest) -> io::Result<(PoolReservation, PendingActionClaim)> {
-        self.try_reserve_for(key, None)
+        self.try_reserve_for(key, None, None)
     }
 
     fn try_reserve_for(
         &self,
         key: &TypedDigest,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<(PoolReservation, PendingActionClaim)> {
         let claim = self.try_claim(key)?;
-        self.try_reserve_worker_excluding_for(&HashSet::new(), request)
+        self.try_reserve_worker_excluding_for(&HashSet::new(), request, sources)
             .map(|reservation| (reservation, claim))
     }
 
@@ -415,15 +417,16 @@ impl DependencyWorkerPool {
         &self,
         attempted: &HashSet<String>,
     ) -> io::Result<PoolReservation> {
-        self.try_reserve_worker_excluding_for(attempted, None)
+        self.try_reserve_worker_excluding_for(attempted, None, None)
     }
 
     fn try_reserve_worker_excluding_for(
         &self,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<PoolReservation> {
-        match self.probe_worker_excluding(attempted, request)? {
+        match self.probe_worker_excluding(attempted, request, sources)? {
             WorkerProbe::Reserved(reservation) => Ok(reservation),
             WorkerProbe::Waiting(_) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -445,7 +448,7 @@ impl DependencyWorkerPool {
         key: &TypedDigest,
         claim: &mut Option<PendingActionClaim>,
     ) -> io::Result<WorkerProbe> {
-        self.probe_claimed_worker_for(key, claim, None)
+        self.probe_claimed_worker_for(key, claim, None, None)
     }
 
     fn probe_claimed_worker_for(
@@ -453,11 +456,12 @@ impl DependencyWorkerPool {
         key: &TypedDigest,
         claim: &mut Option<PendingActionClaim>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<WorkerProbe> {
         if claim.is_none() {
             *claim = Some(self.try_claim(key)?);
         }
-        self.probe_worker_excluding(&HashSet::new(), request)
+        self.probe_worker_excluding(&HashSet::new(), request, sources)
     }
 
     fn ready_worker_order(
@@ -465,6 +469,7 @@ impl DependencyWorkerPool {
         start: usize,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
         now: Instant,
     ) -> Vec<(usize, PlacementReadiness)> {
         let mut order: Vec<_> = (0..self.workers.len())
@@ -489,6 +494,9 @@ impl DependencyWorkerPool {
                         position,
                         (index, readiness),
                         load,
+                        sources.map_or(0, |demand| {
+                            worker.placement_source_bytes(generation, demand, now)
+                        }),
                         worker.placement_toolchain_file_reuse(generation),
                     )
                 })
@@ -497,21 +505,24 @@ impl DependencyWorkerPool {
         // Unknown/expired measurements keep their original round-robin
         // positions; they are neither idle scores nor exclusion evidence.
         // Sort only the measured positions. Normalized load remains primary;
-        // when two authenticated workers are equally loaded, prefer the one
-        // that can reuse verified toolchain files and avoid redundant SDK
-        // transfer bytes. Equal hints still retain round-robin order.
+        // when two authenticated workers are equally loaded, prefer observed
+        // dependency-output locality, then verified toolchain-file reuse.
+        // These are transfer estimates only: ordinary source and SDK negotiation
+        // still prove any reuse. Equal hints retain round-robin order.
         let positions: Vec<_> = measured
             .iter()
-            .map(|(position, _, _, _)| *position)
+            .map(|(position, _, _, _, _)| *position)
             .collect();
         measured.sort_by(
-            |(_, _, left_load, left_reuse), (_, _, right_load, right_reuse)| {
+            |(_, _, left_load, left_sources, left_reuse),
+             (_, _, right_load, right_sources, right_reuse)| {
                 left_load
                     .compare(*right_load)
+                    .then_with(|| right_sources.cmp(left_sources))
                     .then_with(|| right_reuse.cmp(left_reuse))
             },
         );
-        for (position, (_, candidate, _, _)) in positions.into_iter().zip(measured) {
+        for (position, (_, candidate, _, _, _)) in positions.into_iter().zip(measured) {
             order[position] = candidate;
         }
         order
@@ -521,6 +532,7 @@ impl DependencyWorkerPool {
         &self,
         attempted: &HashSet<String>,
         request: Option<&Value>,
+        sources: Option<&SourceDemand>,
     ) -> io::Result<WorkerProbe> {
         // A failed transport probe can briefly own its occupied bit before
         // discovering cooldown. Serialize only these short probes, so another
@@ -543,7 +555,7 @@ impl DependencyWorkerPool {
         let mut request_excluded = false;
         let mut request_candidate = false;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        let ready_order = self.ready_worker_order(start, attempted, request, observed);
+        let ready_order = self.ready_worker_order(start, attempted, request, sources, observed);
         // Readiness is a preference, not execution authority. First try every
         // compatible live peer before assigning a job to an absent worker's
         // connection deadline. The second pass reobserves hints, preserving
@@ -721,6 +733,7 @@ pub struct RemoteInvocation {
     argv: Vec<String>,
     context: DependencyExecContext,
     requirements: Value,
+    source_demand: SourceDemand,
     validation: RemoteValidation,
 }
 
@@ -947,6 +960,8 @@ impl RemoteValidation {
             request.plan.source_kind,
             DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceGeneratedRlib
+                | DependencySourceKind::WorkspaceGeneratedMetadata
         ) {
             request
                 .canonical_paths
@@ -968,7 +983,9 @@ impl RemoteValidation {
                     remote_workspace_execution_shape(&request.plan, &directories, &toolchain)
                 }
                 DependencySourceKind::WorkspaceClosedRlib
-                | DependencySourceKind::WorkspaceClosedMetadata => {
+                | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceGeneratedRlib
+                | DependencySourceKind::WorkspaceGeneratedMetadata => {
                     remote_closed_workspace_library_shape(&request.plan, &directories, &toolchain)
                 }
                 _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
@@ -1039,6 +1056,21 @@ impl RemoteValidation {
 }
 
 fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode, String> {
+    if matches!(
+        plan.source_kind,
+        DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
+    ) {
+        let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
+            .ok_or("generated workspace DAG lost its committed-input policy")?;
+        policy
+            .validate_plan(plan)
+            .map_err(|error| error.to_string())?;
+        return Ok(match policy.output_class() {
+            RemoteDependencyOutputClass::Rlib => DependencyExecutionMode::Rlib,
+            RemoteDependencyOutputClass::Metadata => DependencyExecutionMode::ClosedMetadata,
+        });
+    }
     if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
         validate_terminal_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
         return Ok(DependencyExecutionMode::ClosedMetadata);
@@ -1060,12 +1092,20 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
     }
     if matches!(
         plan.source_kind,
-        DependencySourceKind::WorkspaceClosedRlib | DependencySourceKind::WorkspaceClosedMetadata
+        DependencySourceKind::WorkspaceClosedRlib
+            | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata
     ) {
         return validate_closed_workspace_library_plan(plan)
             .map(|class| match class {
-                ClosedWorkspaceLibraryClass::Rlib => DependencyExecutionMode::Rlib,
-                ClosedWorkspaceLibraryClass::Metadata => DependencyExecutionMode::ClosedMetadata,
+                ClosedWorkspaceLibraryClass::Rlib | ClosedWorkspaceLibraryClass::GeneratedRlib => {
+                    DependencyExecutionMode::Rlib
+                }
+                ClosedWorkspaceLibraryClass::Metadata
+                | ClosedWorkspaceLibraryClass::GeneratedMetadata => {
+                    DependencyExecutionMode::ClosedMetadata
+                }
             })
             .map_err(|error| error.to_string());
     }
@@ -1111,7 +1151,9 @@ fn verify_execution_policy(
                 remote_workspace_execution_isolation_policy(plan)
             }
             DependencySourceKind::WorkspaceClosedRlib
-            | DependencySourceKind::WorkspaceClosedMetadata => {
+            | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata => {
                 let class = validate_closed_workspace_library_plan(plan)
                     .map_err(|error| error.to_string())?;
                 if closed_workspace_library_descriptor_class(&key.descriptor) != Some(class) {
@@ -1262,6 +1304,8 @@ impl RemoteDependencies {
             plan.source_kind,
             DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceGeneratedRlib
+                | DependencySourceKind::WorkspaceGeneratedMetadata
         ) {
             canonical
                 .ok_or("closed workspace library requires its retained Cargo graph")?
@@ -1295,7 +1339,9 @@ impl RemoteDependencies {
                     remote_workspace_execution_shape(plan, directories, &visible_root)
                 }
                 DependencySourceKind::WorkspaceClosedRlib
-                | DependencySourceKind::WorkspaceClosedMetadata => {
+                | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceGeneratedRlib
+                | DependencySourceKind::WorkspaceGeneratedMetadata => {
                     remote_closed_workspace_library_shape(plan, directories, &visible_root)
                 }
                 _ => remote_dependency_shape(plan, directories, &visible_root),
@@ -1343,7 +1389,9 @@ impl RemoteDependencies {
             let key_builder = match plan.source_kind {
                 DependencySourceKind::WorkspaceExecutionOnly => remote_workspace_execution_key,
                 DependencySourceKind::WorkspaceClosedRlib
-                | DependencySourceKind::WorkspaceClosedMetadata => {
+                | DependencySourceKind::WorkspaceClosedMetadata
+                | DependencySourceKind::WorkspaceGeneratedRlib
+                | DependencySourceKind::WorkspaceGeneratedMetadata => {
                     remote_closed_workspace_library_key
                 }
                 _ => remote_dependency_key,
@@ -1471,6 +1519,12 @@ impl RemoteDependencies {
                 argv: argv.to_vec(),
                 context,
                 requirements,
+                source_demand: SourceDemand::new(directories.iter().flat_map(|directory| {
+                    directory
+                        .artifacts
+                        .iter()
+                        .map(|artifact| &artifact.content_digest)
+                })),
                 validation,
             },
         )))
@@ -1502,7 +1556,7 @@ impl RemoteDependencies {
                 guard: guard.clone(),
                 backing: RetainedToolchainBacking::CanonicalCaptured {
                     image: Arc::clone(image),
-                    _owner: Arc::clone(paths.operation_owner()),
+                    _owner: Arc::clone(paths.captured_toolchain_owner()?),
                 },
             });
             retained
@@ -1660,7 +1714,11 @@ impl LiveDependencyLane {
         } else {
             remote
                 .workers
-                .try_reserve_for(&request.key.action_key, Some(&invocation.requirements))
+                .try_reserve_for(
+                    &request.key.action_key,
+                    Some(&invocation.requirements),
+                    Some(&invocation.source_demand),
+                )
                 .map(|(reservation, claim)| (Some(reservation), claim))
         };
         match admitted {
@@ -1883,13 +1941,16 @@ impl PendingRemote {
             .validation
             .verify(&attempt.request)
             .map_err(settled)?;
-        let captured = attempt
+        let mut captured = attempt
             .capture_result(
                 &report,
                 &delivery.directory.join("artifacts"),
                 Some(&delivery.receipt),
             )
             .map_err(settled)?;
+        // No wrapper waits on an acknowledgment here, and request-owned
+        // delivery installs from these objects without publishing them.
+        attempt.store_captured(&mut captured).map_err(settled)?;
         let manifest = captured.offer.manifest.clone();
         let manifest_key = captured.manifest_key.clone();
         let canonical_transcript =
@@ -1901,6 +1962,14 @@ impl PendingRemote {
             .validation
             .verify(&attempt.request)
             .map_err(settled)?;
+        // Output lengths come from the verified delivery, while identities
+        // come from captured CAS bytes. Remote delivery inode signatures are
+        // deliberately absent from captured.known and must stay that way.
+        let produced = captured_outputs(&manifest, &delivery.receipt["artifact_manifest"]);
+        let producer_process = attempt.authority.as_ref().map(|authority| WorkerProcess {
+            boot: authority.worker_boot_generation,
+            incarnation: authority.worker_incarnation_id,
+        });
         let result = if attempt.request.is_execution_only() {
             let result = RequestOwnedResult::new(captured, attempt, delivery, wire, continuation)
                 .map_err(settled)?;
@@ -1926,7 +1995,7 @@ impl PendingRemote {
         // before waiting for permission to write any caller destination. Retain
         // only immutable result custody and this subscriber's input witnesses;
         // the settled execution attempt is not an installation owner.
-        Ok(PendingRemoteInstall {
+        let ready = PendingRemoteInstall {
             coord: Arc::clone(&attempt.coord),
             request: attempt.request.clone(),
             output: Arc::new(RemoteOutput {
@@ -1936,7 +2005,16 @@ impl PendingRemote {
             }),
             validation: invocation.validation,
             result,
-        })
+        };
+        // Only the actual successful reservation learns these advisory hints,
+        // after result custody and durable retirement. Never turn cancellation,
+        // a failed capture/publication or an uncertain worker into locality.
+        if !cancellation.is_cancelled()
+            && let Some(process) = producer_process
+        {
+            execution.remember_produced_outputs(process, &produced, Instant::now());
+        }
+        Ok(ready)
     }
 }
 
@@ -2732,8 +2810,10 @@ impl PendingRemoteInstall {
 #[cfg(test)]
 mod worker_pool_tests {
     use super::*;
+    use crate::coord::remote_dependency_transport::locality::ProducedObject;
     use rabs_asupersync::worker_transport::TlsFiles;
     use rabs_key::typed_digest::compute;
+    use rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -2796,6 +2876,80 @@ mod worker_pool_tests {
                 .contains("toolchain destination parent must be private")
         );
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn captured_compiler_lease_keeps_uploaded_sdk_after_runtime_paths_drop() {
+        use std::fs;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let source = crate::test_util::private_tempdir();
+        fs::create_dir(source.path().join("bin")).unwrap();
+        let bytes = b"retained dataset bytes; never executed";
+        fs::write(source.path().join("bin/rustc"), bytes).unwrap();
+        fs::set_permissions(
+            source.path().join("bin/rustc"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let inputs = Arc::new(crate::test_util::private_tempdir());
+        let runtime = Arc::new(crate::test_util::private_tempdir());
+        let input_root = inputs.path().to_path_buf();
+        let runtime_root = runtime.path().to_path_buf();
+        let image = Arc::new(
+            capture_toolchain(
+                source.path(),
+                &input_root.join("toolchain"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
+        let mappings = [
+            ("/__rabs/workspace", input_root.join("source")),
+            ("/__rabs/toolchain", image.root().to_path_buf()),
+            ("/__rabs/cargo-home", runtime_root.join("cargo-home")),
+            ("/__rabs/out/cargo", runtime_root.join("target")),
+            ("/__rabs/home", runtime_root.join("home")),
+        ]
+        .into_iter()
+        .map(|(logical, backing)| {
+            if logical != "/__rabs/toolchain" {
+                fs::DirBuilder::new().mode(0o700).create(&backing).unwrap();
+            }
+            (PathBuf::from(logical), backing)
+        })
+        .collect();
+        let paths = CanonicalPaths::new_with_input_owner(
+            Arc::clone(&runtime),
+            Arc::clone(&inputs),
+            mappings,
+        )
+        .unwrap()
+        .with_captured_toolchain(Some(Arc::clone(&image)))
+        .unwrap();
+        assert!(Arc::ptr_eq(paths.operation_owner(), &runtime));
+        assert!(Arc::ptr_eq(
+            paths.captured_toolchain_owner().unwrap(),
+            &inputs
+        ));
+        let lease = RetainedToolchainBacking::CanonicalCaptured {
+            image: Arc::clone(paths.captured_toolchain().unwrap()),
+            _owner: Arc::clone(paths.captured_toolchain_owner().unwrap()),
+        };
+        drop((paths, runtime, inputs, image));
+        assert!(!runtime_root.exists());
+        assert_eq!(
+            fs::read(input_root.join("toolchain/bin/rustc")).unwrap(),
+            bytes
+        );
+        let RetainedToolchainBacking::CanonicalCaptured { image, .. } = &lease else {
+            unreachable!()
+        };
+        image.verify_retained_generation(|| false).unwrap();
+        drop(lease);
+        assert!(!input_root.exists());
     }
 
     fn endpoint(index: u16) -> Value {
@@ -2880,21 +3034,42 @@ mod worker_pool_tests {
         })
     }
 
+    pub(super) fn remember_output(
+        pool: &DependencyWorkerPool,
+        worker: usize,
+        hello: &Value,
+        object: &TypedDigest,
+        bytes: u64,
+        observed: Instant,
+    ) {
+        // Like scheduling_hello, this injects evidence at the completion-owner
+        // boundary. It does not execute a compiler or mint publication authority.
+        let reservation = pool.workers[worker].try_reserve().unwrap();
+        reservation.remember_produced_outputs(
+            WorkerProcess::from_hello(hello).unwrap(),
+            &[ProducedObject {
+                object: object.clone(),
+                bytes,
+            }],
+            observed,
+        );
+    }
+
     #[test]
     fn authenticated_ready_worker_precedes_an_absent_endpoint_without_durable_admission() {
         let state = crate::test_util::private_tempdir();
         let pool = pool(state.path(), 2);
         let advertisement = pool.workers[1].advertise_for_test(&scheduling_hello());
         let request = scheduling_request(true);
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         // Preference must not manufacture a second physical slot, and an
         // absent endpoint still retains the ordinary bounded connection path.
-        let (unknown, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (unknown, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(unknown.worker(), "worker-1");
         assert_eq!(
-            pool.try_reserve_for(&key(3), Some(&request))
+            pool.try_reserve_for(&key(3), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -2918,12 +3093,13 @@ mod worker_pool_tests {
         let second = pool.workers[1].advertise_for_test(&four_cpus);
         // The second worker has higher absolute load but half the load per
         // advertised CPU. Plain round-robin would choose worker-1 first.
-        let (preferred, preferred_claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (preferred, preferred_claim) =
+            pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(preferred.worker(), "worker-2");
-        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(other.worker(), "worker-1");
         assert_eq!(
-            pool.try_reserve_for(&key(3), Some(&request))
+            pool.try_reserve_for(&key(3), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -2957,9 +3133,9 @@ mod worker_pool_tests {
         // worker-1 first. Reuse is only an advisory tie-breaker; every ordinary
         // request, capability and transfer verification still runs afterward.
         let (preferred, preferred_claim) =
-            pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(preferred.worker(), "worker-2");
-        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request)).unwrap();
+        let (other, other_claim) = pool.try_reserve_for(&key(2), Some(&request), None).unwrap();
         assert_eq!(other.worker(), "worker-1");
         drop((
             preferred,
@@ -2969,6 +3145,202 @@ mod worker_pool_tests {
             first,
             second,
         ));
+    }
+
+    #[test]
+    fn equal_pressure_prefers_matching_output_bytes_and_busy_producers_yield_capacity() {
+        let state = crate::test_util::private_tempdir();
+        let pool = pool(state.path(), 2);
+        let request = scheduling_request(true);
+        let small = compute("rabs.object.sha256.v1", b"small metadata");
+        let large = compute("rabs.object.sha256.v1", b"large archive");
+        let demand = SourceDemand::new([&small, &large, &large]);
+        let mut first_hello = scheduling_hello();
+        first_hello["load_x100"] = json!(100);
+        first_hello["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+        let mut second_hello = scheduling_hello();
+        second_hello["load_x100"] = json!(100);
+        let first = pool.workers[0].advertise_for_test(&first_hello);
+        let second = pool.workers[1].advertise_for_test(&second_hello);
+        remember_output(&pool, 0, &first_hello, &small, 37, Instant::now());
+        remember_output(&pool, 1, &second_hello, &large, 9000, Instant::now());
+
+        let (producer, producer_claim) = pool
+            .try_reserve_for(&key(1), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(producer.worker(), "worker-2");
+        let (spare, spare_claim) = pool
+            .try_reserve_for(&key(2), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(spare.worker(), "worker-1");
+        assert_eq!(
+            pool.try_reserve_for(&key(3), Some(&request), Some(&demand))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+        drop((producer, producer_claim, spare, spare_claim));
+
+        // A different request gains no preference from unrelated large outputs.
+        let only_small = SourceDemand::new([&small]);
+        let (matching, claim) = pool
+            .try_reserve_for(&key(4), Some(&request), Some(&only_small))
+            .unwrap();
+        assert_eq!(matching.worker(), "worker-1");
+        drop((matching, claim, first, second));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_locality_never_overrides_pressure_unknown_samples_or_capabilities() {
+        let object = compute("rabs.object.sha256.v1", b"retained archive");
+        let demand = SourceDemand::new([&object]);
+        let request = scheduling_request(false);
+        for case in [
+            "higher-load",
+            "unknown-load",
+            "expired-load",
+            "incompatible",
+        ] {
+            let pool = pool(Path::new("/private/locality-load-pool"), 2);
+            let mut ordinary = scheduling_hello();
+            ordinary["load_x100"] = if case == "unknown-load" {
+                Value::Null
+            } else {
+                json!(100)
+            };
+            let mut producer = scheduling_hello();
+            producer["load_x100"] = if case == "higher-load" {
+                json!(200)
+            } else {
+                json!(0)
+            };
+            if case == "incompatible" {
+                producer["dependency_execution_modes"] = json!(["closed-metadata"]);
+            }
+            let first_at = if case == "expired-load" {
+                Instant::now()
+                    - rabs_protocol::worker_standby::LOAD_MAX_AGE
+                    - std::time::Duration::from_secs(1)
+            } else {
+                Instant::now()
+            };
+            let first = pool.workers[0].advertise_at_for_test(&ordinary, first_at);
+            let second = pool.workers[1].advertise_for_test(&producer);
+            remember_output(&pool, 1, &producer, &object, 9000, Instant::now());
+            let (selected, claim) = pool
+                .try_reserve_for(&key(1), Some(&request), Some(&demand))
+                .unwrap();
+            assert_eq!(selected.worker(), "worker-1", "{case}");
+            drop((selected, claim, first, second));
+        }
+    }
+
+    #[test]
+    fn output_locality_survives_standby_reconnect_but_not_worker_restart_or_expiry() {
+        let pool = pool(Path::new("/private/locality-process-pool"), 2);
+        let object = compute("rabs.object.sha256.v1", b"retained metadata");
+        let demand = SourceDemand::new([&object]);
+        let request = scheduling_request(true);
+        let mut hello = scheduling_hello();
+        hello["load_x100"] = json!(100);
+        let first = pool.workers[0].advertise_for_test(&hello);
+        let second = pool.workers[1].advertise_for_test(&hello);
+        let PlacementReadiness::Ready(old_generation) =
+            pool.workers[1].placement_readiness(Some(&request))
+        else {
+            panic!("missing authenticated readiness");
+        };
+        remember_output(&pool, 1, &hello, &object, 9000, Instant::now());
+        drop(second);
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(old_generation, &demand, Instant::now()),
+            0
+        );
+        let reconnected = pool.workers[1].advertise_for_test(&hello);
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(old_generation, &demand, Instant::now()),
+            0
+        );
+        let (selected, claim) = pool
+            .try_reserve_for(&key(1), Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(selected.worker(), "worker-2");
+        drop((selected, claim, reconnected));
+
+        hello["boot_generation"] = json!(2);
+        hello["incarnation"] = json!("00000000000000000000000000000002");
+        let restarted = pool.workers[1].advertise_for_test(&hello);
+        let PlacementReadiness::Ready(new_generation) =
+            pool.workers[1].placement_readiness(Some(&request))
+        else {
+            panic!("missing restarted readiness");
+        };
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(new_generation, &demand, Instant::now()),
+            0
+        );
+        // Expired observations from the correct process also give no score.
+        remember_output(
+            &pool,
+            1,
+            &hello,
+            &object,
+            9000,
+            Instant::now() - std::time::Duration::from_secs(601),
+        );
+        assert_eq!(
+            pool.workers[1].placement_source_bytes(new_generation, &demand, Instant::now()),
+            0
+        );
+        drop((first, restarted));
+    }
+
+    #[test]
+    fn equal_output_locality_keeps_round_robin_and_alternate_worker_exclusions() {
+        let pool = pool(Path::new("/private/locality-fairness-pool"), 3);
+        let object = compute("rabs.object.sha256.v1", b"shared metadata");
+        let additional = compute("rabs.object.sha256.v1", b"additional archive");
+        let demand = SourceDemand::new([&object, &additional]);
+        let request = scheduling_request(true);
+        let mut hello = scheduling_hello();
+        hello["load_x100"] = json!(100);
+        let advertisements = pool
+            .workers
+            .iter()
+            .map(|worker| worker.advertise_for_test(&hello))
+            .collect::<Vec<_>>();
+        for index in 0..3 {
+            remember_output(&pool, index, &hello, &object, 73, Instant::now());
+        }
+        for (index, expected) in ["worker-1", "worker-2", "worker-3", "worker-1"]
+            .into_iter()
+            .enumerate()
+        {
+            let (selected, claim) = pool
+                .try_reserve_for(
+                    &key(u8::try_from(index).unwrap()),
+                    Some(&request),
+                    Some(&demand),
+                )
+                .unwrap();
+            assert_eq!(selected.worker(), expected);
+            drop((selected, claim));
+        }
+        // The next round-robin start is worker-2, but worker-3 has more matching
+        // bytes. An attempted worker remains excluded regardless of its score.
+        remember_output(&pool, 2, &hello, &additional, 9000, Instant::now());
+        let attempted = HashSet::from(["worker-1".to_owned()]);
+        let selected = pool
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(selected.worker(), "worker-3");
+        let spare = pool
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), Some(&demand))
+            .unwrap();
+        assert_eq!(spare.worker(), "worker-2");
+        drop((selected, spare, advertisements));
     }
 
     #[test]
@@ -2987,14 +3359,14 @@ mod worker_pool_tests {
             .enumerate()
         {
             let (reserved, claim) = pool
-                .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request), None)
                 .unwrap();
             assert_eq!(reserved.worker(), expected);
             drop((reserved, claim));
         }
         let excluded = HashSet::from(["worker-1".to_owned()]);
         let reserved = pool
-            .try_reserve_worker_excluding_for(&excluded, Some(&request))
+            .try_reserve_worker_excluding_for(&excluded, Some(&request), None)
             .unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         drop((reserved, first, second));
@@ -3024,7 +3396,7 @@ mod worker_pool_tests {
             let second = pool.workers[1].advertise_for_test(&second_hello);
             for (index, expected) in ["worker-1", "worker-2"].into_iter().enumerate() {
                 let (reserved, claim) = pool
-                    .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request))
+                    .try_reserve_for(&key(u8::try_from(index).unwrap()), Some(&request), None)
                     .unwrap();
                 assert_eq!(reserved.worker(), expected);
                 drop((reserved, claim));
@@ -3059,7 +3431,7 @@ mod worker_pool_tests {
                 PlacementReadiness::Incompatible,
                 "{field}"
             );
-            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
             assert_eq!(reserved.worker(), "worker-2", "{field}");
             drop((reserved, claim, unsuitable, suitable));
         }
@@ -3091,7 +3463,7 @@ mod worker_pool_tests {
                 pool.workers[0].placement_readiness(Some(&request)),
                 PlacementReadiness::Incompatible,
             );
-            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+            let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
             assert_eq!(reserved.worker(), "worker-2");
             assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
             drop((reserved, claim, unsuitable, suitable));
@@ -3111,7 +3483,7 @@ mod worker_pool_tests {
         let first = pool.workers[0].advertise_for_test(&foreign);
         let second = pool.workers[1].advertise_for_test(&foreign);
         assert_eq!(
-            pool.try_reserve_for(&key(1), Some(&request))
+            pool.try_reserve_for(&key(1), Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported,
@@ -3123,7 +3495,7 @@ mod worker_pool_tests {
         // Cargo's output target remains the other architecture.
         drop(second);
         let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&request), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         drop((reserved, claim, first, replacement));
@@ -3141,12 +3513,14 @@ mod worker_pool_tests {
         let metadata = scheduling_request(true);
         let mut archive_claim = None;
         assert_eq!(
-            pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+            pool.probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
         );
-        let (reserved, metadata_claim) = pool.try_reserve_for(&key(2), Some(&metadata)).unwrap();
+        let (reserved, metadata_claim) = pool
+            .try_reserve_for(&key(2), Some(&metadata), None)
+            .unwrap();
         assert_eq!(reserved.worker(), "worker-1");
         assert!(pool.try_claim(&key(1)).is_err());
         drop((reserved, metadata_claim, advertisement));
@@ -3155,7 +3529,7 @@ mod worker_pool_tests {
             PlacementReadiness::Unknown
         );
         let WorkerProbe::Reserved(reconnected) = pool
-            .probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive))
+            .probe_claimed_worker_for(&key(1), &mut archive_claim, Some(&archive), None)
             .unwrap()
         else {
             panic!("revoked capability evidence must not exclude the next connection");
@@ -3174,7 +3548,7 @@ mod worker_pool_tests {
         let second = pool.workers[1].advertise_for_test(&metadata_only);
         let archive = scheduling_request(false);
         assert_eq!(
-            pool.try_reserve_for(&key(1), Some(&archive))
+            pool.try_reserve_for(&key(1), Some(&archive), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
@@ -3186,7 +3560,7 @@ mod worker_pool_tests {
         // claim. A new compatible connection may serve the same action.
         drop(second);
         let replacement = pool.workers[1].advertise_for_test(&scheduling_hello());
-        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+        let (reserved, claim) = pool.try_reserve_for(&key(1), Some(&archive), None).unwrap();
         assert_eq!(reserved.worker(), "worker-2");
         assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
         drop((reserved, claim, first, replacement));
@@ -3203,18 +3577,18 @@ mod worker_pool_tests {
             let second =
                 advertised.then(|| pool.workers[1].advertise_for_test(&scheduling_hello()));
             let archive = scheduling_request(false);
-            let (busy, busy_claim) = pool.try_reserve_for(&key(1), Some(&archive)).unwrap();
+            let (busy, busy_claim) = pool.try_reserve_for(&key(1), Some(&archive), None).unwrap();
             assert_eq!(busy.worker(), "worker-2");
             let mut queued_claim = None;
             assert!(matches!(
-                pool.probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                pool.probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive), None)
                     .unwrap(),
                 WorkerProbe::RequestWaiting(None)
             ));
             assert!(queued_claim.is_some());
             drop((busy, busy_claim));
             let WorkerProbe::Reserved(reserved) = pool
-                .probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive))
+                .probe_claimed_worker_for(&key(2), &mut queued_claim, Some(&archive), None)
                 .unwrap()
             else {
                 panic!("the queued request must use the released eligible endpoint");
@@ -3237,6 +3611,7 @@ mod worker_pool_tests {
             pool.try_reserve_worker_excluding_for(
                 &HashSet::from(["worker-1".to_owned()]),
                 Some(&archive),
+                None,
             )
             .unwrap_err()
             .kind(),
@@ -3254,12 +3629,12 @@ mod worker_pool_tests {
         let request = scheduling_request(true);
         let mut attempted = HashSet::from(["worker-1".to_owned()]);
         let selected = pool
-            .try_reserve_worker_excluding_for(&attempted, Some(&request))
+            .try_reserve_worker_excluding_for(&attempted, Some(&request), None)
             .unwrap();
         assert_eq!(selected.worker(), "worker-3");
         attempted.extend(["worker-2".to_owned(), "worker-3".to_owned()]);
         assert_eq!(
-            pool.try_reserve_worker_excluding_for(&attempted, Some(&request))
+            pool.try_reserve_worker_excluding_for(&attempted, Some(&request), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound
@@ -4599,13 +4974,15 @@ mod execution_resource_tests {
         use rabs_protocol::raw_bytes::RawBytes;
         use rabs_protocol::result_identity::ObjectId;
 
+        // rabs-key workspace_dependency_cache MIXED_METADATA_KEY_EPOCH and
+        // MIXED_RLIB_KEY_EPOCH (renumbered with the v2 domains in 8d17703).
         for (emit, mode, epoch) in [
             (
                 "dep-info,metadata",
                 DependencyExecutionMode::ClosedMetadata,
-                9,
+                21,
             ),
-            ("dep-info,metadata,link", DependencyExecutionMode::Rlib, 8),
+            ("dep-info,metadata,link", DependencyExecutionMode::Rlib, 20),
         ] {
             let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
             let path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
@@ -5001,6 +5378,298 @@ mod execution_resource_tests {
     }
 
     #[test]
+    fn generated_workspace_profiles_require_exact_context_contract_and_committed_capability() {
+        use rabs_key::live_dependency::plan_canonical_workspace_execution;
+        use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_generated_workspace_dag_library,
+        };
+        use rabs_protocol::input_evidence::{DirectoryEnumeration, InputFileType, PositiveInput};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        // This boundary exercises actual request/key/policy assemblers. Real
+        // retained trees and record generations are tested in canonical.rs;
+        // these inventory facts do not assert compiler or TLS execution.
+        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
+            let root = "/__rabs/out/cargo/debug/build/workspace_app-123/out";
+            let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+            let dependency_path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
+            if dag {
+                fixture
+                    .argv
+                    .push(format!("--extern=upstream={dependency_path}"));
+            }
+            if archive {
+                *fixture
+                    .argv
+                    .iter_mut()
+                    .find(|arg| arg.starts_with("--emit="))
+                    .unwrap() = "--emit=dep-info,metadata,link".into();
+            }
+            let mut env = fixture.plan.execution_env.clone();
+            env.extend([
+                ("OUT_DIR".into(), root.into()),
+                ("BUILD_LABEL".into(), "pinned".into()),
+            ]);
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &fixture.argv,
+                    cwd: &fixture.plan.cwd,
+                    env: &env,
+                },
+                &fixture.plan.host_triple,
+            )
+            .unwrap();
+            fixture.plan = if dag {
+                plan_generated_workspace_dag_library(&fresh)
+            } else {
+                plan_closed_workspace_library(&fresh)
+            }
+            .unwrap();
+            let policy = CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind);
+            assert_eq!(policy.is_some(), dag);
+            let mode = if archive {
+                DependencyExecutionMode::Rlib
+            } else {
+                DependencyExecutionMode::ClosedMetadata
+            };
+            assert_eq!(execution_mode(&fixture.plan).unwrap(), mode);
+            fixture.context = fixture.context.with_execution_mode(mode);
+            assert!(
+                fixture.request().is_err(),
+                "the correct execution mode with an absent generated mount authorized reuse"
+            );
+            fixture.context = DependencyExecContext::new_canonical_workspace_execution(
+                mode,
+                fixture.plan.cwd.clone(),
+                fixture.plan.out_dir.clone(),
+                fixture.plan.dependency_dirs.clone(),
+                Vec::new(),
+                if dag {
+                    vec![DependencyArtifactRoot {
+                        path: fixture.plan.out_dir.clone(),
+                        prefix: "dependencies/0000".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                Some(root.into()),
+                fixture.context.source_directories().to_vec(),
+                vec!["empty".into(), "nested".into()],
+                fixture.plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            let request = fixture.request().unwrap();
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+            assert_eq!(request["dependency_context"]["generated_root"], root);
+            assert_eq!(
+                request["dependency_context"]["generated_directories"],
+                json!(["empty", "nested"])
+            );
+            assert_eq!(
+                request["dependency_context"]["env"],
+                json!(fixture.plan.execution_env)
+            );
+            assert_eq!(
+                request["dependency_context"]["execution_mode"],
+                if archive { "rlib" } else { "closed-metadata" }
+            );
+            assert_eq!(
+                request["dependency_context"]["version"],
+                fixture.context.version()
+            );
+            assert_eq!(
+                request["artifacts"]["files"],
+                json!(fixture.plan.output_names())
+            );
+            assert_eq!(
+                request["dependency_context"]["artifact_roots"],
+                if dag {
+                    json!([{"path":fixture.plan.out_dir,"prefix":"dependencies/0000"}])
+                } else {
+                    json!([])
+                },
+            );
+            let exact = fixture.context.clone();
+            let other_root = "/__rabs/out/cargo/debug/build/workspace_app-456/out";
+            let mut other_env = fixture.plan.execution_env.clone();
+            for (name, value) in &mut other_env {
+                if name == "OUT_DIR" {
+                    *value = other_root.into();
+                }
+            }
+            fixture.context = DependencyExecContext::new_canonical_workspace_execution(
+                mode,
+                fixture.plan.cwd.clone(),
+                fixture.plan.out_dir.clone(),
+                fixture.plan.dependency_dirs.clone(),
+                Vec::new(),
+                exact.artifact_roots().to_vec(),
+                Some(other_root.into()),
+                exact.source_directories().to_vec(),
+                exact.generated_directories().to_vec(),
+                other_env,
+                [0x11; 32],
+            )
+            .unwrap();
+            assert!(
+                fixture.request().is_err(),
+                "another Cargo run supplied the generated mount"
+            );
+            fixture.context = exact;
+
+            let plan = &fixture.plan;
+            let digest = |bytes: &[u8]| {
+                rabs_key::typed_digest::compute("rabs.test.generated-dag-mode.v1", bytes)
+            };
+            let dependencies = if dag {
+                vec![CommittedWorkspaceDependency {
+                    path: dependency_path.clone(),
+                    producer_action: digest(b"committed producer action"),
+                    producer_descriptor: digest(b"committed producer descriptor"),
+                    producer_manifest: digest(b"committed producer manifest"),
+                    role: OutputRole::ProvisionalMetadata,
+                    virtual_path: RawBytes::from("libupstream.rmeta"),
+                    object: ObjectId(digest(b"complete producer metadata bytes")),
+                }]
+            } else {
+                Vec::new()
+            };
+            let directories = plan
+                .dependency_dirs
+                .iter()
+                .map(|path| DependencyDirectoryFact {
+                    path: path.clone(),
+                    artifacts: dependencies
+                        .iter()
+                        .filter(|dependency| {
+                            Path::new(&dependency.path).parent() == Some(Path::new(path))
+                        })
+                        .map(|dependency| rabs_key::live_dependency::ExternFact {
+                            path: dependency.path.clone(),
+                            content_digest: dependency.object.0.clone(),
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            let (mut inputs, toolchain) = workspace_metadata_key_facts(plan);
+            inputs.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path("nested/value.rs")
+                        .into_bytes(),
+                ),
+                object: ObjectId(rabs_key::typed_digest::compute(
+                    "rabs.test.generated-mode.v1",
+                    b"pub const VALUE: usize = 42;",
+                )),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+            inputs.directory_enumerations.extend(
+                [
+                    (plan.generated_virtual_root(), vec!["empty", "nested"]),
+                    (plan.generated_input_virtual_path("empty"), Vec::new()),
+                    (
+                        plan.generated_input_virtual_path("nested"),
+                        vec!["value.rs"],
+                    ),
+                ]
+                .into_iter()
+                .map(|(path, entries)| DirectoryEnumeration {
+                    virtual_path: RawBytes::new(path.into_bytes()),
+                    entries: entries.into_iter().map(RawBytes::from).collect(),
+                }),
+            );
+            let runtime = rabs_key::typed_digest::compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            );
+            let key = if let Some(policy) = policy {
+                remote_committed_dependency_key(
+                    plan,
+                    policy,
+                    &toolchain,
+                    &directories,
+                    &dependencies,
+                    &inputs,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n"),
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+            } else {
+                remote_closed_workspace_library_key(
+                    plan,
+                    &toolchain,
+                    &directories,
+                    &inputs,
+                    Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n"),
+                    "/__rabs/toolchain",
+                    &fixture.toolchain.sha256,
+                    &runtime,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                key.descriptor.key_epoch,
+                match (archive, dag) {
+                    (true, false) => 26,
+                    (false, false) => 27,
+                    (true, true) => 28,
+                    (false, true) => 29,
+                }
+            );
+            verify_execution_policy(plan, &key, mode, policy).unwrap();
+            assert!(verify_execution_policy(&fresh, &key, mode, policy).is_err());
+            if dag {
+                assert!(
+                    verify_execution_policy(plan, &key, mode, None).is_err(),
+                    "a generated DAG descriptor replaced its installed-input capability"
+                );
+                for other in [
+                    CommittedDependencyPolicy::WorkspaceDagRlib,
+                    CommittedDependencyPolicy::WorkspaceDagMetadata,
+                ] {
+                    assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());
+                }
+            }
+            for mutation in 0..3 {
+                let mut changed = key.clone();
+                match mutation {
+                    0 => {
+                        changed.descriptor.sandbox_semantic_policy =
+                            remote_workspace_execution_isolation_policy(&fresh).unwrap()
+                    }
+                    1 => changed.descriptor.execution_semantics.bytes[0] ^= 1,
+                    _ => changed.descriptor.key_epoch = if archive { 16 } else { 17 },
+                }
+                changed.action_key =
+                    rabs_key::action_key::compute_action_key(&changed.descriptor).final_key;
+                changed.descriptor_digest = rabs_key::hit_verification::descriptor_digest(
+                    &rabs_key::hit_verification::descriptor_canonical_bytes(&changed.descriptor),
+                );
+                assert!(verify_execution_policy(plan, &changed, mode, policy).is_err());
+            }
+            for other in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::Rlib,
+                DependencyExecutionMode::ClosedMetadata,
+            ] {
+                if other != mode {
+                    assert!(verify_execution_policy(plan, &key, other, policy).is_err());
+                    let exact = fixture.context.clone();
+                    fixture.context = exact.clone().with_execution_mode(other);
+                    assert!(fixture.request().is_err());
+                    fixture.context = exact;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn committed_workspace_metadata_requires_closed_mode_and_its_exact_provenance_descriptor() {
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
         use rabs_key::live_dependency::workspace_dependency_cache::{
@@ -5114,7 +5783,7 @@ mod execution_resource_tests {
             &runtime,
         )
         .unwrap();
-        assert_eq!(key.descriptor.key_epoch, 7);
+        assert_eq!(key.descriptor.key_epoch, 19);
         let policy = Some(CommittedDependencyPolicy::WorkspaceMetadata);
         assert!(
             verify_execution_policy(

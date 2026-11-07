@@ -7,6 +7,10 @@
 //! Its peer identity is derived from the public key TLS actually authenticated,
 //! never from the worker label or a self-asserted hello field.
 //!
+//! Edges use a separate canonical-operation ALPN and explicit Edge/Coordinator
+//! key enrollment. Both planes share bounded ATP records and TLS machinery;
+//! worker-session admission never grants access to the edge/coordinator plane.
+//!
 //! Partial read/write state AND deadlines belong to the connection, not a
 //! disposable future. Trickled progress cannot renew an incomplete record's
 //! budget. Cancellation and timeout return errors through the session driver's
@@ -22,7 +26,7 @@ use asupersync::tls::{
     Certificate, CertificateChain, CertificatePin, PrivateKey, RootCertStore, TlsAcceptor,
     TlsConnector, TlsConnectorBuilder, TlsStream,
 };
-use rabs_protocol::identity_store::TransportIdentity;
+use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope, VerifyVerdict};
 use std::future::{Future, poll_fn};
 use std::io::{self, Read};
 use std::net::SocketAddr;
@@ -66,6 +70,32 @@ pub fn runtime_transport_now() -> asupersync::types::Time {
 
 /// Both endpoints must negotiate this exact protocol. There is no downgrade.
 pub const WORKER_ALPN: &[u8] = b"rabs-worker-atp/1";
+/// Canonical operations submitted by explicitly enrolled edges. Worker control
+/// messages cannot negotiate this protocol, or vice versa.
+pub const EDGE_COORDINATOR_ALPN: &[u8] = b"rabs-edge-coordinator-atp/1";
+
+#[derive(Clone, Copy)]
+enum PeerProtocol {
+    Worker,
+    EdgeCoordinator,
+}
+
+impl PeerProtocol {
+    fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Worker => WORKER_ALPN,
+            Self::EdgeCoordinator => EDGE_COORDINATOR_ALPN,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::EdgeCoordinator => "edge/coordinator",
+        }
+    }
+}
+
 /// Includes ATP header bytes, not just the JSON payload.
 pub const MAX_WIRE_FRAME: usize = 1024 * 1024;
 /// Reserve more than the extension-free ATP header's maximum encoded length.
@@ -521,6 +551,10 @@ impl TlsFiles {
     }
 
     pub fn connector(&self) -> Result<TlsConnector, String> {
+        self.connector_for(PeerProtocol::Worker)
+    }
+
+    fn connector_for(&self, protocol: PeerProtocol) -> Result<TlsConnector, String> {
         let roots = Certificate::from_pem(&read_pem(&self.ca)?).map_err(|e| e.to_string())?;
         let chain =
             CertificateChain::from_pem(&read_pem(&self.certificate)?).map_err(|e| e.to_string())?;
@@ -529,26 +563,49 @@ impl TlsFiles {
             .with_strict_ca_validation()
             .add_root_certificates(roots)
             .identity(chain, key)
-            .alpn_protocols_required(vec![WORKER_ALPN.to_vec()])
+            .alpn_protocols_required(vec![protocol.alpn().to_vec()])
             .handshake_timeout(HANDSHAKE_TIMEOUT)
             .build()
-            .map_err(|e| format!("worker TLS client configuration: {e}"))
+            .map_err(|e| format!("{} TLS client configuration: {e}", protocol.name()))
     }
 
     pub fn acceptor(&self) -> Result<TlsAcceptor, String> {
+        self.acceptor_for(PeerProtocol::Worker)
+    }
+
+    /// Require mutual TLS and the dedicated canonical-operation protocol.
+    /// The listener must still call [`accept_edge_peer`] to apply its explicit
+    /// edge enrollment before exposing an application stream.
+    pub fn edge_coordinator_acceptor(&self) -> Result<TlsAcceptor, String> {
+        self.acceptor_for(PeerProtocol::EdgeCoordinator)
+    }
+
+    fn acceptor_for(&self, protocol: PeerProtocol) -> Result<TlsAcceptor, String> {
         let mut roots = RootCertStore::empty();
         for cert in Certificate::from_pem(&read_pem(&self.ca)?).map_err(|e| e.to_string())? {
-            roots.add(&cert).map_err(|e| format!("worker CA: {e}"))?;
+            roots
+                .add(&cert)
+                .map_err(|e| format!("{} CA: {e}", protocol.name()))?;
         }
         let chain =
             CertificateChain::from_pem(&read_pem(&self.certificate)?).map_err(|e| e.to_string())?;
         let key = PrivateKey::from_pem(&read_pem(&self.private_key)?).map_err(|e| e.to_string())?;
+        // The pinned acceptor selects ring for ServerConfig, but its required
+        // WebPkiClientVerifier still uses the process default. Combined RCH/RABS
+        // builds also enable AWS-LC via reqwest, so inference would panic.
+        // Preserve an application-selected provider. A concurrent installer may
+        // win the OnceLock; that is the only install_default error and is safe.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .unwrap_or(());
+        }
         TlsAcceptor::builder(chain, key)
             .require_client_auth(roots)
-            .alpn_protocols_required(vec![WORKER_ALPN.to_vec()])
+            .alpn_protocols_required(vec![protocol.alpn().to_vec()])
             .handshake_timeout(HANDSHAKE_TIMEOUT)
             .build()
-            .map_err(|e| format!("worker TLS server configuration: {e}"))
+            .map_err(|e| format!("{} TLS server configuration: {e}", protocol.name()))
     }
 }
 
@@ -561,13 +618,16 @@ pub struct AuthenticatedPeer {
     pub identity: TransportIdentity,
 }
 
-fn established(stream: TlsStream<TcpStream>) -> Result<AuthenticatedPeer, String> {
-    if stream.alpn_protocol() != Some(WORKER_ALPN) {
-        return Err("worker ALPN was not negotiated".to_owned());
+fn established(
+    stream: TlsStream<TcpStream>,
+    protocol: PeerProtocol,
+) -> Result<AuthenticatedPeer, String> {
+    if stream.alpn_protocol() != Some(protocol.alpn()) {
+        return Err(format!("{} ALPN was not negotiated", protocol.name()));
     }
     let certificate = stream
         .peer_leaf_certificate_der()
-        .ok_or("worker TLS peer did not provide a certificate")?;
+        .ok_or_else(|| format!("{} TLS peer did not provide a certificate", protocol.name()))?;
     let identity = certificate_identity(&Certificate::from_der(certificate))?;
     Ok(AuthenticatedPeer {
         stream: JsonAtpStream::new(stream),
@@ -580,16 +640,25 @@ pub async fn accept_peer(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
 ) -> Result<AuthenticatedPeer, String> {
+    accept_peer_for(acceptor, stream, PeerProtocol::Worker).await
+}
+
+async fn accept_peer_for(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    protocol: PeerProtocol,
+) -> Result<AuthenticatedPeer, String> {
     // ATP exchanges bounded control records and per-chunk acknowledgments.
     // Do not hold those records behind Nagle while the peer waits for credit.
     stream
         .set_nodelay(true)
-        .map_err(|e| format!("worker TCP no-delay configuration: {e}"))?;
+        .map_err(|e| format!("{} TCP no-delay configuration: {e}", protocol.name()))?;
     established(
         acceptor
             .accept(stream)
             .await
-            .map_err(|e| format!("worker TLS accept: {e}"))?,
+            .map_err(|e| format!("{} TLS accept: {e}", protocol.name()))?,
+        protocol,
     )
 }
 
@@ -599,24 +668,92 @@ pub async fn connect_peer(
     server_name: &str,
     files: &TlsFiles,
 ) -> Result<AuthenticatedPeer, String> {
-    let connector = files.connector()?;
+    connect_peer_for(address, server_name, files, PeerProtocol::Worker).await
+}
+
+async fn connect_peer_for(
+    address: &str,
+    server_name: &str,
+    files: &TlsFiles,
+    protocol: PeerProtocol,
+) -> Result<AuthenticatedPeer, String> {
+    let connector = files.connector_for(protocol)?;
     let connect = async {
         let stream = TcpStream::connect(address.to_owned())
             .await
-            .map_err(|e| format!("worker connect: {e}"))?;
+            .map_err(|e| format!("{} connect: {e}", protocol.name()))?;
         stream
             .set_nodelay(true)
-            .map_err(|e| format!("worker TCP no-delay configuration: {e}"))?;
+            .map_err(|e| format!("{} TCP no-delay configuration: {e}", protocol.name()))?;
         established(
             connector
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| format!("coordinator TLS handshake: {e}"))?,
+            protocol,
         )
     };
     asupersync::time::timeout(runtime_transport_now(), CONNECT_TIMEOUT, connect)
         .await
-        .map_err(|_| "worker connection deadline exceeded".to_owned())?
+        .map_err(|_| format!("{} connection deadline exceeded", protocol.name()))?
+}
+
+fn validate_enrollment(pins: &[[u8; 32]], role: TrustScope) -> Result<(), String> {
+    if pins.is_empty() || pins.contains(&[0; 32]) {
+        return Err(format!("{role:?} enrollment requires nonzero SPKI pins"));
+    }
+    Ok(())
+}
+
+fn admit_enrolled_peer(
+    peer: AuthenticatedPeer,
+    pins: &[[u8; 32]],
+    role: TrustScope,
+) -> Result<AuthenticatedPeer, String> {
+    let pin = pins
+        .iter()
+        .find(|pin| **pin == peer.identity.peer_id)
+        .ok_or_else(|| format!("authenticated peer is not enrolled for {role:?} role"))?;
+    // The listener/client configuration grants this role, never a peer's hello
+    // or the mere presence of a CA-valid certificate. This immutable pin
+    // enrollment is not a credential-rotation or execution-session grant.
+    let mut identities = IdentityStore::default();
+    identities
+        .create(*pin, *pin, role, 1)
+        .map_err(|error| format!("{role:?} identity enrollment: {error:?}"))?;
+    match identities.verify(&peer.identity.peer_id, &peer.identity.fingerprint) {
+        VerifyVerdict::Valid { scope, .. } if scope == role => Ok(peer),
+        _ => Err(format!(
+            "authenticated peer does not prove its {role:?} enrollment"
+        )),
+    }
+}
+
+/// Authenticate one explicitly enrolled edge on the canonical-operation plane.
+/// The allowlist grants only the Edge role; worker enrollment and self-claimed
+/// roles never satisfy it. No application record is read before this returns.
+pub async fn accept_edge_peer(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    allowed_edge_pins: &[[u8; 32]],
+) -> Result<AuthenticatedPeer, String> {
+    validate_enrollment(allowed_edge_pins, TrustScope::Edge)?;
+    let peer = accept_peer_for(acceptor, stream, PeerProtocol::EdgeCoordinator).await?;
+    admit_enrolled_peer(peer, allowed_edge_pins, TrustScope::Edge)
+}
+
+/// Connect an edge to its explicitly pinned coordinator, with mutual TLS and
+/// the dedicated ALPN. CA validation, server-name validation and the configured
+/// coordinator key must all agree; there is no worker or plaintext fallback.
+pub async fn connect_coordinator_peer(
+    address: &str,
+    server_name: &str,
+    files: &TlsFiles,
+    coordinator_pin: [u8; 32],
+) -> Result<AuthenticatedPeer, String> {
+    validate_enrollment(&[coordinator_pin], TrustScope::Coordinator)?;
+    let peer = connect_peer_for(address, server_name, files, PeerProtocol::EdgeCoordinator).await?;
+    admit_enrolled_peer(peer, &[coordinator_pin], TrustScope::Coordinator)
 }
 
 /// The historical plaintext fixture transport is restricted to literal loopback.
@@ -748,6 +885,436 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::Waker;
+
+    #[cfg(unix)]
+    fn openssl(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("openssl")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("OpenSSL is required for the native TLS regressions");
+        assert!(
+            output.status.success(),
+            "openssl {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_ca(root: &Path, name: &str) {
+        openssl(
+            root,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-sha256",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=RABS transport test CA",
+                "-keyout",
+                &format!("{name}.key"),
+                "-out",
+                &format!("{name}.pem"),
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_identity(root: &Path, ca: &str, name: &str, usage: &str, serial: &str) -> TlsFiles {
+        openssl(
+            root,
+            &[
+                "req",
+                "-new",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-sha256",
+                "-subj",
+                "/CN=localhost",
+                "-keyout",
+                &format!("{name}.key"),
+                "-out",
+                &format!("{name}.csr"),
+            ],
+        );
+        std::fs::write(
+            root.join(format!("{name}.ext")),
+            format!(
+                "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage={usage}\nsubjectAltName=DNS:localhost\n"
+            ),
+        )
+        .unwrap();
+        openssl(
+            root,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &format!("{name}.csr"),
+                "-CA",
+                &format!("{ca}.pem"),
+                "-CAkey",
+                &format!("{ca}.key"),
+                "-set_serial",
+                serial,
+                "-days",
+                "1",
+                "-sha256",
+                "-extfile",
+                &format!("{name}.ext"),
+                "-out",
+                &format!("{name}.pem"),
+            ],
+        );
+        TlsFiles {
+            ca: root.join(format!("{ca}.pem")),
+            certificate: root.join(format!("{name}.pem")),
+            private_key: root.join(format!("{name}.key")),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutual_tls_factories_handle_both_crypto_backends_in_fresh_processes() {
+        const CASE: &str = "worker_transport::tests::mutual_tls_factories_handle_both_crypto_backends_in_fresh_processes";
+        const CHILD: &str = "RABS_TLS_PROVIDER_REGRESSION_CHILD";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["unset", "aws"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("1 passed; 0 failed; 0 ignored;"),
+                    "fresh provider probe must execute its exact case"
+                );
+            }
+            return;
+        };
+        // Both symbols must compile: a ring-only test build cannot certify the
+        // real RCH/reqwest + RABS feature-unification regression.
+        let ring = rustls::crypto::ring::default_provider();
+        let aws = rustls::crypto::aws_lc_rs::default_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        if mode == "aws" {
+            aws.install_default().unwrap();
+        } else {
+            assert_eq!(mode, "unset");
+        }
+        drop(ring);
+        let previous = rustls::crypto::CryptoProvider::get_default().cloned();
+        let root = tempfile::tempdir().unwrap();
+        test_ca(root.path(), "ca");
+        let files = test_identity(root.path(), "ca", "peer", "serverAuth,clientAuth", "2");
+        for _ in 0..2 {
+            for protocol in [PeerProtocol::Worker, PeerProtocol::EdgeCoordinator] {
+                let (acceptor, connector) = match protocol {
+                    PeerProtocol::Worker => (files.acceptor().unwrap(), files.connector().unwrap()),
+                    PeerProtocol::EdgeCoordinator => (
+                        files.edge_coordinator_acceptor().unwrap(),
+                        files.connector_for(protocol).unwrap(),
+                    ),
+                };
+                assert_eq!(acceptor.handshake_timeout(), Some(HANDSHAKE_TIMEOUT));
+                assert_eq!(connector.handshake_timeout(), Some(HANDSHAKE_TIMEOUT));
+                assert_eq!(
+                    acceptor.config().alpn_protocols,
+                    vec![protocol.alpn().to_vec()]
+                );
+                assert_eq!(
+                    connector.config().alpn_protocols,
+                    vec![protocol.alpn().to_vec()]
+                );
+            }
+        }
+        let selected = rustls::crypto::CryptoProvider::get_default().unwrap();
+        if let Some(previous) = previous {
+            assert!(std::sync::Arc::ptr_eq(&previous, selected));
+        }
+    }
+
+    #[cfg(unix)]
+    fn tls_exchange(
+        server: &TlsFiles,
+        client: &TlsFiles,
+        allowed_edges: &[[u8; 32]],
+        coordinator_pin: [u8; 32],
+        server_protocol: PeerProtocol,
+        client_protocol: PeerProtocol,
+    ) -> (
+        Result<TransportIdentity, String>,
+        Result<TransportIdentity, String>,
+    ) {
+        use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+        use asupersync::runtime::RuntimeBuilder;
+        const REQUEST: &[u8] = b"{\"kind\":\"canonical-transport-test\"}\n";
+        const RESPONSE: &[u8] = b"{\"kind\":\"canonical-transport-received\"}\n";
+        let run = |future| {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            crate::daemon_runtime::block_on_top_level(&runtime, async {
+                asupersync::time::timeout(runtime_transport_now(), Duration::from_secs(15), future)
+                    .await
+                    .expect("native transport exchange exceeded its deadline")
+            })
+        };
+        std::thread::scope(|scope| {
+            let (address_sender, address_receiver) = std::sync::mpsc::sync_channel(1);
+            let accepted = scope.spawn(move || {
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                crate::daemon_runtime::block_on_top_level(&runtime, async {
+                    asupersync::time::timeout(
+                        runtime_transport_now(),
+                        Duration::from_secs(15),
+                        async {
+                            let acceptor = match server_protocol {
+                                PeerProtocol::Worker => server.acceptor()?,
+                                PeerProtocol::EdgeCoordinator => {
+                                    server.edge_coordinator_acceptor()?
+                                }
+                            };
+                            let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            address_sender
+                                .send(listener.local_addr().unwrap().to_string())
+                                .unwrap();
+                            let (stream, _) =
+                                listener.accept().await.map_err(|error| error.to_string())?;
+                            let mut peer = match server_protocol {
+                                PeerProtocol::Worker => accept_peer(&acceptor, stream).await?,
+                                PeerProtocol::EdgeCoordinator => {
+                                    accept_edge_peer(&acceptor, stream, allowed_edges).await?
+                                }
+                            };
+                            let mut bytes = [0; REQUEST.len()];
+                            peer.stream
+                                .read_exact(&mut bytes)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if bytes.as_slice() != REQUEST {
+                                return Err("server received changed application bytes".to_owned());
+                            }
+                            peer.stream
+                                .write_all(RESPONSE)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            peer.stream
+                                .flush()
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            Ok(peer.identity)
+                        },
+                    )
+                    .await
+                    .expect("native TLS server exceeded its deadline")
+                })
+            });
+            let address = address_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let connected = run(async move {
+                let mut peer = match client_protocol {
+                    PeerProtocol::Worker => connect_peer(&address, "localhost", client).await?,
+                    PeerProtocol::EdgeCoordinator => {
+                        connect_coordinator_peer(&address, "localhost", client, coordinator_pin)
+                            .await?
+                    }
+                };
+                peer.stream
+                    .write_all(REQUEST)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                peer.stream
+                    .flush()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut bytes = [0; RESPONSE.len()];
+                peer.stream
+                    .read_exact(&mut bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if bytes.as_slice() != RESPONSE {
+                    return Err("client received changed application bytes".to_owned());
+                }
+                Ok(peer.identity)
+            });
+            (accepted.join().unwrap(), connected)
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_coordinator_mutual_tls_requires_both_enrolled_role_pins() {
+        let root = tempfile::tempdir().unwrap();
+        test_ca(root.path(), "ca");
+        let coordinator = test_identity(root.path(), "ca", "coordinator", "serverAuth", "2");
+        let edge = test_identity(root.path(), "ca", "edge", "clientAuth", "3");
+        let other = test_identity(root.path(), "ca", "other", "serverAuth,clientAuth", "4");
+        let coordinator_id = coordinator.local_identity().unwrap();
+        let edge_id = edge.local_identity().unwrap();
+        let other_id = other.local_identity().unwrap();
+        let (accepted, connected) = tls_exchange(
+            &coordinator,
+            &edge,
+            &[other_id.fingerprint, edge_id.fingerprint],
+            coordinator_id.fingerprint,
+            PeerProtocol::EdgeCoordinator,
+            PeerProtocol::EdgeCoordinator,
+        );
+        assert_eq!(accepted.unwrap(), edge_id);
+        assert_eq!(connected.unwrap(), coordinator_id);
+
+        // A CA-valid certificate is not permission to assume the Edge role.
+        let (accepted, connected) = tls_exchange(
+            &coordinator,
+            &other,
+            &[edge_id.fingerprint],
+            coordinator_id.fingerprint,
+            PeerProtocol::EdgeCoordinator,
+            PeerProtocol::EdgeCoordinator,
+        );
+        assert!(accepted.unwrap_err().contains("not enrolled for Edge role"));
+        assert!(
+            connected.is_err(),
+            "unlisted edge exchanged application bytes"
+        );
+
+        // The configured coordinator pin is required in addition to CA and
+        // server-name validation. This other server has a fully valid chain.
+        let (accepted, connected) = tls_exchange(
+            &other,
+            &edge,
+            &[edge_id.fingerprint],
+            coordinator_id.fingerprint,
+            PeerProtocol::EdgeCoordinator,
+            PeerProtocol::EdgeCoordinator,
+        );
+        assert!(
+            connected
+                .unwrap_err()
+                .contains("not enrolled for Coordinator role")
+        );
+        assert!(
+            accepted.is_err(),
+            "wrong coordinator received application bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_coordinator_mutual_tls_rejects_worker_alpn_in_both_directions() {
+        let root = tempfile::tempdir().unwrap();
+        test_ca(root.path(), "ca");
+        let coordinator = test_identity(root.path(), "ca", "coordinator", "serverAuth", "2");
+        let edge = test_identity(root.path(), "ca", "edge", "clientAuth", "3");
+        let coordinator_id = coordinator.local_identity().unwrap();
+        let edge_id = edge.local_identity().unwrap();
+        // The old worker API still negotiates and exchanges the original ATP
+        // records; adding another plane must not change its default protocol.
+        let (accepted, connected) = tls_exchange(
+            &coordinator,
+            &edge,
+            &[edge_id.fingerprint],
+            coordinator_id.fingerprint,
+            PeerProtocol::Worker,
+            PeerProtocol::Worker,
+        );
+        assert_eq!(accepted.unwrap(), edge_id);
+        assert_eq!(connected.unwrap(), coordinator_id);
+        for (server, client) in [
+            (PeerProtocol::EdgeCoordinator, PeerProtocol::Worker),
+            (PeerProtocol::Worker, PeerProtocol::EdgeCoordinator),
+        ] {
+            let (accepted, connected) = tls_exchange(
+                &coordinator,
+                &edge,
+                &[edge_id.fingerprint],
+                coordinator_id.fingerprint,
+                server,
+                client,
+            );
+            assert!(
+                accepted.is_err(),
+                "cross-ALPN server admitted application bytes"
+            );
+            assert!(
+                connected.is_err(),
+                "cross-ALPN client admitted application bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_coordinator_mutual_tls_rejects_an_enrolled_but_untrusted_certificate() {
+        let root = tempfile::tempdir().unwrap();
+        test_ca(root.path(), "ca");
+        test_ca(root.path(), "untrusted-ca");
+        let coordinator = test_identity(root.path(), "ca", "coordinator", "serverAuth", "2");
+        let mut edge = test_identity(root.path(), "untrusted-ca", "edge", "clientAuth", "3");
+        // The client trusts the server correctly, but its own presented
+        // certificate was issued by a CA the server has never configured.
+        edge.ca = coordinator.ca.clone();
+        let (accepted, connected) = tls_exchange(
+            &coordinator,
+            &edge,
+            &[edge.local_identity().unwrap().fingerprint],
+            coordinator.local_identity().unwrap().fingerprint,
+            PeerProtocol::EdgeCoordinator,
+            PeerProtocol::EdgeCoordinator,
+        );
+        assert!(
+            accepted.is_err(),
+            "pin enrollment bypassed certificate validation"
+        );
+        assert!(
+            connected.is_err(),
+            "untrusted certificate exchanged application bytes"
+        );
+    }
+
+    #[test]
+    fn edge_coordinator_empty_or_zero_enrollment_never_connects() {
+        assert!(validate_enrollment(&[], TrustScope::Edge).is_err());
+        assert!(validate_enrollment(&[[1; 32], [0; 32]], TrustScope::Edge).is_err());
+        let files = TlsFiles {
+            ca: PathBuf::from("/nonexistent-rabs-ca"),
+            certificate: PathBuf::from("/nonexistent-rabs-certificate"),
+            private_key: PathBuf::from("/nonexistent-rabs-key"),
+        };
+        let mut connect = pin!(connect_coordinator_peer(
+            "invalid-address",
+            "",
+            &files,
+            [0; 32]
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            connect.as_mut().poll(&mut context),
+            Poll::Ready(Err(error)) if error.contains("Coordinator enrollment requires nonzero SPKI pins")
+        ));
+    }
 
     static VIRTUAL_CLOCK_NANOS: AtomicU64 = AtomicU64::new(1_000_000_000);
 

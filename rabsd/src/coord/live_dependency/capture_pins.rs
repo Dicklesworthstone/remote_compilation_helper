@@ -281,7 +281,7 @@ mod tests {
         let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
         let first_source = dir.path().join("first.rlib");
         let second_source = dir.path().join("second.rlib");
-        let bytes = vec![19; 3 * 65536 + 7];
+        let bytes = crate::test_util::closed_rlib_fixture(&vec![19; 3 * 65536 + 7]);
         std::fs::write(&first_source, &bytes).unwrap();
         std::fs::write(&second_source, &bytes).unwrap();
         let mut first = CapturePins::new(Arc::clone(&cas), &authority(41));
@@ -316,9 +316,10 @@ mod tests {
         let dir = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
         let source = dir.path().join("caller.rlib");
-        std::fs::write(&source, b"original compiler artifact").unwrap();
+        let bytes = crate::test_util::closed_rlib_fixture(b"original compiler artifact");
+        std::fs::write(&source, &bytes).unwrap();
         let digest = rabs_cas::digest_set::digest_set(
-            b"original compiler artifact",
+            &bytes,
             rabs_cas::digest_set::DigestRequest::default(),
             None,
         )
@@ -349,6 +350,81 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("observe output target"), "{error}");
         assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn compiler_archive_capture_records_only_validated_exact_bytes() {
+        use crate::coord::native_archives::require_manifest;
+        use rabs_cas::digest_set::{DigestRequest, digest_set};
+        use rabs_protocol::result_identity::ObjectId;
+
+        let dir = crate::test_util::private_tempdir();
+        let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let source = dir.path().join("libnative.rlib");
+        let mut pins = CapturePins::new(Arc::clone(&cas), &authority(1));
+        let manifest = |object: TypedDigest| {
+            let mut manifest = rabs_cas::test_support::sample_manifest();
+            manifest.logical_outputs = vec![LogicalOutput {
+                role: OutputRole::Materializable,
+                virtual_path: RawBytes::from("libnative.rlib"),
+                object: ObjectId(object),
+            }];
+            manifest
+        };
+
+        for bytes in [
+            b"!<thin>\n".as_slice(),
+            b"INPUT(/outside/native.o)\n".as_slice(),
+            b"opaque successful compiler output".as_slice(),
+        ] {
+            std::fs::write(&source, bytes).unwrap();
+            let object = digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            let error = put_output(&cas, &source, 1 << 20, &mut pins).unwrap_err();
+            assert!(error.contains("output native closure"), "{error}");
+            assert!(
+                pins.held.is_empty(),
+                "invalid archive created capture custody"
+            );
+            let mut store = cas.store().lock().unwrap();
+            assert!(store.object_locations(&object).unwrap().is_empty());
+            assert!(!store.object_durably_located(&object).unwrap());
+            assert!(require_manifest(&mut *store, &manifest(object)).is_err());
+        }
+
+        let mut previous = None;
+        for marker in [
+            b"first generation".as_slice(),
+            b"changed generation".as_slice(),
+        ] {
+            let bytes = crate::test_util::closed_rlib_fixture(marker);
+            std::fs::write(&source, &bytes).unwrap();
+            let object = digest_set(&bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            assert!(
+                require_manifest(&mut *cas.store().lock().unwrap(), &manifest(object.clone()))
+                    .is_err()
+            );
+            let captured = put_output(&cas, &source, 1 << 20, &mut pins).unwrap();
+            assert_eq!(captured.digest, object);
+            let mut store = cas.store().lock().unwrap();
+            require_manifest(&mut *store, &manifest(object.clone())).unwrap();
+            assert!(store.object_durably_located(&object).unwrap());
+            assert!(
+                store
+                    .published_manifest_key(&authority(1).action_key)
+                    .unwrap()
+                    .is_none()
+            );
+            if let Some(previous) = previous.replace(object) {
+                // Content evidence survives replacement of the compiler path,
+                // but cannot authorize the replacement's different digest.
+                require_manifest(&mut *store, &manifest(previous)).unwrap();
+            }
+        }
+        assert_eq!(pins.held.len(), 2);
     }
 
     #[test]
@@ -467,14 +543,15 @@ mod tests {
         use std::io::Write;
         let dir = crate::test_util::private_tempdir();
         let source = dir.path().join("libstream.rlib");
-        let chunk = [123_u8; 64 * 1024];
-        let size = 17 * chunk.len() as u64 + 3;
+        let mut marker = vec![123_u8; 17 * 64 * 1024];
+        marker.extend_from_slice(b"end");
+        let bytes = crate::test_util::closed_rlib_fixture(&marker);
+        let size = bytes.len() as u64;
         {
             let mut file = std::fs::File::create(&source).unwrap();
-            for _ in 0..17 {
-                file.write_all(&chunk).unwrap();
+            for chunk in bytes.chunks(64 * 1024) {
+                file.write_all(chunk).unwrap();
             }
-            file.write_all(b"end").unwrap();
         }
         let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
         let mut first = CapturePins::new(Arc::clone(&cas), &authority(1));

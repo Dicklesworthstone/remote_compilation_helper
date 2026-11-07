@@ -14,6 +14,10 @@
 //! unsupported rustc invocations compile normally in the namespace. Workspace
 //! results never gain action-cache publication or replay authority.
 
+mod remote_artifacts;
+pub(super) mod remote_operation;
+pub mod remote_service;
+pub(crate) mod remote_toolchains;
 pub mod service;
 mod target_state;
 pub(crate) use target_state::RestoredTargetProvenance;
@@ -47,9 +51,9 @@ use rabs_sandbox::cargo_check::{
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
 use rabs_sandbox::process_context::CommandContext;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest, SourceReceiver};
 use rabs_sandbox::toolchain_cache::{CAPACITY as TOOLCHAIN_CAPACITY, ToolchainPool};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -75,7 +79,7 @@ const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
 enum SourceSelection {
     #[default]
     #[serde(skip)]
@@ -697,7 +701,7 @@ impl OperationOutput {
 }
 
 impl Profile {
-    fn validate(&self) -> io::Result<()> {
+    fn validate_logical(&self) -> io::Result<()> {
         require(
             self.version == PROFILE_VERSION,
             "unsupported canonical compilation profile version",
@@ -736,6 +740,11 @@ impl Profile {
                 "vendor must be an ordinary relative path",
             )?;
         }
+        Ok(())
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.validate_logical()?;
         ordinary_directory(&self.source_root)?;
         ordinary_directory(&self.toolchain_root)?;
         private_directory(&self.state_root)?;
@@ -1114,7 +1123,9 @@ pub fn run_profile_with_release(
         None,
         Arc::new(AtomicBool::new(false)),
         OperationOutput::Inherit,
+        None,
     )
+    .map(|outcome| outcome.exit_code)
 }
 
 pub(super) fn run_shared_profile(
@@ -1154,7 +1165,26 @@ pub(super) fn run_shared_profile(
         Some(runtime),
         stopped,
         output,
+        None,
     )
+    .map(|outcome| outcome.exit_code)
+}
+
+/// Exact live provenance survives private target retention. Remote delivery
+/// keeps this owner until its final acknowledgment; local callers drop it
+/// after the ordinary synchronous completion barrier.
+struct OperationProvenance {
+    // Close the sealed source descriptor before dropping its directory owner
+    // through CanonicalPaths. Shared dependency producers retain their own Arc.
+    _source: SourceReceiver,
+    paths: Arc<CanonicalPaths>,
+    coord: Arc<CoordLive>,
+}
+
+struct OperationOutcome {
+    exit_code: i32,
+    retained_target: Option<PathBuf>,
+    provenance: OperationProvenance,
 }
 
 fn run_operation(
@@ -1164,7 +1194,14 @@ fn run_operation(
     shared: Option<Arc<SharedRuntime>>,
     stopped: Arc<AtomicBool>,
     mut output: OperationOutput,
-) -> io::Result<i32> {
+    prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
+) -> io::Result<OperationOutcome> {
+    let remote_operation = prepared_inputs.is_some();
+    // Only the authenticated frontend can construct remote input custody. Keep
+    // its peer scope independent of all logical settings and source metadata.
+    let authenticated_edge_pin = prepared_inputs
+        .as_ref()
+        .map(remote_operation::RemoteOperationInputs::authenticated_edge_pin);
     let timeout = Duration::from_secs(profile.timeout_seconds);
     let cancelled = || {
         stopped.load(Ordering::Acquire) || shared.as_ref().is_some_and(|runtime| !runtime.healthy())
@@ -1205,33 +1242,69 @@ fn run_operation(
     // then executes the exact retained image even if that source later changes.
     let retained_toolchain = shared
         .as_ref()
+        .filter(|_| !remote_operation)
         .map(|runtime| {
             runtime
                 .toolchains
                 .acquire(&profile.toolchain_root, timeout, cancelled)
         })
         .transpose()?;
+    // Runtime sockets and writable output always use the configured operation
+    // root, even when uploaded source/SDK custody lives on another volume.
     let owner = Arc::new(
         tempfile::Builder::new()
             .prefix("rabs-compile-")
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&profile.operation_root)?,
     );
-    let bundle = owner.path().join("bundle");
-    let prepared = super::source_delivery::prepare_local_bundle_controlled(
-        &profile.source_root,
-        &profile.source_specification()?,
-        &bundle,
-        retained_toolchain.clone(),
-        &preparation,
-    )?;
-    let source = prepared.source;
-    let captured_toolchain = prepared.toolchain;
-    let (_, request_bytes) = read_stable(
-        &bundle.join("request.json"),
-        super::worker_delivery::MAX_FRAME_BYTES as u64,
-    )?;
-    let request: Value = serde_json::from_slice(&request_bytes)?;
+    let (source, captured_toolchain, request, input_owner, received_toolchain) =
+        match prepared_inputs {
+            Some(inputs) => {
+                inputs.verify_for_profile(&profile, &cancelled)?;
+                (
+                    inputs.source,
+                    Some(Arc::clone(inputs.toolchain.image())),
+                    inputs.request,
+                    Some(inputs.owner),
+                    Some(inputs.toolchain),
+                )
+            }
+            None => {
+                let bundle = owner.path().join("bundle");
+                let prepared = super::source_delivery::prepare_local_bundle_controlled(
+                    &profile.source_root,
+                    &profile.source_specification()?,
+                    &bundle,
+                    retained_toolchain.clone(),
+                    &preparation,
+                )?;
+                let (_, request_bytes) = read_stable(
+                    &bundle.join("request.json"),
+                    super::worker_delivery::MAX_FRAME_BYTES as u64,
+                )?;
+                let request: Value = serde_json::from_slice(&request_bytes)?;
+                (prepared.source, prepared.toolchain, request, None, None)
+            }
+        };
+    let retain_paths = |mappings| {
+        let paths = match (&input_owner, &received_toolchain) {
+            (Some(inputs), Some(toolchain)) => CanonicalPaths::new_with_received_toolchain(
+                Arc::clone(&owner),
+                Arc::clone(inputs),
+                Arc::clone(toolchain),
+                mappings,
+            ),
+            (None, None) => CanonicalPaths::new_with_retained_toolchain(
+                Arc::clone(&owner),
+                mappings,
+                retained_toolchain.clone(),
+            ),
+            _ => Err("remote source and compiler custody must be retained together".into()),
+        };
+        paths
+            .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
+            .map_err(io::Error::other)
+    };
     let source_root = source
         .sealed_root()
         .ok_or_else(|| invalid("source was not sealed"))?;
@@ -1303,10 +1376,15 @@ fn run_operation(
         create_private(&path)?;
         path
     };
-    let toolchain = retained_toolchain.as_ref().map_or_else(
-        || bundle.join("toolchain"),
-        |retained| retained.root().to_path_buf(),
-    );
+    let toolchain = match (&retained_toolchain, &captured_toolchain) {
+        (Some(retained), None) => retained.root().to_path_buf(),
+        (None, Some(captured)) => captured.root().to_path_buf(),
+        _ => {
+            return Err(invalid(
+                "canonical operation requires one retained compiler owner",
+            ));
+        }
+    };
     let mut plan = CanonicalMountPlan::new(&toolchain, &workspace, &cargo_root, &home_root);
     plan.out_units.push(UnitMount {
         unit: "cargo".into(),
@@ -1320,19 +1398,13 @@ fn run_operation(
     // bind obscure its protection in the namespace builder's mount ordering.
     make_read_only(&mut spec, "/__rabs/workspace")?;
     make_read_only(&mut spec, "/__rabs/home")?;
-    let paths = CanonicalPaths::new_with_retained_toolchain(
-        owner.clone(),
-        vec![
-            ("/__rabs/workspace".into(), workspace.clone()),
-            ("/__rabs/cargo-home".into(), cargo_root.clone()),
-            ("/__rabs/toolchain".into(), toolchain.clone()),
-            (TARGET.into(), target_root.clone()),
-            ("/__rabs/home".into(), home_root.clone()),
-        ],
-        retained_toolchain.clone(),
-    )
-    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
-    .map_err(io::Error::other)?;
+    let paths = retain_paths(vec![
+        ("/__rabs/workspace".into(), workspace.clone()),
+        ("/__rabs/cargo-home".into(), cargo_root.clone()),
+        ("/__rabs/toolchain".into(), toolchain.clone()),
+        (TARGET.into(), target_root.clone()),
+        ("/__rabs/home".into(), home_root.clone()),
+    ])?;
     if profile.command == CompilationCommand::Clippy {
         for program in [CARGO_CLIPPY, CLIPPY_DRIVER] {
             let physical = paths
@@ -1359,9 +1431,7 @@ fn run_operation(
     if let Some(retained) = &retained_toolchain {
         retained.image().verify_retained_generation(cancelled)?;
     }
-    if let Some(captured) = &captured_toolchain {
-        captured.verify_retained_generation(cancelled)?;
-    }
+    paths.verify_captured_toolchain(&cancelled)?;
     let compilation_args = profile.compilation_args()?;
     // Ask the captured Cargo for the exact units this command would compile.
     // Metadata's package list includes inactive optional/dev targets and cannot
@@ -1469,6 +1539,7 @@ fn run_operation(
                 build_identity: &build_identity,
                 wrapper: Sha256::digest(&wrapper).into(),
                 closed_dependency_execution: graph.requires_closed_dependency_execution(),
+                authenticated_edge_pin,
             }
             .key(config)?;
             let mut cache = TargetState::open(
@@ -1515,19 +1586,13 @@ fn run_operation(
     preparation.checkpoint()?;
     // A failed restore remains in unmounted private staging. The live endpoint
     // receives only the completely selected target's retained inode capability.
-    let paths = CanonicalPaths::new_with_retained_toolchain(
-        owner.clone(),
-        vec![
-            ("/__rabs/workspace".into(), workspace),
-            ("/__rabs/cargo-home".into(), cargo_root),
-            ("/__rabs/toolchain".into(), toolchain),
-            (TARGET.into(), target_root.clone()),
-            ("/__rabs/home".into(), home_root.clone()),
-        ],
-        retained_toolchain.clone(),
-    )
-    .and_then(|paths| paths.with_captured_toolchain(captured_toolchain.clone()))
-    .map_err(io::Error::other)?;
+    let paths = retain_paths(vec![
+        ("/__rabs/workspace".into(), workspace),
+        ("/__rabs/cargo-home".into(), cargo_root),
+        ("/__rabs/toolchain".into(), toolchain),
+        (TARGET.into(), target_root.clone()),
+        ("/__rabs/home".into(), home_root.clone()),
+    ])?;
     let paths = paths
         .with_workspace_units(graph.workspace_units(), profile.selection.as_ref())
         .map_err(io::Error::other)?;
@@ -1716,9 +1781,7 @@ fn run_operation(
         if let Some(retained) = &retained_toolchain {
             retained.image().verify_retained_generation(cancelled)?;
         }
-        if let Some(captured) = &captured_toolchain {
-            captured.verify_retained_generation(cancelled)?;
-        }
+        paths.verify_captured_toolchain(&cancelled)?;
         if let Some(Err(CommittedOutputExportError::InvalidProducer(reason))) = &target_provenance {
             return Err(io::Error::other(format!(
                 "completed target provenance is no longer valid: {reason}"
@@ -1770,7 +1833,14 @@ fn run_operation(
                     == target_root,
                 "completed target differs from its retained canonical mount",
             )?;
-            Some(retain_build_target(&profile.operation_root, &target_root)?)
+            // Remote targets remain under their runtime operation owner until
+            // verified transfer and its final acknowledgment release custody.
+            let parent = if remote_operation {
+                owner.path()
+            } else {
+                &profile.operation_root
+            };
+            Some(retain_build_target(parent, &target_root)?)
         } else {
             None
         };
@@ -1798,7 +1868,7 @@ fn run_operation(
         // I/O above. Standalone writers have cleanly joined under StateOwner.
         paths.verify_completed_producers(&coord, &cancelled)?;
     }
-    if let Some(delivered) = delivered {
+    if let Some(delivered) = &delivered {
         output.event(
             json!({"kind":"canonical-build-completed", "version":PROFILE_VERSION,
                 "command":profile.command.as_str(), "tests_executed":false,
@@ -1806,10 +1876,18 @@ fn run_operation(
         )?;
     }
     use std::os::unix::process::ExitStatusExt;
-    Ok(compiled
-        .status
-        .code()
-        .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)))
+    Ok(OperationOutcome {
+        exit_code: compiled
+            .status
+            .code()
+            .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)),
+        retained_target: delivered,
+        provenance: OperationProvenance {
+            _source: source,
+            paths,
+            coord,
+        },
+    })
 }
 
 /// Only private Cargo freshness uses this compatibility family. Every command
@@ -1826,6 +1904,9 @@ struct TargetReuseContext<'a> {
     build_identity: &'a str,
     wrapper: [u8; 32],
     closed_dependency_execution: bool,
+    // None is the existing local-only family. Remote families are separated by
+    // the SPKI authenticated by the service, never by a client declaration.
+    authenticated_edge_pin: Option<[u8; 32]>,
 }
 
 impl TargetReuseContext<'_> {
@@ -1899,7 +1980,21 @@ impl TargetReuseContext<'_> {
                 "fresh-home+captured-or-empty-cargo-home+no-project-executors-v1"
             }
         });
-        Ok(Sha256::digest(serde_json::to_vec(&identity)?).into())
+        let key: [u8; 32] = Sha256::digest(serde_json::to_vec(&identity)?).into();
+        let Some(peer) = self.authenticated_edge_pin else {
+            // Preserve existing local seeds without weakening any of their
+            // compatibility inputs or migrating their on-disk generations.
+            return Ok(key);
+        };
+        require(
+            peer != [0; 32],
+            "private target requires an authenticated edge key",
+        )?;
+        let mut hash = Sha256::new();
+        hash.update(b"rabs.remote-private-cargo-target.v1\0");
+        hash.update(peer);
+        hash.update(key);
+        Ok(hash.finalize().into())
     }
 }
 
@@ -3667,6 +3762,7 @@ mod tests {
         wrapper: [u8; 32],
         driver: String,
         closed_dependency_execution: bool,
+        authenticated_edge_pin: Option<[u8; 32]>,
     }
 
     impl ReuseKeyFixture {
@@ -3719,10 +3815,15 @@ mod tests {
                 wrapper: [5; 32],
                 driver: "driver-1".into(),
                 closed_dependency_execution: false,
+                authenticated_edge_pin: None,
             }
         }
 
         fn key(&self) -> [u8; 32] {
+            self.try_key().unwrap()
+        }
+
+        fn try_key(&self) -> io::Result<[u8; 32]> {
             TargetReuseContext {
                 request: &self.request,
                 workspace: self
@@ -3739,9 +3840,9 @@ mod tests {
                 build_identity: &self.driver,
                 wrapper: self.wrapper,
                 closed_dependency_execution: self.closed_dependency_execution,
+                authenticated_edge_pin: self.authenticated_edge_pin,
             }
             .key(&self.config)
-            .unwrap()
         }
 
         fn with_captured_cache(source: &[u8], cache: &[u8]) -> Self {
@@ -3758,6 +3859,137 @@ mod tests {
             );
             fixture
         }
+    }
+
+    #[test]
+    fn remote_private_target_keys_bind_authenticated_peers_without_weakening_inputs() {
+        let mut first = ReuseKeyFixture::new();
+        let local = first.key();
+        first.authenticated_edge_pin = Some([1; 32]);
+        let remote = first.key();
+        assert_ne!(remote, local);
+
+        let mut second = ReuseKeyFixture::new();
+        second.authenticated_edge_pin = Some([1; 32]);
+        assert_eq!(second.key(), remote);
+        second.authenticated_edge_pin = Some([2; 32]);
+        assert_ne!(second.key(), remote);
+        second.authenticated_edge_pin = Some([0; 32]);
+        assert_eq!(
+            second.try_key().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // The peer namespace wraps the full existing compatibility contract.
+        // Compiler-only checks still permit the existing safe source-edit
+        // family; codegen retains every captured source byte in its key.
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_eq!(first.key(), remote);
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"changed manifest", None);
+        assert_ne!(first.key(), remote);
+        first.source = reuse_source(b"pub const VALUE:u8=1;", b"manifest", None);
+        first.args[0] = "build".into();
+        let build = first.key();
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_ne!(first.key(), build);
+
+        for changed in ["toolchain", "epoch", "wrapper", "driver", "environment"] {
+            let mut fixture = ReuseKeyFixture::new();
+            fixture.authenticated_edge_pin = Some([1; 32]);
+            match changed {
+                "toolchain" => {
+                    fixture.request["toolchain_identity"]["sha256"] = json!("cd".repeat(32))
+                }
+                "epoch" => fixture.config.runtime_epoch = "host-2".into(),
+                "wrapper" => fixture.wrapper = [6; 32],
+                "driver" => fixture.driver = "driver-2".into(),
+                "environment" => {
+                    fixture.spec.env.push(("INPUT".into(), "changed".into()));
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(fixture.key(), remote, "changed {changed}");
+        }
+    }
+
+    #[test]
+    fn remote_private_target_restore_is_peer_scoped_under_one_aggregate_budget() {
+        use crate::coord::live_dependency::canonical::CommittedOutputSeeds;
+
+        let state = crate::test_util::private_tempdir();
+        let workspace = crate::test_util::private_tempdir();
+        create_private(&workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), b"manifest").unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub const VALUE:u8=1;",
+        )
+        .unwrap();
+        let target = crate::test_util::private_tempdir();
+        fs::write(target.path().join("artifact"), b"first edge output").unwrap();
+        let mut fixture = ReuseKeyFixture::new();
+        let local = fixture.key();
+        fixture.authenticated_edge_pin = Some([1; 32]);
+        let first = fixture.key();
+        fixture.authenticated_edge_pin = Some([2; 32]);
+        let second = fixture.key();
+        let mut config = fixture.config.clone();
+        let manifest = &fixture.source;
+        let capture = |key, config: &TargetCacheConfig| {
+            TargetState::open(
+                state.path(),
+                config,
+                key,
+                workspace.path(),
+                manifest,
+                &|| false,
+            )
+            .unwrap()
+            .capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
+        };
+        let restore = |key, config: &TargetCacheConfig| {
+            let candidate = crate::test_util::private_tempdir();
+            let mut cache = TargetState::open(
+                state.path(),
+                config,
+                key,
+                workspace.path(),
+                manifest,
+                &|| false,
+            )
+            .unwrap();
+            cache.restore(candidate.path()).unwrap().then(|| {
+                let bytes = fs::read(candidate.path().join("artifact")).unwrap();
+                // A private restored target can be mutated independently.
+                fs::write(candidate.path().join("artifact"), b"private edit").unwrap();
+                bytes
+            })
+        };
+
+        capture(first, &config);
+        assert_eq!(
+            restore(first, &config).as_deref(),
+            Some(b"first edge output".as_slice())
+        );
+        assert!(restore(second, &config).is_none());
+        assert!(restore(local, &config).is_none());
+        assert_eq!(
+            restore(first, &config).as_deref(),
+            Some(b"first edge output".as_slice())
+        );
+
+        // Keys share the same store and retention limit, rather than granting
+        // every enrolled edge its own independently growing byte/family quota.
+        config.max_families = 1;
+        fs::write(target.path().join("artifact"), b"second edge output").unwrap();
+        capture(second, &config);
+        assert_eq!(
+            restore(second, &config).as_deref(),
+            Some(b"second edge output".as_slice())
+        );
+        assert!(restore(first, &config).is_none());
+        assert!(restore(local, &config).is_none());
     }
 
     #[test]

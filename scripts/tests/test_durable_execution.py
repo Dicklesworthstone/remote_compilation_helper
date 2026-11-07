@@ -32,13 +32,17 @@ def build_native_renderer(directory: Path) -> Path:
     start = source.index('    fn durable_execution_command_with_stall(')
     end = source.index('\n    }\n', start) + len('\n    }\n')
     method = source[start:end]
+    helper_start = source.index('pub(crate) fn file_fsync_command(')
+    helper = source[helper_start:source.index('\n}\n', helper_start) + len('\n}\n')]
     (directory / 'src').mkdir()
     (directory / 'Cargo.toml').write_text(
         '[package]\nname = "durable-renderer"\nversion = "0.0.0"\nedition = "2024"\n'
         '[workspace]\n[dependencies]\nshell-escape = "=0.1.5"\n'
+        'uuid = { version = "1", features = ["v4"] }\n'
     )
     (directory / 'src/main.rs').write_text(
         'use std::borrow::Cow;\nuse std::path::Path;\nuse shell_escape::escape;\n'
+        + helper +
         'struct TransferPipeline { recovery_completion: Option<(String, String)> }\n'
         'impl TransferPipeline {\n' + method + '\n}\n'
         'fn main() {\n'

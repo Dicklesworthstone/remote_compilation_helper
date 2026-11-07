@@ -26,6 +26,7 @@ use rch_common::job_identity::{
 };
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use rch_common::ssh::{OwnedProcessGroup, ssh_can_disable_background};
+use rch_common::timing::{MAX_CONTROL_TIMEOUT, TIMING_SCALE_ENV, TimingScale, ceil_seconds};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -47,9 +48,14 @@ const TERMINAL_CANCELLATION_GRACE_MS: u64 = 15 * 60 * 1000;
 /// A worker gets at most one client, so a stalled worker cannot consume every
 /// lane or serialize independent workers behind its timeout.
 const MAX_RECOVERIES_PER_CYCLE: usize = 4;
-/// Deadline handed to `rch jobs recover`, plus slack before the child is killed.
+/// Base control budget handed to `rch jobs recover`. This is recovery of an
+/// already-owned operation, not a new compiler/test lifetime.
 const RECOVER_TIMEOUT_SECS: u64 = 300;
-const RECOVER_KILL_AFTER: Duration = Duration::from_secs(RECOVER_TIMEOUT_SECS + 30);
+/// Local SSH inspection and a readiness-only scan use the same bounded phase
+/// allowance. Neither scan starts worker-side recovery.
+const RECOVERY_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Local parent-lifetime/exit slack stays fixed when remote latency is scaled.
+const RECOVER_EXIT_SLACK: Duration = Duration::from_secs(30);
 /// Keep diagnostics bounded even when a recovery produces gigabytes of output.
 const RECOVER_STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Reap the direct child after timeout without wedging the recovery service.
@@ -57,6 +63,60 @@ const RECOVER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Retry delay after the first failure; doubles per failure up to the cap.
 const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
 const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Snapshot one policy and deadline before admission. Every later phase,
+/// including the child CLI, consumes this window instead of renewing it.
+#[derive(Clone, Copy)]
+struct RecoveryWindow {
+    scale: TimingScale,
+    deadline: Instant,
+}
+
+impl RecoveryWindow {
+    fn new(scale: TimingScale) -> Result<Self, String> {
+        let budget = scale
+            .duration(Duration::from_secs(RECOVER_TIMEOUT_SECS))
+            .saturating_add(RECOVER_EXIT_SLACK)
+            .min(MAX_CONTROL_TIMEOUT);
+        let deadline = Instant::now().checked_add(budget).ok_or_else(|| {
+            "automatic lease recovery deadline exceeds the clock range".to_owned()
+        })?;
+        Ok(Self { scale, deadline })
+    }
+
+    fn remaining(self) -> Result<Duration, String> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err("automatic lease recovery exceeded its total deadline".into())
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn child_timeout_secs(self) -> Result<u64, String> {
+        // The CLI accepts whole seconds. Its rounding never extends the
+        // parent's original elapsed deadline or authorizes late confirmation.
+        Ok(ceil_seconds(
+            self.remaining()?.min(
+                self.scale
+                    .duration(Duration::from_secs(RECOVER_TIMEOUT_SECS)),
+            ),
+        ))
+    }
+}
+
+/// Expiry wins before polling a ready operation; synchronous work finishing
+/// across the boundary is also refused. No result here proves worker exit.
+async fn before_recovery_deadline<F: Future>(deadline: Instant, operation: F) -> Option<F::Output> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => None,
+        result = operation => (Instant::now() < deadline).then_some(result),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryOutcome {
@@ -77,22 +137,26 @@ enum RecoveryAdmission {
 }
 
 impl RecoveryAdmission {
-    async fn run<F: Future>(&mut self, operation: F) -> Option<F::Output> {
+    async fn run_until<F: Future>(&mut self, operation: F, deadline: Instant) -> Option<F::Output> {
         // Keep large recovery operations out of each nested revocation
         // guard's future. Dropping the box still cancels the owned operation.
         let operation = Box::pin(operation);
-        match self {
-            Self::Local => Some(operation.await),
-            Self::Network { admin, network } => admin
-                .run(async {
-                    match network {
-                        Some(network) => network.run(operation).await,
-                        None => Some(operation.await),
-                    }
-                })
-                .await
-                .flatten(),
-        }
+        before_recovery_deadline(deadline, async {
+            match self {
+                Self::Local => Some(operation.await),
+                Self::Network { admin, network } => admin
+                    .run(async {
+                        match network {
+                            Some(network) => network.run_until(operation, deadline).await,
+                            None => Some(operation.await),
+                        }
+                    })
+                    .await
+                    .flatten(),
+            }
+        })
+        .await
+        .flatten()
     }
 }
 
@@ -608,15 +672,27 @@ async fn eligible_recoveries(
     lease_dir: &Path,
 ) -> HashSet<String> {
     let mut eligible = HashSet::new();
+    let Some(deadline) = Instant::now().checked_add(rch_common::timing::scale_duration(
+        RECOVERY_PREFLIGHT_TIMEOUT,
+    )) else {
+        return eligible;
+    };
     for candidate in candidates {
         // Admission only inspects readiness here. The permit claims the
         // shared endpoint flight and any due probe when recovery actually
         // runs, so speculative scans cannot consume the recovery deadline.
         // Invalid journals keep their ordinary error/backoff path.
-        if !matches!(
-            recovery_admission(admin_store, pool, lease_dir, candidate).await,
-            Ok(None)
-        ) {
+        let Some(admitted) = before_recovery_deadline(
+            deadline,
+            recovery_admission(admin_store, pool, lease_dir, candidate),
+        )
+        .await
+        else {
+            // A queued scan must not wedge completion accounting for all
+            // workers. Keep uninspected candidates for the next normal scan.
+            break;
+        };
+        if !matches!(admitted, Ok(None)) {
             eligible.insert(candidate.wrapper_id.clone());
         }
     }
@@ -632,45 +708,87 @@ async fn recover(
     pool: &WorkerPool,
 ) -> Result<RecoveryOutcome, String> {
     let directory = default_job_lease_directory();
-    let Some(mut admission) = recovery_admission(admin_store, pool, &directory, candidate).await?
+    let window = RecoveryWindow::new(rch_common::timing::configured())?;
+    recover_before(
+        rch,
+        socket,
+        &directory,
+        candidate,
+        admin_store,
+        pool,
+        window,
+    )
+    .await
+}
+
+async fn recover_before(
+    rch: &Path,
+    socket: &Path,
+    directory: &Path,
+    candidate: &RecoveryCandidate,
+    admin_store: &Mutex<AdminDisableStore>,
+    pool: &WorkerPool,
+    window: RecoveryWindow,
+) -> Result<RecoveryOutcome, String> {
+    let Some(admission) = before_recovery_deadline(
+        window.deadline,
+        recovery_admission(admin_store, pool, directory, candidate),
+    )
+    .await
     else {
         return Ok(RecoveryOutcome::Deferred);
     };
+    let Some(mut admission) = admission? else {
+        return Ok(RecoveryOutcome::Deferred);
+    };
     let local_only = matches!(admission, RecoveryAdmission::Local);
+    let mut started = false;
     let result = admission
-        .run(tokio::time::timeout(RECOVER_KILL_AFTER, async {
-            let policy = if local_only {
-                // No SSH process is needed to reconcile already-retired
-                // delivery, including the local capability query below.
-                RecoveryClientPolicy::Local
-            } else {
-                // Probe locally in the daemon's owned process before spawning
-                // the CLI. A hard stop cannot orphan a separate -G group.
-                let can_disable_background =
-                    ssh_can_disable_background(Path::new("ssh"), Duration::from_secs(10))
-                        .await
-                        .map_err(|error| {
-                            format!("recovery SSH capability probe failed: {error:#}")
-                        })?;
-                RecoveryClientPolicy::Network {
-                    can_disable_background,
-                }
-            };
-            recover_in_with_policy(
-                rch,
-                socket,
-                &directory,
-                &candidate.wrapper_id,
-                Some(candidate),
-                policy,
-            )
-            .await
-        }))
+        .run_until(
+            async {
+                started = true;
+                window.remaining()?;
+                let policy = if local_only {
+                    // No SSH process is needed to reconcile already-retired
+                    // delivery, including the local capability query below.
+                    RecoveryClientPolicy::Local
+                } else {
+                    // Inspect in the daemon's owned process before spawning
+                    // the CLI. Admission consumes this same original window.
+                    let inspection = window
+                        .remaining()?
+                        .min(window.scale.duration(RECOVERY_PREFLIGHT_TIMEOUT));
+                    let can_disable_background =
+                        ssh_can_disable_background(Path::new("ssh"), inspection)
+                            .await
+                            .map_err(|error| {
+                                format!("recovery SSH capability probe failed: {error:#}")
+                            })?;
+                    window.remaining()?;
+                    RecoveryClientPolicy::Network {
+                        can_disable_background,
+                    }
+                };
+                recover_in_with_policy(
+                    rch,
+                    socket,
+                    directory,
+                    &candidate.wrapper_id,
+                    Some(candidate),
+                    policy,
+                    window,
+                )
+                .await
+            },
+            window.deadline,
+        )
         .await;
     match result {
+        None if started && Instant::now() >= window.deadline => {
+            Err("automatic lease recovery exceeded its total deadline".into())
+        }
         None => Ok(RecoveryOutcome::Deferred),
-        Some(Ok(result)) => result.map(|()| RecoveryOutcome::Recovered),
-        Some(Err(_)) => Err("automatic lease recovery exceeded its total deadline".into()),
+        Some(result) => result.map(|()| RecoveryOutcome::Recovered),
     }
 }
 
@@ -741,6 +859,7 @@ async fn recover_in(
         wrapper_id,
         candidate,
         RecoveryClientPolicy::Unmanaged,
+        RecoveryWindow::new(rch_common::timing::configured())?,
     )
     .await
 }
@@ -752,7 +871,9 @@ async fn recover_in_with_policy(
     wrapper_id: &str,
     candidate: Option<&RecoveryCandidate>,
     policy: RecoveryClientPolicy,
+    window: RecoveryWindow,
 ) -> Result<(), String> {
+    window.remaining()?;
     let before = read_lease(lease_dir, wrapper_id)?;
     check_candidate(&before, wrapper_id, candidate)?;
     if matches!(policy, RecoveryClientPolicy::Local)
@@ -773,8 +894,9 @@ async fn recover_in_with_policy(
     let mut command = tokio::process::Command::new(rch);
     command
         .args(["jobs", "recover", wrapper_id, "--timeout-secs"])
-        .arg(RECOVER_TIMEOUT_SECS.to_string())
+        .arg(window.child_timeout_secs()?.to_string())
         .env("RCH_SOCKET_PATH", socket)
+        .env(TIMING_SCALE_ENV, window.scale.env_value())
         .stdin(if automatic_ssh.is_some() {
             Stdio::piped()
         } else {
@@ -790,14 +912,29 @@ async fn recover_in_with_policy(
     if matches!(policy, RecoveryClientPolicy::Local) {
         command.arg("--daemon-local-only");
     }
+    // Journal validation and command preparation can stall synchronously.
+    // No expired window may create a recovery client or fresh SSH work.
+    window.remaining()?;
     let child = OwnedProcessGroup::spawn(&mut command)
         .map_err(|error| format!("cannot run {}: {error}", rch.display()))?;
-    let (status, stderr) = collect_recovery_child(child, RECOVER_KILL_AFTER).await?;
+    let (status, stderr) = collect_recovery_child(child, window.deadline).await?;
+    window.remaining()?;
     if status.success() {
         let after = read_lease(lease_dir, wrapper_id)?;
-        return verify_recovery_completion(&before, &after);
+        return confirm_recovery_before(&before, &after, window);
     }
     Err(format!("{status}: {}", diagnostic_tail(&stderr)))
+}
+
+fn confirm_recovery_before(
+    before: &DurableJobLease,
+    after: &DurableJobLease,
+    window: RecoveryWindow,
+) -> Result<(), String> {
+    window.remaining()?;
+    let verified = verify_recovery_completion(before, after);
+    window.remaining()?;
+    verified
 }
 
 fn diagnostic_tail(bytes: &[u8]) -> String {
@@ -839,34 +976,31 @@ async fn drain_recovery_stderr(
 /// alone establishes recovery completion. No reader task is detached.
 async fn collect_recovery_child(
     mut child: OwnedProcessGroup,
-    budget: Duration,
+    deadline: Instant,
 ) -> Result<(ExitStatus, Vec<u8>), String> {
     let stderr = child
         .take_stderr()
         .ok_or_else(|| "recovery child has no diagnostic pipe".to_owned())?;
-    collect_recovery_child_stream(child, stderr, budget).await
+    collect_recovery_child_stream(child, stderr, deadline).await
 }
 
 async fn collect_recovery_child_stream(
     mut child: OwnedProcessGroup,
     mut stderr: impl AsyncRead + Unpin,
-    budget: Duration,
+    deadline: Instant,
 ) -> Result<(ExitStatus, Vec<u8>), String> {
     // Child::wait closes its stdin on some platforms. Keep the parent lifetime
     // pipe independently owned until collection ends or admission is revoked.
     let _parent_lifetime = child.take_stdin();
     let mut tail = Vec::with_capacity(RECOVER_STDERR_TAIL_BYTES);
-    let completed = tokio::time::timeout(budget, async {
+    let completed = before_recovery_deadline(deadline, async {
         tokio::try_join!(child.wait(), drain_recovery_stderr(&mut stderr, &mut tail))
     })
     .await;
     let failure = match completed {
-        Ok(Ok((status, ()))) => return Ok((status, tail)),
-        Ok(Err(error)) => format!("cannot collect recovery child: {error}"),
-        Err(_) => format!(
-            "recovery timed out after {}ms waiting for child exit and diagnostic EOF",
-            budget.as_millis()
-        ),
+        Some(Ok((status, ()))) => return Ok((status, tail)),
+        Some(Err(error)) => format!("cannot collect recovery child: {error}"),
+        None => "recovery timed out waiting for child exit and diagnostic EOF".to_owned(),
     };
     // The owned group covers cancellation of this entire future, including
     // SSH and ProxyCommand descendants. On timeout/error also reap its leader.
@@ -886,6 +1020,10 @@ mod tests {
     use super::*;
     use rch_common::WorkerId;
     use rch_common::job_identity::JobIdentity;
+
+    fn test_recovery_window() -> RecoveryWindow {
+        RecoveryWindow::new(TimingScale::default()).unwrap()
+    }
 
     /// A fake `rch` for recovery: a hard link to one shim written once per
     /// process, whose behavior is the data file `body` beside the link.
@@ -1012,6 +1150,294 @@ mod tests {
         (owned, candidate)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn recovery_window_scales_control_budget_and_preserves_fixed_exit_slack() {
+        for (scale, client_seconds, total_seconds) in
+            [(1.0, 300, 330), (2.5, 750, 780), (10.0, 3000, 3030)]
+        {
+            let now = Instant::now();
+            let window = RecoveryWindow::new(TimingScale::try_from(scale).unwrap()).unwrap();
+            assert_eq!(window.deadline - now, Duration::from_secs(total_seconds));
+            assert_eq!(window.child_timeout_secs().unwrap(), client_seconds);
+            assert!(window.remaining().unwrap() <= MAX_CONTROL_TIMEOUT);
+            assert_eq!(RECOVER_REAP_TIMEOUT, Duration::from_secs(5));
+        }
+
+        let window = RecoveryWindow {
+            scale: TimingScale::try_from(2.5).unwrap(),
+            deadline: Instant::now() + Duration::from_millis(1250),
+        };
+        assert_eq!(window.child_timeout_secs().unwrap(), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(window.child_timeout_secs().unwrap(), 1);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(window.remaining().is_err());
+        assert!(window.child_timeout_secs().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_scan_expires_without_consuming_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("queued-readiness");
+        let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+        let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+        let pool = WorkerPool::new();
+        pool.add_worker(endpoint.clone()).await;
+        let pending = VecDeque::from([candidate.clone()]);
+        let blocked = store.lock().await;
+        let mut scan = Box::pin(eligible_recoveries(
+            &pending,
+            &store,
+            &pool,
+            directory.path(),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(Future::poll(scan.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(rch_common::timing::scale_duration(
+            RECOVERY_PREFLIGHT_TIMEOUT,
+        ))
+        .await;
+        drop(blocked);
+        assert!(scan.await.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.front().unwrap().wrapper_id, candidate.wrapper_id);
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            owned
+        );
+        assert!(
+            eligible_recoveries(&pending, &store, &pool, directory.path())
+                .await
+                .contains(&candidate.wrapper_id),
+            "a fresh scan can admit the same still-owned candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn lease_admission_expiry_defers_without_spawning_and_allows_fresh_retry() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = recovery_worker("queued-lease");
+            let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+            let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+            let pool = WorkerPool::new();
+            pool.add_worker(endpoint.clone()).await;
+            let child = fake_rch(
+                directory.path(),
+                "printf 'started\\n' >\"$(dirname \"$0\")/started\"\n",
+            );
+            let socket = directory.path().join("unused.sock");
+            let window = RecoveryWindow {
+                scale: TimingScale::default(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            };
+            let blocked = store.lock().await;
+            let mut recovery = Box::pin(recover_before(
+                &child,
+                &socket,
+                directory.path(),
+                &candidate,
+                &store,
+                &pool,
+                window,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(Future::poll(recovery.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(2) + lateness).await;
+            drop(blocked);
+            assert_eq!(recovery.await, Ok(RecoveryOutcome::Deferred));
+            assert!(!directory.path().join("started").exists());
+            assert_eq!(
+                read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+                owned
+            );
+            let mut fresh = recovery_admission(&store, &pool, directory.path(), &candidate)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fresh
+                    .run_until(async { 7 }, test_recovery_window().deadline)
+                    .await,
+                Some(7)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_recovery_never_resumes_ready_work_at_or_after_expiry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for local_only in [true, false] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut store = AdminDisableStore::with_path(directory.path().join("admin"));
+                let mut admission = if local_only {
+                    RecoveryAdmission::Local
+                } else {
+                    RecoveryAdmission::Network {
+                        admin: store.automatic_network_permit("owned-worker").unwrap(),
+                        network: None,
+                    }
+                };
+                let resumed = AtomicBool::new(false);
+                let (resume, ready) = tokio::sync::oneshot::channel();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut operation = Box::pin(admission.run_until(
+                    async {
+                        ready.await.unwrap();
+                        resumed.store(true, Ordering::SeqCst);
+                        7
+                    },
+                    deadline,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(Future::poll(operation.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(Duration::from_secs(2) + lateness).await;
+                resume.send(()).unwrap();
+                assert!(operation.await.is_none());
+                assert!(!resumed.load(Ordering::SeqCst));
+                assert_eq!(
+                    admission
+                        .run_until(async { 7 }, test_recovery_window().deadline)
+                        .await,
+                    Some(7)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expired_lease_window_never_spawns_the_recovery_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("expired-client");
+        let (owned, candidate) = retired_recovery_fixture(directory.path(), &endpoint);
+        let child = fake_rch(
+            directory.path(),
+            "printf 'started\\n' >\"$(dirname \"$0\")/started\"\n",
+        );
+        let window = RecoveryWindow {
+            scale: TimingScale::try_from(10.0).unwrap(),
+            deadline: Instant::now(),
+        };
+        let error = recover_in_with_policy(
+            &child,
+            &directory.path().join("unused.sock"),
+            directory.path(),
+            &candidate.wrapper_id,
+            Some(&candidate),
+            RecoveryClientPolicy::Local,
+            window,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(!directory.path().join("started").exists());
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            owned
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lease_recovery_client_receives_the_effective_policy_and_scaled_limit() {
+        for (scale, timeout) in [(1.0, "300"), (2.5, "750"), (10.0, "3000")] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = recovery_worker("policy-client");
+            let (owned, candidate) = retired_recovery_fixture(directory.path(), &endpoint);
+            let completed = completed_lease(&owned, 0, 0);
+            std::fs::write(
+                directory.path().join("settled"),
+                serde_json::to_vec(&completed).unwrap(),
+            )
+            .unwrap();
+            let child = fake_rch(
+                directory.path(),
+                "printf '%s\\n' \"$RCH_TIMING_SCALE\" >\"$(dirname \"$0\")/scale\"\n\
+                 printf '%s\\n' \"$@\" >\"$(dirname \"$0\")/args\"\n\
+                 cp \"$(dirname \"$0\")/settled\" \"$(dirname \"$0\")/$3.json\"\n",
+            );
+            let scale = TimingScale::try_from(scale).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                recover_in_with_policy(
+                    &child,
+                    &directory.path().join("unused.sock"),
+                    directory.path(),
+                    &candidate.wrapper_id,
+                    Some(&candidate),
+                    RecoveryClientPolicy::Local,
+                    RecoveryWindow::new(scale).unwrap(),
+                ),
+            )
+            .await
+            .expect("the local fixture must not wait for the remote allowance")
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("scale"))
+                    .unwrap()
+                    .trim(),
+                scale.env_value()
+            );
+            let args = std::fs::read_to_string(directory.path().join("args")).unwrap();
+            let args: Vec<_> = args.lines().collect();
+            assert_eq!(
+                args[3..],
+                [
+                    "--timeout-secs",
+                    timeout,
+                    "--daemon-managed",
+                    "false",
+                    "--daemon-local-only"
+                ]
+            );
+            assert_eq!(
+                read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+                completed
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_completion_requires_both_timely_and_exact_journal_evidence() {
+        let before = handoff_lease(1, 42, 0);
+        let complete = completed_lease(&before, 0, 0);
+        for (delay, accepted) in [
+            (Duration::from_millis(1999), true),
+            (Duration::from_secs(2), false),
+            (Duration::from_millis(2001), false),
+        ] {
+            let window = RecoveryWindow {
+                scale: TimingScale::default(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            };
+            tokio::time::advance(delay).await;
+            assert_eq!(
+                confirm_recovery_before(&before, &complete, window).is_ok(),
+                accepted
+            );
+        }
+        let mut wrong_identity = complete.clone();
+        wrong_identity.command_fingerprint.push_str("-different");
+        assert!(confirm_recovery_before(&before, &wrong_identity, test_recovery_window()).is_err());
+        assert!(
+            confirm_recovery_before(&before, &before, test_recovery_window()).is_err(),
+            "an unchanged incomplete journal is not confirmation"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn local_recovery_launch_keeps_strict_mode_and_rejects_changed_journal() {
@@ -1064,15 +1490,20 @@ mod tests {
             }
             let bytes = serde_json::to_vec(&pending).unwrap();
             std::fs::write(&journal, &bytes).unwrap();
+            let window = test_recovery_window();
             let error = admission
-                .run(recover_in_with_policy(
-                    &child,
-                    &socket,
-                    directory.path(),
-                    &candidate.wrapper_id,
-                    Some(&candidate),
-                    RecoveryClientPolicy::Local,
-                ))
+                .run_until(
+                    recover_in_with_policy(
+                        &child,
+                        &socket,
+                        directory.path(),
+                        &candidate.wrapper_id,
+                        Some(&candidate),
+                        RecoveryClientPolicy::Local,
+                        window,
+                    ),
+                    window.deadline,
+                )
                 .await
                 .unwrap()
                 .unwrap_err();
@@ -1100,15 +1531,20 @@ mod tests {
             serde_json::to_vec(&settled).unwrap(),
         )
         .unwrap();
+        let window = test_recovery_window();
         admission
-            .run(recover_in_with_policy(
-                &child,
-                &socket,
-                directory.path(),
-                &candidate.wrapper_id,
-                Some(&candidate),
-                RecoveryClientPolicy::Local,
-            ))
+            .run_until(
+                recover_in_with_policy(
+                    &child,
+                    &socket,
+                    directory.path(),
+                    &candidate.wrapper_id,
+                    Some(&candidate),
+                    RecoveryClientPolicy::Local,
+                    window,
+                ),
+                window.deadline,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1149,11 +1585,14 @@ mod tests {
             .unwrap();
         let (started, entered) = tokio::sync::oneshot::channel();
         let (resume, resumed) = tokio::sync::oneshot::channel();
-        let operation = admission.run(async {
-            started.send(()).unwrap();
-            resumed.await.unwrap();
-            7
-        });
+        let operation = admission.run_until(
+            async {
+                started.send(()).unwrap();
+                resumed.await.unwrap();
+                7
+            },
+            test_recovery_window().deadline,
+        );
         let disable = async {
             entered.await.unwrap();
             store
@@ -1291,11 +1730,10 @@ mod tests {
                 endpoint.id, build.id, owned.identity.local_wrapper_id
             );
             let (completed, response) = tokio::join!(
-                admission.run(crate::api::handle_connection(
-                    server,
-                    context.clone(),
-                    shutdown
-                )),
+                admission.run_until(
+                    crate::api::handle_connection(server, context.clone(), shutdown),
+                    test_recovery_window().deadline,
+                ),
                 async {
                     client.write_all(release.as_bytes()).await.unwrap();
                     client.shutdown().await.unwrap();
@@ -1356,7 +1794,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(admitted.run(async { 7 }).await, Some(7));
+        assert_eq!(
+            admitted
+                .run_until(async { 7 }, test_recovery_window().deadline)
+                .await,
+            Some(7)
+        );
         store
             .lock()
             .await
@@ -1364,7 +1807,10 @@ mod tests {
             .unwrap();
         assert!(
             admitted
-                .run(async { panic!("revoked recovery was polled") })
+                .run_until(
+                    async { panic!("revoked recovery was polled") },
+                    test_recovery_window().deadline,
+                )
                 .await
                 .is_none()
         );
@@ -1808,18 +2254,23 @@ mod tests {
                     .is_empty(),
                 "a held cancellation must also exclude lease recovery"
             );
+            let window = test_recovery_window();
             assert!(
                 queued
-                    .run(recover_in_with_policy(
-                        &child,
-                        &socket,
-                        &directory,
-                        &candidate.wrapper_id,
-                        Some(&candidate),
-                        RecoveryClientPolicy::Network {
-                            can_disable_background: true
-                        },
-                    ))
+                    .run_until(
+                        recover_in_with_policy(
+                            &child,
+                            &socket,
+                            &directory,
+                            &candidate.wrapper_id,
+                            Some(&candidate),
+                            RecoveryClientPolicy::Network {
+                                can_disable_background: true,
+                            },
+                            window,
+                        ),
+                        window.deadline,
+                    )
                     .await
                     .is_none(),
                 "an earlier readiness snapshot must not bypass the active endpoint owner"
@@ -1839,7 +2290,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(local.run(async { 7 }).await, Some(7));
+            assert_eq!(
+                local
+                    .run_until(async { 7 }, test_recovery_window().deadline)
+                    .await,
+                Some(7)
+            );
             assert_eq!(
                 crate::workers::handle_worker_disable(
                     &context,
@@ -1865,7 +2321,10 @@ mod tests {
             assert_eq!(response.slots_released, 0);
             assert!(
                 queued
-                    .run(async { panic!("old admin permit survived ABA") })
+                    .run_until(
+                        async { panic!("old admin permit survived ABA") },
+                        test_recovery_window().deadline,
+                    )
                     .await
                     .is_none()
             );
@@ -1896,17 +2355,22 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let window = test_recovery_window();
             recovered
-                .run(recover_in_with_policy(
-                    &child,
-                    &socket,
-                    &directory,
-                    &candidate.wrapper_id,
-                    Some(&candidate),
-                    RecoveryClientPolicy::Network {
-                        can_disable_background: true,
-                    },
-                ))
+                .run_until(
+                    recover_in_with_policy(
+                        &child,
+                        &socket,
+                        &directory,
+                        &candidate.wrapper_id,
+                        Some(&candidate),
+                        RecoveryClientPolicy::Network {
+                            can_disable_background: true,
+                        },
+                        window,
+                    ),
+                    window.deadline,
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -1963,17 +2427,22 @@ mod tests {
             let socket = directory.path().join("daemon.sock");
             let id = candidate.wrapper_id.clone();
             let task = tokio::spawn(async move {
+                let window = test_recovery_window();
                 admitted
-                    .run(recover_in_with_policy(
-                        &child,
-                        &socket,
-                        &lease_dir,
-                        &id,
-                        Some(&candidate),
-                        RecoveryClientPolicy::Network {
-                            can_disable_background: true,
-                        },
-                    ))
+                    .run_until(
+                        recover_in_with_policy(
+                            &child,
+                            &socket,
+                            &lease_dir,
+                            &id,
+                            Some(&candidate),
+                            RecoveryClientPolicy::Network {
+                                can_disable_background: true,
+                            },
+                            window,
+                        ),
+                        window.deadline,
+                    )
                     .await
             });
             let _abort = AbortOnDrop(task.abort_handle());
@@ -2244,9 +2713,10 @@ mod tests {
              printf 'final recovery failure\\n' >&2; exit 7",
         )
         .await;
-        let (status, tail) = collect_recovery_child(child, Duration::from_secs(10))
-            .await
-            .unwrap();
+        let (status, tail) =
+            collect_recovery_child(child, Instant::now() + Duration::from_secs(10))
+                .await
+                .unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(tail.len(), RECOVER_STDERR_TAIL_BYTES);
         assert!(diagnostic_tail(&tail).ends_with("final recovery failure"));
@@ -2256,7 +2726,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_timeout_reaps_the_direct_child_before_returning() {
         let (child, pid) = fixture_child("exec sleep 30").await;
-        let error = collect_recovery_child(child, Duration::from_millis(100))
+        let error = collect_recovery_child(child, Instant::now() + Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
@@ -2274,7 +2744,7 @@ mod tests {
         let error = collect_recovery_child_stream(
             child,
             holder.take_stderr().unwrap(),
-            Duration::from_millis(100),
+            Instant::now() + Duration::from_millis(100),
         )
         .await
         .unwrap_err();
@@ -2287,7 +2757,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_recovery_does_not_detach_its_child_or_pipe_reader() {
         let (child, pid) = fixture_child("exec sleep 30").await;
-        let task = tokio::spawn(collect_recovery_child(child, Duration::from_secs(60)));
+        let task = tokio::spawn(collect_recovery_child(
+            child,
+            Instant::now() + Duration::from_secs(60),
+        ));
         tokio::task::yield_now().await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());

@@ -47,7 +47,11 @@ async fn query_fixture(
         &[],
         false,
         &[],
-        dry_run,
+        if dry_run {
+            SelectionQueryIntent::Preview
+        } else {
+            SelectionQueryIntent::Admit
+        },
         None,
     );
     let (result, ()) = timeout(Duration::from_secs(3), async {
@@ -327,7 +331,11 @@ async fn unrequested_fixture(
         &requested,
         false,
         &[],
-        dry_run,
+        if dry_run {
+            SelectionQueryIntent::Preview
+        } else {
+            SelectionQueryIntent::Admit
+        },
         None,
     );
     timeout(Duration::from_secs(3), async {
@@ -481,7 +489,11 @@ async fn resuming_query_fixture(
         &workers,
         true,
         &tools,
-        dry_run,
+        if dry_run {
+            SelectionQueryIntent::Preview
+        } else {
+            SelectionQueryIntent::Admit
+        },
         Some(&topology),
     );
     let result = timeout(Duration::from_secs(3), async {

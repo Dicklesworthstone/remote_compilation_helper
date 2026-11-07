@@ -458,11 +458,11 @@ async fn integrity_plan_repairs_equal_metadata_and_credits_only_verified_staged_
 
     // Exercise the actual planning method, not just a duplicate stats parser.
     let budget = pipeline
-        .retrieval_retry_config_inner(|| command(&pipeline, &worker, &root), checksummed)
+        .retrieval_plan(|| command(&pipeline, &worker, &root), checksummed)
         .await
         .unwrap();
     assert_eq!(
-        budget.total_timeout_ms, 900_000,
+        budget.retry_config.total_timeout_ms, 900_000,
         "allocation credit must not shorten the transfer deadline"
     );
     run(&mut command(&pipeline, &worker, &root)).await;
@@ -510,7 +510,7 @@ async fn insufficient_reserve_refuses_before_collection_without_mutating_staging
     let checksummed =
         TransferPipeline::artifact_integrity_arg(pipeline.resolved_rsync().flavor) == "--checksum";
     let result = pipeline
-        .retrieval_retry_config_inner(|| command(&pipeline, &worker, &root), checksummed)
+        .retrieval_plan(|| command(&pipeline, &worker, &root), checksummed)
         .await;
     assert!(result.is_err());
     assert!(!root.join("stage/build/new.o").exists());

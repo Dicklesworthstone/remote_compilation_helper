@@ -68,6 +68,13 @@ pub enum ActionClassRisk {
     /// negotiated closed metadata namespace. Archive and dependency evidence
     /// cannot promote this separately qualified class.
     ClosedWorkspaceMetadata,
+    /// Workspace leaf archives with a complete sealed Cargo OUT_DIR, exact
+    /// build-script output record and environment. This qualifies the compiler
+    /// action only; the build script still executes for the current operation.
+    GeneratedWorkspaceRlib,
+    /// The separately sampled closed-metadata counterpart of generated-input
+    /// workspace leaves. Neither pure-workspace nor archive evidence enrolls it.
+    GeneratedWorkspaceMetadata,
     /// Complete-workspace archives whose entire retained Rust candidate set
     /// comes from exact committed workspace producers. Separate class evidence
     /// and transitive producer safety are required; dependency SPRT stays closed.
@@ -95,6 +102,13 @@ pub enum ActionClassRisk {
     /// Workspace checks whose committed producer graph may include separately
     /// qualified immutable dependency DAGs. Requires its own class evidence.
     WorkspaceDagMetadata,
+    /// Workspace archives with complete generated inputs and committed Rust
+    /// producer ancestry. Their own Cargo run record and generated tree are
+    /// independently qualified from pure DAGs and generated leaves.
+    GeneratedWorkspaceDagRlib,
+    /// Closed metadata checks with complete generated inputs and committed
+    /// ancestry. Archive or pure-workspace evidence cannot enroll this class.
+    GeneratedWorkspaceDagMetadata,
     /// Exact selected binary/example or harness metadata checks with a proven
     /// empty candidate inventory. Terminal outputs never authorize consumers.
     WorkspaceTerminalLeafMetadata,

@@ -107,6 +107,7 @@ rich-ui = ["rich_rust"]
 true-e2e = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.25.0"
 proptest = "1.11.0"
 insta = "1.47.2"

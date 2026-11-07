@@ -1,4 +1,4 @@
-//! Scheduler admission gate for disk-pressure risk.
+//! Scheduler admission requirements and disk-pressure policy.
 //!
 //! Evaluates workers before selection using pressure state, headroom
 //! estimates, and hysteresis to produce admission verdicts.  Critical
@@ -6,7 +6,11 @@
 //! headroom result in scoring penalties or soft rejections.  Hysteresis
 //! prevents rapid oscillation when disk free space hovers near a threshold.
 //!
-//! # Fail-open guarantee
+//! Execution requirements are hard constraints shared by selection and slot
+//! reservation. They inspect current capability evidence without remote I/O;
+//! reservation holds that evidence stable until accounting commits.
+//!
+//! # Disk-policy fail-open guarantee
 //!
 //! The admission gate never blocks *all* workers silently.  Callers
 //! (the selection pipeline) track soft-rejected workers in a fallback
@@ -17,13 +21,231 @@
 use crate::disk_pressure::PressureState;
 use crate::headroom::HeadroomEstimator;
 use crate::workers::WorkerState;
-use rch_common::WorkerId;
+use rch_common::{
+    CompilationKind, RequiredRuntime, SelectionRequest, ToolchainInfo, WorkerCapabilities,
+    WorkerId, classify_command,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
+
+/// Reuse window for a successful concrete-toolchain execution check. Selection
+/// and reservation must agree on when that authorization expires.
+pub(crate) const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
+
+/// Immutable execution requirements for one selection/reservation attempt.
+///
+/// Borrow the request's tool list and version data; only command-derived keys
+/// are computed here. This keeps command classification outside worker locks
+/// and avoids cloning each worker's capability inventory at admission.
+pub(crate) struct ExecutionRequirements<'a> {
+    request: &'a SelectionRequest,
+    component: Option<&'static str>,
+    component_toolchain: Option<String>,
+    preflight_toolchain: Option<String>,
+}
+
+impl<'a> ExecutionRequirements<'a> {
+    pub(crate) fn new(request: &'a SelectionRequest) -> Self {
+        let component = required_rustup_component(request);
+        let component_toolchain = component.and_then(|_| required_component_toolchain(request));
+        Self {
+            request,
+            component,
+            component_toolchain,
+            // Match the selector's existing concrete-toolchain preflight policy.
+            // Command-derived component pins are a separate capability gate.
+            preflight_toolchain: request
+                .toolchain
+                .as_ref()
+                .map(ToolchainInfo::rustup_toolchain),
+        }
+    }
+
+    pub(crate) fn required_runtime(&self) -> RequiredRuntime {
+        self.request.required_runtime
+    }
+
+    pub(crate) fn preflight_toolchain(&self) -> Option<&str> {
+        self.preflight_toolchain.as_deref()
+    }
+
+    pub(crate) fn tool_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
+        required_tool_capability_mismatch(self.request, capabilities)
+    }
+
+    pub(crate) fn component_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
+        let component = self.component?;
+        let Some(toolchain) = self.component_toolchain.as_deref() else {
+            return Some(format!(
+                "capability_missing:rustup_component:<unknown>:{component}"
+            ));
+        };
+        (!capabilities.has_rustup_component(toolchain, component))
+            .then(|| format!("capability_missing:rustup_component:{toolchain}:{component}"))
+    }
+
+    pub(crate) fn toolchain_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
+        toolchain_capability_mismatch(self.request.toolchain.as_ref(), capabilities)
+    }
+
+    pub(crate) fn capabilities_satisfied(&self, capabilities: &WorkerCapabilities) -> bool {
+        capabilities.has_runtime(self.required_runtime())
+            && self.tool_mismatch(capabilities).is_none()
+            && self.component_mismatch(capabilities).is_none()
+            && self.toolchain_mismatch(capabilities).is_none()
+    }
+}
+
+pub(crate) fn toolchain_capability_mismatch(
+    toolchain: Option<&ToolchainInfo>,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    let toolchain = toolchain?;
+    if toolchain.date.is_some()
+        || toolchain.full_version.trim().is_empty()
+        || toolchain.full_version.trim().eq(toolchain.channel.as_str())
+    {
+        return None;
+    }
+
+    let worker_raw = capabilities.rustc_version.as_deref()?;
+    let channel = toolchain.channel.trim();
+    if is_floating_rust_channel(channel) {
+        return (!worker_rustc_matches_channel(worker_raw, channel)).then(|| {
+            format!(
+                "rustc_channel_mismatch:local={channel}:worker={}",
+                rustc_version_key(worker_raw).unwrap_or_else(|| worker_raw.to_string())
+            )
+        });
+    }
+
+    let local = rustc_version_key(&toolchain.full_version)?;
+    let worker = rustc_version_key(worker_raw)?;
+    (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
+}
+
+pub(crate) fn required_rustup_component(request: &SelectionRequest) -> Option<&'static str> {
+    let command = request.command.as_deref()?;
+    let classification = classify_command(command);
+    if matches!(classification.kind, Some(CompilationKind::CargoClippy)) {
+        return Some("clippy");
+    }
+
+    // Ordinary `cargo fmt` stays local. The remotely admitted form is the
+    // exact clean-overlay `cargo fmt --check` lane tagged by the hook.
+    if request.project.contains("::clean-overlay::") && direct_cargo_fmt_check(command) {
+        return Some("rustfmt");
+    }
+    None
+}
+
+fn direct_cargo_fmt_check(command: &str) -> bool {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    let Some(cargo_index) = tokens.iter().position(|token| {
+        *token == "cargo"
+            || token
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| name == "cargo")
+    }) else {
+        return false;
+    };
+    let mut subcommand_index = cargo_index + 1;
+    if tokens
+        .get(subcommand_index)
+        .is_some_and(|token| token.starts_with('+'))
+    {
+        subcommand_index += 1;
+    }
+    tokens.get(subcommand_index) == Some(&"fmt")
+        && tokens[subcommand_index + 1..].contains(&"--check")
+}
+
+/// Preserve the command-pin precedence used by component admission (issue #63).
+pub(crate) fn toolchain_from_command_text(
+    command: &str,
+) -> Result<Option<String>, rch_common::UnresolvedCommandToolchain> {
+    rch_common::rustup_toolchain_from_command(command)
+}
+
+/// A command's own pin governs its component requirements before the project
+/// toolchain, including job requests that do not carry project toolchain data.
+pub(crate) fn required_component_toolchain(request: &SelectionRequest) -> Option<String> {
+    match request.command.as_deref().map(toolchain_from_command_text) {
+        Some(Ok(Some(name))) => Some(name),
+        Some(Err(_)) => None,
+        _ => request
+            .toolchain
+            .as_ref()
+            .map(ToolchainInfo::rustup_toolchain),
+    }
+}
+
+/// The first unverified named tool or exact runtime version. Preserve the
+/// diagnostic distinction between a failed probe and an undeclared tool.
+pub(crate) fn required_tool_capability_mismatch(
+    request: &SelectionRequest,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    request.required_tools.iter().find_map(|tool| {
+        if let Some(check) = rch_common::tool_requirement::check_exact_runtime(
+            tool,
+            capabilities.node_version.as_deref(),
+            capabilities.bun_version.as_deref(),
+        ) {
+            return check.err();
+        }
+        (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
+            if capabilities.tools_absent.iter().any(|t| t == tool) {
+                format!("capability_missing:tool:{tool}:probe_failed")
+            } else {
+                format!("capability_missing:tool:{tool}:not_declared")
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn rustup_component_capability_mismatch(
+    request: &SelectionRequest,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    ExecutionRequirements::new(request).component_mismatch(capabilities)
+}
+
+fn is_floating_rust_channel(channel: &str) -> bool {
+    matches!(channel, "stable" | "beta" | "nightly")
+}
+
+fn worker_rustc_matches_channel(worker_raw: &str, channel: &str) -> bool {
+    let Some(worker) = rustc_version_key(worker_raw) else {
+        return false;
+    };
+    match channel {
+        "nightly" => worker.contains("-nightly"),
+        "beta" => worker.contains("-beta"),
+        "stable" => !worker.contains("-nightly") && !worker.contains("-beta"),
+        _ => false,
+    }
+}
+
+fn rustc_version_key(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let first = parts.next()?;
+    let version = if first.eq("rustc") {
+        parts.next()?
+    } else {
+        first
+    };
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
 
 // =========================================================================
 // Configuration
@@ -411,6 +633,33 @@ mod tests {
     use crate::history::BuildHistory;
     use rch_common::{BuildLocation, BuildRecord, WorkerConfig, test_guard};
 
+    #[test]
+    fn component_admission_distinguishes_absent_and_unresolved_command_pins() {
+        for (command, expected) in [
+            ("RUSTUP_TOOLCHAIN=stable cargo +nightly clippy", Some("nightly")),
+            ("env 'RUSTUP_TOOLCHAIN=beta' cargo clippy", Some("beta")),
+            ("cargo clippy -- RUSTUP_TOOLCHAIN=payload", Some("project-pin")),
+            ("cargo +--help clippy", None),
+            ("env RUSTUP_TOOLCHAIN=--help cargo clippy", None),
+            ("env -u RUSTUP_TOOLCHAIN cargo clippy", None),
+            ("env env RUSTUP_TOOLCHAIN=nightly cargo clippy", None),
+            ("timeout 10 cargo +nightly clippy", None),
+        ] {
+            let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+                "project": "command-pin-test",
+                "estimated_cores": 1,
+                "command": command,
+                "toolchain": ToolchainInfo::new("project-pin", None, ""),
+            }))
+            .unwrap();
+            assert_eq!(
+                required_component_toolchain(&request),
+                expected.map(str::to_owned),
+                "{command}"
+            );
+        }
+    }
+
     fn make_assessment(state: PressureState, disk_free_gb: Option<f64>) -> PressureAssessment {
         PressureAssessment {
             state,
@@ -426,6 +675,7 @@ mod tests {
             memory_pressure: None,
             telemetry_age_secs: Some(5),
             telemetry_fresh: true,
+            telemetry_received_at_unix_ms: None,
             evaluated_at_unix_ms: 1000,
         }
     }

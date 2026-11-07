@@ -142,6 +142,8 @@ runpy.run_path(script, run_name='__main__')
 class GitArchiveCacheTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Production prepares every root under this umask, whatever the login's is.
+        cls.addClassCleanup(os.umask, os.umask(0o022))
         cls.retained = Path(tempfile.mkdtemp(prefix="rch-git-archive-cache-tests-"))
         repo = cls.retained / "git-input"
         repo.mkdir()
@@ -589,6 +591,49 @@ class GitArchiveCacheTests(unittest.TestCase):
         parent = self.case / "ungranted parent"
         self.status("BYPASS_UNAVAILABLE", "publish", target=parent / "target")
         self.assertFalse(parent.exists())
+
+    def roots_below(self, mode):
+        parent = self.case / "pool parent"
+        parent.mkdir()
+        parent.chmod(mode)
+        self.source = parent / "source"
+        self.target = parent / "target pool"
+        return parent
+
+    def assert_bypassed_without_creating(self):
+        self.stage()
+        self.status("BYPASS_UNAVAILABLE", "publish")
+        self.status("BYPASS_UNAVAILABLE", "restore")
+        self.assertFalse(self.target.exists())
+
+    def test_sticky_parent_owned_by_this_uid_keeps_the_cache(self):
+        self.roots_below(0o1777)
+        self.stage()
+        self.status("PUBLISHED", "publish")
+        self.source.rename(self.case / "retained previous source")
+        self.status("HIT", "restore")
+        self.assertEqual((self.source / SOURCE_ARCHIVE).read_bytes(), self.archive)
+
+    def test_group_writable_parent_bypasses_instead_of_failing_the_job(self):
+        self.roots_below(0o775)
+        self.assert_bypassed_without_creating()
+
+    def test_world_writable_parent_without_sticky_bypasses_instead_of_failing_the_job(self):
+        self.roots_below(0o777)
+        self.assert_bypassed_without_creating()
+
+    def test_writable_exact_root_is_never_a_cache_location(self):
+        self.stage()
+        self.target.mkdir()
+        for mode in (0o775, 0o1777):
+            self.target.chmod(mode)
+            self.refused("publish")
+            self.assertFalse((self.target / CACHE_DIRECTORY).exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "foreign-owner fixture requires chown authority")
+    def test_parent_owned_by_another_uid_bypasses_instead_of_failing_the_job(self):
+        os.chown(self.roots_below(0o755), 65534, 65534)
+        self.assert_bypassed_without_creating()
 
     @unittest.skipUnless(os.geteuid() == 0, "foreign-owner fixture requires chown authority")
     def test_foreign_owned_cache_or_root_is_not_accepted(self):

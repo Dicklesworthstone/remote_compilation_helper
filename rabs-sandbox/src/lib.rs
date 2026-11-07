@@ -49,6 +49,7 @@ pub mod layout;
 pub mod leak_scanner;
 pub mod loader_directories;
 pub mod metadata_policy;
+pub mod native_archive;
 pub mod network_isolation;
 pub mod observation;
 pub mod path_remap;
@@ -61,6 +62,7 @@ pub mod runtime_path_scanner;
 pub mod snapshot_capture;
 #[cfg(unix)]
 pub mod socket_endpoint;
+pub mod source_cache;
 pub mod source_capture;
 pub mod source_transfer;
 pub mod toolchain_cache;

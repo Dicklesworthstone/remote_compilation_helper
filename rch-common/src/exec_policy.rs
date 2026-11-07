@@ -20,6 +20,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::patterns::classify_command;
 
+/// Stamp the same managed environment onto an RCH-owned worker probe shell.
+/// Exporting covers every command in a compound probe, including rustup's
+/// toolchain child. Never prepend this to a caller's local command before its
+/// placement policy has authorized execution.
+#[must_use]
+pub fn managed_cargo_shell_exports() -> String {
+    crate::MANAGED_CARGO_ENV
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "export {key}={}; ",
+                shell_escape::escape(std::borrow::Cow::Borrowed(*value))
+            )
+        })
+        .collect()
+}
+
 /// What RCH will do with the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +289,26 @@ pub fn unavailable_remote_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_cargo_environment_replaces_inherited_markers_for_each_child() {
+        let script = format!(
+            "{}sh -c 'printf \"%s:%s\\n\" \"$RCH_CARGO_WRAPPER_BYPASS\" \"$RCH_CARGO_WRAPPER_ORIGIN\"'; \
+sh -c 'printf \"%s:%s\\n\" \"$RCH_CARGO_WRAPPER_BYPASS\" \"$RCH_CARGO_WRAPPER_ORIGIN\"'",
+            managed_cargo_shell_exports()
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "0")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"1:rch\n1:rch\n");
+    }
 
     #[test]
     fn cargo_fmt_runs_local_and_is_flagged_mutating() {

@@ -567,6 +567,16 @@ pub enum StoreError {
         /// Digest key of the current holder.
         holder: String,
     },
+    /// Boot cannot repurpose a store previously owned by another cluster,
+    /// including when that cluster's authority was already released.
+    AuthorityClusterMismatch {
+        /// Cluster retained in the authority history.
+        recorded: String,
+        /// Cluster requested by this boot.
+        requested: String,
+    },
+    /// A replacement boot must advance beyond every retained authority term.
+    AuthorityTermNotAboveHighWater,
     /// The presented authority is not the active one.
     NotActiveAuthority,
     /// Generation id at or below the high-water mark (ids are NEVER
@@ -1224,6 +1234,16 @@ pub trait RabsMetadataStore {
     /// The active (unreleased) authority, if any.
     fn active_authority(&mut self) -> Result<Option<AuthorityRow>, StoreError>;
 
+    /// Highest retained coordinator term, including released incarnations.
+    /// An empty store returns zero; mixed or foreign cluster history refuses.
+    fn authority_term_high_water(&mut self, cluster_id: &str) -> Result<u64, StoreError>;
+
+    /// Atomically replace the prior boot authority with a strictly newer term
+    /// belonging to the same historical cluster. The caller must hold the
+    /// store's exclusive process lock; this is not cross-host election or an
+    /// operator-reset bypass. Any refusal leaves the prior authority intact.
+    fn replace_authority_for_boot(&mut self, row: &AuthorityRow) -> Result<(), StoreError>;
+
     /// Insert or update an action entry.
     fn upsert_action_entry(&mut self, row: &ActionEntryRow) -> Result<(), StoreError>;
 
@@ -1418,6 +1438,22 @@ pub trait RabsMetadataStore {
     fn add_location(
         &mut self,
         object: &TypedDigest,
+        store_path: &str,
+        verified_seq: Option<u64>,
+        encoding: &str,
+        durable: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Record an object's metadata and one stored copy in a single
+    /// transaction. A failed write or commit leaves both rows unchanged;
+    /// refreshing a copy preserves its existing quarantine. The caller
+    /// must finish verifying and publishing the bytes, including file and
+    /// directory fsync when `durable` is true, before calling this method.
+    /// This reduces metadata commits without weakening storage durability.
+    fn record_object_location(
+        &mut self,
+        object: &TypedDigest,
+        logical_size: u64,
         store_path: &str,
         verified_seq: Option<u64>,
         encoding: &str,
@@ -2536,6 +2572,70 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         result
     }
 
+    /// Row helpers never open transactions: the public operation owns the
+    /// complete commit and rollback boundary, including compound writes.
+    fn record_object_row(
+        engine: &mut E,
+        id: &TypedDigest,
+        logical_size: i64,
+    ) -> Result<(), StoreError> {
+        let [algo, domain, bytes] = Self::digest_params(id);
+        engine.execute(
+            "INSERT OR REPLACE INTO objects (key, algo, domain, bytes, logical_size) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                SqlValue::Text(digest_key(id)),
+                algo,
+                domain,
+                bytes,
+                SqlValue::Int(logical_size),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn record_location_row(
+        engine: &mut E,
+        object: &TypedDigest,
+        store_path: &str,
+        verified_seq: Option<i64>,
+        encoding: &str,
+        durable: bool,
+    ) -> Result<(), StoreError> {
+        let key = digest_key(object);
+        let path = store_path.to_owned();
+        // Location refreshes carry storage/verification observations, not
+        // permission to release a prior containment decision. Preserve the
+        // flag in the same transaction as the refresh so neither stale
+        // inventories nor duplicate puts can clear it.
+        let existing = engine.query(
+            "SELECT quarantined FROM object_locations WHERE object_key = ?1 AND store_path = ?2",
+            &[SqlValue::Text(key.clone()), SqlValue::Text(path.clone())],
+        )?;
+        let quarantined = if let Some(row) = existing.first() {
+            let [value] = row.as_slice() else {
+                return Err(StoreError::Corruption("location quarantine shape".into()));
+            };
+            expect_u64(value, "quarantined")? != 0
+        } else {
+            false
+        };
+        engine.execute(
+            "INSERT OR REPLACE INTO object_locations \
+             (object_key, store_path, verified_seq, encoding, quarantined, durable) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                SqlValue::Text(key),
+                SqlValue::Text(path),
+                verified_seq.map_or(SqlValue::Null, SqlValue::Int),
+                SqlValue::Text(encoding.to_owned()),
+                SqlValue::Int(i64::from(quarantined)),
+                SqlValue::Int(i64::from(durable)),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn active_authority_key(engine: &mut E) -> Result<Option<String>, StoreError> {
         let rows = engine.query(
             "SELECT key FROM coordinator_authorities WHERE released = 0",
@@ -2551,6 +2651,56 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
                 "more than one active authority".into(),
             )),
         }
+    }
+
+    fn retained_authority_term(engine: &mut E, cluster_id: &str) -> Result<u64, StoreError> {
+        // INTEGER affinity does not exclude REAL values. MIN/MAX alone can
+        // hide a corrupt fractional term between two valid integer endpoints.
+        if !engine
+            .query(
+                "SELECT 1 FROM coordinator_authorities \
+                 WHERE typeof(term) != 'integer' OR term <= 0 LIMIT 1",
+                &[],
+            )?
+            .is_empty()
+        {
+            return Err(StoreError::Corruption(
+                "invalid authority history term".into(),
+            ));
+        }
+        // Keep the returned allocation bounded even if corrupt history names
+        // many clusters. All history counts: a released row is still a fence.
+        let rows = engine.query(
+            "SELECT cluster_id, MIN(term), MAX(term) FROM coordinator_authorities \
+             GROUP BY cluster_id LIMIT 2",
+            &[],
+        )?;
+        let row = match rows.as_slice() {
+            [] => return Ok(0),
+            [row] => row,
+            _ => {
+                return Err(StoreError::Corruption(
+                    "more than one recorded coordinator cluster".into(),
+                ));
+            }
+        };
+        let [SqlValue::Text(recorded), minimum, maximum] = row.as_slice() else {
+            return Err(StoreError::Corruption("authority history shape".into()));
+        };
+        if recorded != cluster_id {
+            return Err(StoreError::AuthorityClusterMismatch {
+                recorded: recorded.clone(),
+                requested: cluster_id.to_owned(),
+            });
+        }
+        let minimum = expect_u64(minimum, "minimum authority term")?;
+        let maximum = expect_u64(maximum, "maximum authority term")?;
+        if minimum == 0 || minimum > maximum {
+            return Err(StoreError::Corruption(
+                "authority term history range".into(),
+            ));
+        }
+        Ok(maximum)
     }
 
     fn require_active(engine: &mut E, authority: &TypedDigest) -> Result<(), StoreError> {
@@ -3232,6 +3382,53 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             term: expect_u64(term, "term")?,
             acquired_seq: expect_u64(acquired, "acquired_seq")?,
         }))
+    }
+
+    fn authority_term_high_water(&mut self, cluster_id: &str) -> Result<u64, StoreError> {
+        Self::retained_authority_term(&mut self.engine, cluster_id)
+    }
+
+    fn replace_authority_for_boot(&mut self, row: &AuthorityRow) -> Result<(), StoreError> {
+        // Preserve the active row's ordinary shape/domain checks before any
+        // replacement. The transaction rechecks slot cardinality and history.
+        self.active_authority()?;
+        self.intern(row.digest.domain);
+        let key = digest_key(&row.digest);
+        let [algo, domain, bytes] = Self::digest_params(&row.digest);
+        let term = to_seq(row.term, "authority term")?;
+        let acquired = to_seq(row.acquired_seq, "authority acquired_seq")?;
+        let cluster = row.cluster_id.clone();
+        let incarnation = u128_blob(row.incarnation);
+        self.in_txn(move |engine| {
+            let prior = Self::active_authority_key(engine)?;
+            if row.term <= Self::retained_authority_term(engine, &cluster)? {
+                return Err(StoreError::AuthorityTermNotAboveHighWater);
+            }
+            if let Some(prior) = prior {
+                engine.execute(
+                    "UPDATE coordinator_authorities SET released = 1 WHERE key = ?1",
+                    &[SqlValue::Text(prior)],
+                )?;
+            }
+            // Never overwrite history, even if a caller reuses a digest. An
+            // insertion or commit failure rolls back the prior release too.
+            engine.execute(
+                "INSERT INTO coordinator_authorities \
+                 (key, algo, domain, bytes, cluster_id, incarnation, term, acquired_seq, released) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                &[
+                    SqlValue::Text(key),
+                    algo,
+                    domain,
+                    bytes,
+                    SqlValue::Text(cluster),
+                    SqlValue::Blob(incarnation),
+                    SqlValue::Int(term),
+                    SqlValue::Int(acquired),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn upsert_action_entry(&mut self, row: &ActionEntryRow) -> Result<(), StoreError> {
@@ -3971,24 +4168,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
 
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError> {
         self.intern(id.domain);
-        let key = digest_key(id);
-        let [algo, domain, bytes] = SqlMetadataStore::<E>::digest_params(id);
-        let size = i64::try_from(logical_size)
-            .map_err(|_| StoreError::Corruption("logical_size out of range".into()))?;
-        self.in_txn(move |engine| {
-            engine.execute(
-                "INSERT OR REPLACE INTO objects (key, algo, domain, bytes, logical_size) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                &[
-                    SqlValue::Text(key),
-                    algo,
-                    domain,
-                    bytes,
-                    SqlValue::Int(size),
-                ],
-            )?;
-            Ok(())
-        })
+        let size = to_seq(logical_size, "logical_size")?;
+        self.in_txn(|engine| Self::record_object_row(engine, id, size))
     }
 
     fn add_location(
@@ -3999,48 +4180,31 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         encoding: &str,
         durable: bool,
     ) -> Result<(), StoreError> {
-        let key = digest_key(object);
-        let path = store_path.to_owned();
-        let encoding = encoding.to_owned();
-        let verified = match verified_seq {
-            None => SqlValue::Null,
-            Some(v) => SqlValue::Int(
-                i64::try_from(v)
-                    .map_err(|_| StoreError::Corruption("verified_seq out of range".into()))?,
-            ),
-        };
-        self.in_txn(move |engine| {
-            // Location refreshes carry storage/verification observations,
-            // not permission to release a prior containment decision. In
-            // particular, pack reindexing never re-reads the member bytes.
-            // Preserve the flag in the same transaction as the refresh so
-            // neither stale inventories nor duplicate puts can clear it.
-            let existing = engine.query(
-                "SELECT quarantined FROM object_locations WHERE object_key = ?1 AND store_path = ?2",
-                &[SqlValue::Text(key.clone()), SqlValue::Text(path.clone())],
-            )?;
-            let quarantined = if let Some(row) = existing.first() {
-                let [value] = row.as_slice() else {
-                    return Err(StoreError::Corruption("location quarantine shape".into()));
-                };
-                expect_u64(value, "quarantined")? != 0
-            } else {
-                false
-            };
-            engine.execute(
-                "INSERT OR REPLACE INTO object_locations \
-                 (object_key, store_path, verified_seq, encoding, quarantined, durable) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                &[
-                    SqlValue::Text(key),
-                    SqlValue::Text(path),
-                    verified,
-                    SqlValue::Text(encoding),
-                    SqlValue::Int(i64::from(quarantined)),
-                    SqlValue::Int(i64::from(durable)),
-                ],
-            )?;
-            Ok(())
+        let verified = verified_seq
+            .map(|seq| to_seq(seq, "verified_seq"))
+            .transpose()?;
+        self.in_txn(|engine| {
+            Self::record_location_row(engine, object, store_path, verified, encoding, durable)
+        })
+    }
+
+    fn record_object_location(
+        &mut self,
+        object: &TypedDigest,
+        logical_size: u64,
+        store_path: &str,
+        verified_seq: Option<u64>,
+        encoding: &str,
+        durable: bool,
+    ) -> Result<(), StoreError> {
+        self.intern(object.domain);
+        let size = to_seq(logical_size, "logical_size")?;
+        let verified = verified_seq
+            .map(|seq| to_seq(seq, "verified_seq"))
+            .transpose()?;
+        self.in_txn(|engine| {
+            Self::record_object_row(engine, object, size)?;
+            Self::record_location_row(engine, object, store_path, verified, encoding, durable)
         })
     }
 
@@ -7696,11 +7860,22 @@ pub struct RusqliteEngine {
 }
 
 impl RusqliteEngine {
-    /// Open (or create) a database file.
+    /// Open (or create) a database file with a write-ahead log and
+    /// `synchronous=FULL`. Durability is unchanged from the rollback journal
+    /// (a commit returns only after the WAL is fsynced), but one fsync
+    /// replaces the journal's create, two journal fsyncs, database fsync,
+    /// unlink and directory fsync. The live lane commits tens of transactions
+    /// per executed compile, so that cycle dominated its per-action cost.
+    /// A database that cannot switch (another connection holds it, or the
+    /// filesystem lacks shared memory) keeps its existing crash-safe journal.
     pub fn open(path: &std::path::Path) -> Result<Self, StoreError> {
-        rusqlite::Connection::open(path)
-            .map(|conn| Self { conn })
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        let backend = |e: rusqlite::Error| StoreError::Backend(e.to_string());
+        let conn = rusqlite::Connection::open(path).map_err(backend)?;
+        // The pragma answers the resulting mode; a refusal is not an error.
+        let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0));
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(backend)?;
+        Ok(Self { conn })
     }
 
     /// Open an in-memory database.
@@ -8984,6 +9159,175 @@ mod tests {
         );
     }
 
+    fn boot_authority_recovery<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        let path = fresh_path(tag);
+        {
+            let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+            assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 0);
+            store.replace_authority_for_boot(&authority(7)).unwrap();
+            // This is the durable state left by the old boot path if it died
+            // after releasing its predecessor but before acquiring a new term.
+            store.release_authority(&authority(7).digest).unwrap();
+        }
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        store.intern_domain("rabs.authority.sha256.v1");
+        assert!(store.active_authority().unwrap().is_none());
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 7);
+        assert_eq!(
+            store.replace_authority_for_boot(&authority(1)),
+            Err(StoreError::AuthorityTermNotAboveHighWater)
+        );
+        let mut foreign = authority(8);
+        foreign.cluster_id = "cluster-b".into();
+        assert_eq!(
+            store.replace_authority_for_boot(&foreign),
+            Err(StoreError::AuthorityClusterMismatch {
+                recorded: "cluster-a".into(),
+                requested: "cluster-b".into(),
+            })
+        );
+        assert!(store.active_authority().unwrap().is_none());
+        // Recover an already-reset legacy active term too: active state is
+        // not a substitute for the higher term retained in released history.
+        store.acquire_authority(&authority(1)).unwrap();
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 7);
+        store.replace_authority_for_boot(&authority(8)).unwrap();
+        let before = store.differential_snapshot().unwrap();
+
+        // A real uniqueness failure happens AFTER the old authority is marked
+        // released. The database transaction must restore that ownership.
+        let mut duplicate_digest = authority(9);
+        duplicate_digest.digest = authority(7).digest;
+        assert!(matches!(
+            store.replace_authority_for_boot(&duplicate_digest),
+            Err(StoreError::Backend(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(authority(8)));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+
+        let mut out_of_range = authority(9);
+        out_of_range.term = i64::MAX as u64 + 1;
+        assert!(matches!(
+            store.replace_authority_for_boot(&out_of_range),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        out_of_range.term = 9;
+        out_of_range.acquired_seq = i64::MAX as u64 + 1;
+        assert!(matches!(
+            store.replace_authority_for_boot(&out_of_range),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        drop(store);
+
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        store.intern_domain("rabs.authority.sha256.v1");
+        assert_eq!(store.active_authority().unwrap(), Some(authority(8)));
+        assert_eq!(store.authority_term_high_water("cluster-a").unwrap(), 8);
+        store.replace_authority_for_boot(&authority(9)).unwrap();
+        assert_eq!(store.active_authority().unwrap(), Some(authority(9)));
+
+        // Previously released history cannot silently change cluster even
+        // when an older acquisition path left a different active cluster.
+        store.release_authority(&authority(9).digest).unwrap();
+        foreign.term = 10;
+        store.acquire_authority(&foreign).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        let mut requested = authority(11);
+        requested.cluster_id = "cluster-b".into();
+        assert!(matches!(
+            store.replace_authority_for_boot(&requested),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(foreign));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn boot_authority_recovery_reference() {
+        boot_authority_recovery(RusqliteEngine::open, "boot-authority-reference");
+    }
+
+    #[test]
+    fn boot_authority_recovery_frankensqlite() {
+        boot_authority_recovery(FsqliteEngine::open, "boot-authority-frankensqlite");
+    }
+
+    fn boot_authority_corrupt_history<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        for malformed in [
+            SqlValue::Int(-1),
+            SqlValue::Int(0),
+            SqlValue::Text("bad".into()),
+        ] {
+            let mut store = SqlMetadataStore::open(open(&fresh_path(tag)).unwrap()).unwrap();
+            let old = authority(1);
+            store.acquire_authority(&old).unwrap();
+            store.release_authority(&old.digest).unwrap();
+            store.acquire_authority(&authority(2)).unwrap();
+            store
+                .engine_mut()
+                .execute(
+                    "UPDATE coordinator_authorities SET term = ?1 WHERE key = ?2",
+                    &[malformed, SqlValue::Text(digest_key(&old.digest))],
+                )
+                .unwrap();
+            let before = store.differential_snapshot().unwrap();
+            assert!(matches!(
+                store.replace_authority_for_boot(&authority(3)),
+                Err(StoreError::Corruption(_))
+            ));
+            assert_eq!(store.active_authority().unwrap(), Some(authority(2)));
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
+
+        let mut store = SqlMetadataStore::open(open(&fresh_path(tag)).unwrap()).unwrap();
+        for tag in 1..=3 {
+            if tag > 1 {
+                store.release_authority(&authority(tag - 1).digest).unwrap();
+            }
+            store.acquire_authority(&authority(tag)).unwrap();
+        }
+        // Real SQLite accepts this fractional value in the INTEGER-affinity
+        // column. Both aggregate extrema remain valid integers (1 and 3).
+        store
+            .engine_mut()
+            .execute(
+                "UPDATE coordinator_authorities SET term = 1.5 WHERE key = ?1",
+                &[SqlValue::Text(digest_key(&authority(2).digest))],
+            )
+            .unwrap();
+        let history = "SELECT key, typeof(term), CAST(term AS TEXT), released \
+                       FROM coordinator_authorities ORDER BY key";
+        let before = store.query(history, &[]).unwrap();
+        assert!(matches!(
+            store.authority_term_high_water("cluster-a"),
+            Err(StoreError::Corruption(_))
+        ));
+        assert!(matches!(
+            store.replace_authority_for_boot(&authority(4)),
+            Err(StoreError::Corruption(_))
+        ));
+        assert_eq!(store.active_authority().unwrap(), Some(authority(3)));
+        assert_eq!(store.query(history, &[]).unwrap(), before);
+    }
+
+    #[test]
+    fn boot_authority_corrupt_history_reference() {
+        boot_authority_corrupt_history(RusqliteEngine::open, "boot-authority-corrupt-reference");
+    }
+
+    #[test]
+    fn boot_authority_corrupt_history_frankensqlite() {
+        boot_authority_corrupt_history(FsqliteEngine::open, "boot-authority-corrupt-frankensqlite");
+    }
+
     fn allocation_behavior<E: SqlEngine>(store: &mut SqlMetadataStore<E>) {
         let active = authority(1);
         let action = digest("rabs.action-key.sha256.v1", 7);
@@ -9968,6 +10312,396 @@ mod tests {
 }
 
 #[cfg(test)]
+mod object_location_tests {
+    use super::*;
+    use crate::blob_store::{
+        BlobStoreLayout, DurabilityPolicy, PutError, PutLimits, PutOutcome, put_if_absent,
+    };
+    use crate::digest_set::{DigestRequest, digest_set};
+    use std::time::Duration;
+
+    struct CountedEngine<E> {
+        inner: E,
+        begins: usize,
+        commits: usize,
+    }
+
+    impl<E> CountedEngine<E> {
+        fn new(inner: E) -> Self {
+            Self {
+                inner,
+                begins: 0,
+                commits: 0,
+            }
+        }
+
+        fn reset_counts(&mut self) {
+            self.begins = 0;
+            self.commits = 0;
+        }
+    }
+
+    impl<E: SqlEngine> SqlEngine for CountedEngine<E> {
+        fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+            match sql {
+                "BEGIN" => self.begins += 1,
+                "COMMIT" => self.commits += 1,
+                _ => {}
+            }
+            self.inner.execute(sql, params)
+        }
+
+        fn query(
+            &mut self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+            self.inner.query(sql, params)
+        }
+    }
+
+    fn object() -> TypedDigest {
+        TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN,
+            bytes: [42; 32],
+        }
+    }
+
+    fn snapshot(store: &mut dyn RabsMetadataStore) -> [Vec<Vec<SqlValue>>; 2] {
+        [
+            store
+                .query(
+                    "SELECT key, algo, domain, bytes, logical_size FROM objects ORDER BY key",
+                    &[],
+                )
+                .unwrap(),
+            store
+                .query(
+                    "SELECT object_key, store_path, verified_seq, encoding, quarantined, durable \
+                     FROM object_locations ORDER BY object_key, store_path",
+                    &[],
+                )
+                .unwrap(),
+        ]
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        SqlMetadataStore<CountedEngine<RusqliteEngine>>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap();
+        let mut store = SqlMetadataStore::open(CountedEngine::new(engine)).unwrap();
+        store.engine.reset_counts();
+        (directory, store)
+    }
+
+    fn atomic_record_reopen<E: SqlEngine>(open: fn(&std::path::Path) -> Result<E, StoreError>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meta.sqlite");
+        let mut store = SqlMetadataStore::open(CountedEngine::new(open(&path).unwrap())).unwrap();
+        let id = object();
+        store.engine.reset_counts();
+        store.record_object(&id, 64).unwrap();
+        store
+            .add_location(&id, "/cas/object", Some(7), "raw-v1", true)
+            .unwrap();
+        assert_eq!((store.engine.begins, store.engine.commits), (2, 2));
+        let split = snapshot(&mut store);
+
+        store.engine.reset_counts();
+        store
+            .record_object_location(&id, 64, "/cas/object", Some(7), "raw-v1", true)
+            .unwrap();
+        assert_eq!((store.engine.begins, store.engine.commits), (1, 1));
+        assert_eq!(snapshot(&mut store), split);
+        assert!(store.object_durably_located(&id).unwrap());
+
+        // A verified duplicate still cannot clear an incident quarantine,
+        // and a caller's weaker durability claim must not be promoted.
+        store
+            .set_location_quarantined(&id, "/cas/object", true)
+            .unwrap();
+        store
+            .record_object_location(&id, 64, "/cas/object", None, "raw-v1", false)
+            .unwrap();
+        assert!(!store.object_located(&id).unwrap());
+        let quarantined = snapshot(&mut store);
+        drop(store);
+        let mut reopened = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        assert_eq!(snapshot(&mut reopened), quarantined);
+        reopened
+            .set_location_quarantined(&id, "/cas/object", false)
+            .unwrap();
+        assert_eq!(
+            reopened.object_locations(&id).unwrap(),
+            vec![("/cas/object".into(), "raw-v1".into(), false)]
+        );
+        assert!(!reopened.object_durably_located(&id).unwrap());
+        reopened
+            .record_object_location(&id, 64, "/cas/replica", Some(8), "raw-v1", true)
+            .unwrap();
+        assert!(reopened.object_durably_located(&id).unwrap());
+    }
+
+    #[test]
+    fn atomic_record_matches_split_metadata_with_one_commit_reference() {
+        atomic_record_reopen(RusqliteEngine::open);
+    }
+
+    #[test]
+    fn atomic_record_matches_split_metadata_with_one_commit_frankensqlite() {
+        atomic_record_reopen(FsqliteEngine::open);
+    }
+
+    #[test]
+    fn location_failure_rolls_back_new_and_existing_objects_and_reopens_cleanly() {
+        for existing in [false, true] {
+            let (directory, mut store) = fixture();
+            let id = object();
+            if existing {
+                store
+                    .record_object_location(&id, 64, "/cas/object", Some(7), "raw-v1", false)
+                    .unwrap();
+                store
+                    .set_location_quarantined(&id, "/cas/object", true)
+                    .unwrap();
+            }
+            let before = snapshot(&mut store);
+            store
+                .engine
+                .execute(
+                    "CREATE TRIGGER refuse_location BEFORE INSERT ON object_locations \
+                 BEGIN SELECT RAISE(ABORT, 'location fault'); END",
+                    &[],
+                )
+                .unwrap();
+            store.engine.reset_counts();
+            let error = store
+                .record_object_location(&id, 128, "/cas/object", Some(8), "raw-v1", true)
+                .unwrap_err();
+            assert!(
+                matches!(error, StoreError::Backend(ref detail) if detail.contains("location fault"))
+            );
+            assert_eq!((store.engine.begins, store.engine.commits), (1, 0));
+            assert!(store.engine.inner.conn.is_autocommit());
+            assert_eq!(snapshot(&mut store), before);
+            drop(store);
+
+            let mut reopened = SqlMetadataStore::open(
+                RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot(&mut reopened), before);
+            reopened
+                .engine
+                .execute("DROP TRIGGER refuse_location", &[])
+                .unwrap();
+            reopened
+                .record_object_location(&id, 64, "/cas/object", Some(9), "raw-v1", true)
+                .unwrap();
+            assert_eq!(reopened.object_durably_located(&id).unwrap(), !existing);
+        }
+    }
+
+    #[test]
+    fn busy_atomic_commit_rolls_back_both_rows_and_same_connection_can_retry() {
+        let (directory, mut store) = fixture();
+        // Force a real failed COMMIT using SQLite's supported rollback
+        // journal. This is a test-only fault; production remains WAL/FULL.
+        store
+            .engine
+            .inner
+            .conn
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        store
+            .engine
+            .inner
+            .conn
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            directory.path().join("meta.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM objects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let before = snapshot(&mut store);
+        let error = store
+            .record_object_location(&object(), 64, "/cas/object", None, "raw-v1", true)
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Backend(ref detail) if detail.contains("locked") || detail.contains("busy"))
+        );
+        assert_eq!((store.engine.begins, store.engine.commits), (1, 1));
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_eq!(snapshot(&mut store), before);
+        reader.execute_batch("ROLLBACK").unwrap();
+
+        store.engine.reset_counts();
+        store
+            .record_object_location(&object(), 64, "/cas/object", None, "raw-v1", true)
+            .unwrap();
+        assert_eq!((store.engine.begins, store.engine.commits), (1, 1));
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert!(store.object_durably_located(&object()).unwrap());
+    }
+
+    #[test]
+    fn invalid_object_or_location_ranges_do_not_begin_a_transaction() {
+        let (_directory, mut store) = fixture();
+        for (size, verified) in [(u64::MAX, None), (64, Some(u64::MAX))] {
+            assert!(matches!(
+                store.record_object_location(
+                    &object(),
+                    size,
+                    "/cas/object",
+                    verified,
+                    "raw-v1",
+                    true
+                ),
+                Err(StoreError::Corruption(_))
+            ));
+            assert_eq!((store.engine.begins, store.engine.commits), (0, 0));
+            assert_eq!(
+                snapshot(&mut store),
+                [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+            );
+        }
+    }
+
+    #[test]
+    fn full_blob_put_and_verified_duplicate_each_commit_metadata_once() {
+        let (directory, mut store) = fixture();
+        let layout = BlobStoreLayout::open(&directory.path().join("cas")).unwrap();
+        let bytes = b"complete durable bytes before atomic metadata";
+        let id = digest_set(bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        for duplicate in [false, true] {
+            store.engine.reset_counts();
+            let outcome = put_if_absent(
+                &layout,
+                &mut store,
+                &id,
+                &mut bytes.as_slice(),
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            let path = match outcome {
+                PutOutcome::Stored { path } => {
+                    assert!(!duplicate);
+                    path
+                }
+                PutOutcome::IdempotentDuplicate { path } => {
+                    assert!(duplicate);
+                    path
+                }
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!((store.engine.begins, store.engine.commits), (1, 1));
+            assert!(store.object_durably_located(&id).unwrap());
+            assert_eq!(
+                store.object_locations(&id).unwrap(),
+                vec![(path, "raw-v1".into(), true)]
+            );
+        }
+        assert_eq!(
+            store.query("PRAGMA journal_mode", &[]).unwrap(),
+            vec![vec![SqlValue::Text("wal".into())]]
+        );
+        assert_eq!(
+            store.query("PRAGMA synchronous", &[]).unwrap(),
+            vec![vec![SqlValue::Int(2)]]
+        );
+        let before = snapshot(&mut store);
+        drop(store);
+        let mut reopened = SqlMetadataStore::open(
+            RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot(&mut reopened), before);
+        assert!(reopened.object_durably_located(&id).unwrap());
+    }
+
+    #[test]
+    fn blob_location_failure_keeps_complete_bytes_and_duplicate_repairs_metadata() {
+        let (directory, mut store) = fixture();
+        let layout = BlobStoreLayout::open(&directory.path().join("cas")).unwrap();
+        let bytes = b"durable publication survives a failed metadata transaction";
+        let id = digest_set(bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let path = layout.published_path(&id, "raw-v1", &id);
+        store
+            .engine
+            .execute(
+                "CREATE TRIGGER refuse_location BEFORE INSERT ON object_locations \
+             BEGIN SELECT RAISE(ABORT, 'location fault'); END",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            put_if_absent(
+                &layout,
+                &mut store,
+                &id,
+                &mut bytes.as_slice(),
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::Store(StoreError::Backend(ref detail))) if detail.contains("location fault")
+        ));
+        assert!(store.engine.inner.conn.is_autocommit());
+        assert_eq!(
+            snapshot(&mut store),
+            [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(store);
+
+        let engine = RusqliteEngine::open(&directory.path().join("meta.sqlite")).unwrap();
+        let mut reopened = SqlMetadataStore::open(CountedEngine::new(engine)).unwrap();
+        assert_eq!(
+            snapshot(&mut reopened),
+            [Vec::<Vec<SqlValue>>::new(), Vec::new()]
+        );
+        reopened
+            .engine
+            .execute("DROP TRIGGER refuse_location", &[])
+            .unwrap();
+        reopened.engine.reset_counts();
+        assert_eq!(
+            put_if_absent(
+                &layout,
+                &mut reopened,
+                &id,
+                &mut bytes.as_slice(),
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap(),
+            PutOutcome::IdempotentDuplicate {
+                path: path.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!((reopened.engine.begins, reopened.engine.commits), (1, 1));
+        assert!(reopened.object_durably_located(&id).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
 mod action_key_provenance_tests {
     use super::*;
     use crate::action_inspection::inspect_action;
@@ -10525,6 +11259,51 @@ mod action_key_provenance_tests {
                 .unwrap();
             assert_visible_components(&directory, &descriptor);
         }
+    }
+
+    #[test]
+    fn file_stores_use_a_durable_write_ahead_log_readable_by_read_only_inspectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meta.sqlite");
+        let read_only = || {
+            let reader = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            reader
+                .query_row("SELECT v FROM wal_probe", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+            assert_eq!(
+                store.query("PRAGMA journal_mode", &[]).unwrap(),
+                vec![vec![SqlValue::Text("wal".into())]]
+            );
+            // FULL: every commit is fsynced before it returns, as before.
+            assert_eq!(
+                store.query("PRAGMA synchronous", &[]).unwrap(),
+                vec![vec![SqlValue::Int(2)]]
+            );
+            store
+                .engine
+                .execute("CREATE TABLE wal_probe (v INTEGER)", &[])
+                .unwrap();
+            store
+                .engine
+                .execute("INSERT INTO wal_probe VALUES (7)", &[])
+                .unwrap();
+            // Inspectors (`rch why`) read committed state while it is open...
+            assert_eq!(read_only(), 7);
+        }
+        // ...after it closed cleanly, and a reopen keeps the journal mode.
+        assert_eq!(read_only(), 7);
+        let mut reopened = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            reopened.query("PRAGMA journal_mode", &[]).unwrap(),
+            vec![vec![SqlValue::Text("wal".into())]]
+        );
     }
 
     #[test]

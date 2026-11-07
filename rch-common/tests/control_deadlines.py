@@ -495,8 +495,15 @@ exec "$@"
         self.handles.append(worker)
         return child, record, leader, worker
 
-    def recover(self, group, fault="none", mode="kill", extra="", body=None):
+    def recover(self, group, fault="none", mode="kill", extra="", body=None,
+                enclosing_seconds=None):
         _, record, _, _ = group
+        if enclosing_seconds is not None:
+            # Persistent faults consume an explicit enclosing deadline. Keep
+            # native process/signal/lock assertions bounded without relying
+            # on the former fixed number of unavailable census attempts.
+            extra += ("\nrch_observation_clock_checked || exit 99\n"
+                      f"rch_observation_deadline=$((rch_observation_now + {enclosing_seconds * 100}))\n")
         before = (record.lstat().st_ino, record.read_bytes())
         command = body or 'rch_remote_cancel "$1" 41 "$2"'
         result = subprocess.run([SHELL, "-c", PROTOCOL + "\n" + self.observe + extra
@@ -561,6 +568,7 @@ exec "$@"
         # Advance only the monotonic budget after the genuine authenticated
         # KILL. The process, receipt and failed census remain native. No time
         # limit may turn missing death evidence into a completion receipt.
+        # KILL precedes the first census, so an elapsed budget admits none.
         clock = '''
 rch_observation_clock() {
     if [ -f "$RCH_CENSUS_ROOT/signals" ]; then
@@ -572,7 +580,7 @@ rch_observation_clock() {
 '''
         result = self.recover(group, "persistent", extra=clock)
         self.assertEqual(result.returncode, 44, result.stderr)
-        self.assertEqual(int(self.count.read_text()), 1)
+        self.assertEqual(int(self.count.read_text()), 0)
         self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
         self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)
@@ -607,7 +615,7 @@ rch_observation_clock() {
 '''
                 result = self.recover(group, "persistent", extra=clock)
                 self.assertEqual(result.returncode, 44, result.stderr)
-                self.assertEqual(int(self.count.read_text()), 1)
+                self.assertEqual(int(self.count.read_text()), 0)
                 self.assertEqual(self.signals(), [f"-KILL -{group[0].pid}"])
                 self.assert_stopped(group)
                 self.assertEqual(self.recover(group).returncode, 0)
@@ -620,20 +628,31 @@ rch_observation_clock() {
 
     def test_persistent_census_failure_stops_work_but_cannot_confirm_cleanup(self):
         group = self.group()
-        result = self.recover(group, "persistent")
+        result = self.recover(group, "persistent", enclosing_seconds=5)
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         # Only a later genuine census establishes the release postcondition.
         self.assertEqual(self.recover(group).returncode, 0)
 
     def test_failed_selected_thread_pass_cannot_confirm_cleanup(self):
-        group = self.group()
-        result = self.recover(group, "thread-pass")
-        self.assertTrue((self.root / "thread-pass-failed").exists(),
-                        "fixture must reach the selected live-thread census")
-        self.assertEqual(result.returncode, 44, result.stderr)
-        self.assert_stopped(group)
-        self.assertEqual(self.recover(group).returncode, 0)
+        # The selected pass needs live threads. KILL now precedes the census,
+        # so deliver it late to keep them running while that census looks.
+        late_kill = """
+kill() {
+    printf '%s\\n' "$*" >> "$RCH_CENSUS_ROOT/signals"
+    (sleep 0.5; command kill "$@") >/dev/null 2>&1 &
+}
+"""
+        for mode, extra in (("kill", late_kill), ("term", "")):
+            with self.subTest(mode=mode):
+                group = self.group()
+                (self.root / "thread-pass-failed").unlink(missing_ok=True)
+                result = self.recover(group, "thread-pass", mode, extra, enclosing_seconds=5)
+                self.assertTrue((self.root / "thread-pass-failed").exists(),
+                                "fixture must reach the selected live-thread census")
+                self.assertEqual(result.returncode, 44, result.stderr)
+                self.assert_stopped(group)
+                self.assertEqual(self.recover(group).returncode, 0)
 
     def test_census_failure_after_term_keeps_this_calls_live_escalation_witness(self):
         group = self.group()
@@ -645,7 +664,7 @@ rch_observation_clock() {
 
     def test_persistent_failure_after_term_still_escalates_without_claiming_completion(self):
         group = self.group()
-        result = self.recover(group, "persistent-after-term", "term")
+        result = self.recover(group, "persistent-after-term", "term", enclosing_seconds=5)
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)

@@ -28,6 +28,7 @@ fn reader(stream: UnixStream) -> BufReader<ConsultStream> {
     BufReader::new(ConsultStream {
         stream,
         deadline: Instant::now() + Duration::from_secs(2),
+        panic_fence: PanicFence::default(),
     })
 }
 

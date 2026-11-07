@@ -29,15 +29,24 @@
 //! hundreds of GB of `.rch-target-*-pool-*` and `rch-cargo-cache-*` sat on disk
 //! (~700 GB fleet-wide before the 2026-09 sweep).
 //!
-//! [`derive_gc_roots`] is now the only place a root set is constructed. It
-//! folds the config-derived roots, any operator-configured extra roots
+//! This module constructs the platform-specific root sets. [`derive_gc_roots`]
+//! folds the POSIX config-derived roots, any operator-configured extra roots
 //! (`[remediation.pooled_target] gc_extra_roots`) and any `--root` flags into
 //! one validated, de-duplicated, order-stable list, and it always reports the
 //! worker temp base as a first-class root so `rch gc` output names every place
 //! it looked.
+//!
+//! [`derive_windows_gc_roots`] instead starts from the Windows tar transport's
+//! drive-letter base. Windows inventory reports native process/handle exclusion
+//! as unavailable and cannot authorize collection.
 
 use crate::remediation_config::PooledTargetConfig;
 use crate::stale_target_reap::is_safe_reap_base;
+
+/// The build base used by the Windows tar transport. Keep discovery and
+/// creation tied to one constant: the dispatcher's POSIX configuration does
+/// not describe the Windows worker's drive layout.
+pub const WINDOWS_REMOTE_BASE: &str = "C:/rch";
 
 // These pure path constants and shell builders must remain platform-neutral:
 // shared GC classification uses them even on a native Windows worker, where
@@ -123,6 +132,8 @@ pub fn remote_cargo_cache_expr(worker: &str) -> String {
 /// `rch gc` output can tell a default from something they configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GcRootSource {
+    /// The Windows tar transport's native drive-letter build base.
+    WindowsRemoteBase,
     /// `[remediation.pooled_target] remote_base` — the project mirror.
     PooledRemoteBase,
     /// `[remediation.pooled_target] store_base` — a relocated pooled store.
@@ -141,6 +152,7 @@ impl GcRootSource {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::WindowsRemoteBase => "windows_remote_base",
             Self::PooledRemoteBase => "pooled_remote_base",
             Self::PooledStoreBase => "pooled_store_base",
             Self::ConfiguredExtra => "configured_extra",
@@ -153,6 +165,7 @@ impl GcRootSource {
     #[must_use]
     pub const fn origin_hint(self) -> &'static str {
         match self {
+            Self::WindowsRemoteBase => "Windows transfer base",
             Self::PooledRemoteBase => "[remediation.pooled_target] remote_base",
             Self::PooledStoreBase => "[remediation.pooled_target] store_base",
             Self::ConfiguredExtra => "[remediation.pooled_target] gc_extra_roots",
@@ -357,12 +370,122 @@ pub fn derive_gc_roots(pooled: &PooledTargetConfig, cli_roots: &[String]) -> GcR
     GcRootSet { roots, rejected }
 }
 
+/// Validate a Windows inventory root before embedding it in a quoted Git-sh
+/// command. This is deliberately separate from deletion's POSIX predicates:
+/// accepting a drive path for inventory must not grant collection authority.
+#[must_use]
+pub fn is_safe_windows_gc_base(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1..3] == *b":/"
+        && path.len() <= 4096
+        && path[3..].split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ' '))
+        })
+}
+
+/// Windows builds use the tar transport's drive-letter base, never the
+/// dispatcher's `/data/projects`. Explicit additional roots are still
+/// platform-checked and reported. The worker temp base is resolved remotely by
+/// the same prelude used when creating Cargo caches.
+#[must_use]
+pub fn derive_windows_gc_roots(pooled: &PooledTargetConfig, cli_roots: &[String]) -> GcRootSet {
+    let mut set = GcRootSet {
+        roots: vec![GcRoot {
+            path: WINDOWS_REMOTE_BASE.to_string(),
+            source: GcRootSource::WindowsRemoteBase,
+        }],
+        rejected: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::from([WINDOWS_REMOTE_BASE.to_ascii_lowercase()]);
+    for (raw, source) in pooled
+        .store_base
+        .iter()
+        .map(|path| (path, GcRootSource::PooledStoreBase))
+        .chain(
+            pooled
+                .gc_extra_roots
+                .iter()
+                .map(|path| (path, GcRootSource::ConfiguredExtra)),
+        )
+        .chain(
+            cli_roots
+                .iter()
+                .map(|path| (path, GcRootSource::CommandLine)),
+        )
+    {
+        let path = normalize(&raw.replace('\\', "/"));
+        if !is_safe_windows_gc_base(&path) {
+            set.rejected.push(GcRootRejection {
+                path: raw.clone(),
+                source,
+                reason: "Windows inventory requires a drive-letter absolute directory below the drive root, without traversal or shell metacharacters".to_string(),
+            });
+        } else if seen.insert(path.to_ascii_lowercase()) {
+            set.roots.push(GcRoot { path, source });
+        }
+    }
+    set.roots.push(GcRoot {
+        path: WORKER_TEMP_BASE_PLACEHOLDER.to_string(),
+        source: GcRootSource::WorkerTempBase,
+    });
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg() -> PooledTargetConfig {
         PooledTargetConfig::default()
+    }
+
+    #[test]
+    fn windows_roots_follow_the_transfer_base_and_preserve_explicit_drives() {
+        let mut config = cfg();
+        config.store_base = Some("D:\\warm pools".into());
+        config.gc_extra_roots = vec!["c:/RCH/".into(), "/data/projects".into()];
+        let roots = derive_windows_gc_roots(&config, &["E:/build-cache".into()]);
+        assert_eq!(
+            roots.scan_bases(),
+            vec![WINDOWS_REMOTE_BASE, "D:/warm pools", "E:/build-cache"]
+        );
+        assert_eq!(roots.roots[0].source, GcRootSource::WindowsRemoteBase);
+        assert_eq!(roots.rejected.len(), 1);
+        assert_eq!(roots.rejected[0].path, "/data/projects");
+        assert!(roots.roots.last().unwrap().is_worker_resolved());
+        assert_eq!(
+            derive_gc_roots(&config, &[]).scan_bases(),
+            vec!["/data/projects"]
+        );
+    }
+
+    #[test]
+    fn windows_inventory_does_not_relax_deletion_or_shell_boundaries() {
+        for path in [
+            "C:/",
+            "C:",
+            "C:relative",
+            "//server/share",
+            "C:/../Windows",
+            "C:/rch/./target",
+            "C:/rch//target",
+            "C:/rch/$HOME",
+            "C:/rch/`id`",
+            "C:/rch/\"bad",
+            "C:/rch/line\nbreak",
+            "C:/rch/alternate:stream",
+        ] {
+            assert!(!is_safe_windows_gc_base(path), "{path}");
+        }
+        assert!(is_safe_windows_gc_base("C:/build cache"));
+        assert!(!is_safe_reap_base(WINDOWS_REMOTE_BASE));
     }
 
     #[test]

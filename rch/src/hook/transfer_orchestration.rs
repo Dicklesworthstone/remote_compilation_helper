@@ -57,7 +57,7 @@ use super::source_fidelity::{
 };
 use super::ssh::{
     acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
-    remote_preflight_topology_policy, worker_projects_topology_requires_initialization,
+    remote_preflight_topology_policy,
 };
 use super::*;
 
@@ -82,26 +82,56 @@ async fn read_completion_with_retry(
     pipeline: &TransferPipeline,
     worker: &WorkerConfig,
 ) -> anyhow::Result<Option<i32>> {
-    retry_completion_probe(Duration::from_secs(1), async || {
-        pipeline.read_recovery_completion(worker).await
-    })
+    // Previously three 10-second reads plus 1/2-second backoffs: preserve
+    // that worst-case budget at scale 1, but let fast transport failures retry
+    // while time remains. The per-read deadline is scaled independently.
+    retry_completion_probe(
+        rch_common::timing::scale_duration(Duration::from_secs(33)),
+        Duration::from_secs(1),
+        async || pipeline.read_recovery_completion(worker).await,
+    )
     .await
 }
 
-/// Up to three probe attempts, sleeping `backoff` then twice that between
-/// failures (1 s and 2 s in production).
+/// Retry errors within one monotonic budget, including probe time and backoff.
+/// An absent receipt is evidence and returns immediately. Dropping an expired
+/// read also drops its owned SSH process group; retries never overlap readers.
 async fn retry_completion_probe(
+    budget: Duration,
     backoff: Duration,
     mut probe: impl AsyncFnMut() -> anyhow::Result<Option<i32>>,
 ) -> anyhow::Result<Option<i32>> {
-    const ATTEMPTS: u64 = 3;
-    let mut attempt = 1;
+    let budget = budget.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .context("completion receipt retry deadline exceeds the clock range")?;
+    let mut attempt = 1_u64;
+    let mut delay = backoff.max(Duration::from_millis(1));
+    let max_delay = delay.saturating_mul(2);
     loop {
-        match probe().await {
-            Err(error) if attempt < ATTEMPTS => {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "completion receipt retry budget exhausted"
+        );
+        let result = tokio::time::timeout_at(deadline, probe())
+            .await
+            .map_err(|_| anyhow::anyhow!("completion receipt retry budget exhausted"))?;
+        // Tokio polls the reader before its timer. A reader that becomes ready
+        // at the deadline, or does not yield while collecting, is still late.
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "completion receipt retry budget exhausted"
+        );
+        match result {
+            Err(error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= delay {
+                    return Err(error.context("completion receipt retry budget exhausted"));
+                }
                 warn!(attempt, %error, "completion probe failed; retrying");
-                tokio::time::sleep(backoff * u32::try_from(attempt).unwrap_or(1)).await;
-                attempt += 1;
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(max_delay);
+                attempt = attempt.saturating_add(1);
             }
             other => return other,
         }
@@ -907,17 +937,63 @@ fn admitted_execution_disk_budget(
             Some(BuildDiskBudget {
                 max_growth_bytes: u64::from(admitted_headroom_gib) * BuildDiskBudget::GIB,
                 min_free_bytes: 0,
+                warm_policy: None,
             })
         } else {
             BuildDiskBudget::cold_for_command(command)
         }
     });
     if let Some(budget) = budget.as_mut() {
+        anyhow::ensure!(
+            budget
+                .warm_policy
+                .is_none_or(|policy| policy.valid_for_budget(budget.max_growth_bytes)),
+            "invalid conditional execution disk budget"
+        );
         budget.min_free_bytes = budget
             .min_free_bytes
             .max((floor * BuildDiskBudget::GIB as f64).ceil() as u64);
     }
     Ok(budget)
+}
+
+/// This refusal precedes source preparation and any content receipt. Receipt
+/// mode may safely request cold admission here without emitting two proofs.
+#[derive(Debug, thiserror::Error)]
+#[error("source preparation requires a cold disk reservation")]
+pub(super) struct ColdDiskPreparationRequired;
+
+fn require_guarded_warm_source_mode(
+    worker_id: &WorkerId,
+    budget: Option<rch_common::BuildDiskBudget>,
+    guarded: bool,
+) -> anyhow::Result<()> {
+    if guarded {
+        return Ok(());
+    }
+    let Some(budget) = budget.filter(|budget| budget.warm_policy.is_some()) else {
+        return Ok(());
+    };
+    let policy = budget
+        .warm_policy
+        .expect("conditional budget checked above");
+    Err(
+        anyhow::Error::new(crate::transfer::RemoteBuildDiskBudgetExceeded {
+            worker_id: worker_id.to_string(),
+            roots: Vec::new(),
+            reason: "cold_required".to_owned(),
+            free_bytes: 0,
+            growth_bytes: 0,
+            max_growth_bytes: budget.max_growth_bytes,
+            min_free_bytes: budget.min_free_bytes,
+            started: false,
+            peak_output_bytes: None,
+            required_growth_bytes: Some(policy.cold_growth_bytes),
+            detail: "this source preparation mode requires a cold reservation before uploading"
+                .to_owned(),
+        })
+        .context(ColdDiskPreparationRequired),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1159,6 +1235,19 @@ async fn execute_remote_compilation_inner(
         }
         dependency_plan.sync_roots
     };
+    // Only ordinary single-root Cargo uploads currently carry the same disk
+    // supervisor as execution. Other materializers keep cold admission until
+    // their writes can be charged throughout preparation, not just afterward.
+    require_guarded_warm_source_mode(
+        &worker_config.id,
+        execution_disk_budget,
+        !worker_is_windows
+            && durable_lease.is_some()
+            && clean_overlay.is_none()
+            && !source_content_receipt
+            && exact_dependency_closure_sync
+            && raw_sync_roots.len() == 1,
+    )?;
     let project_id = project_id_from_path(&normalized_project_root);
     if clean_overlay.is_some() && kind.is_some_and(|kind| kind.command_base() == "cargo") {
         // Reject unsupported command grammar before claiming a persistent
@@ -1466,6 +1555,11 @@ async fn execute_remote_compilation_inner(
             };
         }
     }
+    require_guarded_warm_source_mode(
+        &worker_config.id,
+        execution_disk_budget,
+        sync_plan.len() == 1,
+    )?;
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
@@ -1559,39 +1653,6 @@ async fn execute_remote_compilation_inner(
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
-    // bd-fbtws: reject live checkouts before ownership repair or repo-updater
-    // convergence can mutate them, not merely when rsync starts. The receiver
-    // repeats the guard immediately before pruning/upload under its grant.
-    if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
-        let guard = sync_plan
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{} || exit 73;\n",
-                    crate::transfer::live_checkout_sync_guard(&entry.remote_root)
-                )
-            })
-            .collect::<String>();
-        let output = super::ssh::run_offload_ssh_command_with_stdin(
-            &worker_config,
-            "sh -s",
-            guard.as_bytes(),
-            Duration::from_secs(30),
-        )
-        .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::transfer::destination_check_refusal(
-                format!(
-                    "source destination safety check refused on {} (status {:?}): {}",
-                    worker_config.id,
-                    output.status.code(),
-                    stderr.trim(),
-                ),
-                &stderr,
-            ));
-        }
-    }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -1697,27 +1758,16 @@ async fn execute_remote_compilation_inner(
         let writer = durable_lease.context(
             "remote source ownership requires an admitted durable job lease; use rch exec",
         )?;
-        if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
-            .await
-            .map_err(|error| {
-                writer.source_namespace_preflight_failed(
-                    &worker_config.id,
-                    build_id,
-                    local_wrapper_id,
-                    SourceNamespacePreflightStage::TopologyProbe,
-                    error,
-                )
-            })?
-        {
-            reporter
-                .verbose("[RCH] initializing shared path translation without claiming its bases");
-        }
         // Confirm the durable postcondition even when both paths already
         // exist: a prior initializer may have lost its final acknowledgment.
-        source_namespace::initialize_worker_namespace(
+        // The same RPC rejects live checkouts BEFORE any namespace write,
+        // ownership repair or repo convergence (bd-fbtws). Receivers repeat
+        // that guard under their grant immediately before pruning/upload.
+        let initialized = source_namespace::initialize_worker_namespace(
             &worker_config,
             &remote_topology_policy,
             &recovery_identity,
+            &ownership_scan_roots,
         )
         .await
         .map_err(|error| {
@@ -1729,6 +1779,10 @@ async fn execute_remote_compilation_inner(
                 error,
             )
         })?;
+        if initialized {
+            reporter
+                .verbose("[RCH] initialized shared path translation without claiming its bases");
+        }
     }
     let source_target_root = sync_plan
         .iter()
@@ -1841,6 +1895,7 @@ async fn execute_remote_compilation_inner(
         && !source_content_receipt
         && project_lane == 0
         && !topology_policy.is_off_root()
+        && execution_disk_budget.is_none_or(|budget| budget.warm_policy.is_none())
     {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
@@ -2348,6 +2403,7 @@ async fn execute_remote_compilation_inner(
     } else {
         pipeline
     };
+    let pipeline = pipeline.with_cargo_disk_cache(command, &worker_config.id);
     let owned_command = if owned_source_content_pair {
         Some(validate_owned_source_content_closure(
             &prepared_source_roots,
@@ -2629,6 +2685,7 @@ async fn execute_remote_compilation_inner(
     let deadline_triggered = Rc::new(Cell::new(false));
     let disk_failure = Rc::new(RefCell::new(None));
     let disk_peak_output_bytes = Rc::new(Cell::new(None::<u64>));
+    let disk_observation = Rc::new(Cell::new(None::<rch_common::BuildDiskObservation>));
     let disk_usage_exit_code = Rc::new(Cell::new(None::<i32>));
     let disk_usage_conflict = Rc::new(Cell::new(false));
 
@@ -2686,6 +2743,7 @@ async fn execute_remote_compilation_inner(
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
     let disk_failure_stderr = Rc::clone(&disk_failure);
     let disk_peak_output_stderr = Rc::clone(&disk_peak_output_bytes);
+    let disk_observation_stderr = Rc::clone(&disk_observation);
     let disk_usage_exit_stderr = Rc::clone(&disk_usage_exit_code);
     let disk_usage_conflict_stderr = Rc::clone(&disk_usage_conflict);
     let deadline_pipeline = pipeline.clone();
@@ -2763,11 +2821,19 @@ async fn execute_remote_compilation_inner(
             }
             if let Some(peak) = deadline_pipeline.parse_disk_usage_marker(line) {
                 let status = deadline_pipeline.parse_disk_usage_exit_code(line);
+                let observation = deadline_pipeline.parse_disk_observation_marker(line);
                 // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                 if disk_usage_exit_stderr.get().is_some() && disk_usage_exit_stderr.get() != status
                 {
                     disk_usage_conflict_stderr.set(true);
                 }
+                if disk_peak_output_stderr.get().is_some()
+                    && (disk_peak_output_stderr.get() != Some(peak)
+                        || disk_observation_stderr.get() != observation)
+                {
+                    disk_usage_conflict_stderr.set(true);
+                }
+                disk_observation_stderr.set(observation);
                 disk_usage_exit_stderr.set(status);
                 disk_peak_output_stderr
                     .set(Some(disk_peak_output_stderr.get().unwrap_or(0).max(peak)));
@@ -2840,11 +2906,19 @@ async fn execute_remote_compilation_inner(
                 }
                 if let Some(peak) = pipeline.parse_disk_usage_marker(line) {
                     let status = pipeline.parse_disk_usage_exit_code(line);
+                    let observation = pipeline.parse_disk_observation_marker(line);
                     // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
                     if disk_usage_exit_code.get().is_some() && disk_usage_exit_code.get() != status
                     {
                         disk_usage_conflict.set(true);
                     }
+                    if disk_peak_output_bytes.get().is_some()
+                        && (disk_peak_output_bytes.get() != Some(peak)
+                            || disk_observation.get() != observation)
+                    {
+                        disk_usage_conflict.set(true);
+                    }
+                    disk_observation.set(observation);
                     disk_usage_exit_code.set(status);
                     disk_peak_output_bytes
                         .set(Some(disk_peak_output_bytes.get().unwrap_or(0).max(peak)));
@@ -3929,6 +4003,7 @@ async fn execute_remote_compilation_inner(
         result_dirs: exec_dir_stats,
         disk_roots,
         disk_peak_output_bytes: disk_peak_output_bytes.get(),
+        disk_observation: disk_observation.get(),
         cargo_stdout,
     })
 }
@@ -4017,6 +4092,7 @@ mod tests {
             Some(BuildDiskBudget {
                 max_growth_bytes: 80 * gib,
                 min_free_bytes: 30 * gib,
+                warm_policy: None,
             }),
             "cargo test --workspace",
             100,
@@ -4048,6 +4124,49 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn unguarded_source_modes_require_cold_admission_before_preparation() {
+        use rch_common::{BuildDiskBudget, BuildDiskPool, BuildDiskWarmPolicy, WorkerId};
+        let gib = BuildDiskBudget::GIB;
+        let pool = BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 80 * gib,
+        };
+        let warm = BuildDiskBudget {
+            max_growth_bytes: 3 * gib,
+            min_free_bytes: 10 * gib,
+            warm_policy: Some(BuildDiskWarmPolicy {
+                cold_growth_bytes: 103 * gib,
+                pools: [Some(pool), None, None, None, None, None, None, None],
+            }),
+        };
+        let worker = WorkerId::new("source-mode-worker");
+        super::require_guarded_warm_source_mode(&worker, Some(warm), true).unwrap();
+        let error =
+            super::require_guarded_warm_source_mode(&worker, Some(warm), false).unwrap_err();
+        assert!(error.is::<super::ColdDiskPreparationRequired>());
+        let refusal = error
+            .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            .unwrap();
+        assert!(!refusal.started);
+        assert_eq!(refusal.reason, "cold_required");
+        assert_eq!(refusal.worker_id, worker.as_str());
+        assert_eq!(refusal.required_growth_bytes, Some(103 * gib));
+        assert_eq!(refusal.max_growth_bytes, 3 * gib);
+        assert!(
+            refusal.peak_output_bytes.is_none(),
+            "no source or output scan occurred"
+        );
+        let cold = BuildDiskBudget {
+            max_growth_bytes: 103 * gib,
+            warm_policy: None,
+            ..warm
+        };
+        super::require_guarded_warm_source_mode(&worker, Some(cold), false).unwrap();
+        super::require_guarded_warm_source_mode(&worker, None, false).unwrap();
     }
 
     use super::clean_overlay_remote_project_hash;
@@ -4813,17 +4932,17 @@ sys.exit(99)
         }
     }
 
-    /// A finished build must not be stranded by one transient SSH failure on
-    /// its receipt read; a persistent failure still surfaces after 3 tries,
-    /// and an absent receipt is returned at once (it is evidence, not noise).
-    #[tokio::test]
+    /// Fast errors can recover after the old three-attempt ceiling, while
+    /// missing receipts return immediately and persistent failures stay bounded.
+    #[tokio::test(start_paused = true)]
     async fn completion_probe_retries_transport_errors_only() {
         use std::cell::Cell;
-        let fast = std::time::Duration::from_millis(1);
+        let budget = std::time::Duration::from_secs(33);
+        let backoff = std::time::Duration::from_secs(1);
         let calls = Cell::new(0);
-        let flaky = super::retry_completion_probe(fast, async || {
+        let flaky = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
-            if calls.get() < 3 {
+            if calls.get() < 4 {
                 anyhow::bail!("completion probe SSH failed")
             } else {
                 Ok(Some(0))
@@ -4831,25 +4950,132 @@ sys.exit(99)
         })
         .await;
         assert_eq!(flaky.unwrap(), Some(0));
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.get(), 4);
 
         calls.set(0);
-        let down = super::retry_completion_probe(fast, async || {
+        let started = tokio::time::Instant::now();
+        let down = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
             anyhow::bail!("completion probe SSH failed")
         })
         .await;
         assert!(down.is_err());
-        assert_eq!(calls.get(), 3);
+        assert!(calls.get() > 3);
+        assert!(started.elapsed() <= budget);
 
         calls.set(0);
-        let absent = super::retry_completion_probe(fast, async || {
+        let absent = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
             Ok(None)
         })
         .await;
         assert_eq!(absent.unwrap(), None);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_budget_includes_slow_reads_and_cancellation() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let base = Duration::from_secs(10);
+        let extended = rch_common::timing::TimingScale::try_from(2.0)
+            .unwrap()
+            .duration(base);
+        let backoff = Duration::from_secs(1);
+        async fn slow_read() -> anyhow::Result<Option<i32>> {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(Some(0))
+        }
+        assert!(
+            super::retry_completion_probe(base, backoff, async || slow_read().await)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            super::retry_completion_probe(extended, backoff, async || slow_read().await)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+
+        struct Dropped<'a>(&'a Cell<bool>);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let started = tokio::time::Instant::now();
+        let result = super::retry_completion_probe(base, backoff, async || {
+            let _reader = Dropped(&dropped);
+            std::future::pending::<anyhow::Result<Option<i32>>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            dropped.get(),
+            "expired read must release its owned transport"
+        );
+        assert_eq!(started.elapsed(), base);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_refuses_expired_and_unrepresentable_budgets() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let calls = Cell::new(0);
+        let result = super::retry_completion_probe(Duration::ZERO, Duration::ZERO, async || {
+            calls.set(calls.get() + 1);
+            Ok(Some(0))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0, "an expired budget must not start a reader");
+
+        let started = tokio::time::Instant::now();
+        let result = super::retry_completion_probe(Duration::MAX, Duration::ZERO, async || {
+            std::future::pending::<anyhow::Result<Option<i32>>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), rch_common::timing::MAX_CONTROL_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_rejects_receipt_or_absence_at_deadline() {
+        use std::time::Duration;
+        let budget = Duration::from_secs(10);
+        for receipt in [None, Some(0), Some(17)] {
+            let started = tokio::time::Instant::now();
+            let result =
+                super::retry_completion_probe(budget, Duration::from_secs(1), async || {
+                    tokio::time::sleep(budget).await;
+                    Ok(receipt)
+                })
+                .await;
+            assert!(result.is_err(), "late receipt {receipt:?} was accepted");
+            assert_eq!(started.elapsed(), budget);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_probe_rejects_a_non_yielding_late_reader() {
+        use std::time::Duration;
+        let result = super::retry_completion_probe(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            async || {
+                // Deliberately starve the timer: a ready inner future wins
+                // Tokio's poll ordering unless the caller checks elapsed time.
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(Some(0))
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a late ready reader is not timely evidence"
+        );
     }
 
     #[test]

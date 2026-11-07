@@ -76,14 +76,26 @@
 //!   (plan §17.7's conservative default), bound to their crate names.
 //!   Every Rust artifact candidate in every dependency search directory is
 //!   also keyed, including transitive candidates and negative membership.
-//! - **Environment (`dependency-env-v2`):** preserve the compiler's complete
-//!   environment and hash every value by default, including arbitrary
-//!   `env!`/`option_env!` inputs. Jobserver descriptors, wrapper controls,
-//!   shell bookkeeping and the RCH source stamp pass through unkeyed.
-//!   A tracked read of any such control prevents publication, even when
-//!   the variable was absent. The executing process must use
-//!   [`DependencyActionPlan::execution_env`] verbatim; unknown variables
-//!   are never silently removed from a private execution.
+//! - **Environment (`dependency-env-v3`, applied by the edge through
+//!   [`DependencyActionPlan::narrow_to_source_env_reads`]; unnarrowed plans
+//!   keep `dependency-env-v2`, hashing every non-control value):** preserve
+//!   the compiler's complete
+//!   environment, but hash only what can matter: names the compiler process
+//!   consumes untracked (rustc/rustup controls, loader, libc locale, LLVM,
+//!   allocator) and the crate environment Cargo presents, plus every
+//!   `env!`/`option_env!` name the package source spells literally
+//!   ([`source_env_reads`]), keyed by value or by absence. Everything else —
+//!   terminal, multiplexer, SSH and agent-session variables, Cargo's own
+//!   configuration such as `CARGO_TARGET_DIR` — is ambient: hashing it made
+//!   every agent session mint its own keys, so no two sessions ever shared
+//!   a dependency. Only rustc runs in an admitted action (proc-macro
+//!   consumption is refused and build-script effects are captured inputs),
+//!   so nothing reads ambient names untracked; a TRACKED read the scan did
+//!   not key (or of jobserver descriptors, wrapper controls, shell
+//!   bookkeeping, host placement or the RCH source stamp) prevents
+//!   publication, even when the variable was absent. The executing process
+//!   must use [`DependencyActionPlan::execution_env`] verbatim; unknown
+//!   variables are never silently removed from a private execution.
 //! - **Toolchain:** binary digests and the complete `rustc -vV` identity
 //!   supplied by the caller's probe.
 //!
@@ -147,6 +159,10 @@ pub const CANONICAL_PACKAGE_PARENT: &str = "/__rabs/repos";
 pub const DOMAIN_LIVE_INVOCATION: &str = "rabs.live-dependency.invocation.v1";
 /// Working-directory component domain.
 pub const DOMAIN_LIVE_CWD: &str = "rabs.live-dependency.cwd.v1";
+/// Complete environment dataset under the named host-placement/read-veto policy.
+/// All live profiles use this domain, including when those names are absent:
+/// earlier publications cannot supply evidence for the expanded read veto.
+pub const DOMAIN_LIVE_ENVIRONMENT: &str = "rabs.live-dependency.environment.v1";
 /// Negative-dependency component domain.
 pub const DOMAIN_LIVE_NEGATIVE: &str = "rabs.live-dependency.negative.v1";
 /// Dependency-artifact component domain (inputs + name binding).
@@ -162,9 +178,11 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
 pub const ISOLATION_PROFILE: &str = "live-dependency-v8: unsandboxed local edge process; \
-     environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
-     wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
-     unkeyed names, including absent reads, refuse publication); source = complete registry package \
+     environment preserved, keyed by dependency-env-v2 (all non-control values hashed) or, \
+     when the edge narrows it, dependency-env-v3 (compiler-consumed and Cargo crate names \
+     hashed; ambient names hashed by value or absence only when the source names them); \
+     jobserver, wrapper controls, shell bookkeeping, RCH source stamp and unkeyed ambient \
+     names unkeyed; tracked reads of unkeyed names, including absent reads, refuse publication); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
      consumption refused; generated compiler inputs captured as a complete disjoint \
@@ -178,9 +196,11 @@ pub const ISOLATION_PROFILE: &str = "live-dependency-v8: unsandboxed local edge 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
 pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v7: unsandboxed local edge process; \
-     environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
-     wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
-     unkeyed names, including absent reads, refuse publication); source = complete Cargo Git checkout \
+     environment preserved, keyed by dependency-env-v2 (all non-control values hashed) or, \
+     when the edge narrows it, dependency-env-v3 (compiler-consumed and Cargo crate names \
+     hashed; ambient names hashed by value or absence only when the source names them); \
+     jobserver, wrapper controls, shell bookkeeping, RCH source stamp and unkeyed ambient \
+     names unkeyed; tracked reads of unkeyed names, including absent reads, refuse publication); source = complete Cargo Git checkout \
      tree including dirty and untracked source files, root .git excluded before capture; \
      real directory root revalidated on every observation; closure enforced after execution \
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
@@ -196,9 +216,11 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v7: unsandboxed loc
 /// The checksum document identifies the source class, never the file closure:
 /// even files absent from its `files` map are captured, hashed and revalidated.
 pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v4: unsandboxed local edge process; \
-     environment preserved by dependency-env-v2 (all values hashed by default; jobserver, \
-     wrapper controls, shell bookkeeping and RCH source stamp unkeyed; tracked reads of \
-     unkeyed names, including absent reads, refuse publication); source = complete Cargo directory-source \
+     environment preserved, keyed by dependency-env-v2 (all non-control values hashed) or, \
+     when the edge narrows it, dependency-env-v3 (compiler-consumed and Cargo crate names \
+     hashed; ambient names hashed by value or absence only when the source names them); \
+     jobserver, wrapper controls, shell bookkeeping, RCH source stamp and unkeyed ambient \
+     names unkeyed; tracked reads of unkeyed names, including absent reads, refuse publication); source = complete Cargo directory-source \
      package tree including Cargo.toml and the exact observed .cargo-checksum.json witness; \
      checksum declarations never substitute for captured bytes or exclude unlisted files; \
      real directory root and complete tree revalidated before serving and after execution; \
@@ -220,6 +242,21 @@ pub const EXECUTION_SEMANTICS: &str = "live-dependency-v2: rustc exit status 0 b
 /// identical dependency actions. A compiler's tracked read of any of these
 /// names, including an absent `option_env!` read, prevents publication.
 const SHELL_BOOKKEEPING_NAMES: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// RCH's per-job cache/temp directories and the SSH login session change even
+/// for identical rustc inputs. Rustc uses TMPDIR only for temporary placement;
+/// the other names do not configure it. Preserve exact execution bindings and
+/// veto publication on every tracked read, including an absent option_env!.
+/// These are exact names, never broad SSH_*, XDG_* or Go/RCH namespaces.
+const HOST_PLACEMENT_NAMES: &[&str] = &[
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+    "TMPDIR",
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "XDG_SESSION_ID",
+];
 
 /// Names whose presence takes the request out of this class.
 const REFUSED_NAMES: &[&str] = &[
@@ -392,6 +429,9 @@ pub enum PlannedExtern {
 
 /// The Cargo-managed source layout and corresponding capture policy.
 /// Directory names classify the source; captured bytes establish identity.
+/// Workspace cache V2 profiles qualify the independently isolated compiler
+/// action even when other units in the Cargo operation execute project code.
+/// Their names never grant trust to local wrapper-completion claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencySourceKind {
     /// One complete package below Cargo's registry source directory.
@@ -405,12 +445,27 @@ pub enum DependencySourceKind {
     WorkspaceExecutionOnly,
     /// A complete canonical workspace for a separately qualified, closed pure
     /// Rust leaf-library archive. Its worker receipt and cache policy remain
-    /// distinct from the unrestricted fresh workspace execution class.
+    /// distinct from the unrestricted fresh workspace execution class and from
+    /// the operation's other project executors.
     WorkspaceClosedRlib,
     /// A complete canonical workspace for a separately qualified ordinary Rust
     /// leaf-library metadata check. Its explicit closed metadata worker context
     /// excludes procfs and entropy devices; ordinary metadata is not authority.
     WorkspaceClosedMetadata,
+    /// A closed ordinary leaf-library archive with the complete own OUT_DIR
+    /// tree and exact completed Cargo build-script record as retained inputs.
+    /// Build-script execution itself never receives cache authority.
+    WorkspaceGeneratedRlib,
+    /// A closed leaf-library metadata check with complete generated inputs.
+    /// Its separate class still requires the strict closed metadata namespace.
+    WorkspaceGeneratedMetadata,
+    /// A closed library archive with a complete own OUT_DIR and an exact
+    /// committed workspace/immutable producer DAG. Its retained dependency
+    /// capability is mandatory; generated leaf evidence cannot authorize it.
+    WorkspaceGeneratedDagRlib,
+    /// The separately qualified closed metadata form of a generated-input
+    /// workspace library with complete committed producer ancestry.
+    WorkspaceGeneratedDagMetadata,
     /// Closed canonical workspace archive whose entire retained Rust candidate
     /// inventory comes from verified, already committed workspace producers.
     WorkspaceCommittedRlib,
@@ -440,13 +495,17 @@ impl DependencySourceKind {
             Self::GitCheckout => "git-checkout",
             Self::DirectoryPackage => "directory-package",
             Self::WorkspaceExecutionOnly => "canonical-workspace-execution-only",
-            Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v1",
-            Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v1",
-            Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v1",
-            Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v1",
-            Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v1",
-            Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v1",
-            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v1",
+            Self::WorkspaceClosedRlib => "canonical-workspace-closed-rlib-v2",
+            Self::WorkspaceClosedMetadata => "canonical-workspace-closed-metadata-v2",
+            Self::WorkspaceGeneratedRlib => "canonical-workspace-generated-rlib-v1",
+            Self::WorkspaceGeneratedMetadata => "canonical-workspace-generated-metadata-v1",
+            Self::WorkspaceGeneratedDagRlib => "canonical-workspace-generated-dag-rlib-v1",
+            Self::WorkspaceGeneratedDagMetadata => "canonical-workspace-generated-dag-metadata-v1",
+            Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v2",
+            Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v2",
+            Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v2",
+            Self::WorkspaceMixedMetadata => "canonical-workspace-committed-mixed-metadata-v2",
+            Self::WorkspaceTerminalMetadata => "canonical-workspace-terminal-metadata-v2",
         }
     }
 
@@ -459,6 +518,10 @@ impl DependencySourceKind {
             Self::WorkspaceExecutionOnly
                 | Self::WorkspaceClosedRlib
                 | Self::WorkspaceClosedMetadata
+                | Self::WorkspaceGeneratedRlib
+                | Self::WorkspaceGeneratedMetadata
+                | Self::WorkspaceGeneratedDagRlib
+                | Self::WorkspaceGeneratedDagMetadata
                 | Self::WorkspaceCommittedRlib
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
@@ -523,9 +586,56 @@ pub struct DependencyActionPlan {
     /// The COMPLETE environment the compiler must execute with, sorted:
     /// exact caller values, including unkeyed jobserver and launcher controls.
     pub execution_env: Vec<(String, String)>,
+    /// `None`: every present non-control name is keyed (`dependency-env-v2`,
+    /// so every absence is keyed too). `Some(absent)`: narrowed by
+    /// [`DependencyActionPlan::narrow_to_source_env_reads`] to
+    /// `dependency-env-v3`; `absent` lists the source-named ambient names
+    /// missing here, whose absence is keyed. Sorted.
+    pub source_named_env: Option<Vec<String>>,
 }
 
 impl DependencyActionPlan {
+    /// Narrow to `dependency-env-v3`: keep ambient names keyed only when
+    /// `names` (the [`source_env_reads`] of every captured source and
+    /// generated file) spells them — by value when present, by absence
+    /// otherwise — and stop keying every other ambient name. Call once,
+    /// before binding build-script exports and before keying. A tracked
+    /// read of a name this drops refuses publication. Canonical-Cargo and
+    /// workspace execution-only plans keep their exact environment.
+    pub fn narrow_to_source_env_reads(&mut self, names: &[String]) {
+        if self.canonical_cargo || self.source_kind == DependencySourceKind::WorkspaceExecutionOnly
+        {
+            return;
+        }
+        let ambient = |name: &str| matches!(env_role(name), EnvRole::Ambient);
+        self.keyed_env
+            .retain(|(name, _)| !ambient(name) || names.iter().any(|named| named == name));
+        let mut absent: Vec<String> = names
+            .iter()
+            .filter(|name| ambient(name))
+            .filter(|name| !self.execution_env.iter().any(|(bound, _)| bound == *name))
+            .cloned()
+            .collect();
+        absent.sort();
+        absent.dedup();
+        self.source_named_env = Some(absent);
+    }
+
+    /// A tracked read of `name` is covered by the key: a keyed value, a
+    /// keyed absence, or the absence of a name whose every present value
+    /// would be keyed.
+    fn env_read_keyed(&self, name: &str) -> bool {
+        let present = self.execution_env.iter().any(|(bound, _)| bound == name);
+        if present {
+            return self.keyed_env.iter().any(|(keyed, _)| keyed == name);
+        }
+        match (env_role(name), &self.source_named_env) {
+            (EnvRole::Keyed, _) | (EnvRole::Ambient, None) => true,
+            (EnvRole::Passthrough, _) => false,
+            (EnvRole::Ambient, Some(absent)) => absent.iter().any(|named| named == name),
+        }
+    }
+
     /// Real placement roots and their canonical counterparts. Roots are
     /// disjoint, so replacing one can never hide another.
     #[must_use]
@@ -836,13 +946,77 @@ fn directory_source(
     ))
 }
 
-/// Classify one environment variable under `dependency-env-v2`.
-enum EnvRole {
+/// Classify one environment variable under `dependency-env-v3`.
+pub(crate) enum EnvRole {
+    /// Value (or absence) keyed: something in the compiler process can read
+    /// it without a dep-info record, or Cargo presents it to every crate.
     Keyed,
+    /// Never keyed; any tracked read refuses publication.
     Passthrough,
+    /// Session noise nothing in the action consumes untracked (terminal,
+    /// multiplexer, SSH and agent-session variables, Cargo's own
+    /// configuration such as `CARGO_TARGET_DIR`). Unkeyed unless the
+    /// package source names it; a tracked read of an unnamed one refuses
+    /// publication, so the source scan is never trusted for soundness.
+    Ambient,
 }
 
-fn env_role(name: &str) -> EnvRole {
+/// Prefixes of names the compiler process may consume untracked (rustc and
+/// rustup controls, the dynamic loader, LLVM, the allocator, locale) or that
+/// Cargo presents to every crate compile (package metadata, cfg/feature
+/// values for build scripts, Cargo-internal handshakes).
+const KEYED_PREFIXES: &[&str] = &[
+    "RUSTC",
+    "RUST_",
+    "RUSTDOC",
+    "RUSTUP_",
+    "CARGO_PKG_",
+    "CARGO_BIN_EXE_",
+    "CARGO_CFG_",
+    "CARGO_FEATURE_",
+    "__CARGO",
+    "LD_",
+    "DYLD_",
+    "LC_",
+    "LLVM_",
+    "MALLOC_",
+    "_RJEM_",
+];
+
+/// Exact names keyed for the same reasons as [`KEYED_PREFIXES`].
+const KEYED_NAMES: &[&str] = &[
+    "CARGO",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_MANIFEST_LINKS",
+    "CARGO_CRATE_NAME",
+    "CARGO_BIN_NAME",
+    "CARGO_PRIMARY_PACKAGE",
+    "CARGO_TARGET_TMPDIR",
+    "CARGO_RUSTC_CURRENT_DIR",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_SBOM_PATH",
+    "OUT_DIR",
+    "PATH",
+    "HOME",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "COLUMNS",
+    "SOURCE_DATE_EPOCH",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+    "NLSPATH",
+    "GCONV_PATH",
+    "SDKROOT",
+    "DOCS_RS",
+];
+
+pub(crate) fn env_role(name: &str) -> EnvRole {
     // These values control the wrapper or identify host-local descriptors.
     // RCH_BUILD_SOURCE changes when unrelated workspace files change; the
     // dependency's own captured source bytes already establish its identity.
@@ -850,17 +1024,90 @@ fn env_role(name: &str) -> EnvRole {
     // an absent read. Never exempt broad RUST* or RCH_* namespaces.
     if DESCRIPTOR_AUTH_VARS.contains(&name.as_bytes())
         || SHELL_BOOKKEEPING_NAMES.contains(&name)
+        || HOST_PLACEMENT_NAMES.contains(&name)
         || name.starts_with("RABS_")
         || name.starts_with("CARGO_RABS_")
         || name == "RCH_BUILD_SOURCE"
     {
         EnvRole::Passthrough
-    } else {
+    } else if KEYED_NAMES.contains(&name)
+        || KEYED_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || name.ends_with("_DEPLOYMENT_TARGET")
+    {
         EnvRole::Keyed
+    } else {
+        EnvRole::Ambient
     }
 }
 
-/// The complete `dependency-env-v2` environment for a compiler process,
+/// Names a Rust source text reads with `env!`/`option_env!` (any macro
+/// whose name ends in `env!`) given a plain or raw string literal first
+/// argument. Sorted and deduplicated. This is a keying aid, not a closure
+/// proof: reads it misses (names produced by other macros) are still
+/// refused publication by [`dep_info_closure_violation`]. Comments and
+/// strings are not excluded; a spurious name only keys more.
+#[must_use]
+pub fn source_env_reads(source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut at = 0;
+    while let Some(found) = find_bytes(&source[at..], b"env!") {
+        let mut cursor = at + found + b"env!".len();
+        at = cursor;
+        let skip_space = |cursor: &mut usize| {
+            while source.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+                *cursor += 1;
+            }
+        };
+        skip_space(&mut cursor);
+        if !matches!(source.get(cursor), Some(b'(' | b'[' | b'{')) {
+            continue;
+        }
+        cursor += 1;
+        skip_space(&mut cursor);
+        // Plain "…" or raw r"…"/r#"…"# literals; escapes in plain literals
+        // are not decoded (an escaped name is refused by the dep-info veto).
+        let mut hashes = 0;
+        if source.get(cursor) == Some(&b'r') {
+            cursor += 1;
+            while source.get(cursor) == Some(&b'#') {
+                hashes += 1;
+                cursor += 1;
+            }
+        }
+        if source.get(cursor) != Some(&b'"') {
+            continue;
+        }
+        cursor += 1;
+        let start = cursor;
+        while source
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            cursor += 1;
+        }
+        let closed = source.get(cursor) == Some(&b'"')
+            && source
+                .get(cursor + 1..cursor + 1 + hashes)
+                .is_some_and(|tail| tail.iter().all(|byte| *byte == b'#'));
+        if closed
+            && cursor > start
+            && let Ok(name) = std::str::from_utf8(&source[start..cursor])
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The complete `dependency-env-v3` environment for a compiler process,
 /// sorted by name. Preserve every exact caller binding: arbitrary variables
 /// can affect `env!` and `option_env!`, so an allowlist changes real builds.
 /// Toolchain probes use this too, matching the admitted compiler process.
@@ -1165,7 +1412,9 @@ fn plan_in_profile(
     let execution_env = constructed_environment(request.env);
     let keyed_env: Vec<(String, String)> = execution_env
         .iter()
-        .filter(|(name, _)| workspace_execution_only || matches!(env_role(name), EnvRole::Keyed))
+        .filter(|(name, _)| {
+            workspace_execution_only || !matches!(env_role(name), EnvRole::Passthrough)
+        })
         .cloned()
         .collect();
 
@@ -1193,6 +1442,7 @@ fn plan_in_profile(
         outputs,
         keyed_env,
         execution_env,
+        source_named_env: None,
     })
 }
 
@@ -1380,12 +1630,32 @@ fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, Liv
             variables.push((name.as_bytes().to_vec(), EnvDisposition::VolatileRefusal));
         }
     }
-    PresentedEnvironment {
+    let dataset = PresentedEnvironment {
         variables,
         path_manifest: Vec::new(),
     }
     .dataset_digest()
-    .map_err(|error| LiveRefusal::Facts(format!("{error:?}")))
+    .map_err(|error| LiveRefusal::Facts(format!("{error:?}")))?;
+    let mut policy = CanonicalEncoder::new();
+    policy
+        .str(dataset.domain)
+        .bytes(&dataset.bytes)
+        .str("exact execution; host placement tracked reads refuse publication, even absent");
+    for name in HOST_PLACEMENT_NAMES {
+        policy.str(name);
+    }
+    // dependency-env-v3: compiler-consumed and Cargo crate names keyed;
+    // ambient names keyed only when the source reads them, by value (above)
+    // or by absence (here); other tracked reads refuse publication. An
+    // unnarrowed (v2) plan's digest is unchanged.
+    if let Some(absent) = &plan.source_named_env {
+        policy
+            .str("dependency-env-v3")
+            .seq(absent, |encoder, name| {
+                encoder.str(name);
+            });
+    }
+    Ok(compute(DOMAIN_LIVE_ENVIRONMENT, &policy.finish()))
 }
 
 fn output_platform_component(plan: &DependencyActionPlan) -> TypedDigest {
@@ -1556,6 +1826,10 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceExecutionOnly
                             | DependencySourceKind::WorkspaceClosedRlib
                             | DependencySourceKind::WorkspaceClosedMetadata
+                            | DependencySourceKind::WorkspaceGeneratedRlib
+                            | DependencySourceKind::WorkspaceGeneratedMetadata
+                            | DependencySourceKind::WorkspaceGeneratedDagRlib
+                            | DependencySourceKind::WorkspaceGeneratedDagMetadata
                             | DependencySourceKind::WorkspaceCommittedRlib
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
@@ -1624,6 +1898,10 @@ fn captured_action_key(
             DependencySourceKind::WorkspaceExecutionOnly
             | DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
+            | DependencySourceKind::WorkspaceGeneratedRlib
+            | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceGeneratedDagRlib
+            | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
@@ -1715,6 +1993,18 @@ fn captured_action_key(
                 DependencySourceKind::WorkspaceClosedRlib => workspace_cache::ISOLATION_PROFILE,
                 DependencySourceKind::WorkspaceClosedMetadata => {
                     workspace_cache::METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedRlib => {
+                    workspace_cache::GENERATED_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedMetadata => {
+                    workspace_cache::GENERATED_METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedDagRlib => {
+                    workspace_dependency_cache::GENERATED_DAG_RLIB_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspaceGeneratedDagMetadata => {
+                    workspace_dependency_cache::GENERATED_DAG_METADATA_ISOLATION_PROFILE
                 }
                 DependencySourceKind::WorkspaceCommittedRlib => {
                     workspace_dependency_cache::ISOLATION_PROFILE
@@ -2516,13 +2806,9 @@ pub fn dep_info_closure_violation(
         if let Some(comment) = line.strip_prefix('#') {
             if let Some(read) = comment.trim_start().strip_prefix("env-dep:") {
                 let name = read.split_once('=').map_or(read, |(name, _)| name);
-                let passthrough = matches!(env_role(name), EnvRole::Passthrough)
-                    || (plan
-                        .execution_env
-                        .iter()
-                        .any(|(present, _)| present == name)
-                        && !plan.keyed_env.iter().any(|(keyed, _)| keyed == name));
-                if passthrough {
+                let unkeyed =
+                    matches!(env_role(name), EnvRole::Passthrough) || !plan.env_read_keyed(name);
+                if unkeyed {
                     return Some(format!("tracked read of unkeyed variable {name}"));
                 }
                 if name == "LD_LIBRARY_PATH"
@@ -3188,6 +3474,10 @@ mod tests {
             "RCH_BUILD_SOURCE_OTHER",
             "RUSTC_LOG",
             "RUST_FEATURE",
+            "GOPATH_OTHER",
+            "TMPDIR_OTHER",
+            "SSH_CONNECTION_OTHER",
+            "XDG_SESSION_ID_OTHER",
         ] {
             let changed = plan_for(OUT_A, &[], &[(name, "custom = exact value")]).unwrap();
             assert!(
@@ -3272,6 +3562,232 @@ mod tests {
     }
 
     #[test]
+    fn host_placement_preserves_execution_and_requires_fresh_environment_evidence() {
+        let base = plan_for(OUT_A, &[], &[]).unwrap();
+        let base_key =
+            live_dependency_key(&base, &toolchain(), &externs(&base, 20), &inputs(&base, 11))
+                .unwrap();
+        assert_eq!(
+            base_key.descriptor.environment.domain,
+            DOMAIN_LIVE_ENVIRONMENT
+        );
+        for &name in HOST_PLACEMENT_NAMES {
+            for value in ["", "/first/job", "/second/job"] {
+                let changed = plan_for(OUT_A, &[], &[(name, value)]).unwrap();
+                assert_eq!(key(&base), key(&changed), "{name}={value}");
+                assert!(
+                    changed
+                        .execution_env
+                        .contains(&(name.to_string(), value.into()))
+                );
+                assert!(!changed.keyed_env.iter().any(|(keyed, _)| keyed == name));
+            }
+        }
+        let legacy_environment = PresentedEnvironment {
+            variables: base
+                .keyed_env
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_bytes().to_vec(),
+                        EnvDisposition::SemanticHashed(value.as_bytes().to_vec()),
+                    )
+                })
+                .collect(),
+            path_manifest: Vec::new(),
+        }
+        .dataset_digest()
+        .unwrap();
+        assert_ne!(base_key.descriptor.environment, legacy_environment);
+        let mut old_descriptor = base_key.descriptor.clone();
+        old_descriptor.environment = legacy_environment;
+        assert_ne!(
+            base_key.action_key,
+            compute_action_key(&old_descriptor).final_key
+        );
+    }
+
+    #[test]
+    fn source_env_reads_finds_literal_env_macro_names_only() {
+        let source = br##"
+            const A: &str = env!("CARGO_PKG_VERSION");
+            const B: Option<&str> = option_env!( "DEPENDENCY_OPTION" );
+            const C: &str = std::env!{"BRACED"};
+            const D: &str = core::env![r"RAW_PLAIN"];
+            const E: Option<&str> = option_env!(
+                r#"RAW_HASHED"#
+            );
+            const F: &str = my_env!("CUSTOM_MACRO");
+            const G: &str = env!("CARGO_PKG_VERSION");
+            include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+            const H: &str = env!(concat!("NOT", "_LITERAL"));
+            const I: &str = env!("bad-name");
+            const J: &str = env!("ESCAPED\x41");
+            const K: &str = "env!";
+            const L: &str = env!(r#"UNTERMINATED");
+            const M: &str = env!("");
+        "##;
+        assert_eq!(
+            source_env_reads(source),
+            [
+                "BRACED",
+                "CARGO_PKG_VERSION",
+                "CUSTOM_MACRO",
+                "DEPENDENCY_OPTION",
+                "OUT_DIR",
+                "RAW_HASHED",
+                "RAW_PLAIN",
+            ]
+        );
+        assert!(source_env_reads(b"").is_empty());
+        assert!(source_env_reads(b"env!").is_empty());
+        assert_eq!(source_env_reads(b"env!(\"END\")"), ["END"]);
+    }
+
+    /// Variables that differ between agent sessions on one host. Hashing
+    /// them (dependency-env-v2) gave every session its own keys.
+    const SESSION_NOISE: &[(&str, &str)] = &[
+        ("TMUX_PANE", "%17"),
+        ("SSH_AUTH_SOCK", "/tmp/ssh-x/agent.42"),
+        ("CARGO_TARGET_DIR", "/work/b/target"),
+        ("CARGO_BUILD_JOBS", "3"),
+        ("AGENT_SESSION_ID", "agent-b"),
+        ("EDITOR", "vi"),
+    ];
+
+    fn narrowed(extra: &[(&str, &str)], named: &[&str]) -> DependencyActionPlan {
+        let mut plan = plan_for(OUT_A, &[], extra).unwrap();
+        let names: Vec<String> = named.iter().map(|name| (*name).to_owned()).collect();
+        plan.narrow_to_source_env_reads(&names);
+        plan
+    }
+
+    #[test]
+    fn narrowed_keys_ignore_session_noise_but_keep_compiler_and_cargo_inputs() {
+        let base = narrowed(&[], &[]);
+        let noisy = narrowed(SESSION_NOISE, &[]);
+        assert_eq!(key(&base), key(&noisy), "agent sessions must share keys");
+        // The same requests keyed by dependency-env-v2 differ; the narrowed
+        // policy is itself part of the key.
+        assert_ne!(
+            key(&plan_for(OUT_A, &[], &[]).unwrap()),
+            key(&plan_for(OUT_A, &[], SESSION_NOISE).unwrap())
+        );
+        assert_ne!(key(&base), key(&plan_for(OUT_A, &[], &[]).unwrap()));
+        // Execution still preserves every binding exactly.
+        for (name, value) in SESSION_NOISE {
+            assert!(
+                noisy
+                    .execution_env
+                    .contains(&((*name).into(), (*value).into()))
+            );
+            assert!(!noisy.keyed_env.iter().any(|(keyed, _)| keyed == name));
+        }
+        for (name, value) in [
+            ("RUSTC_LOG", "debug"),
+            ("RUST_MIN_STACK", "8388608"),
+            ("RUSTC_BOOTSTRAP", "1"),
+            ("CARGO_PKG_VERSION", "9.9.9"),
+            ("CARGO_PKG_AUTHORS", "someone"),
+            ("CARGO_CFG_FEATURE", "x"),
+            ("PATH", "/elsewhere/bin"),
+            ("TERM", "dumb"),
+            ("LD_LIBRARY_PATH", "/toolchain/lib"),
+            ("LC_ALL", "C"),
+            ("LLVM_PROFILE_FILE", "x.profraw"),
+            ("MALLOC_ARENA_MAX", "2"),
+            ("SOURCE_DATE_EPOCH", "1"),
+            ("MACOSX_DEPLOYMENT_TARGET", "11.0"),
+        ] {
+            assert_ne!(
+                key(&base),
+                key(&narrowed(&[(name, value)], &[])),
+                "{name} is consumed untracked or presented by Cargo"
+            );
+        }
+    }
+
+    #[test]
+    fn narrowed_keys_bind_every_source_named_ambient_value_and_absence() {
+        let mut keys = Vec::new();
+        for value in [None, Some(""), Some("first"), Some("second")] {
+            let extra = value.map(|value| ("DEPENDENCY_FLAVOR", value));
+            let plan = narrowed(extra.as_slice(), &["DEPENDENCY_FLAVOR"]);
+            let keyed = key(&plan);
+            assert!(!keys.contains(&keyed), "{value:?}");
+            keys.push(keyed);
+        }
+        // Naming an ambient variable that is absent is a keyed fact too.
+        assert_ne!(
+            key(&narrowed(&[], &[])),
+            key(&narrowed(&[], &["DEPENDENCY_FLAVOR"]))
+        );
+        // Session noise still does not split a crate that names one variable.
+        assert_eq!(
+            key(&narrowed(
+                &[("DEPENDENCY_FLAVOR", "x")],
+                &["DEPENDENCY_FLAVOR"]
+            )),
+            key(&narrowed(
+                &[SESSION_NOISE, &[("DEPENDENCY_FLAVOR", "x")]].concat(),
+                &["DEPENDENCY_FLAVOR"]
+            ))
+        );
+        // Control names stay unkeyed even when a source spells them.
+        assert_eq!(
+            key(&narrowed(&[("PWD", "/a")], &["PWD"])),
+            key(&narrowed(&[("PWD", "/b")], &["PWD"]))
+        );
+    }
+
+    #[test]
+    fn narrowed_plans_veto_tracked_reads_the_key_does_not_cover() {
+        let plan = narrowed(
+            &[("TMUX_PANE", "%3"), ("NAMED_PRESENT", "v")],
+            &["NAMED_PRESENT", "NAMED_ABSENT"],
+        );
+        let violation = |read: &str| {
+            dep_info_closure_violation(&plan, format!("# env-dep:{read}\n").as_bytes(), |_| true)
+        };
+        for covered in [
+            "NAMED_PRESENT=v",
+            "NAMED_ABSENT",
+            "CARGO_PKG_VERSION=1.0.15",
+            "CARGO_FEATURE_STD",
+            "RUSTC_BOOTSTRAP",
+        ] {
+            assert_eq!(violation(covered), None, "{covered}");
+        }
+        for unkeyed in [
+            "TMUX_PANE=%3",
+            "UNNAMED_ABSENT",
+            "CARGO_TARGET_DIR",
+            "PWD",
+            "CARGO_MAKEFLAGS=-j --jobserver-fds=3,4",
+        ] {
+            assert!(
+                violation(unkeyed)
+                    .is_some_and(|reason| reason.contains("tracked read of unkeyed variable")),
+                "{unkeyed}"
+            );
+        }
+        // Unnarrowed (v2) plans keep their meaning: every present non-control
+        // value is keyed, so its read and an absent read are both covered.
+        let exact = plan_for(OUT_A, &[], &[("TMUX_PANE", "%3")]).unwrap();
+        for read in ["TMUX_PANE=%3", "UNNAMED_ABSENT"] {
+            assert_eq!(
+                dep_info_closure_violation(
+                    &exact,
+                    format!("# env-dep:{read}\n").as_bytes(),
+                    |_| { true }
+                ),
+                None,
+                "{read}"
+            );
+        }
+    }
+
+    #[test]
     fn unkeyed_control_reads_veto_publication_even_when_absent() {
         for name in [
             "MAKEFLAGS",
@@ -3284,7 +3800,10 @@ mod tests {
             "OLDPWD",
             "SHLVL",
             "_",
-        ] {
+        ]
+        .into_iter()
+        .chain(HOST_PLACEMENT_NAMES.iter().copied())
+        {
             let args = argv(OUT_A, &[]);
             let mut absent_env = env(&[]);
             absent_env.retain(|(present, _)| present != name);
@@ -3474,6 +3993,23 @@ mod tests {
                         dep_info_closure_violation(&plan, &executed_bytes, |_| true),
                         None
                     );
+                    // dependency-env-v3 keys exactly what the source names,
+                    // so the narrowed plan publishes too; narrowing without
+                    // the scan must refuse the same real tracked reads.
+                    let names = source_env_reads(&std::fs::read(&source).unwrap());
+                    assert_eq!(names, ["DEPENDENCY_FLAVOR", "DEPENDENCY_OPTION"]);
+                    let mut scanned = plan.clone();
+                    scanned.narrow_to_source_env_reads(&names);
+                    assert_eq!(
+                        dep_info_closure_violation(&scanned, &executed_bytes, |_| true),
+                        None
+                    );
+                    let mut unscanned = plan.clone();
+                    unscanned.narrow_to_source_env_reads(&[]);
+                    assert!(
+                        dep_info_closure_violation(&unscanned, &executed_bytes, |_| true)
+                            .is_some_and(|reason| reason.contains("DEPENDENCY_"))
+                    );
                     assert_eq!(
                         canonicalize_out_dir(&stock_bytes, stock_dir.to_str().unwrap()).unwrap(),
                         canonicalize_placements(&executed_bytes, &plan).unwrap()
@@ -3500,6 +4036,61 @@ mod tests {
                 expected.as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn narrowing_keeps_the_exact_out_dir_lane_for_generated_file_consumers() {
+        const GENERATED_A: &str = "/work/a/target/debug/build/itoa-0123/out";
+        const GENERATED_B: &str = "/elsewhere/b/target/debug/build/itoa-0123/out";
+        let narrowed = |out: &str, generated: &str| {
+            let mut plan = plan_for(out, &[], &[("OUT_DIR", generated)]).unwrap();
+            plan.narrow_to_source_env_reads(&[]);
+            plan
+        };
+        let manifest = |plan: &DependencyActionPlan, tag: u8| {
+            let mut manifest = inputs(plan, 11);
+            manifest.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path("value.rs").into_bytes(),
+                ),
+                object: ObjectId(digest(tag)),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+            manifest.directory_enumerations[0].entries = vec![RawBytes::from("value.rs")];
+            manifest
+        };
+        let keyed = |plan: &DependencyActionPlan, tag: u8| {
+            live_dependency_key(plan, &toolchain(), &externs(plan, 20), &manifest(plan, tag))
+                .unwrap()
+                .action_key
+        };
+        let a = narrowed(OUT_A, GENERATED_A);
+        let b = narrowed(OUT_B, GENERATED_B);
+        // Generated-file consumers keep the exact-path lane: the spelling
+        // stays keyed (a captured EMPTY tree is projected separately, by the
+        // edge's opt-in empty-OUT_DIR class), and contents stay keyed.
+        assert_ne!(keyed(&a, 40), keyed(&b, 40));
+        assert_ne!(keyed(&a, 40), keyed(&a, 41));
+        assert!(
+            a.keyed_env
+                .contains(&("OUT_DIR".into(), GENERATED_A.into()))
+        );
+        let covered = |path: &str| {
+            manifest(&a, 40)
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        let reads = format!(
+            "{OUT_A}/itoa.d: {PACKAGE}/src/lib.rs {GENERATED_A}/value.rs\n\
+             {GENERATED_A}/value.rs:\n# env-dep:OUT_DIR={GENERATED_A}\n"
+        );
+        assert_eq!(
+            dep_info_closure_violation(&a, reads.as_bytes(), covered),
+            None
+        );
     }
 
     #[test]

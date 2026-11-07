@@ -213,6 +213,57 @@ rch workers probe --all
 rch workers probe worker1 --verbose
 ```
 
+### Cargo on Dual-Role Workers
+
+A worker can also run its own agents with `rch shim install` enabled. Once RCH
+has placed a command on that worker, its child environment supplies both
+`RCH_CARGO_WRAPPER_BYPASS=1` and `RCH_CARGO_WRAPPER_ORIGIN=rch`. This applies to
+SSH jobs, nested scripts and `rch-wkr execute`, including disk-supervised jobs.
+The shim continues to reject a caller-set bypass without the managed origin
+when remote execution is required.
+
+An explicit Cargo selector such as `cargo +nightly build` takes precedence over
+leading `RUSTUP_TOOLCHAIN` assignments. RCH consumes that selector when it
+constructs the selected Rustup runner, preserving the remaining Cargo arguments
+so direct toolchain Cargo does not receive a proxy-only `+nightly` argument.
+Cargo Zig builds use the same Rust toolchain admission checks. If environment
+files, split strings or nested command wrappers make the toolchain unresolved,
+RCH refuses Rust admission instead of choosing an ambient toolchain. Clearing
+`RUSTUP_TOOLCHAIN` also requires a later explicit pin for this admission path.
+
+Refresh the worker execution checks before sending builds:
+
+```bash
+rch --json workers capabilities --refresh --command 'cargo test'
+```
+
+On the worker, `rch-wkr capabilities` runs `cargo --version` through PATH and,
+when rustup is available, directly invokes the Cargo reported by
+`rustup which cargo`. Both use the same managed child environment as worker
+execution. The checks share a five-second deadline and a 16 KiB output limit.
+A failed check clears the Rust capability and reports its cause in
+`probe_warnings`; other runtimes and worker connectivity remain independently
+usable. Pinned-toolchain admission also checks both Cargo entry points.
+
+Selection and slot reservation use the same execution requirements. Before
+creating a build owner, the daemon rechecks runtime availability, required
+named tools, exact Node/Bun versions, Rust components and toolchain versions
+against the current capability snapshot. A requested toolchain also requires
+a fresh successful preflight. A refresh that invalidates one of these facts
+causes selection to retry before it spends slots; existing builds retain their
+ownership, and jobs without the failed requirement remain eligible.
+
+Completed toolchain checks belong to the worker connection and lifecycle that
+produced them. Disabling a worker, replacing its endpoint or losing its shared
+transport invalidates both successful and failed checks. After recovery, RCH
+checks the requested toolchain again before reserving slots; reconnecting alone
+cannot reuse a pre-outage success or keep a repaired toolchain excluded.
+
+For `worker Cargo execution check failed`, inspect the reported PATH or
+toolchain failure, update the dispatcher and worker binaries together, and
+repair the worker's Cargo/shim installation as needed. Re-run the capability
+refresh afterward. Do not export bypass markers globally in an agent shell.
+
 ### Updating Workers
 
 ```bash

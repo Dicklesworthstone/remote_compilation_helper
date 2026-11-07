@@ -6,6 +6,9 @@
 //! runs in a fresh process: Rust 2024 environment mutation is never needed.
 #![cfg(unix)]
 
+#[path = "../src/test_util.rs"]
+mod test_util;
+
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
@@ -18,7 +21,6 @@ use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId}
 use rabs_protocol::result_identity::ObjectId;
 use rabsd::coord::live::{CoordLive, ExpectedOutputs, ServeOutcome};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -118,13 +120,14 @@ fn compare(cas: &LiveCas, coord: &CoordLive, original: &OfferPreparedActionResul
 }
 
 fn fixture(stage: u64) -> (tempfile::TempDir, Arc<LiveCas>, Arc<CoordLive>) {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = test_util::private_tempdir();
     let (cas, coord) = open(dir.path());
     let authority = coord.authority().unwrap();
-    let artifact = put(&cas, BYTES);
+    let artifact_bytes = test_util::closed_rlib_fixture(BYTES);
+    let artifact = put(&cas, &artifact_bytes);
     {
         let mut store = cas.store().lock().unwrap();
+        test_util::record_rlib_fixture_closure(&mut *store, &artifact.0, &artifact_bytes);
         install_admission_world(&mut *store, &authority);
         store
             .record_decision_receipt(
@@ -184,7 +187,7 @@ fn installed(coord: &Arc<CoordLive>, destination: &Path) {
     ));
     assert_eq!(
         std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-        BYTES
+        test_util::closed_rlib_fixture(BYTES)
     );
 }
 
@@ -295,7 +298,7 @@ fn live_sprt_concurrent_installers_share_one_qualified_budget() {
                 served += 1;
                 assert_eq!(
                     std::fs::read(destination.join("out/lib.rlib")).unwrap(),
-                    BYTES
+                    test_util::closed_rlib_fixture(BYTES)
                 );
             }
             ServeOutcome::ExecutePrivately(_) => assert!(!destination.exists()),
