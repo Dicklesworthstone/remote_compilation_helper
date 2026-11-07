@@ -2037,6 +2037,93 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
         assert!(out.stderr.is_empty());
     }
 
+    /// Execute the production command builder and generated dual-role shims.
+    /// Rustup alone is a fixture: it models the documented direct handoff.
+    /// The final executable is the real Cargo that compiled this test; only
+    /// --version runs, without a project, registry, compiler, or remote worker.
+    #[cfg(unix)]
+    #[test]
+    fn managed_toolchain_handoff_runs_real_cargo_without_a_proxy_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let bin = root.join("toolchain with 'quotes'/bin");
+        let shims = root.join(".rch/shims");
+        let tools = root.join("tools");
+        for path in [&bin, &shims, &tools] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let direct = bin.join("cargo");
+        write_exe(&direct, &toolchain_wrap_body());
+        write_exe(&shims.join("cargo"), &cargo_shim_body(true));
+        std::os::unix::fs::symlink(env!("CARGO"), bin.join(REAL_CARGO_NAME)).unwrap();
+        write_exe(&tools.join("rch"), "#!/bin/sh\nexit 93\n");
+        write_exe(
+            &tools.join("rustup"),
+            r#"#!/bin/sh
+[ "$1" = run ] && [ "$2" = selected ] || exit 92
+case "$3" in
+    cargo) program=$RCH_SELECTED_CARGO ;;
+    "$RCH_SELECTED_CARGO") program=$3 ;;
+    *) exit 91 ;;
+esac
+printf '%s\000' "$2" >> "$RCH_SELECTOR_LOG"
+RUSTUP_TOOLCHAIN=$2
+export RUSTUP_TOOLCHAIN
+shift 3
+exec "$program" "$@"
+"#,
+        );
+        let selected = root.join("selected.log");
+        let run = |command: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .current_dir(root)
+                .env_clear()
+                .env("HOME", root)
+                .env("PATH", format!("{}:{}:/usr/bin:/bin", shims.display(), tools.display()))
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")
+                .env("RCH_SELECTED_CARGO", &direct)
+                .env("RCH_SELECTOR_LOG", &selected)
+                .output()
+                .unwrap()
+        };
+
+        // The old renderer passed the proxy-only selector to real Cargo.
+        // This counterexample must fail even though authenticated --version
+        // probes of the same direct shim succeed.
+        let broken = run("rustup run selected cargo +selected --version");
+        assert_eq!(broken.status.code(), Some(101), "{broken:?}");
+        assert!(String::from_utf8_lossy(&broken.stderr).contains("no such command"));
+        let version = run("rustup run selected cargo --version");
+        assert!(version.status.success(), "{version:?}");
+        assert!(version.stdout.starts_with(b"cargo "));
+
+        let inherited = rch_common::ToolchainInfo::new("wrong-ambient", None, "");
+        let direct_command = format!(
+            "env 'RUSTUP_TOOLCHAIN=wrong-env' {} '+selected' --version",
+            shell_escape::escape(std::borrow::Cow::Borrowed(direct.to_str().unwrap()))
+        );
+        for command in [
+            "cargo +selected --version",
+            "env 'RUSTUP_TOOLCHAIN=wrong-env' 'cargo' '+selected' --version",
+            direct_command.as_str(),
+        ] {
+            let rendered = rch_common::wrap_command_with_toolchain(command, Some(&inherited));
+            let output = run(&rendered);
+            assert!(output.status.success(), "{rendered}: {output:?}");
+            assert_eq!(output.stdout, version.stdout);
+        }
+        let proxy_command = "cargo +selected --version";
+        let unwrapped = rch_common::wrap_command_with_toolchain(proxy_command, None);
+        assert_eq!(unwrapped, proxy_command);
+        let output = run(&unwrapped);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, version.stdout);
+        assert_eq!(std::fs::read(selected).unwrap(), b"selected\0".repeat(6));
+    }
+
     /// Exercise the generated POSIX shell, not a second routing model. The
     /// boundary stubs record NUL-delimited arguments and policy; no compiler,
     /// installed shim, worker, or process-global environment is touched.

@@ -94,6 +94,13 @@ pub enum RequiredRuntime {
     Zig,
 }
 
+impl RequiredRuntime {
+    /// Cargo cross-compilation still runs with the caller's Rust toolchain.
+    pub fn needs_rust_toolchain(self) -> bool {
+        matches!(self, Self::Rust | Self::Zig)
+    }
+}
+
 /// Per-command priority hint for worker selection.
 ///
 /// This is an *input hint* from the caller (typically the hook) and should not

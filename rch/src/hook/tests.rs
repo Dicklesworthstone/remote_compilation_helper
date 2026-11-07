@@ -18298,44 +18298,64 @@ fn test_structured_log_output_per_tier() {
 /// `<unknown>` for a pinned clippy run.
 #[test]
 fn rustup_toolchain_from_command_tokens_parses_env_prefix_and_selector() {
-    let tokens = |cmd: &str| -> Vec<String> { cmd.split_whitespace().map(String::from).collect() };
+    let tokens = |command: &str| shell_words::split(command).unwrap();
+    for (command, expected) in [
+        (
+            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 CARGO_TARGET_DIR=/data/p/.rch-target cargo clippy --workspace -- -D warnings",
+            Some("nightly-2026-08-25"),
+        ),
+        ("RUSTUP_TOOLCHAIN=stable cargo clippy", Some("stable")),
+        ("cargo +nightly-2026-08-25 clippy", Some("nightly-2026-08-25")),
+        ("/usr/bin/cargo +beta build", Some("beta")),
+        ("env RUSTUP_TOOLCHAIN=stable cargo '+nightly' clippy", Some("nightly")),
+        ("cargo build --features +weird", None),
+        ("cargo test -- RUSTUP_TOOLCHAIN=payload", None),
+        ("go build ./...", None),
+    ] {
+        assert_eq!(
+            rustup_toolchain_from_command_tokens(&tokens(command)),
+            Ok(expected.map(str::to_owned)),
+            "{command}"
+        );
+    }
+    // Whole-command argv takes the same normalization path as execution.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&[
+            "env 'RUSTUP_TOOLCHAIN=stable' cargo '+nightly' build".to_owned(),
+        ]),
+        Ok(Some("nightly".to_owned()))
+    );
+    for command in [
+        "cargo +--help build",
+        "env RUSTUP_TOOLCHAIN=--help cargo build",
+        "RUSTUP_TOOLCHAIN= cargo clippy",
+        "env -u RUSTUP_TOOLCHAIN cargo build",
+        "env -S 'cargo +nightly' build",
+        "env env RUSTUP_TOOLCHAIN=nightly cargo +beta build",
+        "timeout 10 cargo +nightly build",
+    ] {
+        assert!(
+            rustup_toolchain_from_command_tokens(&tokens(command)).is_err(),
+            "unresolved must not become ambient: {command}"
+        );
+    }
+}
 
-    // The exact shape from issue #63.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens(
-            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 \
-             CARGO_TARGET_DIR=/data/p/.rch-target cargo clippy --workspace -- -D warnings"
-        )),
-        Some("nightly-2026-08-25".to_string())
-    );
-    // Bare env-assignment prefix (no `env`).
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN=stable cargo clippy")),
-        Some("stable".to_string())
-    );
-    // `cargo +<tc>` selector, including a path-qualified cargo.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("cargo +nightly-2026-08-25 clippy")),
-        Some("nightly-2026-08-25".to_string())
-    );
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("/usr/bin/cargo +beta build")),
-        Some("beta".to_string())
-    );
-    // A `+`-prefixed token NOT following cargo is an argument, not a selector.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("cargo build --features +weird")),
-        None
-    );
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("go build ./...")),
-        None
-    );
-    // Empty assignment is ignored.
-    assert_eq!(
-        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN= cargo clippy")),
-        None
-    );
+#[test]
+fn rust_and_zig_jobs_require_toolchains_without_reinterpreting_opaque_jobs() {
+    for (command, expected) in [
+        ("cargo build", RequiredRuntime::Rust),
+        ("cargo +nightly clippy", RequiredRuntime::Rust),
+        ("cargo zigbuild", RequiredRuntime::Zig),
+        ("cargo +nightly zigbuild", RequiredRuntime::Zig),
+        ("rustc main.rs", RequiredRuntime::Rust),
+        ("bash ./build.sh", RequiredRuntime::None),
+        ("python3 build.py", RequiredRuntime::None),
+        ("go build ./...", RequiredRuntime::None),
+        ("echo preparing && cargo build", RequiredRuntime::None),
+    ] {
+        assert_eq!(required_runtime_for_job(command), expected, "{command}");
+    }
 }
 
 /// Issue #63(c): explicit `--job` admission counts as strict-remote once

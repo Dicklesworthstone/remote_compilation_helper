@@ -293,7 +293,10 @@ pub use ssh_utils::{
 #[cfg(unix)]
 pub use ssh::{KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use test_change::{TestChangeGuard, TestCodeChange};
-pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
+pub use toolchain::{
+    ToolchainInfo, UnresolvedCommandToolchain, rustup_toolchain_from_command,
+    wrap_command_with_color, wrap_command_with_toolchain,
+};
 pub use transfer_hardening::{
     FirstFailure, RetryDecision, RsyncFailureClass, classify_rsync_outcome, is_ephemeral_path,
 };

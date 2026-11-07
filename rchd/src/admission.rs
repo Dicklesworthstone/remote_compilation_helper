@@ -168,43 +168,23 @@ fn direct_cargo_fmt_check(command: &str) -> bool {
 }
 
 /// Preserve the command-pin precedence used by component admission (issue #63).
-pub(crate) fn toolchain_from_command_text(command: &str) -> Option<String> {
-    let mut prev_is_cargo = false;
-    for raw in command.split_whitespace() {
-        let token = raw.trim_matches(['\'', '"']);
-        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
-            let value = value.trim_matches(['\'', '"']);
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if prev_is_cargo
-            && let Some(value) = token.strip_prefix('+')
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-        prev_is_cargo = token == "cargo"
-            || token
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "cargo");
-    }
-    None
+pub(crate) fn toolchain_from_command_text(
+    command: &str,
+) -> Result<Option<String>, rch_common::UnresolvedCommandToolchain> {
+    rch_common::rustup_toolchain_from_command(command)
 }
 
 /// A command's own pin governs its component requirements before the project
 /// toolchain, including job requests that do not carry project toolchain data.
 pub(crate) fn required_component_toolchain(request: &SelectionRequest) -> Option<String> {
-    request
-        .command
-        .as_deref()
-        .and_then(toolchain_from_command_text)
-        .or_else(|| {
-            request
-                .toolchain
-                .as_ref()
-                .map(ToolchainInfo::rustup_toolchain)
-        })
+    match request.command.as_deref().map(toolchain_from_command_text) {
+        Some(Ok(Some(name))) => Some(name),
+        Some(Err(_)) => None,
+        _ => request
+            .toolchain
+            .as_ref()
+            .map(ToolchainInfo::rustup_toolchain),
+    }
 }
 
 /// The first unverified named tool or exact runtime version. Preserve the
@@ -652,6 +632,33 @@ mod tests {
     use crate::headroom::HeadroomConfig;
     use crate::history::BuildHistory;
     use rch_common::{BuildLocation, BuildRecord, WorkerConfig, test_guard};
+
+    #[test]
+    fn component_admission_distinguishes_absent_and_unresolved_command_pins() {
+        for (command, expected) in [
+            ("RUSTUP_TOOLCHAIN=stable cargo +nightly clippy", Some("nightly")),
+            ("env 'RUSTUP_TOOLCHAIN=beta' cargo clippy", Some("beta")),
+            ("cargo clippy -- RUSTUP_TOOLCHAIN=payload", Some("project-pin")),
+            ("cargo +--help clippy", None),
+            ("env RUSTUP_TOOLCHAIN=--help cargo clippy", None),
+            ("env -u RUSTUP_TOOLCHAIN cargo clippy", None),
+            ("env env RUSTUP_TOOLCHAIN=nightly cargo clippy", None),
+            ("timeout 10 cargo +nightly clippy", None),
+        ] {
+            let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+                "project": "command-pin-test",
+                "estimated_cores": 1,
+                "command": command,
+                "toolchain": ToolchainInfo::new("project-pin", None, ""),
+            }))
+            .unwrap();
+            assert_eq!(
+                required_component_toolchain(&request),
+                expected.map(str::to_owned),
+                "{command}"
+            );
+        }
+    }
 
     fn make_assessment(state: PressureState, disk_free_gb: Option<f64>) -> PressureAssessment {
         PressureAssessment {

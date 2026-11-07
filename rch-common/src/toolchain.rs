@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::ops::Range;
 
 use crate::ssh_utils::is_valid_env_key;
 use crate::types::ColorMode;
@@ -49,6 +50,12 @@ impl ToolchainInfo {
         }
     }
 
+    /// Whether the name can be passed as a Rustup positional argument.
+    /// Installation and compiler compatibility still require worker preflight.
+    pub fn is_valid_rustup_argument(&self) -> bool {
+        valid_toolchain_argument(&self.rustup_toolchain())
+    }
+
     /// Check if this is a nightly toolchain.
     pub fn is_nightly(&self) -> bool {
         self.channel == "nightly"
@@ -71,10 +78,235 @@ impl std::fmt::Display for ToolchainInfo {
     }
 }
 
+/// A literal toolchain pin on the command being executed. Rustup gives an
+/// immediate Cargo +toolchain selector precedence over environment settings.
+/// Only leading assignments belong to that environment; assignment-looking
+/// Cargo arguments and nested shell commands are not toolchain declarations.
+///
+/// # Errors
+/// Returns an error when expansion or an opaque prefix makes the pin unknown.
+/// Callers must distinguish this from a command that inherits its toolchain.
+pub fn rustup_toolchain_from_command(
+    command: &str,
+) -> Result<Option<String>, UnresolvedCommandToolchain> {
+    command_toolchain(command)
+        .map(|pin| pin.name)
+        .ok_or(UnresolvedCommandToolchain)
+}
+
+/// An opaque command cannot be safely assigned an ambient Rust toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnresolvedCommandToolchain;
+
+impl std::fmt::Display for UnresolvedCommandToolchain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command toolchain depends on an unresolved shell or environment prefix")
+    }
+}
+
+impl std::error::Error for UnresolvedCommandToolchain {}
+
+struct CommandToolchain {
+    name: Option<String>,
+    selector: Option<Range<usize>>,
+}
+
+fn command_toolchain(command: &str) -> Option<CommandToolchain> {
+    let (executable, mut name, cleared) = literal_command_prefix(command)?;
+    let (_, executable_end) = next_shell_token_span(command, executable)?;
+    let program = literal_shell_word(command.get(executable..executable_end)?)?;
+    if matches!(
+        program.rsplit('/').next(),
+        Some(
+            "sudo" | "env" | "time" | "timeout" | "nice" | "ionice" | "chrt"
+                | "strace" | "ltrace" | "perf" | "taskset" | "numactl" | "sh"
+                | "bash" | "dash" | "zsh" | "command" | "exec"
+        )
+    ) {
+        return None;
+    }
+    let mut selector = None;
+    if program.rsplit('/').next() == Some("cargo")
+        && next_shell_token_span(command, executable_end).is_some()
+    {
+        let (start, end) = next_command_prefix_token(command, executable_end)?;
+        let argument = literal_shell_word(command.get(start..end)?)?;
+        if let Some(selected) = argument.strip_prefix('+') {
+            if selected.is_empty() {
+                return None;
+            }
+            name = Some(selected.to_owned());
+            selector = Some(executable_end..end);
+        }
+    }
+    if (name.is_none() && cleared)
+        || name.as_deref().is_some_and(|name| !valid_toolchain_argument(name))
+    {
+        return None;
+    }
+    Some(CommandToolchain { name, selector })
+}
+
+fn valid_toolchain_argument(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+/// Find the executable after literal POSIX assignments and an optional env.
+/// This does not evaluate expansion, env split-string options, or env files.
+/// Unknown prefixes cannot authorize rewriting a selector hidden inside them.
+fn literal_command_prefix(command: &str) -> Option<(usize, Option<String>, bool)> {
+    let mut cursor = 0;
+    let mut toolchain = None;
+    let mut cleared = false;
+    let (start, end) = loop {
+        let (start, end) = next_command_prefix_token(command, cursor)?;
+        let token = command.get(start..end)?;
+        if let Some((key, value)) = token.split_once('=')
+            && is_valid_env_key(key)
+        {
+            let value = literal_shell_word(value)?;
+            if key == "RUSTUP_TOOLCHAIN" {
+                cleared = value.is_empty();
+                toolchain = (!value.is_empty()).then(|| value.into_owned());
+            }
+            cursor = end;
+        } else {
+            break (start, end);
+        }
+    };
+    let program = literal_shell_word(command.get(start..end)?)?;
+    if program.rsplit('/').next() != Some("env") {
+        return Some((start, toolchain, cleared));
+    }
+
+    cursor = end;
+    let mut options = true;
+    loop {
+        let (start, end) = next_command_prefix_token(command, cursor)?;
+        let token = literal_shell_word(command.get(start..end)?)?;
+        cursor = end;
+        if options {
+            match token.as_ref() {
+                "--" => {
+                    options = false;
+                    continue;
+                }
+                "-" | "-i" | "--ignore-environment" => {
+                    toolchain = None;
+                    cleared = true;
+                    continue;
+                }
+                "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
+                    let (value_start, value_end) = next_command_prefix_token(command, cursor)?;
+                    let value = literal_shell_word(command.get(value_start..value_end)?)?;
+                    if matches!(token.as_ref(), "-u" | "--unset")
+                        && value == "RUSTUP_TOOLCHAIN"
+                    {
+                        toolchain = None;
+                        cleared = true;
+                    }
+                    cursor = value_end;
+                    continue;
+                }
+                _ if token.starts_with("--unset=") || token.starts_with("-u") => {
+                    let key = token
+                        .strip_prefix("--unset=")
+                        .or_else(|| token.strip_prefix("-u"))?;
+                    if key == "RUSTUP_TOOLCHAIN" {
+                        toolchain = None;
+                        cleared = true;
+                    }
+                    continue;
+                }
+                _ if token.starts_with("--chdir=")
+                    || token.starts_with("--argv0=")
+                    || token.starts_with("-C")
+                    || token.starts_with("-a") =>
+                {
+                    continue;
+                }
+                _ if token.starts_with('-') => return None,
+                _ => {}
+            }
+        }
+        if let Some((key, value)) = token.split_once('=')
+            && is_valid_env_key(key)
+        {
+            options = false;
+            if key == "RUSTUP_TOOLCHAIN" {
+                cleared = value.is_empty();
+                toolchain = (!value.is_empty()).then(|| value.to_owned());
+            }
+        } else {
+            return Some((start, toolchain, cleared));
+        }
+    }
+}
+
+fn next_command_prefix_token(command: &str, offset: usize) -> Option<(usize, usize)> {
+    let span = next_shell_token_span(command, offset)?;
+    let horizontal_gap = command
+        .get(offset..span.0)?
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t'));
+    let boundary = command.get(span.1..)?.chars().next();
+    let shell_boundary = boundary.is_none_or(|ch| matches!(ch, ' ' | '\t' | '\n'));
+    (horizontal_gap && shell_boundary).then_some(span)
+}
+
+/// Decode one literal word without shell expansion. Ordinary words borrow the
+/// input; quoting is decoded only to identify a pin, never to reconstruct argv.
+fn literal_shell_word(word: &str) -> Option<Cow<'_, str>> {
+    if !word.contains([
+        '\'', '"', '\\', '$', '\u{60}', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[',
+        ']', '{', '}', '~', '#',
+    ]) {
+        return Some(Cow::Borrowed(word));
+    }
+    let mut decoded = String::with_capacity(word.len());
+    let mut quote = None;
+    let mut chars = word.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => decoded.push(ch),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None | Some('"'), '$' | '\u{60}') => return None,
+            (
+                None,
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{'
+                | '}' | '~' | '#',
+            ) => return None,
+            (None, '\\') => {
+                let escaped = chars.next()?;
+                if escaped != '\n' {
+                    decoded.push(escaped);
+                }
+            }
+            (Some('"'), '\\') => {
+                let escaped = chars.next()?;
+                if !matches!(escaped, '$' | '\u{60}' | '"' | '\\' | '\n') {
+                    decoded.push('\\');
+                }
+                if escaped != '\n' {
+                    decoded.push(escaped);
+                }
+            }
+            _ => decoded.push(ch),
+        }
+    }
+    quote.is_none().then_some(Cow::Owned(decoded))
+}
+
 /// Wrap a command to run with a specific toolchain.
 ///
 /// If toolchain is provided, wraps the command with `rustup run <toolchain>`.
-/// Otherwise returns the original command unchanged. An explicit
+/// A literal command pin takes precedence, and an immediate Cargo selector is
+/// consumed by that handoff. Opaque commands remain unchanged; callers must
+/// reject unresolved Rust toolchains before admission. Without a toolchain,
+/// the original command retains its selector for the proxy. An explicit
 /// `RCH_RABS_WORKER_CACHE=1` on the command-building process additionally
 /// prepares worker-local RABS for literal Cargo commands. Preparation runs
 /// after environment prefixes, preserving the original toolchain runner and
@@ -88,28 +320,54 @@ fn wrap_command_with_toolchain_policy(
     toolchain: Option<&ToolchainInfo>,
     worker_cache: bool,
 ) -> String {
+    let explicit = toolchain.and_then(|_| command_toolchain(command));
+    if toolchain.is_some() && explicit.is_none() && !command.is_empty() {
+        // Admission must reject unresolved Rust pins. Do not reinterpret an
+        // opaque command if another caller reaches this lower-level renderer.
+        return command.to_owned();
+    }
+    let selected = toolchain.map(|tc| {
+        explicit
+            .as_ref()
+            .and_then(|pin| pin.name.clone())
+            .unwrap_or_else(|| tc.rustup_toolchain())
+    });
+    if selected.as_deref().is_some_and(|name| !valid_toolchain_argument(name)) {
+        return command.to_owned();
+    }
+    // Rustup run executes toolchain Cargo directly. The + argument belongs to
+    // its proxy, not to Cargo or an authenticated direct toolchain shim.
+    let command = if let Some(selector) = explicit.as_ref().and_then(|pin| pin.selector.as_ref()) {
+        Cow::Owned(format!(
+            "{}{}",
+            &command[..selector.start],
+            &command[selector.end..]
+        ))
+    } else {
+        Cow::Borrowed(command)
+    };
     let cache_runner = worker_cache
-        .then(|| worker_cache::runner_for(command))
+        .then(|| worker_cache::runner_for(&command))
         .flatten();
     if let Some(cache_runner) = cache_runner {
-        let runner = match toolchain {
-            Some(tc) => format!(
+        let runner = match selected {
+            Some(name) => format!(
                 "{cache_runner} rustup run {}",
-                shell_escape::escape(Cow::Owned(tc.rustup_toolchain()))
+                shell_escape::escape(Cow::Owned(name))
             ),
             None => cache_runner,
         };
-        return insert_toolchain_runner(command, &runner);
+        return insert_toolchain_runner(&command, &runner);
     }
-    match toolchain {
-        Some(tc) => insert_toolchain_runner(
-            command,
+    match selected {
+        Some(name) => insert_toolchain_runner(
+            &command,
             &format!(
                 "rustup run {}",
-                shell_escape::escape(Cow::Owned(tc.rustup_toolchain()))
+                shell_escape::escape(Cow::Owned(name))
             ),
         ),
-        None => command.to_string(),
+        None => command.into_owned(),
     }
 }
 
@@ -135,6 +393,9 @@ fn insert_toolchain_runner(command: &str, runner: &str) -> String {
 }
 
 fn toolchain_runner_insert_index(command: &str) -> usize {
+    if let Some((executable, _, _)) = literal_command_prefix(command) {
+        return executable;
+    }
     let Some((start, end)) = next_shell_token_span(command, 0) else {
         return command.len();
     };
@@ -412,6 +673,141 @@ mod tests {
     }
 
     #[test]
+    fn command_pin_uses_rustup_precedence_and_only_leading_assignments() {
+        for (command, expected) in [
+            ("cargo build", None),
+            ("RUSTUP_TOOLCHAIN=--help cargo +nightly build", Some("nightly")),
+            ("RUSTUP_TOOLCHAIN=stable cargo build", Some("stable")),
+            ("env 'RUSTUP_TOOLCHAIN=stable' cargo build", Some("stable")),
+            (
+                "env RUSTUP_TOOLCHAIN=stable RUSTUP_TOOLCHAIN=beta cargo build",
+                Some("beta"),
+            ),
+            (
+                "RUSTUP_TOOLCHAIN=stable cargo +nightly clippy",
+                Some("nightly"),
+            ),
+            (
+                "env -u RUSTUP_TOOLCHAIN -- 'RUSTUP_TOOLCHAIN=beta' 'cargo' '+nightly-2026-08-31' test",
+                Some("nightly-2026-08-31"),
+            ),
+            ("'/tools with spaces/cargo' \"+custom\" check", Some("custom")),
+            ("cargo test -- RUSTUP_TOOLCHAIN=payload", None),
+            ("cargo build --features +payload", None),
+            ("printf cargo +payload", None),
+            ("env -i cargo +nightly build", Some("nightly")),
+            ("env -u RUSTUP_TOOLCHAIN RUSTUP_TOOLCHAIN=beta cargo build", Some("beta")),
+            ("env RUSTUP_TOOLCHAIN= cargo +nightly build", Some("nightly")),
+        ] {
+            assert_eq!(
+                rustup_toolchain_from_command(command),
+                Ok(expected.map(str::to_owned)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_command_pins_cannot_become_ambient_toolchain_requests() {
+        let tc = ToolchainInfo::new("stable", None, "");
+        for command in [
+            "cargo +",
+            "sh -c 'cargo +nested build'",
+            "env env RUSTUP_TOOLCHAIN=nightly cargo +beta build",
+            "RUSTUP_TOOLCHAIN=stable env env cargo +beta build",
+            "timeout 10 cargo +nightly build",
+            "env -u RUSTUP_TOOLCHAIN cargo build",
+            "env -i cargo build",
+            "RUSTUP_TOOLCHAIN= cargo build",
+            "env RUSTUP_TOOLCHAIN=stable RUSTUP_TOOLCHAIN= cargo build",
+            "cargo\u{a0}+nightly build",
+            "cargo +nightly\u{a0}build",
+            "cargo +nightly\r",
+            "cargo +--help build",
+            "env RUSTUP_TOOLCHAIN=--help cargo build",
+            "RUSTUP_TOOLCHAIN=--version cargo build",
+            "cargo +$CHANNEL build",
+            "cargo \"+$CHANNEL\" build",
+            "RUSTUP_TOOLCHAIN=$CHANNEL cargo build",
+            "env -S 'cargo +nightly' build",
+            "env --split-string='cargo +nightly' build",
+            "env -f .env cargo +nightly build",
+            "env --file=.env cargo +nightly build",
+            "FLAG=1; cargo +nightly build",
+            "RUSTUP_TOOLCHAIN=stable\ncargo +nightly build",
+            "cargo\n+nightly build",
+        ] {
+            assert_eq!(
+                rustup_toolchain_from_command(command),
+                Err(UnresolvedCommandToolchain),
+                "{command}"
+            );
+            for cache in [false, true] {
+                assert_eq!(
+                    wrap_command_with_toolchain_policy(command, Some(&tc), cache),
+                    command,
+                    "opaque command must retain its original interpretation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toolchain_handoff_consumes_only_the_immediate_cargo_selector() {
+        let tc = ToolchainInfo::new("wrong-ambient", None, "");
+        for (command, expected) in [
+            (
+                "RUSTUP_TOOLCHAIN=stable cargo +nightly clippy -- -D warnings",
+                "RUSTUP_TOOLCHAIN=stable rustup run nightly cargo clippy -- -D warnings",
+            ),
+            (
+                "env 'RUSTUP_TOOLCHAIN=stable' 'cargo' '+nightly' test -- 'a b' '$(false)' RUSTUP_TOOLCHAIN=payload",
+                "env 'RUSTUP_TOOLCHAIN=stable' rustup run nightly 'cargo' test -- 'a b' '$(false)' RUSTUP_TOOLCHAIN=payload",
+            ),
+            (
+                "'/tools with spaces/cargo'\t\"+custom\"\t--version",
+                "rustup run custom '/tools with spaces/cargo'\t--version",
+            ),
+            (
+                "RUSTUP_TOOLCHAIN=beta cargo test --features '+payload'",
+                "RUSTUP_TOOLCHAIN=beta rustup run beta cargo test --features '+payload'",
+            ),
+            (
+                "cargo +nightly\nprintf unchanged",
+                "rustup run nightly cargo\nprintf unchanged",
+            ),
+            ("cargo +nightly", "rustup run nightly cargo"),
+            (
+                "env 'LABEL=日本語' '/工具/cargo' '+nightly' --version",
+                "env 'LABEL=日本語' rustup run nightly '/工具/cargo' --version",
+            ),
+        ] {
+            assert_eq!(
+                wrap_command_with_toolchain_policy(command, Some(&tc), false),
+                expected,
+                "{command}"
+            );
+            assert_eq!(
+                wrap_command_with_toolchain_policy(command, None, false),
+                command,
+                "the proxy still owns its selector without a Rustup handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_supplied_toolchain_cannot_turn_a_build_into_rustup_help() {
+        for name in ["--help", "-V", "", "nightly\n", "nightly bad"] {
+            let tc = ToolchainInfo::new(name, None, "");
+            assert!(!tc.is_valid_rustup_argument());
+            assert_eq!(
+                wrap_command_with_toolchain_policy("cargo build", Some(&tc), false),
+                "cargo build"
+            );
+        }
+    }
+
+    #[test]
     fn test_wrap_command_with_toolchain() {
         let tc = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
         let wrapped = wrap_command_with_toolchain("cargo build", Some(&tc));
@@ -448,12 +844,12 @@ mod tests {
     fn test_wrap_command_with_toolchain_preserves_env_options_with_operands() {
         let tc = ToolchainInfo::new("stable", None, "");
         let wrapped = wrap_command_with_toolchain(
-            "env -C \"/tmp/project dir\" -f .env RUSTFLAGS=-Awarnings cargo test",
+            "env -C \"/tmp/project dir\" RUSTFLAGS=-Awarnings cargo test",
             Some(&tc),
         );
         assert_eq!(
             wrapped,
-            "env -C \"/tmp/project dir\" -f .env RUSTFLAGS=-Awarnings rustup run stable cargo test"
+            "env -C \"/tmp/project dir\" RUSTFLAGS=-Awarnings rustup run stable cargo test"
         );
     }
 
@@ -461,20 +857,20 @@ mod tests {
     fn test_wrap_command_with_toolchain_preserves_env_options_with_inline_operands() {
         let tc = ToolchainInfo::new("stable", None, "");
         let wrapped = wrap_command_with_toolchain(
-            "env --chdir=\"/tmp/project dir\" --file=.env RUSTFLAGS=-Awarnings cargo test",
+            "env --chdir=\"/tmp/project dir\" RUSTFLAGS=-Awarnings cargo test",
             Some(&tc),
         );
         assert_eq!(
             wrapped,
-            "env --chdir=\"/tmp/project dir\" --file=.env RUSTFLAGS=-Awarnings rustup run stable cargo test"
+            "env --chdir=\"/tmp/project dir\" RUSTFLAGS=-Awarnings rustup run stable cargo test"
         );
     }
 
     #[test]
     fn test_wrap_command_with_toolchain_quotes_toolchain_name() {
-        let tc = ToolchainInfo::new("nightly;echo injected", None, "");
+        let tc = ToolchainInfo::new("nightly;echo_injected", None, "");
         let wrapped = wrap_command_with_toolchain("cargo build", Some(&tc));
-        assert_eq!(wrapped, "rustup run 'nightly;echo injected' cargo build");
+        assert_eq!(wrapped, "rustup run 'nightly;echo_injected' cargo build");
     }
 
     #[test]

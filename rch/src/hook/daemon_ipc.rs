@@ -369,16 +369,10 @@ fn unresolved_toolchain_refusal(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
 ) -> Option<SelectionResponse> {
-    if required_runtime != RequiredRuntime::Rust {
+    if !required_runtime.needs_rust_toolchain() {
         return None;
     }
-    if toolchain.is_some_and(|info| {
-        !info.channel.is_empty()
-            && !info
-                .rustup_toolchain()
-                .chars()
-                .any(|ch| ch.is_whitespace() || ch.is_control())
-    }) {
+    if toolchain.is_some_and(ToolchainInfo::is_valid_rustup_argument) {
         return None;
     }
     Some(SelectionResponse {
@@ -1472,17 +1466,25 @@ mod bounded_ipc_tests {
     }
 
     #[tokio::test]
-    async fn unresolved_rust_queries_never_connect_or_create_a_queue_owner() {
+    async fn unresolved_rust_and_zig_queries_never_connect_or_create_a_queue_owner() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selection.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        for toolchain in [
-            None,
-            Some(ToolchainInfo::new("", None, "")),
-            Some(ToolchainInfo::new("nightly bad", None, "")),
-            Some(ToolchainInfo::new("nightly\0", None, "")),
-        ] {
+        for (runtime, toolchain) in [RequiredRuntime::Rust, RequiredRuntime::Zig]
+            .into_iter()
+            .flat_map(|runtime| {
+                [
+                    None,
+                    Some(ToolchainInfo::new("", None, "")),
+                    Some(ToolchainInfo::new("nightly bad", None, "")),
+                    Some(ToolchainInfo::new("nightly\0", None, "")),
+                    Some(ToolchainInfo::new("--help", None, "")),
+                ]
+                .into_iter()
+                .map(move |toolchain| (runtime, toolchain))
+            })
+        {
             for wait in [false, true] {
                 let response = query_daemon(
                     path.to_str().unwrap(),
@@ -1491,7 +1493,7 @@ mod bounded_ipc_tests {
                     0,
                     "cargo build",
                     toolchain.as_ref(),
-                    RequiredRuntime::Rust,
+                    runtime,
                     CommandPriority::Normal,
                     0,
                     None,
@@ -1523,7 +1525,7 @@ mod bounded_ipc_tests {
                 0,
                 "cargo build",
                 toolchain.as_ref(),
-                RequiredRuntime::Rust,
+                runtime,
                 &[],
                 None,
             )
@@ -1542,11 +1544,20 @@ mod bounded_ipc_tests {
     }
 
     #[test]
-    fn toolchain_preflight_is_rust_specific_and_does_not_rewrite_an_identity() {
-        assert!(unresolved_toolchain_refusal(None, RequiredRuntime::None).is_none());
+    fn toolchain_preflight_is_cargo_specific_and_does_not_rewrite_an_identity() {
+        for runtime in [
+            RequiredRuntime::None,
+            RequiredRuntime::Bun,
+            RequiredRuntime::Node,
+            RequiredRuntime::Nix,
+            RequiredRuntime::Go,
+        ] {
+            assert!(unresolved_toolchain_refusal(None, runtime).is_none());
+        }
         for name in ["stable", "nightly-2026-08-31", "custom-with-checks"] {
             let info = ToolchainInfo::new(name, None, "diagnostic compiler version");
             assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Rust).is_none());
+            assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Zig).is_none());
             assert_eq!(info.rustup_toolchain(), name);
         }
         let info = ToolchainInfo::new("nightly", Some("2026-08-31\n".into()), "");

@@ -222,6 +222,15 @@ SSH jobs, nested scripts and `rch-wkr execute`, including disk-supervised jobs.
 The shim continues to reject a caller-set bypass without the managed origin
 when remote execution is required.
 
+An explicit Cargo selector such as `cargo +nightly build` takes precedence over
+leading `RUSTUP_TOOLCHAIN` assignments. RCH consumes that selector when it
+constructs the selected Rustup runner, preserving the remaining Cargo arguments
+so direct toolchain Cargo does not receive a proxy-only `+nightly` argument.
+Cargo Zig builds use the same Rust toolchain admission checks. If environment
+files, split strings or nested command wrappers make the toolchain unresolved,
+RCH refuses Rust admission instead of choosing an ambient toolchain. Clearing
+`RUSTUP_TOOLCHAIN` also requires a later explicit pin for this admission path.
+
 Refresh the worker execution checks before sending builds:
 
 ```bash

@@ -969,29 +969,11 @@ fn env_flag_enabled(value: &str) -> bool {
 
 /// The rustup toolchain explicitly requested inside a delegated command: an
 /// env-style `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind
-/// `env`) or a `cargo +<name>` selector (issue #63). Returns the first match.
-fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
-    let mut prev_is_cargo = false;
-    for token in tokens {
-        let token = token.trim_matches(['\'', '"']);
-        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
-            let value = value.trim_matches(['\'', '"']);
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if prev_is_cargo
-            && let Some(value) = token.strip_prefix('+')
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-        prev_is_cargo = token == "cargo"
-            || token
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "cargo");
-    }
-    None
+/// `env`) or a higher-priority `cargo +<name>` selector (issues #63, #133).
+fn rustup_toolchain_from_command_tokens(
+    tokens: &[String],
+) -> Result<Option<String>, rch_common::UnresolvedCommandToolchain> {
+    rch_common::rustup_toolchain_from_command(&join_exec_command(tokens))
 }
 
 /// rchd's select-worker refusal while a restart holds admission closed.
@@ -5217,30 +5199,31 @@ pub async fn run_exec(
     // `capability_missing:rustup_component:<unknown>:clippy` and the build
     // silently ran locally. Derive the toolchain for Rust-shaped job commands
     // exactly like the classified rail does.
-    let job_needs_rust_toolchain = job
-        && matches!(
-            required_runtime_for_kind(classify_command(&command).kind),
-            RequiredRuntime::Rust
-        );
-    let needs_rust_toolchain = clean_overlay_fmt_check
-        || matches!(
-            required_runtime_for_kind(classification.kind),
-            RequiredRuntime::Rust
-        )
-        || job_needs_rust_toolchain;
+    let required_runtime = if clean_overlay_fmt_check {
+        RequiredRuntime::Rust
+    } else if job {
+        required_runtime_for_job(&command)
+    } else {
+        required_runtime_for_kind(classification.kind)
+    };
+    let needs_rust_toolchain = required_runtime.needs_rust_toolchain();
     let toolchain = if needs_rust_toolchain {
-        if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
+        match rustup_toolchain_from_command_tokens(&command_parts) {
             // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
             // command outranks the ambient project toolchain (rustup's own
             // precedence), so preflight and the component gate must check the
             // toolchain the remote cargo will actually use (issue #63).
-            parse_channel_string(&name).ok()
-        } else if let Some(spec) = clean_overlay_spec.as_ref() {
-            detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
-        } else {
-            project_root
-                .as_ref()
-                .and_then(|root| detect_toolchain(root).ok())
+            Ok(Some(name)) => parse_channel_string(&name).ok(),
+            Ok(None) => {
+                if let Some(spec) = clean_overlay_spec.as_ref() {
+                    detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
+                } else {
+                    project_root
+                        .as_ref()
+                        .and_then(|root| detect_toolchain(root).ok())
+                }
+            }
+            Err(_) => None,
         }
     } else {
         None
@@ -5265,12 +5248,6 @@ pub async fn run_exec(
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
     );
 
-    // Determine required runtime
-    let required_runtime = if clean_overlay_fmt_check {
-        RequiredRuntime::Rust
-    } else {
-        required_runtime_for_kind(classification.kind)
-    };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
     // A CLI pin is a singleton admission constraint, never the environment /
@@ -7990,6 +7967,21 @@ fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<St
             ));
             None
         }
+    }
+}
+
+/// Only directly classified Rust jobs inherit Cargo/toolchain admission.
+/// Opaque jobs retain their explicit-tool requirements and original command.
+fn required_runtime_for_job(command: &str) -> RequiredRuntime {
+    let classification = classify_command(command);
+    if classification.command_prefix.is_some() {
+        return RequiredRuntime::None;
+    }
+    let runtime = required_runtime_for_kind(classification.kind);
+    if runtime.needs_rust_toolchain() {
+        runtime
+    } else {
+        RequiredRuntime::None
     }
 }
 

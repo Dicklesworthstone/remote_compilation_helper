@@ -6556,7 +6556,9 @@ mod tests {
         request.toolchain = None;
 
         assert_eq!(
-            toolchain_from_command_text(request.command.as_deref().unwrap()).as_deref(),
+            toolchain_from_command_text(request.command.as_deref().unwrap())
+                .unwrap()
+                .as_deref(),
             Some("nightly-2026-08-25")
         );
         assert_eq!(
@@ -6602,13 +6604,15 @@ mod tests {
 
         // `cargo +<tc>` selector form.
         assert_eq!(
-            toolchain_from_command_text("cargo +nightly-2026-08-25 clippy --workspace").as_deref(),
+            toolchain_from_command_text("cargo +nightly-2026-08-25 clippy --workspace")
+                .unwrap()
+                .as_deref(),
             Some("nightly-2026-08-25")
         );
         // A `+` token that does not follow cargo is not a selector.
         assert_eq!(
             toolchain_from_command_text("cargo build --features +weird"),
-            None
+            Ok(None)
         );
 
         // Completely underived toolchain still fails closed as before.
