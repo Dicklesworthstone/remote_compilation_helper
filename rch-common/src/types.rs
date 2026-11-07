@@ -1624,6 +1624,9 @@ impl PathTopologyConfig {
 pub struct RchConfig {
     #[serde(default)]
     pub general: GeneralConfig,
+    /// Bounded slow-path control deadlines shared by client and daemon.
+    #[serde(default)]
+    pub timeouts: crate::timing::TimeoutsConfig,
     #[serde(default)]
     pub compilation: CompilationConfig,
     #[serde(default)]

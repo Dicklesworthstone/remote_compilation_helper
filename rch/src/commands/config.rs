@@ -1,6 +1,7 @@
 //! Configuration command implementations.
 
 use anyhow::{Context, Result};
+use rch_common::timing::TimingScaleError;
 use rch_common::{ApiResponse, ConfigValueSource, RchConfig};
 use std::path::{Path, PathBuf};
 
@@ -14,11 +15,12 @@ use super::types::{
     ConfigCircuitSection, ConfigCompilationSection, ConfigDiffEntry, ConfigDiffResponse,
     ConfigEnvironmentSection, ConfigGeneralSection, ConfigGetResponse, ConfigLintResponse,
     ConfigOutputSection, ConfigResetResponse, ConfigSelfHealingSection, ConfigSetResponse,
-    ConfigShowResponse, ConfigTransferSection, ConfigValidationIssue, ConfigValidationResponse,
-    ConfigValueSourceInfo, LintIssue, LintSeverity,
+    ConfigShowResponse, ConfigTimeoutsSection, ConfigTransferSection, ConfigValidationIssue,
+    ConfigValidationResponse, ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
 const SUPPORTED_CONFIG_KEYS: &str = concat!(
+    "timeouts.scale, ",
     "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url, ",
     "selection.disk_critical_free_ratio, selection.disk_critical_ratio_cap_gb, ",
     "circuit.failure_threshold, circuit.down_after_failures, circuit.success_threshold, circuit.error_rate_threshold, circuit.window_secs, circuit.open_cooldown_secs, circuit.half_open_max_probes, circuit.command_failure_threshold, circuit.open_cooldown_max_secs, circuit.recovery_probe_interval_secs"
@@ -122,6 +124,9 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 force_remote: config.general.force_remote,
                 log_level: config.general.log_level.clone(),
                 socket_path: config.general.socket_path.clone(),
+            },
+            timeouts: ConfigTimeoutsSection {
+                scale: f64::from(config.timeouts.scale),
             },
             compilation: ConfigCompilationSection {
                 confidence_threshold: config.compilation.confidence_threshold,
@@ -249,6 +254,17 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "general.socket_path",
             &style.value(&format!("\"{}\"", config.general.socket_path)),
+            &value_sources
+        )
+    );
+
+    println!("\n{}", style.highlight("[timeouts]"));
+    println!(
+        "  {} = {}",
+        style.key("scale"),
+        format_with_source(
+            "timeouts.scale",
+            &style.value(&config.timeouts.scale.env_value()),
             &value_sources
         )
     );
@@ -881,6 +897,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "timeouts.scale",
+        config.timeouts.scale.env_value(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "compilation.confidence_threshold",
         config.compilation.confidence_threshold.to_string(),
         sources,
@@ -1422,6 +1444,15 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
     };
 
     match key {
+        "timeouts.scale" => {
+            config.timeouts.scale = value.parse().map_err(|error: TimingScaleError| {
+                ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason: error.to_string(),
+                    suggestion: "Use a finite scale from 1.0 through 10.0".to_string(),
+                }
+            })?;
+        }
         "general.role" => {
             config.general.role = match value.trim().trim_matches('"') {
                 "dispatcher" => rch_common::BoxRole::Dispatcher,
@@ -1751,6 +1782,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
 
     let defaults = RchConfig::default();
     let value = match key {
+        "timeouts.scale" => {
+            config.timeouts = defaults.timeouts;
+            config.timeouts.scale.env_value()
+        }
         "general.role" => {
             config.general.role = defaults.general.role;
             config.general.role.as_str().to_string()
@@ -2017,6 +2052,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("# RCH configuration export");
             println!("# Source this file: source <(rch config export)");
             println!();
+            println!("export RCH_TIMING_SCALE={}", config.timeouts.scale.env_value());
             println!("export RCH_ENABLED={}", config.general.enabled);
             println!("export RCH_LOG_LEVEL=\"{}\"", config.general.log_level);
             println!("export RCH_VISIBILITY=\"{}\"", config.output.visibility);
@@ -2070,6 +2106,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("# RCH configuration");
             println!("# Save to .rch.env in your project");
             println!();
+            println!("RCH_TIMING_SCALE={}", config.timeouts.scale.env_value());
             println!("RCH_ENABLED={}", config.general.enabled);
             println!("RCH_LOG_LEVEL={}", config.general.log_level);
             println!("RCH_VISIBILITY={}", config.output.visibility);
@@ -2120,6 +2157,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             ctx.json_force(&ApiResponse::ok(
                 "config export",
                 serde_json::json!({
+                    "timeouts": config.timeouts,
                     "general": {
                         "enabled": config.general.enabled,
                         "log_level": config.general.log_level,
@@ -2602,6 +2640,13 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         &config.general.socket_path,
         &defaults.general.socket_path,
         "general.socket_path"
+    );
+
+    diff_field!(
+        "timeouts.scale",
+        config.timeouts.scale.env_value(),
+        defaults.timeouts.scale.env_value(),
+        "timeouts.scale"
     );
 
     // Compilation section
@@ -3253,6 +3298,57 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn timing_scale_set_get_reset_and_rejected_values_preserve_config() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let key = "timeouts.scale";
+        apply_config_set(&path, "compilation.build_timeout_sec", "777").unwrap();
+        for value in ["1", "2.5", "10"] {
+            apply_config_set(&path, key, value).unwrap();
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            let current: RchConfig = toml::from_str(&bytes).unwrap();
+            let sources = config::ConfigSourceMap::from([(
+                key.to_string(),
+                ConfigValueSource::UserConfig(path.clone()),
+            )]);
+            let values = collect_value_sources(&current, &sources);
+            let entry = values.iter().find(|entry| entry.key == key).unwrap();
+            assert_eq!(entry.value, value);
+            assert_eq!(
+                entry.source,
+                ConfigValueSource::UserConfig(path.clone()).label()
+            );
+            assert_eq!(current.compilation.build_timeout_sec, 777);
+            for invalid in ["", "NaN", "inf", "-inf", "0", "-1", "0.5", "11"] {
+                assert!(apply_config_set(&path, key, invalid).is_err(), "{invalid}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            }
+        }
+        config_reset_at(&path, key, &plain_context()).unwrap();
+        let reset: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reset.timeouts.scale.env_value(), "1");
+        assert_eq!(reset.compilation.build_timeout_sec, 777);
+    }
+
+    #[test]
+    fn collect_value_sources_includes_timing_scale_environment_attribution() {
+        let mut config = RchConfig::default();
+        config.timeouts.scale = "3.5".parse().unwrap();
+        let sources = config::ConfigSourceMap::from([(
+            "timeouts.scale".to_string(),
+            ConfigValueSource::EnvVar("RCH_TIMING_SCALE".to_string()),
+        )]);
+        let values = collect_value_sources(&config, &sources);
+        let entry = values
+            .iter()
+            .find(|entry| entry.key == "timeouts.scale")
+            .unwrap();
+        assert_eq!(entry.value, "3.5");
+        assert_eq!(entry.source, "env:RCH_TIMING_SCALE");
     }
 
     #[test]

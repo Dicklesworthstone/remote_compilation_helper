@@ -82,26 +82,43 @@ async fn read_completion_with_retry(
     pipeline: &TransferPipeline,
     worker: &WorkerConfig,
 ) -> anyhow::Result<Option<i32>> {
-    retry_completion_probe(Duration::from_secs(1), async || {
-        pipeline.read_recovery_completion(worker).await
-    })
+    // Previously three 10-second reads plus 1/2-second backoffs: preserve
+    // that worst-case budget at scale 1, but let fast transport failures retry
+    // while time remains. The per-read deadline is scaled independently.
+    retry_completion_probe(
+        rch_common::timing::scale_duration(Duration::from_secs(33)),
+        Duration::from_secs(1),
+        async || pipeline.read_recovery_completion(worker).await,
+    )
     .await
 }
 
-/// Up to three probe attempts, sleeping `backoff` then twice that between
-/// failures (1 s and 2 s in production).
+/// Retry errors within one monotonic budget, including probe time and backoff.
+/// An absent receipt is evidence and returns immediately. Dropping an expired
+/// read also drops its owned SSH process group; retries never overlap readers.
 async fn retry_completion_probe(
+    budget: Duration,
     backoff: Duration,
     mut probe: impl AsyncFnMut() -> anyhow::Result<Option<i32>>,
 ) -> anyhow::Result<Option<i32>> {
-    const ATTEMPTS: u64 = 3;
-    let mut attempt = 1;
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut attempt = 1_u64;
+    let mut delay = backoff.max(Duration::from_millis(1));
+    let max_delay = delay.saturating_mul(2);
     loop {
-        match probe().await {
-            Err(error) if attempt < ATTEMPTS => {
+        let result = tokio::time::timeout_at(deadline, probe())
+            .await
+            .map_err(|_| anyhow::anyhow!("completion receipt retry budget exhausted"))?;
+        match result {
+            Err(error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= delay {
+                    return Err(error.context("completion receipt retry budget exhausted"));
+                }
                 warn!(attempt, %error, "completion probe failed; retrying");
-                tokio::time::sleep(backoff * u32::try_from(attempt).unwrap_or(1)).await;
-                attempt += 1;
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(max_delay);
+                attempt = attempt.saturating_add(1);
             }
             other => return other,
         }
@@ -4902,17 +4919,17 @@ sys.exit(99)
         }
     }
 
-    /// A finished build must not be stranded by one transient SSH failure on
-    /// its receipt read; a persistent failure still surfaces after 3 tries,
-    /// and an absent receipt is returned at once (it is evidence, not noise).
-    #[tokio::test]
+    /// Fast errors can recover after the old three-attempt ceiling, while
+    /// missing receipts return immediately and persistent failures stay bounded.
+    #[tokio::test(start_paused = true)]
     async fn completion_probe_retries_transport_errors_only() {
         use std::cell::Cell;
-        let fast = std::time::Duration::from_millis(1);
+        let budget = std::time::Duration::from_secs(33);
+        let backoff = std::time::Duration::from_secs(1);
         let calls = Cell::new(0);
-        let flaky = super::retry_completion_probe(fast, async || {
+        let flaky = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
-            if calls.get() < 3 {
+            if calls.get() < 4 {
                 anyhow::bail!("completion probe SSH failed")
             } else {
                 Ok(Some(0))
@@ -4920,25 +4937,70 @@ sys.exit(99)
         })
         .await;
         assert_eq!(flaky.unwrap(), Some(0));
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.get(), 4);
 
         calls.set(0);
-        let down = super::retry_completion_probe(fast, async || {
+        let started = tokio::time::Instant::now();
+        let down = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
             anyhow::bail!("completion probe SSH failed")
         })
         .await;
         assert!(down.is_err());
-        assert_eq!(calls.get(), 3);
+        assert!(calls.get() > 3);
+        assert!(started.elapsed() <= budget);
 
         calls.set(0);
-        let absent = super::retry_completion_probe(fast, async || {
+        let absent = super::retry_completion_probe(budget, backoff, async || {
             calls.set(calls.get() + 1);
             Ok(None)
         })
         .await;
         assert_eq!(absent.unwrap(), None);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_budget_includes_slow_reads_and_cancellation() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let base = Duration::from_secs(10);
+        let extended = rch_common::timing::TimingScale::try_from(2.0)
+            .unwrap()
+            .duration(base);
+        let backoff = Duration::from_secs(1);
+        async fn slow_read() -> anyhow::Result<Option<i32>> {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(Some(0))
+        }
+        assert!(
+            super::retry_completion_probe(base, backoff, async || slow_read().await)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            super::retry_completion_probe(extended, backoff, async || slow_read().await)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+
+        struct Dropped<'a>(&'a Cell<bool>);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let started = tokio::time::Instant::now();
+        let result = super::retry_completion_probe(base, backoff, async || {
+            let _reader = Dropped(&dropped);
+            std::future::pending::<anyhow::Result<Option<i32>>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(dropped.get(), "expired read must release its owned transport");
+        assert_eq!(started.elapsed(), base);
     }
 
     #[test]

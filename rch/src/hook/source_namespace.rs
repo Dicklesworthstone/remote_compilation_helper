@@ -119,7 +119,14 @@ fn topology_refusal_detail(
 // required for the registry's record/directory fsync. The descriptor survives
 // exec and CONTROL kills every inheriting descendant before acknowledgement.
 const REGISTRY_LOCK: &str = r#"
-import errno, fcntl, os, stat, sys, time
+import errno, fcntl, math, os, stat, sys, time
+try:
+    timing_scale = float(os.environ.get('RCH_TIMING_SCALE', '1'))
+    if not math.isfinite(timing_scale) or not 1.0 <= timing_scale <= 10.0:
+        raise ValueError('scale outside [1, 10]')
+except ValueError:
+    print('RCH_SOURCE_NAMESPACE_INVALID_TIMING_SCALE', file=sys.stderr)
+    sys.exit(78)
 started = time.monotonic()
 try:
     lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -137,7 +144,7 @@ try:
             if error.errno not in (errno.EAGAIN, errno.EACCES):
                 raise
         elapsed = time.monotonic() - started
-        if elapsed >= 5:
+        if elapsed >= 5 * timing_scale:
             print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
                 int(elapsed * 1000), sys.argv[1]), file=sys.stderr)
             sys.exit(76)
@@ -171,7 +178,8 @@ pub(super) async fn acquire_source_authority_with_retry(
     identity: &str,
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    let deadline = tokio::time::Instant::now() + wait_timeout.min(SOURCE_ADMISSION_WAIT);
+    let deadline = tokio::time::Instant::now()
+        + wait_timeout.min(rch_common::timing::scale_duration(SOURCE_ADMISSION_WAIT));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -325,8 +333,11 @@ fn namespace_preflight_command(
     // Keep the guard's original 30-second allowance separate from the
     // namespace controller's 15-second mutation deadline. This finite RPC has
     // no source grant yet and owns only its read-only guard process group.
-    let guard =
-        crate::transfer::source_activity_bounded_script("", &guard, Duration::from_secs(30));
+    let guard = crate::transfer::source_activity_bounded_script(
+        "",
+        &guard,
+        rch_common::timing::scale_duration(Duration::from_secs(30)),
+    );
     let controller = shell_escape::escape(CONTROL.into());
     let mut delimiter = format!("RCH_NAMESPACE_{}", uuid::Uuid::new_v4().simple());
     while initializer.lines().any(|line| line == delimiter) {
@@ -335,7 +346,8 @@ fn namespace_preflight_command(
     // Parse the entire compound before running either operation. A truncated
     // stdin upload cannot launch a partially received initializer.
     Ok(format!(
-        "{{\n(\n{guard}\n) || exit $?\nsh -c {controller} <<'{delimiter}'\n{initializer}\n{delimiter}\n}}\n",
+        "{}{{\n(\n{guard}\n) || exit $?\nsh -c {controller} <<'{delimiter}'\n{initializer}\n{delimiter}\n}}\n",
+        rch_common::timing::shell_prefix(),
     ))
 }
 
@@ -354,7 +366,7 @@ pub(super) async fn initialize_worker_namespace(
         worker,
         "sh -s",
         script.as_bytes(),
-        Duration::from_secs(50),
+        rch_common::timing::scale_duration(Duration::from_secs(50)),
     )
     .await?;
     if output.status.success() && output.stdout.as_slice() == b"RCH_TOPOLOGY_OK\n" {

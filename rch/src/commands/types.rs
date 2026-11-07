@@ -234,6 +234,7 @@ pub struct DaemonLogsResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigShowResponse {
     pub general: ConfigGeneralSection,
+    pub timeouts: ConfigTimeoutsSection,
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
     pub environment: ConfigEnvironmentSection,
@@ -280,6 +281,12 @@ pub struct ConfigGeneralSection {
     pub force_remote: bool,
     pub log_level: String,
     pub socket_path: String,
+}
+
+/// Bounded slow-path timeout policy.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConfigTimeoutsSection {
+    pub scale: f64,
 }
 
 /// Compilation configuration section.

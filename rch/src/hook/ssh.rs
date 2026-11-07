@@ -73,6 +73,9 @@ fn owned_offload_ssh_options(
         return None;
     }
     Some(rch_common::ssh::SshOptions {
+        connect_timeout: rch_common::timing::scale_duration(
+            rch_common::ssh::SshOptions::default().connect_timeout,
+        ),
         control_master: true,
         control_persist_idle: Some(Duration::from_secs(idle)),
         server_alive_interval: Some(Duration::from_secs(
@@ -1485,12 +1488,18 @@ async fn run_source_metadata_rpc(
     client_timeout: Duration,
 ) -> anyhow::Result<Output> {
     let controller = format!(
-        "set -- {}\n{}",
+        "{}set -- {}\n{}",
+        rch_common::timing::shell_prefix(),
         shell_escape::escape(contract.into()),
         include_str!("source_namespace_control.sh"),
     );
-    run_offload_ssh_command_with_stdin(worker, &controller, command.as_bytes(), client_timeout)
-        .await
+    run_offload_ssh_command_with_stdin(
+        worker,
+        &controller,
+        command.as_bytes(),
+        rch_common::timing::scale_duration(client_timeout),
+    )
+    .await
 }
 
 /// Probe whether a started remote execution is gone for good. Every activity
@@ -1532,7 +1541,7 @@ pub(super) async fn remote_execution_lost(
         worker,
         "sh -s",
         script.as_bytes(),
-        Duration::from_secs(15),
+        rch_common::timing::scale_duration(Duration::from_secs(15)),
     )
     .await?;
     Ok(output.status.success()
@@ -2199,7 +2208,10 @@ async fn spawn_source_authority_lock(
     configure_offload_ssh_transport(cmd.as_std_mut(), worker);
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg(format!(
+        "ConnectTimeout={}",
+        rch_common::timing::scale_duration(Duration::from_secs(10)).as_secs()
+    ));
     cmd.arg("-o").arg("ServerAliveInterval=10");
     cmd.arg("-o").arg("ServerAliveCountMax=3");
     cmd.arg("-i").arg(identity_file.as_ref());
@@ -2502,7 +2514,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
         // A large closure or a batch of bounded operations may legitimately
         // run for minutes. It must not also wait minutes to authenticate an
         // unreachable endpoint before the first operation can start.
-        timeout_duration.as_secs().clamp(1, 20)
+        timeout_duration.as_secs().clamp(
+            1,
+            rch_common::timing::scale_duration(Duration::from_secs(20)).as_secs(),
+        )
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {

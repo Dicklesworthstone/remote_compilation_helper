@@ -656,6 +656,7 @@ mod tests {
                 log_level: "info".to_string(),
                 socket_path: "/tmp/rch.sock".to_string(),
             },
+            timeouts: ConfigTimeoutsSection { scale: 2.5 },
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
@@ -726,6 +727,7 @@ mod tests {
         assert!(json["general"]["enabled"].as_bool().unwrap());
         assert!(json["layer0"]["debug_line_tables_only"].as_bool().unwrap());
         assert!(!json["layer0"]["release_lto_thin"].as_bool().unwrap());
+        assert_eq!(json["timeouts"]["scale"], 2.5);
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
         assert_eq!(json["compilation"]["build_timeout_sec"], 300);
         assert_eq!(json["compilation"]["external_timeout_enabled"], true);

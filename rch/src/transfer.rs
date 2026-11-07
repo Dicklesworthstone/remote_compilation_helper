@@ -1405,7 +1405,11 @@ fn rsync_io_timeout_arg(limit: std::time::Duration) -> String {
 /// watchdog and the daemon kill path in `rchd::cancellation`).
 pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> String {
     // Shared with rchd, which re-runs the same probe to clear a quarantine.
-    rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id)
+    format!(
+        "{}{}",
+        rch_common::timing::shell_prefix(),
+        rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id),
+    )
 }
 
 /// Prints `RCH_PATH_ABSENT` only when `path` does not exist, not even as a
@@ -1795,7 +1799,8 @@ fn remote_build_watchdog_script() -> String {
 
 fn remote_build_watchdog_script_with_refusal(refusal: &str) -> String {
     format!(
-        "{}\nrch_remote_record \"$1\" \"$4\" || {{ {refusal}; }}\n{}",
+        "{}{}\nrch_remote_record \"$1\" \"$4\" || {{ {refusal}; }}\n{}",
+        rch_common::timing::shell_prefix(),
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
         r#"__p=$$; __t="$2"; __m="$3"; shift 4
 __cancelled=0; __w=; __watch_start=
@@ -3269,6 +3274,7 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         let ssh_options = SshOptions {
+            connect_timeout: rch_common::timing::scale_duration(SshOptions::default().connect_timeout),
             server_alive_interval: Some(std::time::Duration::from_secs(
                 transfer_config.ssh_server_alive_interval_secs.unwrap_or(15),
             )),
@@ -3546,7 +3552,8 @@ impl TransferPipeline {
                 // stream. Server arguments are appended by rsync after this
                 // fragment and forwarded unchanged through the activity fence.
                 format!(
-                    "python3 -I -S -c {} {} {} {} {} {} standalone rsync",
+                    "env RCH_TIMING_SCALE={} python3 -I -S -c {} {} {} {} {} {} standalone rsync",
+                    rch_common::timing::configured().env_value(),
                     escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT)),
                     budget.max_growth_bytes,
                     budget.min_free_bytes,
@@ -3846,7 +3853,7 @@ impl TransferPipeline {
                 file_fsync_command(&[path, Path::new(path).parent().unwrap().to_str().unwrap()]),
         );
         let output = tokio::time::timeout(
-            Duration::from_secs(10),
+            rch_common::timing::scale_duration(Duration::from_secs(10)),
             // This immutable identity-bound receipt is outside source-tree
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
@@ -5829,7 +5836,8 @@ impl TransferPipeline {
         let refusal =
             self.disk_prestart_refusal("worker Python disk supervisor is unavailable", 120);
         let program = format!(
-            "if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
+            "{}if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
+            rch_common::timing::shell_prefix(),
             budget.max_growth_bytes, budget.min_free_bytes,
         );
         // This composition can exceed the single-argument limit independently
@@ -8093,7 +8101,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         };
 
-        match tokio::time::timeout(REMOTE_TIMEOUT_KILL_BUDGET, attempt).await {
+        let cleanup_budget = rch_common::timing::scale_duration(REMOTE_TIMEOUT_KILL_BUDGET);
+        match tokio::time::timeout(cleanup_budget, attempt).await {
             Ok(Ok(stdout)) => match parse_remote_timeout_kill_output(&stdout) {
                 Some(RemoteTimeoutCleanup::Verified) => (
                     RemoteTimeoutCleanup::Verified,
@@ -8115,7 +8124,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 RemoteTimeoutCleanup::Unverified,
                 format!(
                     "kill probe exceeded {}s budget",
-                    REMOTE_TIMEOUT_KILL_BUDGET.as_secs()
+                    cleanup_budget.as_secs()
                 ),
             ),
         }
