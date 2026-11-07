@@ -1197,6 +1197,11 @@ fn run_operation(
     prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
 ) -> io::Result<OperationOutcome> {
     let remote_operation = prepared_inputs.is_some();
+    // Only the authenticated frontend can construct remote input custody. Keep
+    // its peer scope independent of all logical settings and source metadata.
+    let authenticated_edge_pin = prepared_inputs
+        .as_ref()
+        .map(remote_operation::RemoteOperationInputs::authenticated_edge_pin);
     let timeout = Duration::from_secs(profile.timeout_seconds);
     let cancelled = || {
         stopped.load(Ordering::Acquire) || shared.as_ref().is_some_and(|runtime| !runtime.healthy())
@@ -1252,34 +1257,35 @@ fn run_operation(
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&profile.operation_root)?,
     );
-    let (source, captured_toolchain, request, input_owner, received_toolchain) = match prepared_inputs {
-        Some(inputs) => {
-            inputs.verify_for_profile(&profile, &cancelled)?;
-            (
-                inputs.source,
-                Some(Arc::clone(inputs.toolchain.image())),
-                inputs.request,
-                Some(inputs.owner),
-                Some(inputs.toolchain),
-            )
-        }
-        None => {
-            let bundle = owner.path().join("bundle");
-            let prepared = super::source_delivery::prepare_local_bundle_controlled(
-                &profile.source_root,
-                &profile.source_specification()?,
-                &bundle,
-                retained_toolchain.clone(),
-                &preparation,
-            )?;
-            let (_, request_bytes) = read_stable(
-                &bundle.join("request.json"),
-                super::worker_delivery::MAX_FRAME_BYTES as u64,
-            )?;
-            let request: Value = serde_json::from_slice(&request_bytes)?;
-            (prepared.source, prepared.toolchain, request, None, None)
-        }
-    };
+    let (source, captured_toolchain, request, input_owner, received_toolchain) =
+        match prepared_inputs {
+            Some(inputs) => {
+                inputs.verify_for_profile(&profile, &cancelled)?;
+                (
+                    inputs.source,
+                    Some(Arc::clone(inputs.toolchain.image())),
+                    inputs.request,
+                    Some(inputs.owner),
+                    Some(inputs.toolchain),
+                )
+            }
+            None => {
+                let bundle = owner.path().join("bundle");
+                let prepared = super::source_delivery::prepare_local_bundle_controlled(
+                    &profile.source_root,
+                    &profile.source_specification()?,
+                    &bundle,
+                    retained_toolchain.clone(),
+                    &preparation,
+                )?;
+                let (_, request_bytes) = read_stable(
+                    &bundle.join("request.json"),
+                    super::worker_delivery::MAX_FRAME_BYTES as u64,
+                )?;
+                let request: Value = serde_json::from_slice(&request_bytes)?;
+                (prepared.source, prepared.toolchain, request, None, None)
+            }
+        };
     let retain_paths = |mappings| {
         let paths = match (&input_owner, &received_toolchain) {
             (Some(inputs), Some(toolchain)) => CanonicalPaths::new_with_received_toolchain(
@@ -1533,6 +1539,7 @@ fn run_operation(
                 build_identity: &build_identity,
                 wrapper: Sha256::digest(&wrapper).into(),
                 closed_dependency_execution: graph.requires_closed_dependency_execution(),
+                authenticated_edge_pin,
             }
             .key(config)?;
             let mut cache = TargetState::open(
@@ -1897,6 +1904,9 @@ struct TargetReuseContext<'a> {
     build_identity: &'a str,
     wrapper: [u8; 32],
     closed_dependency_execution: bool,
+    // None is the existing local-only family. Remote families are separated by
+    // the SPKI authenticated by the service, never by a client declaration.
+    authenticated_edge_pin: Option<[u8; 32]>,
 }
 
 impl TargetReuseContext<'_> {
@@ -1970,7 +1980,21 @@ impl TargetReuseContext<'_> {
                 "fresh-home+captured-or-empty-cargo-home+no-project-executors-v1"
             }
         });
-        Ok(Sha256::digest(serde_json::to_vec(&identity)?).into())
+        let key: [u8; 32] = Sha256::digest(serde_json::to_vec(&identity)?).into();
+        let Some(peer) = self.authenticated_edge_pin else {
+            // Preserve existing local seeds without weakening any of their
+            // compatibility inputs or migrating their on-disk generations.
+            return Ok(key);
+        };
+        require(
+            peer != [0; 32],
+            "private target requires an authenticated edge key",
+        )?;
+        let mut hash = Sha256::new();
+        hash.update(b"rabs.remote-private-cargo-target.v1\0");
+        hash.update(peer);
+        hash.update(key);
+        Ok(hash.finalize().into())
     }
 }
 
@@ -3738,6 +3762,7 @@ mod tests {
         wrapper: [u8; 32],
         driver: String,
         closed_dependency_execution: bool,
+        authenticated_edge_pin: Option<[u8; 32]>,
     }
 
     impl ReuseKeyFixture {
@@ -3790,10 +3815,15 @@ mod tests {
                 wrapper: [5; 32],
                 driver: "driver-1".into(),
                 closed_dependency_execution: false,
+                authenticated_edge_pin: None,
             }
         }
 
         fn key(&self) -> [u8; 32] {
+            self.try_key().unwrap()
+        }
+
+        fn try_key(&self) -> io::Result<[u8; 32]> {
             TargetReuseContext {
                 request: &self.request,
                 workspace: self
@@ -3810,9 +3840,9 @@ mod tests {
                 build_identity: &self.driver,
                 wrapper: self.wrapper,
                 closed_dependency_execution: self.closed_dependency_execution,
+                authenticated_edge_pin: self.authenticated_edge_pin,
             }
             .key(&self.config)
-            .unwrap()
         }
 
         fn with_captured_cache(source: &[u8], cache: &[u8]) -> Self {
@@ -3829,6 +3859,137 @@ mod tests {
             );
             fixture
         }
+    }
+
+    #[test]
+    fn remote_private_target_keys_bind_authenticated_peers_without_weakening_inputs() {
+        let mut first = ReuseKeyFixture::new();
+        let local = first.key();
+        first.authenticated_edge_pin = Some([1; 32]);
+        let remote = first.key();
+        assert_ne!(remote, local);
+
+        let mut second = ReuseKeyFixture::new();
+        second.authenticated_edge_pin = Some([1; 32]);
+        assert_eq!(second.key(), remote);
+        second.authenticated_edge_pin = Some([2; 32]);
+        assert_ne!(second.key(), remote);
+        second.authenticated_edge_pin = Some([0; 32]);
+        assert_eq!(
+            second.try_key().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // The peer namespace wraps the full existing compatibility contract.
+        // Compiler-only checks still permit the existing safe source-edit
+        // family; codegen retains every captured source byte in its key.
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_eq!(first.key(), remote);
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"changed manifest", None);
+        assert_ne!(first.key(), remote);
+        first.source = reuse_source(b"pub const VALUE:u8=1;", b"manifest", None);
+        first.args[0] = "build".into();
+        let build = first.key();
+        first.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        assert_ne!(first.key(), build);
+
+        for changed in ["toolchain", "epoch", "wrapper", "driver", "environment"] {
+            let mut fixture = ReuseKeyFixture::new();
+            fixture.authenticated_edge_pin = Some([1; 32]);
+            match changed {
+                "toolchain" => {
+                    fixture.request["toolchain_identity"]["sha256"] = json!("cd".repeat(32))
+                }
+                "epoch" => fixture.config.runtime_epoch = "host-2".into(),
+                "wrapper" => fixture.wrapper = [6; 32],
+                "driver" => fixture.driver = "driver-2".into(),
+                "environment" => {
+                    fixture.spec.env.push(("INPUT".into(), "changed".into()));
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(fixture.key(), remote, "changed {changed}");
+        }
+    }
+
+    #[test]
+    fn remote_private_target_restore_is_peer_scoped_under_one_aggregate_budget() {
+        use crate::coord::live_dependency::canonical::CommittedOutputSeeds;
+
+        let state = crate::test_util::private_tempdir();
+        let workspace = crate::test_util::private_tempdir();
+        create_private(&workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), b"manifest").unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub const VALUE:u8=1;",
+        )
+        .unwrap();
+        let target = crate::test_util::private_tempdir();
+        fs::write(target.path().join("artifact"), b"first edge output").unwrap();
+        let mut fixture = ReuseKeyFixture::new();
+        let local = fixture.key();
+        fixture.authenticated_edge_pin = Some([1; 32]);
+        let first = fixture.key();
+        fixture.authenticated_edge_pin = Some([2; 32]);
+        let second = fixture.key();
+        let mut config = fixture.config.clone();
+        let manifest = &fixture.source;
+        let capture = |key, config: &TargetCacheConfig| {
+            TargetState::open(
+                state.path(),
+                config,
+                key,
+                workspace.path(),
+                manifest,
+                &|| false,
+            )
+            .unwrap()
+            .capture(target.path(), &CommittedOutputSeeds::default())
+            .unwrap();
+        };
+        let restore = |key, config: &TargetCacheConfig| {
+            let candidate = crate::test_util::private_tempdir();
+            let mut cache = TargetState::open(
+                state.path(),
+                config,
+                key,
+                workspace.path(),
+                manifest,
+                &|| false,
+            )
+            .unwrap();
+            cache.restore(candidate.path()).unwrap().then(|| {
+                let bytes = fs::read(candidate.path().join("artifact")).unwrap();
+                // A private restored target can be mutated independently.
+                fs::write(candidate.path().join("artifact"), b"private edit").unwrap();
+                bytes
+            })
+        };
+
+        capture(first, &config);
+        assert_eq!(
+            restore(first, &config).as_deref(),
+            Some(b"first edge output".as_slice())
+        );
+        assert!(restore(second, &config).is_none());
+        assert!(restore(local, &config).is_none());
+        assert_eq!(
+            restore(first, &config).as_deref(),
+            Some(b"first edge output".as_slice())
+        );
+
+        // Keys share the same store and retention limit, rather than granting
+        // every enrolled edge its own independently growing byte/family quota.
+        config.max_families = 1;
+        fs::write(target.path().join("artifact"), b"second edge output").unwrap();
+        capture(second, &config);
+        assert_eq!(
+            restore(second, &config).as_deref(),
+            Some(b"second edge output".as_slice())
+        );
+        assert!(restore(first, &config).is_none());
+        assert!(restore(local, &config).is_none());
     }
 
     #[test]

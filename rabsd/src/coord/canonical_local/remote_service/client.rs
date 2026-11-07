@@ -1199,7 +1199,10 @@ mod tests {
                 b"#!/bin/sh\nexit 0\n"
             );
             assert_eq!(
-                fs::metadata(source_root.join("c-executable")).unwrap().mode() & 0o7777,
+                fs::metadata(source_root.join("c-executable"))
+                    .unwrap()
+                    .mode()
+                    & 0o7777,
                 0o555
             );
             assert_eq!(
@@ -1333,9 +1336,11 @@ mod tests {
             assert_eq!(result.unwrap_err().kind(), expected);
             let messages = admission_messages(&output);
             assert_eq!(messages.len(), wire::WINDOW as usize + 1);
-            assert!(messages[..wire::WINDOW as usize]
-                .iter()
-                .all(|message| message["kind"] == "source-chunk"));
+            assert!(
+                messages[..wire::WINDOW as usize]
+                    .iter()
+                    .all(|message| message["kind"] == "source-chunk")
+            );
             assert_eq!(
                 messages.last().unwrap(),
                 &json!({"kind":"window-end", "count":wire::WINDOW})
@@ -1400,8 +1405,7 @@ mod tests {
         let mut fixture = InputFixture::new();
         let destination = private();
         let sdk_destination = Arc::new(private());
-        let (source, toolchain) =
-            fixture.receivers(destination.path(), sdk_destination.path());
+        let (source, toolchain) = fixture.receivers(destination.path(), sdk_destination.path());
         let expected_source = fixture.bundle.source.manifest().clone();
         let expected_sdk = *fixture.bundle.toolchain.as_ref().unwrap().identity();
         assert!(fixture.source_bytes.len() > MAX_SOURCE_CHUNK * wire::WINDOW as usize);

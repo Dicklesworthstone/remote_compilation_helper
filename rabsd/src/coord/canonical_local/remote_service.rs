@@ -14,6 +14,7 @@ use super::remote_artifacts::CapturedTarget;
 use super::remote_operation::{self, RemoteOperationInputs, RemoteOperationOutcome};
 use super::remote_toolchains::{ReceivedToolchain, RemoteToolchainCache};
 use super::service::{AdmittedOperation, OperationAdmissions};
+use super::target_state::TargetCacheConfig;
 use super::{SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory};
 use crate::coord::{source_manifest, worker_delivery};
 use crate::edge::live_facts::read_stable;
@@ -99,6 +100,9 @@ struct ServiceProfile {
     toolchain_cache_bytes: u64,
     #[serde(default = "default_toolchain_cache_entries")]
     toolchain_cache_entries: usize,
+    /// Restore only private target copies, partitioned by authenticated edge.
+    #[serde(default)]
+    target_cache: Option<TargetCacheConfig>,
     jobs_per_root: u32,
 }
 
@@ -135,6 +139,9 @@ impl ServiceProfile {
                 && (1..=32).contains(&self.toolchain_cache_entries),
             "remote toolchain cache must be at most 64 GiB and between 1 and 32 entries",
         )?;
+        if let Some(cache) = &self.target_cache {
+            cache.validate()?;
+        }
         let roots = [&self.state_root, &self.input_root, &self.operation_root];
         for (index, root) in roots.iter().enumerate() {
             private_directory(root)?;
@@ -289,6 +296,9 @@ pub fn run_service_profile(
         "queue_timeout_seconds":config.queue_timeout_seconds,
         "toolchain_cache_bytes":config.toolchain_cache_bytes,
         "toolchain_cache_entries":config.toolchain_cache_entries,
+        "target_cache":config.target_cache.as_ref().map(|cache| json!({
+            "runtime_epoch":cache.runtime_epoch,
+            "max_bytes":cache.max_bytes, "max_families":cache.max_families})),
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
         "transport":"mutual-tls-atp", "cargo_location":"coordinator"})
@@ -533,14 +543,13 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or_else(|| invalid("remote operation admission deadline overflow"))?;
     // Keep this permit through input custody, execution, final delivery and
     // every error/drop path. It is separate from the existing Cargo root token.
-    let _admission =
-        acquire_operation(wire, admissions, stopped, queue_deadline, || runtime.healthy())
-            .await?;
+    let _admission = acquire_operation(wire, admissions, stopped, queue_deadline, || {
+        runtime.healthy()
+    })
+    .await?;
     let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
     let cancelled = || {
-        stopped.load(Ordering::Acquire)
-            || !runtime.healthy()
-            || Instant::now() >= input_deadline
+        stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= input_deadline
     };
     let toolchain = prepare_toolchain_input(
         toolchains,
@@ -571,8 +580,14 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         ToolchainDisposition::Upload => toolchains.adopt(edge_pin, toolchain, &cancelled)?,
         ToolchainDisposition::Reuse => toolchain,
     };
-    let inputs =
-        RemoteOperationInputs::new(Arc::clone(&owner), source, toolchain, request, &cancelled)?;
+    let inputs = RemoteOperationInputs::new(
+        Arc::clone(&owner),
+        source,
+        toolchain,
+        request,
+        edge_pin,
+        &cancelled,
+    )?;
     checkpoint(stopped, input_deadline)?;
     let stdout = output_file(owner.path(), "stdout")?;
     let stderr = output_file(owner.path(), "stderr")?;
@@ -586,6 +601,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         Arc::clone(&runtime),
         config.wrapper.clone(),
         config.operation_root.clone(),
+        config.target_cache.clone(),
         inputs,
         *settings,
         stdout.try_clone()?,
@@ -733,7 +749,9 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Message::ToolchainEntry { entry } => {
                 let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
-                    return Err(invalid("SDK entries are forbidden after toolchain reuse admission"));
+                    return Err(invalid(
+                        "SDK entries are forbidden after toolchain reuse admission",
+                    ));
                 };
                 window.record()?;
                 if !source_finished {
@@ -744,7 +762,9 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Message::ToolchainChunk { chunk } => {
                 let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
-                    return Err(invalid("SDK bytes are forbidden after toolchain reuse admission"));
+                    return Err(invalid(
+                        "SDK bytes are forbidden after toolchain reuse admission",
+                    ));
                 };
                 require(source_finished, "toolchain bytes arrived before its entry")?;
                 window.record()?;
@@ -776,7 +796,10 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let toolchain = match toolchain {
-        ToolchainInput::Upload { mut receiver, owner } => Arc::new(ReceivedToolchain::new(
+        ToolchainInput::Upload {
+            mut receiver,
+            owner,
+        } => Arc::new(ReceivedToolchain::new(
             owner,
             Arc::new(receiver.seal(&cancelled)?),
             &cancelled,
@@ -959,7 +982,10 @@ mod tests {
                 // No peer wakeup: cancellation/expiry must use the real timer.
                 return Poll::Pending;
             }
-            let count = output.remaining().min(3).min(peer.input.len() - peer.offset);
+            let count = output
+                .remaining()
+                .min(3)
+                .min(peer.input.len() - peer.offset);
             output.put_slice(&peer.input[peer.offset..peer.offset + count]);
             peer.offset += count;
             Poll::Ready(Ok(()))
@@ -973,7 +999,10 @@ mod tests {
             bytes: &[u8],
         ) -> Poll<io::Result<usize>> {
             let count = bytes.len().min(3);
-            self.output.lock().unwrap().extend_from_slice(&bytes[..count]);
+            self.output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..count]);
             Poll::Ready(Ok(count))
         }
 
@@ -1011,8 +1040,7 @@ mod tests {
         panic!("scripted remote admission did not settle");
     }
 
-    #[test]
-    fn remote_queue_defaults_and_capacity_are_bounded() {
+    fn service_profile() -> (tempfile::TempDir, ServiceProfile) {
         let owner = tempfile::Builder::new()
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
@@ -1026,7 +1054,7 @@ mod tests {
         let wrapper = owner.path().join("rabs-wrap");
         fs::write(&wrapper, b"#!/bin/sh\nexit 99\n").unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut profile: ServiceProfile = serde_json::from_value(json!({
+        let profile: ServiceProfile = serde_json::from_value(json!({
             "version": SERVICE_VERSION, "listen":"127.0.0.1:0",
             "state_root":owner.path().join("state"),
             "input_root":owner.path().join("inputs"),
@@ -1037,10 +1065,17 @@ mod tests {
             "allowed_edge_pins":["ab".repeat(32)], "max_roots":2, "jobs_per_root":2,
         }))
         .unwrap();
+        (owner, profile)
+    }
+
+    #[test]
+    fn remote_queue_defaults_and_capacity_are_bounded() {
+        let (_owner, mut profile) = service_profile();
         assert_eq!(profile.max_queued_roots, 0);
         assert_eq!(profile.queue_timeout_seconds, 300);
         assert_eq!(profile.toolchain_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_entries, 4);
+        assert!(profile.target_cache.is_none());
         assert_eq!(profile.max_sessions(), 2);
         profile.validate().unwrap();
         profile.max_roots = 32;
@@ -1067,6 +1102,49 @@ mod tests {
         for bytes in [64 * 1024 * 1024 * 1024 + 1, u64::MAX] {
             profile.toolchain_cache_bytes = bytes;
             assert!(profile.validate().is_err(), "cache bytes {bytes}");
+        }
+    }
+
+    #[test]
+    fn remote_target_state_is_explicit_bounded_server_policy() {
+        let (_owner, mut profile) = service_profile();
+        profile.validate().unwrap();
+        assert!(profile.target_cache.is_none());
+
+        let cache: TargetCacheConfig =
+            serde_json::from_value(json!({"runtime_epoch":"coordinator-runtime-1"})).unwrap();
+        assert_eq!(cache.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(cache.max_families, 8);
+        profile.target_cache = Some(cache);
+        profile.validate().unwrap();
+
+        for value in [
+            json!({"runtime_epoch":"coordinator-runtime-1", "max_bytes":1, "max_families":1}),
+            json!({"runtime_epoch":"a".repeat(256), "max_bytes":8_u64 * 1024 * 1024 * 1024,
+                "max_families":32}),
+        ] {
+            profile.target_cache = Some(serde_json::from_value(value).unwrap());
+            profile.validate().unwrap();
+        }
+        for value in [
+            json!({"runtime_epoch":""}),
+            json!({"runtime_epoch":"a".repeat(257)}),
+            json!({"runtime_epoch":"runtime/escape"}),
+            json!({"runtime_epoch":"runtime\n"}),
+            json!({"runtime_epoch":"runtime", "max_bytes":0}),
+            json!({"runtime_epoch":"runtime", "max_bytes":8_u64 * 1024 * 1024 * 1024 + 1}),
+            json!({"runtime_epoch":"runtime", "max_families":0}),
+            json!({"runtime_epoch":"runtime", "max_families":33}),
+        ] {
+            profile.target_cache = Some(serde_json::from_value(value.clone()).unwrap());
+            assert!(profile.validate().is_err(), "{value}");
+        }
+        for value in [
+            json!({}),
+            json!({"runtime_epoch":"runtime", "path":"/peer/cache"}),
+            json!({"runtime_epoch":"runtime", "authenticated_edge_pin":"ab".repeat(32)}),
+        ] {
+            assert!(serde_json::from_value::<TargetCacheConfig>(value).is_err());
         }
     }
 
@@ -1133,14 +1211,8 @@ mod tests {
         let retained = cache.adopt(pin, Arc::clone(&sdk), || false).unwrap();
         assert!(Arc::ptr_eq(&retained, &sdk));
         let inputs = crate::test_util::private_tempdir();
-        let selection = prepare_toolchain_input(
-            &cache,
-            pin,
-            *sdk.identity(),
-            inputs.path(),
-            || false,
-        )
-        .unwrap();
+        let selection =
+            prepare_toolchain_input(&cache, pin, *sdk.identity(), inputs.path(), || false).unwrap();
         assert_eq!(selection.disposition(), ToolchainDisposition::Reuse);
         let ToolchainInput::Reuse(hit) = selection else {
             panic!("verified retained SDK should skip upload");
@@ -1150,14 +1222,9 @@ mod tests {
 
         // Another enrolled principal must upload its own independently
         // verified data, even with an identical declared content digest.
-        let selection = prepare_toolchain_input(
-            &cache,
-            [8; 32],
-            *sdk.identity(),
-            inputs.path(),
-            || false,
-        )
-        .unwrap();
+        let selection =
+            prepare_toolchain_input(&cache, [8; 32], *sdk.identity(), inputs.path(), || false)
+                .unwrap();
         assert_eq!(selection.disposition(), ToolchainDisposition::Upload);
         let ToolchainInput::Upload { owner, .. } = selection else {
             panic!("a different authenticated peer must upload its own SDK");
@@ -1286,10 +1353,7 @@ mod tests {
             ))
             .is_err()
         );
-        assert_eq!(
-            messages(&output),
-            vec![json!({"kind":"window", "count":1})]
-        );
+        assert_eq!(messages(&output), vec![json!({"kind":"window", "count":1})]);
         assert!(!owner.path().join("toolchain").exists());
     }
 
@@ -1304,10 +1368,8 @@ mod tests {
         fs::write(path, b"tampered SDK").unwrap();
         let inputs = crate::test_util::private_tempdir();
         assert!(
-            prepare_toolchain_input(
-                &cache, pin, *sdk.identity(), inputs.path(), || false,
-            )
-            .is_err()
+            prepare_toolchain_input(&cache, pin, *sdk.identity(), inputs.path(), || false,)
+                .is_err()
         );
         assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
     }
@@ -1503,7 +1565,10 @@ mod tests {
                             std::thread::spawn(move || {
                                 let deadline = Instant::now() + Duration::from_secs(1);
                                 while !output.lock().unwrap().ends_with(b"\n") {
-                                    assert!(Instant::now() < deadline, "client never entered queue");
+                                    assert!(
+                                        Instant::now() < deadline,
+                                        "client never entered queue"
+                                    );
                                     std::thread::sleep(Duration::from_millis(1));
                                 }
                                 stopped.store(true, Ordering::Release);

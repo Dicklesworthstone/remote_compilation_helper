@@ -2415,6 +2415,11 @@ Save the complete service profile as `remote-service.json`:
   "queue_timeout_seconds": 300,
   "toolchain_cache_bytes": 8589934592,
   "toolchain_cache_entries": 4,
+  "target_cache": {
+    "runtime_epoch": "builder-image-2026.10",
+    "max_bytes": 1073741824,
+    "max_families": 8
+  },
   "jobs_per_root": 2
 }
 ```
@@ -2472,6 +2477,33 @@ upload; no directory is adopted from a pathname or an old on-disk marker. The
 client still captures and validates its local SDK on each invocation. Reuse
 removes repeated SDK network transfer and reconstruction; it does not eliminate
 local capture or verification, and no end-to-end speedup is claimed here.
+
+The optional server `target_cache` object retains Cargo's private compilation
+state across remote operations and service restarts. It uses the existing
+[persistent target cache](#persistent-reuse-and-command-results), including its
+required host `runtime_epoch`, exact compatibility checks, private copies,
+transaction recovery and producer verification. Omit the object to start every
+remote operation with a cold Cargo target. Its default retention is 1 GiB and
+eight families; the limits are 8 GiB and 32 families. These are one aggregate
+budget for the service, shared across enrolled clients, independently of the
+SDK cache and active operation storage.
+
+Remote target families also bind the client key authenticated by TLS. A
+different client key or a local canonical command cannot restore another
+client's target, even when source and compiler identities match. The client
+cannot provide this scope, a cache directory, or target-cache policy through its
+remote settings. Every operation still uploads and seals its source, uses an
+independent runtime workspace and target, and executes the selected Cargo
+command. Timestamp restoration only touches that runtime copy; the original
+received source remains available for final verification. Compiler-only checks
+retain the existing eligible source-edit behavior; codegen, Clippy and graphs
+with project executors keep the complete captured source identity.
+
+Successful restore can let Cargo report existing units as Fresh. Current
+coordinator publication, qualification and producer ancestry are rechecked
+before execution and completion. Stored target bytes never become a cached
+command result or bypass final artifact delivery verification. Changing the
+host tools or libraries visible through `/usr` requires a new `runtime_epoch`.
 
 Set the coordinator's dependency-worker environment before starting the service.
 For example, a single worker uses its own listener, separate from the remote
@@ -2705,7 +2737,8 @@ also capture their toolchain there; the service instead holds its bounded shared
 toolchain images under the locked state root.
 
 To retain Cargo's own private target state between local canonical commands,
-add this optional object to the same profile:
+add this optional object to the same profile. Remote canonical services accept
+the same object in their server profile:
 
 ```json
 "target_cache": {

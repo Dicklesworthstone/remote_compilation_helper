@@ -492,7 +492,9 @@ impl Drop for Retirement<'_> {
 impl RemoteToolchainCache {
     pub(crate) fn new(max_bytes: u64, max_entries: usize) -> io::Result<Self> {
         if max_bytes > MAX_CACHE_BYTES || !(1..=MAX_CACHE_ENTRIES).contains(&max_entries) {
-            return Err(invalid("remote toolchain cache limits outside their bounds"));
+            return Err(invalid(
+                "remote toolchain cache limits outside their bounds",
+            ));
         }
         Ok(Self {
             max_bytes,
@@ -551,7 +553,9 @@ impl RemoteToolchainCache {
         if !self.lock()?.entries.iter().any(|entry| {
             entry.peer == peer && !entry.invalidated && Arc::ptr_eq(&entry.lease, &lease)
         }) {
-            return Err(invalid("received compiler was invalidated during acquisition"));
+            return Err(invalid(
+                "received compiler was invalidated during acquisition",
+            ));
         }
         Ok(lease)
     }
@@ -800,9 +804,7 @@ mod tests {
         lease
             .verify_with(&|| false, || {
                 scans.fetch_add(1, Ordering::SeqCst);
-                let current = Arc::clone(
-                    lease.verification.lock().unwrap().as_ref().unwrap(),
-                );
+                let current = Arc::clone(lease.verification.lock().unwrap().as_ref().unwrap());
                 assert!(!Arc::ptr_eq(&current, &completed));
                 lease.scan_bytes(&|| false)
             })
@@ -810,7 +812,10 @@ mod tests {
         assert_eq!(scans.load(Ordering::SeqCst), 2);
         assert!(lease.verification.lock().unwrap().is_none());
         assert!(Arc::ptr_eq(
-            &cache.lookup(EDGE_A, lease.identity(), || false).unwrap().unwrap(),
+            &cache
+                .lookup(EDGE_A, lease.identity(), || false)
+                .unwrap()
+                .unwrap(),
             &lease,
         ));
     }
@@ -858,7 +863,9 @@ mod tests {
     fn cancelled_or_expired_received_waiter_does_not_cancel_scan_or_retire_custody() {
         for cancel_waiter in [false, true] {
             let cache = Arc::new(RemoteToolchainCache::new(1024, 1).unwrap());
-            let lease = cache.adopt(EDGE_A, fixture(b"retained SDK"), || false).unwrap();
+            let lease = cache
+                .adopt(EDGE_A, fixture(b"retained SDK"), || false)
+                .unwrap();
             let identity = *lease.identity();
             let (entered_tx, entered_rx) = mpsc::sync_channel(1);
             let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -914,7 +921,9 @@ mod tests {
     fn cancelled_or_unwound_received_scan_leader_allows_a_live_waiter_to_retry() {
         for panics in [false, true] {
             let cache = RemoteToolchainCache::new(1024, 1).unwrap();
-            let lease = cache.adopt(EDGE_A, fixture(b"retained SDK"), || false).unwrap();
+            let lease = cache
+                .adopt(EDGE_A, fixture(b"retained SDK"), || false)
+                .unwrap();
             let scans = Arc::new(AtomicUsize::new(0));
             let cancelled = Arc::new(AtomicBool::new(false));
             let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -1047,10 +1056,17 @@ mod tests {
         for budget in [0, 3] {
             let cache = RemoteToolchainCache::new(budget, 1).unwrap();
             let uploaded = fixture(b"four");
-            let lease = cache.adopt(EDGE_A, Arc::clone(&uploaded), || false).unwrap();
+            let lease = cache
+                .adopt(EDGE_A, Arc::clone(&uploaded), || false)
+                .unwrap();
             assert!(Arc::ptr_eq(&lease, &uploaded));
             assert!(lease.root().is_dir());
-            assert!(cache.lookup(EDGE_A, lease.identity(), || false).unwrap().is_none());
+            assert!(
+                cache
+                    .lookup(EDGE_A, lease.identity(), || false)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(counts(&cache), (0, 0, 0));
         }
     }
@@ -1061,23 +1077,36 @@ mod tests {
         let uploaded = fixture(b"same immutable SDK");
         let identity = *uploaded.identity();
         let root = uploaded.root().to_path_buf();
-        let lease = cache.adopt(EDGE_A, Arc::clone(&uploaded), || false).unwrap();
+        let lease = cache
+            .adopt(EDGE_A, Arc::clone(&uploaded), || false)
+            .unwrap();
         let hit = cache.lookup(EDGE_A, &identity, || false).unwrap().unwrap();
         assert!(Arc::ptr_eq(&hit, &uploaded));
         assert_eq!(hit.root(), root);
         assert!(cache.lookup(EDGE_B, &identity, || false).unwrap().is_none());
 
         for changed in [
-            ToolchainIdentity { sha256: [0; 32], ..identity },
-            ToolchainIdentity { files: identity.files + 1, ..identity },
-            ToolchainIdentity { bytes: identity.bytes + 1, ..identity },
+            ToolchainIdentity {
+                sha256: [0; 32],
+                ..identity
+            },
+            ToolchainIdentity {
+                files: identity.files + 1,
+                ..identity
+            },
+            ToolchainIdentity {
+                bytes: identity.bytes + 1,
+                ..identity
+            },
         ] {
             assert!(cache.lookup(EDGE_A, &changed, || false).unwrap().is_none());
         }
 
         let duplicate = fixture(b"same immutable SDK");
         assert_eq!(*duplicate.identity(), identity);
-        let same_edge = cache.adopt(EDGE_A, Arc::clone(&duplicate), || false).unwrap();
+        let same_edge = cache
+            .adopt(EDGE_A, Arc::clone(&duplicate), || false)
+            .unwrap();
         assert!(Arc::ptr_eq(&same_edge, &lease));
         assert_eq!(counts(&cache), (1, 0, identity.bytes));
         let other_edge = cache.adopt(EDGE_B, duplicate, || false).unwrap();
@@ -1093,24 +1122,26 @@ mod tests {
     #[test]
     fn received_constructor_refuses_foreign_nested_shared_and_nonprivate_owners() {
         let lease = fixture(b"compiler bytes");
-        assert!(ReceivedToolchain::new(
-            Arc::new(private()),
-            Arc::clone(lease.image()),
-            || false,
-        ).is_err());
+        assert!(
+            ReceivedToolchain::new(Arc::new(private()), Arc::clone(lease.image()), || false,)
+                .is_err()
+        );
 
         let nested_owner = Arc::new(private());
         let nested = nested_owner.path().join("nested");
         fs::DirBuilder::new().mode(0o700).create(&nested).unwrap();
         let source = private();
         fs::write(source.path().join("compiler"), b"nested image").unwrap();
-        let nested_image = Arc::new(capture_toolchain(
-            source.path(),
-            &nested.join("toolchain"),
-            None,
-            &ToolchainLimits::default(),
-            || false,
-        ).unwrap());
+        let nested_image = Arc::new(
+            capture_toolchain(
+                source.path(),
+                &nested.join("toolchain"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+            )
+            .unwrap(),
+        );
         assert!(ReceivedToolchain::new(nested_owner, nested_image, || false).is_err());
 
         let shared_owner = Arc::new(private());
@@ -1198,9 +1229,16 @@ mod tests {
         ));
         let overflow = fixture(b"other");
         let overflow_id = *overflow.identity();
-        let private = cache.adopt(EDGE_A, Arc::clone(&overflow), || false).unwrap();
+        let private = cache
+            .adopt(EDGE_A, Arc::clone(&overflow), || false)
+            .unwrap();
         assert!(Arc::ptr_eq(&private, &overflow));
-        assert!(cache.lookup(EDGE_A, &overflow_id, || false).unwrap().is_none());
+        assert!(
+            cache
+                .lookup(EDGE_A, &overflow_id, || false)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(counts(&cache), (2, 0, identity.bytes * 2));
     }
 
@@ -1222,17 +1260,27 @@ mod tests {
 
             let replacement = fixture(b"second");
             let replacement_id = *replacement.identity();
-            let private = cache.adopt(EDGE_A, Arc::clone(&replacement), || false).unwrap();
+            let private = cache
+                .adopt(EDGE_A, Arc::clone(&replacement), || false)
+                .unwrap();
             assert!(Arc::ptr_eq(&private, &replacement));
             assert!(cache.lookup(EDGE_A, &identity, || false).unwrap().is_some());
-            assert!(cache.lookup(EDGE_A, &replacement_id, || false).unwrap().is_none());
+            assert!(
+                cache
+                    .lookup(EDGE_A, &replacement_id, || false)
+                    .unwrap()
+                    .is_none()
+            );
             assert!(path.is_dir());
             assert_eq!(counts(&cache), (1, 0, identity.bytes));
 
             drop(handles);
             let retained = cache.adopt(EDGE_A, replacement, || false).unwrap();
             assert!(Arc::ptr_eq(
-                &cache.lookup(EDGE_A, &replacement_id, || false).unwrap().unwrap(),
+                &cache
+                    .lookup(EDGE_A, &replacement_id, || false)
+                    .unwrap()
+                    .unwrap(),
                 &retained,
             ));
             assert!(!path.exists(), "idle predecessor cleanup was not completed");
@@ -1247,11 +1295,13 @@ mod tests {
         let identity = *lease.identity();
         for stop_after in 1..=8 {
             let checks = Cell::new(0);
-            let error = cache.lookup(EDGE_A, &identity, || {
-                assert!(cache.state.try_lock().is_ok());
-                checks.set(checks.get() + 1);
-                checks.get() >= stop_after
-            }).unwrap_err();
+            let error = cache
+                .lookup(EDGE_A, &identity, || {
+                    assert!(cache.state.try_lock().is_ok());
+                    checks.set(checks.get() + 1);
+                    checks.get() >= stop_after
+                })
+                .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             assert!(!cache.lock().unwrap().entries[0].invalidated);
             assert!(Arc::ptr_eq(
@@ -1260,7 +1310,10 @@ mod tests {
             ));
         }
         assert_eq!(
-            cache.adopt(EDGE_A, fixture(b"other"), || true).unwrap_err().kind(),
+            cache
+                .adopt(EDGE_A, fixture(b"other"), || true)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::Interrupted,
         );
         assert_eq!(counts(&cache), (1, 0, identity.bytes));
@@ -1278,9 +1331,17 @@ mod tests {
 
         let third = cache.adopt(EDGE_A, fixture(b"cccc"), || false).unwrap();
         assert!(cache.lookup(EDGE_A, &first_id, || false).unwrap().is_some());
-        assert!(cache.lookup(EDGE_A, &second_id, || false).unwrap().is_none());
+        assert!(
+            cache
+                .lookup(EDGE_A, &second_id, || false)
+                .unwrap()
+                .is_none()
+        );
         assert!(Arc::ptr_eq(
-            &cache.lookup(EDGE_A, third.identity(), || false).unwrap().unwrap(),
+            &cache
+                .lookup(EDGE_A, third.identity(), || false)
+                .unwrap()
+                .unwrap(),
             &third,
         ));
         assert_eq!(counts(&cache), (2, 0, 8));
@@ -1295,17 +1356,31 @@ mod tests {
         drop(idle);
         let incoming = fixture(b"large SDK");
         // This image is too large for the configured budget at all.
-        let private = cache.adopt(EDGE_A, Arc::clone(&incoming), || false).unwrap();
+        let private = cache
+            .adopt(EDGE_A, Arc::clone(&incoming), || false)
+            .unwrap();
         assert!(Arc::ptr_eq(&private, &incoming));
         assert!(cache.lookup(EDGE_A, &idle_id, || false).unwrap().is_some());
 
         let incoming = fixture(b"larger");
         let incoming_id = *incoming.identity();
-        let private = cache.adopt(EDGE_A, Arc::clone(&incoming), || false).unwrap();
+        let private = cache
+            .adopt(EDGE_A, Arc::clone(&incoming), || false)
+            .unwrap();
         assert!(Arc::ptr_eq(&private, &incoming));
-        assert!(cache.lookup(EDGE_A, &incoming_id, || false).unwrap().is_none());
+        assert!(
+            cache
+                .lookup(EDGE_A, &incoming_id, || false)
+                .unwrap()
+                .is_none()
+        );
         assert!(cache.lookup(EDGE_A, &idle_id, || false).unwrap().is_some());
-        assert!(cache.lookup(EDGE_A, active.identity(), || false).unwrap().is_some());
+        assert!(
+            cache
+                .lookup(EDGE_A, active.identity(), || false)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(counts(&cache), (2, 0, 8));
     }
 
@@ -1323,7 +1398,9 @@ mod tests {
         };
         assert_eq!(counts(&cache), (0, 1, identity.bytes));
         assert!(path.is_dir());
-        let private = cache.adopt(EDGE_A, Arc::clone(&incoming), || false).unwrap();
+        let private = cache
+            .adopt(EDGE_A, Arc::clone(&incoming), || false)
+            .unwrap();
         assert!(Arc::ptr_eq(&private, &incoming));
         assert_eq!(counts(&cache), (0, 1, identity.bytes));
 
@@ -1334,7 +1411,10 @@ mod tests {
             // releasing its accounting is the only step that waits for us.
             let deadline = Instant::now() + Duration::from_secs(5);
             while path.exists() {
-                assert!(Instant::now() < deadline, "cleanup waited for the cache mutex");
+                assert!(
+                    Instant::now() < deadline,
+                    "cleanup waited for the cache mutex"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(guard.retiring_entries, 1);
@@ -1344,7 +1424,12 @@ mod tests {
         });
         assert_eq!(counts(&cache), (0, 0, 0));
         let retained = cache.adopt(EDGE_A, incoming, || false).unwrap();
-        assert!(cache.lookup(EDGE_A, retained.identity(), || false).unwrap().is_some());
+        assert!(
+            cache
+                .lookup(EDGE_A, retained.identity(), || false)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(counts(&cache), (1, 0, retained.identity().bytes));
     }
 
@@ -1378,7 +1463,11 @@ mod tests {
             assert!(cache.lock().unwrap().entries[0].invalidated);
             drop(old);
             let incoming = fixture(b"new compiler");
-            assert!(cache.adopt(EDGE_A, Arc::clone(&incoming), || false).is_err());
+            assert!(
+                cache
+                    .adopt(EDGE_A, Arc::clone(&incoming), || false)
+                    .is_err()
+            );
             assert_eq!(counts(&cache), (0, 1, identity.bytes));
             assert_eq!(fs::read(&sentinel).unwrap(), b"not the received SDK");
             assert_eq!(
@@ -1388,9 +1477,16 @@ mod tests {
 
             // Failed cleanup cannot finance another retained image. Ordinary
             // admission remains usable with its independent uploaded owner.
-            let private = cache.adopt(EDGE_A, Arc::clone(&incoming), || false).unwrap();
+            let private = cache
+                .adopt(EDGE_A, Arc::clone(&incoming), || false)
+                .unwrap();
             assert!(Arc::ptr_eq(&private, &incoming));
-            assert!(cache.lookup(EDGE_A, incoming.identity(), || false).unwrap().is_none());
+            assert!(
+                cache
+                    .lookup(EDGE_A, incoming.identity(), || false)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(counts(&cache), (0, 1, identity.bytes));
             drop(cache);
             assert_eq!(fs::read(&sentinel).unwrap(), b"not the received SDK");
@@ -1401,7 +1497,9 @@ mod tests {
     #[test]
     fn dropping_the_pool_preserves_an_active_lease_and_does_not_adopt_restart_paths() {
         let cache = RemoteToolchainCache::new(64, 1).unwrap();
-        let lease = cache.adopt(EDGE_A, fixture(b"retained compiler"), || false).unwrap();
+        let lease = cache
+            .adopt(EDGE_A, fixture(b"retained compiler"), || false)
+            .unwrap();
         let identity = *lease.identity();
         let path = lease.owner().path().to_path_buf();
         drop(cache);
@@ -1409,7 +1507,12 @@ mod tests {
         lease.verify(|| false).unwrap();
 
         let restarted = RemoteToolchainCache::new(64, 1).unwrap();
-        assert!(restarted.lookup(EDGE_A, &identity, || false).unwrap().is_none());
+        assert!(
+            restarted
+                .lookup(EDGE_A, &identity, || false)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(counts(&restarted), (0, 0, 0));
         drop(lease);
         assert!(!path.exists());

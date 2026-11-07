@@ -5,6 +5,7 @@
 //! the same coordinator publication provenance through final artifact delivery.
 
 use super::remote_toolchains::ReceivedToolchain;
+use super::target_state::TargetCacheConfig;
 use super::{
     CompilationCommand, CompilationSelection, OperationOutput, OperationProvenance, Profile,
     SharedRuntime, SourceSelection, default_jobs, default_manifest, default_timeout, invalid,
@@ -111,6 +112,9 @@ pub(super) struct RemoteOperationInputs {
     pub(super) toolchain: Arc<ReceivedToolchain>,
     pub(super) owner: Arc<tempfile::TempDir>,
     pub(super) request: Value,
+    // The transport supplies the authenticated TLS identity. Neither logical
+    // settings nor a prepared request may choose a persistent-target namespace.
+    authenticated_edge_pin: [u8; 32],
 }
 
 impl RemoteOperationInputs {
@@ -119,6 +123,7 @@ impl RemoteOperationInputs {
         source: SourceReceiver,
         toolchain: Arc<ReceivedToolchain>,
         request: Value,
+        authenticated_edge_pin: [u8; 32],
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Self> {
         let inputs = Self {
@@ -126,13 +131,22 @@ impl RemoteOperationInputs {
             toolchain,
             owner,
             request,
+            authenticated_edge_pin,
         };
         inputs.verify(stopped)?;
         Ok(inputs)
     }
 
+    pub(super) fn authenticated_edge_pin(&self) -> [u8; 32] {
+        self.authenticated_edge_pin
+    }
+
     fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
         checkpoint(stopped)?;
+        require(
+            self.authenticated_edge_pin != [0; 32],
+            "remote input custody requires an authenticated edge key",
+        )?;
         private_directory(self.owner.path())?;
         let source = self
             .source
@@ -263,7 +277,9 @@ impl RemoteOperationOutcome {
             self.provenance.coord.authority().as_ref() == Some(&self.authority),
             "remote completion lost its original coordinator authority",
         )?;
-        self.provenance.paths.verify_captured_toolchain(&cancelled)?;
+        self.provenance
+            .paths
+            .verify_captured_toolchain(&cancelled)?;
         verify_source(&self.provenance._source, &cancelled)?;
         self.provenance
             .paths
@@ -313,6 +329,7 @@ pub(super) fn start(
     runtime: Arc<SharedRuntime>,
     wrapper: PathBuf,
     operation_root: PathBuf,
+    target_cache: Option<TargetCacheConfig>,
     inputs: RemoteOperationInputs,
     settings: RemoteOperationSettings,
     stdout: File,
@@ -336,6 +353,7 @@ pub(super) fn start(
     profile.state_root = runtime.parent.clone();
     profile.operation_root = operation_root;
     profile.wrapper = wrapper;
+    profile.target_cache = target_cache;
     profile.validate()?;
     // Admission already sealed and verified these receivers under its input
     // deadline. run_operation rechecks their exact profile binding and bytes
@@ -424,6 +442,7 @@ mod tests {
             "toolchain_backing",
             "remote_workers",
             "target_cache",
+            "authenticated_edge_pin",
             "program",
             "args",
         ] {
@@ -513,7 +532,80 @@ mod tests {
             json!(rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION);
         request["toolchain_identity"] =
             worker_delivery::toolchain_identity_value(toolchain.identity());
-        RemoteOperationInputs::new(owner, source, toolchain, request, &|| false).unwrap()
+        RemoteOperationInputs::new(owner, source, toolchain, request, [7; 32], &|| false).unwrap()
+    }
+
+    #[test]
+    fn remote_input_custody_preserves_the_authenticated_peer() {
+        let inputs = fixture();
+        assert_eq!(inputs.authenticated_edge_pin(), [7; 32]);
+        let request = inputs.request.clone();
+        let source_root = inputs.source.sealed_root().unwrap().to_path_buf();
+        let sdk_root = inputs.toolchain.root().to_path_buf();
+        let inputs = RemoteOperationInputs::new(
+            inputs.owner,
+            inputs.source,
+            inputs.toolchain,
+            inputs.request,
+            [29; 32],
+            &|| false,
+        )
+        .unwrap();
+        inputs.verify(&|| false).unwrap();
+        assert_eq!(inputs.authenticated_edge_pin(), [29; 32]);
+        assert_eq!(inputs.request, request);
+        assert_eq!(inputs.source.sealed_root(), Some(source_root.as_path()));
+        assert_eq!(inputs.toolchain.root(), sdk_root);
+
+        // Server target policy is independent of the prepared logical intent;
+        // it cannot alter the retained source/compiler or replace the TLS peer.
+        let mut profile = settings(json!({})).profile();
+        assert!(profile.target_cache.is_none());
+        profile.source_root = source_root;
+        profile.toolchain_root = sdk_root;
+        profile.target_cache = Some(TargetCacheConfig {
+            runtime_epoch: "coordinator-runtime-1".into(),
+            max_bytes: 1024 * 1024,
+            max_families: 2,
+        });
+        inputs.verify_for_profile(&profile, &|| false).unwrap();
+        assert_eq!(inputs.authenticated_edge_pin(), [29; 32]);
+    }
+
+    #[test]
+    fn remote_input_custody_rejects_missing_or_client_injected_peer() {
+        let inputs = fixture();
+        let refused = RemoteOperationInputs::new(
+            inputs.owner,
+            inputs.source,
+            inputs.toolchain,
+            inputs.request,
+            [0; 32],
+            &|| false,
+        );
+        assert!(
+            refused
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("authenticated edge key")
+        );
+
+        let mut inputs = fixture();
+        inputs.authenticated_edge_pin = [0; 32];
+        assert!(inputs.verify(&|| false).is_err());
+
+        let mut inputs = fixture();
+        inputs.request["authenticated_edge_pin"] = json!("1d".repeat(32));
+        assert!(inputs.verify(&|| false).is_err());
+        assert_eq!(inputs.authenticated_edge_pin(), [7; 32]);
+
+        for value in [
+            json!({"target_cache":{"runtime_epoch":"client-selected"}}),
+            json!({"authenticated_edge_pin":"1d".repeat(32)}),
+        ] {
+            assert!(serde_json::from_value::<RemoteOperationSettings>(value).is_err());
+        }
     }
 
     #[test]
@@ -526,6 +618,7 @@ mod tests {
                 inputs.source,
                 inputs.toolchain,
                 inputs.request,
+                inputs.authenticated_edge_pin,
                 &|| false
             )
             .is_err()
@@ -555,6 +648,7 @@ mod tests {
             inputs.source,
             inputs.toolchain,
             inputs.request,
+            inputs.authenticated_edge_pin,
             &|| true,
         );
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted);
@@ -654,7 +748,12 @@ mod tests {
         ];
         let mappings = logical_roots
             .iter()
-            .map(|root| (PathBuf::from(root), paths.physical(Path::new(root)).unwrap()))
+            .map(|root| {
+                (
+                    PathBuf::from(root),
+                    paths.physical(Path::new(root)).unwrap(),
+                )
+            })
             .collect::<Vec<_>>();
         // A legitimate captured subdirectory keeps lease verification valid;
         // the refusal must come from the mount capability, not corrupt data.

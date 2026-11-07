@@ -256,7 +256,9 @@ impl CanonicalPaths {
             {
                 return Err("received compiler must retain a distinct SDK owner".into());
             }
-            toolchain.verify(|| false).map_err(|error| error.to_string())?;
+            toolchain
+                .verify(|| false)
+                .map_err(|error| error.to_string())?;
         }
         let mut visible = BTreeSet::new();
         let mut mounts: Vec<Mount> = Vec::new();
@@ -285,7 +287,7 @@ impl CanonicalPaths {
                 Some(toolchain) if logical == Path::new("/__rabs/toolchain") => {
                     if backing != toolchain.root() {
                         return Err(
-                            "canonical compiler mount differs from its received lease".into(),
+                            "canonical compiler mount differs from its received lease".into()
                         );
                     }
                     toolchain.owner().path()
@@ -424,7 +426,9 @@ impl CanonicalPaths {
             if !Arc::ptr_eq(image, received.image()) || backing != received.root() {
                 return Err("captured compiler differs from its retained SDK lease".into());
             }
-            received.verify(|| false).map_err(|error| error.to_string())?;
+            received
+                .verify(|| false)
+                .map_err(|error| error.to_string())?;
             return Ok(received.owner());
         }
         if let Some(inputs) = &self.input_owner

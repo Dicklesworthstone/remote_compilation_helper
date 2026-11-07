@@ -71,7 +71,7 @@ fn default_max_families() -> usize {
 
 /// The epoch identifies host runtime inputs outside the captured Rust toolchain.
 /// The caller also binds it into the target compatibility key.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TargetCacheConfig {
     pub runtime_epoch: String,
