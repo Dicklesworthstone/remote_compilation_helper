@@ -1260,6 +1260,19 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// Render the installed scripts for tests of RCH's worker-side handoff. The
+/// transfer tests exercise these scripts together with the generated remote
+/// command, so a change to either side cannot silently break their contract.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_cargo_shim_body() -> String {
+    cargo_shim_body(true)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_toolchain_wrap_body() -> String {
+    toolchain_wrap_body()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2806,28 +2819,37 @@ esac
     fn caller_set_wrapper_bypass_is_refused_when_require_remote_is_enabled() {
         for (body, args) in [
             (cargo_shim_body(true), vec!["test"]),
+            (cargo_shim_body(true), vec!["--version"]),
+            (cargo_shim_body(true), vec!["+selected", "test"]),
             (cargo_clippy_shim_body(true), vec!["--all-targets"]),
         ] {
-            let out = record_shim(
-                &body,
-                &argv_bytes(&args),
-                &[("RCH_CARGO_WRAPPER_BYPASS", "1")],
-            );
-            assert_eq!(
-                out.status.code(),
-                Some(1),
-                "bare caller bypass must fail closed"
-            );
-            assert!(out.stdout.is_empty(), "neither rch nor real cargo may run");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr.contains("refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1"),
-                "stderr: {stderr}"
-            );
-            assert!(
-                stderr.contains("force_local = true"),
-                "stderr should point to .rch/config.toml: {stderr}"
-            );
+            for require_remote in [None, Some("1"), Some("true")] {
+                for origin in [None, Some(""), Some("caller"), Some("rch-extra")] {
+                    let mut environment = vec![("RCH_CARGO_WRAPPER_BYPASS", "1")];
+                    if let Some(value) = require_remote {
+                        environment.push(("RCH_REQUIRE_REMOTE", value));
+                    }
+                    if let Some(value) = origin {
+                        environment.push(("RCH_CARGO_WRAPPER_ORIGIN", value));
+                    }
+                    let out = record_shim(&body, &argv_bytes(&args), &environment);
+                    assert_eq!(
+                        out.status.code(),
+                        Some(1),
+                        "unpaired bypass must fail closed: {args:?}, {environment:?}"
+                    );
+                    assert!(out.stdout.is_empty(), "neither rch nor real cargo may run");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(
+                        stderr.contains("refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1"),
+                        "stderr: {stderr}"
+                    );
+                    assert!(
+                        stderr.contains("force_local = true"),
+                        "stderr should point to .rch/config.toml: {stderr}"
+                    );
+                }
+            }
         }
 
         // Fail-open shim (`--allow-local`) honors bare bypass unless caller sets RCH_REQUIRE_REMOTE=1.
@@ -2849,6 +2871,33 @@ esac
             ],
         );
         assert_eq!(refused.status.code(), Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn origin_marker_without_exact_bypass_still_offloads() {
+        for (body, args) in [
+            (cargo_shim_body(true), vec!["test"]),
+            (cargo_shim_body(true), vec!["+selected", "test"]),
+            (cargo_clippy_shim_body(true), vec!["--all-targets"]),
+        ] {
+            for bypass in [None, Some(""), Some("0"), Some("true")] {
+                let mut environment = vec![
+                    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+                    ("RCH_REQUIRE_REMOTE", "1"),
+                ];
+                if let Some(value) = bypass {
+                    environment.push(("RCH_CARGO_WRAPPER_BYPASS", value));
+                }
+                let out = record_shim(&body, &argv_bytes(&args), &environment);
+                assert!(out.status.success(), "{:?}", out.stderr);
+                assert_eq!(
+                    recorded_fields(&out)[0],
+                    b"RCH",
+                    "origin alone must not authorize a local build: {args:?}, {environment:?}"
+                );
+            }
+        }
     }
 
     /// A direct `cargo-clippy` call is the leak; it must offload.
@@ -2915,41 +2964,122 @@ esac
         assert!(body.contains(r#"PATH="$SELF_DIR:$PATH""#));
     }
 
-    /// Executed for real: a bypassed toolchain-wrapper build runs the sibling
-    /// real cargo with the toolchain's bin dir leading PATH.
+    /// A dual-role host has BOTH a PATH shim and wrapped absolute toolchain
+    /// Cargo. Execute those installed scripts; only RCH and the final Cargo
+    /// are recording stubs. In particular, an absent shim must not accidentally
+    /// make a bare bypass pass through the wrapper's fail-open branch.
+    #[cfg(unix)]
+    fn installed_toolchain_output(
+        args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> (std::process::Output, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(".rustup/toolchains/test 'toolchain/bin");
+        let shims = dir.path().join(".rch/shims");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&shims).unwrap();
+        write_exe(&shims.join("cargo"), &cargo_shim_body(true));
+        write_exe(&bin.join("cargo"), &toolchain_wrap_body());
+        write_exe(
+            &dir.path().join("rch"),
+            "#!/bin/sh\nprintf '%s\\0' OFFLOAD \"$@\"\n",
+        );
+        write_exe(
+            &bin.join(REAL_CARGO_NAME),
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\0' TC-REAL \"${RCH_CARGO_WRAPPER_BYPASS-unset}\" ",
+                "\"${RCH_CARGO_WRAPPER_ORIGIN-unset}\" ",
+                "\"${CARGO_BUILD_JOBS-unset}\" \"${PATH%%:*}\" \"$@\"\n",
+                "exit \"${STUB_CARGO_STATUS:-0}\"\n",
+            ),
+        );
+        let mut cmd = std::process::Command::new(bin.join("cargo"));
+        cmd.args(args).env_clear().env("HOME", dir.path()).env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", shims.display(), dir.path().display()),
+        );
+        for (key, value) in environment {
+            cmd.env(key, value);
+        }
+        (output_retrying_text_busy(&mut cmd), bin)
+    }
+
     #[cfg(unix)]
     #[test]
     fn toolchain_wrapper_local_fallback_prepends_its_bin() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        write_exe(&bin.join("cargo"), &toolchain_wrap_body());
-        write_exe(
-            &bin.join(REAL_CARGO_NAME),
-            "#!/bin/sh\necho TC-REAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset} first=${PATH%%:*}\n",
-        );
-        let mut cmd = std::process::Command::new(bin.join("cargo"));
-        cmd.arg("build")
-            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
-            .env_remove("CARGO_BUILD_JOBS")
-            .env_remove("RCH_LOCAL_MAX_JOBS");
-        let out = output_retrying_text_busy(&mut cmd);
-        assert!(
-            out.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert!(
-            stdout.starts_with("TC-REAL"),
-            "must exec the real cargo: {stdout}"
-        );
-        assert!(
-            stdout.contains(&format!("first={}", bin.display())),
-            "toolchain bin must lead PATH for child rustc: {stdout}"
-        );
-        assert!(stdout.contains("jobs=8"), "local cap must hold: {stdout}");
+        let args = [
+            "test",
+            "--",
+            "spaces and 'quotes'",
+            "$(false)",
+            "line\nbreak",
+            "",
+        ];
+        for require_remote in [None, Some("1")] {
+            for (status, expected_status) in [("0", 0), ("101", 101)] {
+                let mut environment = vec![
+                    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+                    ("STUB_CARGO_STATUS", status),
+                ];
+                if let Some(value) = require_remote {
+                    environment.push(("RCH_REQUIRE_REMOTE", value));
+                }
+                let (out, bin) = installed_toolchain_output(&args, &environment);
+                assert_eq!(out.status.code(), Some(expected_status), "{:?}", out.stderr);
+                let mut expected = vec!["TC-REAL", "1", "rch", "8", bin.to_str().unwrap()];
+                expected.extend_from_slice(&args);
+                expected.push("");
+                assert_eq!(out.stdout, expected.join("\0").as_bytes());
+                assert!(out.stderr.is_empty());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_toolchain_wrapper_cannot_bypass_strict_shim_with_unpaired_markers() {
+        for require_remote in [None, Some("1")] {
+            for origin in [None, Some(""), Some("caller"), Some("rch-extra")] {
+                for args in [vec!["test"], vec!["--version"]] {
+                    let mut environment = vec![("RCH_CARGO_WRAPPER_BYPASS", "1")];
+                    if let Some(value) = require_remote {
+                        environment.push(("RCH_REQUIRE_REMOTE", value));
+                    }
+                    if let Some(value) = origin {
+                        environment.push(("RCH_CARGO_WRAPPER_ORIGIN", value));
+                    }
+                    let (out, _) = installed_toolchain_output(&args, &environment);
+                    assert_eq!(
+                        out.status.code(),
+                        Some(1),
+                        "{environment:?}: {:?}",
+                        out.stderr
+                    );
+                    assert!(out.stdout.is_empty(), "neither rch nor real Cargo may run");
+                    assert!(
+                        String::from_utf8_lossy(&out.stderr)
+                            .contains("refusing caller-set RCH_CARGO_WRAPPER_BYPASS=1")
+                    );
+                }
+            }
+        }
+
+        // The origin alone is not enough, including on the absolute-path
+        // entry point: ordinary builds must still reach RCH admission.
+        for bypass in [None, Some("0"), Some("true")] {
+            let mut environment = vec![
+                ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+                ("RCH_REQUIRE_REMOTE", "1"),
+            ];
+            if let Some(value) = bypass {
+                environment.push(("RCH_CARGO_WRAPPER_BYPASS", value));
+            }
+            let (out, _) = installed_toolchain_output(&["test"], &environment);
+            assert!(out.status.success(), "{:?}", out.stderr);
+            assert_eq!(out.stdout, b"OFFLOAD\0exec\0--\0cargo\0test\0");
+        }
     }
 
     #[test]

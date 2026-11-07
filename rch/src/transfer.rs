@@ -1978,14 +1978,11 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
 /// exit 103; on a dispatcher it "succeeds" by bouncing the build to a third
 /// host, paying a second sync for no reason.
 ///
-/// This mirrors the local-fallback loop-break in [`crate::hook`], which sets the
-/// same variable on rch's own local re-exec. The shim checks it before anything
-/// else, so it short-circuits regardless of how the remote-required intent
-/// reached the worker.
-const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &[
-    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
-    ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
-];
+/// Both markers are required by shim v9. Share the pair with the standalone
+/// worker and its benchmarks so no managed execution path emits a bare bypass.
+/// These assignments belong to the admitted remote command, never to the
+/// dispatcher's own environment or its local-fallback policy decision.
+const REMOTE_LOOP_BREAK_ENVS: &[(&str, &str)] = &rch_common::MANAGED_CARGO_ENV;
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -18755,7 +18752,8 @@ Number of files transferred: 42
     /// A job already running on a worker must compile there, never offload
     /// onward. Without the loop-break the worker's own cargo shim re-offloads:
     /// a pure worker refuses local fallback (exit 103), a dispatcher bounces
-    /// the build to a third host. See REMOTE_LOOP_BREAK_ENV.
+    /// the build to a third host. Shim v9 also refuses a bare bypass without
+    /// the origin marker, even for --version (issue #133).
     #[test]
     fn test_remote_env_plan_injects_loop_break() {
         let pipeline = TransferPipeline::new(
@@ -18765,19 +18763,24 @@ Number of files transferred: 42
             TransferConfig::default(),
         );
 
-        let prefix = pipeline.build_env_prefix();
-        assert!(
-            prefix.prefix.contains("RCH_CARGO_WRAPPER_BYPASS=1"),
-            "remote command must carry the loop-break, got: {}",
-            prefix.prefix
-        );
-        assert!(
-            prefix
-                .applied
-                .iter()
-                .any(|k| k == "RCH_CARGO_WRAPPER_BYPASS"),
-            "loop-break should be reported as applied"
-        );
+        let prefix = pipeline
+            .build_remote_env_plan_with_environment(&pipeline.remote_path(), [])
+            .env_prefix;
+        for (key, value) in [
+            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+            ("RCH_CARGO_WRAPPER_ORIGIN", "rch"),
+        ] {
+            assert!(
+                prefix.prefix.contains(&format!("{key}={value}")),
+                "remote command must carry the whole pair: {}",
+                prefix.prefix
+            );
+            assert_eq!(
+                prefix.applied.iter().filter(|applied| *applied == key).count(),
+                1,
+                "{key} must be reported exactly once"
+            );
+        }
     }
 
     /// A caller that exports the bypass OFF locally must not be able to re-arm
@@ -18786,6 +18789,7 @@ Number of files transferred: 42
     fn test_remote_loop_break_overrides_forwarded_value() {
         let mut overrides = HashMap::new();
         overrides.insert("RCH_CARGO_WRAPPER_BYPASS".to_string(), "0".to_string());
+        overrides.insert("RCH_CARGO_WRAPPER_ORIGIN".to_string(), "caller".to_string());
 
         let pipeline = TransferPipeline::new(
             PathBuf::from("/tmp/project"),
@@ -18793,7 +18797,11 @@ Number of files transferred: 42
             "hash".to_string(),
             TransferConfig::default(),
         )
-        .with_env_allowlist(vec!["RCH_CARGO_WRAPPER_BYPASS".to_string()])
+        .with_env_allowlist(vec![
+            "RCH_CARGO_WRAPPER_BYPASS".to_string(),
+            "RCH_CARGO_WRAPPER_ORIGIN".to_string(),
+            " RCH_CARGO_WRAPPER_ORIGIN ".to_string(),
+        ])
         .with_env_overrides(overrides);
 
         let prefix = pipeline.build_env_prefix();
@@ -18807,15 +18815,172 @@ Number of files transferred: 42
             "the disabling value must not survive, got: {}",
             prefix.prefix
         );
-        assert_eq!(
-            prefix
-                .applied
-                .iter()
-                .filter(|k| *k == "RCH_CARGO_WRAPPER_BYPASS")
-                .count(),
-            1,
-            "loop-break must be assigned exactly once"
+        assert!(
+            prefix.prefix.contains("RCH_CARGO_WRAPPER_ORIGIN=rch"),
+            "RCH must stamp its own origin: {}",
+            prefix.prefix
         );
+        assert!(!prefix.prefix.contains("RCH_CARGO_WRAPPER_ORIGIN=caller"));
+        for key in ["RCH_CARGO_WRAPPER_BYPASS", "RCH_CARGO_WRAPPER_ORIGIN"] {
+            assert_eq!(prefix.prefix.matches(&format!("{key}=")).count(), 1);
+            assert_eq!(
+                prefix.applied.iter().filter(|applied| *applied == key).count(),
+                1,
+                "each loop-break marker must be assigned exactly once"
+            );
+        }
+    }
+
+    /// Execute the generated remote command and the actual installed shim
+    /// scripts on a dual-role layout. Cargo and RCH are recording executables:
+    /// this tests the shell handoff, not a live fleet or compiler installation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_job_runs_installed_cargo_shims_with_paired_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+        for tracked in [false, true] {
+            for require_remote in [None, Some("1")] {
+                for exit_code in [0, 101] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path();
+                    let work = root.join("work");
+                    let home = root.join("home");
+                    let shims = home.join(".rch/shims");
+                    let sysroot = home.join(".rustup/toolchains/fixture");
+                    let toolchain_bin = sysroot.join("bin");
+                    let bin = root.join("bin");
+                    for path in [&work, &shims, &toolchain_bin, &bin] {
+                        std::fs::create_dir_all(path).unwrap();
+                    }
+                    let write_exe = |path: &Path, body: &str| {
+                        std::fs::write(path, body).unwrap();
+                        std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(0o755),
+                        )
+                        .unwrap();
+                    };
+                    write_exe(
+                        &shims.join("cargo"),
+                        &crate::commands::shim::test_cargo_shim_body(),
+                    );
+                    write_exe(
+                        &toolchain_bin.join("cargo"),
+                        &crate::commands::shim::test_toolchain_wrap_body(),
+                    );
+                    write_exe(
+                        &bin.join("rustc"),
+                        "#!/bin/sh\nprintf '%s\\n' \"$RCH_TEST_SYSROOT\"\n",
+                    );
+                    write_exe(
+                        &bin.join("rch"),
+                        "#!/bin/sh\nprintf offload > \"$RCH_TEST_OFFLOAD\"\nexit 87\n",
+                    );
+                    write_exe(
+                        &toolchain_bin.join("cargo-rch-real"),
+                        concat!(
+                            "#!/bin/sh\n",
+                            "printf '%s\\0' \"${RCH_CARGO_WRAPPER_BYPASS-unset}\" ",
+                            "\"${RCH_CARGO_WRAPPER_ORIGIN-unset}\" \"$@\" >> \"$RCH_TEST_LOG\"\n",
+                            "printf 'cargo fixture\\n'\n",
+                            "exit \"${RCH_TEST_STATUS:-0}\"\n",
+                        ),
+                    );
+                    std::fs::write(
+                        work.join("job.sh"),
+                        concat!(
+                            "set -eu\n",
+                            "cargo --version\n",
+                            "sh -c 'cargo test --features \"feature with spaces\"'\n",
+                            "RCH_TEST_STATUS=\"$RCH_TEST_LAST_STATUS\" ",
+                            "\"$RCH_TEST_TOOLCHAIN_CARGO\" build --release\n",
+                        ),
+                    )
+                    .unwrap();
+                    let log = root.join("calls");
+                    let offload = root.join("unexpected-offload");
+                    let mut overrides = HashMap::from([
+                        ("HOME".to_string(), home.to_str().unwrap().to_string()),
+                        (
+                            "PATH".to_string(),
+                            format!("{}:{}:/usr/bin:/bin", shims.display(), bin.display()),
+                        ),
+                        (
+                            "RCH_TEST_SYSROOT".to_string(),
+                            sysroot.to_str().unwrap().to_string(),
+                        ),
+                        (
+                            "RCH_TEST_TOOLCHAIN_CARGO".to_string(),
+                            toolchain_bin.join("cargo").to_str().unwrap().to_string(),
+                        ),
+                        ("RCH_TEST_LOG".to_string(), log.to_str().unwrap().to_string()),
+                        (
+                            "RCH_TEST_OFFLOAD".to_string(),
+                            offload.to_str().unwrap().to_string(),
+                        ),
+                        ("RCH_TEST_LAST_STATUS".to_string(), exit_code.to_string()),
+                        ("RCH_CARGO_WRAPPER_BYPASS".to_string(), "0".to_string()),
+                        ("RCH_CARGO_WRAPPER_ORIGIN".to_string(), "caller".to_string()),
+                    ]);
+                    if let Some(value) = require_remote {
+                        overrides.insert("RCH_REQUIRE_REMOTE".to_string(), value.to_string());
+                    }
+                    let pipeline = TransferPipeline::new(
+                        work.clone(),
+                        "shim-worker".to_string(),
+                        "hash".to_string(),
+                        TransferConfig::default(),
+                    )
+                    .with_remote_path_override(work.to_str().unwrap())
+                    .with_env_allowlist(overrides.keys().cloned().collect())
+                    .with_env_overrides(overrides)
+                    .with_build_id(tracked.then_some(41))
+                    .with_compilation_kind(Some(CompilationKind::Job))
+                    .with_compilation_config(rch_common::CompilationConfig {
+                        build_timeout_sec: 15,
+                        test_timeout_sec: 15,
+                        remote_build_jobs: RemoteBuildJobs::Off,
+                        ..Default::default()
+                    });
+                    let script = root.join("remote-command.sh");
+                    std::fs::write(
+                        &script,
+                        pipeline.build_remote_command("sh ./job.sh", None),
+                    )
+                    .unwrap();
+                    let output = std::process::Command::new("/usr/bin/timeout")
+                        .args(["--kill-after=5", "30", "/bin/sh"])
+                        .arg(&script)
+                        .current_dir(&work)
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("HOME", &home)
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(exit_code),
+                        "tracked={tracked}, require_remote={require_remote:?}: {output:?}"
+                    );
+                    assert!(!offload.exists(), "an admitted job must never offload again");
+                    assert_eq!(
+                        std::fs::read(&log).unwrap().as_slice(),
+                        concat!(
+                            "1\0rch\0--version\0",
+                            "1\0rch\0test\0--features\0feature with spaces\0",
+                            "1\0rch\0build\0--release\0",
+                        )
+                        .as_bytes()
+                    );
+                    assert_eq!(
+                        output.stdout.as_slice(),
+                        b"cargo fixture\ncargo fixture\ncargo fixture\n"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
