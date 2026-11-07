@@ -7813,11 +7813,22 @@ pub struct RusqliteEngine {
 }
 
 impl RusqliteEngine {
-    /// Open (or create) a database file.
+    /// Open (or create) a database file with a write-ahead log and
+    /// `synchronous=FULL`. Durability is unchanged from the rollback journal
+    /// (a commit returns only after the WAL is fsynced), but one fsync
+    /// replaces the journal's create, two journal fsyncs, database fsync,
+    /// unlink and directory fsync. The live lane commits tens of transactions
+    /// per executed compile, so that cycle dominated its per-action cost.
+    /// A database that cannot switch (another connection holds it, or the
+    /// filesystem lacks shared memory) keeps its existing crash-safe journal.
     pub fn open(path: &std::path::Path) -> Result<Self, StoreError> {
-        rusqlite::Connection::open(path)
-            .map(|conn| Self { conn })
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        let backend = |e: rusqlite::Error| StoreError::Backend(e.to_string());
+        let conn = rusqlite::Connection::open(path).map_err(backend)?;
+        // The pragma answers the resulting mode; a refusal is not an error.
+        let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0));
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(backend)?;
+        Ok(Self { conn })
     }
 
     /// Open an in-memory database.
@@ -10811,6 +10822,51 @@ mod action_key_provenance_tests {
                 .unwrap();
             assert_visible_components(&directory, &descriptor);
         }
+    }
+
+    #[test]
+    fn file_stores_use_a_durable_write_ahead_log_readable_by_read_only_inspectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meta.sqlite");
+        let read_only = || {
+            let reader = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            reader
+                .query_row("SELECT v FROM wal_probe", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+            assert_eq!(
+                store.query("PRAGMA journal_mode", &[]).unwrap(),
+                vec![vec![SqlValue::Text("wal".into())]]
+            );
+            // FULL: every commit is fsynced before it returns, as before.
+            assert_eq!(
+                store.query("PRAGMA synchronous", &[]).unwrap(),
+                vec![vec![SqlValue::Int(2)]]
+            );
+            store
+                .engine
+                .execute("CREATE TABLE wal_probe (v INTEGER)", &[])
+                .unwrap();
+            store
+                .engine
+                .execute("INSERT INTO wal_probe VALUES (7)", &[])
+                .unwrap();
+            // Inspectors (`rch why`) read committed state while it is open...
+            assert_eq!(read_only(), 7);
+        }
+        // ...after it closed cleanly, and a reopen keeps the journal mode.
+        assert_eq!(read_only(), 7);
+        let mut reopened = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            reopened.query("PRAGMA journal_mode", &[]).unwrap(),
+            vec![vec![SqlValue::Text("wal".into())]]
+        );
     }
 
     #[test]
