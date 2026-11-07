@@ -12,6 +12,13 @@ use std::time::Duration;
 /// Environment override for `[timeouts].scale`.
 pub const TIMING_SCALE_ENV: &str = "RCH_TIMING_SCALE";
 
+/// Absolute ceiling for one slow-path control-operation budget.
+///
+/// A finite multiplier alone cannot make an arbitrary base duration safe for
+/// constructing an absolute deadline. This cap also applies at scale one.
+/// Workload runtime limits and signal-escalation grace do not use this policy.
+pub const MAX_CONTROL_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// A finite multiplier between one and ten, inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
@@ -60,16 +67,20 @@ impl std::str::FromStr for TimingScale {
 }
 
 impl TimingScale {
-    /// Scale a control-operation budget without panicking on duration overflow.
-    /// The default is exact, including durations beyond floating-point precision.
+    /// Scale a control-operation budget within the absolute one-hour ceiling.
+    /// The default preserves every duration within that ceiling exactly.
+    /// Overflow must never produce an effectively indefinite wait or an
+    /// unrepresentable absolute deadline in a caller.
     #[must_use]
     pub fn duration(self, base: Duration) -> Duration {
+        let base = base.min(MAX_CONTROL_TIMEOUT);
         if self.0.to_bits() == 1.0_f64.to_bits() {
             return base;
         }
         Duration::try_from_secs_f64(base.as_secs_f64() * self.0)
-            .unwrap_or(Duration::MAX)
+            .unwrap_or(MAX_CONTROL_TIMEOUT)
             .max(base)
+            .min(MAX_CONTROL_TIMEOUT)
     }
 
     /// Numeric text safe to pass to a remote environment or shell assignment.
@@ -144,15 +155,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_preserves_every_duration_exactly() {
+    fn default_preserves_control_durations_within_ceiling_exactly() {
         let scale = TimingScale::default();
         for duration in [
             Duration::ZERO,
             Duration::from_nanos(1),
             Duration::from_millis(1500),
-            Duration::new(1 << 60, 123_456_789),
-            Duration::MAX,
+            Duration::new(3599, 123_456_789),
+            MAX_CONTROL_TIMEOUT,
         ] {
+            assert_eq!(scale.duration(duration), duration);
+        }
+        for seconds in [1, 2, 3, 5, 10, 15, 20, 25, 30, 33, 45, 60, 120] {
+            let duration = Duration::from_secs(seconds);
             assert_eq!(scale.duration(duration), duration);
         }
         assert_eq!(scale.env_value(), "1");
@@ -170,8 +185,38 @@ mod tests {
             maximum.duration(Duration::from_secs(30)),
             Duration::from_secs(300)
         );
-        assert_eq!(maximum.duration(Duration::MAX), Duration::MAX);
+        assert_eq!(maximum.duration(Duration::MAX), MAX_CONTROL_TIMEOUT);
         assert_eq!(fractional.duration(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn extreme_budgets_remain_finite_and_form_valid_absolute_deadlines() {
+        let now = std::time::Instant::now();
+        for value in [1.0, 1.001, 1.5, 10.0] {
+            let scale = TimingScale::try_from(value).unwrap();
+            for base in [
+                MAX_CONTROL_TIMEOUT + Duration::from_nanos(1),
+                Duration::from_secs(3601),
+                Duration::new(1 << 60, 123_456_789),
+                Duration::MAX,
+            ] {
+                let bounded = scale.duration(base);
+                assert_eq!(bounded, MAX_CONTROL_TIMEOUT);
+                assert!(
+                    now.checked_add(bounded).is_some(),
+                    "scale {value} produced an unrepresentable deadline"
+                );
+            }
+        }
+        let doubled = TimingScale::try_from(2.0).unwrap();
+        assert_eq!(
+            doubled.duration(Duration::from_secs(1799)),
+            Duration::from_secs(3598)
+        );
+        assert_eq!(
+            doubled.duration(Duration::from_secs(1801)),
+            MAX_CONTROL_TIMEOUT
+        );
     }
 
     #[test]
