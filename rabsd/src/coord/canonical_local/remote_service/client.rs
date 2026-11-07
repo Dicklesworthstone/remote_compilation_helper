@@ -255,12 +255,12 @@ pub fn run_client_profile(
             input_deadline,
         )
         .await?;
-        wire.send(&Message::InputsDone, stopped, input_deadline)
+        wire.send(&Message::InputsDone {}, stopped, input_deadline)
             .await?;
         require(
             matches!(
                 wire.receive_until(stopped, input_deadline).await?,
-                Message::Accepted
+                Message::Accepted {}
             ),
             "coordinator did not acknowledge operation admission",
         )?;
@@ -288,7 +288,7 @@ async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
             Message::Ready { toolchain } => {
                 return Ok((Instant::now() + TOOLCHAIN_INPUT_BUDGET, toolchain));
             }
-            Message::Queued => {
+            Message::Queued {} => {
                 if !reported_queue {
                     eprintln!(
                         "{}",
@@ -302,7 +302,7 @@ async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(())
                 })
                 .await?;
-                wire.send(&Message::Poll, stopped, admission_deadline)
+                wire.send(&Message::Poll {}, stopped, admission_deadline)
                     .await?;
             }
             _ => {
@@ -479,7 +479,7 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
     let mut stdout_offset = 0;
     let mut stderr_offset = 0;
     let (exit_code, target) = loop {
-        wire.send(&Message::Poll, stopped, execution_deadline)
+        wire.send(&Message::Poll {}, stopped, execution_deadline)
             .await?;
         match wire.receive_until(stopped, execution_deadline).await? {
             Message::Progress { stdout, stderr } => {
@@ -531,7 +531,7 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         Some(&config.output_destination)
     } else {
-        wire.send(&Message::Close, stopped, delivery_deadline)
+        wire.send(&Message::Close {}, stopped, delivery_deadline)
             .await?;
         None
     };
@@ -573,7 +573,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
             .ok_or_else(|| invalid("target parent missing"))?,
         native,
     )?;
-    wire.send(&Message::ReceiveTarget, stopped, deadline)
+    wire.send(&Message::ReceiveTarget {}, stopped, deadline)
         .await?;
     let mut window = Window::default();
     loop {
@@ -588,7 +588,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
                 wire.send(&Message::Window { count }, stopped, deadline)
                     .await?;
             }
-            Message::ArtifactEnd => {
+            Message::ArtifactEnd {} => {
                 require(
                     !window.pending(),
                     "remote artifacts ended before their last window acknowledgment",
@@ -771,12 +771,12 @@ mod tests {
         native(async {
             let stream = AdmissionStream::new(
                 &[
-                    Message::Queued,
-                    Message::Queued,
+                    Message::Queued {},
+                    Message::Queued {},
                     Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
                     },
-                    Message::Accepted,
+                    Message::Accepted {},
                 ],
                 false,
             );
@@ -803,7 +803,7 @@ mod tests {
             // not mistaken for another queue reply or consumed by the wait.
             assert!(matches!(
                 wire.receive_until(&stopped, input_deadline).await.unwrap(),
-                Message::Accepted
+                Message::Accepted {}
             ));
         });
     }
@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn admission_queue_replies_cannot_renew_the_absolute_deadline() {
         native(async {
-            let stream = AdmissionStream::new(&[Message::Queued], true);
+            let stream = AdmissionStream::new(&[Message::Queued {}], true);
             let output = Arc::clone(&stream.output);
             let mut wire = Wire::new(stream);
             let stopped = AtomicBool::new(false);
@@ -879,7 +879,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
             cancel.store(true, Ordering::Release);
         });
-        let mut stream = AdmissionStream::new(&[Message::Queued], true);
+        let mut stream = AdmissionStream::new(&[Message::Queued {}], true);
         stream.first_read = Some(observed);
         let output = Arc::clone(&stream.output);
         let mut wire = Wire::new(stream);
@@ -908,15 +908,15 @@ mod tests {
                     }),
                     io::ErrorKind::InvalidData,
                 ),
-                (Some(Message::Cancel), io::ErrorKind::Interrupted),
-                (Some(Message::Accepted), io::ErrorKind::InvalidData),
+                (Some(Message::Cancel {}), io::ErrorKind::Interrupted),
+                (Some(Message::Accepted {}), io::ErrorKind::InvalidData),
                 (
                     Some(Message::Window { count: 1 }),
                     io::ErrorKind::InvalidData,
                 ),
                 (None, io::ErrorKind::UnexpectedEof),
             ] {
-                let mut replies = vec![Message::Queued];
+                let mut replies = vec![Message::Queued {}];
                 replies.extend(reply);
                 let stream = AdmissionStream::new(&replies, false);
                 let output = Arc::clone(&stream.output);
@@ -932,7 +932,7 @@ mod tests {
                 assert_eq!(error.kind(), kind);
                 assert_eq!(admission_messages(&output), [json!({"kind":"poll"})]);
             }
-            let stream = AdmissionStream::new(&[Message::Accepted], false);
+            let stream = AdmissionStream::new(&[Message::Accepted {}], false);
             let output = Arc::clone(&stream.output);
             let mut wire = Wire::new(stream);
             assert!(
@@ -1141,7 +1141,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                wire.send(&Message::InputsDone, &stopped, deadline)
+                wire.send(&Message::InputsDone {}, &stopped, deadline)
                     .await
                     .unwrap();
             });
@@ -1188,7 +1188,7 @@ mod tests {
                         assert_eq!(count, window_total);
                         frames = 0;
                     }
-                    Message::InputsDone => {
+                    Message::InputsDone {} => {
                         assert_eq!(frames, 0);
                         completed = true;
                     }
@@ -1285,7 +1285,7 @@ mod tests {
                     deadline,
                 )
                 .await?;
-                wire.send(&Message::InputsDone, &stopped, deadline).await
+                wire.send(&Message::InputsDone {}, &stopped, deadline).await
             });
             assert!(result.is_err(), "changed retained inputs cannot execute");
             for message in admission_messages(&output) {
@@ -1312,7 +1312,7 @@ mod tests {
                 }),
                 io::ErrorKind::InvalidData,
             ),
-            (Some(Message::Cancel), io::ErrorKind::Interrupted),
+            (Some(Message::Cancel {}), io::ErrorKind::Interrupted),
             (None, io::ErrorKind::UnexpectedEof),
         ] {
             let mut fixture = InputFixture::new();
@@ -1342,7 +1342,7 @@ mod tests {
                     deadline,
                 )
                 .await?;
-                wire.send(&Message::InputsDone, &stopped, deadline).await
+                wire.send(&Message::InputsDone {}, &stopped, deadline).await
             });
             assert_eq!(result.unwrap_err().kind(), expected);
             let messages = admission_messages(&output);
@@ -1443,7 +1443,7 @@ mod tests {
                         deadline,
                     )
                     .await?;
-                    wire.send(&Message::Accepted, &stopped, deadline).await?;
+                    wire.send(&Message::Accepted {}, &stopped, deadline).await?;
                     Ok::<_, io::Error>(sealed)
                 })
             });
@@ -1462,11 +1462,12 @@ mod tests {
                     deadline,
                 )
                 .await?;
-                wire.send(&Message::InputsDone, &stopped, deadline).await?;
+                wire.send(&Message::InputsDone {}, &stopped, deadline)
+                    .await?;
                 require(
                     matches!(
                         wire.receive_until(&stopped, deadline).await?,
-                        Message::Accepted
+                        Message::Accepted {}
                     ),
                     "native receiver did not seal the complete transfer",
                 )
@@ -1583,7 +1584,7 @@ mod tests {
                         match received {
                             Ok(_) => {
                                 server_accepted.store(true, Ordering::Release);
-                                wire.send(&Message::Accepted, &stopped, deadline).await?;
+                                wire.send(&Message::Accepted {}, &stopped, deadline).await?;
                                 Ok(())
                             }
                             Err(error) => Err(error),

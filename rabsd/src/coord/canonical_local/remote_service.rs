@@ -521,9 +521,9 @@ impl<'a> ToolchainAdmission<'a> {
                         }
                         UploadPoll::Abandoned => break,
                         UploadPoll::Pending => {
-                            wire.send(&Message::Queued, stopped, deadline).await?;
+                            wire.send(&Message::Queued {}, stopped, deadline).await?;
                             require(
-                                matches!(wire.receive(stopped, deadline).await?, Message::Poll),
+                                matches!(wire.receive(stopped, deadline).await?, Message::Poll {}),
                                 "expected an admission status poll while awaiting an SDK upload",
                             )?;
                         }
@@ -649,7 +649,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         Instant::now() + Duration::from_secs(settings.timeout_seconds) + DELIVERY_BUDGET;
     // Acceptance means execution may begin. An interruption from this point
     // never selects a retry, another coordinator or local compilation.
-    wire.send(&Message::Accepted, stopped, input_deadline)
+    wire.send(&Message::Accepted {}, stopped, input_deadline)
         .await?;
     let operation = remote_operation::start(
         Arc::clone(&runtime),
@@ -676,7 +676,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         require(
             matches!(
                 wire.receive(stopped, execution_deadline).await?,
-                Message::Poll
+                Message::Poll {}
             ),
             "expected an operation status poll",
         )?;
@@ -766,11 +766,11 @@ async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(admitted) = waiting.try_start()? {
             return Ok(admitted);
         }
-        wire.send(&Message::Queued, stopped, deadline).await?;
+        wire.send(&Message::Queued {}, stopped, deadline).await?;
         // Do not renew the queue deadline on activity or consume upload bytes.
         // The bounded read also observes EOF, Cancel and service shutdown.
         require(
-            matches!(wire.receive(stopped, deadline).await?, Message::Poll),
+            matches!(wire.receive(stopped, deadline).await?, Message::Poll {}),
             "expected an admission status poll before input upload",
         )?;
     }
@@ -830,7 +830,7 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 wire.send(&Message::Window { count }, stopped, input_deadline)
                     .await?;
             }
-            Message::InputsDone => {
+            Message::InputsDone {} => {
                 require(
                     !window.pending(),
                     "remote inputs ended before their complete acknowledged transfer",
@@ -908,7 +908,7 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         require(
             matches!(
                 wire.receive(stopped, deadline).await?,
-                Message::ReceiveTarget
+                Message::ReceiveTarget {}
             ),
             "client did not accept the declared target",
         )?;
@@ -937,7 +937,8 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         send_window(wire, &mut window, stopped, deadline).await?;
-        wire.send(&Message::ArtifactEnd, stopped, deadline).await?;
+        wire.send(&Message::ArtifactEnd {}, stopped, deadline)
+            .await?;
         let manifest_sha256 = encode_hex(&target.manifest().digest());
         let Message::Received {
             manifest_sha256: received,
@@ -971,7 +972,7 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         )?;
     } else {
         require(
-            matches!(wire.receive(stopped, deadline).await?, Message::Close),
+            matches!(wire.receive(stopped, deadline).await?, Message::Close {}),
             "expected completion acknowledgment",
         )?;
     }
@@ -1253,7 +1254,7 @@ mod tests {
             }));
             input.extend(record(&Message::WindowEnd { count: 1 }));
         }
-        input.extend(record(&Message::InputsDone));
+        input.extend(record(&Message::InputsDone {}));
         input
     }
 
@@ -1340,7 +1341,7 @@ mod tests {
                 publisher.publish(lease, || false).unwrap();
                 published.send(()).unwrap();
             });
-            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
             let output = Arc::clone(&peer.output);
             peer.before_read = Some(Box::new(move || {
                 assert_eq!(fs::read_dir(&input_root).unwrap().count(), 0);
@@ -1402,7 +1403,7 @@ mod tests {
                 drop(publisher);
                 abandoned.send(()).unwrap();
             });
-            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
             let output = Arc::clone(&peer.output);
             peer.before_read = Some(Box::new(move || {
                 release.send(()).unwrap();
@@ -1442,11 +1443,11 @@ mod tests {
         let identity = *sdk.identity();
         for input in [
             Vec::new(),
-            record(&Message::Cancel),
+            record(&Message::Cancel {}),
             record(&Message::SourceChunk {
                 chunk: Chunk::new("src/lib.rs", 0, b"too early").unwrap(),
             }),
-            record(&Message::InputsDone),
+            record(&Message::InputsDone {}),
         ] {
             let cache = RemoteToolchainCache::new(0, 1).unwrap();
             let pin = [19; 32];
@@ -1498,7 +1499,7 @@ mod tests {
             let inputs = crate::test_util::private_tempdir();
             let stopped = Arc::new(AtomicBool::new(false));
             let child_stop = Arc::clone(&stopped);
-            let mut peer = AdmissionPeer::new(record(&Message::Poll));
+            let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
             peer.before_read = Some(Box::new(move || {
                 if expire {
                     std::thread::sleep(Duration::from_millis(40));
@@ -1589,7 +1590,7 @@ mod tests {
             chunk: Chunk::new("src/lib.rs", 0, b"wrong input").unwrap(),
         });
         let window = record(&Message::WindowEnd { count: 1 });
-        let done = record(&Message::InputsDone);
+        let done = record(&Message::InputsDone {});
         for input in [
             done.clone(),
             [chunk, done.clone()].concat(),
@@ -1708,7 +1709,7 @@ mod tests {
         let tail = Arc::new(Mutex::new(None));
         let queued_tail = Arc::clone(&tail);
         let peer_admissions = Arc::clone(&admissions);
-        let mut peer = AdmissionPeer::new(record(&Message::Poll));
+        let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
         let output = Arc::clone(&peer.output);
         peer.before_read = Some(Box::new(move || {
             *queued_tail.lock().unwrap() = Some(peer_admissions.enqueue().unwrap());
@@ -1737,8 +1738,8 @@ mod tests {
     fn queued_remote_disconnect_cancel_and_early_upload_release_only_their_ticket() {
         for (input, expected) in [
             (Vec::new(), io::ErrorKind::UnexpectedEof),
-            (record(&Message::Cancel), io::ErrorKind::Interrupted),
-            (record(&Message::InputsDone), io::ErrorKind::InvalidData),
+            (record(&Message::Cancel {}), io::ErrorKind::Interrupted),
+            (record(&Message::InputsDone {}), io::ErrorKind::InvalidData),
             (
                 record(&Message::SourceChunk {
                     chunk: Chunk::new("src/lib.rs", 0, b"not admitted").unwrap(),
@@ -1826,7 +1827,7 @@ mod tests {
         let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
         let healthy = Arc::new(AtomicBool::new(true));
         let peer_health = Arc::clone(&healthy);
-        let mut peer = AdmissionPeer::new(record(&Message::Poll));
+        let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
         let output = Arc::clone(&peer.output);
         peer.before_read = Some(Box::new(move || {
             peer_health.store(false, Ordering::Release);

@@ -284,6 +284,10 @@ pub(super) enum ToolchainDisposition {
     Reuse,
 }
 
+/// Field-less messages are empty struct variants, never unit variants: serde's
+/// internally tagged unit visitor skips remaining entries, so
+/// `deny_unknown_fields` would not refuse `{"kind":"poll","extra":1}`.
+/// The JSON is the same `{"kind":"poll"}` either way.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum Message {
@@ -296,7 +300,7 @@ pub(super) enum Message {
         toolchain_identity: Toolchain,
         cargo_home: Option<CargoHome>,
     },
-    Queued,
+    Queued {},
     Ready {
         toolchain: ToolchainDisposition,
     },
@@ -315,9 +319,9 @@ pub(super) enum Message {
     Window {
         count: u64,
     },
-    InputsDone,
-    Accepted,
-    Poll,
+    InputsDone {},
+    Accepted {},
+    Poll {},
     Progress {
         stdout: Output,
         stderr: Output,
@@ -328,11 +332,11 @@ pub(super) enum Message {
         stderr_bytes: u64,
         target: Option<Manifest>,
     },
-    ReceiveTarget,
+    ReceiveTarget {},
     ArtifactChunk {
         chunk: Chunk,
     },
-    ArtifactEnd,
+    ArtifactEnd {},
     Received {
         manifest_sha256: String,
     },
@@ -345,8 +349,8 @@ pub(super) enum Message {
     Complete {
         exit_code: i32,
     },
-    Close,
-    Cancel,
+    Close {},
+    Cancel {},
     Failure {
         message: String,
     },
@@ -436,7 +440,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
                     "remote canonical service: {}",
                     message.chars().take(4096).collect::<String>()
                 ))),
-                Message::Cancel => Err(io::Error::new(
+                Message::Cancel {} => Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "remote client cancelled its operation",
                 )),
@@ -709,7 +713,7 @@ mod tests {
 
     #[test]
     fn fragmented_and_coalesced_records_keep_the_exact_next_phase() {
-        let mut bytes = record(&Message::Queued);
+        let mut bytes = record(&Message::Queued {});
         bytes.extend(record(&Message::Ready {
             toolchain: ToolchainDisposition::Reuse,
         }));
@@ -720,7 +724,7 @@ mod tests {
             let mut buffered = Vec::new();
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
-                Message::Queued
+                Message::Queued {}
             ));
             assert!(matches!(
                 ready(read_record(&mut stream, &mut buffered)).unwrap(),
@@ -745,7 +749,7 @@ mod tests {
 
     #[test]
     fn record_boundary_allows_the_delimiter_but_refuses_oversize_and_partial_eof() {
-        let payload = serde_json::to_vec(&Message::Poll).unwrap();
+        let payload = serde_json::to_vec(&Message::Poll {}).unwrap();
         for (length, accepted) in [(MAX_JSON_RECORD, true), (MAX_JSON_RECORD + 1, false)] {
             let mut bytes = payload.clone();
             bytes.resize(length, b' ');
@@ -754,7 +758,7 @@ mod tests {
             let mut buffered = Vec::new();
             let result = ready(read_record(&mut stream, &mut buffered));
             if accepted {
-                assert!(matches!(result.unwrap(), Message::Poll));
+                assert!(matches!(result.unwrap(), Message::Poll {}));
             } else {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
                 assert!(buffered.len() <= MAX_JSON_RECORD + 1);
@@ -773,7 +777,7 @@ mod tests {
 
     #[test]
     fn continuously_ready_fragments_yield_before_starving_the_controller() {
-        let mut bytes = serde_json::to_vec(&Message::Poll).unwrap();
+        let mut bytes = serde_json::to_vec(&Message::Poll {}).unwrap();
         bytes.resize(4 * READS_BEFORE_YIELD, b' ');
         bytes.push(b'\n');
         let mut stream = MemoryStream::new(bytes, 1);
@@ -783,7 +787,7 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(future.as_mut().poll(&mut context).is_pending());
         assert_eq!(reads.load(Ordering::Relaxed), READS_BEFORE_YIELD);
-        assert!(matches!(ready(future), Ok(Message::Poll)));
+        assert!(matches!(ready(future), Ok(Message::Poll {})));
     }
 
     #[test]
@@ -830,7 +834,7 @@ mod tests {
                 let mut wire = Wire::new(stream);
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let error = if writing {
-                    wire.send(&Message::Poll, &stopped, deadline)
+                    wire.send(&Message::Poll {}, &stopped, deadline)
                         .await
                         .unwrap_err()
                 } else {
@@ -839,7 +843,7 @@ mod tests {
                 setter.join().unwrap();
                 assert_eq!(error.kind(), io::ErrorKind::Interrupted);
                 if writing {
-                    assert_eq!(wire.stream.output, record(&Message::Poll)[..5]);
+                    assert_eq!(wire.stream.output, record(&Message::Poll {})[..5]);
                 } else {
                     assert_eq!(wire.buffered, prefix);
                 }
@@ -958,7 +962,7 @@ mod tests {
                 record(&Message::Failure {
                     message: "refused".into(),
                 }),
-                record(&Message::Cancel),
+                record(&Message::Cancel {}),
                 b"{invalid}\n".to_vec(),
                 Vec::new(),
             ] {
@@ -972,7 +976,11 @@ mod tests {
                 });
                 wire.stream.offset = 0;
                 assert!(wire.receive_until(&stopped, deadline).await.is_err());
-                assert!(wire.send(&Message::Poll, &stopped, deadline).await.is_err());
+                assert!(
+                    wire.send(&Message::Poll {}, &stopped, deadline)
+                        .await
+                        .is_err()
+                );
                 assert_eq!(wire.stream.reads.load(Ordering::Relaxed), reads);
                 assert!(wire.stream.output.is_empty());
             }
@@ -996,6 +1004,28 @@ mod tests {
         }
         let settings = json!({"state_root":"/server/state"});
         assert!(serde_json::from_value::<RemoteOperationSettings>(settings).is_err());
+    }
+
+    #[test]
+    fn field_less_messages_keep_their_exact_wire_bytes() {
+        // Empty struct variants exist only so deny_unknown_fields applies;
+        // peers built before that change exchange the identical records.
+        for (message, bytes) in [
+            (Message::Queued {}, r#"{"kind":"queued"}"#),
+            (Message::InputsDone {}, r#"{"kind":"inputs-done"}"#),
+            (Message::Accepted {}, r#"{"kind":"accepted"}"#),
+            (Message::Poll {}, r#"{"kind":"poll"}"#),
+            (Message::ReceiveTarget {}, r#"{"kind":"receive-target"}"#),
+            (Message::ArtifactEnd {}, r#"{"kind":"artifact-end"}"#),
+            (Message::Close {}, r#"{"kind":"close"}"#),
+            (Message::Cancel {}, r#"{"kind":"cancel"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&message).unwrap(), bytes);
+            let decoded: Message = serde_json::from_str(bytes).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+            let extra = format!("{},\"extra\":1}}", &bytes[..bytes.len() - 1]);
+            assert!(serde_json::from_str::<Message>(&extra).is_err(), "{extra}");
+        }
     }
 
     #[test]
