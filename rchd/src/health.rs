@@ -838,24 +838,38 @@ async fn check_worker_health_for_endpoint(
     // One total wall-clock budget covers connection setup, authentication,
     // command execution and cleanup. A blackholed VPN/ProxyCommand cannot
     // multiply this budget across retries or pool lock waits.
+    let timeout = config
+        .check_timeout
+        .min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+        return HealthCheckResult::transient_failure(
+            "Health probe deadline exceeds the monotonic clock range".to_string(),
+        );
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return HealthCheckResult::transient_failure(format!(
+            "Health probe deadline exceeded after {:?}",
+            timeout,
+        ));
+    }
+
     let connected = AtomicBool::new(false);
-    match tokio::time::timeout(
-        config.check_timeout,
-        check_worker_health_once(worker_config, mock_enabled, config, ssh_pool, &connected),
+    match tokio::time::timeout_at(
+        deadline,
+        check_worker_health_once(worker_config, mock_enabled, timeout, ssh_pool, &connected),
     )
     .await
     {
-        Ok(result) => result,
-        Err(_) if connected.load(Ordering::Acquire) => HealthCheckResult::command_failure(
-            format!(
-                "Health command deadline exceeded after {:?}",
-                config.check_timeout,
-            ),
+        // Tokio polls the operation before its timer. A ready result can
+        // therefore arrive after the deadline when the runtime was busy.
+        Ok(result) if tokio::time::Instant::now() < deadline => result,
+        _ if connected.load(Ordering::Acquire) => HealthCheckResult::command_failure(
+            format!("Health command deadline exceeded after {:?}", timeout),
             true,
         ),
-        Err(_) => HealthCheckResult::transient_failure(format!(
+        _ => HealthCheckResult::transient_failure(format!(
             "Health probe deadline exceeded after {:?}",
-            config.check_timeout,
+            timeout,
         )),
     }
 }
@@ -878,7 +892,15 @@ pub(crate) async fn probe_owned_recovery_transport(
     const SENTINEL: &str = "RCH_TRANSPORT_READY_V1";
     const OUTPUT_LIMIT: u64 = 128;
 
-    tokio::time::timeout(timeout, async {
+    let timeout = timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+
+    tokio::time::timeout_at(deadline, async {
         if mock::is_mock_enabled() {
             let mut client = MockSshClient::new(config.clone(), MockConfig::from_env());
             client.connect().await.ok()?;
@@ -937,13 +959,14 @@ pub(crate) async fn probe_owned_recovery_transport(
     .await
     .ok()
     .flatten()
+    .filter(|_| tokio::time::Instant::now() < deadline)
     .unwrap_or(false)
 }
 
 async fn check_worker_health_once(
     worker_config: &rch_common::WorkerConfig,
     mock_enabled: bool,
-    config: &HealthConfig,
+    timeout: Duration,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
     connected: &AtomicBool,
 ) -> HealthCheckResult {
@@ -993,8 +1016,8 @@ async fn check_worker_health_once(
 
     // Create SSH connection with timeout
     let ssh_options = SshOptions {
-        connect_timeout: config.check_timeout,
-        command_timeout: config.check_timeout,
+        connect_timeout: timeout,
+        command_timeout: timeout,
         control_master: false, // Don't use control master for health checks
         ..Default::default()
     };
@@ -1580,6 +1603,286 @@ mod tests {
             result.command_failure,
             "a connected command timeout must retain its quarantine class"
         );
+    }
+
+    async fn assert_health_probe_pending<F: std::future::Future>(
+        mut probe: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(probe.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    async fn yield_health_probe_tasks() {
+        // Keep the test task runnable so Tokio cannot auto-advance past a
+        // timer before the next explicit clock step.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_deadlines_refuse_zero_budget_without_connecting() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::success().with_stdout("health_check")));
+        let worker = WorkerConfig {
+            id: WorkerId::new("zero-health-and-recovery-budget"),
+            ..Default::default()
+        };
+
+        let result = check_worker_health_for_endpoint(
+            &worker,
+            true,
+            &HealthConfig {
+                check_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(!result.healthy);
+        assert!(result.transient);
+        assert!(!result.command_failure);
+        assert!(!probe_owned_recovery_transport(&worker, Duration::ZERO).await);
+        assert!(
+            mock::global_ssh_invocations_snapshot()
+                .iter()
+                .all(|call| call.worker_id != worker.id),
+            "an expired budget must not start a connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_deadline_rejects_ready_receipts_at_and_after_expiry() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut mock_config = MockConfig::success().with_stdout("health_check");
+        mock_config.execution_delay_ms = 10;
+        set_mock_ssh_config_override(Some(mock_config));
+
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let worker = WorkerConfig {
+                id: WorkerId::new(format!("late-health-receipt-{}", lateness.as_millis())),
+                ..Default::default()
+            };
+            let config = HealthConfig {
+                check_timeout: Duration::from_millis(20),
+                ..Default::default()
+            };
+            let probe = check_worker_health_for_endpoint(&worker, true, &config, None);
+            tokio::pin!(probe);
+            assert_health_probe_pending(probe.as_mut()).await;
+            tokio::time::advance(Duration::from_millis(6)).await;
+            assert_health_probe_pending(probe.as_mut()).await;
+            assert!(
+                mock::global_ssh_invocations_snapshot().iter().any(|call| {
+                    call.worker_id == worker.id && call.phase == mock::Phase::Execute
+                }),
+                "the connection must complete before the command deadline"
+            );
+
+            // The command becomes ready at 16 ms, but its owner is not polled
+            // until 20 ms or later. Timeout alone would accept that receipt.
+            tokio::time::advance(Duration::from_millis(14) + lateness).await;
+            let result = probe.await;
+            assert!(!result.healthy);
+            assert!(result.command_failure);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Health command deadline exceeded"))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scaled_health_budget_accepts_loaded_worker_before_deadline() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut mock_config = MockConfig::success().with_stdout("health_check");
+        mock_config.execution_delay_ms = 10;
+        set_mock_ssh_config_override(Some(mock_config));
+
+        for scale in [1.0, 2.5, 10.0] {
+            let timeout = rch_common::timing::TimingScale::try_from(scale)
+                .unwrap()
+                .duration(Duration::from_millis(10));
+            let result = check_worker_health_for_endpoint(
+                &WorkerConfig::default(),
+                true,
+                &HealthConfig {
+                    check_timeout: timeout,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+            assert_eq!(result.healthy, scale > 1.0, "scale={scale}");
+            assert_eq!(result.command_failure, scale == 1.0, "scale={scale}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_recovery_deadline_requires_a_timely_complete_receipt() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut mock_config = MockConfig::success().with_stdout("RCH_TRANSPORT_READY_V1");
+        mock_config.execution_delay_ms = 10;
+        set_mock_ssh_config_override(Some(mock_config));
+        let worker = WorkerConfig {
+            id: WorkerId::new("historical-endpoint-late-receipt"),
+            ..Default::default()
+        };
+
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let probe = probe_owned_recovery_transport(&worker, Duration::from_millis(20));
+            tokio::pin!(probe);
+            assert_health_probe_pending(probe.as_mut()).await;
+            tokio::time::advance(Duration::from_millis(6)).await;
+            assert_health_probe_pending(probe.as_mut()).await;
+            tokio::time::advance(Duration::from_millis(14) + lateness).await;
+            assert!(
+                !probe.await,
+                "a complete receipt observed at or after expiry cannot prove timely recovery"
+            );
+        }
+
+        assert!(probe_owned_recovery_transport(&worker, Duration::from_millis(25)).await);
+        set_mock_ssh_config_override(Some(
+            MockConfig::success().with_stdout("RCH_TRANSPORT_READY_V"),
+        ));
+        assert!(
+            !probe_owned_recovery_transport(&worker, Duration::from_millis(25)).await,
+            "a larger budget must not authorize a truncated receipt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_and_recovery_cap_extreme_caller_budgets() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let cap = rch_common::timing::MAX_CONTROL_TIMEOUT;
+        let mut mock_config = MockConfig::success().with_stdout("health_check");
+        mock_config.execution_delay_ms = u64::try_from(cap.as_millis()).unwrap() + 1000;
+        set_mock_ssh_config_override(Some(mock_config.clone()));
+        let worker = WorkerConfig {
+            id: WorkerId::new("bounded-health-and-recovery"),
+            ..Default::default()
+        };
+
+        let start = tokio::time::Instant::now();
+        let result = check_worker_health_for_endpoint(
+            &worker,
+            true,
+            &HealthConfig {
+                check_timeout: Duration::MAX,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(!result.healthy);
+        assert!(result.command_failure);
+        assert!(start.elapsed() >= cap);
+        assert!(start.elapsed() <= cap + Duration::from_millis(2));
+
+        mock_config.default_stdout = "RCH_TRANSPORT_READY_V1".to_string();
+        set_mock_ssh_config_override(Some(mock_config));
+        let start = tokio::time::Instant::now();
+        assert!(!probe_owned_recovery_transport(&worker, Duration::MAX).await);
+        assert!(start.elapsed() >= cap);
+        assert!(start.elapsed() <= cap + Duration::from_millis(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_recovery_health_receipt_keeps_worker_excluded() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard::set_failure();
+        let pool = WorkerPool::new().with_connection_monitoring();
+        let id = WorkerId::new("late-recovery-keeps-admission-closed");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            total_slots: 4,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        let monitor = HealthMonitor::new(
+            pool,
+            HealthConfig {
+                check_interval: Duration::from_secs(300),
+                check_timeout: Duration::from_millis(20),
+                circuit: CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let handle = monitor.start();
+        yield_health_probe_tasks().await;
+        assert!(worker.transport_is_down().await);
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        assert_eq!(worker.circuit_state().await, Some(CircuitState::Open));
+        assert!(!worker.reserve_slots(1).await);
+
+        let mut recovered = MockConfig::success().with_stdout("health_check");
+        recovered.execution_delay_ms = 10;
+        set_mock_ssh_config_override(Some(recovered));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        yield_health_probe_tasks().await;
+        assert_eq!(
+            mock::global_ssh_invocations_snapshot()
+                .iter()
+                .filter(|call| call.worker_id == id && call.phase == mock::Phase::Connect)
+                .count(),
+            2
+        );
+        tokio::time::advance(Duration::from_millis(6)).await;
+        yield_health_probe_tasks().await;
+        assert_eq!(
+            mock::global_ssh_invocations_snapshot()
+                .iter()
+                .filter(|call| call.worker_id == id && call.phase == mock::Phase::Execute)
+                .count(),
+            1
+        );
+
+        // Both the command and deadline become ready while the owner is
+        // descheduled. The late success must retain command-failure evidence.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        yield_health_probe_tasks().await;
+        let result = monitor
+            .health_states
+            .read()
+            .await
+            .get(id.as_str())
+            .unwrap()
+            .last_result()
+            .unwrap()
+            .clone();
+        monitor.stop().await;
+        handle.await.unwrap();
+
+        assert!(!result.healthy);
+        assert!(result.command_failure);
+        assert!(!worker.transport_is_down().await);
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            1
+        );
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        assert_eq!(worker.circuit_state().await, Some(CircuitState::Open));
+        assert!(!worker.reserve_slots(1).await);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use crate::config::CacheCleanupConfig;
 use crate::workers::{WorkerPool, WorkerState};
+use rch_common::timing::scale_duration;
 use rch_common::{SshClient, SshOptions, WorkerId, WorkerStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -285,7 +286,7 @@ fn build_cleanup_command_with_source_guard(
     // garbage. A launch racing its removal fails typed setup and fails over.
     let empty_run_dir_minutes = 1440_u64;
     format!(
-        "set -u; \
+        "{timing}set -u; \
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
@@ -418,6 +419,7 @@ fn build_cleanup_command_with_source_guard(
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
          if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
+        timing = rch_common::timing::shell_prefix(),
         base = escaped_base,
         run_root = escaped_run_root,
         max_age_minutes = max_age_minutes,
@@ -490,12 +492,18 @@ pub struct CacheCleanupScheduler {
 impl CacheCleanupScheduler {
     /// Create a new cache cleanup scheduler.
     pub fn new(pool: WorkerPool, config: CacheCleanupConfig) -> Self {
+        let defaults = SshOptions::default();
+        let ssh_options = SshOptions {
+            connect_timeout: scale_duration(defaults.connect_timeout),
+            command_timeout: scale_duration(defaults.command_timeout),
+            ..defaults
+        };
         Self {
             pool,
             config,
             last_cleanup: Arc::new(RwLock::new(HashMap::new())),
             idle_since: Arc::new(RwLock::new(HashMap::new())),
-            ssh_options: SshOptions::default(),
+            ssh_options,
             ssh_pool: None,
         }
     }
@@ -2106,6 +2114,50 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert!(command.contains("RCH_CLEANUP_METRICS"));
         assert!(command.contains("low_disk"));
         assert!(command.contains("remove_errors"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_propagates_policy_to_embedded_observers_over_worker_environment() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("private empty cache");
+        let runs = tempfile::tempdir().expect("private empty process records");
+        let scale = rch_common::timing::configured().env_value();
+        // Empty owned trees require no source transaction and never touch
+        // the host's registry or process records.
+        let cleanup = build_cleanup_command_with_source_guard(
+            &shell_escape::escape(base.path().to_string_lossy()),
+            &shell_escape::escape(runs.path().to_string_lossy()),
+            72,
+            0,
+            0,
+            "",
+        );
+        let command = format!(
+            "{cleanup}\n{}\nrch_timing_budget 300\n\
+             [ \"$rch_timing_scaled\" -ge 300 ] && \
+             [ \"$rch_timing_scaled\" -le 3000 ] || exit 1\n\
+             printf 'RCH_CLEANUP_EFFECTIVE_SCALE=%s\\n' \"$RCH_TIMING_SCALE\"\n",
+            rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .env("RCH_TIMING_SCALE", "invalid-worker-environment")
+            .output()
+            .expect("run empty sweep and embedded timing parser");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("RCH_CLEANUP_METRICS removed=0"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("RCH_CLEANUP_EFFECTIVE_SCALE={scale}\n")),
+            "{stdout}"
+        );
+        assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(runs.path()).unwrap().count(), 0);
     }
 
     /// Backdate a file far past the 240-minute orphan threshold.
