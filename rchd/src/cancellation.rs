@@ -674,9 +674,18 @@ impl CancellationOrchestrator {
             return true;
         };
         let mut started = false;
+        // The fenced admission chain is deep: keep its state machine on the
+        // heap so it is not inlined into every enclosing future's layout or
+        // a caller's stack (a #[tokio::test] stack overflowed on it).
         let admitted = before_cancellation_deadline(
             deadline,
-            self.execute_cancellation_admitted(ctx, record, force, deadline, &mut started),
+            Box::pin(self.execute_cancellation_admitted(
+                ctx,
+                record,
+                force,
+                deadline,
+                &mut started,
+            )),
         )
         .await;
         match admitted {
