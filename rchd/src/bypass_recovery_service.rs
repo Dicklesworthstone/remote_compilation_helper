@@ -49,6 +49,7 @@ use rch_common::capability_probe::{
     FACT_PREFIX, NamedToolProbe, ProbeSpec, build_capability_probe_script, parse_capability_probe,
 };
 use rch_common::ssh::{SshClient, SshOptions};
+use rch_common::timing::{scale_duration, shell_prefix};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
 use rch_telemetry::remediation::{self, BypassTransition, SelfHealingAction, SelfHealingOutcome};
 
@@ -89,21 +90,22 @@ fn process_observation_required(record: &BypassRecord) -> bool {
 }
 
 fn recovery_capability_timeout(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
-    if process_observation_required(record) {
+    let budget = if process_observation_required(record) {
         config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT)
     } else {
         config.probe_timeout
-    }
+    };
+    scale_duration(budget)
 }
 
 fn recovery_canary_timeout(config: &BypassRecoveryConfig) -> Duration {
-    config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT)
+    scale_duration(config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT))
 }
 
 fn recovery_probe_deadline(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
     let capability = recovery_capability_timeout(config, record).saturating_mul(2);
     if process_observation_required(record) {
-        capability.saturating_add(PROCESS_OBSERVATION_PROBE_TIMEOUT)
+        capability.saturating_add(scale_duration(PROCESS_OBSERVATION_PROBE_TIMEOUT))
     } else {
         capability
     }
@@ -111,7 +113,8 @@ fn recovery_probe_deadline(config: &BypassRecoveryConfig, record: &BypassRecord)
 
 fn process_observation_probe_command() -> String {
     format!(
-        "{}\nrch_process_health_probe",
+        "{}{}\nrch_process_health_probe",
+        shell_prefix(),
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
     )
 }
@@ -360,10 +363,11 @@ impl SshRecoveryProber {
     }
 
     async fn process_observation_probe(&self, config: &WorkerConfig) -> bool {
+        let budget = scale_duration(PROCESS_OBSERVATION_PROBE_TIMEOUT);
         let probe = async {
             let options = SshOptions {
-                connect_timeout: self.config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT),
-                command_timeout: PROCESS_OBSERVATION_PROBE_TIMEOUT,
+                connect_timeout: recovery_canary_timeout(&self.config),
+                command_timeout: budget,
                 ..Default::default()
             };
             let mut client = SshClient::new(config.clone(), options);
@@ -374,9 +378,7 @@ impl SshRecoveryProber {
             let _ = client.disconnect().await;
             result.is_ok_and(|result| process_observation_probe_passed(&result))
         };
-        tokio::time::timeout(PROCESS_OBSERVATION_PROBE_TIMEOUT, probe)
-            .await
-            .unwrap_or(false)
+        tokio::time::timeout(budget, probe).await.unwrap_or(false)
     }
 
     /// Whether the worker's most recent telemetry sample is within tolerance.

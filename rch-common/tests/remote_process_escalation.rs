@@ -14,6 +14,7 @@ fn run_case(body: &str) {
         .expect("write embedded production protocol");
         let script = format!("{}\n{body}", rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT);
         let output = Command::new(shell)
+            .env_remove("RCH_TIMING_SCALE")
             .args(["-c", &script, "rch-process-test"])
             .arg(directory.path())
             .output()
@@ -423,35 +424,81 @@ fn every_control_capture_consumes_the_same_absolute_deadline() {
 
 const CENSUS_RETRY_BUDGET: &str = r#"
 rch_test_dir=$1
-rch_read_record() { rch_identified=1; rch_scope_bound=0; }
+# Only the clock, observations and signals are doubled. The production
+# cancellation state machine owns the deadline and completion decision.
+rch_read_record() { rch_identified=1; rch_scope_bound=1; }
 rch_recovery_boot_state() { return 0; }
-rch_observation_clock() { rch_observation_now=100; }
-rch_posix_signal_authorized() { return 0; }
-rch_signal_group() { printf '%s\n' "$1" >> "$rch_test_dir/signals"; }
-sleep() { :; }
+rch_observation_clock() {
+    rch_observation_now=$test_clock
+    printf '%s\n' "$test_clock" > "$rch_test_dir/clock"
+}
+rch_signal_group() {
+    [ "$1" = KILL ] || return 44
+    test_signalled=1
+    printf '%s\n' "$1" >> "$rch_test_dir/signals"
+}
+sleep() {
+    [ "$1" = 0.1 ] || return 1
+    test_clock=$((test_clock + 10))
+}
 rch_group_state() {
+    test_clock=$((test_clock + test_census_ticks))
+    [ "$test_clock" -le "$rch_observation_deadline" ] ||
+        test_clock=$rch_observation_deadline
+    printf '%s\n' "$rch_observation_deadline" > "$rch_test_dir/deadline"
+    # V2 has a pre-signal observation; the regression needs three further
+    # observations after KILL, not three including that initial observation.
+    [ "$test_signalled" = 1 ] || return 1
     test_census_calls=$((test_census_calls + 1))
     printf '%s\n' "$test_census_calls" > "$rch_test_dir/calls"
+    # Bound this fixture even if a regression stops consulting the clock.
+    [ "$test_census_calls" -le 1000 ] || return 9
+    # Model the production collector refusing output at its own deadline.
+    [ "$test_clock" -lt "$rch_observation_deadline" ] || return 2
     [ "$test_census_calls" != "$test_settled_after" ] || return 0
-    return 2
+    return "$test_pending_state"
 }
-test_census_calls=0; test_settled_after=3
+test_clock=100; test_signalled=0; test_census_calls=0
+test_census_ticks=120; test_pending_state=2; test_settled_after=3
+# Each real-fleet-shaped census consumes 1.2s of simulated monotonic time.
+# A separate two-second settlement cap would stop before the third pass.
 rch_remote_cancel /unused regression kill || exit 1
 [ "$(cat "$rch_test_dir/calls")" = 3 ] || exit 2
 [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 3
-# One initial observation plus at most three post-kill unknown observations.
-# Even an authenticated successful signal never becomes a completion proof.
+# Unknown never becomes completion. All slow passes consume the same
+# original 30s deadline; observations cannot restart or extend it.
 : > "$rch_test_dir/signals"
-test_settled_after=99
+test_settled_after=0
 rch_remote_cancel /unused regression kill
 [ "$?" = 44 ] || exit 4
-[ "$(cat "$rch_test_dir/calls")" = 4 ] || exit 5
+[ "$(cat "$rch_test_dir/calls")" -gt 3 ] || exit 5
 [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 6
-# An inherited setup cap can only tighten cancellation. Do not reset it.
+[ "$(cat "$rch_test_dir/deadline")" = 3100 ] || exit 7
+test_finished=$(cat "$rch_test_dir/clock")
+[ "$test_finished" -ge 3100 ] && [ "$test_finished" -le 3110 ] || exit 8
+# An earlier enclosing cap wins even while slow observations are retried.
+: > "$rch_test_dir/signals"
+rch_observation_deadline=600
+rch_remote_cancel /unused regression kill
+[ "$?" = 44 ] || exit 9
+[ "$rch_observation_deadline" = 600 ] || exit 10
+[ "$(cat "$rch_test_dir/deadline")" = 600 ] || exit 11
+test_finished=$(cat "$rch_test_dir/clock")
+[ "$test_finished" -ge 600 ] && [ "$test_finished" -le 610 ] || exit 12
+[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 13
+# Retain the known-live refusal when the deadline expires between censuses.
+: > "$rch_test_dir/signals"
+test_census_ticks=0; test_pending_state=1
+rch_remote_cancel /unused regression kill
+[ "$?" = 45 ] || exit 14
+[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 15
+# An already expired enclosing cap permits neither a signal nor a retry.
+: > "$rch_test_dir/signals"
 rch_observation_deadline=100
 rch_remote_cancel /unused regression kill
-[ "$?" = 44 ] || exit 7
-[ "$rch_observation_deadline" = 100 ] || exit 8
+[ "$?" = 44 ] || exit 16
+[ "$rch_observation_deadline" = 100 ] || exit 17
+[ ! -s "$rch_test_dir/signals" ] || exit 18
 "#;
 
 #[test]

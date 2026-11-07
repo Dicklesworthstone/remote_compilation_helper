@@ -2,6 +2,28 @@
 # namespace setup or finite source-ownership metadata, never a build workload.
 # Every result requires settled descendant teardown, including empty replies.
 set -eu
+# The client exports one validated timing policy to every fresh worker shell.
+# Parse data, never shell arithmetic from the environment. Round upward to
+# microseconds, then upward again only where timeout requires whole seconds.
+rch_timing_micros=1000000
+case "${RCH_TIMING_SCALE-1}" in
+    1) ;;
+    *)
+        rch_timing_micros=$(LC_ALL=C awk '
+            BEGIN {
+                value = ENVIRON["RCH_TIMING_SCALE"]
+                if (length(value) > 128 || value !~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
+                scale = value + 0
+                if (!(scale >= 1 && scale <= 10)) exit 1
+                units = int(scale * 1000000)
+                if (units < scale * 1000000) units++
+                printf "%.0f\n", units
+            }
+        ') || { printf "%s\n" "RCH: invalid RCH_TIMING_SCALE (expected finite 1..10)" >&2; exit 73; };;
+esac
+rch_timing_budget() {
+    rch_timing_scaled=$((($1 * rch_timing_micros + 999999) / 1000000))
+}
 rch_control_ready=${1:-RCH_TOPOLOGY_OK}
 rch_control_contract=$rch_control_ready
 rch_control_alternate=
@@ -45,6 +67,12 @@ import signal
 import subprocess
 import sys
 import time
+
+# The shell validated the transported finite scale before any child or file.
+TIMING_SCALE = float(os.environ.get("RCH_TIMING_SCALE", "1"))
+PROGRAM_DEADLINE = 15.0 * TIMING_SCALE
+SETTLEMENT_DEADLINE = PROGRAM_DEADLINE + 1.0
+DELIVERY_DEADLINE = 2.0 * TIMING_SCALE
 
 # A guardian is the unreaped direct child and the private group leader. It
 # stays alive after the program exits, independently enforcing the deadline
@@ -109,13 +137,13 @@ def guardian(owner, report, stdout, stderr, descriptors, started):
         close(0)
         close(stdout)
         close(stderr)
-        deadline = started + 15
+        deadline = started + PROGRAM_DEADLINE
         terminating = False
         while True:
             now = time.monotonic()
             if not terminating and (interrupted or now >= deadline):
                 terminating = True
-                deadline = min(now + 1, started + 16)
+                deadline = min(now + 1, started + SETTLEMENT_DEADLINE)
                 os.killpg(os.getpid(), signal.SIGTERM)
             if terminating:
                 if now >= deadline:
@@ -359,7 +387,7 @@ def deliver(stderr, stdout, status):
     # No writers survive execution teardown. Nonblocking writes and one
     # shared delivery deadline prevent a stalled SSH reader from stranding
     # this observer; diagnostics must finish before any readiness is sent.
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + DELIVERY_DEADLINE
     for descriptor, content in ((2, stderr), (1, stdout if status == 0 else b"")):
         if not content:
             continue
@@ -424,7 +452,7 @@ try:
     opened = set(limits)
     for descriptor in opened:
         os.set_blocking(descriptor, False)
-    while not changed and not interrupted and time.monotonic() < started + 16:
+    while not changed and not interrupted and time.monotonic() < started + SETTLEMENT_DEADLINE:
         for descriptor in select.select(list(opened), [], [], 0.02)[0]:
             chunk = os.read(descriptor, min(8192, limits[descriptor] + 1 - len(buffers[descriptor])))
             if not chunk:
@@ -448,7 +476,7 @@ try:
             finished = True
     owned_timer = timer
     timer = None
-    settled = teardown(owned_timer, started + 16 if finished else None)
+    settled = teardown(owned_timer, started + SETTLEMENT_DEADLINE if finished else None)
     # The guardian writes at most three bytes before dying. Drain that pipe
     # after reaping too: SIGCHLD can arrive before select reports its last byte.
     while len(buffers[status_read]) <= 3:
@@ -457,7 +485,7 @@ try:
             break
         buffers[status_read].extend(chunk)
     settled = (settled and finished and not interrupted
-               and time.monotonic() < started + 16
+               and time.monotonic() < started + SETTLEMENT_DEADLINE
                and bytes(buffers[status_read]) == b"S" + bytes((code,)) + b"D")
 except BaseException:
     settled = False
@@ -520,7 +548,7 @@ def kill_owned_group():
 
 try:
     if (len(sys.argv) < 4 or sys.argv[1] != "--kill-after=1"
-            or sys.argv[2] not in ("1", "2", "15")
+            or sys.argv[2] not in tuple(str(n) for n in range(1, 151))
             or sys.platform not in ("linux", "darwin")):
         os._exit(73)
     os.setsid()
@@ -584,6 +612,11 @@ rch_namespace_observed_timer() {
     rch_timer_observation=$1
     shift
     case "$rch_timer_observation" in status|teardown) ;; *) exit 73 ;; esac
+    [ "${1:-}" = --kill-after=1 ] || exit 73
+    case "${2:-}" in 1|2|15) ;; *) exit 73 ;; esac
+    rch_timing_budget "$2"
+    shift 2
+    set -- --kill-after=1 "$rch_timing_scaled" "$@"
     case "$rch_namespace_timer" in
         rch_namespace_python_timer)
             set -- python3 -I -S -c "$rch_namespace_python_timer_program" "$@" ;;

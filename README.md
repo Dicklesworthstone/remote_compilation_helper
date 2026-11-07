@@ -748,6 +748,32 @@ export RCH_ALIAS_PROJECT_ROOT=/home/me/code
 Empty strings are treated as unset (defaults apply). See
 `docs/guides/configuration.md` (`[path_topology]`) for details.
 
+### Loaded or High-Latency Workers
+
+Increase bounded control-operation deadlines together when healthy workers need
+more time for SSH setup, filesystem scans or lock acquisition:
+
+```toml
+[timeouts]
+scale = 2.5                  # default 1.0; finite values from 1.0 through 10.0
+```
+
+`RCH_TIMING_SCALE=2.5 rch exec -- cargo check` overrides the client policy for
+one invocation. The daemon reads its own user configuration and environment at
+startup; restart `rchd` after changing its policy. A project override or an
+environment variable on `rch exec` does not reconfigure an already running
+daemon. Inspect the effective client value with
+`rch config get timeouts.scale` or `rch config show --sources`.
+
+The scale extends slow-path control deadlines and bounded retry windows. The
+shared timing policy caps each scaled control budget at one hour, including at
+scale 1.0. Build and test execution time limits, signal-escalation grace,
+polling cadence, disk thresholds, ownership checks and the proof required to
+release a worker remain separate. Invalid, non-finite or out-of-range values
+are configuration errors. See the
+[configuration guide](docs/guides/configuration.md#timeouts) for scope and
+precedence.
+
 ### Minimal Example
 
 ```toml

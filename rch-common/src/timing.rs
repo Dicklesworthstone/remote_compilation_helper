@@ -234,7 +234,16 @@ mod tests {
             assert!(TimingScale::try_from(value).is_err(), "accepted {value}");
         }
         for value in [
-            "", "nan", "inf", "-inf", "0", "-2", "0.5", "11", "1;echo unsafe", "1e999",
+            "",
+            "nan",
+            "inf",
+            "-inf",
+            "0",
+            "-2",
+            "0.5",
+            "11",
+            "1;echo unsafe",
+            "1e999",
         ] {
             assert!(value.parse::<TimingScale>().is_err(), "accepted {value}");
         }

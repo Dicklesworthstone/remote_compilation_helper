@@ -5,6 +5,7 @@ use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
+use rch_common::timing::scale_duration;
 use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
     ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, TestRunStatsAccumulator,
@@ -376,7 +377,15 @@ const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 16;
 /// its concurrency permit) leaks indefinitely, silently starving future polls.
 /// Sized just above `ssh_timeout` so a healthy-but-slow worker still completes.
 fn poll_hard_timeout(ssh_timeout: Duration) -> Duration {
-    ssh_timeout + Duration::from_secs(5)
+    ssh_timeout.saturating_add(Duration::from_secs(5))
+}
+
+/// Preserve the old two full attempts plus backoff as one elapsed-time budget.
+/// Fast transient failures may retry within it, but a retry never resets it.
+fn poll_retry_budget(ssh_timeout: Duration) -> Duration {
+    poll_hard_timeout(ssh_timeout)
+        .saturating_mul(2)
+        .saturating_add(TELEMETRY_RETRY_BACKOFF)
 }
 
 pub struct TelemetryPoller {
@@ -418,8 +427,8 @@ impl TelemetryPoller {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(self.config.poll_interval);
-            // A cycle can occasionally run long (a worker failing both attempts
-            // back-to-back). Skip missed ticks rather than firing a burst of
+            // A cycle can occasionally exhaust a worker's retry budget.
+            // Skip missed ticks rather than firing a burst of
             // back-to-back cycles, which would only add SSH contention.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -530,7 +539,7 @@ pub(crate) async fn collect_telemetry_from_worker_pooled(
     let telemetry = admission
         .run(collect_telemetry_for_endpoint(
             endpoint.config.clone(),
-            ssh_timeout,
+            scale_duration(ssh_timeout),
             ssh_pool,
         ))
         .await
@@ -609,8 +618,8 @@ async fn collect_telemetry_for_endpoint(
     Ok(telemetry)
 }
 
-/// Total attempts (1 initial + retries) for a single worker poll per cycle.
-const TELEMETRY_POLL_ATTEMPTS: u32 = 2;
+/// Bound retained diagnostics even when fast failures allow many retries.
+const MAX_TELEMETRY_FAILURE_DETAILS: usize = 4;
 /// Backoff between poll attempts. Short, so a transient SSH connect failure
 /// under contention is retried after the burst clears, without dropping the
 /// worker past the stale threshold until the next cycle.
@@ -620,9 +629,9 @@ const TELEMETRY_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
 /// collected and ingested this call.
 ///
 /// Each attempt is bounded by a hard timeout (the SSH layer's own timeout is not
-/// always honored); a single transient failure is retried once. Without the
-/// retry, one failed re-poll under concurrent SSH load drops the worker past the
-/// stale threshold — the root cause of fluctuating fleet telemetry freshness.
+/// always honored); transient failures retry within one elapsed-time budget.
+/// This lets brief SSH contention clear without starting a new deadline on
+/// every retry or waiting for the next fleet poll cycle.
 /// One failed poll attempt's evidence (bead pn1xb: a worker used to be
 /// able to sit telemetry-dark indefinitely with ZERO log lines while a
 /// no-fresh-telemetry verdict gated scheduling — the failure log must
@@ -634,7 +643,7 @@ struct PollAttemptFailure {
     error: String,
 }
 
-/// Render every attempt's evidence into one warn line.
+/// Render the retained recent attempts into one bounded warn line.
 fn render_poll_failures(failures: &[PollAttemptFailure]) -> String {
     failures
         .iter()
@@ -663,7 +672,7 @@ async fn poll_worker(
     } else {
         "throwaway-ssh"
     };
-    let ssh_timeout = config.ssh_timeout;
+    let ssh_timeout = scale_duration(config.ssh_timeout);
     poll_worker_with(worker, store, config, transport, move |endpoint| {
         collect_telemetry_for_endpoint(endpoint, ssh_timeout, ssh_pool.clone())
     })
@@ -691,17 +700,26 @@ where
     // neither mix old failures with a new host nor admit late old telemetry.
     let endpoint = worker.endpoint_snapshot().await;
     let worker_id = &endpoint.config.id;
-    let per_attempt = poll_hard_timeout(config.ssh_timeout);
+    let per_attempt = scale_duration(poll_hard_timeout(config.ssh_timeout));
+    let retry_budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+    let poll_started = tokio::time::Instant::now();
+    let mut attempts = 0_u32;
     let mut failures: Vec<PollAttemptFailure> = Vec::new();
 
-    for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
+    loop {
         if worker.lock_current_endpoint(&endpoint).await.is_none() {
             return false;
         }
-        let started = std::time::Instant::now();
+        let remaining = retry_budget.saturating_sub(poll_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = per_attempt.min(remaining);
+        attempts = attempts.saturating_add(1);
+        let started = tokio::time::Instant::now();
         let Some(outcome) = admission
             .run(tokio::time::timeout(
-                per_attempt,
+                attempt_timeout,
                 collect(endpoint.config.clone()),
             ))
             .await
@@ -718,11 +736,11 @@ where
         let Some(publication) = worker.lock_network_publication(&admission).await else {
             return false;
         };
-        match outcome {
+        let failure = match outcome {
             Ok(Ok(telemetry)) => {
                 debug!(
                     worker = worker_id.as_str(),
-                    attempt,
+                    attempt = attempts,
                     cpu = %telemetry.cpu.overall_percent,
                     memory = %telemetry.memory.used_percent,
                     "Telemetry collected via SSH"
@@ -731,28 +749,35 @@ where
                 record_poll_command_outcome(&worker, worker_id, true, &config.circuit).await;
                 return true;
             }
-            Ok(Err(e)) => failures.push(PollAttemptFailure {
-                attempt,
+            Ok(Err(e)) => PollAttemptFailure {
+                attempt: attempts,
                 transport,
                 elapsed: started.elapsed(),
                 // The collector's errors carry exit code + stderr for
                 // command failures (see collect_telemetry_from_worker_pooled).
                 error: format!("{e:#}"),
-            }),
-            Err(_) => failures.push(PollAttemptFailure {
-                attempt,
+            },
+            Err(_) => PollAttemptFailure {
+                attempt: attempts,
                 transport,
                 elapsed: started.elapsed(),
-                error: format!("hard timeout after {per_attempt:?}"),
-            }),
+                error: format!("hard timeout after {attempt_timeout:?}"),
+            },
+        };
+        if failures.len() == MAX_TELEMETRY_FAILURE_DETAILS {
+            failures.remove(0);
         }
+        failures.push(failure);
         drop(publication);
         drop(endpoint_guard);
-        if attempt < TELEMETRY_POLL_ATTEMPTS
-            && admission
-                .run(tokio::time::sleep(TELEMETRY_RETRY_BACKOFF))
-                .await
-                .is_none()
+        let remaining = retry_budget.saturating_sub(poll_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        if admission
+            .run(tokio::time::sleep(TELEMETRY_RETRY_BACKOFF.min(remaining)))
+            .await
+            .is_none()
         {
             return false;
         }
@@ -766,7 +791,8 @@ where
     };
     warn!(
         worker = worker_id.as_str(),
-        attempts = TELEMETRY_POLL_ATTEMPTS,
+        attempts,
+        budget_s = retry_budget.as_secs_f64(),
         "Telemetry poll failed: {}",
         render_poll_failures(&failures)
     );
@@ -1246,6 +1272,131 @@ mod tests {
             tags: vec![],
             tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn telemetry_retry_budget_preserves_full_attempt_allowance_without_overflow() {
+        assert_eq!(
+            poll_retry_budget(Duration::from_secs(20)),
+            Duration::from_millis(51_500)
+        );
+        assert_eq!(poll_hard_timeout(Duration::MAX), Duration::MAX);
+        assert_eq!(poll_retry_budget(Duration::MAX), Duration::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_recovers_after_more_than_two_transient_failures() {
+        let worker = Arc::new(WorkerState::new(create_worker_config("busy-poll")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        assert!(
+            poll_worker_with(
+                worker.clone(),
+                store.clone(),
+                TelemetryPollerConfig::default(),
+                "busy-test-transport",
+                |endpoint| {
+                    attempts += 1;
+                    std::future::ready(if attempts <= 2 {
+                        Err(anyhow::anyhow!("SSH temporarily busy"))
+                    } else {
+                        Ok(make_telemetry(endpoint.id.as_str(), 10.0, 20.0))
+                    })
+                },
+            )
+            .await
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(started.elapsed(), TELEMETRY_RETRY_BACKOFF * 2);
+        assert!(store.latest("busy-poll").is_some());
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_hung_and_fast_failures_share_one_elapsed_budget() {
+        for hung in [false, true] {
+            let worker = Arc::new(WorkerState::new(create_worker_config("exhausted-poll")));
+            let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+            let config = TelemetryPollerConfig::default();
+            let budget = scale_duration(poll_retry_budget(config.ssh_timeout));
+            let started = tokio::time::Instant::now();
+            let mut attempts = 0;
+            assert!(
+                !poll_worker_with(
+                    worker.clone(),
+                    store.clone(),
+                    config,
+                    "failing-test-transport",
+                    |_| {
+                        attempts += 1;
+                        async move {
+                            if hung {
+                                std::future::pending().await
+                            } else {
+                                Err(anyhow::anyhow!("SSH remains unavailable"))
+                            }
+                        }
+                    },
+                )
+                .await
+            );
+            assert!(attempts >= 2);
+            if !hung {
+                assert!(attempts > 2, "fast failures must use the remaining budget");
+            }
+            assert!(started.elapsed() >= budget);
+            assert!(started.elapsed() <= budget + Duration::from_millis(1));
+            assert!(store.latest("exhausted-poll").is_none());
+            assert_eq!(
+                worker.circuit_stats().await.consecutive_command_failures(),
+                1,
+                "a whole exhausted poll contributes one command failure"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_during_telemetry_backoff_cancels_future_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let worker = Arc::new(WorkerState::new(create_worker_config("backoff-poll")));
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let worker = worker.clone();
+            let store = store.clone();
+            let started = started.clone();
+            let attempts = attempts.clone();
+            tokio::spawn(async move {
+                poll_worker_with(
+                    worker,
+                    store,
+                    TelemetryPollerConfig::default(),
+                    "retry-test-transport",
+                    move |_| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        std::future::ready(Err(anyhow::anyhow!("retryable SSH failure")))
+                    },
+                )
+                .await
+            })
+        };
+        started.notified().await;
+        worker.disable(Some("maintenance".into())).await;
+        assert!(!task.await.unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(store.latest("backoff-poll").is_none());
+        assert_eq!(
+            worker.circuit_stats().await.consecutive_command_failures(),
+            0,
+            "administrative cancellation must not publish failure evidence"
+        );
     }
 
     #[tokio::test]

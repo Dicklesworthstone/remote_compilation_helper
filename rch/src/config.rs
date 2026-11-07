@@ -4095,8 +4095,7 @@ identity_file = "/tmp/id_ed25519"
         let user_path = dir.path().join("user.toml");
         let project_path = dir.path().join("project.toml");
         let no_env = HashMap::new();
-        let defaults =
-            load_config_with_sources_from_paths(None, None, Some(&no_env)).unwrap();
+        let defaults = load_config_with_sources_from_paths(None, None, Some(&no_env)).unwrap();
         assert_eq!(defaults.config.timeouts.scale.env_value(), "1");
         assert_eq!(
             defaults.sources.get("timeouts.scale"),
@@ -4105,8 +4104,7 @@ identity_file = "/tmp/id_ed25519"
 
         std::fs::write(&user_path, "[timeouts]\nscale = 4\n").unwrap();
         let user =
-            load_config_with_sources_from_paths(Some(&user_path), None, Some(&no_env))
-                .unwrap();
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&no_env)).unwrap();
         assert_eq!(user.config.timeouts.scale.env_value(), "4");
         assert_eq!(
             user.sources.get("timeouts.scale"),
@@ -4114,8 +4112,7 @@ identity_file = "/tmp/id_ed25519"
         );
 
         for value in ["2.5", "1"] {
-            std::fs::write(&project_path, format!("[timeouts]\nscale = {value}\n"))
-                .unwrap();
+            std::fs::write(&project_path, format!("[timeouts]\nscale = {value}\n")).unwrap();
             let project = load_config_with_sources_from_paths(
                 Some(&user_path),
                 Some(&project_path),
@@ -4130,19 +4127,15 @@ identity_file = "/tmp/id_ed25519"
         }
 
         let env = HashMap::from([("RCH_TIMING_SCALE".to_string(), "3.5".to_string())]);
-        let overridden = load_config_with_sources_from_paths(
-            Some(&user_path),
-            Some(&project_path),
-            Some(&env),
-        )
-        .unwrap();
+        let overridden =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), Some(&env))
+                .unwrap();
         assert_eq!(overridden.config.timeouts.scale.env_value(), "3.5");
         assert_eq!(
             overridden.sources.get("timeouts.scale"),
             Some(&ConfigValueSource::EnvVar("RCH_TIMING_SCALE".to_string()))
         );
-        let env_only =
-            load_config_with_sources_from_paths(None, None, Some(&env)).unwrap();
+        let env_only = load_config_with_sources_from_paths(None, None, Some(&env)).unwrap();
         assert_eq!(env_only.config.timeouts.scale.env_value(), "3.5");
     }
 
@@ -4155,8 +4148,7 @@ identity_file = "/tmp/id_ed25519"
         for value in ["nan", "inf", "-inf", "0", "-1", "0.5", "11"] {
             std::fs::write(&path, format!("[timeouts]\nscale = {value}\n")).unwrap();
             assert!(
-                load_config_with_sources_from_paths(Some(&path), None, Some(&no_env))
-                    .is_err(),
+                load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err(),
                 "accepted invalid file scale {value}"
             );
             let env = HashMap::from([("RCH_TIMING_SCALE".to_string(), value.to_string())]);

@@ -495,8 +495,15 @@ exec "$@"
         self.handles.append(worker)
         return child, record, leader, worker
 
-    def recover(self, group, fault="none", mode="kill", extra="", body=None):
+    def recover(self, group, fault="none", mode="kill", extra="", body=None,
+                enclosing_seconds=None):
         _, record, _, _ = group
+        if enclosing_seconds is not None:
+            # Persistent faults consume an explicit enclosing deadline. Keep
+            # native process/signal/lock assertions bounded without relying
+            # on the former fixed number of unavailable census attempts.
+            extra += ("\nrch_observation_clock_checked || exit 99\n"
+                      f"rch_observation_deadline=$((rch_observation_now + {enclosing_seconds * 100}))\n")
         before = (record.lstat().st_ino, record.read_bytes())
         command = body or 'rch_remote_cancel "$1" 41 "$2"'
         result = subprocess.run([SHELL, "-c", PROTOCOL + "\n" + self.observe + extra
@@ -621,7 +628,7 @@ rch_observation_clock() {
 
     def test_persistent_census_failure_stops_work_but_cannot_confirm_cleanup(self):
         group = self.group()
-        result = self.recover(group, "persistent")
+        result = self.recover(group, "persistent", enclosing_seconds=5)
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         # Only a later genuine census establishes the release postcondition.
@@ -640,7 +647,7 @@ kill() {
             with self.subTest(mode=mode):
                 group = self.group()
                 (self.root / "thread-pass-failed").unlink(missing_ok=True)
-                result = self.recover(group, "thread-pass", mode, extra)
+                result = self.recover(group, "thread-pass", mode, extra, enclosing_seconds=5)
                 self.assertTrue((self.root / "thread-pass-failed").exists(),
                                 "fixture must reach the selected live-thread census")
                 self.assertEqual(result.returncode, 44, result.stderr)
@@ -657,7 +664,7 @@ kill() {
 
     def test_persistent_failure_after_term_still_escalates_without_claiming_completion(self):
         group = self.group()
-        result = self.recover(group, "persistent-after-term", "term")
+        result = self.recover(group, "persistent-after-term", "term", enclosing_seconds=5)
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assert_stopped(group)
         self.assertEqual(self.recover(group).returncode, 0)

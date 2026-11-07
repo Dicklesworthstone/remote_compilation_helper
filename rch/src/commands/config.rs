@@ -1445,13 +1445,14 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
 
     match key {
         "timeouts.scale" => {
-            config.timeouts.scale = value.parse().map_err(|error: TimingScaleError| {
-                ConfigError::InvalidValue {
-                    field: key.to_string(),
-                    reason: error.to_string(),
-                    suggestion: "Use a finite scale from 1.0 through 10.0".to_string(),
-                }
-            })?;
+            config.timeouts.scale =
+                value
+                    .parse()
+                    .map_err(|error: TimingScaleError| ConfigError::InvalidValue {
+                        field: key.to_string(),
+                        reason: error.to_string(),
+                        suggestion: "Use a finite scale from 1.0 through 10.0".to_string(),
+                    })?;
         }
         "general.role" => {
             config.general.role = match value.trim().trim_matches('"') {
@@ -2052,7 +2053,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("# RCH configuration export");
             println!("# Source this file: source <(rch config export)");
             println!();
-            println!("export RCH_TIMING_SCALE={}", config.timeouts.scale.env_value());
+            println!(
+                "export RCH_TIMING_SCALE={}",
+                config.timeouts.scale.env_value()
+            );
             println!("export RCH_ENABLED={}", config.general.enabled);
             println!("export RCH_LOG_LEVEL=\"{}\"", config.general.log_level);
             println!("export RCH_VISIBILITY=\"{}\"", config.output.visibility);

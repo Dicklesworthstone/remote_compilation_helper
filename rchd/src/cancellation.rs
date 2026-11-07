@@ -10,6 +10,7 @@ use crate::DaemonContext;
 use crate::api::{CancelAllBuildsResponse, CancelBuildResponse, CancelledBuildInfo};
 use crate::events::EventBus;
 use crate::workers::WorkerEndpointSnapshot;
+use rch_common::timing::{scale_duration, shell_prefix};
 use rch_common::{
     BuildCancellationMetadata, BuildCancellationWorkerHealth, WorkerId, WorkerStatus,
 };
@@ -713,8 +714,9 @@ impl CancellationOrchestrator {
 
     /// One budget bounds all termination stages, including lock waits and force.
     async fn execute_cancellation(&self, record: &mut CancellationRecord, force: bool) {
-        let deadline = Instant::now().checked_add(self.config.cleanup_timeout);
-        if self.config.cleanup_timeout.is_zero() || deadline.is_none() {
+        let cleanup_timeout = scale_duration(self.config.cleanup_timeout);
+        let deadline = Instant::now().checked_add(cleanup_timeout);
+        if cleanup_timeout.is_zero() || deadline.is_none() {
             record.state = CancellationState::Failed;
             record.cleanup_ok = false;
             return;
@@ -913,13 +915,14 @@ impl CancellationOrchestrator {
             );
             return false;
         }
-        let ssh_result = tokio::time::timeout(self.config.remote_kill_timeout, async {
+        let remote_kill_timeout = scale_duration(self.config.remote_kill_timeout);
+        let ssh_result = tokio::time::timeout(remote_kill_timeout, async {
             // Keep the local client inspection and the single remote attempt
             // inside the same budget. An inherited background/control-master
             // setting must not detach the transport from this cancellation.
             let foreground = rch_common::ssh::ssh_can_disable_background(
                 std::path::Path::new("ssh"),
-                self.config.remote_kill_timeout,
+                remote_kill_timeout,
             )
             .await?;
             let mut ssh = build_remote_kill_command(record, foreground)
@@ -1303,11 +1306,12 @@ fn build_remote_kill_command(
     let config = cancellation_transport_endpoint(record)?;
     let mut ssh = tokio::process::Command::new("ssh");
     rch_common::ssh::configure_oneshot_ssh(&mut ssh, can_disable_background);
+    let connect_timeout = scale_duration(Duration::from_secs(5)).as_secs_f64().ceil();
     ssh.args([
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
-        "ConnectTimeout=5",
+        &format!("ConnectTimeout={connect_timeout}"),
         "-o",
         "BatchMode=yes",
         "-i",
@@ -1368,7 +1372,8 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
         return "exit 42".to_owned();
     };
     let protocol = format!(
-        "{}\n{}",
+        "{}{}\n{}",
+        shell_prefix(),
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
         REMOTE_CANCELLATION_SCRIPT
     );
@@ -3387,7 +3392,10 @@ exec /bin/sh -c "$payload"
     ) -> std::process::Output {
         tokio::time::timeout(
             Duration::from_secs(5),
+            // The observer needs its own valid group, including in test
+            // runners whose initial process group is the reserved ID 1.
             tokio::process::Command::new("/bin/sh")
+                .process_group(0)
                 .arg("-c")
                 .arg(format!(
                     "{}\n{prefix}\n{REMOTE_CANCELLATION_SCRIPT}",
@@ -3490,8 +3498,16 @@ exec /bin/sh -c "$payload"
         let root = tempfile::tempdir().unwrap().keep();
         let path = root.join("group.pgid");
         std::fs::write(&path, "123\n").unwrap();
-        // Execute the production shell source with only OS failures injected.
-        // All kill calls are inert; sleep is shortened for deterministic faults.
+        // Execute the production shell source with OS failures and time injected.
+        // Advance time only during sleep: the last completed census must remain
+        // valid until the next loop guard, preserving live versus unknown.
+        const CLOCK: &str = r#"
+rch_cancel_test_clock=100
+rch_observation_clock() { rch_observation_now=$rch_cancel_test_clock; }
+sleep() { rch_cancel_test_clock=$((rch_cancel_test_clock + 1500)); }
+"#;
+        // All kill calls are inert; the production elapsed deadline still stops
+        // settlement, without spending thirty real seconds in the fixture.
         // This legacy record proves no identity, so an unknown census refuses with
         // 43 (87695314): unknown grants neither stop authority nor proof of death.
         // The identified case below keeps the 44 observation fault covered.
@@ -3517,7 +3533,7 @@ exec /bin/sh -c "$payload"
             ("printf '%s %s 99 S 1\\n' \"$OBS\" \"$OBS\"", 0),
         ] {
             let prefix = format!(
-                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                "{CLOCK}\nkill() {{ return 0; }};\n{}",
                 fake_ps_on_path(&root, probe)
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
@@ -3552,7 +3568,7 @@ exec /bin/sh -c "$payload"
             // signals and observations are injected: the reported survivor
             // must keep cancellation unconfirmed after bounded escalation.
             let prefix = format!(
-                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                "{CLOCK}\nkill() {{ return 0; }};\n{}",
                 fake_ps_on_path(
                     &root,
                     &format!(
@@ -3568,7 +3584,7 @@ exec /bin/sh -c "$payload"
             // With identity established, a failed census stays an observation
             // fault rather than the authority refusal the legacy record gets.
             let prefix = format!(
-                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                "{CLOCK}\nkill() {{ return 0; }};\n{}",
                 fake_ps_on_path(&root, "exit 1")
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;

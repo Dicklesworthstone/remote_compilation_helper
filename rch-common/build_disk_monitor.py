@@ -14,7 +14,9 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -23,11 +25,27 @@ import tempfile
 import time
 import uuid
 
+def parse_timing_scale(value):
+    """Validate transported policy before forking or admitting any workload."""
+    if (not isinstance(value, str) or len(value) > 128
+            or re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) is None):
+        raise ValueError("RCH_TIMING_SCALE must be a finite number in [1, 10]")
+    scale = float(value)
+    if not math.isfinite(scale) or not 1.0 <= scale <= 10.0:
+        raise ValueError("RCH_TIMING_SCALE must be a finite number in [1, 10]")
+    return scale
+
+
+TIMING_SCALE = parse_timing_scale(os.environ.get("RCH_TIMING_SCALE", "1"))
 POLL_SECONDS = 0.25
-FREE_SAMPLE_DEADLINE = 1.0
+FREE_SAMPLE_DEADLINE = 1.0 * TIMING_SCALE
 SCAN_INTERVAL = 2.0
-SCAN_DEADLINE = 30.0
-HEARTBEAT_DEADLINE = 3.0
+SCAN_DEADLINE = 30.0 * TIMING_SCALE
+HEARTBEAT_DEADLINE = 3.0 * TIMING_SCALE
+RESERVATION_LOCK_DEADLINE = 2.0 * TIMING_SCALE
+ADMISSION_DEADLINE = 5.0 * TIMING_SCALE
+FINALIZATION_DEADLINE = 2.0 * TIMING_SCALE
+BOOTSTRAP_ALLOWANCE = 10.0 * TIMING_SCALE
 EXIT_BUDGET = 120
 MAX_LEDGER_BYTES = 2 * 1024 * 1024
 MAX_RECEIPT_BYTES = 8192
@@ -103,7 +121,7 @@ def boot_identity():
             boot = stream.read().strip()
     elif sys.platform == "darwin":
         boot = subprocess.check_output(
-            ["sysctl", "-n", "kern.bootsessionuuid"], timeout=1, text=True
+            ["sysctl", "-n", "kern.bootsessionuuid"], timeout=TIMING_SCALE, text=True
         ).strip().lower()
     else:
         raise BudgetFailure("monitor_unavailable", detail="unsupported worker process platform")
@@ -159,7 +177,7 @@ def process_snapshot(heartbeat=lambda: None):
             ["ps", "-axo", "pid=,ppid=,pgid=,stat="], stdout=subprocess.PIPE, text=True
         )
         try:
-            output, _ = census.communicate(timeout=1)
+            output, _ = census.communicate(timeout=TIMING_SCALE)
         except BaseException:
             census.kill()
             census.communicate()
@@ -188,7 +206,7 @@ def darwin_leader_start(group, boot):
     # Native witness rejects dead/zombie leaders and rechecks birth and group
     # membership. A whole-machine ps census adds no owner identity evidence.
     witness = subprocess.check_output(
-        ["rch-wkr", "process-identity", str(group)], timeout=1, text=True
+        ["rch-wkr", "process-identity", str(group)], timeout=TIMING_SCALE, text=True
     ).split()
     if len(witness) != 3 or witness[0] != boot or int(witness[2]) != group:
         raise BudgetFailure("monitor_unavailable", detail="unverified Darwin group identity")
@@ -465,7 +483,7 @@ class Registry:
         descriptor = os.open(self.root + "/lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             private_regular(descriptor)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + RESERVATION_LOCK_DEADLINE
             while True:
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -807,7 +825,7 @@ def finish_descendants(monitor, heartbeat):
         # than expiring it before the first signal. The guardian still fences
         # a stalled census, and completion still requires an empty census.
         if deadline is None:
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + FINALIZATION_DEADLINE
         for record in descendants:
             # Pin the process on Linux so a recycled numeric PID cannot receive
             # a signal between membership inspection and signal delivery.
@@ -853,7 +871,7 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         )
         monitor.require_warm_pool(warm_policy)
         monitor.require_runtime_tracking(require_incremental_tracking)
-        bounded_result(executor.submit(monitor.admit), time.monotonic() + 5, heartbeat)
+        bounded_result(executor.submit(monitor.admit), time.monotonic() + ADMISSION_DEADLINE, heartbeat)
 
         def interrupted(signum, frame):
             raise BudgetFailure("interrupted", detail="supervisor received signal " + str(signum))
@@ -1007,7 +1025,7 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
             if os.WIFEXITED(status) and completed:
                 return os.WEXITSTATUS(status)
             stop("supervisor_exit_unconfirmed", wait_status=status)
-        deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + 10
+        deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + BOOTSTRAP_ALLOWANCE
         age = time.monotonic() - last_heartbeat
         if cancelled or os.getppid() != parent or age > deadline:
             # Also fences a wedged fsync/receipt or process-identity probe. A

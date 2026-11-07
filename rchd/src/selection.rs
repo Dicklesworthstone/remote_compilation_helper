@@ -20,6 +20,7 @@ use crate::metrics::{
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use rand::RngExt;
+use rch_common::timing::scale_duration;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
     SelectionConfig, SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
@@ -2309,7 +2310,7 @@ impl WorkerSelector {
             handles.push(tokio::spawn(async move {
                 let capabilities = crate::health::probe_worker_capabilities(
                     &worker,
-                    TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+                    scale_duration(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT),
                     ssh_pool.as_ref(),
                 )
                 .await?;
@@ -4648,9 +4649,10 @@ async fn probe_worker_toolchain(
     toolchain_name: &str,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), String> {
+    let command_timeout = scale_duration(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT);
     let ssh_options = SshOptions {
-        connect_timeout: TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT,
-        command_timeout: TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+        connect_timeout: scale_duration(TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT),
+        command_timeout,
         control_master: false,
         ..Default::default()
     };
@@ -4664,13 +4666,9 @@ async fn probe_worker_toolchain(
     // spawn/leak). The pool distinguishes connect failures internally, so map a
     // pool error onto the same connect-failed reason string for callers.
     let result = if let Some(pool) = ssh_pool {
-        pool.run_with_timeout(
-            &worker_config,
-            &command,
-            TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
-        )
-        .await
-        .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))
+        pool.run_with_timeout(&worker_config, &command, command_timeout)
+            .await
+            .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))
     } else {
         let mut client = SshClient::new(worker_config, ssh_options);
         client

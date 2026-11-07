@@ -45,6 +45,49 @@ Sections and fields:
   `"~/.cache/rch/rch.sock"`; falls back to `"/tmp/rch.sock"`) — Unix socket path
   used to communicate with the daemon.
 
+### `[timeouts]`
+
+- `scale` (number, default `1.0`, inclusive range `1.0..=10.0`) — Multiplies
+  bounded slow-path control deadlines for healthy workers whose SSH, filesystem
+  scans and locks take longer under load. Both integer and fractional TOML
+  values are accepted. `RCH_TIMING_SCALE` overrides the file setting. Empty,
+  malformed, non-finite and out-of-range values are errors rather than silently
+  falling back to a different policy.
+
+```toml
+[timeouts]
+scale = 2.5
+```
+
+The client resolves defaults, user TOML, project TOML and the environment in that
+order. An explicit project `scale = 1` resets a larger user value. The on-disk
+configuration cache stores only the file layers; each invocation reapplies the
+current environment. The client explicitly exports its validated value to
+embedded remote helpers, so workers need no environment setup for that job.
+
+The daemon resolves its own user `config.toml` and `RCH_TIMING_SCALE` at startup,
+including starts without a configuration file. Restart `rchd` after changing
+its timing policy. A project setting or a variable supplied only to `rch exec`
+affects that invocation, not the daemon already running in another process.
+To use one fleet policy for both, set it in the user configuration and restart
+the daemon, or provide the variable to both processes.
+
+The affected operations are worker toolchain/capability/telemetry probes,
+embedded disk-monitor admission and heartbeat observations, source-namespace
+control, cancellation observation and settlement, and completion-receipt
+retries. Their enclosing transport budgets must allow the same scaled work.
+Retry windows remain bounded by elapsed time. The shared duration policy caps
+each scaled control budget at one hour, even at scale 1.0; oversized configured
+base budgets and multiplication overflow cannot create an unbounded deadline.
+The scale does not change compiler/test lifetimes, signal-escalation grace,
+queue limits, periodic polling cadence, resource or disk thresholds, or
+process-ownership evidence. A larger deadline cannot
+authorize a signal, declare an unknown process dead, bypass disk admission or
+release a reservation without its existing confirmation.
+
+Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
+`show --sources`, `diff` or `export` to manage and inspect this setting.
+
 ### `[compilation]`
 - `confidence_threshold` (float, default `0.85`) — Minimum classifier confidence
   to intercept a command.
@@ -425,6 +468,7 @@ applied in your version, verify with `rch config show --sources` or `rch --help`
 These are read by the hook configuration loader:
 
 - `RCH_ENABLED`
+- `RCH_TIMING_SCALE` (validated `[timeouts].scale` override, finite `1.0..=10.0`)
 - `RCH_LOG_LEVEL`
 - `RCH_SOCKET_PATH`
 - `RCH_CONFIDENCE_THRESHOLD`

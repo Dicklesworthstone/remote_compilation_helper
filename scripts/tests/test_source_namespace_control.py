@@ -386,6 +386,35 @@ class SourceNamespaceControlTests(unittest.TestCase):
         with lock.open("a") as probe:
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_invalid_timing_policy_refuses_before_namespace_mutation(self):
+        mutation = self.root / "invalid-timing-mutation"
+        for value in ("", "0", "-1", "0.99", "10.1", "nan", "inf", "1e9999",
+                      " 2", "2 ", "1_0", "$(printf injected)", "1;printf injected"):
+            for contract in ("RCH_TOPOLOGY_OK", "RCH_SOURCE_INTENT_FINISHED"):
+                with self.subTest(value=value, contract=contract):
+                    command = "set -- " + contract + "\n" + self.script
+                    result = subprocess.run(
+                        [SHELL, "-c", command],
+                        input=("touch " + shlex.quote(str(mutation))).encode(),
+                        capture_output=True, timeout=5,
+                        env={**self.env, "RCH_TIMING_SCALE": value})
+                    self.assertEqual((result.returncode, result.stdout), (73, b""))
+                    self.assertIn(b"invalid RCH_TIMING_SCALE", result.stderr)
+                    self.assertFalse(mutation.exists())
+                    self.assertFalse(self.calls.exists())
+
+    def test_scaled_metadata_program_can_finish_after_default_deadline(self):
+        started = time.monotonic()
+        result = subprocess.run(
+            [SHELL, "-c", "set -- RCH_SOURCE_INTENT_CANCEL\n" + self.script],
+            input=b"sleep 16.3; printf owned\n", capture_output=True, timeout=23,
+            env={**self.env, "RCH_TIMING_SCALE": "2"})
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, b"owned", b""))
+        self.assertGreaterEqual(time.monotonic() - started, 16)
+        self.assertLess(time.monotonic() - started, 22)
+        self.assertFalse(self.calls.exists())
+
     def test_missing_timer_refuses_before_the_program_runs(self):
         empty_path = self.root / "no-tools"
         empty_path.mkdir()
@@ -598,7 +627,7 @@ class SourceNamespaceTimerObserverTests(unittest.TestCase):
         temporary = root / "tmp"
         temporary.mkdir()
         for name in ("mktemp", "ps", "head", "grep", "mkfifo", "wc", "cmp",
-                     "cat", "rm", "rmdir", "sleep"):
+                     "cat", "rm", "rmdir", "sleep", "awk"):
             executable = shutil.which(name)
             self.assertIsNotNone(executable, name)
             (tools / name).symlink_to(executable)
@@ -672,6 +701,66 @@ class SourceNamespaceTimerObserverTests(unittest.TestCase):
         (tools / "python3").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
                                         " -I -S -c " + shlex.quote(bootstrap) + ' "$@"\n')
         (tools / "python3").chmod(0o700)
+
+    def test_scaled_native_timers_allow_delayed_success(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                _, _, env = self.fixture(backend)
+                prefix = self.script.split("# GNU timeout kills", 1)[0]
+                timer = "gnutimeout" if backend == "gnu" else "rch_namespace_python_timer"
+                command = (prefix + "\nrch_namespace_timer=" + timer +
+                           "\n(rch_namespace_observed_timer status --kill-after=1 1 "
+                           "sh -c 'sleep 1.4; printf ready')")
+                for scale, succeeds in (("1", False), ("2", True), ("1.25", True)):
+                    with self.subTest(scale=scale):
+                        result = subprocess.run(
+                            [SHELL, "-c", command], capture_output=True, timeout=6,
+                            env={**env, "RCH_TIMING_SCALE": scale})
+                        self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                        self.assertEqual(result.stdout, b"ready" if succeeds else b"")
+
+    def test_scaled_native_timer_keeps_term_grace_and_kills_only_owned_group(self):
+        for backend in ("gnu", "python"):
+            with self.subTest(backend=backend):
+                root, _, env = self.fixture(backend)
+                held, term = root / "scaled-held", root / "scaled-term"
+                code = (
+                    "import os,signal,time\n"
+                    f"term={str(term)!r}\n"
+                    "def stop(signum,frame):\n"
+                    "    with open(term,'w') as out: out.write(str(time.monotonic()))\n"
+                    "signal.signal(signal.SIGTERM,stop)\n"
+                    f"with open({str(held)!r},'w') as out: "
+                    "out.write(str(os.getpid())+' '+str(os.getpgrp()))\n"
+                    "while True: time.sleep(1)\n"
+                )
+                payload = "exec " + shlex.quote(sys.executable) + " -I -S -c " + shlex.quote(code)
+                prefix = self.script.split("# GNU timeout kills", 1)[0]
+                timer = "gnutimeout" if backend == "gnu" else "rch_namespace_python_timer"
+                command = (prefix + "\nrch_namespace_timer=" + timer +
+                           "\n(rch_namespace_observed_timer teardown --kill-after=1 1 sh -c " +
+                           shlex.quote(payload) + ")")
+                unrelated = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                self.processes.append(unrelated)
+                self.pin(unrelated.pid)
+                started = time.monotonic()
+                process = subprocess.Popen([SHELL, "-c", command],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           env={**env, "RCH_TIMING_SCALE": "2"})
+                self.processes.append(process)
+                child, group = map(int, self.wait_file(held, process).split())
+                child_fd, timer_fd = self.pin(child), self.pin(group)
+                stdout, stderr = process.communicate(timeout=7)
+                self.assertEqual((process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertTrue(term.exists(), "TERM must precede KILL")
+                term_at = float(term.read_text())
+                self.assertGreaterEqual(term_at - started, 1.8)
+                self.assertGreaterEqual(time.monotonic() - term_at, 0.8)
+                self.assert_exited(child_fd)
+                self.assert_exited(timer_fd)
+                self.assertIsNone(unrelated.poll(), "timer signalled an unrelated group")
 
     def exercise_timer_signal(self, signum):
         for backend in ("gnu", "python"):

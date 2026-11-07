@@ -4999,7 +4999,10 @@ sys.exit(99)
         })
         .await;
         assert!(result.is_err());
-        assert!(dropped.get(), "expired read must release its owned transport");
+        assert!(
+            dropped.get(),
+            "expired read must release its owned transport"
+        );
         assert_eq!(started.elapsed(), base);
     }
 

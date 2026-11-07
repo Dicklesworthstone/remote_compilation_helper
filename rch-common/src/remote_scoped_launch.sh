@@ -170,13 +170,15 @@ rch_scope_launch_parent_alive() {
 
 # Bound marker delivery. Map fd 3 before Python closes nonstandard descriptors.
 rch_scope_launch_deadline_marker() {
-    rch_group_timeout --signal=KILL 1s /bin/sh -c 'printf "\n%s\n" "$1"' rch-deadline "$1" \
+    rch_timing_budget 1
+    rch_group_timeout --signal=KILL "${rch_timing_scaled}s" /bin/sh -c 'printf "\n%s\n" "$1"' rch-deadline "$1" \
         >&3 2>/dev/null </dev/null
 }
 
 # Bound diagnostics without changing receipt, claim, status or cleanup verdict.
 rch_scope_launch_message() (
-    rch_group_timeout --signal=KILL 1s /bin/sh -c '
+    rch_timing_budget 1
+    rch_group_timeout --signal=KILL "${rch_timing_scaled}s" /bin/sh -c '
         case "$2" in
             line) printf "%s\n" "$1";;
             setup) printf "\n%s_IDENTITY_UNAVAILABLE\n" "$1";;
@@ -235,7 +237,8 @@ rch_scope_launch_child() {
         rch_policy_enforce
     }
     rch_observation_clock_checked || exit 125
-    rch_observation_deadline=$((rch_observation_now + 6000))
+    rch_timing_budget 6000
+    rch_observation_deadline=$((rch_observation_now + rch_timing_scaled))
     rch_remote_record "$__sl_record" "$__sl_build" || exit 125
     rch_scope_launch_binding_matches || exit 125
     unset rch_observation_deadline rch_observation_last_clock
@@ -413,6 +416,8 @@ rch_scope_launch_finish() {
     __sl_admission_observations=0
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
+    rch_timing_budget 6000
+    __sl_setup_deadline=$((__sl_setup_started + rch_timing_scaled))
     __sl_last_clock=$rch_launch_now
     while :; do
         rch_scope_launch_process "$__sl_child"
@@ -431,7 +436,7 @@ rch_scope_launch_finish() {
         __sl_last_clock=$rch_launch_now
         if [ "$__sl_admitted" = 0 ]; then
             # One deadline covers publication and all admission observations.
-            if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+            if [ "$rch_launch_now" -ge "$__sl_setup_deadline" ]; then
                 [ "$__sl_admission_observations" = 0 ] || __sl_reason=unknown
                 break
             fi
@@ -443,7 +448,7 @@ rch_scope_launch_finish() {
                 rch_remote_leader_matches || { __sl_reason=unknown; break; }
                 if [ $rch_scope_bound = 1 ]; then
                     __sl_admission_observations=$((__sl_admission_observations + 1))
-                    rch_observation_deadline=$((__sl_setup_started + 6000))
+                    rch_observation_deadline=$__sl_setup_deadline
                     rch_observation_last_clock=$rch_launch_now
                     rch_scope_operation state
                     __sl_scope_state=$?
@@ -464,7 +469,7 @@ rch_scope_launch_finish() {
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
                 [ "$rch_launch_now" -ge "$__sl_last_clock" ] || { __sl_reason=unknown; break; }
                 __sl_last_clock=$rch_launch_now
-                if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+                if [ "$rch_launch_now" -ge "$__sl_setup_deadline" ]; then
                     __sl_reason=unknown; break
                 fi
                 if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi

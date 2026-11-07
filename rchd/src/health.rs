@@ -9,6 +9,7 @@ use crate::metrics;
 use crate::ui::workers::WorkerStatusPanel;
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::mock::{self, MockConfig, MockSshClient};
+use rch_common::timing::scale_duration;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, SshClient, SshOptions, WorkerStatus,
     is_retryable_transport_error,
@@ -730,7 +731,7 @@ impl HealthMonitor {
                     // `disk_free_gb` makes `is_low_disk()` return `None`, and the
                     // low-disk admission gate then FAILS OPEN — the dispatcher keeps
                     // scheduling onto a worker that is about to run out of disk.
-                    let timeout = CAPABILITY_PROBE_TIMEOUT;
+                    let timeout = scale_duration(CAPABILITY_PROBE_TIMEOUT);
                     let probe_pool = ssh_pool.clone();
                     // An admin-disabled worker receives no work, so its
                     // capability facts have no consumer; the first cycle

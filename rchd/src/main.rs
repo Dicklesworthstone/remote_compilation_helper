@@ -1387,6 +1387,9 @@ async fn main() -> Result<()> {
     // `control_persist_mode` — that default is exactly what leaked masters).
     let ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
         let pool_options = rch_common::SshOptions {
+            connect_timeout: rch_common::timing::scale_duration(
+                rch_common::SshOptions::default().connect_timeout,
+            ),
             control_master: true,
             control_persist_idle: Some(Duration::from_secs(60)),
             ..Default::default()
@@ -1664,6 +1667,11 @@ async fn main() -> Result<()> {
     // while still giving health checks warm-connection reuse.
     let health_ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
         let pool_options = rch_common::SshOptions {
+            // Capability probes share this pool; fast liveness retains its
+            // separate enclosing check_timeout.
+            connect_timeout: rch_common::timing::scale_duration(
+                rch_common::SshOptions::default().connect_timeout,
+            ),
             control_master: true,
             control_persist_idle: Some(Duration::from_secs(60)),
             ..Default::default()

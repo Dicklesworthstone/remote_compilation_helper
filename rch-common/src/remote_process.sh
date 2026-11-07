@@ -1,6 +1,27 @@
 # Process-group identity shared by launch, timeout cleanup, and recovery.
 # A PID is not durable authority: bind it to the worker boot and leader start.
 set -f
+# Parse exported policy as data in C locale; round positive caps upward.
+# Whole-second helpers and monotonic tick budgets share this one multiplier.
+rch_timing_micros=1000000
+case "${RCH_TIMING_SCALE-1}" in
+    1) ;;
+    *)
+        rch_timing_micros=$(LC_ALL=C awk '
+            BEGIN {
+                value = ENVIRON["RCH_TIMING_SCALE"]
+                if (length(value) > 128 || value !~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
+                scale = value + 0
+                if (!(scale >= 1 && scale <= 10)) exit 1
+                units = int(scale * 1000000)
+                if (units < scale * 1000000) units++
+                printf "%.0f\n", units
+            }
+        ') || { printf "%s\n" "RCH: invalid RCH_TIMING_SCALE (expected finite 1..10)" >&2; exit 125; };;
+esac
+rch_timing_budget() {
+    rch_timing_scaled=$((($1 * rch_timing_micros + 999999) / 1000000))
+}
 # Fixed printf/stat formats use double quotes: four transport layers multiply
 # literal apostrophes and must fit the existing 110 KB argument budget.
 
@@ -40,7 +61,8 @@ rch_observation_budget() {
 rch_observation_clock() {
     if [ ! -r /proc/uptime ]; then
         [ "$(uname -s)" = Darwin ] || return 1
-        rch_observation_now=$(rch_group_timeout --signal=KILL 5s python3 -I -S -c \
+        rch_timing_budget 5
+        rch_observation_now=$(rch_group_timeout --signal=KILL "${rch_timing_scaled}s" python3 -I -S -c \
             'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
         case "$rch_observation_now" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
         [ "${#rch_observation_now}" -le 15 ]
@@ -473,7 +495,7 @@ rch_remote_cancel() {
 
 # Only validated in-memory identity grants signal authority.
 rch_remote_cancel_loaded() (
-    # Share 30s inside 45s SSH; subshell isolates deadlines and authority.
+    # Share 30 * scale seconds inside 45 * scale SSH; isolate authority.
     # A full build disk must not prevent observing that its writers stopped.
     # Keep this preference local to cancellation/supervisor cleanup; workers
     # without Python retain the existing bounded file-backed control path.
@@ -482,7 +504,8 @@ rch_remote_cancel_loaded() (
     # Darwin identity observations must use the same storage-independent path.
     export rch_control_diskless
     rch_observation_clock_checked || return 44
-    rch_cancel_deadline=$((rch_observation_now + 3000))
+    rch_timing_budget 3000
+    rch_cancel_deadline=$((rch_observation_now + rch_timing_scaled))
     if [ -n "${rch_observation_deadline:-}" ]; then
         case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) return 44;; esac
         [ "${#rch_observation_deadline}" -le 15 ] || return 44
@@ -547,27 +570,21 @@ rch_remote_cancel_loaded() (
         rch_signal_group KILL || rch_kill_status=$?
     fi
     case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
-    rch_attempt=0
-    rch_unknown_attempts=0
     rch_last_state=2
-    # Budgeted settling polls; unknown gets at most three attempts.
-    rch_attempt_limit=20
-    while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
+    # Census time consumes the remaining shared cancellation deadline. The old
+    # twenty 0.1s pauses were not a two-second wall limit on slow observations.
+    # Unknown still proves neither death nor authority to send another signal.
+    while :; do
         rch_observation_clock_checked || return 44
-        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || return 44
+        [ "$rch_observation_now" -lt "$rch_observation_deadline" ] || break
         rch_group_state
         rch_last_state=$?
-        # Unknown grants nothing; recheck between-pass exits within this cap.
         case $rch_last_state in
             0) return 0;;
-            1) rch_unknown_attempts=0;;
-            2)
-                [ "$rch_kill_status" = 0 ] || return 43
-                rch_unknown_attempts=$((rch_unknown_attempts + 1))
-                [ "$rch_unknown_attempts" -lt 3 ] || return 44;;
+            1) ;;
+            2) [ "$rch_kill_status" = 0 ] || return 43;;
             *) return 44;;
         esac
-        rch_attempt=$((rch_attempt + 1))
         sleep 0.1 || return 44
     done
     [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
@@ -711,7 +728,7 @@ import signal
 import subprocess
 import sys
 
-if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in tuple(str(n) + "s" for n in range(1, 9)):
+if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in tuple(str(n) + "s" for n in range(1, 81)):
     sys.exit(125)
 try:
     os.setsid()
@@ -831,7 +848,8 @@ sys.exit(128 + interrupted if interrupted else status if status >= 0 else 128 - 
 
 rch_control_capture() {
     case "$1" in [1-8]s) ;; *) return 125;; esac
-    rch_control_timeout=$1
+    rch_timing_budget "${1%s}"
+    rch_control_timeout=${rch_timing_scaled}s
     shift
     # Nested captures and retries consume one admission/cancellation deadline.
     rch_control_budget || return 125
@@ -968,7 +986,9 @@ rch_policy_enter_scope() {
     # Attach the EXISTING setsid leader, rather than starting an independent
     # transient service. All subsequently spawned work keeps the same PGID and
     # stdio, so the existing watchdog, cancellation and recovery remain owners.
-    rch_control_capture 5s busctl "--$rch_policy_manager" --timeout=5s --allow-interactive-authorization=no \
+    rch_timing_budget 5
+    rch_policy_bus_timeout=${rch_timing_scaled}s
+    rch_control_capture 5s busctl "--$rch_policy_manager" "--timeout=$rch_policy_bus_timeout" --allow-interactive-authorization=no \
         call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
         org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
         "$rch_policy_scope" fail 3 PIDs au 1 "$rch_pgid" \
@@ -976,10 +996,16 @@ rch_policy_enter_scope() {
         rch_policy_refuse scope_creation; return 125;
     }
     rch_policy_expected_cgroup="$rch_policy_slice_cgroup/$rch_policy_scope"
-    rch_policy_poll=0
+    rch_observation_clock_checked || { rch_policy_refuse scope_clock; return 125; }
+    rch_timing_budget 500
+    rch_policy_placement_deadline=$((rch_observation_now + rch_timing_scaled))
     while [ "$(rch_policy_current_cgroup)" != "$rch_policy_expected_cgroup" ]; do
-        rch_policy_poll=$((rch_policy_poll + 1))
-        [ "$rch_policy_poll" -lt 50 ] || { rch_policy_refuse scope_not_enforced; return 125; }
+        rch_observation_clock_checked && rch_control_in_budget || {
+            rch_policy_refuse scope_clock; return 125;
+        }
+        [ "$rch_observation_now" -lt "$rch_policy_placement_deadline" ] || {
+            rch_policy_refuse scope_not_enforced; return 125;
+        }
         sleep 0.1 || { rch_policy_refuse scope_wait; return 125; }
     done
     rch_policy_property_is ActiveState "$rch_policy_scope" active &&
@@ -1239,7 +1265,8 @@ rch_scope_bind_created() {
     # changed identity. Keep the payload gate closed throughout the retries.
     (
         rch_observation_clock_checked || exit 1
-        rch_probe_deadline=$((rch_observation_now + 3000))
+        rch_timing_budget 3000
+        rch_probe_deadline=$((rch_observation_now + rch_timing_scaled))
         if [ -n "${rch_observation_deadline:-}" ]; then
             case "$rch_observation_deadline" in ''|*[!0-9]*|0[0-9]*) exit 1;; esac
             [ "${#rch_observation_deadline}" -le 15 ] || exit 1

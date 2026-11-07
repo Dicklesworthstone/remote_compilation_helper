@@ -28,6 +28,38 @@ MIB = 1 << 20
 MARKER = "RCH_TEST_ATTEMPT_DISK_BUDGET:"
 
 
+class TimingScaleTests(unittest.TestCase):
+    def test_transported_scale_scales_caps_without_changing_poll_cadence(self):
+        driver = (
+            "import importlib.util,json\n"
+            f"s=importlib.util.spec_from_file_location('m',{str(SOURCE)!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "print(json.dumps([m.TIMING_SCALE,m.FREE_SAMPLE_DEADLINE,"
+            "m.SCAN_DEADLINE,m.HEARTBEAT_DEADLINE,m.RESERVATION_LOCK_DEADLINE,"
+            "m.ADMISSION_DEADLINE,m.FINALIZATION_DEADLINE,m.BOOTSTRAP_ALLOWANCE,"
+            "m.POLL_SECONDS,m.SCAN_INTERVAL]))\n"
+        )
+        for value, scale in ((None, 1), ("1", 1), ("2", 2), ("1.25", 1.25), ("10", 10)):
+            with self.subTest(value=value):
+                env = dict(os.environ)
+                env.pop("RCH_TIMING_SCALE", None)
+                if value is not None:
+                    env["RCH_TIMING_SCALE"] = value
+                result = subprocess.run([sys.executable, "-I", "-S", "-c", driver],
+                                        capture_output=True, env=env, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout),
+                                 [scale, scale, 30 * scale, 3 * scale, 2 * scale,
+                                  5 * scale, 2 * scale, 10 * scale, 0.25, 2])
+
+    def test_invalid_and_nonfinite_policy_is_rejected(self):
+        for value in ("", "0", "-1", "0.999", "10.01", "nan", "NaN", "inf",
+                      "-inf", "1e9999", "1e-9999", " 2", "2 ", "1_0",
+                      "1;printf injected", "$(printf injected)", "2" * 129):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                monitor.parse_timing_scale(value)
+
+
 class DiskMonitorTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux procfs exit race")
     def test_census_tolerates_real_procfs_exit_but_preserves_live_process(self):
@@ -123,7 +155,7 @@ class DiskMonitorTests(unittest.TestCase):
                     process.kill()
             process.communicate(timeout=3)
 
-    def spawn(self, payload, *, budget=8 * MIB, floor=MIB, inject="", mode="standalone", outputs=None, target=None, timeout_seconds=0, receipt_initial=None, probe_paths=None, warm_policy=None, require_incremental_tracking=False):
+    def spawn(self, payload, *, budget=8 * MIB, floor=MIB, inject="", mode="standalone", outputs=None, target=None, timeout_seconds=0, receipt_initial=None, probe_paths=None, warm_policy=None, require_incremental_tracking=False, timing_scale=None):
         number = len(self.processes)
         receipt = self.root / ("receipt-" + str(number))
         target = target or self.target
@@ -144,9 +176,13 @@ class DiskMonitorTests(unittest.TestCase):
             + inject + "\n"
             + f"os._exit(m.main({[str(budget), str(floor), MARKER, str(target), json.dumps(plan), mode, sys.executable, '-c', payload]!r}))\n"
         )
+        env = dict(os.environ)
+        env.pop("RCH_TIMING_SCALE", None)
+        if timing_scale is not None:
+            env["RCH_TIMING_SCALE"] = timing_scale
         process = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", driver], stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, start_new_session=mode == "tracked",
+            stderr=subprocess.PIPE, start_new_session=mode == "tracked", env=env,
         )
         self.processes.append(process)
         return process, receipt
@@ -1431,6 +1467,55 @@ m.subprocess.Popen=interrupted_spawn"""
         self.complete(process)
         self.assertEqual(self.failure(receipt)["reason"], "monitor_unavailable")
         self.assertTrue(self.failure(receipt)["started"])
+
+    def test_invalid_timing_policy_never_starts_payload(self):
+        mutation = self.root / "invalid-scale-payload"
+        for value in ("nan", "inf", "0", "11", ""):
+            with self.subTest(value=value):
+                process, _ = self.spawn(
+                    f"from pathlib import Path; Path({str(mutation)!r}).touch()",
+                    timing_scale=value)
+                status, _, stderr = self.complete(process)
+                self.assertNotEqual(status, 0)
+                self.assertIn("RCH_TIMING_SCALE", stderr)
+                self.assertFalse(mutation.exists())
+
+    def test_scaled_free_sample_deadline_allows_delayed_success(self):
+        for value, succeeds in (("1", False), ("2", True)):
+            with self.subTest(scale=value):
+                ready = self.target / ("delayed-sample-" + value)
+                inject = f"""original_sample=m.filesystem_sample
+def delayed_sample(paths):
+    if pathlib.Path({str(ready)!r}).exists():
+        time.sleep(1.3)
+    return original_sample(paths)
+m.filesystem_sample=delayed_sample"""
+                payload = ("from pathlib import Path; import time; "
+                           f"Path({str(ready)!r}).write_text('ready'); time.sleep(2.5)")
+                process, receipt = self.spawn(payload, inject=inject, timing_scale=value)
+                status, _, stderr = self.complete(process, timeout=10)
+                if succeeds:
+                    self.assertEqual(status, 0, stderr)
+                else:
+                    self.assertNotEqual(status, 0)
+                    self.assertIn("telemetry deadline", self.failure(receipt)["detail"])
+
+    def test_scaled_blocked_statvfs_is_still_bounded(self):
+        ready = self.target / "scaled-blocked-sample"
+        inject = f"""original_sample=m.filesystem_sample
+def blocked_sample(paths):
+    if pathlib.Path({str(ready)!r}).exists():
+        time.sleep(20)
+    return original_sample(paths)
+m.filesystem_sample=blocked_sample"""
+        started = time.monotonic()
+        process, receipt = self.spawn(
+            "from pathlib import Path; import time; "
+            f"Path({str(ready)!r}).write_text('ready'); time.sleep(20)",
+            inject=inject, timing_scale="2")
+        self.complete(process, timeout=10)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIn("telemetry deadline", self.failure(receipt)["detail"])
 
     def test_blocked_statvfs_has_deadline(self):
         ready = self.target / "ready"

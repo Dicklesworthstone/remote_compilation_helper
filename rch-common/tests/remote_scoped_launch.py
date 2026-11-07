@@ -359,6 +359,61 @@ class ScriptTransport(unittest.TestCase):
         return subprocess.run([SHELL, "-c", script, "rch-observer", *args],
                               capture_output=True, timeout=10, **options)
 
+    @staticmethod
+    def timing_env(scale):
+        env = dict(os.environ)
+        env.pop("RCH_TIMING_SCALE", None)
+        if scale is not None:
+            env["RCH_TIMING_SCALE"] = scale
+        return env
+
+    def test_worker_scale_validates_fractional_caps_and_default(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + "\nrch_timing_budget 5; printf '%s:' \"$rch_timing_scaled\"\n"
+        command += "rch_timing_budget 200; printf '%s\\n' \"$rch_timing_scaled\"\n"
+        for scale, expected in ((None, b"5:200\n"), ("1", b"5:200\n"),
+                                ("2", b"10:400\n"), ("1.25", b"7:250\n"),
+                                ("10", b"50:2000\n")):
+            with self.subTest(scale=scale):
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (0, expected, b""))
+
+    def test_invalid_worker_scale_refuses_before_command_evaluation(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        for scale in ("", "0", "0.99", "-1", "10.1", "NaN", "inf", "-inf",
+                      "1e9999", "1e-9999", " 2", "2 ", "1_0",
+                      "1;printf INJECTED", "$(printf INJECTED)"):
+            with self.subTest(scale=scale):
+                result = self.invoke(core + "\nprintf UNEXPECTED\n",
+                                     env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout), (125, b""))
+                self.assertIn(b"invalid RCH_TIMING_SCALE", result.stderr)
+                self.assertNotIn(b"INJECTED", result.stderr)
+
+    def test_scaled_control_capture_admits_delayed_success(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + "\nrch_control_capture 1s /bin/sh -c 'sleep 1.4; printf ready'\n"
+        for scale, succeeds in (("1", False), ("2", True), ("1.25", True)):
+            with self.subTest(scale=scale):
+                started = time.monotonic()
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertEqual(result.stdout, b"ready" if succeeds else b"")
+
+    def test_scaled_capture_cannot_disable_near_exhausted_deadline(self):
+        core = (SOURCE / "remote_process.sh").read_text()
+        command = core + """
+rch_observation_clock_checked || exit 99
+rch_observation_deadline=$((rch_observation_now + 50))
+rch_control_capture 1s /bin/sh -c 'printf UNEXPECTED'
+"""
+        for scale in ("1", "2", "1.25", "10"):
+            with self.subTest(scale=scale):
+                result = self.invoke(command, env=self.timing_env(scale))
+                self.assertEqual((result.returncode, result.stdout), (125, b""))
+
     def test_one_literal_hydrates_the_exact_child_program(self):
         source = protocol(instrument=False)
         core = (SOURCE / "remote_process.sh").read_text()

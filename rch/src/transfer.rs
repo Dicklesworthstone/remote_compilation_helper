@@ -3274,7 +3274,9 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         let ssh_options = SshOptions {
-            connect_timeout: rch_common::timing::scale_duration(SshOptions::default().connect_timeout),
+            connect_timeout: rch_common::timing::scale_duration(
+                SshOptions::default().connect_timeout,
+            ),
             server_alive_interval: Some(std::time::Duration::from_secs(
                 transfer_config.ssh_server_alive_interval_secs.unwrap_or(15),
             )),
@@ -5838,7 +5840,8 @@ impl TransferPipeline {
         let program = format!(
             "{}if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
             rch_common::timing::shell_prefix(),
-            budget.max_growth_bytes, budget.min_free_bytes,
+            budget.max_growth_bytes,
+            budget.min_free_bytes,
         );
         // This composition can exceed the single-argument limit independently
         // of the outer session wrapper, even when each embedded program fits.
@@ -8122,10 +8125,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Ok(Err(reason)) => (RemoteTimeoutCleanup::Unverified, reason),
             Err(_) => (
                 RemoteTimeoutCleanup::Unverified,
-                format!(
-                    "kill probe exceeded {}s budget",
-                    cleanup_budget.as_secs()
-                ),
+                format!("kill probe exceeded {}s budget", cleanup_budget.as_secs()),
             ),
         }
     }
