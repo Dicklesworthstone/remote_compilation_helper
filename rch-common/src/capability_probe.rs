@@ -197,6 +197,25 @@ fn shq_path(path: &str) -> String {
     }
 }
 
+/// Validate rustup's one selected executable path before invoking it. Native
+/// Windows rustup prints drive/UNC paths and CRLF even under Git Bash/MSYS;
+/// normalize those separators without changing backslashes in POSIX paths.
+/// The function runs in a command substitution so its variables stay private.
+const CARGO_PROBE_PATH_HELPER: &str = r#"
+rch_cargo_probe_path() {
+    p=$1
+    cr=$(printf '\r')
+    p=${p%"$cr"}
+    case "$p" in
+        ''|*"$cr"*|*'
+'*) return 1 ;;
+        [a-zA-Z]:[\\/]*|'\\'*) printf '%s' "$p" | tr '\\' '/' ;;
+        /*) printf '%s' "$p" ;;
+        *) return 1 ;;
+    esac
+}
+"#;
+
 /// Where RCH deploys `rch-wkr` on a worker, in the order the capability probe
 /// tries them.
 ///
@@ -283,9 +302,25 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
         "if [ -n \"$w\" ]; then v=$(\"$w\" --version 2>/dev/null) && printf '%sworker_version=%s\\n' \"$P\" \"$v\"; \
          pr=$(\"$w\" --protocol-version 2>/dev/null) && printf '%sworker_protocol=%s\\n' \"$P\" \"$pr\"; fi; ",
     );
-    // Cargo / rust.
+    // The PATH shim can resolve cargo-rch-real without touching the direct
+    // toolchain wrapper. Require both execution paths when rustup is present;
+    // otherwise a broken direct Cargo could pass smoke/recovery admission.
+    // Discover rustup separately from running it: a discovered but broken
+    // resolver must not be mistaken for a standalone Cargo installation.
+    // All commands remain inside the caller's existing whole-probe deadline.
+    s.push_str(CARGO_PROBE_PATH_HELPER);
     s.push_str(&format!(
-        "cv=$({cargo} --version 2>/dev/null) && printf '%scargo_version=%s\\n' \"$P\" \"$cv\"; "
+        r#"if cv=$({cargo} --version 2>/dev/null); then
+    cargo_ok=1
+    if command -v {rustup} >/dev/null 2>&1; then
+        if ! selected_cargo=$({rustup} which cargo 2>/dev/null) ||
+           ! selected_cargo=$(rch_cargo_probe_path "$selected_cargo") ||
+           ! "$selected_cargo" --version >/dev/null 2>&1; then
+            cargo_ok=0
+        fi
+    fi
+    if [ "$cargo_ok" = 1 ]; then printf '%scargo_version=%s\n' "$P" "$cv"; fi
+fi; "#
     ));
     // Toolchains + installed targets via rustup (each on its own fact line).
     s.push_str(&format!(
@@ -1058,6 +1093,290 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         let facts = parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap());
         assert_eq!(facts.rust.rustc_version.as_deref(), Some("cargo fixture"));
+    }
+
+    #[cfg(unix)]
+    struct CargoProbeFixture {
+        root: tempfile::TempDir,
+        bin: std::path::PathBuf,
+        direct_cargo: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CargoProbeFixture {
+        fn new(with_rustup: bool) -> Self {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let root = tempfile::tempdir().unwrap();
+            let bin = root.path().join("bin with spaces");
+            let toolchain = root.path().join("toolchain 'quoted' $(not-expanded)");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::create_dir(&toolchain).unwrap();
+            let direct_cargo = toolchain.join("cargo");
+            let log = root.path().join("invocations");
+            let executable = |path: &std::path::Path, body: &str| {
+                std::fs::write(path, body).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            // Only the probe's basic utilities can reach the host. Runtime and
+            // rustup discovery stay inside this fixture, including absence.
+            for utility in ["uname", "tr", "id", "awk"] {
+                let path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                    .map(|dir| dir.join(utility))
+                    .find(|path| path.is_file())
+                    .unwrap_or_else(|| panic!("missing test utility {utility}"));
+                symlink(std::fs::canonicalize(path).unwrap(), bin.join(utility)).unwrap();
+            }
+            for (path, label, status_var) in [
+                (bin.join("cargo"), "PATH", "RCH_TEST_PATH_CARGO_EXIT"),
+                (direct_cargo.clone(), "DIRECT", "RCH_TEST_DIRECT_CARGO_EXIT"),
+            ] {
+                executable(
+                    &path,
+                    &format!(
+                        r#"#!/bin/sh
+printf '{label}|%s|%s|%s\n' "$RCH_CARGO_WRAPPER_BYPASS" "$RCH_CARGO_WRAPPER_ORIGIN" "$*" >> "$RCH_TEST_LOG"
+[ "$RCH_CARGO_WRAPPER_BYPASS" = 1 ] && [ "$RCH_CARGO_WRAPPER_ORIGIN" = rch ] || exit 96
+[ "$#" = 1 ] && [ "$1" = --version ] || exit 97
+printf 'cargo {label}\n'
+exit "${status_var}"
+"#
+                    ),
+                );
+            }
+            if with_rustup {
+                executable(
+                    &bin.join("rustup"),
+                    r#"#!/bin/sh
+printf 'RUSTUP|%s|%s|%s\n' "$RCH_CARGO_WRAPPER_BYPASS" "$RCH_CARGO_WRAPPER_ORIGIN" "$*" >> "$RCH_TEST_LOG"
+[ "$RCH_CARGO_WRAPPER_BYPASS" = 1 ] && [ "$RCH_CARGO_WRAPPER_ORIGIN" = rch ] || exit 96
+case "$*" in
+    'which cargo') printf '%s' "$RCH_TEST_RUSTUP_OUTPUT"; exit "$RCH_TEST_RUSTUP_EXIT" ;;
+    'toolchain list') printf 'stable (default)\n' ;;
+    'target list --installed') printf 'x86_64-unknown-linux-gnu\n' ;;
+    *) exit 97 ;;
+esac
+"#,
+                );
+            }
+            executable(
+                &bin.join("rch-wkr"),
+                "#!/bin/sh\ncase \"$1\" in --version) echo 'rch-wkr fixture' ;; --protocol-version) echo 7 ;; *) exit 97 ;; esac\n",
+            );
+            executable(&bin.join("bun"), "#!/bin/sh\nprintf '1.3.0\\n'\n");
+            executable(&bin.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+            Self {
+                root,
+                bin,
+                direct_cargo,
+                log,
+            }
+        }
+
+        fn spec(&self, exact_paths: bool) -> ProbeSpec {
+            let mut spec = ProbeSpec::new("fixture", self.bin.join("rch-wkr").to_str().unwrap());
+            spec.rust_components = false;
+            if exact_paths {
+                spec.cargo_path = Some(self.bin.join("cargo").to_str().unwrap().to_owned());
+                spec.rustup_path = Some(self.bin.join("rustup").to_str().unwrap().to_owned());
+            }
+            spec
+        }
+
+        fn run(&self, exact_paths: bool, env: &[(&str, &str)]) -> (ProbedFacts, Vec<String>) {
+            std::fs::write(&self.log, "").unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &build_capability_probe_script(&self.spec(exact_paths))])
+                .env_clear()
+                .env("HOME", self.root.path())
+                .env("PATH", &self.bin)
+                .env("RCH_CARGO_WRAPPER_BYPASS", "0")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_TEST_LOG", &self.log)
+                .env("RCH_TEST_PATH_CARGO_EXIT", "0")
+                .env("RCH_TEST_DIRECT_CARGO_EXIT", "0")
+                .env("RCH_TEST_RUSTUP_EXIT", "0")
+                .env(
+                    "RCH_TEST_RUSTUP_OUTPUT",
+                    format!("{}\n", self.direct_cargo.display()),
+                )
+                .envs(env.iter().copied())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let facts = parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap());
+            let log = std::fs::read_to_string(&self.log)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            (facts, log)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_requires_path_and_direct_execution_with_managed_markers() {
+        let fixture = CargoProbeFixture::new(true);
+        for exact_paths in [false, true] {
+            let (facts, log) = fixture.run(exact_paths, &[]);
+            assert_eq!(facts.rust.rustc_version.as_deref(), Some("cargo PATH"));
+            assert_eq!(
+                log,
+                [
+                    "PATH|1|rch|--version",
+                    "RUSTUP|1|rch|which cargo",
+                    "DIRECT|1|rch|--version",
+                    "RUSTUP|1|rch|toolchain list",
+                    "RUSTUP|1|rch|target list --installed",
+                ],
+                "exact_paths={exact_paths}"
+            );
+            assert_eq!(
+                assess_admissibility(&facts, &CapabilityRequirement::rust(7)),
+                CapabilityVerdict::Admissible
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_failure_is_not_replaced_by_other_paths_or_inventory() {
+        let fixture = CargoProbeFixture::new(true);
+        for exact_paths in [false, true] {
+            for failed in ["RCH_TEST_PATH_CARGO_EXIT", "RCH_TEST_DIRECT_CARGO_EXIT"] {
+                let (facts, log) = fixture.run(exact_paths, &[(failed, "73")]);
+                assert!(facts.rust.rustc_version.is_none(), "{facts:?}");
+                assert_eq!(facts.rust.toolchains, ["stable"]);
+                assert_eq!(facts.runtimes.bun_version.as_deref(), Some("1.3.0"));
+                assert_eq!(facts.runtimes.node_version.as_deref(), Some("v22.0.0"));
+                assert!(matches!(
+                    assess_admissibility(&facts, &CapabilityRequirement::rust(7)),
+                    CapabilityVerdict::Rejected {
+                        reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    log.iter().any(|line| line == "DIRECT|1|rch|--version"),
+                    failed == "RCH_TEST_DIRECT_CARGO_EXIT",
+                    "a failed requested Cargo must not try another Cargo: {log:?}"
+                );
+                if failed == "RCH_TEST_PATH_CARGO_EXIT" {
+                    assert!(!log.iter().any(|line| line.ends_with("which cargo")));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_rejects_failed_or_invalid_rustup_resolution() {
+        let fixture = CargoProbeFixture::new(true);
+        for exact_paths in [false, true] {
+            let (facts, log) = fixture.run(exact_paths, &[("RCH_TEST_RUSTUP_EXIT", "71")]);
+            assert!(facts.rust.rustc_version.is_none(), "{facts:?}");
+            assert!(log.iter().any(|line| line.ends_with("which cargo")));
+            assert!(!log.iter().any(|line| line.starts_with("DIRECT|")));
+
+            for answer in [
+                String::new(),
+                "cargo".to_owned(),
+                "../cargo".to_owned(),
+                "C:cargo.exe".to_owned(),
+                format!("{}\n/another/cargo\n", fixture.direct_cargo.display()),
+                format!("{}\rbroken\n", fixture.direct_cargo.display()),
+                fixture
+                    .root
+                    .path()
+                    .join("missing-cargo")
+                    .display()
+                    .to_string(),
+            ] {
+                let (facts, log) =
+                    fixture.run(exact_paths, &[("RCH_TEST_RUSTUP_OUTPUT", &answer)]);
+                assert!(facts.rust.rustc_version.is_none(), "answer={answer:?}");
+                assert!(!log.iter().any(|line| line.starts_with("DIRECT|")));
+                assert_eq!(facts.runtimes.node_version.as_deref(), Some("v22.0.0"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_accepts_standalone_cargo_without_rustup() {
+        let fixture = CargoProbeFixture::new(false);
+        for exact_paths in [false, true] {
+            let (facts, log) = fixture.run(exact_paths, &[]);
+            assert_eq!(facts.rust.rustc_version.as_deref(), Some("cargo PATH"));
+            assert_eq!(log, ["PATH|1|rch|--version"]);
+            assert_eq!(
+                assess_admissibility(&facts, &CapabilityRequirement::rust(7)),
+                CapabilityVerdict::Admissible
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_accepts_native_rustup_line_endings() {
+        let fixture = CargoProbeFixture::new(true);
+        let answer = format!("{}\r\n", fixture.direct_cargo.display());
+        let (facts, log) = fixture.run(false, &[("RCH_TEST_RUSTUP_OUTPUT", &answer)]);
+        assert_eq!(facts.rust.rustc_version.as_deref(), Some("cargo PATH"));
+        assert!(log.iter().any(|line| line == "DIRECT|1|rch|--version"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_probe_path_helper_handles_native_and_posix_paths_literally() {
+        // This exercises the production shell path validation on Unix. It is
+        // not a claim that Windows process execution ran on this test host.
+        for (input, expected) in [
+            ("/opt/rust/bin/cargo", Some("/opt/rust/bin/cargo")),
+            ("/c/Users/worker/cargo.exe", Some("/c/Users/worker/cargo.exe")),
+            (r"/opt/back\slash/cargo", Some(r"/opt/back\slash/cargo")),
+            (
+                "/opt/'$(not-expanded)'/cargo",
+                Some("/opt/'$(not-expanded)'/cargo"),
+            ),
+            (
+                "C:/Program Files/Rust/cargo.exe",
+                Some("C:/Program Files/Rust/cargo.exe"),
+            ),
+            (
+                "C:\\Program Files\\Rust\\cargo.exe\r",
+                Some("C:/Program Files/Rust/cargo.exe"),
+            ),
+            (
+                r"\\server\share\cargo.exe",
+                Some("//server/share/cargo.exe"),
+            ),
+            ("", None),
+            ("cargo", None),
+            ("../cargo", None),
+            ("C:cargo.exe", None),
+            (r"\relative\cargo.exe", None),
+            ("/opt/cargo\n/another/cargo", None),
+            ("/opt/cargo\rbroken", None),
+            ("/opt/cargo\r\r", None),
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("{CARGO_PROBE_PATH_HELPER}rch_cargo_probe_path \"$1\""),
+                    "probe-path",
+                    input,
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), expected.is_some(), "{input:?}");
+            assert_eq!(output.stdout, expected.unwrap_or("").as_bytes(), "{input:?}");
+        }
     }
 
     fn tool(name: &str, argv: &[&str]) -> NamedToolProbe {
