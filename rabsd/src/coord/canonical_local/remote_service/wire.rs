@@ -490,7 +490,8 @@ async fn read_record<S: AsyncRead + Unpin>(
     buffered: &mut Vec<u8>,
 ) -> io::Result<Message> {
     let mut scanned = 0;
-    let mut chunk = [0_u8; 16 * 1024];
+    // Heap, not the future's state: read_record nests in every receive loop.
+    let mut chunk = vec![0_u8; 16 * 1024];
     let mut reads = 0;
     loop {
         if let Some(offset) = buffered[scanned..].iter().position(|byte| *byte == b'\n') {

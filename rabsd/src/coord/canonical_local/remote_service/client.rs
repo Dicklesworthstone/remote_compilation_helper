@@ -381,7 +381,9 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             .into_file();
         verified.seek(SeekFrom::Start(0))?;
         let mut offset = 0;
-        let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+        // Held across awaits: an inline array would sit in the future, and
+        // every move of the composed upload future copies it (bd-yxl32).
+        let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
         while offset < file.len {
             checkpoint(stopped, deadline)?;
             let length = (file.len - offset).min(buffer.len() as u64) as usize;
