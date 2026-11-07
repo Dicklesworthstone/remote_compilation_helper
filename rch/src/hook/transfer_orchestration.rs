@@ -101,14 +101,27 @@ async fn retry_completion_probe(
     backoff: Duration,
     mut probe: impl AsyncFnMut() -> anyhow::Result<Option<i32>>,
 ) -> anyhow::Result<Option<i32>> {
-    let deadline = tokio::time::Instant::now() + budget;
+    let budget = budget.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .context("completion receipt retry deadline exceeds the clock range")?;
     let mut attempt = 1_u64;
     let mut delay = backoff.max(Duration::from_millis(1));
     let max_delay = delay.saturating_mul(2);
     loop {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "completion receipt retry budget exhausted"
+        );
         let result = tokio::time::timeout_at(deadline, probe())
             .await
             .map_err(|_| anyhow::anyhow!("completion receipt retry budget exhausted"))?;
+        // Tokio polls the reader before its timer. A reader that becomes ready
+        // at the deadline, or does not yield while collecting, is still late.
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "completion receipt retry budget exhausted"
+        );
         match result {
             Err(error) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -5004,6 +5017,64 @@ sys.exit(99)
             "expired read must release its owned transport"
         );
         assert_eq!(started.elapsed(), base);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_refuses_expired_and_unrepresentable_budgets() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let calls = Cell::new(0);
+        let result = super::retry_completion_probe(Duration::ZERO, Duration::ZERO, async || {
+            calls.set(calls.get() + 1);
+            Ok(Some(0))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0, "an expired budget must not start a reader");
+
+        let started = tokio::time::Instant::now();
+        let result = super::retry_completion_probe(Duration::MAX, Duration::ZERO, async || {
+            std::future::pending::<anyhow::Result<Option<i32>>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            started.elapsed(),
+            rch_common::timing::MAX_CONTROL_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_probe_rejects_receipt_or_absence_at_deadline() {
+        use std::time::Duration;
+        let budget = Duration::from_secs(10);
+        for receipt in [None, Some(0), Some(17)] {
+            let started = tokio::time::Instant::now();
+            let result = super::retry_completion_probe(budget, Duration::from_secs(1), async || {
+                tokio::time::sleep(budget).await;
+                Ok(receipt)
+            })
+            .await;
+            assert!(result.is_err(), "late receipt {receipt:?} was accepted");
+            assert_eq!(started.elapsed(), budget);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_probe_rejects_a_non_yielding_late_reader() {
+        use std::time::Duration;
+        let result = super::retry_completion_probe(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            async || {
+                // Deliberately starve the timer: a ready inner future wins
+                // Tokio's poll ordering unless the caller checks elapsed time.
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(Some(0))
+            },
+        )
+        .await;
+        assert!(result.is_err(), "a late ready reader is not timely evidence");
     }
 
     #[test]
