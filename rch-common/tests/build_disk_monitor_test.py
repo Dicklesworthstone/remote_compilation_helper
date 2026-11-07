@@ -1346,6 +1346,214 @@ m.Monitor.sample=sample"""
     def test_completion_bounds_terminal_probe(self):
         self.check_terminal_sample("timeout", "monitor_unavailable")
 
+    def test_complete_ack_retries_share_one_scaled_deadline(self):
+        for scale, ready_after, succeeds in (
+                (1, 0, True), (1, 3.6, False), (2, 3.6, True),
+                (10, float("inf"), False)):
+            with self.subTest(scale=scale, ready_after=ready_after):
+                clock, attempts = [10.0], []
+                deadline = 10.0 + 3.0 * scale
+
+                def write(descriptor, data):
+                    attempts.append(clock[0])
+                    self.assertEqual((descriptor, data), (71, b"C"))
+                    if clock[0] - 10.0 < ready_after:
+                        raise BlockingIOError()
+                    return len(data)
+
+                def sleep(delay):
+                    self.assertGreaterEqual(delay, 0)
+                    self.assertLessEqual(delay, 0.025)
+                    clock[0] += delay
+
+                with patch.object(monitor, "HEARTBEAT_DEADLINE", 3.0 * scale), \
+                        patch.object(monitor.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(monitor.time, "sleep", side_effect=sleep), \
+                        patch.object(monitor.os, "getppid", return_value=73), \
+                        patch.object(monitor.os, "write", side_effect=write):
+                    if succeeds:
+                        monitor.acknowledge_completion(71, 73)
+                    else:
+                        with self.assertRaises(monitor.BudgetFailure) as caught:
+                            monitor.acknowledge_completion(71, 73)
+                        self.assertIn("deadline", caught.exception.detail)
+                self.assertTrue(attempts)
+                self.assertTrue(all(attempt < deadline for attempt in attempts))
+                if succeeds:
+                    self.assertGreaterEqual(clock[0] - 10.0, ready_after)
+                    self.assertLess(clock[0], deadline)
+                else:
+                    self.assertAlmostEqual(clock[0], deadline)
+
+    def test_complete_ack_refuses_lost_parent_and_late_or_short_writes(self):
+        for failure in ("parent_before", "parent_after", "equal_deadline",
+                        "late_deadline", "short_write"):
+            with self.subTest(failure=failure):
+                clock, parent = [1.0], [73]
+                if failure == "parent_before":
+                    parent[0] = 74
+
+                def write(descriptor, data):
+                    if failure == "parent_after":
+                        parent[0] = 74
+                    elif failure == "equal_deadline":
+                        clock[0] = 4.0
+                    elif failure == "late_deadline":
+                        clock[0] = 4.001
+                    return 0 if failure == "short_write" else len(data)
+
+                with patch.object(monitor, "HEARTBEAT_DEADLINE", 3.0), \
+                        patch.object(monitor.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(monitor.os, "getppid", side_effect=lambda: parent[0]), \
+                        patch.object(monitor.os, "write", side_effect=write) as writes:
+                    with self.assertRaises(monitor.BudgetFailure):
+                        monitor.acknowledge_completion(71, 73)
+                self.assertEqual(writes.call_count, 0 if failure == "parent_before" else 1)
+
+    def test_complete_ack_late_delivery_never_authorizes_normal_exit(self):
+        # The native C write succeeds, but a scheduling delay crosses its
+        # delivery deadline before confirmation. Even with C queued, the owned
+        # group must fail closed instead of returning a normal exception code.
+        inject = """native_write=os.write
+native_monotonic=time.monotonic
+def write(descriptor, data):
+    written=native_write(descriptor, data)
+    if data == b'C':
+        native_write(2, b'RCH_TEST_COMPLETION_ACK_WAS_WRITTEN\\n')
+        m.time.monotonic=lambda: native_monotonic()+m.HEARTBEAT_DEADLINE
+    return written
+m.os.write=write"""
+        for scale in ("1", "10"):
+            with self.subTest(scale=scale):
+                process, receipt = self.spawn(
+                    "print('completed-zero')", inject=inject, timing_scale=scale)
+                status, stdout, stderr = self.complete(process)
+                self.assertIn("RCH_TEST_COMPLETION_ACK_WAS_WRITTEN", stderr)
+                self.assertIn("completed-zero", stdout)
+                self.assertTrue(self.usage(receipt)["complete"])
+                self.assertEqual(self.usage(receipt)["exit_code"], 0)
+                self.assertEqual(status, -signal.SIGKILL, stderr)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pinned guardian")
+    def test_complete_ack_survives_real_heartbeat_pipe_pressure(self):
+        # Pause only this attempt's pinned guardian. Fill its real nonblocking
+        # heartbeat pipe so the first completion write receives native EAGAIN.
+        # The finally block resumes that same guardian before a retry can run.
+        inject = """import fcntl
+native_write=os.write
+pressured=False
+def write(descriptor, data):
+    global pressured
+    if data != b'C' or pressured:
+        return native_write(descriptor, data)
+    pressured=True
+    guardian=os.getppid()
+    guardian_fd=os.pidfd_open(guardian)
+    try:
+        if os.getppid() != guardian or os.getpgid(guardian) != os.getpgrp():
+            raise AssertionError('guardian no longer belongs to this attempt')
+        signal.pidfd_send_signal(guardian_fd, signal.SIGSTOP)
+        try:
+            stopped_by=time.monotonic()+1
+            while m.linux_process('/proc/'+str(guardian)+'/stat')['state'] not in ('T', 't'):
+                if time.monotonic() >= stopped_by:
+                    raise AssertionError('owned guardian did not stop')
+                time.sleep(0.005)
+            capacity=fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
+            for size in (4096, 1):
+                for _ in range(capacity//size+1):
+                    try:
+                        native_write(descriptor, b'H'*size)
+                    except BlockingIOError:
+                        break
+                else:
+                    raise AssertionError('native heartbeat pipe did not fill')
+            try:
+                return native_write(descriptor, data)
+            except BlockingIOError:
+                native_write(2, b'RCH_TEST_COMPLETION_PIPE_SATURATED\\n')
+                raise
+        finally:
+            signal.pidfd_send_signal(guardian_fd, signal.SIGCONT)
+    finally:
+        os.close(guardian_fd)
+m.os.write=write"""
+        process, receipt = self.spawn("print('completed-zero')", inject=inject)
+        status, stdout, stderr = self.complete(process)
+        self.assertIn("RCH_TEST_COMPLETION_PIPE_SATURATED", stderr)
+        self.assertIn("completed-zero", stdout)
+        usage = self.usage(receipt)
+        self.assertTrue(usage["complete"])
+        self.assertEqual(usage["exit_code"], 0)
+        self.assertEqual(status, 0, stderr)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pinned guardian")
+    def test_complete_ack_is_drained_after_supervisor_exit(self):
+        # This race needs more queued bytes than the guardian's two original
+        # reads. Resume the owned guardian only after its child is a zombie:
+        # the acknowledgment is already in the pipe, with no remaining writer.
+        read_fd, write_fd = os.pipe()
+        try:
+            capacity = monitor.fcntl.fcntl(write_fd, monitor.fcntl.F_GETPIPE_SZ)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        if capacity < 16384:
+            self.skipTest("native pipe cannot hold the completion backlog")
+        queued = self.root / "completion-queued"
+        inject = f"""native_write=os.write
+def write(descriptor, data):
+    if data != b'C':
+        return native_write(descriptor, data)
+    guardian=os.getppid()
+    guardian_fd=os.pidfd_open(guardian)
+    try:
+        if os.getppid() != guardian or os.getpgid(guardian) != os.getpgrp():
+            raise AssertionError('guardian no longer belongs to this attempt')
+        signal.pidfd_send_signal(guardian_fd, signal.SIGSTOP)
+        stopped_by=time.monotonic()+1
+        while m.linux_process('/proc/'+str(guardian)+'/stat')['state'] not in ('T', 't'):
+            if time.monotonic() >= stopped_by:
+                raise AssertionError('owned guardian did not stop')
+            time.sleep(0.005)
+        backlog=b'H'*8192+data
+        if native_write(descriptor, backlog) != len(backlog):
+            raise AssertionError('native completion backlog was truncated')
+        pathlib.Path({str(queued)!r}).write_text(str(os.getpid()))
+        return len(data)
+    except BaseException:
+        signal.pidfd_send_signal(guardian_fd, signal.SIGCONT)
+        raise
+    finally:
+        os.close(guardian_fd)
+m.os.write=write"""
+        process, receipt = self.spawn("print('completed-zero')", inject=inject)
+        guardian_fd = os.pidfd_open(process.pid)
+        try:
+            supervisor = int(self.wait_file(queued))
+            deadline = time.monotonic() + 3
+            while True:
+                record = monitor.linux_process(f"/proc/{supervisor}/stat")
+                self.assertEqual(record["parent"], process.pid)
+                self.assertEqual(record["group"], process.pid)
+                if record["state"] == "Z":
+                    break
+                self.assertLess(time.monotonic(), deadline, "supervisor did not exit")
+                time.sleep(0.005)
+        finally:
+            try:
+                signal.pidfd_send_signal(guardian_fd, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            os.close(guardian_fd)
+        status, stdout, stderr = self.complete(process)
+        self.assertIn("completed-zero", stdout)
+        self.assertTrue(self.usage(receipt)["complete"])
+        self.assertEqual(self.usage(receipt)["exit_code"], 0)
+        self.assertEqual(status, 0, stderr)
+
     def test_complete_receipt_binds_original_status_before_guardian_ack(self):
         inject = """original_supervise=m.supervise
 def killed_after_receipt(*args):

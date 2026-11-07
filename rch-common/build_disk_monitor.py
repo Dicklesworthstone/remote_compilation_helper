@@ -813,6 +813,26 @@ def bounded_result(future, deadline, heartbeat):
     return future.result()
 
 
+def acknowledge_completion(descriptor, guardian):
+    # Progress can be coalesced when the pipe is full; the final C cannot be
+    # dropped. Give the live guardian one bounded, scaled window to drain it.
+    # A retry never renews that window or accepts a replacement parent.
+    deadline = time.monotonic() + HEARTBEAT_DEADLINE
+    while True:
+        if os.getppid() != guardian:
+            raise BudgetFailure("interrupted", detail="disk guardian disappeared before completion acknowledgement")
+        if time.monotonic() >= deadline:
+            raise BudgetFailure("monitor_unavailable", detail="completion acknowledgement deadline reached")
+        try:
+            written = os.write(descriptor, b"C")
+        except BlockingIOError:
+            time.sleep(min(0.025, max(0, deadline - time.monotonic())))
+            continue
+        if written != 1 or os.getppid() != guardian or time.monotonic() >= deadline:
+            raise BudgetFailure("monitor_unavailable", detail="completion acknowledgement remained unconfirmed")
+        return
+
+
 def finish_descendants(monitor, heartbeat):
     deadline = None
     while True:
@@ -991,8 +1011,15 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
 
         parent_guardian = os.getppid()
         result = supervise(budget, floor, marker, target, paths, outputs, receipt_path, command, heartbeat, timeout_seconds, receipt_initialized, warm_policy, require_incremental_tracking, cargo_cache, cargo_cache_required)
-        os.write(write_fd, b"C")
-        os._exit(result)
+        try:
+            acknowledge_completion(write_fd, parent_guardian)
+            os._exit(result)
+        except BaseException:
+            # C might already be queued when a deadline, signal, or parent
+            # check fails. Never pair that byte with a normal exception exit:
+            # the guardian still requires C AND normal supervisor completion.
+            kill_owned_group(group)
+            raise
     os.close(write_fd)
     cancelled, started, completed = False, False, False
 
@@ -1010,6 +1037,10 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
         finally:
             kill_owned_group(group)
 
+    def check_interruption():
+        if cancelled or os.getppid() != parent:
+            stop("cancelled" if cancelled else "parent_lost")
+
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
     last_heartbeat = time.monotonic()
@@ -1024,11 +1055,27 @@ def run_guarded(budget, floor, marker, target, paths, outputs, receipt_path, com
             pass
         pid, status = os.waitpid(supervisor, os.WNOHANG)
         if pid:
+            # An abnormal supervisor exit requires immediate containment;
+            # draining progress must never extend that safety boundary.
+            if not os.WIFEXITED(status):
+                stop("supervisor_exit_unconfirmed", wait_status=status)
             # The exit can race the preceding pipe read. Consume its explicit
-            # completion acknowledgement before accepting a normal exit code.
-            with contextlib.suppress(BlockingIOError):
-                completed = completed or b"C" in os.read(read_fd, 4096)
-            if os.WIFEXITED(status) and completed:
+            # completion acknowledgement even behind a full heartbeat backlog.
+            # Our only writer has exited, so this normally drains immediately;
+            # keep a finite bound even if an unexpected writer retained the fd.
+            drain_deadline = time.monotonic() + HEARTBEAT_DEADLINE
+            while not completed and time.monotonic() < drain_deadline:
+                check_interruption()
+                try:
+                    data = os.read(read_fd, 4096)
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                started = started or b"S" in data
+                completed = b"C" in data
+            check_interruption()
+            if completed and time.monotonic() < drain_deadline:
                 return os.WEXITSTATUS(status)
             stop("supervisor_exit_unconfirmed", wait_status=status)
         deadline = HEARTBEAT_DEADLINE if started else SCAN_DEADLINE + BOOTSTRAP_ALLOWANCE
