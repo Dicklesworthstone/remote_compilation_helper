@@ -1449,6 +1449,7 @@ impl WorkerSelector {
     /// Returns the last-success worker if:
     /// - Last-success fallback is enabled
     /// - The worker still exists in the pool
+    /// - The worker satisfies the request's runtime, tools, and toolchain
     /// - The worker has available slots
     /// - The worker's circuit is not open
     async fn try_fallback(
@@ -1474,6 +1475,13 @@ impl WorkerSelector {
         // In particular, an exact runtime or named-tool requirement must not
         // disappear when the normal eligibility pass finds no usable worker.
         let capabilities = worker.capabilities().await;
+        if !capabilities.has_runtime(request.required_runtime)
+            || required_tool_capability_mismatch(request, &capabilities).is_some()
+            || rustup_component_capability_mismatch(request, &capabilities).is_some()
+            || toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities).is_some()
+        {
+            return None;
+        }
         if capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
             == Some(false)
             || self
@@ -1483,10 +1491,6 @@ impl WorkerSelector {
         {
             return None;
         }
-        if required_tool_capability_mismatch(request, &capabilities).is_some() {
-            return None;
-        }
-
         if self
             .disk_headroom_failure(&worker, &fallback_id, request)
             .await
@@ -1569,6 +1573,16 @@ impl WorkerSelector {
                 return None;
             }
         } else if worker.pressure_assessment().await.state == PressureState::Critical {
+            return None;
+        }
+
+        // A previous successful build cannot override a current toolchain
+        // refusal. Reuse the same bounded, cached preflight as normal selection.
+        if self
+            .toolchain_preflight_failure(worker.as_ref(), request)
+            .await
+            .is_some()
+        {
             return None;
         }
 
@@ -1816,15 +1830,7 @@ impl WorkerSelector {
                 active_project_exclusion_count += 1;
             }
 
-            let runtime_available = match request.required_runtime {
-                RequiredRuntime::None => true,
-                RequiredRuntime::Rust => capabilities.has_rust(),
-                RequiredRuntime::Bun => capabilities.has_bun(),
-                RequiredRuntime::Node => capabilities.has_node(),
-                RequiredRuntime::Nix => capabilities.has_nix(),
-                RequiredRuntime::Go => capabilities.has_go(),
-                RequiredRuntime::Zig => capabilities.has_zig(),
-            };
+            let runtime_available = capabilities.has_runtime(request.required_runtime);
 
             let toolchain_mismatch =
                 toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
@@ -2475,15 +2481,7 @@ impl WorkerSelector {
             }
 
             // Filter by required runtime
-            let has_required_runtime = match &request.required_runtime {
-                RequiredRuntime::None => true,
-                RequiredRuntime::Rust => worker.has_rust().await,
-                RequiredRuntime::Bun => worker.has_bun().await,
-                RequiredRuntime::Node => worker.has_node().await,
-                RequiredRuntime::Nix => worker.has_nix().await,
-                RequiredRuntime::Go => worker.has_go().await,
-                RequiredRuntime::Zig => worker.has_zig().await,
-            };
+            let has_required_runtime = worker.has_runtime(request.required_runtime).await;
 
             if excluded_worker_ids.contains(worker_id.as_str()) {
                 debug!(
@@ -3892,15 +3890,7 @@ pub async fn select_worker_with_config(
         }
 
         // Check required runtime capability
-        let has_required_runtime = match &request.required_runtime {
-            RequiredRuntime::None => true,
-            RequiredRuntime::Rust => worker.has_rust().await,
-            RequiredRuntime::Bun => worker.has_bun().await,
-            RequiredRuntime::Node => worker.has_node().await,
-            RequiredRuntime::Nix => worker.has_nix().await,
-            RequiredRuntime::Go => worker.has_go().await,
-            RequiredRuntime::Zig => worker.has_zig().await,
-        };
+        let has_required_runtime = worker.has_runtime(request.required_runtime).await;
 
         if !has_required_runtime {
             debug!(
@@ -10618,6 +10608,222 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+    }
+
+    async fn last_success_contention_fixture() -> (
+        WorkerPool,
+        WorkerSelector,
+        Arc<WorkerState>,
+        SelectionRequest,
+    ) {
+        let pool = WorkerPool::new();
+        for id in ["last-success", "busy-rust"] {
+            let worker = make_worker(id, 4, 80.0);
+            worker
+                .set_capabilities(WorkerCapabilities {
+                    rustc_version: Some("rustc 1.88.0-nightly".to_string()),
+                    node_version: Some("v22.0.0".to_string()),
+                    zig_version: Some("0.14.1".to_string()),
+                    cargo_zigbuild_version: Some("cargo-zigbuild 0.23.0".to_string()),
+                    rustup_toolchains: vec![
+                        "nightly-2026-07-05-x86_64-unknown-linux-gnu".to_string(),
+                    ],
+                    rustup_components: vec![
+                        "nightly-2026-07-05-x86_64-unknown-linux-gnu:clippy".to_string(),
+                    ],
+                    projects_root_ok: Some(true),
+                    ..Default::default()
+                })
+                .await;
+            worker
+                .record_toolchain_preflight("nightly-2026-07-05".to_string(), true, None)
+                .await;
+            pool.add_worker_state(worker).await;
+        }
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+        let busy = pool.get(&WorkerId::new("busy-rust")).await.unwrap();
+        assert!(busy.reserve_slots(4).await);
+        let request = pinned_component_request("cargo-probe-project", "cargo test");
+        selector
+            .record_success("last-success", &request.project)
+            .await;
+        let last_success = pool.get(&WorkerId::new("last-success")).await.unwrap();
+        (pool, selector, last_success, request)
+    }
+
+    fn assert_last_success_contention_refused(result: SelectionResult, reason_code: &str) {
+        assert!(
+            result.worker.is_none(),
+            "last-success history must not resurrect a worker rejected for {reason_code}"
+        );
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        let diagnostics = result.diagnostics.expect("contention refusal diagnostics");
+        for (id, code) in [
+            ("last-success", reason_code),
+            ("busy-rust", "slots.insufficient"),
+        ] {
+            let worker = diagnostics
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id.as_str() == id)
+                .unwrap();
+            assert!(
+                worker.reason_codes.iter().any(|reason| reason == code),
+                "expected {code} for {id}: {worker:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_respects_negative_cargo_probe_during_contention() {
+        let _guard = test_guard!();
+        for pinned_toolchain in [false, true] {
+            let (pool, selector, last_success, mut request) =
+                last_success_contention_fixture().await;
+            if !pinned_toolchain {
+                request.toolchain = None;
+            }
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .expect("healthy last-success worker is initially selectable");
+            assert_eq!(selected.config.read().await.id.as_str(), "last-success");
+
+            // A successful capability refresh can report healthy transport and
+            // a broken Cargo shim. Keep the worker healthy and its Node runtime
+            // intact, just as the worker-side Cargo execution check does.
+            let mut capabilities = last_success.capabilities().await;
+            capabilities.rustc_version = None;
+            capabilities.probe_warnings =
+                vec!["worker Cargo execution check failed: shim refused bypass".to_string()];
+            last_success.set_capabilities(capabilities).await;
+            assert_eq!(last_success.status().await, WorkerStatus::Healthy);
+            if pinned_toolchain {
+                // Even a successful in-flight toolchain probe published after
+                // the negative capability report cannot authorize this worker.
+                last_success
+                    .record_toolchain_preflight("nightly-2026-07-05".to_string(), true, None)
+                    .await;
+            }
+
+            assert_last_success_contention_refused(
+                selector.select(&pool, &request).await,
+                "runtime.unavailable",
+            );
+
+            // A Cargo failure is not a global worker quarantine. Explicit Node
+            // work and opaque jobs without a runtime requirement remain usable.
+            for (runtime, command) in [
+                (RequiredRuntime::Node, "node --version"),
+                (RequiredRuntime::None, "sh job.sh"),
+            ] {
+                let mut unrelated = request.clone();
+                unrelated.required_runtime = runtime;
+                unrelated.toolchain = None;
+                unrelated.command = Some(command.to_string());
+                unrelated.job_mode = runtime == RequiredRuntime::None;
+                let selected = selector
+                    .select(&pool, &unrelated)
+                    .await
+                    .worker
+                    .expect("Cargo failure must not exclude unrelated work");
+                assert_eq!(selected.config.read().await.id.as_str(), "last-success");
+            }
+
+            let mut recovered = last_success.capabilities().await;
+            recovered.rustc_version = Some("rustc 1.88.0-nightly".to_string());
+            recovered.probe_warnings.clear();
+            last_success.set_capabilities(recovered).await;
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .expect("a successful capability refresh restores Rust eligibility");
+            assert_eq!(selected.config.read().await.id.as_str(), "last-success");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rejects_zig_after_cargo_probe_failure() {
+        let _guard = test_guard!();
+        let (pool, selector, last_success, mut request) = last_success_contention_fixture().await;
+        request.required_runtime = RequiredRuntime::Zig;
+        request.command = Some("cargo zigbuild".to_string());
+        let selected = selector
+            .select(&pool, &request)
+            .await
+            .worker
+            .expect("usable Cargo and both Zig binaries permit cross-compilation");
+        assert_eq!(selected.config.read().await.id.as_str(), "last-success");
+
+        let mut capabilities = last_success.capabilities().await;
+        capabilities.rustc_version = None;
+        assert!(capabilities.has_zig(), "both Zig binaries remain installed");
+        last_success.set_capabilities(capabilities).await;
+
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "runtime.unavailable",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rechecks_components_during_contention() {
+        let _guard = test_guard!();
+        let (pool, selector, last_success, mut request) = last_success_contention_fixture().await;
+        request.command = Some("cargo clippy --workspace".to_string());
+        let mut capabilities = last_success.capabilities().await;
+        capabilities.rustup_components.clear();
+        last_success.set_capabilities(capabilities).await;
+
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "toolchain.component_missing",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rechecks_toolchain_version_during_contention() {
+        let _guard = test_guard!();
+        let (pool, selector, _last_success, mut request) = last_success_contention_fixture().await;
+        request.toolchain = Some(ToolchainInfo {
+            channel: "stable".to_string(),
+            date: None,
+            full_version: "rustc 1.88.0".to_string(),
+        });
+        let busy = pool.get(&WorkerId::new("busy-rust")).await.unwrap();
+        let mut capabilities = busy.capabilities().await;
+        capabilities.rustc_version = Some("rustc 1.88.0".to_string());
+        busy.set_capabilities(capabilities).await;
+        for worker in pool.all_workers().await {
+            worker
+                .record_toolchain_preflight("stable".to_string(), true, None)
+                .await;
+        }
+
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "toolchain.version_mismatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rechecks_toolchain_preflight_during_contention() {
+        let _guard = test_guard!();
+        let (pool, selector, last_success, request) = last_success_contention_fixture().await;
+        last_success
+            .record_toolchain_preflight(
+                "nightly-2026-07-05".to_string(),
+                false,
+                Some("toolchain Cargo execution check failed".to_string()),
+            )
+            .await;
+
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "toolchain.preflight_failed",
+        );
     }
 
     #[tokio::test]

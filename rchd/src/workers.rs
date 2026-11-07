@@ -11,8 +11,8 @@ use crate::health::probe_worker_capabilities;
 use rch_common::bypass_record::AdminDisableStore;
 use rch_common::timing::scale_duration;
 use rch_common::{
-    CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
-    WorkerStatus,
+    CircuitBreakerConfig, CircuitState, CircuitStats, RequiredRuntime, WorkerCapabilities,
+    WorkerConfig, WorkerId, WorkerStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1518,16 +1518,22 @@ impl WorkerState {
     /// There is no await after slot accounting succeeds. The caller can therefore
     /// synchronously publish durable ownership before cancellation becomes
     /// observable again. A retarget, retirement, stale lifecycle, Critical
-    /// pressure, or insufficient capacity is refused before accounting changes.
+    /// pressure, missing runtime, or insufficient capacity is refused before
+    /// accounting changes.
     pub(crate) async fn reserve_slots_for_endpoint(
         &self,
         count: u32,
         endpoint: &WorkerEndpointSnapshot,
+        required_runtime: RequiredRuntime,
     ) -> Option<WorkerSlotAdmission> {
         if count == 0 {
             return None;
         }
         let config = self.config.read().await;
+        // Match publish_capabilities' capability-before-pressure order and
+        // retain this guard through the CAS. A negative runtime observation
+        // published after selection must fence new ownership at admission.
+        let capabilities = self.capabilities.read().await;
         let pressure = self.pressure_assessment.read().await;
         let lifecycle = self.lifecycle.read().await;
         let disk_capacity = self.disk_capacity_observation.read().await.clone();
@@ -1542,6 +1548,7 @@ impl WorkerState {
         if !endpoint_current
             || !lifecycle.is_schedulable()
             || pressure.state == PressureState::Critical
+            || !capabilities.has_runtime(required_runtime)
         {
             return None;
         }
@@ -1898,6 +1905,11 @@ impl WorkerState {
     /// Get the latest disk-pressure policy assessment.
     pub async fn pressure_assessment(&self) -> PressureAssessment {
         self.pressure_assessment.read().await.clone()
+    }
+
+    /// Check current capability evidence for a command's required runtime.
+    pub async fn has_runtime(&self, required: RequiredRuntime) -> bool {
+        self.capabilities.read().await.has_runtime(required)
     }
 
     /// Check if this worker has Bun installed.
@@ -3790,7 +3802,7 @@ mod tests {
 
         assert!(
             worker
-                .reserve_slots_for_endpoint(2, &selected)
+                .reserve_slots_for_endpoint(2, &selected, RequiredRuntime::None)
                 .await
                 .is_none()
         );
@@ -3803,12 +3815,133 @@ mod tests {
         let selected = worker.endpoint_snapshot().await;
         let before = worker.disk_capacity_observation().await;
         let admission = worker
-            .reserve_slots_for_endpoint(2, &selected)
+            .reserve_slots_for_endpoint(2, &selected, RequiredRuntime::None)
             .await
             .expect("current healthy endpoint should reserve");
         assert_eq!(admission.disk_capacity.is_some(), before.is_some());
         assert_eq!(worker.used_slots(), 2);
         worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_waits_for_current_runtime_evidence() {
+        let _guard = rch_common::test_guard!();
+        for owned_slots in [0, 3] {
+            for required in [RequiredRuntime::Rust, RequiredRuntime::Zig] {
+                let worker = WorkerState::new(recovered_worker_config("runtime-race", 8));
+                let available = WorkerCapabilities {
+                    rustc_version: Some("rustc fixture".into()),
+                    rustup_toolchains: vec!["nightly-fixture".into()],
+                    rustup_components: vec!["nightly-fixture:clippy".into()],
+                    node_version: Some("node fixture".into()),
+                    zig_version: Some("zig fixture".into()),
+                    cargo_zigbuild_version: Some("cargo-zigbuild fixture".into()),
+                    ..Default::default()
+                };
+                worker.set_capabilities(available.clone()).await;
+                if owned_slots > 0 {
+                    assert!(worker.reserve_slots(owned_slots).await);
+                }
+                let selected = worker.endpoint_snapshot().await;
+                assert!(worker.has_runtime(required).await);
+
+                // Pause the real reservation at the capability lock, after an
+                // eligible endpoint was selected. No sleeps or scheduler races
+                // are needed to publish a refusal before admission resumes.
+                let mut publication = worker.capabilities.write().await;
+                let pending = worker.reserve_slots_for_endpoint(1, &selected, required);
+                tokio::pin!(pending);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert_eq!(worker.used_slots(), owned_slots);
+                publication.rustc_version = None;
+                publication
+                    .probe_warnings
+                    .push("Cargo execution check failed: fixture wrapper refusal".into());
+                drop(publication);
+
+                assert!(pending.await.is_none(), "{required:?}");
+                assert_eq!(worker.used_slots(), owned_slots);
+                let unavailable = worker.capabilities().await;
+                assert_eq!(unavailable.rustup_toolchains, available.rustup_toolchains);
+                assert_eq!(unavailable.rustup_components, available.rustup_components);
+                for independent in [RequiredRuntime::Node, RequiredRuntime::None] {
+                    assert!(
+                        worker
+                            .reserve_slots_for_endpoint(1, &selected, independent)
+                            .await
+                            .is_some(),
+                        "{independent:?} remains usable"
+                    );
+                    assert_eq!(worker.used_slots(), owned_slots + 1);
+                    worker.release_slots(1).await;
+                }
+
+                worker.set_capabilities(available).await;
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, required)
+                        .await
+                        .is_some(),
+                    "fresh successful evidence restores admission for {required:?}"
+                );
+                assert_eq!(worker.used_slots(), owned_slots + 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_retains_runtime_guard_until_accounting() {
+        let _guard = rch_common::test_guard!();
+        let worker = WorkerState::new(recovered_worker_config("runtime-publication", 8));
+        worker
+            .set_capabilities(WorkerCapabilities::mock_with_rust())
+            .await;
+        let selected = worker.endpoint_snapshot().await;
+        let pressure = worker.pressure_assessment.write().await;
+        let pending = worker.reserve_slots_for_endpoint(1, &selected, RequiredRuntime::Rust);
+        tokio::pin!(pending);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            worker.capabilities.try_write().is_err(),
+            "admission must retain capability evidence while awaiting the remaining guards"
+        );
+
+        let publication = worker.set_capabilities(WorkerCapabilities::default());
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(worker.used_slots(), 0);
+        drop(pressure);
+
+        // The reservation already holds the positive evidence, so its CAS
+        // linearizes before the waiting publisher. Neither side deadlocks.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("reservation completes before capability publication")
+                .is_some()
+        );
+        tokio::time::timeout(Duration::from_secs(1), publication)
+            .await
+            .expect("publication resumes after admission releases its guards");
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::Rust)
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 1, "existing ownership is preserved");
     }
 
     #[tokio::test]
@@ -3849,7 +3982,7 @@ mod tests {
         assert!(!worker.reserve_slots(1).await);
         assert!(
             worker
-                .reserve_slots_for_endpoint(1, &selected)
+                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::None)
                 .await
                 .is_none()
         );
@@ -3867,7 +4000,7 @@ mod tests {
         );
         assert!(
             worker
-                .reserve_slots_for_endpoint(1, &selected)
+                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::None)
                 .await
                 .is_some()
         );

@@ -8014,7 +8014,7 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             // with `error: no such command: 'zigbuild'` — which is not a rustup
             // message, so `is_toolchain_failure` doesn't recognize it and the
             // nonzero exit is surfaced to the user verbatim instead of falling open
-            // to local. Zig gets its own runtime so selection gates on `has_zig()`.
+            // to local. Zig's runtime requires usable Rust/Cargo plus both helpers.
             CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,

@@ -2937,7 +2937,7 @@ async fn handle_select_worker_mode(
             });
         }
         let response = async {
-            // Retry loop to handle race conditions where slots are taken between selection and reservation.
+            // Retry if admission evidence changes between selection and reservation.
             let mut reservation_attempts = 0;
             const MAX_ATTEMPTS: u32 = 3;
             let mut excluded_worker_ids = project_excluded_workers(ctx, &request.project);
@@ -3018,11 +3018,15 @@ async fn handle_select_worker_mode(
                     }
                 };
                 if let Some(slot_admission) = worker
-                    .reserve_slots_for_endpoint(reserve_slots, &selected_endpoint)
+                    .reserve_slots_for_endpoint(
+                        reserve_slots,
+                        &selected_endpoint,
+                        request.required_runtime,
+                    )
                     .await
                 {
-                    // Endpoint identity and disk evidence were validated before
-                    // slot accounting. From this point through synchronous
+                    // Endpoint identity, runtime, and disk evidence were validated
+                    // before slot accounting. From this point through synchronous
                     // durable-history publication there is no await, so a
                     // cancelled request cannot strand capacity without an owner.
                     let config = &selected_endpoint.config;
@@ -3195,7 +3199,7 @@ async fn handle_select_worker_mode(
                         diagnostics: None,
                     });
                 }
-                // Loop again - next selection will see reduced slot count.
+                // The next selection sees current capacity and runtime evidence.
             }
         }
         .await;

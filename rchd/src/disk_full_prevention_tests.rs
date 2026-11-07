@@ -521,6 +521,167 @@ mod tests {
     // =================================================================
 
     #[tokio::test]
+    async fn runtime_refusal_after_selection_does_not_create_durable_ownership() {
+        // Exercise the same no-await handoff from endpoint admission to durable
+        // history as the API, including a successful owner before the race.
+        async fn admit(
+            worker: &WorkerState,
+            endpoint: &crate::workers::WorkerEndpointSnapshot,
+            history: &BuildHistory,
+            required: RequiredRuntime,
+            project: &str,
+            slots: u32,
+        ) -> Option<crate::history::ActiveBuildState> {
+            let admission = worker
+                .reserve_slots_for_endpoint(slots, endpoint, required)
+                .await?;
+            history
+                .try_start_active_build_with_waiter(
+                    project.into(),
+                    endpoint.config.id.to_string(),
+                    "fixture build".into(),
+                    0,
+                    Some(format!("owner-{project}")),
+                    slots,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission {
+                        capacity: admission.disk_capacity,
+                        ..Default::default()
+                    },
+                    Some(endpoint.clone()),
+                )
+                .expect("persist admitted ownership")
+        }
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("runtime-history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+        let config = rch_common::RchConfig::default();
+        let pool = WorkerPool::with_selection_config(&config.selection);
+        let id = WorkerId::new("runtime-race");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            host: "localhost".into(),
+            total_slots: 8,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        let available = WorkerCapabilities {
+            rustc_version: Some("rustc fixture".into()),
+            rustup_toolchains: vec!["nightly-fixture".into()],
+            rustup_components: vec!["nightly-fixture:clippy".into()],
+            node_version: Some("node fixture".into()),
+            zig_version: Some("zig fixture".into()),
+            cargo_zigbuild_version: Some("cargo-zigbuild fixture".into()),
+            disk_free_gb: Some(100.0),
+            disk_total_gb: Some(500.0),
+            build_disk_free_gb: Some(100.0),
+            build_disk_total_gb: Some(500.0),
+            projects_root_ok: Some(true),
+            ..Default::default()
+        };
+        worker.set_capabilities(available.clone()).await;
+        let endpoint = worker.endpoint_snapshot().await;
+        let existing = admit(
+            &worker,
+            &endpoint,
+            &history,
+            RequiredRuntime::Rust,
+            "already-running",
+            2,
+        )
+        .await
+        .expect("initial healthy owner");
+
+        let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+        let mut request = select_request("new-build");
+        request.required_runtime = RequiredRuntime::Rust;
+        let selected = selector
+            .select(&pool, &request)
+            .await
+            .worker
+            .expect("positive runtime evidence permits selection");
+        let selected_endpoint = selected.endpoint_snapshot().await;
+
+        // Inventory remains populated, but the worker's live Cargo check now
+        // failed. The selected Arc and endpoint still point at the same worker.
+        let mut unavailable = available.clone();
+        unavailable.rustc_version = None;
+        unavailable
+            .probe_warnings
+            .push("Cargo execution check failed: fixture wrapper refusal".into());
+        worker.set_capabilities(unavailable).await;
+        for required in [RequiredRuntime::Rust, RequiredRuntime::Zig] {
+            assert!(
+                admit(
+                    &selected,
+                    &selected_endpoint,
+                    &history,
+                    required,
+                    "refused-build",
+                    1,
+                )
+                .await
+                .is_none(),
+                "{required:?} cannot spend slots on stale positive evidence"
+            );
+            assert_eq!(worker.used_slots(), 2);
+            assert_eq!(history.active_builds().len(), 1);
+            assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+        }
+
+        for (required, project) in [
+            (RequiredRuntime::Node, "node-build"),
+            (RequiredRuntime::None, "runtime-independent-build"),
+        ] {
+            assert!(
+                admit(
+                    &selected,
+                    &selected_endpoint,
+                    &history,
+                    required,
+                    project,
+                    1,
+                )
+                .await
+                .is_some(),
+                "the Rust refusal must not block {required:?} ownership"
+            );
+        }
+        worker.set_capabilities(available).await;
+        assert!(
+            admit(
+                &selected,
+                &selected_endpoint,
+                &history,
+                RequiredRuntime::Rust,
+                "recovered-build",
+                1,
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(worker.used_slots(), 5);
+        assert_eq!(history.active_builds().len(), 4);
+        assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+
+        drop(selector);
+        drop(history);
+        let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        assert_eq!(restored.active_builds().len(), 4);
+        assert!(
+            restored
+                .active_builds()
+                .iter()
+                .all(|owner| owner.project_id != "refused-build")
+        );
+        assert_eq!(restored.active_build(existing.id).unwrap().slots, 2);
+    }
+
+    #[tokio::test]
     async fn default_large_disk_admission_keeps_storage_budgets_and_explicit_policy() {
         let _guard = test_guard!();
         for total in [774.0, 900.0] {
@@ -635,7 +796,7 @@ mod tests {
         original.set_capabilities(caps(30.0)).await;
         let endpoint = original.endpoint_snapshot().await;
         let slot = original
-            .reserve_slots_for_endpoint(1, &endpoint)
+            .reserve_slots_for_endpoint(1, &endpoint, RequiredRuntime::None)
             .await
             .unwrap();
         let active = history

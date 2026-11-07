@@ -90,7 +90,7 @@ pub enum RequiredRuntime {
     Nix,
     /// Requires the Go toolchain (`go` binary).
     Go,
-    /// Requires the zig cross-compilation toolchain (`cargo-zigbuild` + `zig`).
+    /// Requires Rust/Cargo and its cross-compilation helpers (`cargo-zigbuild` + `zig`).
     Zig,
 }
 
@@ -1402,6 +1402,23 @@ impl WorkerCapabilities {
         self.rustc_version.is_some()
     }
 
+    /// Whether this snapshot can satisfy a command's required runtime.
+    /// Use the same predicate for selection, affinity fallback and final slot
+    /// admission so historical success cannot override fresh negative evidence.
+    /// `cargo zigbuild` also needs usable Rust/Cargo, not just its two helpers.
+    #[must_use]
+    pub fn has_runtime(&self, required: RequiredRuntime) -> bool {
+        match required {
+            RequiredRuntime::None => true,
+            RequiredRuntime::Rust => self.has_rust(),
+            RequiredRuntime::Bun => self.has_bun(),
+            RequiredRuntime::Node => self.has_node(),
+            RequiredRuntime::Nix => self.has_nix(),
+            RequiredRuntime::Go => self.has_go(),
+            RequiredRuntime::Zig => self.has_rust() && self.has_zig(),
+        }
+    }
+
     /// Check whether `component` is installed for `toolchain`.
     ///
     /// Rustup reports pinned toolchains with a host-triple suffix. The request
@@ -1427,7 +1444,8 @@ impl WorkerCapabilities {
         self.go_version.is_some()
     }
 
-    /// Check if this worker can run `cargo zigbuild` cross-compiles.
+    /// Check whether this worker has both helpers used by `cargo zigbuild`.
+    /// Usable Rust/Cargo is checked separately by [`Self::has_runtime`].
     ///
     /// Requires BOTH halves of the toolchain: the `cargo-zigbuild` cargo
     /// subcommand and the `zig` binary it drives as the linker. Either one
@@ -4880,6 +4898,37 @@ retry_max = 2
 
         caps.rustc_version = Some("rustc 1.76.0 (07dca489a 2024-02-04)".to_string());
         assert!(caps.has_rust());
+    }
+
+    #[test]
+    fn failed_cargo_probe_blocks_rust_runtimes_without_discarding_other_facts() {
+        // Successful probe JSON may retain inventories even when executable
+        // Cargo failed. Those inventories must not restore Rust eligibility.
+        let mut caps: WorkerCapabilities = serde_json::from_value(serde_json::json!({
+            "rustup_toolchains": ["nightly-fixture"],
+            "rustup_components": ["nightly-fixture:clippy"],
+            "node_version": "v22.0.0",
+            "zig_version": "0.14.0",
+            "cargo_zigbuild_version": "0.20.0",
+            "probe_warnings": ["worker Cargo execution check failed: toolchain Cargo refused"]
+        }))
+        .unwrap();
+
+        assert!(caps.has_zig(), "helper inventory remains available");
+        assert!(!caps.has_runtime(RequiredRuntime::Rust));
+        assert!(!caps.has_runtime(RequiredRuntime::Zig));
+        assert!(caps.has_runtime(RequiredRuntime::Node));
+        assert!(caps.has_runtime(RequiredRuntime::None));
+        assert!(caps.has_rustup_component("nightly-fixture", "clippy"));
+
+        // Fresh positive execution evidence restores both Cargo routes.
+        caps.rustc_version = Some("1.100.0-nightly".into());
+        caps.probe_warnings.clear();
+        let refreshed: WorkerCapabilities =
+            serde_json::from_slice(&serde_json::to_vec(&caps).unwrap()).unwrap();
+        assert!(refreshed.has_runtime(RequiredRuntime::Rust));
+        assert!(refreshed.has_runtime(RequiredRuntime::Zig));
+        assert!(refreshed.has_runtime(RequiredRuntime::Node));
     }
 
     #[test]
