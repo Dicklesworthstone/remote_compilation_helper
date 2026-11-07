@@ -1179,8 +1179,9 @@ async fn acknowledge_capture(
 }
 
 /// Two-phase completion on the actual admitted session. Preparation copies
-/// every output into immutable CAS objects before requesting acknowledgment;
-/// publication only consumes those captured objects, never the target paths.
+/// every output into private read-only stages before requesting
+/// acknowledgment, so Cargo waits for copies only; publication makes those
+/// stages durable CAS objects and never rereads the target paths.
 pub(super) async fn complete_on_lane(
     lane: &super::Limit,
     live: Arc<LiveEdge>,

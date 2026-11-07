@@ -750,8 +750,49 @@ struct CapturedLocalResult {
     transcript: ObjectId,
     manifest_key: String,
     known: Vec<KnownOutput>,
-    // Retain every captured object while the wrapper acknowledges the handoff.
+    // Pins every stored capture object through publication.
     pins: CapturePins,
+    // Copies the CAS does not hold yet; `store_staged` makes them durable.
+    staged: Vec<StagedCaptureObject>,
+}
+
+/// One capture object held privately until publication (bd-lxmfd). Cargo is
+/// released by the custody receipt, so only copying belongs before it: the
+/// fsyncs, location rows and pins happen in `store_staged` after the ACK, and
+/// a capture that is never acknowledged leaves nothing in the CAS.
+#[derive(Debug)]
+enum StagedCaptureObject {
+    Output(Box<output_capture::StagedCapture>),
+    Bytes(Vec<u8>),
+    BundleRoot(Vec<LogicalOutput>),
+}
+
+impl CapturedLocalResult {
+    /// Make every staged object a durable, pinned CAS object, in capture
+    /// order. Publication re-verifies the complete durable closure anyway.
+    fn store_staged(&mut self, cas: &crate::janitor::store::LiveCas) -> Result<(), String> {
+        for object in std::mem::take(&mut self.staged) {
+            match object {
+                StagedCaptureObject::Output(capture) => {
+                    output_capture::publish_output(cas, &capture, &mut self.pins)?;
+                }
+                StagedCaptureObject::Bytes(bytes) => {
+                    put_bytes(cas, &bytes, &mut self.pins)?;
+                }
+                StagedCaptureObject::BundleRoot(outputs) => {
+                    put_bundle_root(cas, &outputs, &mut self.pins)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stage bytes for publication, returning the identity they will be stored under.
+fn stage_bytes(staged: &mut Vec<StagedCaptureObject>, bytes: Vec<u8>) -> Result<ObjectId, String> {
+    let id = object_id(&bytes)?;
+    staged.push(StagedCaptureObject::Bytes(bytes));
+    Ok(ObjectId(id))
 }
 
 impl CapturedLocalAttempt {
@@ -767,7 +808,8 @@ impl CapturedLocalAttempt {
         self.attempt.attempt_hex()
     }
 
-    /// Content identity of the already durable canonical result manifest.
+    /// Content identity of the captured canonical result manifest. The CAS
+    /// stores it, durably, only when [`Self::publish`] runs after the ACK.
     #[must_use]
     pub fn manifest_key(&self) -> &str {
         &self.result.manifest_key
@@ -1510,11 +1552,12 @@ impl ExecutionAttempt {
         )?;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let authority = self.authority.clone().ok_or("attempt not admitted")?;
-        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
+        let pins = CapturePins::new(Arc::clone(cas), &authority);
+        let mut staged = Vec::new();
         let mut logical_outputs = Vec::with_capacity(plan.outputs.declarations.len());
         let mut known = Vec::new();
         // Lock order is submissions -> store: never advance while holding
-        // the store. Each output is retained before the next one is read.
+        // the store. Each output is copied privately before the next is read.
         self.advance(AttemptState::HarvestingOutputs)?;
         self.advance(AttemptState::UploadingOutputs)?;
         // Keep only signatures and CAS identities, not a Vec containing every
@@ -1543,11 +1586,13 @@ impl ExecutionAttempt {
                     rabs_sandbox::leak_scanner::Surface::DepInfo,
                     &bytes,
                 )?;
-                (sig, put_bytes(cas, &bytes, &mut pins)?)
+                (sig, stage_bytes(&mut staged, bytes)?)
             } else {
-                let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
+                let capture = output_capture::stage_output(cas, &path, MAX_OUTPUT_BYTES)?;
+                let captured = capture.known();
                 let object = ObjectId(captured.digest.clone());
                 let sig = captured.sig;
+                staged.push(StagedCaptureObject::Output(Box::new(capture)));
                 // Private delivery inode signatures do not describe Cargo's
                 // target files. Remember only after a remote install finishes.
                 if remote_receipt.is_none() {
@@ -1576,14 +1621,13 @@ impl ExecutionAttempt {
         self.request.verify_package()?;
         self.request.dependencies.verify_unchanged()?;
         self.request.verify_toolchain()?;
-        // Each put takes the store lock for itself only: decisions for other
-        // compiles must not queue behind a whole completion's fsyncs. The
-        // pin installed by each put protects the object between those locks
-        // and across the asynchronous acknowledgment. The commit transaction
-        // still re-verifies the complete durable closure.
+        // Nothing below touches the CAS: evidence objects are staged with the
+        // outputs and stored by `store_staged` after the custody ACK, each put
+        // taking the store lock for itself only, its pin protecting the object
+        // until commit. The commit transaction re-verifies the durable closure.
         let (transcript_id, evidence_parts) = {
-            put_bundle_root(cas, &logical_outputs, &mut pins)?;
-            let transcript_id = put_bytes(cas, &transcript, &mut pins)?;
+            staged.push(StagedCaptureObject::BundleRoot(logical_outputs.clone()));
+            let transcript_id = stage_bytes(&mut staged, transcript)?;
             let hex =
                 |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
             let snapshot = serde_json::to_vec(&serde_json::json!({
@@ -1643,10 +1687,10 @@ impl ExecutionAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let parts = [
-                put_bytes(cas, &snapshot, &mut pins)?,
-                put_bytes(cas, &observed, &mut pins)?,
-                put_bytes(cas, &process, &mut pins)?,
-                put_bytes(cas, &provenance, &mut pins)?,
+                stage_bytes(&mut staged, snapshot)?,
+                stage_bytes(&mut staged, observed)?,
+                stage_bytes(&mut staged, process)?,
+                stage_bytes(&mut staged, provenance)?,
             ];
             (transcript_id, parts)
         };
@@ -1703,8 +1747,8 @@ impl ExecutionAttempt {
             }))
             .map_err(|error| error.to_string())
         };
-        let manifest_id = put_bytes(cas, &manifest_bytes, &mut pins)?;
-        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?, &mut pins)?;
+        let manifest_id = stage_bytes(&mut staged, manifest_bytes.clone())?;
+        let evidence_id = stage_bytes(&mut staged, evidence_bytes(&manifest_id)?)?;
         let offer = OfferPreparedActionResult::build(
             authority,
             stamped.manifest,
@@ -1726,18 +1770,28 @@ impl ExecutionAttempt {
             manifest_key: digest_key(&manifest_id.0),
             known,
             pins,
+            staged,
         })
+    }
+
+    /// Store a capture's staged objects in this attempt's CAS. Publication
+    /// does this itself; a consumer that reads the objects without
+    /// publishing (request-owned delivery) must call it first.
+    fn store_captured(&self, captured: &mut CapturedLocalResult) -> Result<(), String> {
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
+        captured.store_staged(cas)
     }
 
     fn publish_captured(
         &self,
-        captured: CapturedLocalResult,
+        mut captured: CapturedLocalResult,
     ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
         if self.request.is_execution_only() {
             return Err("workspace execution-only results cannot be published".into());
         }
         self.request
             .verify_enforced_read_closure(self.remote_validation.as_ref())?;
+        self.store_captured(&mut captured)?;
         let CapturedLocalResult {
             offer,
             transcript,

@@ -83,6 +83,7 @@ impl Fixture {
                 manifest_key: self.manifest.clone(),
                 known: Vec::new(),
                 pins,
+                staged: Vec::new(),
             },
         }
     }

@@ -1941,13 +1941,16 @@ impl PendingRemote {
             .validation
             .verify(&attempt.request)
             .map_err(settled)?;
-        let captured = attempt
+        let mut captured = attempt
             .capture_result(
                 &report,
                 &delivery.directory.join("artifacts"),
                 Some(&delivery.receipt),
             )
             .map_err(settled)?;
+        // No wrapper waits on an acknowledgment here, and request-owned
+        // delivery installs from these objects without publishing them.
+        attempt.store_captured(&mut captured).map_err(settled)?;
         let manifest = captured.offer.manifest.clone();
         let manifest_key = captured.manifest_key.clone();
         let canonical_transcript =
@@ -4971,13 +4974,15 @@ mod execution_resource_tests {
         use rabs_protocol::raw_bytes::RawBytes;
         use rabs_protocol::result_identity::ObjectId;
 
+        // rabs-key workspace_dependency_cache MIXED_METADATA_KEY_EPOCH and
+        // MIXED_RLIB_KEY_EPOCH (renumbered with the v2 domains in 8d17703).
         for (emit, mode, epoch) in [
             (
                 "dep-info,metadata",
                 DependencyExecutionMode::ClosedMetadata,
-                9,
+                21,
             ),
-            ("dep-info,metadata,link", DependencyExecutionMode::Rlib, 8),
+            ("dep-info,metadata,link", DependencyExecutionMode::Rlib, 20),
         ] {
             let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
             let path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
