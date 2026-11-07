@@ -715,7 +715,8 @@ impl CancellationOrchestrator {
         }
         if record.reason == CancelReason::User || !remote_cancellation_required(record) {
             *started = true;
-            self.execute_cancellation_until(record, force, deadline).await;
+            self.execute_cancellation_until(record, force, deadline)
+                .await;
             return true;
         }
         if let Some(store) = &ctx.admin_disable_store {
@@ -792,7 +793,8 @@ impl CancellationOrchestrator {
                             return false;
                         }
                         *started = true;
-                        self.execute_cancellation_until(record, force, deadline).await;
+                        self.execute_cancellation_until(record, force, deadline)
+                            .await;
                         true
                     },
                     deadline,
@@ -804,7 +806,8 @@ impl CancellationOrchestrator {
             return false;
         }
         *started = true;
-        self.execute_cancellation_until(record, force, deadline).await;
+        self.execute_cancellation_until(record, force, deadline)
+            .await;
         true
     }
 
@@ -823,7 +826,8 @@ impl CancellationOrchestrator {
             record.cleanup_ok = false;
             return;
         };
-        self.execute_cancellation_until(record, force, deadline).await;
+        self.execute_cancellation_until(record, force, deadline)
+            .await;
     }
 
     /// Admission, termination and observation consume one original budget.
@@ -970,8 +974,7 @@ impl CancellationOrchestrator {
             self.send_verified_signal(record, false, deadline).await;
         }
 
-        let local_stopped =
-            wait_for_wrapper_exit(record, self.config.grace_period, deadline).await;
+        let local_stopped = wait_for_wrapper_exit(record, self.config.grace_period, deadline).await;
         if TokioInstant::now() >= deadline {
             return;
         }
@@ -994,8 +997,7 @@ impl CancellationOrchestrator {
             return;
         }
 
-        if TokioInstant::now() >= deadline
-            || record.escalation_count >= self.config.max_escalations
+        if TokioInstant::now() >= deadline || record.escalation_count >= self.config.max_escalations
         {
             record.state = CancellationState::Failed;
             return;
@@ -1029,8 +1031,7 @@ impl CancellationOrchestrator {
         record: &mut CancellationRecord,
         deadline: TokioInstant,
     ) -> bool {
-        if TokioInstant::now() >= deadline
-            || record.escalation_count >= self.config.max_escalations
+        if TokioInstant::now() >= deadline || record.escalation_count >= self.config.max_escalations
         {
             return false;
         }
@@ -2011,14 +2012,11 @@ wait
         ] {
             let (release, pending) = tokio::sync::oneshot::channel::<()>();
             let executed = AtomicBool::new(false);
-            let operation = before_cancellation_deadline(
-                TokioInstant::now() + allowance,
-                async {
-                    pending.await.unwrap();
-                    executed.store(true, Ordering::SeqCst);
-                    7
-                },
-            );
+            let operation = before_cancellation_deadline(TokioInstant::now() + allowance, async {
+                pending.await.unwrap();
+                executed.store(true, Ordering::SeqCst);
+                7
+            });
             tokio::pin!(operation);
             assert_cancellation_pending(operation.as_mut()).await;
             tokio::time::advance(elapsed).await;
@@ -2038,8 +2036,7 @@ wait
                 let store = Arc::new(tokio::sync::Mutex::new(AdminDisableStore::with_path(
                     directory.path().join("admin.json"),
                 )));
-                let mut ctx =
-                    make_test_context(WorkerPool::new(), Arc::new(BuildHistory::new(10)));
+                let mut ctx = make_test_context(WorkerPool::new(), Arc::new(BuildHistory::new(10)));
                 ctx.admin_disable_store = Some(store.clone());
                 let owner = CancellationOrchestrator::new(
                     CancellationConfig {
@@ -2061,10 +2058,8 @@ wait
                     );
                     tokio::pin!(operation);
                     assert_cancellation_pending(operation.as_mut()).await;
-                    tokio::time::advance(
-                        scale_duration(owner.config.cleanup_timeout) + lateness,
-                    )
-                    .await;
+                    tokio::time::advance(scale_duration(owner.config.cleanup_timeout) + lateness)
+                        .await;
                     drop(blocked);
                     assert!(!operation.await);
                 }
@@ -2208,7 +2203,9 @@ wait
             record.slots = 0;
             let deadline = TokioInstant::now();
             assert!(!owner.send_verified_signal(&record, force, deadline).await);
-            owner.execute_cancellation_until(&mut record, force, deadline).await;
+            owner
+                .execute_cancellation_until(&mut record, force, deadline)
+                .await;
             assert_eq!(record.state, CancellationState::Failed);
             assert!(!record.remote_kill_attempted);
             assert!(child.0.try_wait().unwrap().is_none());

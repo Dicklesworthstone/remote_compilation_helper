@@ -636,9 +636,15 @@ mod tests {
     #[test]
     fn component_admission_distinguishes_absent_and_unresolved_command_pins() {
         for (command, expected) in [
-            ("RUSTUP_TOOLCHAIN=stable cargo +nightly clippy", Some("nightly")),
+            (
+                "RUSTUP_TOOLCHAIN=stable cargo +nightly clippy",
+                Some("nightly"),
+            ),
             ("env 'RUSTUP_TOOLCHAIN=beta' cargo clippy", Some("beta")),
-            ("cargo clippy -- RUSTUP_TOOLCHAIN=payload", Some("project-pin")),
+            (
+                "cargo clippy -- RUSTUP_TOOLCHAIN=payload",
+                Some("project-pin"),
+            ),
             ("cargo +--help clippy", None),
             ("env RUSTUP_TOOLCHAIN=--help cargo clippy", None),
             ("env -u RUSTUP_TOOLCHAIN cargo clippy", None),

@@ -18305,9 +18305,15 @@ fn rustup_toolchain_from_command_tokens_parses_env_prefix_and_selector() {
             Some("nightly-2026-08-25"),
         ),
         ("RUSTUP_TOOLCHAIN=stable cargo clippy", Some("stable")),
-        ("cargo +nightly-2026-08-25 clippy", Some("nightly-2026-08-25")),
+        (
+            "cargo +nightly-2026-08-25 clippy",
+            Some("nightly-2026-08-25"),
+        ),
         ("/usr/bin/cargo +beta build", Some("beta")),
-        ("env RUSTUP_TOOLCHAIN=stable cargo '+nightly' clippy", Some("nightly")),
+        (
+            "env RUSTUP_TOOLCHAIN=stable cargo '+nightly' clippy",
+            Some("nightly"),
+        ),
         ("cargo build --features +weird", None),
         ("cargo test -- RUSTUP_TOOLCHAIN=payload", None),
         ("go build ./...", None),

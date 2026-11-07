@@ -3885,14 +3885,16 @@ impl TransferPipeline {
             // This immutable identity-bound receipt is outside source-tree
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
-            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
-                worker,
-                &["sh", "-c", &escape(Cow::from(script.as_str()))],
-                false,
-                self.ssh_options
-                    .connect_timeout
-                    .min(deadline.saturating_duration_since(TokioInstant::now())),
-            )),
+            completion_probe_output(
+                self.worker_ssh_command_with_activity_and_connect_timeout(
+                    worker,
+                    &["sh", "-c", &escape(Cow::from(script.as_str()))],
+                    false,
+                    self.ssh_options
+                        .connect_timeout
+                        .min(deadline.saturating_duration_since(TokioInstant::now())),
+                ),
+            ),
         )
         .await?;
         anyhow::ensure!(output.status.success(), "completion probe SSH failed");
@@ -6085,14 +6087,16 @@ exit \"$__rch_disk_status\"; }}"
             format!("if [ -f {path} ] && [ ! -L {path} ]; then head -c 8193 -- {path}; fi");
         let output = receipt_probe_before(
             deadline,
-            completion_probe_output(self.worker_ssh_command_with_activity_and_connect_timeout(
-                worker,
-                &["sh", "-c", &escape(Cow::Owned(script))],
-                false,
-                self.ssh_options
-                    .connect_timeout
-                    .min(deadline.saturating_duration_since(TokioInstant::now())),
-            )),
+            completion_probe_output(
+                self.worker_ssh_command_with_activity_and_connect_timeout(
+                    worker,
+                    &["sh", "-c", &escape(Cow::Owned(script))],
+                    false,
+                    self.ssh_options
+                        .connect_timeout
+                        .min(deadline.saturating_duration_since(TokioInstant::now())),
+                ),
+            ),
         )
         .await?;
         anyhow::ensure!(output.status.success(), "disk receipt probe failed");
@@ -11986,14 +11990,11 @@ sys.stdout.buffer.write(b'complete')
         let resumed = std::cell::Cell::new(false);
         let (ready, pending) = tokio::sync::oneshot::channel();
         let budget = Duration::from_secs(10);
-        let mut probe = Box::pin(receipt_probe_before(
-            TokioInstant::now() + budget,
-            async {
-                pending.await.unwrap();
-                resumed.set(true);
-                Ok(())
-            },
-        ));
+        let mut probe = Box::pin(receipt_probe_before(TokioInstant::now() + budget, async {
+            pending.await.unwrap();
+            resumed.set(true);
+            Ok(())
+        }));
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(probe.as_mut(), cx).is_pending());
             std::task::Poll::Ready(())
@@ -12003,7 +12004,10 @@ sys.stdout.buffer.write(b'complete')
         ready.send(()).unwrap();
         let error = probe.await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(!resumed.get(), "expiry must win before polling newly ready work");
+        assert!(
+            !resumed.get(),
+            "expiry must win before polling newly ready work"
+        );
     }
 
     #[tokio::test]
@@ -12124,15 +12128,25 @@ cat "$root/$kind.receipt"
 
         std::fs::write(root.join("delay"), b"0").unwrap();
         std::fs::write(root.join("completion.receipt"), b"another-attempt 0\n").unwrap();
-        std::fs::write(root.join("disk.receipt"), b"another-attempt_DISK_USAGE:{}\n").unwrap();
+        std::fs::write(
+            root.join("disk.receipt"),
+            b"another-attempt_DISK_USAGE:{}\n",
+        )
+        .unwrap();
         assert!(pipeline.read_recovery_completion(&worker).await.is_err());
         assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
         std::fs::write(root.join("disk.receipt"), vec![b'x'; 8193]).unwrap();
         assert!(pipeline.read_remote_disk_receipt(&worker).await.is_err());
         std::fs::write(root.join("completion.receipt"), b"").unwrap();
         std::fs::write(root.join("disk.receipt"), b"").unwrap();
-        assert_eq!(pipeline.read_recovery_completion(&worker).await.unwrap(), None);
-        assert_eq!(pipeline.read_remote_disk_receipt(&worker).await.unwrap(), None);
+        assert_eq!(
+            pipeline.read_recovery_completion(&worker).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            pipeline.read_remote_disk_receipt(&worker).await.unwrap(),
+            None
+        );
     }
 
     /// A completion probe can be cancelled while its local SSH process and a

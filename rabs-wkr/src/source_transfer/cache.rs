@@ -91,7 +91,9 @@ mod tests {
         assert!(receiver.sealed_root().is_none());
         let mut retained_snapshot = retained_snapshot.expect("clone callback retained its input");
         retained_snapshot.rewind().unwrap();
-        retained_snapshot.write_all(b"changed private spool").unwrap();
+        retained_snapshot
+            .write_all(b"changed private spool")
+            .unwrap();
         let installed = receiver.seal().unwrap().join("lib.rlib");
         assert_eq!(fs::read(&installed).unwrap(), bytes);
         assert_ne!(
@@ -104,7 +106,14 @@ mod tests {
         let mut confirmed =
             SourceReceiver::create(&confirm.path().join("workspace"), source.manifest().clone())
                 .unwrap();
-        cache.load(expected).unwrap().install(&mut confirmed).unwrap();
-        assert_eq!(fs::read(confirmed.seal().unwrap().join("lib.rlib")).unwrap(), bytes);
+        cache
+            .load(expected)
+            .unwrap()
+            .install(&mut confirmed)
+            .unwrap();
+        assert_eq!(
+            fs::read(confirmed.seal().unwrap().join("lib.rlib")).unwrap(),
+            bytes
+        );
     }
 }

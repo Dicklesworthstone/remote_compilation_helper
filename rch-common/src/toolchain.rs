@@ -118,9 +118,24 @@ fn command_toolchain(command: &str) -> Option<CommandToolchain> {
     if matches!(
         program.rsplit('/').next(),
         Some(
-            "sudo" | "env" | "time" | "timeout" | "nice" | "ionice" | "chrt"
-                | "strace" | "ltrace" | "perf" | "taskset" | "numactl" | "sh"
-                | "bash" | "dash" | "zsh" | "command" | "exec"
+            "sudo"
+                | "env"
+                | "time"
+                | "timeout"
+                | "nice"
+                | "ionice"
+                | "chrt"
+                | "strace"
+                | "ltrace"
+                | "perf"
+                | "taskset"
+                | "numactl"
+                | "sh"
+                | "bash"
+                | "dash"
+                | "zsh"
+                | "command"
+                | "exec"
         )
     ) {
         return None;
@@ -140,7 +155,9 @@ fn command_toolchain(command: &str) -> Option<CommandToolchain> {
         }
     }
     if (name.is_none() && cleared)
-        || name.as_deref().is_some_and(|name| !valid_toolchain_argument(name))
+        || name
+            .as_deref()
+            .is_some_and(|name| !valid_toolchain_argument(name))
     {
         return None;
     }
@@ -201,9 +218,7 @@ fn literal_command_prefix(command: &str) -> Option<(usize, Option<String>, bool)
                 "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
                     let (value_start, value_end) = next_command_prefix_token(command, cursor)?;
                     let value = literal_shell_word(command.get(value_start..value_end)?)?;
-                    if matches!(token.as_ref(), "-u" | "--unset")
-                        && value == "RUSTUP_TOOLCHAIN"
-                    {
+                    if matches!(token.as_ref(), "-u" | "--unset") && value == "RUSTUP_TOOLCHAIN" {
                         toolchain = None;
                         cleared = true;
                     }
@@ -260,8 +275,8 @@ fn next_command_prefix_token(command: &str, offset: usize) -> Option<(usize, usi
 /// input; quoting is decoded only to identify a pin, never to reconstruct argv.
 fn literal_shell_word(word: &str) -> Option<Cow<'_, str>> {
     if !word.contains([
-        '\'', '"', '\\', '$', '\u{60}', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[',
-        ']', '{', '}', '~', '#',
+        '\'', '"', '\\', '$', '\u{60}', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', ']', '{',
+        '}', '~', '#',
     ]) {
         return Some(Cow::Borrowed(word));
     }
@@ -276,8 +291,8 @@ fn literal_shell_word(word: &str) -> Option<Cow<'_, str>> {
             (None | Some('"'), '$' | '\u{60}') => return None,
             (
                 None,
-                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{'
-                | '}' | '~' | '#',
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}' | '~'
+                | '#',
             ) => return None,
             (None, '\\') => {
                 let escaped = chars.next()?;
@@ -332,7 +347,10 @@ fn wrap_command_with_toolchain_policy(
             .and_then(|pin| pin.name.clone())
             .unwrap_or_else(|| tc.rustup_toolchain())
     });
-    if selected.as_deref().is_some_and(|name| !valid_toolchain_argument(name)) {
+    if selected
+        .as_deref()
+        .is_some_and(|name| !valid_toolchain_argument(name))
+    {
         return command.to_owned();
     }
     // Rustup run executes toolchain Cargo directly. The + argument belongs to
@@ -362,10 +380,7 @@ fn wrap_command_with_toolchain_policy(
     match selected {
         Some(name) => insert_toolchain_runner(
             &command,
-            &format!(
-                "rustup run {}",
-                shell_escape::escape(Cow::Owned(name))
-            ),
+            &format!("rustup run {}", shell_escape::escape(Cow::Owned(name))),
         ),
         None => command.into_owned(),
     }
@@ -676,7 +691,10 @@ mod tests {
     fn command_pin_uses_rustup_precedence_and_only_leading_assignments() {
         for (command, expected) in [
             ("cargo build", None),
-            ("RUSTUP_TOOLCHAIN=--help cargo +nightly build", Some("nightly")),
+            (
+                "RUSTUP_TOOLCHAIN=--help cargo +nightly build",
+                Some("nightly"),
+            ),
             ("RUSTUP_TOOLCHAIN=stable cargo build", Some("stable")),
             ("env 'RUSTUP_TOOLCHAIN=stable' cargo build", Some("stable")),
             (
@@ -691,13 +709,22 @@ mod tests {
                 "env -u RUSTUP_TOOLCHAIN -- 'RUSTUP_TOOLCHAIN=beta' 'cargo' '+nightly-2026-08-31' test",
                 Some("nightly-2026-08-31"),
             ),
-            ("'/tools with spaces/cargo' \"+custom\" check", Some("custom")),
+            (
+                "'/tools with spaces/cargo' \"+custom\" check",
+                Some("custom"),
+            ),
             ("cargo test -- RUSTUP_TOOLCHAIN=payload", None),
             ("cargo build --features +payload", None),
             ("printf cargo +payload", None),
             ("env -i cargo +nightly build", Some("nightly")),
-            ("env -u RUSTUP_TOOLCHAIN RUSTUP_TOOLCHAIN=beta cargo build", Some("beta")),
-            ("env RUSTUP_TOOLCHAIN= cargo +nightly build", Some("nightly")),
+            (
+                "env -u RUSTUP_TOOLCHAIN RUSTUP_TOOLCHAIN=beta cargo build",
+                Some("beta"),
+            ),
+            (
+                "env RUSTUP_TOOLCHAIN= cargo +nightly build",
+                Some("nightly"),
+            ),
         ] {
             assert_eq!(
                 rustup_toolchain_from_command(command),

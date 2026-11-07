@@ -307,7 +307,8 @@ impl VerifiedSource {
     /// Install through the bounded private-copy path without requiring a
     /// platform clone implementation from this crate.
     pub fn install(self, receiver: &mut SourceReceiver) -> io::Result<()> {
-        self.install_with_cloner(receiver, |_, _, _| false).map(|_| ())
+        self.install_with_cloner(receiver, |_, _, _| false)
+            .map(|_| ())
     }
 
     /// The optional callback may create only an independent CoW clone, never a
@@ -1232,12 +1233,13 @@ mod tests {
         assert_eq!(cache.max_bytes, DEFAULT_SOURCE_CACHE_BYTES);
         assert!(cache.projections().is_none());
         assert!(cache.projection_writer.is_none());
-        assert!(
-            fs::read_dir(parent.path())
+        assert!(fs::read_dir(parent.path()).unwrap().all(|entry| {
+            !entry
                 .unwrap()
-                .all(|entry| !entry.unwrap().file_name().as_encoded_bytes()
-                    .starts_with(SOURCE_PROJECTION_PREFIX.as_bytes()))
-        );
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(SOURCE_PROJECTION_PREFIX.as_bytes())
+        }));
         assert!(cache.clone().for_peer([0; 32]).is_err());
         let peer = cache.clone().for_peer([1; 32]).unwrap();
         assert_eq!(peer.root, cache.root);
@@ -1269,8 +1271,14 @@ mod tests {
         assert!(first.load(expected).is_some());
         assert!(second.load(expected).is_none());
         assert!(cache.load(expected).is_none());
-        assert_ne!(first.object_path(&expected.sha256), second.object_path(&expected.sha256));
-        assert_ne!(first.object_path(&expected.sha256), cache.object_path(&expected.sha256));
+        assert_ne!(
+            first.object_path(&expected.sha256),
+            second.object_path(&expected.sha256)
+        );
+        assert_ne!(
+            first.object_path(&expected.sha256),
+            cache.object_path(&expected.sha256)
+        );
 
         let mut renamed = expected.clone();
         renamed.path = "renamed/tool".into();
@@ -1281,14 +1289,20 @@ mod tests {
             SourceManifest::new(vec![renamed.clone()]).unwrap(),
         )
         .unwrap();
-        first.load(&renamed).unwrap().install(&mut receiver).unwrap();
+        first
+            .load(&renamed)
+            .unwrap()
+            .install(&mut receiver)
+            .unwrap();
         assert!(receiver.sealed_root().is_none());
         let installed = receiver.seal().unwrap().join(&renamed.path);
         assert_eq!(fs::read(&installed).unwrap(), bytes);
         assert_ne!(fs::metadata(&installed).unwrap().mode() & 0o111, 0);
         assert_ne!(
             fs::metadata(&installed).unwrap().ino(),
-            fs::metadata(first.object_path(&expected.sha256)).unwrap().ino()
+            fs::metadata(first.object_path(&expected.sha256))
+                .unwrap()
+                .ino()
         );
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&installed, b"private execution edit").unwrap();
@@ -1302,7 +1316,13 @@ mod tests {
         // a process-local declaration or sharing another principal's key.
         let reopened = SourceCache::open_byte_only(parent.path(), 1024).unwrap();
         assert_eq!(
-            reopened.clone().for_peer([1; 32]).unwrap().load(expected).unwrap().bytes(),
+            reopened
+                .clone()
+                .for_peer([1; 32])
+                .unwrap()
+                .load(expected)
+                .unwrap()
+                .bytes(),
             bytes
         );
         assert!(reopened.for_peer([3; 32]).unwrap().load(expected).is_none());

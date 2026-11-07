@@ -1389,11 +1389,9 @@ mod tests {
                     .map(|index| manifest.files()[usize::from(*index)].len)
                     .sum();
                 let destination = private();
-                let mut receiver = SourceReceiver::create(
-                    &destination.path().join("source"),
-                    manifest.clone(),
-                )
-                .unwrap();
+                let mut receiver =
+                    SourceReceiver::create(&destination.path().join("source"), manifest.clone())
+                        .unwrap();
                 for (index, file) in manifest.files().iter().enumerate() {
                     let index = u16::try_from(index).unwrap();
                     if file.len == 0 || plan.missing_files.contains(&index) {
@@ -1403,11 +1401,7 @@ mod tests {
                     let mut verified = fixture
                         .bundle
                         .source
-                        .checkpoint_file(
-                            &file.path,
-                            spool.as_file().try_clone().unwrap(),
-                            || false,
-                        )
+                        .checkpoint_file(&file.path, spool.as_file().try_clone().unwrap(), || false)
                         .unwrap()
                         .into_file();
                     receiver
@@ -1511,7 +1505,10 @@ mod tests {
                 receiver.seal().unwrap();
                 assert_eq!(receiver.manifest(), &manifest);
                 let root = receiver.sealed_root().unwrap();
-                assert_eq!(fs::read(root.join("a-binary")).unwrap(), fixture.source_bytes);
+                assert_eq!(
+                    fs::read(root.join("a-binary")).unwrap(),
+                    fixture.source_bytes
+                );
                 assert!(fs::read(root.join("b-empty")).unwrap().is_empty());
                 assert_eq!(
                     fs::read(root.join("c-executable")).unwrap(),
@@ -1524,14 +1521,24 @@ mod tests {
                 for file in manifest.files() {
                     let received = fs::metadata(root.join(&file.path)).unwrap();
                     let captured = fs::metadata(
-                        fixture.bundle.source.sealed_root().unwrap().join(&file.path),
+                        fixture
+                            .bundle
+                            .source
+                            .sealed_root()
+                            .unwrap()
+                            .join(&file.path),
                     )
                     .unwrap();
                     assert_eq!(received.nlink(), 1);
-                    assert_ne!((received.dev(), received.ino()), (captured.dev(), captured.ino()));
+                    assert_ne!(
+                        (received.dev(), received.ino()),
+                        (captured.dev(), captured.ino())
+                    );
                 }
                 assert_eq!(
-                    fs::read_dir(fixture.owner.path().join("scratch")).unwrap().count(),
+                    fs::read_dir(fixture.owner.path().join("scratch"))
+                        .unwrap()
+                        .count(),
                     0,
                 );
             }
@@ -1545,7 +1552,13 @@ mod tests {
             let plan = SourcePlan::new(fixture.bundle.source.manifest(), Vec::new()).unwrap();
             let peer = fixture.upload_peer(ToolchainDisposition::Reuse, plan);
             let path = if member == "sdk" {
-                fixture.bundle.toolchain.as_ref().unwrap().root().join("lib/runtime")
+                fixture
+                    .bundle
+                    .toolchain
+                    .as_ref()
+                    .unwrap()
+                    .root()
+                    .join("lib/runtime")
             } else {
                 fixture.bundle.source.sealed_root().unwrap().join(member)
             };
@@ -1578,7 +1591,9 @@ mod tests {
             assert!(result.is_err(), "a warm hint cannot hide changed {member}");
             assert!(output.lock().unwrap().is_empty());
             assert_eq!(
-                fs::read_dir(fixture.owner.path().join("scratch")).unwrap().count(),
+                fs::read_dir(fixture.owner.path().join("scratch"))
+                    .unwrap()
+                    .count(),
                 0,
             );
         }

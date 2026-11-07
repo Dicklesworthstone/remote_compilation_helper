@@ -198,8 +198,8 @@ impl SourceInput {
         let index = files
             .binary_search_by(|file| file.path.as_str().cmp(path))
             .map_err(|_| invalid("remote source chunk names an undeclared file"))?;
-        let index_u16 = u16::try_from(index)
-            .map_err(|_| invalid("remote source index exceeds its bound"))?;
+        let index_u16 =
+            u16::try_from(index).map_err(|_| invalid("remote source index exceeds its bound"))?;
         require(
             self.plan.missing_files.binary_search(&index_u16).is_ok(),
             "remote source chunk was not requested by the admitted missing-file plan",
@@ -369,7 +369,11 @@ mod tests {
         send(&mut first, "b.rs", &second_bytes[..3]);
         assert!(first.receiver.sealed_root().is_none());
         let retained = objects(&pool);
-        assert_eq!(retained.len(), 1, "an incomplete member must not enter reuse");
+        assert_eq!(
+            retained.len(),
+            1,
+            "an incomplete member must not enter reuse"
+        );
         drop(first);
 
         let (next_owner, mut next) = prepared(&pool, &manifest);
@@ -382,7 +386,9 @@ mod tests {
         );
         assert_ne!(
             fs::metadata(&restored).unwrap().ino(),
-            fs::metadata(first_owner.path().join("source/a.rs")).unwrap().ino()
+            fs::metadata(first_owner.path().join("source/a.rs"))
+                .unwrap()
+                .ino()
         );
         next.begin_transfer(deadline()).unwrap();
         send(&mut next, "b.rs", second_bytes);
@@ -477,7 +483,13 @@ mod tests {
         changed.begin_transfer(deadline()).unwrap();
         assert!(
             changed
-                .write_chunk("input.rs", 0, b"wrong", Sha256::digest(b"wrong").into(), || false)
+                .write_chunk(
+                    "input.rs",
+                    0,
+                    b"wrong",
+                    Sha256::digest(b"wrong").into(),
+                    || false
+                )
                 .is_ok()
         );
         // The cache warning path cannot convert an incomplete/incorrect
@@ -524,7 +536,9 @@ mod tests {
         let receiver =
             SourceReceiver::create(&owner.path().join("source"), manifest.clone()).unwrap();
         let stopped = Arc::new(AtomicBool::new(false));
-        let cache = pool.for_peer(EDGE, Arc::clone(&stopped), deadline()).unwrap();
+        let cache = pool
+            .for_peer(EDGE, Arc::clone(&stopped), deadline())
+            .unwrap();
         let refused = SourceInput::prepare(receiver, Some(cache), || {
             if fs::metadata(&path).unwrap().len() == bytes.len() as u64 {
                 stopped.store(true, Ordering::Release);
@@ -553,13 +567,9 @@ mod tests {
             "a repeated begin must not renew the cache's expired input budget"
         );
         let error = input
-            .write_chunk(
-                "input.rs",
-                0,
-                bytes,
-                Sha256::digest(bytes).into(),
-                || Instant::now() >= expired,
-            )
+            .write_chunk("input.rs", 0, bytes, Sha256::digest(bytes).into(), || {
+                Instant::now() >= expired
+            })
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(input.failed);

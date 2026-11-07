@@ -9,7 +9,9 @@ use super::super::remote_operation::RemoteOperationSettings;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest};
+use rabs_sandbox::source_transfer::{
+    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest,
+};
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
 };
@@ -1151,7 +1153,11 @@ mod tests {
     fn source_plans_bind_canonical_manifest_members_and_refuse_ambiguous_hints() {
         let manifest = source_manifest();
         assert_eq!(
-            manifest.files().iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            manifest
+                .files()
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
             ["Cargo.toml", "empty", "src/lib.rs"],
         );
         let all = SourcePlan::all(&manifest).unwrap();

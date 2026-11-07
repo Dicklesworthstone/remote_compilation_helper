@@ -2080,7 +2080,10 @@ exec "$program" "$@"
                 .current_dir(root)
                 .env_clear()
                 .env("HOME", root)
-                .env("PATH", format!("{}:{}:/usr/bin:/bin", shims.display(), tools.display()))
+                .env(
+                    "PATH",
+                    format!("{}:{}:/usr/bin:/bin", shims.display(), tools.display()),
+                )
                 .env("RCH_REQUIRE_REMOTE", "1")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
                 .env("RCH_CARGO_WRAPPER_ORIGIN", "rch")

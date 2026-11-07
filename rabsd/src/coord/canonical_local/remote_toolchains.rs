@@ -496,7 +496,9 @@ impl UploadWaiter<'_> {
             }
             Some(UploadResult::Ready(lease)) => {
                 if lease.identity() != &self.flight.identity {
-                    return Err(invalid("shared compiler differs from its upload declaration"));
+                    return Err(invalid(
+                        "shared compiler differs from its upload declaration",
+                    ));
                 }
                 self.cache
                     .verified_upload(self.flight.peer, lease, &stopped)
@@ -526,7 +528,9 @@ impl UploadPublisher<'_> {
     ) -> io::Result<()> {
         checkpoint(&stopped)?;
         if lease.identity() != &self.identity {
-            return Err(invalid("received compiler differs from its upload declaration"));
+            return Err(invalid(
+                "received compiler differs from its upload declaration",
+            ));
         }
         // The sealed receiver already hashed every byte; preserve its complete
         // owner/generation witness. Every waiting reuse performs a fresh full
@@ -536,7 +540,9 @@ impl UploadPublisher<'_> {
         {
             let mut state = self.cache.lock()?;
             if RemoteToolchainCache::upload_invalidated(&state, self.peer, &lease) {
-                return Err(invalid("received compiler was invalidated before publication"));
+                return Err(invalid(
+                    "received compiler was invalidated before publication",
+                ));
             }
             if let Some(flight) = &self.flight {
                 RemoteToolchainCache::detach_upload(&mut state, flight);
@@ -669,16 +675,12 @@ impl RemoteToolchainCache {
 
     fn detach_upload(state: &mut State, flight: &Arc<UploadFlight>) {
         let selected = Arc::downgrade(flight);
-        state.pending_uploads.retain(|pending| {
-            pending.strong_count() != 0 && !Weak::ptr_eq(pending, &selected)
-        });
+        state
+            .pending_uploads
+            .retain(|pending| pending.strong_count() != 0 && !Weak::ptr_eq(pending, &selected));
     }
 
-    fn upload_invalidated(
-        state: &State,
-        peer: [u8; 32],
-        lease: &Arc<ReceivedToolchain>,
-    ) -> bool {
+    fn upload_invalidated(state: &State, peer: [u8; 32], lease: &Arc<ReceivedToolchain>) -> bool {
         state.entries.iter().any(|entry| {
             entry.peer == peer && entry.invalidated && Arc::ptr_eq(&entry.lease, lease)
         })
@@ -724,7 +726,9 @@ impl RemoteToolchainCache {
     ) -> io::Result<ToolchainAcquisition<'_>> {
         checkpoint(&stopped)?;
         if peer == [0; 32] {
-            return Err(invalid("remote compiler acquisition requires an authenticated edge key"));
+            return Err(invalid(
+                "remote compiler acquisition requires an authenticated edge key",
+            ));
         }
         let acquisition = {
             let mut state = self.lock()?;
@@ -736,14 +740,19 @@ impl RemoteToolchainCache {
             if let Some(lease) = retained {
                 ToolchainAcquisition::Ready(lease)
             } else {
-                state.pending_uploads.retain(|pending| pending.strong_count() != 0);
+                state
+                    .pending_uploads
+                    .retain(|pending| pending.strong_count() != 0);
                 let pending = state
                     .pending_uploads
                     .iter()
                     .filter_map(Weak::upgrade)
                     .find(|flight| flight.peer == peer && &flight.identity == identity);
                 if let Some(flight) = pending {
-                    ToolchainAcquisition::Wait(UploadWaiter { cache: self, flight })
+                    ToolchainAcquisition::Wait(UploadWaiter {
+                        cache: self,
+                        flight,
+                    })
                 } else {
                     let flight = (state.pending_uploads.len() < MAX_PENDING_UPLOADS).then(|| {
                         let flight = Arc::new(UploadFlight {
@@ -1126,9 +1135,15 @@ mod tests {
             drop(received);
             assert!(path.is_dir(), "the registered ticket still owns the SDK");
             drop(waiter);
-            assert!(!path.exists(), "weak registry must not retain a private SDK");
+            assert!(
+                !path.exists(),
+                "weak registry must not retain a private SDK"
+            );
             assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
-            assert!(matches!(next_waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+            assert!(matches!(
+                next_waiter.poll(|| false).unwrap(),
+                UploadPoll::Pending
+            ));
             drop((next_waiter, next));
             assert!(cache.lock().unwrap().pending_uploads.is_empty());
             assert_eq!(counts(&cache), before);
@@ -1155,9 +1170,15 @@ mod tests {
         }
         assert_eq!(cache.lock().unwrap().pending_uploads.len(), 5);
         assert!(cache.acquire([0; 32], &identity, || false).is_err());
-        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+        assert!(matches!(
+            waiter.poll(|| false).unwrap(),
+            UploadPoll::Pending
+        ));
         drop(owners);
-        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+        assert!(matches!(
+            waiter.poll(|| false).unwrap(),
+            UploadPoll::Abandoned
+        ));
         assert!(cache.lock().unwrap().pending_uploads.is_empty());
     }
 
@@ -1180,7 +1201,10 @@ mod tests {
             } else {
                 drop(owner);
             }
-            assert!(matches!(abandoned.poll(|| false).unwrap(), UploadPoll::Abandoned));
+            assert!(matches!(
+                abandoned.poll(|| false).unwrap(),
+                UploadPoll::Abandoned
+            ));
             let replacement = upload(&cache, EDGE_A, &identity);
             let live = join_upload(&cache, EDGE_A, &identity);
             assert!(!Arc::ptr_eq(&abandoned.flight, &live.flight));
@@ -1235,9 +1259,15 @@ mod tests {
             blocker.join().unwrap();
             assert!(publisher.join().unwrap().is_err());
             assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
-            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Pending));
+            assert!(matches!(
+                waiter.poll(|| false).unwrap(),
+                UploadPoll::Pending
+            ));
             next.publish(Arc::clone(&sdk), || false).unwrap();
-            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Ready(_)));
+            assert!(matches!(
+                waiter.poll(|| false).unwrap(),
+                UploadPoll::Ready(_)
+            ));
         });
         assert!(cache.lock().unwrap().pending_uploads.is_empty());
     }
@@ -1252,13 +1282,22 @@ mod tests {
             let waiter = join_upload(&cache, EDGE_A, sdk.identity());
             let deadline = Instant::now();
             let stopped = || !expired || Instant::now() >= deadline;
-            assert_eq!(waiter.poll(stopped).unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(
+                waiter.poll(stopped).unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
             drop(waiter);
-            assert!(matches!(survivor.poll(|| false).unwrap(), UploadPoll::Pending));
+            assert!(matches!(
+                survivor.poll(|| false).unwrap(),
+                UploadPoll::Pending
+            ));
             assert_eq!(cache.lock().unwrap().pending_uploads.len(), 1);
         }
         owner.publish(Arc::clone(&sdk), || false).unwrap();
-        assert!(matches!(survivor.poll(|| false).unwrap(), UploadPoll::Ready(_)));
+        assert!(matches!(
+            survivor.poll(|| false).unwrap(),
+            UploadPoll::Ready(_)
+        ));
         drop(survivor);
 
         let calls = Cell::new(0);
@@ -1276,7 +1315,10 @@ mod tests {
             next.publish(Arc::clone(&sdk), || true).unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
-        assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+        assert!(matches!(
+            waiter.poll(|| false).unwrap(),
+            UploadPoll::Abandoned
+        ));
     }
 
     #[test]
@@ -1309,7 +1351,10 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(owner.publish(published, || false).is_err(), "{changed}");
-            assert!(matches!(waiter.poll(|| false).unwrap(), UploadPoll::Abandoned));
+            assert!(matches!(
+                waiter.poll(|| false).unwrap(),
+                UploadPoll::Abandoned
+            ));
             assert!(cache.lock().unwrap().pending_uploads.is_empty());
         }
     }
@@ -1338,7 +1383,11 @@ mod tests {
         assert!(waiter.poll(|| false).is_err());
         let replacement_owner = upload(&cache, EDGE_A, &identity);
         let replacement_waiter = join_upload(&cache, EDGE_A, &identity);
-        assert!(replacement_owner.publish(Arc::clone(&sdk), || false).is_err());
+        assert!(
+            replacement_owner
+                .publish(Arc::clone(&sdk), || false)
+                .is_err()
+        );
         assert!(matches!(
             replacement_waiter.poll(|| false).unwrap(),
             UploadPoll::Abandoned
@@ -1359,9 +1408,14 @@ mod tests {
             panic!("an older generation invalidated its replacement");
         };
         assert!(Arc::ptr_eq(&received, &successor));
-        assert!(!cache.lock().unwrap().entries.iter().any(|entry| {
-            Arc::ptr_eq(&entry.lease, &successor) && entry.invalidated
-        }));
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| { Arc::ptr_eq(&entry.lease, &successor) && entry.invalidated })
+        );
 
         let private_cache = RemoteToolchainCache::new(0, 1).unwrap();
         let private_sdk = fixture(b"private completed SDK");
@@ -1386,14 +1440,24 @@ mod tests {
             different.sha256[0] ^= index as u8;
             owners.push(upload(&cache, EDGE_A, &different));
         }
-        assert_eq!(cache.lock().unwrap().pending_uploads.len(), MAX_PENDING_UPLOADS);
+        assert_eq!(
+            cache.lock().unwrap().pending_uploads.len(),
+            MAX_PENDING_UPLOADS
+        );
         let fallback = upload(&cache, EDGE_A, &identity);
         assert!(fallback.flight.is_none());
-        assert!(fallback.publish(fixture(b"wrong fallback SDK"), || false).is_err());
+        assert!(
+            fallback
+                .publish(fixture(b"wrong fallback SDK"), || false)
+                .is_err()
+        );
         let fallback = upload(&cache, EDGE_A, &identity);
         assert!(fallback.flight.is_none());
         fallback.publish(Arc::clone(&sdk), || false).unwrap();
-        assert_eq!(cache.lock().unwrap().pending_uploads.len(), MAX_PENDING_UPLOADS);
+        assert_eq!(
+            cache.lock().unwrap().pending_uploads.len(),
+            MAX_PENDING_UPLOADS
+        );
         assert_eq!(counts(&cache), (0, 0, 0));
 
         drop(owners.pop());

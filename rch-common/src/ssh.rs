@@ -1387,7 +1387,11 @@ impl SshClient {
         self.health_check_before(timeout, None).await
     }
 
-    async fn health_check_before(&self, timeout: Duration, deadline: Option<Instant>) -> Result<bool> {
+    async fn health_check_before(
+        &self,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
         match self
             .execute_with_timeout_before(HEALTH_CHECK_COMMAND, timeout, deadline)
             .await
@@ -1750,7 +1754,14 @@ pub(crate) async fn system_ssh_execute(
     command_timeout: Duration,
     server_alive_interval: Duration,
 ) -> Result<CommandResult> {
-    system_ssh_execute_before(config, command, command_timeout, server_alive_interval, None).await
+    system_ssh_execute_before(
+        config,
+        command,
+        command_timeout,
+        server_alive_interval,
+        None,
+    )
+    .await
 }
 
 async fn system_ssh_execute_before(
@@ -2561,7 +2572,9 @@ mod tests {
                             .await
                             .map(|_| ())
                         } else {
-                            pool.get_or_connect_until(&config, deadline).await.map(|_| ())
+                            pool.get_or_connect_until(&config, deadline)
+                                .await
+                                .map(|_| ())
                         }
                     };
                     tokio::pin!(operation);
@@ -2570,7 +2583,10 @@ mod tests {
                     drop(controls);
                     drop(connections);
                     let error = operation.await.unwrap_err();
-                    assert!(format!("{error:#}").contains("deadline exceeded"), "{error:#}");
+                    assert!(
+                        format!("{error:#}").contains("deadline exceeded"),
+                        "{error:#}"
+                    );
                     assert!(is_retryable_transport_error(&error));
                     assert!(pool.connections.read().await.is_empty());
                     if block_controls {
@@ -2608,7 +2624,9 @@ mod tests {
                     .await
                     .map(|_| ())
                 } else {
-                    pool.get_or_connect_until(&new_config, deadline).await.map(|_| ())
+                    pool.get_or_connect_until(&new_config, deadline)
+                        .await
+                        .map(|_| ())
                 }
             };
             tokio::pin!(operation);
@@ -2617,7 +2635,13 @@ mod tests {
             drop(cache);
             assert!(operation.await.is_err());
             assert!(Arc::ptr_eq(
-                &pool.connections.read().await.get(&old_config.id).unwrap().client,
+                &pool
+                    .connections
+                    .read()
+                    .await
+                    .get(&old_config.id)
+                    .unwrap()
+                    .client,
                 &old,
             ));
             let fresh = pool
@@ -4753,7 +4777,9 @@ exit 37
                         .await
                         .map(|_| ())
                     } else {
-                        pool.get_or_connect_until(&config, deadline).await.map(|_| ())
+                        pool.get_or_connect_until(&config, deadline)
+                            .await
+                            .map(|_| ())
                     }
                 };
                 tokio::pin!(operation);

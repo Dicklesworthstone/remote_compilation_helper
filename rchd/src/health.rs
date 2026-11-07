@@ -1905,9 +1905,11 @@ mod tests {
             assert_health_probe_pending(probe.as_mut()).await;
             tokio::time::advance(budget + lateness).await;
             assert!(!probe.await);
-            assert!(mock::global_ssh_invocations_snapshot().iter().all(|call| {
-                call.worker_id != worker.id || call.phase != mock::Phase::Execute
-            }));
+            assert!(
+                mock::global_ssh_invocations_snapshot().iter().all(|call| {
+                    call.worker_id != worker.id || call.phase != mock::Phase::Execute
+                })
+            );
         }
         let worker = WorkerConfig {
             id: WorkerId::new("historical-expired-before-connect"),
@@ -1921,9 +1923,11 @@ mod tests {
             )
             .await
         );
-        assert!(mock::global_ssh_invocations_snapshot()
-            .iter()
-            .all(|call| call.worker_id != worker.id));
+        assert!(
+            mock::global_ssh_invocations_snapshot()
+                .iter()
+                .all(|call| call.worker_id != worker.id)
+        );
         assert!(
             probe_owned_recovery_transport_until(
                 &worker,
@@ -1995,13 +1999,9 @@ mod tests {
                 ..Default::default()
             }
             .with_timing_scale(rch_common::timing::TimingScale::try_from(scale).unwrap());
-            let result = check_worker_health_for_endpoint(
-                &WorkerConfig::default(),
-                true,
-                &config,
-                None,
-            )
-            .await;
+            let result =
+                check_worker_health_for_endpoint(&WorkerConfig::default(), true, &config, None)
+                    .await;
             assert_eq!(result.healthy, scale > 1.0, "scale={scale}");
             assert_eq!(result.command_failure, scale == 1.0, "scale={scale}");
         }
@@ -3535,8 +3535,7 @@ mod tests {
                 .await;
             let config_guard = worker.config.write().await;
             let policy = rch_common::timing::TimingScale::try_from(scale).unwrap();
-            let deadline =
-                tokio::time::Instant::now() + policy.duration(Duration::from_secs(2));
+            let deadline = tokio::time::Instant::now() + policy.duration(Duration::from_secs(2));
             // Per-phase SSH allowances are deliberately longer than the caller
             // budget: the response deadline must also fence publication.
             let probe = probe_worker_capabilities_until(

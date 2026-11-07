@@ -515,11 +515,13 @@ impl<'a> ToolchainAdmission<'a> {
         deadline: Instant,
         healthy: impl Fn() -> bool,
     ) -> io::Result<(ToolchainInput, Option<UploadPublisher<'a>>)> {
-        let cancelled = || {
-            stopped.load(Ordering::Acquire) || !healthy() || Instant::now() >= deadline
-        };
+        let cancelled =
+            || stopped.load(Ordering::Acquire) || !healthy() || Instant::now() >= deadline;
         loop {
-            match self.cache.acquire(self.edge_pin, &self.identity, cancelled)? {
+            match self
+                .cache
+                .acquire(self.edge_pin, &self.identity, cancelled)?
+            {
                 ToolchainAcquisition::Ready(lease) => {
                     return Ok((ToolchainInput::Reuse(lease), None));
                 }
@@ -676,9 +678,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     let (source, toolchain) =
         receive_inputs(wire, source, toolchain, stopped, input_deadline).await?;
     let toolchain = match disposition {
-        ToolchainDisposition::Upload => {
-            caches.toolchains.adopt(edge_pin, toolchain, cancelled)?
-        }
+        ToolchainDisposition::Upload => caches.toolchains.adopt(edge_pin, toolchain, cancelled)?,
         ToolchainDisposition::Reuse => toolchain,
     };
     if let Some(publisher) = publisher {
@@ -1524,21 +1524,23 @@ mod tests {
             let peer = AdmissionPeer::new(input);
             let output = Arc::clone(&peer.output);
             let mut wire = Wire::new(peer);
-            assert!(ready(
-                ToolchainAdmission {
-                    cache: &cache,
-                    edge_pin: pin,
-                    identity,
-                    input_root: inputs.path(),
-                }
-                .prepare(
-                    &mut wire,
-                    &AtomicBool::new(false),
-                    Instant::now() + Duration::from_secs(5),
-                    || true,
-                ),
-            )
-            .is_err());
+            assert!(
+                ready(
+                    ToolchainAdmission {
+                        cache: &cache,
+                        edge_pin: pin,
+                        identity,
+                        input_root: inputs.path(),
+                    }
+                    .prepare(
+                        &mut wire,
+                        &AtomicBool::new(false),
+                        Instant::now() + Duration::from_secs(5),
+                        || true,
+                    ),
+                )
+                .is_err()
+            );
             assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
             assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
             assert!(matches!(
@@ -1595,7 +1597,11 @@ mod tests {
                 io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
             ));
             assert_eq!(fs::read_dir(inputs.path()).unwrap().count(), 0);
-            assert!(messages(&output).iter().all(|message| message["kind"] == "queued"));
+            assert!(
+                messages(&output)
+                    .iter()
+                    .all(|message| message["kind"] == "queued")
+            );
             assert!(matches!(
                 cache.acquire(pin, &identity, || false).unwrap(),
                 ToolchainAcquisition::Wait(_)
@@ -1754,13 +1760,9 @@ mod tests {
         )
         .unwrap();
         seed.begin_transfer(deadline).unwrap();
-        seed.write_chunk(
-            "src/lib.rs",
-            0,
-            bytes,
-            Sha256::digest(bytes).into(),
-            || false,
-        )
+        seed.write_chunk("src/lib.rs", 0, bytes, Sha256::digest(bytes).into(), || {
+            false
+        })
         .unwrap();
         seed.finish(|| false).unwrap();
         let owner = crate::test_util::private_tempdir();
