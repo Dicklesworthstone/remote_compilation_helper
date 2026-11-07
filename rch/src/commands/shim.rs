@@ -1263,7 +1263,7 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
 /// Render the installed scripts for tests of RCH's worker-side handoff. The
 /// transfer tests exercise these scripts together with the generated remote
 /// command, so a change to either side cannot silently break their contract.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 pub(crate) fn test_cargo_shim_body() -> String {
     cargo_shim_body(true)
 }
@@ -2824,7 +2824,13 @@ esac
             (cargo_clippy_shim_body(true), vec!["--all-targets"]),
         ] {
             for require_remote in [None, Some("1"), Some("true")] {
-                for origin in [None, Some(""), Some("caller"), Some("rch-extra")] {
+                for origin in [
+                    None,
+                    Some(""),
+                    Some("caller"),
+                    Some("rch-extra"),
+                    Some("RCH"),
+                ] {
                     let mut environment = vec![("RCH_CARGO_WRAPPER_BYPASS", "1")];
                     if let Some(value) = require_remote {
                         environment.push(("RCH_REQUIRE_REMOTE", value));
@@ -3041,7 +3047,13 @@ esac
     #[test]
     fn installed_toolchain_wrapper_cannot_bypass_strict_shim_with_unpaired_markers() {
         for require_remote in [None, Some("1")] {
-            for origin in [None, Some(""), Some("caller"), Some("rch-extra")] {
+            for origin in [
+                None,
+                Some(""),
+                Some("caller"),
+                Some("rch-extra"),
+                Some("RCH"),
+            ] {
                 for args in [vec!["test"], vec!["--version"]] {
                     let mut environment = vec![("RCH_CARGO_WRAPPER_BYPASS", "1")];
                     if let Some(value) = require_remote {

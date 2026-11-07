@@ -39,6 +39,16 @@ pub(crate) fn quote_shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Start an RCH-owned worker child without letting its Cargo shim offload the
+/// job again. Override inherited values together, including on opaque scripts
+/// and the disk supervisor, so every descendant sees the same loop-break
+/// contract. This does not change the worker process's own environment.
+pub(crate) fn managed_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.envs(rch_common::MANAGED_CARGO_ENV);
+    command
+}
+
 /// Sentinel exit code returned when worker-side dependency prepare
 /// (`bun install` / `npm install`) fails or times out *before* the user command
 /// runs. Distinct from a real build/test exit 1 so the client can report
@@ -560,7 +570,7 @@ pub async fn execute_with_disk_budget(
         } else {
             command.to_owned()
         };
-        let mut guarded = Command::new("python3");
+        let mut guarded = managed_command("python3");
         guarded
             .args([
                 "-I",
@@ -582,16 +592,11 @@ pub async fn execute_with_disk_budget(
         disk_receipt = Some((receipt, marker, budget));
         guarded
     } else {
-        let mut shell = Command::new("sh");
+        let mut shell = managed_command("sh");
         shell.args(["-c", command]);
         shell
     };
-    // This child is already executing on the selected worker. Stamp the whole
-    // shim-v9 loop-break pair here, even if the incoming environment contains
-    // a bare or stale bypass marker. Keep it on the child Command so a dual-role
-    // host's ordinary dispatcher invocations do not inherit bypass authority.
-    cmd.envs(rch_common::MANAGED_CARGO_ENV)
-        .current_dir(workdir)
+    cmd.current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

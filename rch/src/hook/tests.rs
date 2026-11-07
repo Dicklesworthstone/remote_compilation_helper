@@ -3589,7 +3589,7 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
     let command = local_fallback_command("cargo test -p rch");
 
     let has_bypass = command.get_envs().any(|(key, value)| {
-        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_BYPASS_ENV)
+        key == std::ffi::OsStr::new("RCH_CARGO_WRAPPER_BYPASS")
             && value == Some(std::ffi::OsStr::new("1"))
     });
     assert!(
@@ -3597,8 +3597,8 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
         "local fallback must bypass the PATH cargo wrapper to avoid recursive rch exec"
     );
     let has_origin = command.get_envs().any(|(key, value)| {
-        key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_ENV)
-            && value == Some(std::ffi::OsStr::new(RCH_CARGO_WRAPPER_ORIGIN_RCH))
+        key == std::ffi::OsStr::new("RCH_CARGO_WRAPPER_ORIGIN")
+            && value == Some(std::ffi::OsStr::new("rch"))
     });
     assert!(
         has_origin,
@@ -3656,6 +3656,52 @@ fn remote_required_fallback_refuses_before_building_local_shell_command() {
         local_fallback_command_for_policy(command, false).is_ok(),
         "ordinary local fallback behavior remains available when remote is not required"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_authorized_local_fallback_executes_the_strict_cargo_shim() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = test_guard!();
+    let root = tempfile::tempdir().unwrap();
+    let write_executable = |name: &str, body: &str| {
+        let path = root.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let shim = write_executable("cargo", &crate::commands::shim::test_cargo_shim_body());
+    let real = write_executable(
+        "real-cargo",
+        "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$RCH_CARGO_WRAPPER_BYPASS\" \
+\"$RCH_CARGO_WRAPPER_ORIGIN\" \"$*\"\nexit 37\n",
+    );
+    write_executable(
+        "rch",
+        "#!/bin/sh\nprintf 'unexpected offload\\n' >&2\nexit 95\n",
+    );
+    let requested = format!(
+        "{} test --locked",
+        shell_escape::escape(shim.to_str().unwrap().into())
+    );
+    assert!(matches!(
+        local_fallback_command_for_policy(&requested, true),
+        Err(LocalFallbackRefusal::RemoteRequired)
+    ));
+    // Explicit local placement is already authorized by the policy caller.
+    // Even an inherited strict-remote flag must not make this recurse.
+    let output = local_fallback_command_for_policy(&requested, false)
+        .unwrap()
+        .env("HOME", root.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", root.path().display()))
+        .env("RCH_REAL_CARGO", real)
+        .env("RCH_REQUIRE_REMOTE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(output.stdout, b"1:rch:test --locked\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

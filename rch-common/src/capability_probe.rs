@@ -261,6 +261,9 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
 
     let mut s = String::new();
     s.push_str("set -u; P='RCH_FACT '; ");
+    // A dual-role worker may have both PATH and toolchain Cargo shims. Probe
+    // their managed execution environment, not a caller-supplied bare bypass.
+    s.push_str(&crate::exec_policy::managed_cargo_shell_exports());
     // Host facts.
     s.push_str("printf '%sos=%s\\n' \"$P\" \"$(uname -s | tr 'A-Z' 'a-z')\"; ");
     s.push_str("printf '%sarch=%s\\n' \"$P\" \"$(uname -m)\"; ");
@@ -1023,6 +1026,38 @@ mod tests {
         s.cargo_path = Some("/home/rch/.cargo/bin/cargo".to_string());
         s.disk_roots = vec!["/data/tmp".to_string()];
         s
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_capability_probe_uses_the_managed_worker_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let cargo = root.path().join("cargo with spaces");
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\n[ \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 ] && \
+[ \"$RCH_CARGO_WRAPPER_ORIGIN\" = rch ] || exit 1\nprintf 'cargo fixture\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut spec = ProbeSpec::new("fixture", "/absent/rch-wkr");
+        spec.cargo_path = Some(cargo.to_str().unwrap().to_owned());
+        spec.rustup_path = Some("/absent/rustup".to_owned());
+        spec.rust_components = false;
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &build_capability_probe_script(&spec)])
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "0")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let facts = parse_capability_probe(std::str::from_utf8(&output.stdout).unwrap());
+        assert_eq!(facts.rust.rustc_version.as_deref(), Some("cargo fixture"));
     }
 
     fn tool(name: &str, argv: &[&str]) -> NamedToolProbe {

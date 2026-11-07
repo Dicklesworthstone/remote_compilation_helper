@@ -131,9 +131,6 @@ const EXIT_ARTIFACT_TRANSFER_FAILED: i32 = 102;
 /// config) keep [`EXIT_BUILD_ERROR`].
 const EXIT_REMOTE_REQUIRED_REFUSED: i32 = 103;
 
-const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
-const RCH_CARGO_WRAPPER_ORIGIN_ENV: &str = "RCH_CARGO_WRAPPER_ORIGIN";
-const RCH_CARGO_WRAPPER_ORIGIN_RCH: &str = "rch";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 
 /// Opt-out knob for remote target-dir REUSE. When set to a truthy value the hook
@@ -1224,8 +1221,7 @@ fn exec_worker_preferences(
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
-        .env(RCH_CARGO_WRAPPER_BYPASS_ENV, "1")
-        .env(RCH_CARGO_WRAPPER_ORIGIN_ENV, RCH_CARGO_WRAPPER_ORIGIN_RCH)
+        .envs(rch_common::MANAGED_CARGO_ENV)
         .arg("-c")
         .arg(command);
     child

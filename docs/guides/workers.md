@@ -213,6 +213,34 @@ rch workers probe --all
 rch workers probe worker1 --verbose
 ```
 
+### Cargo on Dual-Role Workers
+
+A worker can also run its own agents with `rch shim install` enabled. Once RCH
+has placed a command on that worker, its child environment supplies both
+`RCH_CARGO_WRAPPER_BYPASS=1` and `RCH_CARGO_WRAPPER_ORIGIN=rch`. This applies to
+SSH jobs, nested scripts and `rch-wkr execute`, including disk-supervised jobs.
+The shim continues to reject a caller-set bypass without the managed origin
+when remote execution is required.
+
+Refresh the worker execution checks before sending builds:
+
+```bash
+rch --json workers capabilities --refresh --command 'cargo test'
+```
+
+On the worker, `rch-wkr capabilities` runs `cargo --version` through PATH and,
+when rustup is available, directly invokes the Cargo reported by
+`rustup which cargo`. Both use the same managed child environment as worker
+execution. The checks share a five-second deadline and a 16 KiB output limit.
+A failed check clears the Rust capability and reports its cause in
+`probe_warnings`; other runtimes and worker connectivity remain independently
+usable. Pinned-toolchain admission also checks both Cargo entry points.
+
+For `worker Cargo execution check failed`, inspect the reported PATH or
+toolchain failure, update the dispatcher and worker binaries together, and
+repair the worker's Cargo/shim installation as needed. Re-run the capability
+refresh afterward. Do not export bypass markers globally in an agent shell.
+
 ### Updating Workers
 
 ```bash

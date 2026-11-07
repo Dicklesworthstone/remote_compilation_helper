@@ -4657,10 +4657,7 @@ async fn probe_worker_toolchain(
         ..Default::default()
     };
 
-    let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
-    let command = format!(
-        "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
-    );
+    let command = worker_toolchain_probe_command(toolchain_name);
 
     // Pooled path: run over the warm shared ControlMaster (no per-probe master
     // spawn/leak). The pool distinguishes connect failures internally, so map a
@@ -4689,6 +4686,20 @@ async fn probe_worker_toolchain(
         )),
         Err(reason) => Err(reason),
     }
+}
+
+/// Test both Cargo entry points in the managed environment used by real jobs.
+/// A healthy rustc alone cannot establish that a dual-role worker's shims will
+/// permit Cargo. Keep the requested toolchain active for the PATH shim too.
+fn worker_toolchain_probe_command(toolchain_name: &str) -> String {
+    let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
+    let managed_environment = rch_common::exec_policy::managed_cargo_shell_exports();
+    format!(
+        "{managed_environment}export RUSTUP_TOOLCHAIN={escaped_toolchain}; \
+rustup run {escaped_toolchain} rustc --version >/dev/null && \
+cargo --version >/dev/null && \
+rustup run {escaped_toolchain} cargo --version >/dev/null"
+    )
 }
 
 fn short_preflight_error(stderr: &str) -> String {
@@ -4726,6 +4737,133 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
+
+    /// Execute the production preflight shell with inert tool executables.
+    /// The doubles record environment and routing; these are not live Cargo,
+    /// rustup or SSH checks. Real shim behavior is exercised in the CLI tests.
+    #[cfg(unix)]
+    fn run_toolchain_probe_fixture(
+        toolchain: &str,
+        fail: &str,
+    ) -> (std::process::Output, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("path bin");
+        let toolchain_bin = root.path().join("toolchain bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&toolchain_bin).unwrap();
+        let log = root.path().join("invocations");
+        for (path, name, failure) in [
+            (toolchain_bin.join("rustc"), "rustc", 16),
+            (bin.join("cargo"), "path-cargo", 17),
+            (toolchain_bin.join("cargo"), "toolchain-cargo", 18),
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n\
+                     printf '%s\\0' '{name}' \"${{RCH_CARGO_WRAPPER_BYPASS-unset}}\" \
+\"${{RCH_CARGO_WRAPPER_ORIGIN-unset}}\" \"${{RUSTUP_TOOLCHAIN-unset}}\" \
+\"$*\" >> \"$RCH_TEST_PROBE_LOG\"\n\
+                     [ \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 ] && \
+[ \"$RCH_CARGO_WRAPPER_ORIGIN\" = rch ] && \
+[ \"$RUSTUP_TOOLCHAIN\" = \"$RCH_TEST_TOOLCHAIN\" ] || exit 92\n\
+                     [ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 93\n\
+                     if [ \"$RCH_TEST_FAIL\" = '{name}' ]; then\n\
+                       printf 'fixture {name} failed\\n' >&2\n\
+                       exit {failure}\n\
+                     fi\n\
+                     printf '{name} fixture-version\\n'\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let rustup = bin.join("rustup");
+        std::fs::write(
+            &rustup,
+            "#!/bin/sh\n\
+             [ \"$#\" = 4 ] && [ \"$1\" = run ] && \
+[ \"$2\" = \"$RCH_TEST_TOOLCHAIN\" ] && [ \"$4\" = --version ] || exit 94\n\
+             case \"$3\" in rustc|cargo) exec \"$RCH_TEST_TOOLCHAIN_BIN/$3\" \"$4\";; \
+*) exit 95;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &worker_toolchain_probe_command(toolchain)])
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", &bin)
+            .env("RCH_CARGO_WRAPPER_BYPASS", "0")
+            .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+            .env("RCH_REQUIRE_REMOTE", "1")
+            .env("RUSTUP_TOOLCHAIN", "inherited-other-toolchain")
+            .env("RCH_TEST_TOOLCHAIN", toolchain)
+            .env("RCH_TEST_TOOLCHAIN_BIN", &toolchain_bin)
+            .env("RCH_TEST_PROBE_LOG", &log)
+            .env("RCH_TEST_FAIL", fail)
+            .output()
+            .unwrap();
+        let invocations = std::fs::read_to_string(&log)
+            .unwrap()
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect();
+        (output, invocations)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_toolchain_probe_checks_both_cargo_routes_with_managed_environment() {
+        // The second value also verifies that a toolchain name remains data
+        // through every shell invocation, including the environment export.
+        for toolchain in [
+            "nightly-2026-08-31",
+            "nightly with spaces'$(printf INJECTED)",
+        ] {
+            let (output, invocations) = run_toolchain_probe_fixture(toolchain, "");
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                output.stdout.is_empty(),
+                "probe output must stay suppressed"
+            );
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let expected: Vec<_> = ["rustc", "path-cargo", "toolchain-cargo"]
+                .into_iter()
+                .flat_map(|name| [name, "1", "rch", toolchain, "--version"])
+                .collect();
+            assert_eq!(invocations, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_toolchain_probe_fails_when_either_cargo_route_is_broken() {
+        for (fail, status, expected_calls) in [
+            ("path-cargo", 17, vec!["rustc", "path-cargo"]),
+            (
+                "toolchain-cargo",
+                18,
+                vec!["rustc", "path-cargo", "toolchain-cargo"],
+            ),
+        ] {
+            let (output, invocations) = run_toolchain_probe_fixture("nightly-fixture", fail);
+            assert_eq!(output.status.code(), Some(status), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!("fixture {fail} failed\n")
+            );
+            let expected: Vec<_> = expected_calls
+                .into_iter()
+                .flat_map(|name| [name, "1", "rch", "nightly-fixture", "--version"])
+                .collect();
+            assert_eq!(invocations, expected);
+        }
+    }
 
     fn assert_golden_json(
         actual: serde_json::Value,

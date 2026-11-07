@@ -18779,7 +18779,11 @@ Number of files transferred: 42
                 prefix.prefix
             );
             assert_eq!(
-                prefix.applied.iter().filter(|applied| *applied == key).count(),
+                prefix
+                    .applied
+                    .iter()
+                    .filter(|applied| *applied == key)
+                    .count(),
                 1,
                 "{key} must be reported exactly once"
             );
@@ -18827,7 +18831,11 @@ Number of files transferred: 42
         for key in ["RCH_CARGO_WRAPPER_BYPASS", "RCH_CARGO_WRAPPER_ORIGIN"] {
             assert_eq!(prefix.prefix.matches(&format!("{key}=")).count(), 1);
             assert_eq!(
-                prefix.applied.iter().filter(|applied| *applied == key).count(),
+                prefix
+                    .applied
+                    .iter()
+                    .filter(|applied| *applied == key)
+                    .count(),
                 1,
                 "each loop-break marker must be assigned exactly once"
             );
@@ -18859,11 +18867,8 @@ Number of files transferred: 42
                     }
                     let write_exe = |path: &Path, body: &str| {
                         std::fs::write(path, body).unwrap();
-                        std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(0o755),
-                        )
-                        .unwrap();
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
                     };
                     write_exe(
                         &shims.join("cargo"),
@@ -18918,7 +18923,10 @@ Number of files transferred: 42
                             "RCH_TEST_TOOLCHAIN_CARGO".to_string(),
                             toolchain_bin.join("cargo").to_str().unwrap().to_string(),
                         ),
-                        ("RCH_TEST_LOG".to_string(), log.to_str().unwrap().to_string()),
+                        (
+                            "RCH_TEST_LOG".to_string(),
+                            log.to_str().unwrap().to_string(),
+                        ),
                         (
                             "RCH_TEST_OFFLOAD".to_string(),
                             offload.to_str().unwrap().to_string(),
@@ -18948,11 +18956,8 @@ Number of files transferred: 42
                         ..Default::default()
                     });
                     let script = root.join("remote-command.sh");
-                    std::fs::write(
-                        &script,
-                        pipeline.build_remote_command("sh ./job.sh", None),
-                    )
-                    .unwrap();
+                    std::fs::write(&script, pipeline.build_remote_command("sh ./job.sh", None))
+                        .unwrap();
                     let output = std::process::Command::new("/usr/bin/timeout")
                         .args(["--kill-after=5", "30", "/bin/sh"])
                         .arg(&script)
@@ -18967,7 +18972,10 @@ Number of files transferred: 42
                         Some(exit_code),
                         "tracked={tracked}, require_remote={require_remote:?}: {output:?}"
                     );
-                    assert!(!offload.exists(), "an admitted job must never offload again");
+                    assert!(
+                        !offload.exists(),
+                        "an admitted job must never offload again"
+                    );
                     assert_eq!(
                         std::fs::read(&log).unwrap().as_slice(),
                         concat!(
@@ -18982,6 +18990,118 @@ Number of files transferred: 42
                         b"cargo fixture\ncargo fixture\ncargo fixture\n"
                     );
                 }
+            }
+        }
+    }
+
+    /// Execute the actual remote launcher and installed shim bodies. Cargo and
+    /// rch are inert argv/exit sentinels: this proves the shell/environment
+    /// contract on a dual-role worker, not an SSH connection or a Rust build.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_job_cargo_uses_managed_origin_through_worker_supervision() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let shims = home.join(".rch/shims");
+        let tools = root.path().join("tools");
+        let toolchain = root.path().join("toolchain with spaces/bin");
+        for directory in [&shims, &tools, &toolchain] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let executable = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(
+            &shims.join("cargo"),
+            &crate::commands::shim::test_cargo_shim_body(),
+        );
+        executable(
+            &toolchain.join("cargo"),
+            &crate::commands::shim::test_toolchain_wrap_body(),
+        );
+        let real_cargo = toolchain.join("cargo-rch-real");
+        executable(
+            &real_cargo,
+            "#!/bin/sh\nprintf 'cargo-fixture:%s:%s:%s\\n' \
+\"$RCH_CARGO_WRAPPER_BYPASS\" \"$RCH_CARGO_WRAPPER_ORIGIN\" \"$*\"\n\
+if [ \"${1:-}\" = test ]; then exit \"$RCH_TEST_CARGO_EXIT\"; fi\n",
+        );
+        executable(
+            &tools.join("rch"),
+            "#!/bin/sh\nprintf 'unexpected recursive offload\\n' >&2\nexit 95\n",
+        );
+        let job = root.path().join("job.sh");
+        std::fs::write(
+            &job,
+            "set -eu\nHOME=$RCH_TEST_HOME\nPATH=$RCH_TEST_PATH\nexport HOME PATH\n\
+cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n",
+        )
+        .unwrap();
+        let workload = format!("bash {}", escape(Cow::from(job.to_str().unwrap())));
+        let path = format!("{}:{}:/usr/bin:/bin", shims.display(), tools.display());
+        for (index, (guarded, exit_code)) in [(false, 0), (false, 101), (true, 0), (true, 101)]
+            .into_iter()
+            .enumerate()
+        {
+            let project = root.path().join(format!("project-{index}"));
+            std::fs::create_dir(&project).unwrap();
+            let pipeline = if guarded {
+                disk_budget_test_pipeline(&project, Some(index as u64 + 1), 15)
+            } else {
+                cargo_home_boundary_pipeline(&project)
+            }
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_env_allowlist(vec![
+                "RCH_CARGO_WRAPPER_BYPASS".to_owned(),
+                "RCH_CARGO_WRAPPER_ORIGIN".to_owned(),
+            ])
+            .with_env_overrides(HashMap::from([
+                ("RCH_CARGO_WRAPPER_BYPASS".to_owned(), "0".to_owned()),
+                ("RCH_CARGO_WRAPPER_ORIGIN".to_owned(), "caller".to_owned()),
+            ]));
+            // Production also carries large supervisors on stdin/a script,
+            // never in a single exec argument (Linux MAX_ARG_STRLEN).
+            let script = root.path().join(format!("launch-{index}.sh"));
+            std::fs::write(&script, pipeline.build_remote_command(&workload, None)).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", &path)
+                .env("RCH_TEST_HOME", &home)
+                .env("RCH_TEST_PATH", &path)
+                .env("RCH_REAL_CARGO", &real_cargo)
+                .env("RCH_TEST_TOOLCHAIN_CARGO", toolchain.join("cargo"))
+                .env("RCH_TEST_CARGO_EXIT", exit_code.to_string())
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(exit_code),
+                "case {index}: {output:?}"
+            );
+            assert_eq!(
+                output.stdout,
+                b"cargo-fixture:1:rch:--version\ncargo-fixture:1:rch:--version\ncargo-fixture:1:rch:test --locked\n",
+                "case {index}: {output:?}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("recursive offload"));
+            if guarded {
+                pipeline
+                    .ensure_remote_disk_budget(&CommandResult {
+                        exit_code,
+                        stdout: String::from_utf8(output.stdout).unwrap(),
+                        stderr: String::from_utf8(output.stderr).unwrap(),
+                        duration_ms: 0,
+                    })
+                    .unwrap();
             }
         }
     }
