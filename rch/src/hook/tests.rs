@@ -2950,6 +2950,13 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
     assert_ne!(first.execution_receipt(), second.execution_receipt());
 
     let retained = tempfile::tempdir().unwrap().keep();
+    // The archive cache refuses group-writable ancestors; a umask-002 host
+    // would otherwise create this fixture 0775 and bypass the cache (bd-t19ig).
+    std::fs::set_permissions(
+        &retained,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
     let cargo_home = retained.join("cargo-home");
     std::fs::create_dir(&cargo_home).unwrap();
     let mut cargo = PathBuf::from(env!("CARGO"));
@@ -3018,11 +3025,22 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
+            // Production runs `mkdir -p` and the cache under `umask 0022`
+            // (transfer.rs); reproduce that rather than the caller's umask.
             std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(
+                &root,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
             let transport = root.join(".rch-clean-overlay-base.tar");
             let cache = |operation: &str| {
-                let output = std::process::Command::new("/usr/bin/timeout")
+                let output = std::process::Command::new("/bin/sh")
                     .args([
+                        "-c",
+                        "umask 0022 && exec \"$@\"",
+                        "rch-archive-cache",
+                        "/usr/bin/timeout",
                         "--kill-after=5",
                         "120",
                         "/usr/bin/python3",
@@ -3056,9 +3074,10 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
             if !unchanged {
                 std::fs::copy(archive.path(), &transport).unwrap();
             }
-            tar::Archive::new(std::fs::File::open(&transport).unwrap())
-                .unpack(&root)
-                .unwrap();
+            let mut unpack = tar::Archive::new(std::fs::File::open(&transport).unwrap());
+            // The worker's tar extracts under the same 0022 umask.
+            unpack.set_mask(0o022);
+            unpack.unpack(&root).unwrap();
             if !unchanged {
                 assert_eq!(cache("publish"), "RCH_GIT_ARCHIVE_CACHE_V1 PUBLISHED\n");
             }

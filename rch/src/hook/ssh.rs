@@ -3860,6 +3860,18 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     }
 
     #[cfg(target_os = "linux")]
+    /// A registry fixture's parent, owner-only like the tree production
+    /// creates under `umask 077`. A plain tempdir follows the caller's umask
+    /// (0775 under the fleet's 002), and the registry refuses a group-writable
+    /// parent (bd-t19ig).
+    #[cfg(target_os = "linux")]
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
     async fn test_source_intent(
         registry: &Path,
         roots: &[String],
@@ -4688,7 +4700,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     async fn durable_source_registry_repairs_empty_legacy_cancellation_as_unowned() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let registry = directory.path().join("registry");
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -4774,7 +4786,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[tokio::test]
     async fn durable_source_registry_write_failure_keeps_partial_bytes_private() {
         for limit in [0, 1] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = private_tempdir();
             let registry = directory.path().join("registry");
             // Real EFBIG from RLIMIT_FSIZE exercises zero-byte and truncated
             // writes, without a mocked printf, filesystem, sync, or rename.
@@ -4825,7 +4837,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             assert_eq!(cancelled.stdout, b"unowned");
         }
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let registry = directory.path().join("registry");
         let roots = vec![directory.path().join("source").display().to_string()];
         let (contents, digest) = source_claim_roots(&roots).unwrap();
@@ -5097,6 +5109,13 @@ os.execv({python:?}, [{python:?}] + args)
             .prefix("rch-source-registry-portable-")
             .tempdir_in("/tmp")
             .unwrap();
+        // The registry refuses a group-writable parent; under the fleet's
+        // umask 002 this tempdir would be 0775 (bd-t19ig).
+        std::fs::set_permissions(
+            directory.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let registry = directory.path().join("registry");
         let root = directory.path().join("source");
         std::fs::create_dir_all(root.join("sub")).unwrap();

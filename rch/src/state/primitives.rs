@@ -155,13 +155,28 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
             .context("atomic write has no destination name")?,
     );
     temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
-    atomic_write_with_temporary_name(path, content, &temporary)
+    atomic_write_with_temporary_name(path, content, &temporary, 0o666)
+}
+
+/// [`atomic_write`] for files only this user may read or write (job lease
+/// journals): created `0600` whatever the umask. Recovery refuses a current
+/// journal that grants group or other write, so a umask-002 host writing a
+/// lease through [`atomic_write`] (`0664`) made it unrecoverable (bd-t19ig).
+pub(crate) fn atomic_write_private(path: &Path, content: &[u8]) -> Result<()> {
+    let mut temporary = std::ffi::OsString::from(".");
+    temporary.push(
+        path.file_name()
+            .context("atomic write has no destination name")?,
+    );
+    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    atomic_write_with_temporary_name(path, content, &temporary, 0o600)
 }
 
 fn atomic_write_with_temporary_name(
     path: &Path,
     content: &[u8],
     temporary: &std::ffi::OsStr,
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -206,7 +221,7 @@ fn atomic_write_with_temporary_name(
                 directory.as_fd(),
                 temporary,
                 OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::from_bits_truncate(0o666),
+                Mode::from_bits_truncate(mode),
             )
             .with_context(|| format!("create exclusive temporary {temp_path:?}"))?,
         );
@@ -745,6 +760,30 @@ mod tests {
         log_test_pass("test_atomic_write_no_temp_files_left");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_write_is_owner_only_and_replaces_a_group_writable_journal() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let journal = temp_dir.path().join("rchw-lease.json");
+        // What a umask-002 host left behind through the shared writer.
+        fs::write(&journal, b"older journal").unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o664)).unwrap();
+        atomic_write_private(&journal, b"current journal").unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"current journal");
+        // Requested 0600: a umask can only clear bits, never grant group write.
+        assert_eq!(
+            fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let fresh = temp_dir.path().join("fresh.json");
+        atomic_write_private(&fresh, b"{}").unwrap();
+        assert_eq!(
+            fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn atomic_write_retains_failed_rename_bytes_and_occupied_temporary() {
         let directory = tempfile::Builder::new()
@@ -772,7 +811,9 @@ mod tests {
         fs::write(directory.path().join(occupied), b"original temporary").unwrap();
         // The same production writer takes its generated name as an argument;
         // exercise a real collision without replacing randomness or I/O.
-        assert!(atomic_write_with_temporary_name(&target, b"replacement", occupied).is_err());
+        assert!(
+            atomic_write_with_temporary_name(&target, b"replacement", occupied, 0o666).is_err()
+        );
         assert_eq!(fs::read(&target).unwrap(), b"original destination");
         assert_eq!(
             fs::read(directory.path().join(occupied)).unwrap(),

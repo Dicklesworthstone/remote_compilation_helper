@@ -610,7 +610,7 @@ mod tests {
                 // Independent watchdog makes reactor-blocking regressions
                 // fail instead of hanging the process indefinitely.
                 let _ = release_rx.recv_timeout(Duration::from_secs(3));
-                atomic_write(path, bytes)
+                atomic_write_private(path, bytes)
             })
         });
         ready_rx.await.unwrap();

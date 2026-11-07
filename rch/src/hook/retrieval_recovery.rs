@@ -11469,7 +11469,7 @@ mod tests {
             heartbeat_writer.persist_snapshot(|path, bytes| {
                 captured_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                atomic_write(path, bytes)
+                atomic_write_private(path, bytes)
             })
         });
         captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();

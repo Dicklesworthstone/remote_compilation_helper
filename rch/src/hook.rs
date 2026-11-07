@@ -5,7 +5,7 @@
 
 use crate::config::load_config;
 use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
-use crate::state::primitives::atomic_write;
+use crate::state::primitives::atomic_write_private;
 use crate::status_types::format_bytes;
 use crate::toolchain::{detect_toolchain, parse_channel_string};
 use crate::transfer::{
@@ -2995,7 +2995,9 @@ impl DurableLeaseWriter {
             !supersedes_recovery,
             "cannot supersede recovery custody without descriptor-bound journal snapshots on this platform"
         );
-        atomic_write(&self.path, &bytes)?;
+        // A loaded (ownerless) writer still publishes a private journal:
+        // recovery refuses one that grants group or other write.
+        atomic_write_private(&self.path, &bytes)?;
         // Unix atomic_write already synchronizes and verifies its held parent;
         // reopening the pathname here adds no durability to that publication.
         #[cfg(not(unix))]
@@ -3023,7 +3025,7 @@ impl DurableLeaseWriter {
         if let Some(ownership) = &self.recovery_ownership {
             return self.persist_snapshot(|_, bytes| ownership.publish(bytes));
         }
-        self.persist_snapshot(atomic_write)
+        self.persist_snapshot(atomic_write_private)
     }
 
     #[cfg(any(not(unix), test))]
