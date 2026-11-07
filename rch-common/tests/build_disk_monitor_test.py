@@ -437,15 +437,153 @@ class DiskMonitorTests(unittest.TestCase):
         value.observe_free({1: 31 * GIB}, 10)
         self.assertEqual(value.peak_growth, 2 * GIB)
 
+    def test_admission_preserves_probe_time_across_delayed_ledger_publication(self):
+        value = self.synthetic_monitor(budget=8 * MIB, floor=MIB)
+        device = self.target.stat().st_dev
+        value.devices, value.paths = {device}, [str(self.target)]
+        value.bindings = monitor.output_bindings(value.paths)
+        value.cargo_cache_bindings = {}
+        value.boot, value.group, value.start = monitor.boot_identity(), os.getpgrp(), "probe-time"
+        registry = monitor.Registry(str(self.registry))
+        clock = [1.0]
+        original_atomic_json = monitor.atomic_json
+
+        def publish(path, payload):
+            original_atomic_json(path, payload)
+            # The actual reservation is durable, but publishing it consumed
+            # time after the free-space probe returned.
+            clock[0] = 9.0
+
+        with patch.object(monitor, "filesystem_sample", return_value={device: GIB}), \
+                patch.object(monitor.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(monitor, "atomic_json", side_effect=publish), \
+                patch.object(monitor, "Registry", return_value=registry):
+            value.admit()
+        self.assertEqual(value.previous, (1.0, {device: GIB}))
+        self.assertEqual(value.free_start, {device: GIB})
+        self.assertEqual(value.free_min, {device: GIB})
+        self.assertEqual(registry.read(), [{
+            "boot": value.boot, "group": value.group, "leader_start": value.start,
+            "devices": [device], "budget": value.budget, "floor": value.floor,
+        }])
+        value.observe_free({device: 3 * GIB // 4}, 9.1)
+        self.assertEqual(value.free_start[device] - value.free_min[device], GIB // 4)
+        self.assertEqual(value.peak_growth, 0)
+
+    def test_sample_timestamp_precedes_delayed_post_probe_validation(self):
+        value = self.synthetic_monitor(budget=8 * MIB, floor=MIB)
+        device = self.target.stat().st_dev
+        value.devices, value.paths = {device}, [str(self.target)]
+        value.bindings = monitor.output_bindings(value.paths)
+        value.cargo_cache_bindings = {}
+        clock, checks = [1.0], [0]
+        original_verify = monitor.verify_output_bindings
+
+        def verify(bindings):
+            original_verify(bindings)
+            checks[0] += 1
+            if checks[0] == 2:
+                clock[0] = 9.0
+
+        with patch.object(monitor, "filesystem_sample", return_value={device: GIB}), \
+                patch.object(monitor.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(monitor, "verify_output_bindings", side_effect=verify):
+            sampled = value.sample()
+        self.assertEqual(checks[0], 2)
+        self.assertEqual(sampled, ({device: GIB}, 1.0))
+
+    def test_probe_time_preserves_slow_drop_but_refuses_real_burst_and_floor(self):
+        for later_time, rejected in ((9.0, False), (1.25, True)):
+            with self.subTest(later_time=later_time):
+                value = self.synthetic_monitor(budget=8 * MIB, floor=MIB)
+                device = self.target.stat().st_dev
+                value.devices, value.paths = {device}, [str(self.target)]
+                value.bindings = monitor.output_bindings(value.paths)
+                value.cargo_cache_bindings = {}
+                value.floors, value.free = {device: MIB}, {device: GIB}
+                value.free_start, value.free_min = dict(value.free), dict(value.free)
+                value.previous = (0.0, dict(value.free))
+                with patch.object(monitor, "filesystem_sample",
+                                  side_effect=[{device: GIB}, {device: 3 * GIB // 4}]), \
+                        patch.object(monitor.time, "monotonic", side_effect=[1.0, later_time]):
+                    old_probe, fresh_probe = value.sample(), value.sample()
+                # Consumption occurs long after both real probes. That delay
+                # must neither invent a burst nor erase one that was measured.
+                with patch.object(monitor.time, "monotonic", return_value=1000.0):
+                    value.observe_free(*old_probe)
+                    if rejected:
+                        with self.assertRaises(monitor.BudgetFailure) as caught:
+                            value.observe_free(*fresh_probe)
+                        self.assertEqual(caught.exception.reason, "free_floor")
+                    else:
+                        value.observe_free(*fresh_probe)
+                        self.assertEqual(value.previous, (later_time, {device: 3 * GIB // 4}))
+                self.assertEqual(value.free_start[device] - value.free_min[device], GIB // 4)
+                self.assertEqual(value.peak_growth, 0)
+        value = self.synthetic_monitor(budget=8 * MIB, floor=MIB)
+        value.previous = None
+        with self.assertRaises(monitor.BudgetFailure) as caught:
+            value.observe_free({1: MIB}, 1000.0)
+        self.assertEqual(caught.exception.reason, "free_floor")
+
+    def test_delayed_terminal_consumption_keeps_true_free_drop_and_completes(self):
+        # The fixture changes only logical statvfs availability; it allocates
+        # no large files. Native bindings, census, guardian, and receipts run.
+        inject = f"""import threading
+original_filesystem_sample=m.filesystem_sample
+original_sample=m.Monitor.sample
+original_admit=m.Monitor.admit
+original_finish=m.finish_descendants
+admitted=False
+after_delay=False
+runtime_probe_seen=threading.Event()
+def filesystem_sample(paths):
+    samples=original_filesystem_sample(paths)
+    available={GIB} - ({GIB // 4} if after_delay else 0)
+    return {{device: available for device in samples}}
+def sample(value):
+    result=original_sample(value)
+    if admitted:
+        runtime_probe_seen.set()
+    return result
+def admit(value):
+    global admitted
+    result=original_admit(value)
+    admitted=True
+    return result
+def finish(value, heartbeat):
+    global after_delay
+    if not runtime_probe_seen.wait(1):
+        raise AssertionError('runtime free-space probe did not finish')
+    original_finish(value, heartbeat)
+    for _ in range(8):
+        heartbeat()
+        time.sleep(0.25)
+    after_delay=True
+m.filesystem_sample=filesystem_sample
+m.Monitor.sample=sample
+m.Monitor.admit=admit
+m.finish_descendants=finish"""
+        process, receipt = self.spawn("print('foreground-finished')", inject=inject)
+        status, stdout, stderr = self.complete(process)
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("foreground-finished", stdout)
+        usage = self.usage(receipt)
+        self.assertTrue(usage["complete"])
+        self.assertEqual(usage["exit_code"], 0)
+        self.assertEqual(usage["peak_growth_bytes"], 0)
+        self.assertIsNotNone(usage["incremental"])
+        self.assertEqual(usage["incremental"]["peak_free_drop_bytes"], GIB // 4)
+
     def test_flat_slot_allowance_cannot_admit_cold_test_budget(self):
         registry = monitor.Registry(str(self.registry))
         value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="test",
-                                budget=30 * GIB, floor=10 * GIB, devices={1}, sample=lambda: {1: 33 * GIB})
+                                budget=30 * GIB, floor=10 * GIB, devices={1}, sample=lambda: ({1: 33 * GIB}, time.monotonic()))
         with self.assertRaises(monitor.BudgetFailure) as caught:
             registry.admit(value)
         self.assertEqual(caught.exception.reason, "admission")
         value.budget = 4 * GIB
-        free, floors = registry.admit(value)
+        free, floors, _sampled_at = registry.admit(value)
         self.assertEqual((free, floors), ({1: 33 * GIB}, {1: 10 * GIB}))
 
     def test_reservation_retirement_requires_dead_group_or_new_boot(self):
@@ -462,9 +600,9 @@ class DiskMonitorTests(unittest.TestCase):
                       leader_start="retained", devices=[1], budget=7 * GIB, floor=10 * GIB)
         monitor.atomic_json(str(self.registry / "ledger.json"), {"version": 1, "entries": [record]})
         value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
-                                budget=4 * GIB, floor=2 * GIB, devices={1}, sample=lambda: {1: 21 * GIB})
+                                budget=4 * GIB, floor=2 * GIB, devices={1}, sample=lambda: ({1: 21 * GIB}, time.monotonic()))
         with patch.object(monitor, "process_snapshot", side_effect=AssertionError("unnecessary census")):
-            free, floors = registry.admit(value)
+            free, floors, _sampled_at = registry.admit(value)
         self.assertEqual((free, floors), ({1: 21 * GIB}, {1: 10 * GIB}))
         self.assertEqual(registry.read()[0], record)
         self.assertEqual(len(registry.read()), 2)
@@ -474,7 +612,7 @@ class DiskMonitorTests(unittest.TestCase):
         value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
                                 budget=4 * GIB, floor=2 * GIB, devices={1})
         samples = iter(({1: 5 * GIB}, {2: 20 * GIB}))
-        value.sample = lambda: next(samples)
+        value.sample = lambda: (next(samples), time.monotonic())
         with self.assertRaises(monitor.BudgetFailure) as caught:
             registry.admit(value)
         self.assertEqual(caught.exception.reason, "monitor_unavailable")
@@ -486,7 +624,7 @@ class DiskMonitorTests(unittest.TestCase):
                       leader_start="retained", devices=[1], budget=1, floor=0)
         monitor.atomic_json(str(self.registry / "ledger.json"), {"version": 1, "entries": [record] * 4096})
         value = SimpleNamespace(boot=monitor.boot_identity(), group=os.getpgrp(), start="new",
-                                budget=1, floor=0, devices={1}, sample=lambda: {1: GIB})
+                                budget=1, floor=0, devices={1}, sample=lambda: ({1: GIB}, time.monotonic()))
         with self.assertRaises(monitor.BudgetFailure) as caught:
             registry.admit(value)
         self.assertEqual(caught.exception.reason, "monitor_unavailable")
@@ -1165,19 +1303,19 @@ def scan(value):
         value.terminal_scan_done=True
     return total
 def sample(value):
-    samples=original_sample(value)
+    samples, sampled_at=original_sample(value)
     if getattr(value, 'terminal_scan_done', False):
         pathlib.Path({str(witness)!r}).write_text('sampled after final scan')
         condition={condition!r}
         if condition == 'floor':
-            return {{device: value.floor for device in samples}}
+            return {{device: value.floor for device in samples}}, sampled_at
         if condition == 'error':
             raise OSError('terminal filesystem probe failed')
         if condition == 'identity':
-            return {{max(samples) + 1: min(samples.values())}}
+            return {{max(samples) + 1: min(samples.values())}}, sampled_at
         if condition == 'timeout':
             time.sleep(5)
-    return samples
+    return samples, sampled_at
 m.finish_descendants=finish
 m.Monitor.observe_free=observe
 m.Monitor.scan=scan

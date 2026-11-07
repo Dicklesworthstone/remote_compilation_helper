@@ -533,7 +533,7 @@ class Registry:
         # or the ledger limit requires it, using the authoritative census.
         with self.locked():
             records = self.read()
-            free = monitor.sample()
+            free, sampled_at = monitor.sample()
             if set(free) != monitor.devices:
                 raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
 
@@ -545,7 +545,7 @@ class Registry:
             if len(records) >= 4096 or not fits():
                 groups = alive_groups(process_snapshot())
                 records = [entry for entry in records if reservation_alive(entry, monitor.boot, groups)]
-                free = monitor.sample()
+                free, sampled_at = monitor.sample()
                 if set(free) != monitor.devices:
                     raise BudgetFailure("monitor_unavailable", detail="filesystem changed before admission")
             if len(records) >= 4096:
@@ -563,7 +563,7 @@ class Registry:
                 "devices": sorted(monitor.devices), "budget": monitor.budget, "floor": monitor.floor,
             })
             atomic_json(self.root + "/ledger.json", {"version": 1, "entries": records})
-            return free, floors
+            return free, floors, sampled_at
 
 
 class Monitor:
@@ -589,7 +589,7 @@ class Monitor:
             self.controls.add(parent)
             parent = snapshot[parent]["parent"]
         self.parent = os.getppid()
-        self.devices = set(self.sample())
+        self.devices = set(self.sample()[0])
         identity = ["rch-pool-identity-v1", os.path.abspath(target), self.boot,
                     *self.bindings[target]]
         self.pool_identity = list(hashlib.sha256(
@@ -611,9 +611,13 @@ class Monitor:
         verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
         verify_output_bindings(self.bindings)
         samples = filesystem_sample(self.paths)
+        # Bind the clock to receipt of the probe, before validation or the
+        # supervisor can be delayed. Consumption time invents a write burst
+        # when an older sample is followed immediately by a fresh one.
+        sampled_at = time.monotonic()
         verify_output_bindings(self.bindings)
         verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
-        return samples
+        return samples, sampled_at
 
     def scan(self):
         verify_cargo_cache_bindings(getattr(self, "cargo_cache_bindings", {}))
@@ -665,9 +669,9 @@ class Monitor:
         self.admitted_pool = self.baseline_pool
 
     def admit(self):
-        self.free, self.floors = Registry().admit(self)
+        self.free, self.floors, sampled_at = Registry().admit(self)
         self.free_start, self.free_min = dict(self.free), dict(self.free)
-        self.previous = (time.monotonic(), self.free)
+        self.previous = (sampled_at, self.free)
 
     def observe_free(self, samples, now):
         if set(samples) != self.devices:
@@ -897,7 +901,7 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
             if timeout_seconds and now - execution_started >= timeout_seconds:
                 raise BudgetFailure("deadline", detail="remote execution deadline reached")
             if free_future.done():
-                monitor.observe_free(free_future.result(), now)
+                monitor.observe_free(*free_future.result())
                 free_future = executor.submit(monitor.sample)
                 free_started = now
             elif now - free_started > FREE_SAMPLE_DEADLINE:
@@ -913,7 +917,9 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
                 scan_started, next_scan = now, now + SCAN_INTERVAL
             time.sleep(POLL_SECONDS)
         finish_descendants(monitor, heartbeat)
-        monitor.observe_free(bounded_result(free_future, free_started + FREE_SAMPLE_DEADLINE, heartbeat), time.monotonic())
+        monitor.observe_free(*bounded_result(
+            free_future, free_started + FREE_SAMPLE_DEADLINE, heartbeat,
+        ))
         if scan_future is not None:
             monitor.observe_output(bounded_result(scan_future, scan_started + SCAN_DEADLINE, heartbeat))
         monitor.observe_output(bounded_result(executor.submit(monitor.scan), time.monotonic() + SCAN_DEADLINE, heartbeat))
@@ -921,9 +927,9 @@ def supervise(budget, floor, marker, target, paths, outputs, receipt_path, comma
         # (or the entire command). A final output scan can also take seconds
         # while unrelated jobs consume this filesystem. Only a NEW probe after
         # writers stop and scanning finishes can attest the completion floor.
-        monitor.observe_free(bounded_result(
+        monitor.observe_free(*bounded_result(
             executor.submit(monitor.sample), time.monotonic() + FREE_SAMPLE_DEADLINE, heartbeat,
-        ), time.monotonic())
+        ))
         # Completion means the foreground command ended, remaining writers
         # stopped, and final output and free-space checks passed. A nonzero exit
         # remains a complete measurement; callers gate successful learning on
