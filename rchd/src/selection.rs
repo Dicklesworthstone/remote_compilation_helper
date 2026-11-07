@@ -9,7 +9,13 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
-use crate::admission::AdmissionGate;
+use crate::admission::{AdmissionGate, ExecutionRequirements, TOOLCHAIN_PREFLIGHT_TTL};
+#[cfg(test)]
+use crate::admission::{
+    required_component_toolchain, required_rustup_component, required_tool_capability_mismatch,
+    rustup_component_capability_mismatch, toolchain_capability_mismatch,
+    toolchain_from_command_text,
+};
 use crate::disk_pressure::{
     DiskHeadroomAdmission, DiskHeadroomAvailability, DiskHeadroomRejection, PressureState,
 };
@@ -20,12 +26,14 @@ use crate::metrics::{
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use rand::RngExt;
+#[cfg(test)]
+use rch_common::WorkerCapabilities;
 use rch_common::timing::{MAX_CONTROL_TIMEOUT, scale_duration};
 use rch_common::{
-    CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
-    SelectionConfig, SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
-    SelectionWeightConfig, SshClient, SshOptions, ToolchainInfo, WorkerCapabilities, WorkerId,
-    WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus, classify_command,
+    CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
+    SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
+    SelectionWeightConfig, SshClient, SshOptions, WorkerId, WorkerSelectionDiagnostic,
+    WorkerSelectionDiagnosticDecision, WorkerStatus, classify_command,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,7 +49,6 @@ const PRIORITY_CACHE_TIEBREAK_SCORE: f64 = 1_000.0;
 const PRIORITY_SPEED_TIEBREAK_SCORE: f64 = 10.0;
 const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
-const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
 /// Reuse window for a probe that failed to reach the worker or timed out:
 /// long enough not to re-probe a sick worker on every request, short enough
 /// that a network blip does not exclude a healthy worker for 10 minutes.
@@ -1474,12 +1481,9 @@ impl WorkerSelector {
         // Last-success history is only a preference, never capability evidence.
         // In particular, an exact runtime or named-tool requirement must not
         // disappear when the normal eligibility pass finds no usable worker.
+        let requirements = ExecutionRequirements::new(request);
         let capabilities = worker.capabilities().await;
-        if !capabilities.has_runtime(request.required_runtime)
-            || required_tool_capability_mismatch(request, &capabilities).is_some()
-            || rustup_component_capability_mismatch(request, &capabilities).is_some()
-            || toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities).is_some()
-        {
+        if !requirements.capabilities_satisfied(&capabilities) {
             return None;
         }
         if capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
@@ -1579,7 +1583,7 @@ impl WorkerSelector {
         // A previous successful build cannot override a current toolchain
         // refusal. Reuse the same bounded, cached preflight as normal selection.
         if self
-            .toolchain_preflight_failure(worker.as_ref(), request)
+            .toolchain_preflight_failure(worker.as_ref(), &requirements)
             .await
             .is_some()
         {
@@ -1805,6 +1809,7 @@ impl WorkerSelector {
         let mut active_project_exclusion_count = 0usize;
 
         let required_os = required_os_for_request(request);
+        let requirements = ExecutionRequirements::new(request);
         for worker in all_workers {
             let config = worker.config.read().await;
             let worker_id = config.id.clone();
@@ -1830,16 +1835,16 @@ impl WorkerSelector {
                 active_project_exclusion_count += 1;
             }
 
-            let runtime_available = capabilities.has_runtime(request.required_runtime);
+            let runtime_available = capabilities.has_runtime(requirements.required_runtime());
 
-            let toolchain_mismatch =
-                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
-            let component_mismatch = rustup_component_capability_mismatch(request, &capabilities);
-            let tool_mismatch = required_tool_capability_mismatch(request, &capabilities);
-            let cached_toolchain_failure = if let Some(toolchain) = request.toolchain.as_ref() {
-                let toolchain_name = toolchain.rustup_toolchain();
+            let toolchain_mismatch = requirements.toolchain_mismatch(&capabilities);
+            let component_mismatch = requirements.component_mismatch(&capabilities);
+            let tool_mismatch = requirements.tool_mismatch(&capabilities);
+            let cached_toolchain_failure = if let Some(toolchain_name) =
+                requirements.preflight_toolchain()
+            {
                 worker
-                    .toolchain_preflight_status(&toolchain_name)
+                    .toolchain_preflight_status(toolchain_name)
                     .await
                     .filter(|status| {
                         status
@@ -2324,14 +2329,16 @@ impl WorkerSelector {
             }));
         }
 
+        let requirements = component_request.map(ExecutionRequirements::new);
         let mut any_recovered = false;
         for handle in handles {
             let Ok(Some((worker, capabilities))) = handle.await else {
                 continue;
             };
-            if component_request.is_none_or(|request| {
-                rustup_component_capability_mismatch(request, &capabilities).is_none()
-            }) {
+            if requirements
+                .as_ref()
+                .is_none_or(|requirements| requirements.component_mismatch(&capabilities).is_none())
+            {
                 let worker_id = worker.config.read().await.id.clone();
                 info!(
                     "Worker {} capabilities refreshed after {}; re-running full admission",
@@ -2431,6 +2438,7 @@ impl WorkerSelector {
         let mut any_has_runtime = false;
 
         let required_os = required_os_for_request(request);
+        let requirements = ExecutionRequirements::new(request);
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -2481,7 +2489,7 @@ impl WorkerSelector {
             }
 
             // Filter by required runtime
-            let has_required_runtime = worker.has_runtime(request.required_runtime).await;
+            let has_required_runtime = worker.has_runtime(requirements.required_runtime()).await;
 
             if excluded_worker_ids.contains(worker_id.as_str()) {
                 debug!(
@@ -2519,13 +2527,13 @@ impl WorkerSelector {
             }
 
             let capabilities = worker.capabilities().await;
-            if let Some(reason) = required_tool_capability_mismatch(request, &capabilities) {
+            if let Some(reason) = requirements.tool_mismatch(&capabilities) {
                 debug!("Worker {} excluded: {}", worker_id, reason);
                 metrics::inc_reliability_error("selection", "required_tool_missing");
                 filtered_by_hard_preflight += 1;
                 continue;
             }
-            if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
+            if let Some(reason) = requirements.component_mismatch(&capabilities) {
                 debug!("Worker {} excluded: {}", worker_id, reason);
                 metrics::inc_reliability_error("selection", "toolchain_component_missing");
                 filtered_by_hard_preflight += 1;
@@ -2533,9 +2541,7 @@ impl WorkerSelector {
                 component_excluded.push(Arc::clone(&worker));
                 continue;
             }
-            if let Some(reason) =
-                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
-            {
+            if let Some(reason) = requirements.toolchain_mismatch(&capabilities) {
                 debug!("Worker {} excluded: {}", worker_id, reason);
                 metrics::inc_reliability_error("selection", "toolchain_version_mismatch");
                 filtered_by_hard_preflight += 1;
@@ -2543,7 +2549,7 @@ impl WorkerSelector {
             }
 
             if let Some(reason) = self
-                .toolchain_preflight_failure(worker.as_ref(), request)
+                .toolchain_preflight_failure(worker.as_ref(), &requirements)
                 .await
             {
                 debug!(
@@ -3301,13 +3307,12 @@ impl WorkerSelector {
     async fn toolchain_preflight_failure(
         &self,
         worker: &WorkerState,
-        request: &SelectionRequest,
+        requirements: &ExecutionRequirements<'_>,
     ) -> Option<String> {
-        let toolchain = request.toolchain.as_ref()?;
-        let toolchain_name = toolchain.rustup_toolchain();
+        let toolchain_name = requirements.preflight_toolchain()?;
 
-        toolchain_preflight_with(worker, &toolchain_name, |endpoint, deadline| {
-            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref(), deadline)
+        toolchain_preflight_with(worker, toolchain_name, |endpoint, deadline| {
+            probe_worker_toolchain(endpoint, toolchain_name, self.ssh_pool.as_ref(), deadline)
         })
         .await
     }
@@ -3837,6 +3842,7 @@ pub async fn select_worker_with_config(
     let mut matched_preferred_worker = false;
 
     let required_os = required_os_for_request(request);
+    let requirements = ExecutionRequirements::new(request);
 
     // Filter workers by circuit state and slot availability
     let mut eligible: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
@@ -3890,7 +3896,7 @@ pub async fn select_worker_with_config(
         }
 
         // Check required runtime capability
-        let has_required_runtime = worker.has_runtime(request.required_runtime).await;
+        let has_required_runtime = worker.has_runtime(requirements.required_runtime()).await;
 
         if !has_required_runtime {
             debug!(
@@ -3903,11 +3909,11 @@ pub async fn select_worker_with_config(
         any_has_runtime = true;
 
         let capabilities = worker.capabilities().await;
-        if let Some(reason) = required_tool_capability_mismatch(request, &capabilities) {
+        if let Some(reason) = requirements.tool_mismatch(&capabilities) {
             debug!("Worker {} excluded: {}", worker_id, reason);
             continue;
         }
-        if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
+        if let Some(reason) = requirements.component_mismatch(&capabilities) {
             filtered_by_component += 1;
             debug!("Worker {} excluded: {}", worker_id, reason);
             continue;
@@ -4369,203 +4375,8 @@ fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     }
 }
 
-fn toolchain_capability_mismatch(
-    toolchain: Option<&ToolchainInfo>,
-    capabilities: &WorkerCapabilities,
-) -> Option<String> {
-    let toolchain = toolchain?;
-    if toolchain.date.is_some()
-        || toolchain.full_version.trim().is_empty()
-        || toolchain.full_version.trim().eq(toolchain.channel.as_str())
-    {
-        return None;
-    }
-
-    let worker_raw = capabilities.rustc_version.as_deref()?;
-    let channel = toolchain.channel.trim();
-    if is_floating_rust_channel(channel) {
-        return (!worker_rustc_matches_channel(worker_raw, channel)).then(|| {
-            format!(
-                "rustc_channel_mismatch:local={channel}:worker={}",
-                rustc_version_key(worker_raw).unwrap_or_else(|| worker_raw.to_string())
-            )
-        });
-    }
-
-    let local = rustc_version_key(&toolchain.full_version)?;
-    let worker = rustc_version_key(worker_raw)?;
-    (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
-}
-
-fn required_rustup_component(request: &SelectionRequest) -> Option<&'static str> {
-    let command = request.command.as_deref()?;
-    let classification = classify_command(command);
-    if matches!(classification.kind, Some(CompilationKind::CargoClippy)) {
-        return Some("clippy");
-    }
-
-    // Ordinary `cargo fmt` stays local. The one remotely admitted form is the
-    // exact clean-overlay `cargo fmt --check` lane, whose project identity is
-    // deliberately tagged by the hook. Keep this guard so prose or an unrelated
-    // command containing the words `cargo fmt` cannot create a capability gate.
-    if request.project.contains("::clean-overlay::") && direct_cargo_fmt_check(command) {
-        return Some("rustfmt");
-    }
-    None
-}
-
-fn direct_cargo_fmt_check(command: &str) -> bool {
-    let tokens = command
-        .split_whitespace()
-        .map(|token| token.trim_matches(['\'', '"']))
-        .collect::<Vec<_>>();
-    let Some(cargo_index) = tokens.iter().position(|token| {
-        *token == "cargo"
-            || token
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "cargo")
-    }) else {
-        return false;
-    };
-    let mut subcommand_index = cargo_index + 1;
-    if tokens
-        .get(subcommand_index)
-        .is_some_and(|token| token.starts_with('+'))
-    {
-        subcommand_index += 1;
-    }
-    tokens.get(subcommand_index) == Some(&"fmt")
-        && tokens[subcommand_index + 1..].contains(&"--check")
-}
-
-/// The rustup toolchain the command itself pins: an env-style
-/// `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind `env`) or a
-/// `cargo +<name>` selector. Rustup gives the env assignment precedence over
-/// a project's rust-toolchain.toml, so for capability gating the command's
-/// own pin is authoritative when present (issue #63).
-fn toolchain_from_command_text(command: &str) -> Option<String> {
-    let mut prev_is_cargo = false;
-    for raw in command.split_whitespace() {
-        let token = raw.trim_matches(['\'', '"']);
-        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
-            let value = value.trim_matches(['\'', '"']);
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if prev_is_cargo
-            && let Some(value) = token.strip_prefix('+')
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-        prev_is_cargo = token == "cargo"
-            || token
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "cargo");
-    }
-    None
-}
-
-/// The toolchain governing `request`'s component requirements: the command's
-/// own `RUSTUP_TOOLCHAIN=`/`+<tc>` pin first (rustup precedence), then the
-/// request-carried project toolchain. Issue #63: `rch exec --job` requests
-/// used to carry NO toolchain at all, and the previous fail-closed `<unknown>`
-/// branch excluded EVERY worker (`missing_toolchain_component=14`) although
-/// the pinned clippy was installed fleet-wide — followed by a silent local
-/// build.
-fn required_component_toolchain(request: &SelectionRequest) -> Option<String> {
-    request
-        .command
-        .as_deref()
-        .and_then(toolchain_from_command_text)
-        .or_else(|| {
-            request
-                .toolchain
-                .as_ref()
-                .map(ToolchainInfo::rustup_toolchain)
-        })
-}
-
-/// The first required named tool this worker has not VERIFIED, as a selection
-/// reason — or `None` when the request requires none (no requirement, no gate).
-///
-/// Mirrors [`rustup_component_capability_mismatch`] deliberately, including its
-/// position in every eligibility ladder: the decision must happen BEFORE a slot
-/// is reserved. A job admitted onto a worker that lacks its tool would hold a
-/// reservation only to fail on the worker, and job mode surfaces the remote
-/// status verbatim — so that failure would be indistinguishable from the job's
-/// own nonzero exit.
-///
-/// "Declared but the probe failed" and "no worker ever declared this name" are
-/// reported distinctly: the first is a broken worker, the second is usually a
-/// typo or a fleet that was never configured for the tool.
-fn required_tool_capability_mismatch(
-    request: &SelectionRequest,
-    capabilities: &WorkerCapabilities,
-) -> Option<String> {
-    request.required_tools.iter().find_map(|tool| {
-        if let Some(check) = rch_common::tool_requirement::check_exact_runtime(
-            tool,
-            capabilities.node_version.as_deref(),
-            capabilities.bun_version.as_deref(),
-        ) {
-            return check.err();
-        }
-        (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
-            if capabilities.tools_absent.iter().any(|t| t == tool) {
-                format!("capability_missing:tool:{tool}:probe_failed")
-            } else {
-                format!("capability_missing:tool:{tool}:not_declared")
-            }
-        })
-    })
-}
-
 #[cfg(test)]
 mod exact_runtime_tests;
-
-fn rustup_component_capability_mismatch(
-    request: &SelectionRequest,
-    capabilities: &WorkerCapabilities,
-) -> Option<String> {
-    let component = required_rustup_component(request)?;
-    let Some(toolchain) = required_component_toolchain(request) else {
-        return Some(format!(
-            "capability_missing:rustup_component:<unknown>:{component}"
-        ));
-    };
-    (!capabilities.has_rustup_component(&toolchain, component))
-        .then(|| format!("capability_missing:rustup_component:{toolchain}:{component}"))
-}
-
-fn is_floating_rust_channel(channel: &str) -> bool {
-    matches!(channel, "stable" | "beta" | "nightly")
-}
-
-fn worker_rustc_matches_channel(worker_raw: &str, channel: &str) -> bool {
-    let Some(worker) = rustc_version_key(worker_raw) else {
-        return false;
-    };
-    match channel {
-        "nightly" => worker.contains("-nightly"),
-        "beta" => worker.contains("-beta"),
-        "stable" => !worker.contains("-nightly") && !worker.contains("-beta"),
-        _ => false,
-    }
-}
-
-fn rustc_version_key(value: &str) -> Option<String> {
-    let mut parts = value.split_whitespace();
-    let first = parts.next()?;
-    let version = if first.eq("rustc") {
-        parts.next()?
-    } else {
-        first
-    };
-    let version = version.trim();
-    (!version.is_empty()).then(|| version.to_string())
-}
 
 async fn toolchain_preflight_with<F, Fut>(
     worker: &WorkerState,

@@ -1187,7 +1187,10 @@ esac
         fn run(&self, exact_paths: bool, env: &[(&str, &str)]) -> (ProbedFacts, Vec<String>) {
             std::fs::write(&self.log, "").unwrap();
             let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &build_capability_probe_script(&self.spec(exact_paths))])
+                .args([
+                    "-c",
+                    &build_capability_probe_script(&self.spec(exact_paths)),
+                ])
                 .env_clear()
                 .env("HOME", self.root.path())
                 .env("PATH", &self.bin)
@@ -1295,8 +1298,7 @@ esac
                     .display()
                     .to_string(),
             ] {
-                let (facts, log) =
-                    fixture.run(exact_paths, &[("RCH_TEST_RUSTUP_OUTPUT", &answer)]);
+                let (facts, log) = fixture.run(exact_paths, &[("RCH_TEST_RUSTUP_OUTPUT", &answer)]);
                 assert!(facts.rust.rustc_version.is_none(), "answer={answer:?}");
                 assert!(!log.iter().any(|line| line.starts_with("DIRECT|")));
                 assert_eq!(facts.runtimes.node_version.as_deref(), Some("v22.0.0"));
@@ -1336,7 +1338,10 @@ esac
         // not a claim that Windows process execution ran on this test host.
         for (input, expected) in [
             ("/opt/rust/bin/cargo", Some("/opt/rust/bin/cargo")),
-            ("/c/Users/worker/cargo.exe", Some("/c/Users/worker/cargo.exe")),
+            (
+                "/c/Users/worker/cargo.exe",
+                Some("/c/Users/worker/cargo.exe"),
+            ),
             (r"/opt/back\slash/cargo", Some(r"/opt/back\slash/cargo")),
             (
                 "/opt/'$(not-expanded)'/cargo",
@@ -1375,7 +1380,11 @@ esac
                 .output()
                 .unwrap();
             assert_eq!(output.status.success(), expected.is_some(), "{input:?}");
-            assert_eq!(output.stdout, expected.unwrap_or("").as_bytes(), "{input:?}");
+            assert_eq!(
+                output.stdout,
+                expected.unwrap_or("").as_bytes(),
+                "{input:?}"
+            );
         }
     }
 

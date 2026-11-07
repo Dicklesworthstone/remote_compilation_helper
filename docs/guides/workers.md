@@ -236,6 +236,14 @@ A failed check clears the Rust capability and reports its cause in
 `probe_warnings`; other runtimes and worker connectivity remain independently
 usable. Pinned-toolchain admission also checks both Cargo entry points.
 
+Selection and slot reservation use the same execution requirements. Before
+creating a build owner, the daemon rechecks runtime availability, required
+named tools, exact Node/Bun versions, Rust components and toolchain versions
+against the current capability snapshot. A requested toolchain also requires
+a fresh successful preflight. A refresh that invalidates one of these facts
+causes selection to retry before it spends slots; existing builds retain their
+ownership, and jobs without the failed requirement remain eligible.
+
 For `worker Cargo execution check failed`, inspect the reported PATH or
 toolchain failure, update the dispatcher and worker binaries together, and
 repair the worker's Cargo/shim installation as needed. Re-run the capability

@@ -13,7 +13,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::admission::{AdmissionConfig, AdmissionGate, AdmissionVerdict};
+    use crate::admission::{
+        AdmissionConfig, AdmissionGate, AdmissionVerdict, ExecutionRequirements,
+    };
     use crate::disk_pressure::{
         DiskHeadroomAdmission, DiskHeadroomRejection, DiskPressurePolicyConfig, PressureAssessment,
         PressureConfidence, PressureState, evaluate_pressure_policy,
@@ -95,6 +97,40 @@ mod tests {
             hook_pid: None,
             required_tools: Vec::new(),
         }
+    }
+
+    /// Mirror the API's non-cancellable handoff after successful accounting.
+    async fn admit_selected(
+        worker: &WorkerState,
+        endpoint: &crate::workers::WorkerEndpointSnapshot,
+        history: &BuildHistory,
+        request: &SelectionRequest,
+        slots: u32,
+    ) -> Option<crate::history::ActiveBuildState> {
+        let requirements = ExecutionRequirements::new(request);
+        let admission = worker
+            .reserve_slots_for_endpoint(slots, endpoint, &requirements)
+            .await?;
+        history
+            .try_start_active_build_with_waiter(
+                request.project.clone(),
+                endpoint.config.id.to_string(),
+                request
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| "fixture build".into()),
+                0,
+                Some(format!("owner-{}", request.project)),
+                slots,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    capacity: admission.disk_capacity,
+                    ..Default::default()
+                },
+                Some(endpoint.clone()),
+            )
+            .expect("persist admitted ownership")
     }
 
     fn remote_build(id: u64, project: &str, bytes: u64) -> BuildRecord {
@@ -532,26 +568,9 @@ mod tests {
             project: &str,
             slots: u32,
         ) -> Option<crate::history::ActiveBuildState> {
-            let admission = worker
-                .reserve_slots_for_endpoint(slots, endpoint, required)
-                .await?;
-            history
-                .try_start_active_build_with_waiter(
-                    project.into(),
-                    endpoint.config.id.to_string(),
-                    "fixture build".into(),
-                    0,
-                    Some(format!("owner-{project}")),
-                    slots,
-                    BuildLocation::Remote,
-                    None,
-                    DiskHeadroomAdmission {
-                        capacity: admission.disk_capacity,
-                        ..Default::default()
-                    },
-                    Some(endpoint.clone()),
-                )
-                .expect("persist admitted ownership")
+            let mut request = select_request(project);
+            request.required_runtime = required;
+            admit_selected(worker, endpoint, history, &request, slots).await
         }
 
         let _guard = test_guard!();
@@ -682,6 +701,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_requirement_changes_after_selection_never_create_durable_owners() {
+        let _guard = test_guard!();
+        for scenario in [
+            "named-tool",
+            "exact-node",
+            "exact-bun",
+            "clippy",
+            "rustfmt",
+            "rustc-version",
+            "toolchain-preflight",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let history_path = directory.path().join("execution-history.jsonl");
+            let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+            let config = rch_common::RchConfig::default();
+            let pool = WorkerPool::with_selection_config(&config.selection);
+            let id = WorkerId::new("execution-race");
+            pool.add_worker(WorkerConfig {
+                id: id.clone(),
+                host: "localhost".into(),
+                total_slots: 8,
+                ..Default::default()
+            })
+            .await;
+            let worker = pool.get(&id).await.unwrap();
+            let available = WorkerCapabilities {
+                rustc_version: Some("rustc 1.100.0".into()),
+                rustup_toolchains: vec!["nightly-fixture".into(), "1.100.0".into()],
+                rustup_components: vec![
+                    "nightly-fixture:clippy".into(),
+                    "nightly-fixture:rustfmt".into(),
+                ],
+                node_version: Some("v26.7.0".into()),
+                bun_version: Some("1.3.0".into()),
+                tools_present: vec!["clang".into()],
+                disk_free_gb: Some(100.0),
+                disk_total_gb: Some(500.0),
+                build_disk_free_gb: Some(100.0),
+                build_disk_total_gb: Some(500.0),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            };
+            worker.set_capabilities(available.clone()).await;
+            let endpoint = worker.endpoint_snapshot().await;
+            let existing = admit_selected(
+                &worker,
+                &endpoint,
+                &history,
+                &select_request("already-running"),
+                2,
+            )
+            .await
+            .expect("existing owner");
+
+            let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+            let mut request = select_request("new-build::clean-overlay::fixture");
+            let mut changed = available.clone();
+            match scenario {
+                "named-tool" => {
+                    request.command = Some("clang -c input.c".into());
+                    request.required_tools.push("clang".into());
+                    changed.tools_present.clear();
+                    changed.tools_absent.push("clang".into());
+                }
+                "exact-node" => {
+                    request.command = Some("node build.js".into());
+                    request.required_runtime = RequiredRuntime::Node;
+                    request.required_tools.push("node@26.7.0".into());
+                    changed.node_version = Some("v26.6.0".into());
+                }
+                "exact-bun" => {
+                    request.command = Some("bun test".into());
+                    request.required_runtime = RequiredRuntime::Bun;
+                    request.required_tools.push("bun@1.3.0".into());
+                    changed.bun_version = Some("1.2.9".into());
+                }
+                "clippy" | "rustfmt" => {
+                    request.required_runtime = RequiredRuntime::Rust;
+                    request.command = Some(if scenario == "clippy" {
+                        "cargo +nightly-fixture clippy".into()
+                    } else {
+                        "cargo +nightly-fixture fmt --check".into()
+                    });
+                    changed
+                        .rustup_components
+                        .retain(|entry| !entry.ends_with(scenario));
+                }
+                "rustc-version" | "toolchain-preflight" => {
+                    request.required_runtime = RequiredRuntime::Rust;
+                    request.command = Some("cargo build".into());
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "1.100.0",
+                        None,
+                        "rustc 1.100.0",
+                    ));
+                    worker
+                        .record_toolchain_preflight("1.100.0".into(), true, None)
+                        .await;
+                    if scenario == "rustc-version" {
+                        changed.rustc_version = Some("rustc 1.99.0".into());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap_or_else(|| panic!("{scenario}: initially valid worker"));
+            let selected_endpoint = selected.endpoint_snapshot().await;
+
+            // The runtime is still present. Only the request's finer execution
+            // contract changes after the actual selector has accepted it.
+            assert!(changed.has_runtime(request.required_runtime));
+            worker.set_capabilities(changed).await;
+            if scenario == "toolchain-preflight" {
+                worker
+                    .record_toolchain_preflight(
+                        "1.100.0".into(),
+                        false,
+                        Some("toolchain_preflight_command_failed:1:Cargo refused".into()),
+                    )
+                    .await;
+            }
+            assert!(
+                admit_selected(&selected, &selected_endpoint, &history, &request, 1)
+                    .await
+                    .is_none(),
+                "{scenario}: stale selection must not publish ownership"
+            );
+            assert_eq!(worker.used_slots(), 2, "{scenario}");
+            assert_eq!(history.active_builds().len(), 1, "{scenario}");
+            assert_eq!(history.active_build(existing.id).unwrap().slots, 2);
+
+            assert!(
+                admit_selected(
+                    &worker,
+                    &endpoint,
+                    &history,
+                    &select_request("unconstrained-job"),
+                    1,
+                )
+                .await
+                .is_some(),
+                "{scenario}: refusal is scoped to the execution requirements"
+            );
+            worker.set_capabilities(available).await;
+            if request.toolchain.is_some() {
+                worker
+                    .record_toolchain_preflight("1.100.0".into(), true, None)
+                    .await;
+            }
+            request.project = "recovered-build::clean-overlay::fixture".into();
+            assert!(
+                admit_selected(&worker, &endpoint, &history, &request, 1)
+                    .await
+                    .is_some(),
+                "{scenario}: fresh positive evidence restores admission"
+            );
+            assert_eq!(worker.used_slots(), 4, "{scenario}");
+
+            drop(selector);
+            drop(history);
+            let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+            assert_eq!(restored.active_builds().len(), 3, "{scenario}");
+            assert!(
+                restored
+                    .active_builds()
+                    .iter()
+                    .all(|owner| { owner.project_id != "new-build::clean-overlay::fixture" }),
+                "{scenario}: no refused owner persisted"
+            );
+            assert_eq!(restored.active_build(existing.id).unwrap().slots, 2);
+        }
+    }
+
+    #[tokio::test]
     async fn default_large_disk_admission_keeps_storage_budgets_and_explicit_policy() {
         let _guard = test_guard!();
         for total in [774.0, 900.0] {
@@ -795,8 +991,9 @@ mod tests {
         let original = WorkerState::new(config.clone());
         original.set_capabilities(caps(30.0)).await;
         let endpoint = original.endpoint_snapshot().await;
+        let request = select_request("initial-disk-owner");
         let slot = original
-            .reserve_slots_for_endpoint(1, &endpoint, RequiredRuntime::None)
+            .reserve_slots_for_endpoint(1, &endpoint, &ExecutionRequirements::new(&request))
             .await
             .unwrap();
         let active = history

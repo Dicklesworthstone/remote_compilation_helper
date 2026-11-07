@@ -3,6 +3,7 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::DaemonContext;
+use crate::admission::{ExecutionRequirements, TOOLCHAIN_PREFLIGHT_TTL};
 use crate::disk_pressure::{
     DiskCapacityObservation, DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment,
     PressureState, refresh_pressure_policy,
@@ -1526,22 +1527,29 @@ impl WorkerState {
     /// There is no await after slot accounting succeeds. The caller can therefore
     /// synchronously publish durable ownership before cancellation becomes
     /// observable again. A retarget, retirement, stale lifecycle, Critical
-    /// pressure, missing runtime, or insufficient capacity is refused before
-    /// accounting changes.
+    /// pressure, unsatisfied execution requirements, or insufficient capacity is
+    /// refused before accounting changes.
     pub(crate) async fn reserve_slots_for_endpoint(
         &self,
         count: u32,
         endpoint: &WorkerEndpointSnapshot,
-        required_runtime: RequiredRuntime,
+        requirements: &ExecutionRequirements<'_>,
     ) -> Option<WorkerSlotAdmission> {
         if count == 0 {
             return None;
         }
         let config = self.config.read().await;
         // Match publish_capabilities' capability-before-pressure order and
-        // retain this guard through the CAS. A negative runtime observation
-        // published after selection must fence new ownership at admission.
+        // retain this guard through the CAS. Every execution requirement must
+        // still hold when a refresh publishes after selection. The optional
+        // toolchain guard similarly fences a newly failed preflight without
+        // cloning the inventory or doing remote work under these locks.
         let capabilities = self.capabilities.read().await;
+        let toolchain_preflight = if requirements.preflight_toolchain().is_some() {
+            Some(self.toolchain_preflight.read().await)
+        } else {
+            None
+        };
         let pressure = self.pressure_assessment.read().await;
         let lifecycle = self.lifecycle.read().await;
         let disk_capacity = self.disk_capacity_observation.read().await.clone();
@@ -1556,12 +1564,21 @@ impl WorkerState {
         if !endpoint_current
             || !lifecycle.is_schedulable()
             || pressure.state == PressureState::Critical
-            || !capabilities.has_runtime(required_runtime)
+            || !requirements.capabilities_satisfied(&capabilities)
+        {
+            return None;
+        }
+        let total_slots = self.slots_for(config.total_slots, &pressure);
+        if let Some(toolchain_name) = requirements.preflight_toolchain()
+            && !toolchain_preflight.as_ref().is_some_and(|cache| {
+                cache.get(toolchain_name).is_some_and(|verdict| {
+                    verdict.usable && verdict.is_fresh(TOOLCHAIN_PREFLIGHT_TTL)
+                })
+            })
         {
             return None;
         }
 
-        let total_slots = self.slots_for(config.total_slots, &pressure);
         self.reserve_slots_accounting(count, total_slots)
             .then_some(WorkerSlotAdmission { disk_capacity })
     }
@@ -3818,6 +3835,25 @@ mod tests {
         }
     }
 
+    fn execution_request(required_runtime: RequiredRuntime) -> rch_common::SelectionRequest {
+        rch_common::SelectionRequest {
+            project: "admission-fixture".into(),
+            command: None,
+            command_priority: rch_common::CommandPriority::Normal,
+            estimated_cores: 1,
+            disk_headroom_gib: 0,
+            disk_observation_version: 0,
+            preferred_workers: Vec::new(),
+            toolchain: None,
+            required_runtime,
+            classification_duration_us: None,
+            job_mode: false,
+            required_tools: Vec::new(),
+            source_topology: None,
+            hook_pid: None,
+        }
+    }
+
     #[tokio::test]
     async fn reservation_cancelled_while_waiting_does_not_consume_capacity() {
         let worker = WorkerState::new(recovered_worker_config("cancel-wait", 8));
@@ -3868,7 +3904,11 @@ mod tests {
 
         assert!(
             worker
-                .reserve_slots_for_endpoint(2, &selected, RequiredRuntime::None)
+                .reserve_slots_for_endpoint(
+                    2,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
                 .await
                 .is_none()
         );
@@ -3881,7 +3921,11 @@ mod tests {
         let selected = worker.endpoint_snapshot().await;
         let before = worker.disk_capacity_observation().await;
         let admission = worker
-            .reserve_slots_for_endpoint(2, &selected, RequiredRuntime::None)
+            .reserve_slots_for_endpoint(
+                2,
+                &selected,
+                &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+            )
             .await
             .expect("current healthy endpoint should reserve");
         assert_eq!(admission.disk_capacity.is_some(), before.is_some());
@@ -3895,6 +3939,8 @@ mod tests {
         for owned_slots in [0, 3] {
             for required in [RequiredRuntime::Rust, RequiredRuntime::Zig] {
                 let worker = WorkerState::new(recovered_worker_config("runtime-race", 8));
+                let request = execution_request(required);
+                let requirements = ExecutionRequirements::new(&request);
                 let available = WorkerCapabilities {
                     rustc_version: Some("rustc fixture".into()),
                     rustup_toolchains: vec!["nightly-fixture".into()],
@@ -3915,7 +3961,7 @@ mod tests {
                 // eligible endpoint was selected. No sleeps or scheduler races
                 // are needed to publish a refusal before admission resumes.
                 let mut publication = worker.capabilities.write().await;
-                let pending = worker.reserve_slots_for_endpoint(1, &selected, required);
+                let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
                 tokio::pin!(pending);
                 std::future::poll_fn(|cx| {
                     assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
@@ -3937,7 +3983,11 @@ mod tests {
                 for independent in [RequiredRuntime::Node, RequiredRuntime::None] {
                     assert!(
                         worker
-                            .reserve_slots_for_endpoint(1, &selected, independent)
+                            .reserve_slots_for_endpoint(
+                                1,
+                                &selected,
+                                &ExecutionRequirements::new(&execution_request(independent)),
+                            )
                             .await
                             .is_some(),
                         "{independent:?} remains usable"
@@ -3949,7 +3999,7 @@ mod tests {
                 worker.set_capabilities(available).await;
                 assert!(
                     worker
-                        .reserve_slots_for_endpoint(1, &selected, required)
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
                         .await
                         .is_some(),
                     "fresh successful evidence restores admission for {required:?}"
@@ -3968,7 +4018,9 @@ mod tests {
             .await;
         let selected = worker.endpoint_snapshot().await;
         let pressure = worker.pressure_assessment.write().await;
-        let pending = worker.reserve_slots_for_endpoint(1, &selected, RequiredRuntime::Rust);
+        let request = execution_request(RequiredRuntime::Rust);
+        let requirements = ExecutionRequirements::new(&request);
+        let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
         tokio::pin!(pending);
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
@@ -4003,7 +4055,295 @@ mod tests {
             .expect("publication resumes after admission releases its guards");
         assert!(
             worker
-                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::Rust)
+                .reserve_slots_for_endpoint(1, &selected, &requirements)
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 1, "existing ownership is preserved");
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_rechecks_every_execution_requirement() {
+        let _guard = rch_common::test_guard!();
+        for case in [
+            "tool", "node", "bun", "clippy", "rustfmt", "channel", "version",
+        ] {
+            let worker = WorkerState::new(recovered_worker_config("requirements-race", 8));
+            let mut request = execution_request(RequiredRuntime::Rust);
+            let available = WorkerCapabilities {
+                rustc_version: Some("rustc 1.90.0 (fixture)".into()),
+                node_version: Some("v26.7.0".into()),
+                bun_version: Some("1.3.0".into()),
+                tools_present: vec!["clang".into(), "node@26.7.0".into(), "bun@1.3.0".into()],
+                rustup_toolchains: vec!["nightly-2026-08-31-x86_64-unknown-linux-gnu".into()],
+                rustup_components: vec![
+                    "nightly-2026-08-31-x86_64-unknown-linux-gnu:clippy".into(),
+                    "nightly-2026-08-31-x86_64-unknown-linux-gnu:rustfmt".into(),
+                ],
+                ..Default::default()
+            };
+            let mut unavailable = available.clone();
+            match case {
+                "tool" => {
+                    request.required_runtime = RequiredRuntime::None;
+                    request.required_tools.push("clang".into());
+                    unavailable.tools_present.retain(|tool| tool != "clang");
+                    unavailable.tools_absent.push("clang".into());
+                }
+                "node" => {
+                    request.required_runtime = RequiredRuntime::Node;
+                    request.required_tools.push("node@26.7.0".into());
+                    unavailable.node_version = Some("v22.0.0".into());
+                }
+                "bun" => {
+                    request.required_runtime = RequiredRuntime::Bun;
+                    request.required_tools.push("bun@1.3.0".into());
+                    unavailable.bun_version = Some("1.2.9".into());
+                }
+                "clippy" | "rustfmt" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "nightly",
+                        Some("2026-08-31".into()),
+                        "nightly-2026-08-31",
+                    ));
+                    request.command = Some(if case == "clippy" {
+                        "cargo clippy --workspace".into()
+                    } else {
+                        request.project.push_str("::clean-overlay::fixture");
+                        "cargo fmt --check".into()
+                    });
+                    unavailable
+                        .rustup_components
+                        .retain(|component| !component.ends_with(&format!(":{case}")));
+                }
+                "channel" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "stable",
+                        None,
+                        "rustc 1.90.0 (fixture)",
+                    ));
+                    unavailable.rustc_version = Some("rustc 1.91.0-nightly (fixture)".into());
+                }
+                "version" => {
+                    request.toolchain = Some(rch_common::ToolchainInfo::new(
+                        "1.90.0",
+                        None,
+                        "rustc 1.90.0 (fixture)",
+                    ));
+                    unavailable.rustc_version = Some("rustc 1.90.1 (fixture)".into());
+                }
+                _ => unreachable!(),
+            }
+            let requirements = ExecutionRequirements::new(&request);
+            worker.set_capabilities(available.clone()).await;
+            if let Some(toolchain) = requirements.preflight_toolchain() {
+                worker
+                    .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                    .await;
+            }
+            let selected = worker.endpoint_snapshot().await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(3, &selected, &requirements)
+                    .await
+                    .is_some(),
+                "{case}: initial evidence admits an existing owner"
+            );
+
+            // Selection succeeded, then a real inventory update queues ahead
+            // of admission. Runtime presence stays true in every case: checking
+            // only has_runtime would spend another slot on an unusable worker.
+            let mut publication = worker.capabilities.write().await;
+            let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(unavailable.has_runtime(request.required_runtime), "{case}");
+            *publication = unavailable;
+            drop(publication);
+            assert!(
+                pending.await.is_none(),
+                "{case}: stale selection is refused"
+            );
+            assert_eq!(
+                worker.used_slots(),
+                3,
+                "{case}: existing owner is untouched"
+            );
+
+            let independent = execution_request(if case == "node" {
+                RequiredRuntime::Bun
+            } else {
+                RequiredRuntime::Node
+            });
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(
+                        1,
+                        &selected,
+                        &ExecutionRequirements::new(&independent)
+                    )
+                    .await
+                    .is_some(),
+                "{case}: unrelated commands remain available"
+            );
+            worker.release_slots(1).await;
+            worker.set_capabilities(available).await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &requirements)
+                    .await
+                    .is_some(),
+                "{case}: fresh successful evidence restores admission"
+            );
+            assert_eq!(worker.used_slots(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_requires_current_toolchain_preflight() {
+        let _guard = rch_common::test_guard!();
+        for case in ["missing", "expired", "failed", "transport-failed"] {
+            let worker = WorkerState::new(recovered_worker_config("preflight-race", 8));
+            worker
+                .set_capabilities(WorkerCapabilities::mock_with_rust())
+                .await;
+            let mut request = execution_request(RequiredRuntime::Rust);
+            request.toolchain = Some(rch_common::ToolchainInfo::new(
+                "nightly",
+                Some("2026-08-31".into()),
+                "nightly-2026-08-31",
+            ));
+            let requirements = ExecutionRequirements::new(&request);
+            let toolchain = requirements.preflight_toolchain().unwrap();
+            worker
+                .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                .await;
+            let selected = worker.endpoint_snapshot().await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(3, &selected, &requirements)
+                    .await
+                    .is_some()
+            );
+
+            let mut publication = worker.toolchain_preflight.write().await;
+            let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            match case {
+                "missing" => {
+                    let verdict = publication.remove(toolchain).unwrap();
+                    publication.insert("another-toolchain".into(), verdict);
+                }
+                "expired" => {
+                    publication.get_mut(toolchain).unwrap().checked_at_unix_ms = current_unix_ms()
+                        .saturating_sub(duration_millis_i64(TOOLCHAIN_PREFLIGHT_TTL) + 1000);
+                }
+                "failed" | "transport-failed" => {
+                    let verdict = publication.get_mut(toolchain).unwrap();
+                    verdict.usable = false;
+                    verdict.reason = Some(if case == "failed" {
+                        "toolchain_preflight_command_failed:1:wrapper refused".into()
+                    } else {
+                        "toolchain_preflight_connect_failed:fixture timeout".into()
+                    });
+                }
+                _ => unreachable!(),
+            }
+            drop(publication);
+            assert!(pending.await.is_none(), "{case}");
+            assert_eq!(worker.used_slots(), 3, "{case}: no additional ownership");
+            assert!(worker.has_runtime(RequiredRuntime::Rust).await);
+
+            // No toolchain requirement means this cache cannot condemn a
+            // command, and a later successful probe can restore the pinned one.
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(
+                        1,
+                        &selected,
+                        &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                    )
+                    .await
+                    .is_some()
+            );
+            worker.release_slots(1).await;
+            worker
+                .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                .await;
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &requirements)
+                    .await
+                    .is_some()
+            );
+            assert_eq!(worker.used_slots(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_bound_reservation_retains_preflight_guard_until_accounting() {
+        let _guard = rch_common::test_guard!();
+        let worker = WorkerState::new(recovered_worker_config("preflight-publication", 8));
+        worker
+            .set_capabilities(WorkerCapabilities::mock_with_rust())
+            .await;
+        let mut request = execution_request(RequiredRuntime::Rust);
+        request.toolchain = Some(rch_common::ToolchainInfo::new(
+            "nightly",
+            Some("2026-08-31".into()),
+            "nightly-2026-08-31",
+        ));
+        let requirements = ExecutionRequirements::new(&request);
+        let toolchain = requirements.preflight_toolchain().unwrap();
+        worker
+            .record_toolchain_preflight(toolchain.to_owned(), true, None)
+            .await;
+        let selected = worker.endpoint_snapshot().await;
+        let pressure = worker.pressure_assessment.write().await;
+        let pending = worker.reserve_slots_for_endpoint(1, &selected, &requirements);
+        tokio::pin!(pending);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(worker.capabilities.try_write().is_err());
+        assert!(worker.toolchain_preflight.try_write().is_err());
+
+        let publication = worker.record_toolchain_preflight(
+            toolchain.to_owned(),
+            false,
+            Some("toolchain_preflight_command_failed:1:wrapper refused".into()),
+        );
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(worker.used_slots(), 0);
+        drop(pressure);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("positive admission precedes waiting publication")
+                .is_some()
+        );
+        tokio::time::timeout(Duration::from_secs(1), publication)
+            .await
+            .expect("preflight publication resumes after accounting");
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected, &requirements)
                 .await
                 .is_none()
         );
@@ -4048,7 +4388,11 @@ mod tests {
         assert!(!worker.reserve_slots(1).await);
         assert!(
             worker
-                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::None)
+                .reserve_slots_for_endpoint(
+                    1,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
                 .await
                 .is_none()
         );
@@ -4066,7 +4410,11 @@ mod tests {
         );
         assert!(
             worker
-                .reserve_slots_for_endpoint(1, &selected, RequiredRuntime::None)
+                .reserve_slots_for_endpoint(
+                    1,
+                    &selected,
+                    &ExecutionRequirements::new(&execution_request(RequiredRuntime::None)),
+                )
                 .await
                 .is_some()
         );

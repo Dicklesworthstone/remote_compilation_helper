@@ -2918,6 +2918,7 @@ async fn handle_select_worker_mode(
     ) -> Result<SelectionResponse> {
         let source_topology = ctx.worker_selector.source_topology_for(request);
         source_topology.validate().map_err(anyhow::Error::msg)?;
+        let execution_requirements = crate::admission::ExecutionRequirements::new(request);
         if local_wrapper_id
             .as_deref()
             .is_some_and(|id| ctx.history.wrapper_cancelled(id))
@@ -3021,14 +3022,15 @@ async fn handle_select_worker_mode(
                     .reserve_slots_for_endpoint(
                         reserve_slots,
                         &selected_endpoint,
-                        request.required_runtime,
+                        &execution_requirements,
                     )
                     .await
                 {
-                    // Endpoint identity, runtime, and disk evidence were validated
-                    // before slot accounting. From this point through synchronous
-                    // durable-history publication there is no await, so a
-                    // cancelled request cannot strand capacity without an owner.
+                    // Endpoint identity, execution requirements, toolchain
+                    // preflight, and disk evidence were validated before slot
+                    // accounting. Through synchronous durable-history publication
+                    // there is no await, so cancellation cannot strand capacity
+                    // without an owner.
                     let config = &selected_endpoint.config;
                     let (id, host, user, identity_file, declared_os) = (
                         config.id.clone(),
