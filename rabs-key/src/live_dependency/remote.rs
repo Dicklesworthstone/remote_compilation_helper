@@ -1122,11 +1122,13 @@ pub(super) fn bind_remote_execution_inputs(
         // Use original semantic values, not keyed_env: that set may already
         // have projected Cargo layout or empty OUT_DIR spellings. Preserve
         // the shared exclusion for jobserver/wrapper controls, whose tracked
-        // reads (including absence) already veto publication.
+        // reads (including absence) already veto publication. This lane keeps
+        // its exact environment: ambient names key here too (every present
+        // name is enumerated, so absences are keyed as well).
         let semantic_env = plan
             .execution_env
             .iter()
-            .filter(|(name, _)| matches!(super::env_role(name), super::EnvRole::Keyed))
+            .filter(|(name, _)| !matches!(super::env_role(name), super::EnvRole::Passthrough))
             .collect::<Vec<_>>();
         let mut environment = CanonicalEncoder::new();
         environment.seq(&semantic_env, |encoder, (name, value)| {

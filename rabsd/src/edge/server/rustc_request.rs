@@ -575,6 +575,14 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     if let Err(reason) = package.verify_generated_disjoint(&physical_plan) {
         return refuse(&reason);
     }
+    // dependency-env-v3 for the local lane: key ambient variables only when
+    // this package's captured sources name them, so agent sessions that
+    // differ in terminal/SSH/multiplexer/Cargo-config variables share keys.
+    // Unnamed tracked reads still refuse publication after execution. The
+    // remote lane keeps its exact environment contract.
+    if !remote_requested {
+        plan.narrow_to_source_env_reads(&package.source_env_reads);
+    }
     // This record comes from the generated-tree capture, never a wire field.
     // Keying below binds these same bytes; PackageFacts revalidates the run
     // record and generated inputs before serving and after execution.
