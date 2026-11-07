@@ -562,6 +562,18 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         action: commands::why::WhyAction,
     },
 
+    /// Advise crate-architecture changes priced by measured compiler time
+    ///
+    /// Read-only: reads `cargo metadata` and Cargo `--timings` reports, then
+    /// reports duplicate versions, feature-set splits, rebuild tails and link
+    /// time with their evidence, expected saving and evidence limits. Never
+    /// edits source or config. Use `--json` for the machine-readable envelope.
+    #[command(after_help = r#"EXAMPLES:
+    cargo build --timings && rch advise
+    rch advise --manifest-path path/to/Cargo.toml
+    rch --json advise --timings target/cargo-timings/cargo-timing-<stamp>.html"#)]
+    Advise(commands::advise::AdviseArgs),
+
     /// RABS content-addressed store operator commands
     ///
     /// Operator surface over the RABS CAS engines (plan §173): bounded
@@ -2470,6 +2482,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 action: commands::rabs_gc::RabsCommand::Quarantine { action },
             } => commands::rabs_gc::run_quarantine(action, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
+            Commands::Advise(args) => commands::advise::run(&args, &ctx),
             Commands::Rabs {
                 action:
                     commands::rabs_gc::RabsCommand::Inventory {
@@ -2956,6 +2969,12 @@ fn schema_json_for_command(command: &Option<Commands>) -> Result<String> {
                 .into_root_schema_for::<commands::why::RefusalExplanation>();
             serde_json::to_string_pretty(&schema)?
         }
+        Some(Commands::Advise(_)) => {
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::advise::AdviseReport>();
+            serde_json::to_string_pretty(&schema)?
+        }
         Some(Commands::Hook { action }) => match action {
             HookAction::Install | HookAction::Uninstall { .. } | HookAction::Status => {
                 let schema = SchemaSettings::draft07()
@@ -2985,6 +3004,7 @@ fn schema_json_for_command(command: &Option<Commands>) -> Result<String> {
             eprintln!("  rch --schema daemon status     # DaemonStatusResponse");
             eprintln!("  rch --schema diagnose <cmd>    # DiagnoseResponse");
             eprintln!("  rch --schema hook install      # HookActionResponse");
+            eprintln!("  rch --schema advise            # AdviseReport");
             std::process::exit(0);
         }
         _ => {

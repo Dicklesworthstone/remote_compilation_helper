@@ -38,16 +38,22 @@ pub struct Advice {
 }
 
 /// The measured inputs (from the DAG, Q011, and telemetry).
+///
+/// A `measured_ms` slot carries compiler wall time attributed from a build
+/// timing report. When present it replaces the per-kind estimate and the
+/// advice cites it; when absent the advice keeps the estimate and says so.
 #[derive(Debug, Clone, Default)]
 pub struct AdviseInputs {
     /// (crate, rebuild tail ms, dependents) — from R011 tails.
     pub rebuild_tails: Vec<(String, u64, u32)>,
-    /// (crate, distinct feature variants) — from Q011/F018.
-    pub feature_variants: Vec<(String, u32)>,
+    /// (crate, distinct feature variants, measured ms of every variant but
+    /// the most expensive) — from Q011/F018 or build timings.
+    pub feature_variants: Vec<(String, u32, Option<u64>)>,
     /// (proc-macro crate, downstream rebuilds it caused).
     pub proc_macro_rebuilds: Vec<(String, u64)>,
-    /// (dependency, distinct versions in the graph).
-    pub version_spread: Vec<(String, u32)>,
+    /// (dependency, distinct versions in the graph, measured ms of every
+    /// version but the newest).
+    pub version_spread: Vec<(String, u32, Option<u64>)>,
     /// (binary, link ms).
     pub link_ms: Vec<(String, u64)>,
     /// (suite, permille of total wall time).
@@ -72,6 +78,38 @@ const ESTIMATE_NON_CLAIMS: [&str; 2] = [
     "NO_CLAIM_AUTOMATIC_CHANGE (rch never edits source or config)",
 ];
 
+const MEASURED_NON_CLAIMS: [&str; 2] = [
+    "NO_CLAIM_INCREMENTAL_SAVINGS (measured compiler time of duplicate compiles in the timed builds; a warm incremental build may not repeat them)",
+    "NO_CLAIM_AUTOMATIC_CHANGE (rch never edits source or config)",
+];
+
+/// Measured duplicate compile time replaces the estimate; the evidence then
+/// names the measurement so a reader can tell the two apart.
+fn priced(
+    evidence: String,
+    estimate_ms: u64,
+    measured_ms: Option<u64>,
+    estimate_confidence: u32,
+) -> (Vec<String>, u64, u32, Vec<&'static str>) {
+    match measured_ms {
+        Some(ms) => (
+            vec![
+                evidence,
+                format!("measured: the duplicate compiles took {ms}ms of compiler time"),
+            ],
+            ms,
+            900,
+            MEASURED_NON_CLAIMS.to_vec(),
+        ),
+        None => (
+            vec![evidence],
+            estimate_ms,
+            estimate_confidence,
+            ESTIMATE_NON_CLAIMS.to_vec(),
+        ),
+    }
+}
+
 /// Produce the advice report, sorted by expected saving.
 #[must_use]
 pub fn advise(inputs: &AdviseInputs) -> Vec<Advice> {
@@ -90,17 +128,21 @@ pub fn advise(inputs: &AdviseInputs) -> Vec<Advice> {
             });
         }
     }
-    for (name, variants) in &inputs.feature_variants {
+    for (name, variants, measured_ms) in &inputs.feature_variants {
         if *variants >= FEATURE_VARIANT_THRESHOLD {
+            let (evidence, expected_saved_ms, confidence_permille, non_claims) = priced(
+                format!("`{name}` compiled under {variants} distinct feature sets in the window"),
+                u64::from(variants - 1) * 1_000,
+                *measured_ms,
+                700,
+            );
             advice.push(Advice {
                 kind: AdviceKind::ReduceFeatureCoupling,
                 subject: name.clone(),
-                evidence: vec![format!(
-                    "`{name}` compiled under {variants} distinct feature sets in the window"
-                )],
-                expected_saved_ms: u64::from(variants - 1) * 1_000,
-                confidence_permille: 700,
-                non_claims: ESTIMATE_NON_CLAIMS.to_vec(),
+                evidence,
+                expected_saved_ms,
+                confidence_permille,
+                non_claims,
             });
         }
     }
@@ -118,17 +160,21 @@ pub fn advise(inputs: &AdviseInputs) -> Vec<Advice> {
             });
         }
     }
-    for (name, versions) in &inputs.version_spread {
+    for (name, versions, measured_ms) in &inputs.version_spread {
         if *versions >= VERSION_SPREAD_THRESHOLD {
+            let (evidence, expected_saved_ms, confidence_permille, non_claims) = priced(
+                format!("`{name}` appears at {versions} distinct versions in the dependency graph"),
+                u64::from(versions - 1) * 2_000,
+                *measured_ms,
+                800,
+            );
             advice.push(Advice {
                 kind: AdviceKind::AlignVersions,
                 subject: name.clone(),
-                evidence: vec![format!(
-                    "`{name}` appears at {versions} distinct versions in the dependency graph"
-                )],
-                expected_saved_ms: u64::from(versions - 1) * 2_000,
-                confidence_permille: 800,
-                non_claims: ESTIMATE_NON_CLAIMS.to_vec(),
+                evidence,
+                expected_saved_ms,
+                confidence_permille,
+                non_claims,
             });
         }
     }
@@ -173,9 +219,9 @@ mod tests {
     fn fixture_repo() -> AdviseInputs {
         AdviseInputs {
             rebuild_tails: vec![("core-types".into(), 42_000, 31), ("leaf".into(), 900, 1)],
-            feature_variants: vec![("common".into(), 5)],
+            feature_variants: vec![("common".into(), 5, None)],
             proc_macro_rebuilds: vec![("derive-everything".into(), 240)],
-            version_spread: vec![("syn".into(), 3), ("serde".into(), 1)],
+            version_spread: vec![("syn".into(), 3, None), ("serde".into(), 1, None)],
             link_ms: vec![("bin/rch".into(), 18_000)],
             test_dominance: vec![("daemon_lifecycle".into(), 620)],
         }
@@ -210,6 +256,49 @@ mod tests {
         assert_eq!(report[0].expected_saved_ms, 24_000);
         assert_eq!(report[1].kind, AdviceKind::SplitRebuildTailCrate);
         assert_eq!(report[1].expected_saved_ms, 21_000);
+    }
+
+    #[test]
+    fn measured_compiler_time_replaces_the_estimate_and_is_cited() {
+        let inputs = AdviseInputs {
+            version_spread: vec![("syn".into(), 2, Some(7_350))],
+            feature_variants: vec![("common".into(), 3, Some(420))],
+            ..AdviseInputs::default()
+        };
+        let report = advise(&inputs);
+        let versions = report
+            .iter()
+            .find(|a| a.kind == AdviceKind::AlignVersions)
+            .expect("version advice");
+        assert_eq!(versions.expected_saved_ms, 7_350);
+        assert!(versions.evidence[1].contains("7350ms of compiler time"));
+        assert!(
+            versions
+                .non_claims
+                .iter()
+                .any(|nc| nc.starts_with("NO_CLAIM_INCREMENTAL_SAVINGS"))
+        );
+        // A measured row never also carries the estimate's disclaimer.
+        assert!(
+            !versions
+                .non_claims
+                .iter()
+                .any(|nc| nc.starts_with("NO_CLAIM_EXACT_SAVINGS"))
+        );
+        let features = report
+            .iter()
+            .find(|a| a.kind == AdviceKind::ReduceFeatureCoupling)
+            .expect("feature advice");
+        assert_eq!(features.expected_saved_ms, 420);
+        // Sorted by the measured saving, not the estimates (2000 vs 2000).
+        assert_eq!(report[0].kind, AdviceKind::AlignVersions);
+        // Measurement prices a problem; it never lowers the threshold.
+        let quiet = AdviseInputs {
+            version_spread: vec![("serde".into(), 1, Some(9_000))],
+            feature_variants: vec![("common".into(), 2, Some(9_000))],
+            ..AdviseInputs::default()
+        };
+        assert!(advise(&quiet).is_empty());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! - Command handlers are implemented directly in this module
 
 // Sub-modules
+pub mod advise;
 mod agents;
 mod config;
 mod config_doctor;
