@@ -900,6 +900,20 @@ pub(crate) async fn probe_owned_recovery_transport(
     config: &rch_common::WorkerConfig,
     timeout: Duration,
 ) -> bool {
+    let timeout = timeout.min(rch_common::timing::MAX_CONTROL_TIMEOUT);
+    let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    probe_owned_recovery_transport_until(config, timeout, deadline).await
+}
+
+/// Historical recovery shares the cancellation caller's original deadline;
+/// queued admission cannot create a fresh transport window afterward.
+pub(crate) async fn probe_owned_recovery_transport_until(
+    config: &rch_common::WorkerConfig,
+    timeout: Duration,
+    caller_deadline: tokio::time::Instant,
+) -> bool {
     use rch_common::ssh::{OwnedProcessGroup, configure_oneshot_ssh, ssh_can_disable_background};
     use std::path::Path;
     use std::process::Stdio;
@@ -913,6 +927,7 @@ pub(crate) async fn probe_owned_recovery_transport(
     let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
         return false;
     };
+    let deadline = deadline.min(caller_deadline);
     if tokio::time::Instant::now() >= deadline {
         return false;
     }
@@ -928,9 +943,12 @@ pub(crate) async fn probe_owned_recovery_transport(
             let _ = client.disconnect().await;
             return Some(result.success() && result.stdout.trim() == SENTINEL);
         }
-        let foreground = ssh_can_disable_background(Path::new("ssh"), timeout)
-            .await
-            .ok()?;
+        let foreground = ssh_can_disable_background(
+            Path::new("ssh"),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+        .ok()?;
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
@@ -947,7 +965,10 @@ pub(crate) async fn probe_owned_recovery_transport(
             ])
             .arg(format!(
                 "ConnectTimeout={}",
-                rch_common::timing::ceil_seconds(timeout).max(1)
+                rch_common::timing::ceil_seconds(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .max(1)
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1859,6 +1880,59 @@ mod tests {
                 "late authentication must not start the historical recovery command"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_probe_keeps_inherited_deadline_after_queued_admission() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(
+            MockConfig::success().with_stdout("RCH_TRANSPORT_READY_V1"),
+        ));
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let worker = WorkerConfig {
+                id: WorkerId::new(format!("historical-inherited-{}", lateness.as_millis())),
+                ..Default::default()
+            };
+            let budget = Duration::from_millis(20);
+            let probe = probe_owned_recovery_transport_until(
+                &worker,
+                Duration::from_secs(30),
+                tokio::time::Instant::now() + budget,
+            );
+            tokio::pin!(probe);
+            assert_health_probe_pending(probe.as_mut()).await;
+            tokio::time::advance(budget + lateness).await;
+            assert!(!probe.await);
+            assert!(mock::global_ssh_invocations_snapshot().iter().all(|call| {
+                call.worker_id != worker.id || call.phase != mock::Phase::Execute
+            }));
+        }
+        let worker = WorkerConfig {
+            id: WorkerId::new("historical-expired-before-connect"),
+            ..Default::default()
+        };
+        assert!(
+            !probe_owned_recovery_transport_until(
+                &worker,
+                Duration::from_secs(30),
+                tokio::time::Instant::now(),
+            )
+            .await
+        );
+        assert!(mock::global_ssh_invocations_snapshot()
+            .iter()
+            .all(|call| call.worker_id != worker.id));
+        assert!(
+            probe_owned_recovery_transport_until(
+                &worker,
+                Duration::from_secs(30),
+                tokio::time::Instant::now() + Duration::from_millis(25),
+            )
+            .await,
+            "a fresh timely attempt still proves historical transport recovery"
+        );
     }
 
     #[tokio::test(start_paused = true)]

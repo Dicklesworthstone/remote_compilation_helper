@@ -80,6 +80,31 @@ capability check retains the previous complete snapshot; it cannot advertise
 new capacity or reset that snapshot's age. A late toolchain verdict cannot
 refresh a cached worker exclusion.
 
+Periodic and on-demand telemetry retain their original collection deadline
+through SSH and publication. A periodic poll commits its sample and clears
+command-failure evidence together after checking the worker's endpoint and
+administrative generation. On-demand publication preserves its existing
+circuit behavior. Waiting for a busy telemetry cache cannot give an old sample
+a new freshness window or clear a failure after the probe deadline. If a timely
+remote sample cannot be published locally, the poll leaves existing evidence
+unchanged instead of recording a worker command failure. Exhausted remote
+polls have a fixed one-second local window to record failure; that window starts
+at the remote deadline, permits no more SSH work and cannot overwrite a newer
+successful observation.
+
+Cancellation uses one overall deadline starting before recovery admission.
+Connection inspection, the remote stop attempt and local settlement consume
+that same allowance. Historical recovery checks also retain that deadline while
+waiting to publish transport evidence. Queued publication consumes the proof's
+lifetime; when a down endpoint recovers, its next probe remains due at the
+proof's original expiry. A response at or after expiry remains unconfirmed; the
+existing process identity, exact receipt and reservation-retention rules still
+apply. A timely remote confirmation stays
+recorded if later local settlement expires, while incomplete overall
+cancellation retains ownership. Durable completion and fallback disk receipts
+both use the scaled ten-second read allowance and terminate their owned local
+transport on timeout.
+
 The affected operations are worker toolchain/capability/telemetry probes,
 embedded disk-monitor admission and heartbeat observations, source-namespace
 control, cancellation observation and settlement, and completion-receipt

@@ -503,6 +503,42 @@ impl EndpointTransport {
             .then(|| self.record_result_locked(&mut state, connected, normal_interval, circuit))
     }
 
+    async fn record_probe_result_until(
+        &self,
+        network: &BackgroundProbe,
+        connected: bool,
+        normal_interval: Duration,
+        circuit: &CircuitBreakerConfig,
+        deadline: tokio::time::Instant,
+    ) -> Option<(bool, bool)> {
+        let observed_at = tokio::time::Instant::now();
+        if observed_at >= deadline {
+            return None;
+        }
+        let positive_evidence = connected.then_some(TransportProbeDeadline {
+            started_at: observed_at,
+            interval: normal_interval,
+        });
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
+            .await
+            .ok()?;
+        if tokio::time::Instant::now() >= deadline
+            || !network.is_current()
+            || positive_evidence.is_some_and(|evidence| evidence.remaining().is_zero())
+        {
+            return None;
+        }
+        let outcome = self.record_result_locked(&mut state, connected, normal_interval, circuit);
+        // Publication contention consumes the proof's lifetime. Keep the
+        // existing intervals without renewing freshness or delaying a recovered
+        // endpoint's next probe beyond the observation's original due time.
+        state.positive_evidence = positive_evidence;
+        if connected && outcome.0 {
+            state.next_probe = positive_evidence;
+        }
+        Some(outcome)
+    }
+
     fn record_result_locked(
         &self,
         state: &mut WorkerTransportState,
@@ -702,14 +738,64 @@ impl OwnedRecoveryPermit {
         .await
     }
 
+    /// Preserve one cancellation deadline through admission, historical
+    /// transport proof, publication, and the authorized recovery operation.
+    pub(crate) async fn run_until<F: std::future::Future>(
+        &mut self,
+        operation: F,
+        deadline: tokio::time::Instant,
+    ) -> Option<F::Output> {
+        let endpoint = self.endpoint.clone();
+        let timeout = self.policy.probe_timeout;
+        self.run_with_probe_before(
+            operation,
+            crate::health::probe_owned_recovery_transport_until(&endpoint, timeout, deadline),
+            Some(deadline),
+        )
+        .await
+    }
+
     async fn run_with_probe<F: std::future::Future, P: std::future::Future<Output = bool>>(
         &mut self,
         operation: F,
         probe: P,
     ) -> Option<F::Output> {
+        self.run_with_probe_before(operation, probe, None).await
+    }
+
+    async fn run_with_probe_before<F: std::future::Future, P: std::future::Future<Output = bool>>(
+        &mut self,
+        operation: F,
+        probe: P,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<F::Output> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return None;
+        }
+        let operation = self.run_with_probe_admitted(operation, probe, deadline);
+        match deadline {
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                result = operation => result.filter(|_| tokio::time::Instant::now() < deadline),
+            },
+            None => operation.await,
+        }
+    }
+
+    async fn run_with_probe_admitted<F: std::future::Future, P: std::future::Future<Output = bool>>(
+        &mut self,
+        operation: F,
+        probe: P,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<F::Output> {
+        let in_budget = || deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline);
+        if !in_budget() {
+            return None;
+        }
         let _operation = self.transport.recovery.clone().try_lock_owned().ok()?;
         if let Some(current) = &mut self.current {
-            if !current.is_current() || self.transport.state.lock().await.down {
+            if !current.is_current() || self.transport.state.lock().await.down || !in_budget() {
                 return None;
             }
             return current.run(operation).await;
@@ -718,6 +804,9 @@ impl OwnedRecoveryPermit {
         let mut network = self.transport.revision_guard();
         let needs_probe = {
             let state = self.transport.state.lock().await;
+            if !in_budget() {
+                return None;
+            }
             !(state.connected
                 && !state.down
                 && state
@@ -731,9 +820,10 @@ impl OwnedRecoveryPermit {
             };
             {
                 let mut state = self.transport.state.lock().await;
-                if state
-                    .next_probe
-                    .is_some_and(|deadline| !deadline.remaining().is_zero())
+                if !in_budget()
+                    || state
+                        .next_probe
+                        .is_some_and(|deadline| !deadline.remaining().is_zero())
                 {
                     return None;
                 }
@@ -748,19 +838,43 @@ impl OwnedRecoveryPermit {
                     self.policy.normal_interval
                 }));
             }
+            if !in_budget() {
+                return None;
+            }
             let connected = network.run(probe).await?;
-            self.transport
-                .record_probe_result(
-                    &network,
-                    connected,
-                    self.policy.normal_interval,
-                    &self.policy.circuit,
-                )
-                .await?;
+            if !in_budget() {
+                return None;
+            }
+            match deadline {
+                Some(deadline) => {
+                    self.transport
+                        .record_probe_result_until(
+                            &network,
+                            connected,
+                            self.policy.normal_interval,
+                            &self.policy.circuit,
+                            deadline,
+                        )
+                        .await?;
+                }
+                None => {
+                    self.transport
+                        .record_probe_result(
+                            &network,
+                            connected,
+                            self.policy.normal_interval,
+                            &self.policy.circuit,
+                        )
+                        .await?;
+                }
+            }
             if !connected {
                 return None;
             }
             drop(flight);
+        }
+        if !in_budget() {
+            return None;
         }
         network.run(operation).await
     }
@@ -1741,6 +1855,22 @@ impl WorkerState {
         let previous = circuit.state();
         let new = circuit.apply_command_outcome(success, config);
         (previous, new)
+    }
+
+    /// Acquire command-evidence publication within the caller's original
+    /// deadline. Callers retain endpoint then network guards before this lock
+    /// and commit without another await once all destination locks are held.
+    pub(crate) async fn lock_command_outcome_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<tokio::sync::RwLockWriteGuard<'_, CircuitStats>> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        let guard = tokio::time::timeout_at(deadline, self.circuit.write())
+            .await
+            .ok()?;
+        (tokio::time::Instant::now() < deadline).then_some(guard)
     }
 
     /// Record a failed operation for circuit breaker.
@@ -4561,6 +4691,205 @@ mod tests {
             failure_threshold: 3,
             open_cooldown_secs: 900,
             ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_recovery_deadline_fences_queued_admission_and_allows_fresh_retry() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let pool = WorkerPool::new();
+            let endpoint = recovered_worker_config("historical-caller-deadline", 8);
+            let mut permit = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            let transport = pool.endpoint_transports.get(&endpoint);
+            let blocked = transport.state.lock().await;
+            let attempted = AtomicBool::new(false);
+            let executed = AtomicBool::new(false);
+            let allowance = Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now() + allowance;
+            let operation = permit.run_with_probe_before(
+                async {
+                    executed.store(true, Ordering::SeqCst);
+                    7
+                },
+                async {
+                    attempted.store(true, Ordering::SeqCst);
+                    true
+                },
+                Some(deadline),
+            );
+            tokio::pin!(operation);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(allowance + lateness).await;
+            drop(blocked);
+            assert!(operation.await.is_none());
+            assert!(!attempted.load(Ordering::SeqCst));
+            assert!(!executed.load(Ordering::SeqCst));
+            let state = transport.state.lock().await;
+            assert!(state.next_probe.is_none());
+            assert!(state.positive_evidence.is_none());
+            assert_eq!(state.failures, 0);
+            drop(state);
+            let mut fresh = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            assert_eq!(fresh.run_with_probe(async { 9 }, async { true }).await, Some(9));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_recovery_deadline_stops_a_ready_pending_operation() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let pool = WorkerPool::new();
+            let endpoint = recovered_worker_config("historical-pending-operation", 8);
+            let mut permit = pool.owned_recovery_admission(&endpoint).await.unwrap();
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let started = AtomicBool::new(false);
+            let executed = AtomicBool::new(false);
+            let allowance = Duration::from_secs(2);
+            let operation = permit.run_with_probe_before(
+                async {
+                    started.store(true, Ordering::SeqCst);
+                    let _ = pending.await;
+                    executed.store(true, Ordering::SeqCst);
+                    7
+                },
+                async { true },
+                Some(tokio::time::Instant::now() + allowance),
+            );
+            tokio::pin!(operation);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(started.load(Ordering::SeqCst));
+            tokio::time::advance(allowance + lateness).await;
+            release.send(()).unwrap();
+            assert!(operation.await.is_none());
+            assert!(!executed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_probe_publication_cannot_refresh_after_queued_state_lock_expires() {
+        for connected in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let transport = EndpointTransport::new();
+                let network = transport.revision_guard();
+                let blocked = transport.state.lock().await;
+                let circuit = CircuitBreakerConfig::default();
+                let budget = Duration::from_secs(2);
+                let publication = transport.record_probe_result_until(
+                    &network,
+                    connected,
+                    Duration::from_secs(30),
+                    &circuit,
+                    tokio::time::Instant::now() + budget,
+                );
+                tokio::pin!(publication);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(budget + lateness).await;
+                drop(blocked);
+                assert!(publication.await.is_none());
+                let state = transport.state.lock().await;
+                assert!(state.positive_evidence.is_none());
+                assert_eq!(state.failures, 0);
+                assert!(!state.down);
+                assert!(network.is_current());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn historical_probe_publication_preserves_the_observed_proof_age() {
+        let transport = EndpointTransport::new();
+        let network = transport.revision_guard();
+        let circuit = CircuitBreakerConfig::default();
+        let mut blocked = transport.state.lock().await;
+        blocked.down = true;
+        blocked.failures = 3;
+        let observed_at = tokio::time::Instant::now();
+        let publication = transport.record_probe_result_until(
+            &network,
+            true,
+            Duration::from_secs(30),
+            &circuit,
+            observed_at + Duration::from_secs(120),
+        );
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drop(blocked);
+        assert_eq!(publication.await, Some((true, false)));
+        let state = transport.state.lock().await;
+        let proof = state.positive_evidence.unwrap();
+        assert_eq!(proof.started_at, observed_at);
+        assert_eq!(proof.remaining(), Duration::from_secs(10));
+        assert_eq!(state.failures, 0);
+        assert!(state.connected);
+        assert!(!state.down);
+        assert_eq!(
+            state.next_probe.unwrap().remaining(),
+            Duration::from_secs(10),
+            "the next probe retains the observation's original due time"
+        );
+        drop(state);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let state = transport.state.lock().await;
+        assert!(state.positive_evidence.unwrap().remaining().is_zero());
+        assert!(state.next_probe.unwrap().remaining().is_zero());
+        drop(state);
+        assert!(transport.historical_recovery_eligible().await);
+        assert!(network.is_current());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_historical_proof_is_refused_even_with_caller_budget_remaining() {
+        for delay in [Duration::from_secs(30), Duration::from_secs(31)] {
+            let transport = EndpointTransport::new();
+            let network = transport.revision_guard();
+            let circuit = CircuitBreakerConfig::default();
+            let mut blocked = transport.state.lock().await;
+            blocked.down = true;
+            blocked.failures = 3;
+            blocked.next_probe = Some(TransportProbeDeadline::new(Duration::from_secs(120)));
+            let observed_at = tokio::time::Instant::now();
+            let publication = transport.record_probe_result_until(
+                &network,
+                true,
+                Duration::from_secs(30),
+                &circuit,
+                observed_at + Duration::from_secs(120),
+            );
+            tokio::pin!(publication);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(delay).await;
+            drop(blocked);
+            assert!(publication.await.is_none());
+            let state = transport.state.lock().await;
+            assert_eq!(state.failures, 3);
+            assert!(state.down);
+            assert!(!state.connected);
+            assert!(state.positive_evidence.is_none());
+            assert_eq!(
+                state.next_probe.unwrap().remaining(),
+                Duration::from_secs(120) - delay
+            );
+            assert!(network.is_current());
         }
     }
 

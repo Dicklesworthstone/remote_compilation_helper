@@ -19,10 +19,27 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// An expired timer wins over an operation that became ready while queued.
+/// The postcheck also rejects synchronous work that finishes across the boundary.
+async fn before_cancellation_deadline<F: std::future::Future>(
+    deadline: TokioInstant,
+    operation: F,
+) -> Option<F::Output> {
+    if TokioInstant::now() >= deadline {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => None,
+        result = operation => (TokioInstant::now() < deadline).then_some(result),
+    }
 }
 
 // ── Cancel Reason ────────────────────────────────────────────────────────
@@ -651,28 +668,69 @@ impl CancellationOrchestrator {
         record: &mut CancellationRecord,
         force: bool,
     ) -> bool {
+        let Some(deadline) = self.cancellation_deadline() else {
+            record.state = CancellationState::Failed;
+            record.cleanup_ok = false;
+            return true;
+        };
+        let mut started = false;
+        let admitted = before_cancellation_deadline(
+            deadline,
+            self.execute_cancellation_admitted(ctx, record, force, deadline, &mut started),
+        )
+        .await;
+        match admitted {
+            Some(admitted) => admitted,
+            None if !started => {
+                // Local admission contention is not a failed worker attempt.
+                // Retain ownership and permit a later automatic retry.
+                false
+            }
+            None => {
+                Self::finish_cancellation_attempt(record, deadline, true);
+                true
+            }
+        }
+    }
+
+    async fn execute_cancellation_admitted(
+        &self,
+        ctx: &DaemonContext,
+        record: &mut CancellationRecord,
+        force: bool,
+        deadline: TokioInstant,
+        started: &mut bool,
+    ) -> bool {
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
         if record.reason == CancelReason::User || !remote_cancellation_required(record) {
-            self.execute_cancellation(record, force).await;
+            *started = true;
+            self.execute_cancellation_until(record, force, deadline).await;
             return true;
         }
         if let Some(store) = &ctx.admin_disable_store {
-            let Some(mut permit) = store
-                .lock()
-                .await
-                .automatic_network_permit(&record.worker_id)
-            else {
+            let mut store = store.lock().await;
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
+            let Some(mut permit) = store.automatic_network_permit(&record.worker_id) else {
                 return false;
             };
+            drop(store);
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
             // No store lock spans signals or SSH. A disable revokes the ID's
             // permit even when inventory was removed/re-added or persistence
             // failed; dropping the operation terminates its owned transport.
             return permit
-                .run(self.execute_automatic_cancellation(ctx, record, force))
+                .run(self.execute_automatic_cancellation(ctx, record, force, deadline, started))
                 .await
                 .unwrap_or(false);
         }
 
-        self.execute_automatic_cancellation(ctx, record, force)
+        self.execute_automatic_cancellation(ctx, record, force, deadline, started)
             .await
     }
 
@@ -681,15 +739,26 @@ impl CancellationOrchestrator {
         ctx: &DaemonContext,
         record: &mut CancellationRecord,
         force: bool,
+        deadline: TokioInstant,
+        started: &mut bool,
     ) -> bool {
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
         // Nonpersistent embedded/test contexts still honor live disablement.
         // Do not use background_network_allowed: health readiness and today's
         // endpoint are not authority over a historical build's process group.
-        if ctx.admin_disable_store.is_none()
-            && let Some(worker) = ctx.pool.get(&WorkerId::new(&record.worker_id)).await
-            && worker.is_disabled().await
-        {
-            return false;
+        if ctx.admin_disable_store.is_none() {
+            let worker = ctx.pool.get(&WorkerId::new(&record.worker_id)).await;
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
+            if let Some(worker) = worker {
+                let disabled = worker.is_disabled().await;
+                if TokioInstant::now() >= deadline || disabled {
+                    return false;
+                }
+            }
         }
         // Without a process record no SSH answer can confirm termination.
         // Keep that existing no-network failure path; a connectivity probe
@@ -697,40 +766,84 @@ impl CancellationOrchestrator {
         if remote_answer_can_confirm(record)
             && let Some(owned) = cancellation_transport_endpoint(record)
         {
-            let Some(mut permit) = ctx.pool.owned_recovery_admission(owned).await else {
+            let permit = ctx.pool.owned_recovery_admission(owned).await;
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
+            let Some(mut permit) = permit else {
                 return false;
             };
             // The same endpoint gate covers current health, historical
             // cancellation and lease recovery. A different build cannot
             // bypass its outage deadline after inventory removal/retarget.
             return permit
-                .run(self.execute_cancellation(record, force))
+                .run_until(
+                    async {
+                        if TokioInstant::now() >= deadline {
+                            return false;
+                        }
+                        *started = true;
+                        self.execute_cancellation_until(record, force, deadline).await;
+                        true
+                    },
+                    deadline,
+                )
                 .await
-                .is_some();
+                .unwrap_or(false);
         }
-        self.execute_cancellation(record, force).await;
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
+        *started = true;
+        self.execute_cancellation_until(record, force, deadline).await;
         true
     }
 
-    /// One budget bounds all termination stages, including lock waits and force.
-    async fn execute_cancellation(&self, record: &mut CancellationRecord, force: bool) {
+    fn cancellation_deadline(&self) -> Option<TokioInstant> {
         let cleanup_timeout = scale_duration(self.config.cleanup_timeout);
-        let deadline = Instant::now().checked_add(cleanup_timeout);
-        if cleanup_timeout.is_zero() || deadline.is_none() {
+        if cleanup_timeout.is_zero() {
+            return None;
+        }
+        TokioInstant::now().checked_add(cleanup_timeout)
+    }
+
+    #[cfg(test)]
+    async fn execute_cancellation(&self, record: &mut CancellationRecord, force: bool) {
+        let Some(deadline) = self.cancellation_deadline() else {
             record.state = CancellationState::Failed;
             record.cleanup_ok = false;
             return;
-        }
-        let deadline = deadline.expect("checked cancellation deadline");
-        let timed_out = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
+        };
+        self.execute_cancellation_until(record, force, deadline).await;
+    }
+
+    /// Admission, termination and observation consume one original budget.
+    async fn execute_cancellation_until(
+        &self,
+        record: &mut CancellationRecord,
+        force: bool,
+        deadline: TokioInstant,
+    ) {
+        let timed_out = before_cancellation_deadline(
+            deadline,
             self.execute_cancellation_stages(record, force, deadline),
         )
         .await
-        .is_err();
+        .is_none();
+        Self::finish_cancellation_attempt(record, deadline, timed_out);
+    }
+
+    fn finish_cancellation_attempt(
+        record: &mut CancellationRecord,
+        deadline: TokioInstant,
+        timed_out: bool,
+    ) {
+        let timed_out = timed_out || TokioInstant::now() >= deadline;
         if timed_out || record.state != CancellationState::Completed {
             record.state = CancellationState::Failed;
             record.cleanup_ok = false;
+            // Preserve any earlier timely remote receipt. A later local
+            // settlement timeout must not manufacture remote failure evidence.
             warn!(
                 "Cancellation of build {} unconfirmed (timed_out={}); retaining active state",
                 record.build_id, timed_out
@@ -753,11 +866,19 @@ impl CancellationOrchestrator {
         Some(handle)
     }
 
-    async fn send_verified_signal(&self, record: &CancellationRecord, force: bool) -> bool {
+    async fn send_verified_signal(
+        &self,
+        record: &CancellationRecord,
+        force: bool,
+        deadline: TokioInstant,
+    ) -> bool {
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
         if wrapper_process_state(record.hook_pid, record.hook_process_identity.as_deref())
             == WrapperProcessState::Exited
         {
-            return true;
+            return TokioInstant::now() < deadline;
         }
         #[cfg(target_os = "linux")]
         if let Some(handle) = Self::verified_hook_handle(record) {
@@ -766,6 +887,11 @@ impl CancellationOrchestrator {
             } else {
                 rustix::process::Signal::TERM
             };
+            // Opening the pidfd and reading identity can themselves stall.
+            // Revalidate time immediately before the irreversible signal.
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
             return rustix::process::pidfd_send_signal(&handle, signal).is_ok();
         }
         #[cfg(not(target_os = "linux"))]
@@ -781,8 +907,11 @@ impl CancellationOrchestrator {
         &self,
         record: &mut CancellationRecord,
         force: bool,
-        deadline: Instant,
+        deadline: TokioInstant,
     ) {
+        if TokioInstant::now() >= deadline {
+            return;
+        }
         // Losing the hook does not prove that its remote process group exited.
         // Only builds with no reservation AND no remote identity may skip SSH,
         // or an abandoned reservation that never reported a record path. An
@@ -811,40 +940,54 @@ impl CancellationOrchestrator {
         if force {
             record.state = CancellationState::Escalated;
             if record.hook_pid > 0 {
-                self.send_verified_signal(record, true).await;
+                self.send_verified_signal(record, true, deadline).await;
             }
-            let remote_stopped = !remote_required || self.try_remote_kill(record).await;
-            let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout).await;
-            record.state = cancellation_terminal_state(local_stopped, remote_stopped);
+            if TokioInstant::now() >= deadline {
+                return;
+            }
+            let remote_stopped = !remote_required || self.try_remote_kill(record, deadline).await;
+            let local_stopped =
+                wait_for_wrapper_exit(record, self.config.kill_timeout, deadline).await;
+            record.state = cancellation_terminal_state(
+                local_stopped && TokioInstant::now() < deadline,
+                remote_stopped,
+            );
             return;
         }
 
         // Step 1: Send SIGTERM.
         record.state = CancellationState::TermSent;
         if record.hook_pid > 0 {
-            self.send_verified_signal(record, false).await;
+            self.send_verified_signal(record, false, deadline).await;
         }
 
-        let local_stopped = wait_for_wrapper_exit(record, self.config.grace_period).await;
-        if local_stopped {
-            let remote_stopped = !remote_required || self.attempt_remote_kill_stage(record).await;
-            record.state = cancellation_terminal_state(true, remote_stopped);
+        let local_stopped =
+            wait_for_wrapper_exit(record, self.config.grace_period, deadline).await;
+        if TokioInstant::now() >= deadline {
             return;
         }
-
-        if Instant::now() >= deadline {
-            record.state = CancellationState::Failed;
+        if local_stopped {
+            let remote_stopped =
+                !remote_required || self.attempt_remote_kill_stage(record, deadline).await;
+            record.state =
+                cancellation_terminal_state(TokioInstant::now() < deadline, remote_stopped);
             return;
         }
 
         // Step 2: Terminate remote work, preserving its result through SIGKILL.
-        let remote_stopped = !remote_required || self.attempt_remote_kill_stage(record).await;
-        if remote_stopped && wait_for_wrapper_exit(record, Duration::from_millis(500)).await {
+        let remote_stopped =
+            !remote_required || self.attempt_remote_kill_stage(record, deadline).await;
+        if remote_stopped
+            && wait_for_wrapper_exit(record, Duration::from_millis(500), deadline).await
+            && TokioInstant::now() < deadline
+        {
             record.state = CancellationState::Completed;
             return;
         }
 
-        if Instant::now() >= deadline || record.escalation_count >= self.config.max_escalations {
+        if TokioInstant::now() >= deadline
+            || record.escalation_count >= self.config.max_escalations
+        {
             record.state = CancellationState::Failed;
             return;
         }
@@ -863,14 +1006,23 @@ impl CancellationOrchestrator {
 
         record.state = CancellationState::Escalated;
         if record.hook_pid > 0 {
-            self.send_verified_signal(record, true).await;
+            self.send_verified_signal(record, true, deadline).await;
         }
-        let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout).await;
-        record.state = cancellation_terminal_state(local_stopped, remote_stopped);
+        let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout, deadline).await;
+        record.state = cancellation_terminal_state(
+            local_stopped && TokioInstant::now() < deadline,
+            remote_stopped,
+        );
     }
 
-    async fn attempt_remote_kill_stage(&self, record: &mut CancellationRecord) -> bool {
-        if record.escalation_count >= self.config.max_escalations {
+    async fn attempt_remote_kill_stage(
+        &self,
+        record: &mut CancellationRecord,
+        deadline: TokioInstant,
+    ) -> bool {
+        if TokioInstant::now() >= deadline
+            || record.escalation_count >= self.config.max_escalations
+        {
             return false;
         }
         record.escalation_count += 1;
@@ -885,11 +1037,23 @@ impl CancellationOrchestrator {
         );
 
         record.state = CancellationState::RemoteKillSent;
-        self.try_remote_kill(record).await
+        self.try_remote_kill(record, deadline).await
     }
 
     /// Attempt to kill the remote process on the worker via SSH.
-    async fn try_remote_kill(&self, record: &mut CancellationRecord) -> bool {
+    async fn try_remote_kill(
+        &self,
+        record: &mut CancellationRecord,
+        caller_deadline: TokioInstant,
+    ) -> bool {
+        let remote_kill_timeout = scale_duration(self.config.remote_kill_timeout);
+        let Some(deadline) = TokioInstant::now().checked_add(remote_kill_timeout) else {
+            return false;
+        };
+        let deadline = deadline.min(caller_deadline);
+        if TokioInstant::now() >= deadline {
+            return false;
+        }
         record.remote_kill_attempted = true;
         record.remote_kill_confirmed = false;
 
@@ -915,42 +1079,38 @@ impl CancellationOrchestrator {
             );
             return false;
         }
-        let remote_kill_timeout = scale_duration(self.config.remote_kill_timeout);
-        let ssh_result = tokio::time::timeout(remote_kill_timeout, async {
-            // Keep the local client inspection and the single remote attempt
-            // inside the same budget. An inherited background/control-master
-            // setting must not detach the transport from this cancellation.
-            let foreground = rch_common::ssh::ssh_can_disable_background(
+        let observed_record = &*record;
+        let ssh_result = remote_cancellation_attempt_before(
+            deadline,
+            rch_common::ssh::ssh_can_disable_background(
                 std::path::Path::new("ssh"),
-                remote_kill_timeout,
-            )
-            .await?;
-            let mut ssh = build_remote_kill_command(record, foreground)
-                .ok_or_else(|| anyhow::anyhow!("Remote cancellation lost endpoint evidence"))?;
-            Ok::<_, anyhow::Error>(remote_cancellation_output(&mut ssh).await?)
-        })
+                deadline.saturating_duration_since(TokioInstant::now()),
+            ),
+            move |foreground| async move {
+                let mut ssh = build_remote_kill_command(observed_record, foreground)
+                    .ok_or_else(|| anyhow::anyhow!("Remote cancellation lost endpoint evidence"))?;
+                Ok::<_, anyhow::Error>(remote_cancellation_output(&mut ssh, deadline).await?)
+            },
+        )
         .await;
 
         match ssh_result {
-            Ok(Ok(output)) => {
-                let success = remote_kill_confirmed(&output, record.build_id)
-                    || (record.abandoned_unlaunched
-                        && remote_record_absent(&output, record.build_id));
-                record.remote_kill_confirmed = success;
+            Some(Ok(output)) => {
+                let success = confirm_remote_cancellation_before(record, &output, deadline);
                 debug!(
                     "Remote kill for build {} on {}: success={}",
                     record.build_id, record.worker_id, success
                 );
                 success
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 warn!(
                     "Remote kill SSH command failed for build {}: {}",
                     record.build_id, e
                 );
                 false
             }
-            Err(_) => {
+            None => {
                 warn!(
                     "Remote kill timed out for build {} on {}",
                     record.build_id, record.worker_id
@@ -1328,11 +1488,34 @@ fn build_remote_kill_command(
     Some(ssh)
 }
 
+/// The foreground-client inspection and remote spawn share the caller's
+/// remaining allowance. No ready inspection can start SSH after expiry.
+async fn remote_cancellation_attempt_before<I, E, F>(
+    deadline: TokioInstant,
+    inspection: I,
+    execute: E,
+) -> Option<anyhow::Result<std::process::Output>>
+where
+    I: std::future::Future<Output = anyhow::Result<bool>>,
+    E: FnOnce(bool) -> F,
+    F: std::future::Future<Output = anyhow::Result<std::process::Output>>,
+{
+    before_cancellation_deadline(deadline, async {
+        let foreground = inspection.await?;
+        if TokioInstant::now() >= deadline {
+            anyhow::bail!("Remote cancellation deadline exceeded during SSH inspection");
+        }
+        execute(foreground).await
+    })
+    .await
+}
+
 /// Own the cancellation transport and its ProxyCommand descendants together.
 /// The caller's deadline drops this owner on timeout or cancellation, but never
 /// treats a killed local SSH process as evidence that remote work has stopped.
 async fn remote_cancellation_output(
     command: &mut tokio::process::Command,
+    deadline: TokioInstant,
 ) -> std::io::Result<std::process::Output> {
     use rch_common::ssh::OwnedProcessGroup;
     use std::process::Stdio;
@@ -1342,6 +1525,12 @@ async fn remote_cancellation_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if TokioInstant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Remote cancellation deadline exceeded before SSH spawn",
+        ));
+    }
     let mut process = OwnedProcessGroup::spawn(command)?;
     let mut stdout = process
         .take_stdout()
@@ -1406,6 +1595,23 @@ fn remote_kill_confirmed(output: &std::process::Output, build_id: u64) -> bool {
         && output.stdout.as_slice() == format!("RCH_REMOTE_CANCELLED_V1:{build_id}\n").as_bytes()
 }
 
+fn confirm_remote_cancellation_before(
+    record: &mut CancellationRecord,
+    output: &std::process::Output,
+    deadline: TokioInstant,
+) -> bool {
+    if TokioInstant::now() >= deadline {
+        return false;
+    }
+    let success = remote_kill_confirmed(output, record.build_id)
+        || (record.abandoned_unlaunched && remote_record_absent(output, record.build_id));
+    if TokioInstant::now() >= deadline {
+        return false;
+    }
+    record.remote_kill_confirmed = success;
+    success
+}
+
 /// Use the existing safe syscall wrapper: spawning /bin/kill can block the
 /// runtime before an async deadline can be polled, especially under fork load.
 #[cfg(test)]
@@ -1460,21 +1666,36 @@ fn is_process_alive(pid: u32) -> bool {
     !matches!(kill(Pid::from_raw(raw_pid), None), Err(Errno::ESRCH))
 }
 
-async fn wait_for_wrapper_exit(record: &CancellationRecord, budget: Duration) -> bool {
+async fn wait_for_wrapper_exit(
+    record: &CancellationRecord,
+    budget: Duration,
+    caller_deadline: TokioInstant,
+) -> bool {
+    let started = TokioInstant::now();
+    if started >= caller_deadline {
+        return false;
+    }
     let observe =
         || wrapper_process_state(record.hook_pid, record.hook_process_identity.as_deref());
     match observe() {
-        WrapperProcessState::Exited => return true,
+        WrapperProcessState::Exited => return TokioInstant::now() < caller_deadline,
         WrapperProcessState::Unverified => return false,
         WrapperProcessState::Running => {}
     }
     if budget.is_zero() {
         return false;
     }
-    tokio::time::timeout(budget, async {
+    let Some(deadline) = started.checked_add(budget) else {
+        return false;
+    };
+    let deadline = deadline.min(caller_deadline);
+    before_cancellation_deadline(deadline, async {
         loop {
+            if TokioInstant::now() >= deadline {
+                return false;
+            }
             match observe() {
-                WrapperProcessState::Exited => return true,
+                WrapperProcessState::Exited => return TokioInstant::now() < deadline,
                 WrapperProcessState::Unverified => return false,
                 WrapperProcessState::Running => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1594,7 +1815,11 @@ wait
                 Duration::from_secs(30)
             };
             let task = tokio::spawn(async move {
-                tokio::time::timeout(budget, remote_cancellation_output(&mut command)).await
+                tokio::time::timeout(
+                    budget,
+                    remote_cancellation_output(&mut command, TokioInstant::now() + budget),
+                )
+                .await
             });
             let (leader, proxy) = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -1743,6 +1968,254 @@ wait
             remote_pgid_file: None,
             abandoned_unlaunched: false,
         }
+    }
+
+    async fn assert_cancellation_pending<F: std::future::Future>(
+        mut operation: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    fn cancellation_receipt_fixture(build_id: u64) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!("RCH_REMOTE_CANCELLED_V1:{build_id}\n").into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_deadline_wins_over_a_ready_pending_operation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let allowance = Duration::from_secs(2);
+        for elapsed in [
+            allowance - Duration::from_millis(1),
+            allowance,
+            allowance + Duration::from_millis(1),
+        ] {
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let executed = AtomicBool::new(false);
+            let operation = before_cancellation_deadline(
+                TokioInstant::now() + allowance,
+                async {
+                    pending.await.unwrap();
+                    executed.store(true, Ordering::SeqCst);
+                    7
+                },
+            );
+            tokio::pin!(operation);
+            assert_cancellation_pending(operation.as_mut()).await;
+            tokio::time::advance(elapsed).await;
+            release.send(()).unwrap();
+            assert_eq!(operation.await, (elapsed < allowance).then_some(7));
+            assert_eq!(executed.load(Ordering::SeqCst), elapsed < allowance);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_admission_expiry_defers_without_starting_termination() {
+        use rch_common::bypass_record::AdminDisableStore;
+
+        for force in [false, true] {
+            for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Arc::new(tokio::sync::Mutex::new(AdminDisableStore::with_path(
+                    directory.path().join("admin.json"),
+                )));
+                let mut ctx =
+                    make_test_context(WorkerPool::new(), Arc::new(BuildHistory::new(10)));
+                ctx.admin_disable_store = Some(store.clone());
+                let owner = CancellationOrchestrator::new(
+                    CancellationConfig {
+                        cleanup_timeout: Duration::from_secs(2),
+                        ..test_config()
+                    },
+                    test_events(),
+                );
+                let mut record = test_record(CancellationState::Requested, 0, false);
+                record.reason = CancelReason::Timeout;
+                record.hook_pid = 0;
+                record.slots_released = 0;
+                let blocked = store.lock().await;
+                {
+                    let operation = owner.execute_cancellation_with_recovery_admission(
+                        &ctx,
+                        &mut record,
+                        force,
+                    );
+                    tokio::pin!(operation);
+                    assert_cancellation_pending(operation.as_mut()).await;
+                    tokio::time::advance(
+                        scale_duration(owner.config.cleanup_timeout) + lateness,
+                    )
+                    .await;
+                    drop(blocked);
+                    assert!(!operation.await);
+                }
+                assert_eq!(record.state, CancellationState::Requested);
+                assert!(!record.remote_kill_attempted);
+                assert_eq!(record.escalation_count, 0);
+                assert!(record.cleanup_ok);
+                assert_eq!(owner.cancellation_debt(&record.worker_id).await, 0.0);
+
+                // A later admitted attempt is allowed, but missing remote
+                // identity still cannot authorize a release or an SSH dial.
+                assert!(
+                    owner
+                        .execute_cancellation_with_recovery_admission(&ctx, &mut record, force)
+                        .await
+                );
+                assert_eq!(record.state, CancellationState::Failed);
+                assert!(record.remote_kill_attempted);
+                assert!(!record.remote_kill_confirmed);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_inspection_cannot_start_remote_execution_at_expiry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let allowance = Duration::from_secs(2);
+        for elapsed in [
+            allowance - Duration::from_millis(1),
+            allowance,
+            allowance + Duration::from_millis(1),
+        ] {
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let executed = AtomicBool::new(false);
+            let operation = remote_cancellation_attempt_before(
+                TokioInstant::now() + allowance,
+                async {
+                    pending.await.unwrap();
+                    Ok(true)
+                },
+                |_| async {
+                    executed.store(true, Ordering::SeqCst);
+                    Ok(cancellation_receipt_fixture(42))
+                },
+            );
+            tokio::pin!(operation);
+            assert_cancellation_pending(operation.as_mut()).await;
+            tokio::time::advance(elapsed).await;
+            release.send(()).unwrap();
+            let result = operation.await;
+            if elapsed < allowance {
+                assert!(remote_kill_confirmed(&result.unwrap().unwrap(), 42));
+            } else {
+                assert!(result.is_none());
+            }
+            assert_eq!(executed.load(Ordering::SeqCst), elapsed < allowance);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_receipts_require_time_before_the_deadline() {
+        let allowance = Duration::from_secs(2);
+        for elapsed in [
+            allowance - Duration::from_millis(1),
+            allowance,
+            allowance + Duration::from_millis(1),
+        ] {
+            let mut record = test_record(CancellationState::RemoteKillSent, 1, true);
+            let output = cancellation_receipt_fixture(record.build_id);
+            let deadline = TokioInstant::now() + allowance;
+            tokio::time::advance(elapsed).await;
+            assert_eq!(
+                confirm_remote_cancellation_before(&mut record, &output, deadline),
+                elapsed < allowance,
+            );
+            assert_eq!(record.remote_kill_confirmed, elapsed < allowance);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_late_settlement_keeps_earlier_remote_confirmation_and_ownership() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let pool = WorkerPool::new();
+            let config = rch_common::WorkerConfig::default();
+            let id = config.id.clone();
+            pool.add_worker(config).await;
+            let worker = pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(3).await);
+            let history = Arc::new(BuildHistory::new(10));
+            let active = history.start_active_build(
+                "late-local-settlement".into(),
+                id.to_string(),
+                "cargo test".into(),
+                0,
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            let ctx = make_test_context(pool, history.clone());
+            let owner = CancellationOrchestrator::new(test_config(), test_events());
+            let mut record = test_record(CancellationState::RemoteKillSent, 1, true);
+            record.build_id = active.id;
+            record.worker_id = id.to_string();
+            record.slots_released = 0;
+            let deadline = TokioInstant::now() + Duration::from_secs(2);
+            let output = cancellation_receipt_fixture(record.build_id);
+            assert!(confirm_remote_cancellation_before(
+                &mut record,
+                &output,
+                deadline,
+            ));
+            record.state = CancellationState::Completed;
+            tokio::time::advance(Duration::from_secs(2) + lateness).await;
+            CancellationOrchestrator::finish_cancellation_attempt(&mut record, deadline, false);
+            assert_eq!(record.state, CancellationState::Failed);
+            assert!(record.remote_kill_confirmed);
+            assert!(!record.cleanup_ok);
+            owner.run_cleanup(&ctx, &mut record).await;
+            assert_eq!(record.slots_released, 0);
+            assert_eq!(worker.used_slots(), 3);
+            assert!(history.active_build(active.id).is_some());
+            assert!(history.recent(10).is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_expired_deadline_never_signals_or_spawns() {
+        let mut child = CancellationOwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let owner = CancellationOrchestrator::new(test_config(), test_events());
+        for force in [false, true] {
+            let mut record = test_record(CancellationState::Requested, 0, false);
+            record.hook_pid = child.0.id();
+            record.hook_process_identity =
+                Some(crate::history::process_identity(record.hook_pid).unwrap());
+            record.slots = 0;
+            let deadline = TokioInstant::now();
+            assert!(!owner.send_verified_signal(&record, force, deadline).await);
+            owner.execute_cancellation_until(&mut record, force, deadline).await;
+            assert_eq!(record.state, CancellationState::Failed);
+            assert!(!record.remote_kill_attempted);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("spawned");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf spawned > \"$1\"", "expired-cancellation"])
+            .arg(&marker);
+        let error = remote_cancellation_output(&mut command, TokioInstant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -3045,19 +3518,48 @@ wait
             "modelled prior incarnation is gone, but the current occupant is alive"
         );
         assert!(CancellationOrchestrator::verified_hook_handle(&record).is_none());
-        assert!(owner.send_verified_signal(&record, true).await);
-        assert!(wait_for_wrapper_exit(&record, Duration::ZERO).await);
+        assert!(
+            owner
+                .send_verified_signal(&record, true, TokioInstant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(
+            wait_for_wrapper_exit(
+                &record,
+                Duration::ZERO,
+                TokioInstant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
         assert!(
             child.0.try_wait().unwrap().is_none(),
             "reused PID was signalled"
         );
 
         record.hook_process_identity = Some(identity);
-        assert!(!wait_for_wrapper_exit(&record, Duration::ZERO).await);
+        assert!(
+            !wait_for_wrapper_exit(
+                &record,
+                Duration::ZERO,
+                TokioInstant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
         let handle = CancellationOrchestrator::verified_hook_handle(&record).unwrap();
-        assert!(owner.send_verified_signal(&record, false).await);
+        assert!(
+            owner
+                .send_verified_signal(&record, false, TokioInstant::now() + Duration::from_secs(1))
+                .await
+        );
         child.0.wait().unwrap();
-        assert!(wait_for_wrapper_exit(&record, Duration::from_secs(1)).await);
+        assert!(
+            wait_for_wrapper_exit(
+                &record,
+                Duration::from_secs(1),
+                TokioInstant::now() + Duration::from_secs(2),
+            )
+            .await
+        );
         // The retained kernel handle refers to the exited process even if its
         // numeric PID is reused later; it cannot signal a replacement owner.
         assert_eq!(
@@ -3901,7 +4403,13 @@ sleep() { rch_cancel_test_clock=$((rch_cancel_test_clock + 1500)); }
             abandoned.worker_endpoint = active.worker_endpoint.clone();
             abandoned.remote_pgid_file = Some("/test/owned-group.pgid".into());
             abandoned.abandoned_unlaunched = true;
-            assert!(orch.try_remote_kill(&mut abandoned).await);
+            assert!(
+                orch.try_remote_kill(
+                    &mut abandoned,
+                    TokioInstant::now() + scale_duration(orch.config.cleanup_timeout),
+                )
+                .await
+            );
             assert!(abandoned.remote_kill_confirmed);
             std::fs::write(root.join("child-completed"), "ok").unwrap();
             return;
@@ -5196,10 +5704,9 @@ fi
             drop(health);
             tokio::time::resume();
 
-            // Resuming Tokio's clock retains its 900-second offset. The
-            // cancellation state machine also uses std::Instant deadlines,
-            // so its real transport assertions need a fresh, aligned runtime.
-            // Keep the actual owned state and every admission assertion.
+            // Keep actual SSH work on a fresh real-time runtime after the
+            // paused recovery-cadence assertions, retaining the same owned
+            // state and every admission assertion.
             tokio::task::spawn_blocking(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()

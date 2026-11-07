@@ -12,7 +12,7 @@ use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::reload;
 use crate::restart_admission::{MaintenanceFence, MaintenancePeer, RestartAdmissionState};
-use crate::telemetry::collect_telemetry_from_worker;
+use crate::telemetry::{collect_telemetry_from_worker, publish_collected_telemetry};
 use crate::workers::{
     WorkerCapabilitiesResponse, get_workers_capabilities, handle_worker_disable,
     handle_worker_drain, handle_worker_enable,
@@ -2392,46 +2392,20 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
         };
     }
 
-    // 20s (matching TelemetryPollerConfig): a fresh SSH connect+auth+exec to a
-    // trans-continental worker can approach/exceed 5s under load.
-    let Some(permission) = worker.background_probe().await else {
-        return TelemetryPollResponse {
-            status: "error".into(),
-            telemetry: None,
-            error: Some("worker background connections are suspended".into()),
-            worker_id: Some(worker_id.to_string()),
-        };
-    };
-    match collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await {
-        Ok((endpoint, telemetry)) => {
-            let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
-                return TelemetryPollResponse {
-                    status: "error".to_string(),
-                    telemetry: None,
-                    error: Some("worker endpoint changed during telemetry collection".to_string()),
-                    worker_id: Some(worker_id.to_string()),
-                };
-            };
-            let Some(_publication) = worker.lock_network_publication(&permission).await else {
-                return TelemetryPollResponse {
-                    status: "error".into(),
-                    telemetry: None,
-                    error: Some("worker lifecycle changed during telemetry collection".into()),
-                    worker_id: Some(worker_id.to_string()),
-                };
-            };
-            ctx.telemetry.ingest_for_endpoint(
-                telemetry.clone(),
-                TelemetrySource::OnDemand,
-                &endpoint,
-            );
-            TelemetryPollResponse {
-                status: "ok".to_string(),
-                telemetry: Some(telemetry),
-                error: None,
-                worker_id: None,
-            }
-        }
+    // Preserve the existing per-phase allowance, but carry one scaled and
+    // bounded deadline through admission, SSH and local cache publication.
+    let result = async {
+        let collected = collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await?;
+        publish_collected_telemetry(&worker, &ctx.telemetry, collected).await
+    }
+    .await;
+    match result {
+        Ok(telemetry) => TelemetryPollResponse {
+            status: "ok".to_string(),
+            telemetry: Some(telemetry),
+            error: None,
+            worker_id: None,
+        },
         Err(e) => TelemetryPollResponse {
             status: "error".to_string(),
             telemetry: None,
