@@ -1777,6 +1777,481 @@ mod tests {
         }
     }
 
+    fn persist_recovery_fixture(directory: &Path, lease: &DurableJobLease) {
+        std::fs::write(
+            directory.join(format!("{}.json", lease.identity.local_wrapper_id)),
+            serde_json::to_vec(lease).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Worker settlement is the injected boundary in this daemon test. The
+    /// real registry/activity-lock protocol has separate worker-side tests;
+    /// local absence alone never produces these receipts in production.
+    fn preparation_settlement_fixture(before: &DurableJobLease) -> DurableJobLease {
+        let mut settled = before.clone();
+        let recipe = settled.recovery.as_mut().unwrap();
+        assert_eq!(recipe["prepared"], false);
+        assert_eq!(recipe["execution_started"], false);
+        for field in [
+            "preparation_cancelled",
+            "source_cancellation_settled",
+            "sources_released",
+            "tree_retired",
+            "pair_released",
+            "retired",
+        ] {
+            recipe[field] = serde_json::json!(true);
+        }
+        recipe["returned"] = serde_json::json!(1);
+        settled.exit_code = Some(1);
+        settled
+    }
+
+    async fn recovery_accounting_request(
+        context: &crate::DaemonContext,
+        request: String,
+    ) -> serde_json::Value {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (shutdown, _) = tokio::sync::mpsc::channel(1);
+        let (served, response) = tokio::join!(
+            crate::api::handle_connection(server, context.clone(), shutdown),
+            async {
+                client.write_all(request.as_bytes()).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut response = String::new();
+                client.read_to_string(&mut response).await.unwrap();
+                response
+            }
+        );
+        served.unwrap();
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    async fn restore_recovery_fleet(
+        directory: &Path,
+        endpoints: &[WorkerConfig],
+    ) -> crate::DaemonContext {
+        let pool = WorkerPool::new();
+        for endpoint in endpoints {
+            pool.add_worker(endpoint.clone()).await;
+        }
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.client_lease_dir = directory.to_owned();
+        context.history = Arc::new(
+            crate::history::BuildHistory::load_from_file(&directory.join("history.jsonl"), 32)
+                .unwrap(),
+        );
+        Arc::make_mut(&mut context.worker_selector).set_build_history(context.history.clone());
+        for active in context.history.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                .await
+                .unwrap();
+        }
+        context
+    }
+
+    /// Supply a verified worker result, then exercise real daemon release and
+    /// exact terminal readback. This adapter never runs a compiler or SSH.
+    async fn settle_preparation_fixture(
+        context: crate::DaemonContext,
+        directory: PathBuf,
+        candidate: RecoveryCandidate,
+    ) -> Result<(), String> {
+        let before = read_lease(&directory, &candidate.wrapper_id)?;
+        check_candidate(&before, &candidate.wrapper_id, Some(&candidate))?;
+        let mut settled = preparation_settlement_fixture(&before);
+        persist_recovery_fixture(&directory, &settled);
+        let query = format!(
+            "GET /builds/{}?local_wrapper_id={}\n",
+            candidate.build_id, candidate.wrapper_id
+        );
+        let mut receipt = recovery_accounting_request(&context, query.clone()).await;
+        if receipt["status"] == "active" {
+            recovery_accounting_request(
+                &context,
+                format!(
+                    "POST /release-worker?worker={}&build_id={}&local_wrapper_id={}&exit_code=1\n",
+                    candidate.worker_id, candidate.build_id, candidate.wrapper_id
+                ),
+            )
+            .await;
+            receipt = recovery_accounting_request(&context, query).await;
+        }
+        assert_eq!(receipt["status"], "completed");
+        assert_eq!(receipt["record"]["id"], candidate.build_id);
+        assert_eq!(receipt["record"]["worker_id"], candidate.worker_id);
+        assert_eq!(receipt["local_wrapper_id"], candidate.wrapper_id);
+        assert_eq!(receipt["record"]["exit_code"], 1);
+        settled.recovery.as_mut().unwrap()["daemon_exit_code"] =
+            receipt["record"]["exit_code"].clone();
+        settled.acknowledge_terminal(before.heartbeat_unix_ms + 1);
+        persist_recovery_fixture(&directory, &settled);
+        verify_recovery_completion(&before, &read_lease(&directory, &candidate.wrapper_id)?)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(start_paused = true)]
+    async fn nine_abandoned_preparations_recover_capacity_after_failures_and_restarts() {
+        use rch_common::process_identity::{
+            ProcessObservation, current_process_identity, observe_process,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let now_ms = 100 * 60 * 60 * 1000;
+        let endpoints: Vec<_> = [4, 2, 2, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(index, slots)| WorkerConfig {
+                total_slots: slots,
+                ..recovery_worker(&format!("preparation-worker-{index}"))
+            })
+            .collect();
+        let pool = WorkerPool::new();
+        for endpoint in &endpoints {
+            pool.add_worker(endpoint.clone()).await;
+        }
+        let history = crate::history::BuildHistory::new(32)
+            .with_persistence(directory.path().join("history.jsonl"));
+        let mut leases = Vec::new();
+        for index in 0..11 {
+            // Real local process births make dead/live/reused PID distinctions
+            // independent of a canned bool probe. PID 1 without a recorded
+            // birth models an unverified owner and must remain protected too.
+            let (pid, birth) = if index < 9 {
+                let mut child = std::process::Command::new("/bin/sh")
+                    .args(["-c", "read -r gate"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let pid = child.id();
+                let observed = observe_process(pid);
+                drop(child.stdin.take());
+                child.wait().unwrap();
+                let ProcessObservation::Present(birth) = observed else {
+                    panic!("fixture wrapper has no kernel birth identity: {observed:?}");
+                };
+                assert_eq!(owner_presence(pid, Some(&birth)), OwnerPresence::Absent);
+                (pid, Some(birth))
+            } else if index == 9 {
+                (std::process::id(), current_process_identity())
+            } else {
+                (1, None)
+            };
+            let worker_index = if index == 9 {
+                0
+            } else if index == 10 {
+                3
+            } else {
+                index % 4
+            };
+            let endpoint = &endpoints[worker_index];
+            let worker = pool.get(&endpoint.id).await.unwrap();
+            assert!(worker.reserve_slots(1).await);
+            let age_tenths_of_an_hour = [217, 190, 165, 140, 115, 90, 65, 40, 21, 21, 21][index];
+            let heartbeat = now_ms - age_tenths_of_an_hour * 360_000;
+            let mut owned = lease(heartbeat, pid, serde_json::Value::Null);
+            owned.process_birth = birth;
+            let build = history
+                .try_start_active_build_with_waiter(
+                    format!("preparation-project-{index}"),
+                    endpoint.id.to_string(),
+                    "cargo +nightly test".into(),
+                    pid,
+                    Some(owned.identity.local_wrapper_id.clone()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            owned.admit(build.id, endpoint.id.to_string(), heartbeat);
+            owned.recovery = Some(serde_json::json!({
+                "version": 2, "wrapper_id": owned.identity.local_wrapper_id,
+                "build_id": build.id, "worker": endpoint,
+                "identity": format!("aa-{index:x}"),
+                "prepared": false, "execution_started": false, "phases": [],
+                "preparation_cancelled": index < 5,
+                "source_cancellation_settled": false,
+                "source_authority_namespace": if index % 2 == 0 { "current" } else { "legacy" },
+                "source_roots": [format!("/owned/source-{index}")],
+                "pair": [format!("/owned/pair-{index}"), format!("aa-{index:x}")],
+                "retire_root": format!("/owned/tree-{index}"),
+                "sources_released": false, "tree_retired": false, "pair_released": false,
+                "retired": false, "returned": (index < 3).then_some(1)
+            }));
+            persist_recovery_fixture(directory.path(), &owned);
+            leases.push(owned);
+        }
+        let scan = || {
+            recoverable_candidates(directory.path(), now_ms, |lease| {
+                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+            })
+        };
+        let original_ids: Vec<_> = leases[..9]
+            .iter()
+            .map(|lease| lease.identity.local_wrapper_id.clone())
+            .collect();
+        assert_eq!(
+            scan()
+                .iter()
+                .map(|job| job.wrapper_id.clone())
+                .collect::<Vec<_>>(),
+            original_ids
+        );
+        assert_eq!(
+            owner_presence(leases[9].wrapper_pid, leases[9].owner_identity().as_ref()),
+            OwnerPresence::Live
+        );
+        assert_eq!(
+            owner_presence(leases[10].wrapper_pid, leases[10].owner_identity().as_ref()),
+            OwnerPresence::Unknown
+        );
+        for endpoint in &endpoints {
+            assert!(!pool.get(&endpoint.id).await.unwrap().reserve_slots(1).await);
+        }
+
+        // A zero-status client without new settlement/acknowledgement evidence
+        // is a failed recovery. Repeated five-minute scans must back off, keep
+        // every durable reservation, and eventually inspect all nine wrappers.
+        let mut queue = RecoveryQueue::default();
+        for _ in 0..9 {
+            queue.refresh(scan());
+            queue.start_ready(Instant::now(), |job| {
+                let before = read_lease(directory.path(), &job.wrapper_id).unwrap();
+                async move { verify_recovery_completion(&before, &before) }
+            });
+            assert!(queue.running.len() <= MAX_RECOVERIES_PER_CYCLE);
+            assert_eq!(
+                queue
+                    .running
+                    .values()
+                    .map(|job| &job.worker_id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                queue.running.len()
+            );
+            while !queue.running.is_empty() {
+                let (job, outcome) = queue.next_completed().await.unwrap();
+                assert!(outcome.unwrap_err().contains("cancellation unsettled"));
+                assert!(!queue.backoff.ready(&job.wrapper_id, Instant::now()));
+            }
+            tokio::time::advance(RECOVERY_INTERVAL).await;
+        }
+        for original in &leases {
+            assert_eq!(
+                read_lease(directory.path(), &original.identity.local_wrapper_id).unwrap(),
+                *original
+            );
+            assert!(
+                history
+                    .active_build(original.identity.remote_build_id.unwrap())
+                    .is_some()
+            );
+        }
+        for id in &original_ids {
+            assert!(queue.backoff.failures[id].0 >= 2);
+        }
+        for endpoint in &endpoints {
+            assert_eq!(
+                pool.get(&endpoint.id).await.unwrap().used_slots(),
+                endpoint.total_slots
+            );
+        }
+        drop(queue);
+        drop(history);
+        drop(pool);
+
+        // Only retry scheduling uses virtual time. Native UnixStream readiness
+        // must not race Tokio's automatic jumps to an otherwise idle deadline.
+        tokio::time::resume();
+
+        let context = restore_recovery_fleet(directory.path(), &endpoints).await;
+        assert_eq!(context.history.active_builds().len(), 11);
+        for endpoint in &endpoints {
+            assert_eq!(
+                context.pool.get(&endpoint.id).await.unwrap().used_slots(),
+                endpoint.total_slots
+            );
+        }
+
+        // Lose a release acknowledgement after verified worker settlement.
+        // A second daemon restart must retain the terminal receipt and restore
+        // only active reservations; the unacknowledged journal remains eligible.
+        let lost = preparation_settlement_fixture(&leases[8]);
+        persist_recovery_fixture(directory.path(), &lost);
+        recovery_accounting_request(
+            &context,
+            format!(
+                "POST /release-worker?worker={}&build_id={}&local_wrapper_id={}&exit_code=1\n",
+                lost.worker_id.as_ref().unwrap(),
+                lost.identity.remote_build_id.unwrap(),
+                lost.identity.local_wrapper_id
+            ),
+        )
+        .await;
+        assert!(verify_recovery_completion(&leases[8], &lost).is_err());
+        assert!(
+            !read_lease(directory.path(), &lost.identity.local_wrapper_id)
+                .unwrap()
+                .terminal_acknowledged
+        );
+        drop(context);
+        let context = restore_recovery_fleet(directory.path(), &endpoints).await;
+        assert_eq!(context.history.active_builds().len(), 10);
+        assert_eq!(
+            context
+                .pool
+                .get(&endpoints[0].id)
+                .await
+                .unwrap()
+                .used_slots(),
+            3
+        );
+        assert_eq!(scan().len(), 9);
+        let lost_candidate = scan()
+            .into_iter()
+            .find(|job| job.wrapper_id == lost.identity.local_wrapper_id)
+            .unwrap();
+        let admin = Mutex::new(AdminDisableStore::with_path(
+            directory.path().join("admin.json"),
+        ));
+        assert!(matches!(
+            recovery_admission(&admin, &context.pool, directory.path(), &lost_candidate)
+                .await
+                .unwrap(),
+            Some(RecoveryAdmission::Local)
+        ));
+        let foreign_receipt = recovery_accounting_request(
+            &context,
+            format!(
+                "GET /builds/{}?local_wrapper_id={}\n",
+                lost_candidate.build_id, leases[9].identity.local_wrapper_id
+            ),
+        )
+        .await;
+        assert_eq!(foreign_receipt["status"], "identity_mismatch");
+
+        // Hold one worker's reply while the other three settle. A rescan cannot
+        // duplicate that flight or let its queued peers consume other lanes.
+        let slow = leases[0].identity.local_wrapper_id.clone();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = |job: RecoveryCandidate| {
+            let context = context.clone();
+            let directory = directory.path().to_owned();
+            let gate = gate.clone();
+            let delayed = job.wrapper_id == slow;
+            async move {
+                if delayed {
+                    gate.acquire().await.unwrap().forget();
+                }
+                settle_preparation_fixture(context, directory, job).await
+            }
+        };
+        let mut queue = RecoveryQueue::default();
+        let mut completed = HashSet::new();
+        for _ in 0..2 {
+            queue.refresh(scan());
+            queue.start_ready(Instant::now(), run);
+            while queue.running.len() > 1 {
+                let (job, outcome) =
+                    tokio::time::timeout(Duration::from_secs(5), queue.next_completed())
+                        .await
+                        .expect("responsive workers must not wait behind the delayed recovery")
+                        .unwrap();
+                assert_eq!(outcome, Ok(RecoveryOutcome::Recovered));
+                assert!(completed.insert(job.wrapper_id));
+            }
+            assert_eq!(queue.running.values().next().unwrap().wrapper_id, slow);
+        }
+        assert_eq!(completed.len(), 6);
+        assert_eq!(
+            context
+                .pool
+                .get(&endpoints[1].id)
+                .await
+                .unwrap()
+                .used_slots(),
+            0
+        );
+        assert_eq!(
+            context
+                .pool
+                .get(&endpoints[2].id)
+                .await
+                .unwrap()
+                .used_slots(),
+            0
+        );
+        assert_eq!(read_lease(directory.path(), &slow).unwrap(), leases[0]);
+        queue.refresh(scan());
+        queue.start_ready(Instant::now(), run);
+        assert_eq!(queue.running.len(), 1);
+        gate.add_permits(1);
+        while !queue.running.is_empty() {
+            let (job, outcome) =
+                tokio::time::timeout(Duration::from_secs(5), queue.next_completed())
+                    .await
+                    .expect("released recovery must complete within its local accounting window")
+                    .unwrap();
+            assert_eq!(outcome, Ok(RecoveryOutcome::Recovered));
+            assert!(completed.insert(job.wrapper_id));
+            queue.start_ready(Instant::now(), run);
+        }
+        assert_eq!(completed.len(), 9);
+        assert!(scan().is_empty());
+        for original in &leases[..9] {
+            let after = read_lease(directory.path(), &original.identity.local_wrapper_id).unwrap();
+            verify_recovery_completion(original, &after).unwrap();
+            assert_eq!(after.recovery.as_ref().unwrap()["prepared"], false);
+            assert_eq!(after.recovery.as_ref().unwrap()["execution_started"], false);
+            assert_eq!(
+                after.recovery.as_ref().unwrap()["phases"],
+                serde_json::json!([])
+            );
+            assert!(
+                context
+                    .history
+                    .terminal_build(
+                        original.identity.remote_build_id.unwrap(),
+                        &original.identity.local_wrapper_id
+                    )
+                    .is_some()
+            );
+        }
+        for protected in &leases[9..] {
+            assert_eq!(
+                read_lease(directory.path(), &protected.identity.local_wrapper_id).unwrap(),
+                *protected
+            );
+            assert!(
+                context
+                    .history
+                    .active_build(protected.identity.remote_build_id.unwrap())
+                    .is_some()
+            );
+        }
+        drop(queue);
+        drop(context);
+        let restarted = restore_recovery_fleet(directory.path(), &endpoints).await;
+        assert_eq!(restarted.history.active_builds().len(), 2);
+        for (endpoint, expected) in endpoints.iter().zip([1, 0, 0, 1]) {
+            let worker = restarted.pool.get(&endpoint.id).await.unwrap();
+            assert_eq!(worker.used_slots(), expected);
+            assert!(
+                worker.reserve_slots(1).await,
+                "verified settlement must make capacity usable"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn offline_worker_lease_recovery_keeps_operator_disable_across_restart() {
         let directory = tempfile::tempdir().unwrap();

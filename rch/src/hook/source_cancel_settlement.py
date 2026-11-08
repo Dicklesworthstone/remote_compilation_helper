@@ -11,6 +11,7 @@ does not run a registry transaction. Strict location still requires evidence.
 import errno
 import fcntl
 import hashlib
+import math
 import os
 import re
 import stat
@@ -62,6 +63,27 @@ def main():
         refuse("invalid source authority namespace request")
     if not re.fullmatch(r"[a-f0-9-]{1,128}", token) or not re.fullmatch(r"[a-f0-9]{64}", digest):
         refuse("invalid settlement identity")
+    # The daemon and metadata guardian transport the same bounded policy.
+    # Honor that scale in this innermost admission window, too. Validate it
+    # before opening/healing any registry lock; an invalid value must not
+    # create an unbounded lock waiter.
+    timing_text = os.environ.get("RCH_TIMING_SCALE", "1")
+    if (len(timing_text) > 128 or re.fullmatch(
+            r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+            timing_text) is None):
+        refuse("invalid RCH_TIMING_SCALE (expected finite 1..10)")
+    timing_scale = float(timing_text)
+    if not math.isfinite(timing_scale) or not 1.0 <= timing_scale <= 10.0:
+        refuse("invalid RCH_TIMING_SCALE (expected finite 1..10)")
+    started = time.monotonic()
+    deadline = started + 5.0 * timing_scale
+
+    def require_admission_time(lock="registry discovery"):
+        now = time.monotonic()
+        if now >= deadline:
+            refuse("RCH_SOURCE_SETTLEMENT_LOCK_BUSY identity={} lock={} elapsed_ms={}".format(
+                token, lock, int((now - started) * 1000)))
+
     roots = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
     if not roots or len(roots) > 32 * 1024 * 1024 or hashlib.sha256(roots).hexdigest() != digest:
         refuse("settlement roots do not match identity digest")
@@ -162,10 +184,10 @@ def main():
     # again under both metadata locks and after the transaction. Settlement in
     # the selected namespace still requires an EXISTING locked activity inode;
     # creating one cannot prove that a previous activity holder has drained.
-    started = time.monotonic()
-    deadline = started + 5
     for name in (token + ".activity.lock", "metadata.lock"):
         for path, _, directory in registries:
+            lock_path = path + "/" + name
+            require_admission_time(lock_path)
             lock_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
             if name == "metadata.lock":
                 lock_flags |= os.O_CREAT
@@ -183,19 +205,22 @@ def main():
             locks.append((directory, name, descriptor))
             while True:
                 verify()
+                # Expiry wins over a lock released while this waiter was
+                # descheduled. All locks consume the original shared window.
+                require_admission_time(lock_path)
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    require_admission_time(lock_path)
                     if name != "metadata.lock":
                         locked_activity.add(path)
                     break
                 except OSError as error:
                     if error.errno not in (errno.EAGAIN, errno.EACCES):
                         raise
-                if time.monotonic() >= deadline:
-                    refuse("RCH_SOURCE_SETTLEMENT_LOCK_BUSY identity={} lock={} elapsed_ms={}".format(
-                        token, path + "/" + name, int((time.monotonic() - started) * 1000)))
-                time.sleep(0.02)
+                require_admission_time(lock_path)
+                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
     verify()
+    require_admission_time()
 
     candidates = []
     for path, _, directory in registries:
@@ -207,6 +232,7 @@ def main():
         # This is an observation only: no source/cleanup access, cancellation
         # receipt, or retirement can be inferred from absent worker evidence.
         verify()
+        require_admission_time()
         sys.stdout.write("RCH_SOURCE_AUTHORITY_DISCOVERY absent\n")
         return
     if len(candidates) != 1:
@@ -218,10 +244,11 @@ def main():
         refuse("source cancellation activity lock is absent")
     verify()
     # The caller runs this program inside source_namespace_control's owned
-    # process group. Its independent 15-second deadline kills ALL descendants
+    # process group. Its independent scaled 15-second deadline kills ALL descendants
     # (including helpers inheriting these descriptors) before acknowledging
     # success or failure. A direct-child subprocess timeout would strand them.
     transaction_operation = "locate" if operation == "discover" else operation
+    require_admission_time()
     process = subprocess.Popen(
         ["sh", "-c", transaction, "rch-source-settlement", candidates[0], token, digest, transaction_operation],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,

@@ -121,6 +121,14 @@ the exact elapsed boundary. Readiness scans also bound queued lock waits while
 retaining candidates and their ownership for a later scan. These limits govern
 recovery control work and do not change compiler or test lifetimes.
 
+Worker-side source namespace location and cancellation settlement share one
+five-second lock-admission budget multiplied by the transported scale. Current
+and legacy activity and metadata locks consume that same original window;
+waiting for the next lock does not renew it. A lock becoming free at or after
+the deadline cannot admit a registry transaction. The enclosing metadata
+guardian keeps its separate scaled fifteen-second program limit. Expiry
+retains the cancellation obligation and grants no source or slot release.
+
 Recovery of temporarily bypassed workers keeps one captured allowance across
 its concurrency queue, admission, SSH setup, capability probes and optional
 canary. Telemetry retains its original, unscaled freshness limit through local

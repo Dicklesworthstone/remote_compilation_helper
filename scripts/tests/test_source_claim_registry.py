@@ -1990,6 +1990,173 @@ class CancellationSettlementStorageTests(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=20)
         return subprocess.CompletedProcess([], process.returncode, stdout, stderr)
 
+    def coordinator_clock_env(self, scale, injection):
+        # Execute the unchanged coordinator with a deterministic scheduling
+        # clock. All registry files, flock calls, transactions and fsyncs stay
+        # real. Only this program sees the clock; its child transactions do not.
+        setup = ("if program == {!r}:\n".format(self.coordinator)
+                 + "    import fcntl, time\n"
+                 + "    clock = [0.0]\n"
+                 + "    time.monotonic = lambda: clock[0]\n"
+                 + "    def advance(delay):\n"
+                 + "        clock[0] += 1.0\n"
+                 + "    time.sleep = advance\n"
+                 + "".join("    " + line + "\n" for line in injection.splitlines()))
+        return {**self.python_fault_env(setup), "RCH_TIMING_SCALE": scale}
+
+    def delayed_lock_env(self, scale, release_at, name="aa.activity.lock"):
+        return self.coordinator_clock_env(scale, '''
+holder = os.open(%r, os.O_RDWR)
+fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+def advance(delay):
+    clock[0] += 1.0
+    if clock[0] >= %r:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+time.sleep = advance
+''' % (str(self.registry / name), release_at))
+
+    def test_invalid_settlement_timing_policy_never_opens_or_heals_a_lock(self):
+        self.record("aa", self.roots, "cancelling")
+        lock = self.registry / "aa.activity.lock"
+        lock.chmod(0o664)
+        before = self.records(), lock.stat()
+        for scale in ("", "0", "0.99", "10.01", "nan", "inf", "1e9999",
+                      "1_0", "٢", " 2", "2 ", "0" * 129, "$(printf injected)"):
+            with self.subTest(scale=scale):
+                result = self.settle(env={**self.env, "RCH_TIMING_SCALE": scale})
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"invalid RCH_TIMING_SCALE", result.stderr)
+                self.assertEqual((self.records(), lock.stat()), before)
+
+    def test_scaled_settlement_drains_delayed_activity_after_repeated_default_failures(self):
+        self.assert_granted(self.transact("aa", self.roots))
+        self.assert_granted(self.transact("aa", self.roots, "cancel"))
+        before = self.records()
+        for _attempt in range(3):
+            result = self.settle(env=self.delayed_lock_env("1", 6.0))
+            self.assert_refused(result)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"RCH_SOURCE_SETTLEMENT_LOCK_BUSY", result.stderr)
+            self.assertEqual(self.records(), before)
+        self.assert_settled(self.settle(env=self.delayed_lock_env("3", 6.0)))
+        settled = self.records()
+        # A new recovery process rechecks the same durable receipt. It neither
+        # replays the compile nor needs the previous coordinator's memory.
+        self.assert_settled(self.settle())
+        self.assertEqual(self.records(), settled)
+        self.assert_refused(self.transact("aa", self.roots, "recover"))
+        self.assert_granted(self.transact("bb", self.roots))
+
+    def test_expired_waiter_cannot_acquire_a_newly_free_lock(self):
+        for scale, release_at in (("1", 5.0), ("1", 6.0), ("2", 10.0), ("10", 50.0)):
+            with self.subTest(scale=scale, release_at=release_at):
+                self.setUp()
+                self.record("aa", self.roots, "cancelling")
+                before = self.records()
+                result = self.settle(env=self.delayed_lock_env(scale, release_at))
+                self.assert_refused(result)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"RCH_SOURCE_SETTLEMENT_LOCK_BUSY", result.stderr)
+                self.assertEqual(self.records(), before)
+
+    def test_scaled_namespace_location_preserves_unfinished_ownership(self):
+        self.assert_granted(self.transact("aa", self.roots))
+        before = self.records()
+        for scale in ("1.25", "+2e0", "10"):
+            with self.subTest(scale=scale):
+                result = self.settle(operation="locate", expected="",
+                                     env=self.delayed_lock_env(scale, 6.0, "metadata.lock"))
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n")
+                self.assertEqual(self.records(), before,
+                                 "locating the namespace grants no cancellation or source release")
+        self.assert_refused(self.transact("bb", self.roots))
+
+    def test_successful_flock_returning_at_deadline_cannot_launch_transaction(self):
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        injection = '''
+original_flock = fcntl.flock
+def resumed_flock(descriptor, operation):
+    result = original_flock(descriptor, operation)
+    clock[0] = 10.0
+    return result
+fcntl.flock = resumed_flock
+'''
+        result = self.settle(env=self.coordinator_clock_env("2", injection))
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RCH_SOURCE_SETTLEMENT_LOCK_BUSY", result.stderr)
+        self.assertEqual(self.records(), before)
+
+    def test_namespace_validation_consumes_the_original_lock_admission_window(self):
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        injection = '''
+original_listdir = os.listdir
+def delayed_listdir(directory):
+    entries = original_listdir(directory)
+    clock[0] = 10.0
+    return entries
+os.listdir = delayed_listdir
+'''
+        result = self.settle(env=self.coordinator_clock_env("2", injection))
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(self.records(), before)
+
+    def test_all_namespace_locks_share_one_scaled_admission_deadline(self):
+        self.make_legacy()
+        self.record("aa", self.roots, "cancelling")
+        before = self.records()
+        injection = '''
+activity = os.open(%r, os.O_RDWR)
+metadata = os.open(%r, os.O_RDWR)
+fcntl.flock(activity, fcntl.LOCK_EX | fcntl.LOCK_NB)
+fcntl.flock(metadata, fcntl.LOCK_EX | fcntl.LOCK_NB)
+def advance(delay):
+    clock[0] += 1.0
+    if clock[0] >= 6.0:
+        fcntl.flock(activity, fcntl.LOCK_UN)
+    if clock[0] >= 11.0:
+        fcntl.flock(metadata, fcntl.LOCK_UN)
+time.sleep = advance
+''' % (str(self.registry / "aa.activity.lock"), str(self.legacy / "metadata.lock"))
+        result = self.settle(env=self.coordinator_clock_env("2", injection))
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(str(self.legacy / "metadata.lock").encode(), result.stderr)
+        self.assertIn(b"elapsed_ms=10000", result.stderr)
+        self.assertEqual(self.records(), before)
+
+    def test_delayed_settlement_preserves_a_live_competing_source_owner(self):
+        # This abandoned preparation never owned the overlapping paths. Its
+        # durable cancellation fence can settle while another actual process
+        # holds the newer build's activity lock and source claim.
+        self.record("aa", self.roots, "cancelling")
+        self.assert_granted(self.transact("bb", self.roots))
+        peer = self.registry / ("bb." + digest(self.roots) + ".claim")
+        before = peer.stat().st_ino, peer.read_bytes()
+        peer_lock = self.registry / "bb.activity.lock"
+        peer_lock.touch(mode=0o600)
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c",
+             "import fcntl,sys; lock=open(sys.argv[1],'r+'); "
+             "fcntl.flock(lock,fcntl.LOCK_EX); print('active',flush=True); sys.stdin.read()",
+             str(peer_lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(child.stdout.readline(), b"active\n")
+            self.assert_settled(self.settle(env=self.delayed_lock_env("2", 6.0, "metadata.lock")))
+            self.assertIsNone(child.poll())
+            self.assertEqual((peer.stat().st_ino, peer.read_bytes()), before)
+            with peer_lock.open("r+") as probe:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assert_refused(self.transact("aa", self.roots, "acquire"))
+        finally:
+            child.communicate(timeout=5)
+
     def test_controller_and_real_settlement_work_without_scratch_or_record_allocation(self):
         self.require_native_control_view()
         self.empty_legacy()
