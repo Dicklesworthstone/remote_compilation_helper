@@ -16,7 +16,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
@@ -471,6 +471,119 @@ async fn read_control_stream(
         std::io::ErrorKind::InvalidData,
         format!("control command {stream} exceeds {limit}-byte limit"),
     ))
+}
+
+/// A bounded UTF-8 line reader whose pending bytes survive a cancelled read.
+/// Keeping that state here allows both pipes to participate directly in a
+/// select without detached reader tasks or an unbounded queue of large lines.
+pub struct BoundedLines<R> {
+    reader: BufReader<R>,
+    pending: Vec<u8>,
+    limit: usize,
+    eof: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
+    /// Limit includes the newline when one is present. An unterminated final
+    /// line is returned only after actual EOF, as with read_line().
+    pub fn new(reader: R, limit: usize) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            pending: Vec::new(),
+            limit,
+            eof: false,
+        }
+    }
+
+    /// Read one complete line without discarding progress if this future is
+    /// cancelled. No partial line is published on overflow or a read failure.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error, or InvalidData for an oversized line
+    /// or invalid UTF-8. Callers must treat either as incomplete capture.
+    pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        if self.eof {
+            return Ok(None);
+        }
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                self.eof = true;
+                return self.take_line();
+            }
+            let newline = memchr::memchr(b'\n', available);
+            let count = newline.map_or(available.len(), |index| index + 1);
+            if count > self.limit.saturating_sub(self.pending.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("SSH output line exceeds {}-byte limit", self.limit),
+                ));
+            }
+            self.pending.extend_from_slice(&available[..count]);
+            self.reader.consume(count);
+            if newline.is_some() {
+                return self.take_line();
+            }
+        }
+    }
+
+    fn take_line(&mut self) -> std::io::Result<Option<String>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        String::from_utf8(std::mem::take(&mut self.pending))
+            .map(Some)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SSH output line is not valid UTF-8",
+                )
+            })
+    }
+}
+
+/// Retain a finite diagnostic preview without limiting streamed callbacks.
+/// The truncation marker is part of the byte budget. Truncation drops whole
+/// lines, so it cannot turn a retained prefix into a complete control receipt.
+pub struct OutputPreview {
+    text: String,
+    limit: usize,
+    truncated: bool,
+}
+
+impl OutputPreview {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+            truncated: false,
+        }
+    }
+
+    pub fn push(&mut self, line: &str) {
+        if self.truncated {
+            return;
+        }
+        if line.len() <= self.limit.saturating_sub(self.text.len()) {
+            self.text.push_str(line);
+            return;
+        }
+        self.truncated = true;
+        const MARKER: &str = "\n...[output truncated]...\n";
+        let marker = &MARKER[..MARKER.len().min(self.limit)];
+        let content_limit = self.limit - marker.len();
+        // Never append a prefix of the overflowing line. Reserving marker
+        // space can also cut an earlier line: drop that whole line, including
+        // any unterminated tail, before the marker supplies another newline.
+        let available = &self.text.as_bytes()[..self.text.len().min(content_limit)];
+        let boundary = memchr::memrchr(b'\n', available).map_or(0, |index| index + 1);
+        self.text.truncate(boundary);
+        self.text.push_str(marker);
+    }
+
+    pub fn into_string(self) -> String {
+        self.text
+    }
 }
 
 /// Owns a foreground SSH process from spawn through wait/reap. Dropping a
@@ -1467,86 +1580,37 @@ impl SshClient {
             .await
             .with_context(|| format!("Failed to spawn command on {}", self.config.id))?;
 
-        let stdout = child.stdout().take();
-        let stderr = child.stderr().take();
-
-        // Use a channel to aggregate stream events from reader tasks.
-        // This avoids cancellation safety issues with select! over AsyncBufReadExt::read_line.
-        let (tx, mut rx) = mpsc::channel(100);
-
-        // Spawn stdout reader
-        if let Some(out) = stdout {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(out);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stdout(line.clone())).await.is_err() {
-                                break; // Receiver dropped
-                            }
-                        }
-                        Err(_) => break, // Read error
-                    }
-                }
-            });
-        }
-
-        // Spawn stderr reader
-        if let Some(err) = stderr {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(err);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stderr(line.clone())).await.is_err() {
-                                break; // Receiver dropped
-                            }
-                        }
-                        Err(_) => break, // Read error
-                    }
-                }
-            });
-        }
-
-        // Drop original tx so rx closes when tasks finish
-        drop(tx);
-
-        let mut stdout_acc = String::new();
-        let mut stderr_acc = String::new();
-
-        enum StreamEvent {
-            Stdout(String),
-            Stderr(String),
-        }
+        let stdout = child.stdout().take().context("Missing SSH stdout pipe")?;
+        let stderr = child.stderr().take().context("Missing SSH stderr pipe")?;
+        let mut stdout = BoundedLines::new(stdout, MAX_OUTPUT_SIZE as usize);
+        let mut stderr = BoundedLines::new(stderr, MAX_OUTPUT_SIZE as usize);
+        let mut stdout_acc = OutputPreview::new(MAX_OUTPUT_SIZE as usize);
+        let mut stderr_acc = OutputPreview::new(MAX_OUTPUT_SIZE as usize);
 
         let streaming_future = async {
-            // Process events until channel closes (EOF from both streams)
-            while let Some(event) = rx.recv().await {
-                match event {
-                    StreamEvent::Stdout(line) => {
-                        on_stdout(&line);
-                        if stdout_acc.len() < MAX_OUTPUT_SIZE as usize {
-                            stdout_acc.push_str(&line);
-                            if stdout_acc.len() >= MAX_OUTPUT_SIZE as usize {
-                                stdout_acc.push_str("\n...[output truncated]...\n");
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+            // Reader state belongs to this operation. Cancelling one select
+            // arm retains its partial line; dropping the operation closes both
+            // pipes. Errors cannot masquerade as successful EOF.
+            while stdout_open || stderr_open {
+                tokio::select! {
+                    line = stdout.next_line(), if stdout_open => {
+                        match line.context("Failed to capture SSH stdout")? {
+                            Some(line) => {
+                                on_stdout(&line);
+                                stdout_acc.push(&line);
                             }
+                            None => stdout_open = false,
                         }
                     }
-                    StreamEvent::Stderr(line) => {
-                        on_stderr(&line);
-                        if stderr_acc.len() < MAX_OUTPUT_SIZE as usize {
-                            stderr_acc.push_str(&line);
-                            if stderr_acc.len() >= MAX_OUTPUT_SIZE as usize {
-                                stderr_acc.push_str("\n...[output truncated]...\n");
+                    line = stderr.next_line(), if stderr_open => {
+                        match line.context("Failed to capture SSH stderr")? {
+                            Some(line) => {
+                                on_stderr(&line);
+                                stderr_acc.push(&line);
                             }
+                            None => stderr_open = false,
                         }
                     }
                 }
@@ -1565,14 +1629,14 @@ impl SshClient {
                 activity.complete();
                 Ok(CommandResult {
                     exit_code,
-                    stdout: stdout_acc,
-                    stderr: stderr_acc,
+                    stdout: stdout_acc.into_string(),
+                    stderr: stderr_acc.into_string(),
                     duration_ms: duration.as_millis() as u64,
                 })
             }
             Err(_) => {
-                // Dropping RemoteChild kills the local slave and closes its
-                // pipes, ending the reader tasks. The incomplete activity
+                // Dropping RemoteChild kills the local slave; the owned readers
+                // close their pipes with this operation. The incomplete activity
                 // guard retires the master after other active commands finish.
                 warn!(
                     "Command (streaming) timed out on {} after {:?}, cleaning up",
@@ -2599,6 +2663,216 @@ impl Default for SshPool {
 mod tests {
     use super::*;
     use crate::test_guard;
+
+    #[tokio::test]
+    async fn bounded_lines_resume_cancelled_reads_without_losing_utf8_or_line_endings() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, input) = tokio::io::duplex(128);
+        let mut reader = BoundedLines::new(input, 64);
+        for fragment in [b"first ".as_slice(), b"\xf0\x9f".as_slice()] {
+            writer.write_all(fragment).await.unwrap();
+            let pending = reader.next_line();
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Dropping this pending next_line simulates another select arm
+            // winning after the reader consumed an incomplete UTF-8 prefix.
+        }
+        writer
+            .write_all(b"\x92\xa1\nsecond\r\nunterminated")
+            .await
+            .unwrap();
+        drop(writer);
+        for expected in ["first 💡\n", "second\r\n", "unterminated"] {
+            assert_eq!(reader.next_line().await.unwrap().as_deref(), Some(expected));
+        }
+        assert!(reader.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_require_eof_and_enforce_the_complete_line_byte_limit() {
+        for (bytes, limit, accepted) in [
+            (&b""[..], 0, true),
+            (&b"\n"[..], 1, true),
+            (&b"abc"[..], 3, true),
+            (&b"ab\n"[..], 3, true),
+            (&b"abc\n"[..], 3, false),
+            (&b"abcd"[..], 3, false),
+            (&b"\xff\n"[..], 3, false),
+            (&b"\xf0\x9f"[..], 3, false),
+        ] {
+            let mut reader = BoundedLines::new(bytes, limit);
+            let result = reader.next_line().await;
+            if accepted {
+                assert_eq!(result.unwrap().unwrap_or_default().as_bytes(), bytes);
+                assert!(reader.next_line().await.unwrap().is_none());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_propagate_io_errors_without_publishing_the_partial_line() {
+        struct BrokenInput(bool);
+        impl tokio::io::AsyncRead for BrokenInput {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.0 {
+                    self.0 = false;
+                    buffer.put_slice(b"partial-receipt");
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected stream failure",
+                    )))
+                }
+            }
+        }
+        let mut reader = BoundedLines::new(BrokenInput(true), 64);
+        assert_eq!(
+            reader.next_line().await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset,
+        );
+    }
+
+    #[tokio::test]
+    async fn output_preview_caps_utf8_without_suppressing_later_complete_receipts() {
+        let input = "αβγδεζηθικλμνξοπρστυφχψω\nmore diagnostics\nRCH_CONTROL_RECEIPT\n";
+        for limit in [0, 1, 25, 32, input.len() - 1, input.len()] {
+            let mut reader = BoundedLines::new(input.as_bytes(), 128);
+            let mut preview = OutputPreview::new(limit);
+            let mut callbacks = Vec::new();
+            while let Some(line) = reader.next_line().await.unwrap() {
+                preview.push(&line);
+                callbacks.push(line);
+            }
+            assert_eq!(callbacks.concat(), input);
+            assert_eq!(callbacks.last().unwrap(), "RCH_CONTROL_RECEIPT\n");
+            let retained = preview.into_string();
+            assert!(retained.len() <= limit);
+            if limit == input.len() {
+                assert_eq!(retained, input);
+            } else if limit >= "\n...[output truncated]...\n".len() {
+                assert!(retained.ends_with("\n...[output truncated]...\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn output_preview_never_completes_a_truncated_control_receipt_prefix() {
+        const RECEIPT: &str = "RCH_CONTROL_RECEIPT";
+        const TRUNCATED: &str = "\n...[output truncated]...\n";
+        let limit = RECEIPT.len() + TRUNCATED.len();
+        for already_retained in [false, true] {
+            let mut preview = OutputPreview::new(limit);
+            if already_retained {
+                preview.push(&format!("{RECEIPT}-not-a-receipt\n"));
+                preview.push(&"x".repeat(limit + 1));
+            } else {
+                preview.push(&format!("{RECEIPT}{}\n", "x".repeat(limit + 1)));
+            }
+            let retained = preview.into_string();
+            assert!(retained.len() <= limit);
+            assert!(retained.ends_with(TRUNCATED));
+            assert!(
+                retained.lines().all(|line| line != RECEIPT),
+                "truncation must not manufacture a complete receipt: {retained:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_lines_overflow_stops_the_owned_transport_and_pipe_holding_proxy() {
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+        use std::os::fd::{AsFd, OwnedFd};
+
+        struct Processes(OwnedFd, OwnedFd);
+        impl Drop for Processes {
+            fn drop(&mut self) {
+                let _ = rustix::process::pidfd_send_signal(&self.1, Signal::KILL);
+                let _ = rustix::process::pidfd_send_signal(&self.0, Signal::KILL);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap().keep();
+        let ready = directory.join("ready");
+        let release = directory.join("release");
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .args([
+                "-c",
+                r#"import os, signal, sys, time
+descendant = os.fork()
+signal.alarm(30)
+if descendant == 0:
+    while True: signal.pause()
+with open(sys.argv[1] + '.pending', 'x') as output:
+    output.write(f'{os.getpid()} {descendant}')
+os.rename(sys.argv[1] + '.pending', sys.argv[1])
+while not os.path.exists(sys.argv[2]): time.sleep(0.01)
+os.write(1, b'x' * 129)
+while True: signal.pause()
+"#,
+            ])
+            .arg(&ready)
+            .arg(&release)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut process = OwnedProcessGroup::spawn(&mut command).unwrap();
+        let mut reader = BoundedLines::new(process.take_stdout().unwrap(), 128);
+        let identities = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&ready) {
+                    break text
+                        .split_whitespace()
+                        .map(|pid| pid.parse::<i32>().unwrap())
+                        .collect::<Vec<_>>();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned transport fixture must publish its process identities");
+        let open = |pid| {
+            rustix::process::pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap()
+        };
+        let processes = Processes(open(identities[0]), open(identities[1]));
+        let leader = tokio::io::unix::AsyncFd::new(processes.0.as_fd()).unwrap();
+        let proxy = tokio::io::unix::AsyncFd::new(processes.1.as_fd()).unwrap();
+        std::fs::write(&release, b"emit").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), reader.next_line())
+            .await
+            .expect("an overlong line must fail without waiting for EOF")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        drop(reader);
+        drop(process);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let _ = tokio::try_join!(leader.readable(), proxy.readable()).unwrap();
+            loop {
+                match rustix::process::waitid(
+                    WaitId::PidFd(processes.0.as_fd()),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                ) {
+                    Err(rustix::io::Errno::CHILD) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("observe streaming transport reaping: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("failed capture must terminate its proxy and reap its leader");
+    }
 
     #[tokio::test]
     async fn control_capture_drains_both_outputs_while_uploading() {

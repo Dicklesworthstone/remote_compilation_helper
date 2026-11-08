@@ -8212,6 +8212,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         F: FnMut(&str),
         G: FnMut(&str),
     {
+        use rch_common::ssh::{BoundedLines, OutputPreview, OwnedProcessGroup};
+
         let destination = format!("{}@{}", worker.user, worker.host);
         let identity_file = shellexpand::tilde(&worker.identity_file);
 
@@ -8250,74 +8252,29 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .kill_on_drop(true);
 
         let start = std::time::Instant::now();
-        let mut child = cmd
-            .spawn()
+        let mut child = OwnedProcessGroup::spawn(&mut cmd)
             .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
 
         // Take every pipe before uploading the script. SSH and the remote shell
         // can produce diagnostics while stdin is still being consumed; draining
         // stdout/stderr only after write_all() lets those pipes fill and deadlock
         // the upload outside the command timeout.
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let stdin = child.take_stdin();
+        let stdout = child.take_stdout().context("Missing SSH stdout pipe")?;
+        let stderr = child.take_stderr().context("Missing SSH stderr pipe")?;
+        const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
+        let mut stdout = BoundedLines::new(stdout, MAX_OUTPUT_SIZE);
+        let mut stderr = BoundedLines::new(stderr, MAX_OUTPUT_SIZE);
 
         enum StreamEvent {
             Stdout(String),
             Stderr(String),
         }
 
-        // Spawn stdout reader
-        if let Some(out) = stdout {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(out);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stdout(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-
-        // Spawn stderr reader
-        if let Some(err) = stderr {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(err);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stderr(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-
-        drop(tx);
-
-        let mut stdout_acc = String::new();
-        let mut stderr_acc = String::new();
+        let mut stdout_acc = OutputPreview::new(MAX_OUTPUT_SIZE);
+        let mut stderr_acc = OutputPreview::new(MAX_OUTPUT_SIZE);
 
         let command_timeout = self.ssh_options.command_timeout;
-        const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
         let mut durable_status = None;
         // Seeing the completion receipt means the workload finished, not that
         // its output has arrived: the remote wrapper is still streaming the
@@ -8330,10 +8287,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut drain_cap: Option<tokio::time::Instant> = None;
 
-        // Readers above are already running when this future starts, so script
-        // upload and remote output progress concurrently. Keep upload under the
-        // same absolute command budget as execution: a blocked ssh stdin is a
-        // transport failure, not an unbounded pre-execution phase.
+        // Script upload and both owned readers are polled together. Keep upload
+        // under the same command budget as execution: blocked ssh stdin is a
+        // transport failure, not an unbounded pre-execution phase. Partial lines
+        // survive other select arms without detached tasks or cloned line queues.
         let upload = async move {
             if let Some(mut stdin) = stdin {
                 stdin
@@ -8374,9 +8331,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             });
             let mut uploaded = false;
-            let mut streams_open = true;
+            let mut stdout_open = true;
+            let mut stderr_open = true;
             loop {
-                if uploaded && !streams_open {
+                if uploaded && !stdout_open && !stderr_open {
                     break;
                 }
                 let drain_expired = async move {
@@ -8391,10 +8349,17 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         uploaded = true;
                         continue;
                     }
-                    event = rx.recv(), if streams_open => match event {
-                        Some(event) => event,
+                    line = stdout.next_line(), if stdout_open => match line.context("Failed to capture SSH stdout")? {
+                        Some(line) => StreamEvent::Stdout(line),
                         None => {
-                            streams_open = false;
+                            stdout_open = false;
+                            continue;
+                        }
+                    },
+                    line = stderr.next_line(), if stderr_open => match line.context("Failed to capture SSH stderr")? {
+                        Some(line) => StreamEvent::Stderr(line),
+                        None => {
+                            stderr_open = false;
                             continue;
                         }
                     },
@@ -8406,7 +8371,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         continue;
                     }
                     () = drain_expired => {
-                        let _ = child.kill().await;
+                        let _ = child.start_kill();
                         break;
                     }
                 };
@@ -8416,21 +8381,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 match event {
                     StreamEvent::Stdout(line) => {
                         on_stdout(&line);
-                        if stdout_acc.len() < MAX_OUTPUT_SIZE {
-                            stdout_acc.push_str(&line);
-                            if stdout_acc.len() >= MAX_OUTPUT_SIZE {
-                                stdout_acc.push_str("\n...[output truncated]...\n");
-                            }
-                        }
+                        stdout_acc.push(&line);
                     }
                     StreamEvent::Stderr(line) => {
                         on_stderr(&line);
-                        if stderr_acc.len() < MAX_OUTPUT_SIZE {
-                            stderr_acc.push_str(&line);
-                            if stderr_acc.len() >= MAX_OUTPUT_SIZE {
-                                stderr_acc.push_str("\n...[output truncated]...\n");
-                            }
-                        }
+                        stderr_acc.push(&line);
                     }
                 }
             }
@@ -8446,7 +8401,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 // work. Stop the local channel, then use the same identity-bound
                 // remote cleanup as timeout handling. Never convert an upload or
                 // stream failure into permission to replay elsewhere.
-                let _ = child.kill().await;
+                let _ = child.start_kill();
+                drop(child);
+                drop(stdout);
+                drop(stderr);
                 let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
                 return Err(error
                     .context(format!(
@@ -8456,7 +8414,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
             Err(_) => {
                 // Best-effort: kill local ssh process first so the channel is closed.
-                let _ = child.kill().await;
+                let _ = child.start_kill();
+                drop(child);
+                drop(stdout);
+                drop(stderr);
                 // Issue #62: killing the LOCAL ssh does NOT stop the remote
                 // cargo — the orphan keeps building and retains the project's
                 // Cargo build-directory lock, deadlocking the next job that
@@ -8501,8 +8462,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let duration = start.elapsed();
         Ok(CommandResult {
             exit_code: durable_status.unwrap_or_else(|| status.code().unwrap_or(-1)),
-            stdout: stdout_acc,
-            stderr: stderr_acc,
+            stdout: stdout_acc.into_string(),
+            stderr: stderr_acc.into_string(),
             duration_ms: duration.as_millis() as u64,
         })
     }
@@ -12257,6 +12218,103 @@ while True:
         })
         .await
         .expect("cancelled probe must terminate its descendant and reap its direct child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn streaming_capture_failures_stay_unconfirmed_and_previews_keep_late_callbacks() {
+        const CHILD: &str = "RCH_TEST_BOUNDED_STREAM_CAPTURE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let directory = tempfile::tempdir().unwrap().keep();
+            let peer = directory.join("ssh");
+            std::fs::write(
+                &peer,
+                r#"#!/usr/bin/env python3
+import os, sys
+sys.stdin.buffer.read()
+mode = os.environ['RCH_TEST_BOUNDED_STREAM_MODE']
+if mode == 'stdout-overflow':
+    sys.stdout.buffer.write(b'x' * (10 * 1024 * 1024 + 1))
+elif mode == 'stderr-overflow':
+    sys.stderr.buffer.write(b'x' * (10 * 1024 * 1024 + 1))
+elif mode == 'invalid-utf8':
+    sys.stdout.buffer.write(b'valid prefix\ninvalid byte: \xff\n')
+else:
+    line = b'x' * (1024 * 1024 - 1) + b'\n'
+    for stream in [sys.stdout.buffer, sys.stderr.buffer]:
+        for _ in range(11):
+            stream.write(line)
+        stream.write(b'RCH_LATE_CONTROL_RECEIPT\n')
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(std::iter::once(directory.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            for mode in [
+                "stdout-overflow",
+                "stderr-overflow",
+                "invalid-utf8",
+                "late-receipt",
+            ] {
+                let output = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "transfer::tests::streaming_capture_failures_stay_unconfirmed_and_previews_keep_late_callbacks",
+                            "--nocapture",
+                        ])
+                        .env(CHILD, &directory)
+                        .env("RCH_TEST_BOUNDED_STREAM_MODE", mode)
+                        .env("PATH", &path)
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await
+                .expect("streaming capture fixture must remain bounded")
+                .unwrap();
+                assert!(output.status.success(), "{mode}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let mode = std::env::var("RCH_TEST_BOUNDED_STREAM_MODE").unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from(std::env::var_os(CHILD).unwrap()),
+            "bounded-capture".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_command_timeout(Duration::from_secs(10));
+        let mut stdout_receipt = false;
+        let mut stderr_receipt = false;
+        let result = pipeline
+            .execute_over_ssh_streaming(
+                &estimate_test_worker(),
+                "scripted capture fixture",
+                |line| stdout_receipt |= line == "RCH_LATE_CONTROL_RECEIPT\n",
+                |line| stderr_receipt |= line == "RCH_LATE_CONTROL_RECEIPT\n",
+            )
+            .await;
+        if mode == "late-receipt" {
+            let result = result.unwrap();
+            assert_eq!(result.exit_code, 0);
+            assert!(stdout_receipt && stderr_receipt);
+            for preview in [&result.stdout, &result.stderr] {
+                assert!(preview.len() <= 10 * 1024 * 1024);
+                assert!(preview.ends_with("\n...[output truncated]...\n"));
+                assert!(!preview.contains("RCH_LATE_CONTROL_RECEIPT"));
+            }
+        } else {
+            let error = result.expect_err("incomplete capture must not confirm remote execution");
+            assert!(error.is::<RemoteExecutionUnconfirmed>(), "{error:#}");
+            assert!(format!("{error:#}").contains("Failed to capture SSH"));
+            assert!(!stdout_receipt && !stderr_receipt);
+        }
     }
 
     /// These are transport-scheduler regressions with a scripted SSH peer, not
