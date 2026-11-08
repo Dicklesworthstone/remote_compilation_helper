@@ -17,7 +17,12 @@ pub enum JobsAction {
         timeout_secs: u64,
     },
     /// Cancel the exact daemon build and cooperatively stop its wrapper
-    Cancel { wrapper_id: String },
+    Cancel {
+        wrapper_id: String,
+        /// Override the wait budget; by default allow the daemon's scaled cleanup window
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
     /// Reconcile completion and retrieve outstanding outputs; never replay
     Recover {
         wrapper_id: String,
@@ -460,7 +465,7 @@ fn job_deadline_error(detail: String) -> anyhow::Error {
     error.remediation = vec![
         "Nothing was replayed and the job journal is retained; progress already recorded is kept"
             .to_owned(),
-        "Rerun the same `rch jobs recover <wrapper-id>` or `rch jobs attach <wrapper-id>` with a larger --timeout-secs; a large artifact set can take minutes to publish"
+        "Rerun the same `rch jobs recover <wrapper-id>`, `rch jobs attach <wrapper-id>`, or `rch jobs cancel <wrapper-id>` with a larger --timeout-secs; remote cleanup and large artifact sets can take minutes"
             .to_owned(),
         "Run `rch jobs` to see the job's current phase".to_owned(),
     ];
@@ -635,11 +640,18 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         }
         return Ok(());
     };
-    let (wrapper_id, recover, cancel, timeout_secs, cargo_json, local_only) = match action {
+    let (wrapper_id, recover, cancel, timeout, cargo_json, local_only) = match action {
         JobsAction::Attach {
             wrapper_id,
             timeout_secs,
-        } => (wrapper_id, false, false, timeout_secs, false, false),
+        } => (
+            wrapper_id,
+            false,
+            false,
+            Duration::from_secs(timeout_secs.min(86400)),
+            false,
+            false,
+        ),
         JobsAction::Recover {
             wrapper_id,
             timeout_secs,
@@ -650,13 +662,26 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             wrapper_id,
             true,
             false,
-            timeout_secs,
+            Duration::from_secs(timeout_secs.min(86400)),
             cargo_json,
             daemon_local_only,
         ),
-        JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30, false, false),
+        JobsAction::Cancel {
+            wrapper_id,
+            timeout_secs,
+        } => {
+            // Resolve configuration before choosing the outer deadline; the
+            // first daemon request would otherwise install the timing scale
+            // only after a shorter, unscaled budget had already been fixed.
+            let scale = crate::config::load_config()?.timeouts.scale;
+            let timeout = timeout_secs.map_or_else(
+                || super::helpers::daemon_job_cancellation_timeout(scale),
+                |secs| Duration::from_secs(secs.min(86400)),
+            );
+            (wrapper_id, false, true, timeout, false, false)
+        }
     };
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.min(86400));
+    let deadline = Instant::now() + timeout;
     if local_only {
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let (code, recovered_writer) = within_job_deadline(
@@ -789,9 +814,12 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             // Admission may win after this snapshot. The daemon serializes the
             // decision with registration and cancels that exact active build.
             let response = within_job_deadline(deadline, "queued cancellation", async {
-                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n"))
-                    .await
-                    .map_err(|error| cancellation_unconfirmed_error(&lease, error))
+                super::helpers::send_daemon_cancellation(
+                    &format!("POST /jobs/{wrapper_id}/cancel\n"),
+                    deadline,
+                )
+                .await
+                .map_err(|error| cancellation_unconfirmed_error(&lease, error))
             })
             .await?;
             let mut reply = parse_cancellation_response(&lease, &response)?;
@@ -853,10 +881,10 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 ));
             }
             let response = within_job_deadline(deadline, "admitted cancellation", async {
-                super::send_daemon_command(&format!(
-                    "POST /builds/{id}/cancel?local_wrapper_id={}\n",
-                    wrapper_id
-                ))
+                super::helpers::send_daemon_cancellation(
+                    &format!("POST /builds/{id}/cancel?local_wrapper_id={wrapper_id}\n"),
+                    deadline,
+                )
                 .await
                 .map_err(|error| cancellation_unconfirmed_error(&lease, error))
             })
@@ -1043,6 +1071,34 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::fd::AsFd;
+
+    #[test]
+    fn job_cancel_accepts_an_explicit_wait_budget() {
+        use clap::Parser;
+
+        assert!(
+            crate::Cli::try_parse_from([
+                "rch",
+                "jobs",
+                "cancel",
+                "rchw-12345678-1234-4321-8765-123456789abc",
+                "--timeout-secs",
+                "180",
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "rch",
+                "jobs",
+                "cancel",
+                "wrapper",
+                "--timeout-secs",
+                "-1"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn offline_worker_local_settlement_requires_managed_recovery_without_cargo_output() {
@@ -2138,6 +2194,114 @@ mod tests {
         })
         .await;
         assert_eq!(error.unwrap_err().to_string(), "identity mismatch");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_cancellation_receipt_survives_a_full_daemon_cleanup_window() -> Result<()> {
+        cancellation_receipt_after_delay(
+            queued_lease(),
+            super::super::helpers::daemon_job_cancellation_timeout(Default::default()),
+            Duration::from_secs(61),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_cancellation_budget_waits_past_the_default_transport_limit() -> Result<()> {
+        // A client at scale 1 can wait for a daemon with slower cleanup. The
+        // operator's 900s budget must not still hit the old 75s response cap.
+        cancellation_receipt_after_delay(
+            admitted_lease(),
+            Duration::from_secs(900),
+            Duration::from_secs(76),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn cancellation_receipt_after_delay(
+        lease: DurableJobLease,
+        budget: Duration,
+        elapsed: Duration,
+    ) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+        use tokio::sync::oneshot;
+
+        let directory = tempfile::tempdir()?;
+        let socket_path = directory.path().join("cancel.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let wrapper = lease.identity.local_wrapper_id.clone();
+        let expected = json!({
+            "status": "cancelled",
+            "local_wrapper_id": wrapper,
+            "build_id": 42,
+            "worker_id": "worker-a",
+            "exit_code": 130,
+        });
+        let response = format!("HTTP/1.1 200 OK\r\n\r\n{expected}\n");
+        let request = match lease.identity.remote_build_id {
+            Some(id) => format!("POST /builds/{id}/cancel?local_wrapper_id={wrapper}\n"),
+            None => format!("POST /jobs/{wrapper}/cancel\n"),
+        };
+        let server_request = request.clone();
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut received = String::new();
+            stream.read_to_string(&mut received).await?;
+            assert_eq!(received, server_request);
+            arrived_tx.send(()).unwrap();
+            finish_rx.await?;
+            stream.write_all(response.as_bytes()).await?;
+            Result::<()>::Ok(())
+        });
+        let client = tokio::spawn(async move {
+            let deadline = Instant::now() + budget;
+            let response = within_job_deadline(
+                deadline,
+                "cancellation",
+                super::super::helpers::send_daemon_command_to_socket_with_cancellation_deadline(
+                    &socket_path,
+                    &request,
+                    Some(tokio::time::Instant::from_std(deadline)),
+                ),
+            )
+            .await?;
+            let reply = parse_cancellation_response(&lease, &response)?;
+            if lease.identity.remote_build_id.is_some() {
+                assert_eq!(
+                    validate_admitted_cancellation(&lease, &reply)?,
+                    AdmittedCancellation::StopWrapper
+                );
+            } else {
+                validate_queued_cancellation(&lease.identity.local_wrapper_id, &reply)?;
+            }
+            Result::<Value>::Ok(reply)
+        });
+
+        // Wait for real socket I/O before advancing virtual time. The wrapper
+        // can become admitted while cancellation is in flight, so this route
+        // must allow the same complete cleanup window as /builds/<id>/cancel.
+        arrived_rx.await?;
+        tokio::time::pause();
+        tokio::time::advance(elapsed).await;
+        tokio::task::yield_now().await;
+        let waiting_for_receipt = !client.is_finished();
+        tokio::time::resume();
+        finish_tx.send(()).unwrap();
+
+        let actual = client.await??;
+        server.await??;
+        assert!(
+            waiting_for_receipt,
+            "cancellation was abandoned before its receipt"
+        );
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[cfg(unix)]

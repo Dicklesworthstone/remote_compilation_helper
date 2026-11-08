@@ -19,8 +19,8 @@ const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_RESTART_ADMISSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
-/// A busy-worker cancellation can consume 60s in the daemon. Keep the
-/// completion response inside a larger client budget instead of abandoning
+/// A busy-worker cancellation can consume 60s before timing scale in the daemon.
+/// Keep the completion response inside a larger client budget instead of abandoning
 /// it at the ordinary 10s status-query deadline (issue #129).
 #[cfg(unix)]
 const DAEMON_CANCELLATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(75);
@@ -830,6 +830,29 @@ pub async fn send_daemon_command(_command: &str) -> Result<String> {
 /// Helper to send command to daemon socket.
 #[cfg(unix)]
 pub async fn send_daemon_command(command: &str) -> Result<String> {
+    send_daemon_command_with_cancellation_deadline(command, None).await
+}
+
+/// Let a same-identity job cancellation spend its remaining operation budget
+/// receiving the daemon's acknowledgement. The daemon may have a larger timing
+/// scale than the client; an explicit jobs timeout must reach this final read.
+#[cfg(unix)]
+pub(super) async fn send_daemon_cancellation(
+    command: &str,
+    deadline: std::time::Instant,
+) -> Result<String> {
+    send_daemon_command_with_cancellation_deadline(
+        command,
+        Some(tokio::time::Instant::from_std(deadline)),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn send_daemon_command_with_cancellation_deadline(
+    command: &str,
+    cancellation_deadline: Option<tokio::time::Instant>,
+) -> Result<String> {
     let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
     if !socket_path.exists() {
@@ -839,13 +862,27 @@ pub async fn send_daemon_command(command: &str) -> Result<String> {
         .into());
     }
 
-    send_daemon_command_to_socket(socket_path, command).await
+    send_daemon_command_to_socket_with_cancellation_deadline(
+        socket_path,
+        command,
+        cancellation_deadline,
+    )
+    .await
 }
 
 #[cfg(unix)]
 pub(crate) async fn send_daemon_command_to_socket(
     socket_path: &Path,
     command: &str,
+) -> Result<String> {
+    send_daemon_command_to_socket_with_cancellation_deadline(socket_path, command, None).await
+}
+
+#[cfg(unix)]
+pub(super) async fn send_daemon_command_to_socket_with_cancellation_deadline(
+    socket_path: &Path,
+    command: &str,
+    cancellation_deadline: Option<tokio::time::Instant>,
 ) -> Result<String> {
     let stream = tokio::time::timeout(
         DAEMON_COMMAND_CONNECT_TIMEOUT,
@@ -865,8 +902,12 @@ pub(crate) async fn send_daemon_command_to_socket(
 
     let mut reader = BufReader::new(reader);
     let mut response = String::new();
-    let response_timeout = daemon_command_response_timeout(command);
-    tokio::time::timeout(response_timeout, reader.read_to_string(&mut response))
+    let response_deadline = daemon_command_response_deadline(
+        command,
+        tokio::time::Instant::now(),
+        cancellation_deadline,
+    );
+    tokio::time::timeout_at(response_deadline, reader.read_to_string(&mut response))
         .await
         .context("Timed out waiting for daemon response")??;
 
@@ -874,11 +915,37 @@ pub(crate) async fn send_daemon_command_to_socket(
 }
 
 #[cfg(unix)]
+fn daemon_command_response_deadline(
+    command: &str,
+    now: tokio::time::Instant,
+    cancellation_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    if daemon_command_is_cancellation(command)
+        && let Some(deadline) = cancellation_deadline
+    {
+        return deadline;
+    }
+    // Identity/status requests and all other commands retain their existing
+    // per-request limits, even if a caller supplies a cancellation deadline.
+    now + daemon_command_response_timeout(command)
+}
+
+#[cfg(unix)]
 fn daemon_command_response_timeout(command: &str) -> Duration {
+    daemon_command_response_timeout_with_scale(command, rch_common::timing::configured())
+}
+
+#[cfg(unix)]
+fn daemon_command_response_timeout_with_scale(
+    command: &str,
+    scale: rch_common::timing::TimingScale,
+) -> Duration {
     if daemon_command_is_capabilities_refresh(command) {
         DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
-    } else if daemon_command_is_build_cancellation(command) {
-        DAEMON_CANCELLATION_RESPONSE_TIMEOUT
+    } else if daemon_command_is_cancellation(command) {
+        // The daemon scales its complete cleanup window. Both admitted builds
+        // and queued wrappers can enter that same remote cancellation path.
+        scale.duration(DAEMON_CANCELLATION_RESPONSE_TIMEOUT)
     } else if command.starts_with("POST /restart-admission") {
         // A daemon on a host at load ~130 took over 10 s to answer; the
         // barrier is an operator action, so wait for its verdict.
@@ -899,21 +966,42 @@ fn daemon_command_response_timeout(command: &str) -> Duration {
 }
 
 #[cfg(unix)]
-fn daemon_command_is_build_cancellation(command: &str) -> bool {
+fn daemon_command_is_cancellation(command: &str) -> bool {
     let mut words = command.lines().next().unwrap_or("").split_whitespace();
     if words.next() != Some("POST") {
         return false;
     }
-    let path = words.next().unwrap_or("").split('?').next().unwrap_or("");
+    let target = words.next().unwrap_or("");
+    let path = target.split('?').next().unwrap_or("");
     if path == "/builds/cancel-all" {
         // The daemon owns a bounded batch after caller disconnect. This
         // allowance covers one full cancellation window; larger batches can
         // outlive it and remain inspectable through active history/events.
         return true;
     }
-    path.strip_prefix("/builds/")
+    let build = path
+        .strip_prefix("/builds/")
         .and_then(|rest| rest.strip_suffix("/cancel"))
-        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
+    // Unlike the build endpoints, the daemon's queued-job route accepts only
+    // the bare path. A query suffix must not receive a cancellation allowance.
+    let job = target
+        .strip_prefix("/jobs/")
+        .and_then(|rest| rest.strip_suffix("/cancel"))
+        .and_then(|wrapper| wrapper.strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX))
+        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok());
+    build || job
+}
+
+/// The jobs command first verifies admitted identity through a status request,
+/// then waits for the cancellation receipt. Its outer deadline must cover both
+/// complete IPC requests, including connect/write time, rather than truncate
+/// the daemon's cleanup window. A queued job needs only the second request.
+#[cfg(unix)]
+pub(super) fn daemon_job_cancellation_timeout(scale: rch_common::timing::TimingScale) -> Duration {
+    DAEMON_COMMAND_CONNECT_TIMEOUT * 2
+        + DAEMON_COMMAND_IO_TIMEOUT * 3
+        + scale.duration(DAEMON_CANCELLATION_RESPONSE_TIMEOUT)
 }
 
 /// If `command` is a `POST /self-test/run` request, return its per-worker
@@ -1047,9 +1135,10 @@ mod daemon_command_tests {
             "POST /builds/42/cancel\n",
             "POST /builds/42/cancel?force=true&local_wrapper_id=owner\n",
             "POST /builds/cancel-all?force=false\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel\n",
         ] {
             assert_eq!(
-                daemon_command_response_timeout(command),
+                daemon_command_response_timeout_with_scale(command, Default::default()),
                 DAEMON_CANCELLATION_RESPONSE_TIMEOUT,
                 "{command}"
             );
@@ -1060,12 +1149,87 @@ mod daemon_command_tests {
             "POST /builds/not-an-id/cancel\n",
             "POST /builds//cancel\n",
             "POST /builds/cancel-all-extra\n",
+            "GET /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel-extra\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel?force=true\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel?\n",
+            "POST /jobs/rchw-invalid/cancel\n",
+            "POST /jobs/42/cancel\n",
+            "POST /jobs//cancel\n",
             "GET /status\n",
         ] {
             assert_eq!(
-                daemon_command_response_timeout(command),
+                daemon_command_response_timeout_with_scale(command, Default::default()),
                 DAEMON_COMMAND_IO_TIMEOUT,
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_deadlines_cover_scaled_cleanup_and_identity_lookup() {
+        for multiplier in [1.0, 1.5, 10.0] {
+            let scale = rch_common::timing::TimingScale::try_from(multiplier).unwrap();
+            // The daemon uses this scaled 60s outer cleanup window. The
+            // response allowance must still leave time to return its receipt.
+            let cleanup = scale.duration(Duration::from_secs(60));
+            for command in [
+                "POST /builds/42/cancel\n",
+                "POST /builds/cancel-all\n",
+                "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel\n",
+            ] {
+                let response = daemon_command_response_timeout_with_scale(command, scale);
+                assert!(response > cleanup, "{command}, scale={multiplier}");
+                assert!(response <= rch_common::timing::MAX_CONTROL_TIMEOUT);
+                let status_request = DAEMON_COMMAND_CONNECT_TIMEOUT + DAEMON_COMMAND_IO_TIMEOUT * 2;
+                let cancel_request =
+                    DAEMON_COMMAND_CONNECT_TIMEOUT + DAEMON_COMMAND_IO_TIMEOUT + response;
+                assert!(
+                    daemon_job_cancellation_timeout(scale) >= status_request + cancel_request,
+                    "the jobs deadline must permit both complete IPC requests"
+                );
+            }
+            assert_eq!(
+                daemon_command_response_timeout_with_scale("GET /status\n", scale),
+                DAEMON_COMMAND_IO_TIMEOUT,
+                "ordinary polling must remain promptly bounded"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_response_read_uses_the_remaining_explicit_job_deadline() {
+        let started = tokio::time::Instant::now();
+        let requested = started + Duration::from_secs(900);
+        let response_started = started + Duration::from_secs(125);
+        for command in [
+            "POST /builds/42/cancel?local_wrapper_id=rchw-12345678-1234-4321-8765-123456789abc\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel\n",
+        ] {
+            assert_eq!(
+                daemon_command_response_deadline(command, response_started, Some(requested)),
+                requested,
+                "the actual response read must use the remaining job budget, not a fresh 75s or 900s window"
+            );
+            assert_eq!(
+                daemon_command_response_deadline(
+                    command,
+                    requested + Duration::from_secs(1),
+                    Some(requested)
+                ),
+                requested,
+                "an expired operation budget must stay expired"
+            );
+        }
+        for command in [
+            "GET /status\n",
+            "GET /builds/42?local_wrapper_id=rchw-12345678-1234-4321-8765-123456789abc\n",
+            "POST /jobs/rchw-12345678-1234-4321-8765-123456789abc/cancel?force=true\n",
+        ] {
+            assert_eq!(
+                daemon_command_response_deadline(command, response_started, Some(requested)),
+                response_started + DAEMON_COMMAND_IO_TIMEOUT,
+                "identity queries and unrecognized cancellation routes keep the ordinary response limit"
             );
         }
     }
