@@ -14657,12 +14657,12 @@ fn test_artifact_patterns_for_test_commands() {
         "Test artifacts should not include target/release/**"
     );
     assert!(
-        !check_patterns.iter().any(|p| p == "target/debug/**"),
-        "Cargo check artifacts should not include target/debug/**"
+        check_patterns.is_empty(),
+        "cargo check must not retrieve stale test reports or pay for an empty report scan"
     );
     assert!(
-        !clippy_patterns.iter().any(|p| p == "target/debug/**"),
-        "Cargo clippy artifacts should not include target/debug/**"
+        clippy_patterns.is_empty(),
+        "cargo clippy must not retrieve stale test reports or pay for an empty report scan"
     );
 }
 
@@ -14761,17 +14761,35 @@ fn test_custom_target_artifact_patterns_for_cargo_test_are_skipped() {
 }
 
 #[test]
-fn test_custom_target_artifact_patterns_for_diagnostic_commands_are_skipped() {
+fn test_artifact_patterns_for_diagnostic_commands_are_skipped_at_every_root() {
     let _guard = test_guard!();
 
-    assert!(
-        get_custom_target_artifact_patterns(Some(CompilationKind::CargoCheck), None).is_empty(),
-        "cargo check output is streamed; do not sync a custom target dir"
-    );
-    assert!(
-        get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy), None).is_empty(),
-        "cargo clippy output is streamed; do not sync a custom target dir"
-    );
+    for command in [
+        "cargo check --workspace",
+        "cargo +nightly c --all-targets --profile release-perf",
+        "env CARGO_TARGET_DIR=/tmp/diagnostics cargo clippy --all-targets -- -D warnings",
+        "cargo clippy --target-dir diagnostics --profile release-perf",
+        "cargo xwin check --target x86_64-pc-windows-msvc",
+        "cargo xwin clippy --target x86_64-pc-windows-msvc",
+    ] {
+        let classification = classify_command(command);
+        assert!(classification.is_compilation, "{command}");
+        assert!(matches!(
+            classification.kind,
+            Some(CompilationKind::CargoCheck | CompilationKind::CargoClippy)
+        ));
+        for forwarded in [false, true] {
+            assert!(
+                get_project_artifact_patterns(classification.kind, Some(command), forwarded)
+                    .is_empty(),
+                "{command}: diagnostics must not create a project report retrieval phase"
+            );
+        }
+        assert!(
+            get_custom_target_artifact_patterns(classification.kind, Some(command)).is_empty(),
+            "{command}: diagnostics must not create a target retrieval phase"
+        );
+    }
 }
 
 #[test]
