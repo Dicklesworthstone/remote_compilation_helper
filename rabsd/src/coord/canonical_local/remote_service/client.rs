@@ -377,8 +377,14 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     for (index, file) in files.into_iter().enumerate() {
         checkpoint(stopped, deadline)?;
         // Every captured member is checked, including reused and empty files.
-        // The checkpoint API hashes through retained descriptors and refuses
-        // replacement/mutation. A remote hit never replaces local custody.
+        // Both paths hash through retained descriptors and refuse replacement
+        // or mutation. A remote hit never replaces local custody, but needs no
+        // disposable local copy of bytes that will not be sent.
+        if requested.peek().copied().map(usize::from) != Some(index) {
+            bundle.source.verify_completed_file(&file.path, cancelled)?;
+            continue;
+        }
+        requested.next();
         let checkpoint_file = tempfile::NamedTempFile::new_in(scratch)?;
         let mut verified = bundle
             .source
@@ -392,10 +398,6 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 | SourceCheckpointError::Destination(error) => error,
             })?
             .into_file();
-        if requested.peek().copied().map(usize::from) != Some(index) {
-            continue;
-        }
-        requested.next();
         verified.seek(SeekFrom::Start(0))?;
         let mut offset = 0;
         // Held across awaits: an inline array would sit in the future, and
@@ -782,6 +784,52 @@ mod tests {
             .filter(|record| !record.is_empty())
             .map(|record| serde_json::from_slice(record).unwrap())
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch_source_spools(scratch: &Path) -> rustix::fd::OwnedFd {
+        use rustix::fs::inotify;
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(
+            &watch,
+            scratch,
+            inotify::WatchFlags::CREATE | inotify::WatchFlags::MODIFY,
+        )
+        .unwrap();
+        watch
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_source_spools(watch: rustix::fd::OwnedFd, expected: usize) {
+        use rustix::fs::inotify;
+        use std::collections::BTreeSet;
+        use std::mem::MaybeUninit;
+
+        let mut buffer = [MaybeUninit::uninit(); 4096];
+        let mut events = inotify::Reader::new(watch, &mut buffer);
+        let mut created = BTreeSet::new();
+        let mut written = BTreeSet::new();
+        loop {
+            let event = match events.next() {
+                Err(rustix::io::Errno::WOULDBLOCK) => break,
+                Err(error) => panic!("source spool event read failed: {error}"),
+                Ok(event) => event,
+            };
+            assert!(!event.events().contains(inotify::ReadFlags::QUEUE_OVERFLOW));
+            let name = event.file_name().expect("spool event names a file");
+            if event.events().contains(inotify::ReadFlags::CREATE) {
+                created.insert(name.to_bytes().to_vec());
+            }
+            if event.events().contains(inotify::ReadFlags::MODIFY) {
+                written.insert(name.to_bytes().to_vec());
+            }
+        }
+        assert_eq!(created.len(), expected, "only missing members need a spool");
+        assert_eq!(
+            written, created,
+            "each missing member was copied to its spool"
+        );
     }
 
     fn admission_manifest() -> SourceManifest {
@@ -1417,6 +1465,8 @@ mod tests {
                 let output = Arc::clone(&peer.output);
                 let mut wire = Wire::new(peer);
                 let stopped = AtomicBool::new(false);
+                #[cfg(target_os = "linux")]
+                let spools = watch_source_spools(&fixture.owner.path().join("scratch"));
                 native(async {
                     let (deadline, selected, source_plan) = await_input_admission(
                         &mut wire,
@@ -1444,6 +1494,8 @@ mod tests {
                         .await
                         .unwrap();
                 });
+                #[cfg(target_os = "linux")]
+                assert_source_spools(spools, plan.missing_files.len());
                 let mut source_bytes = 0_u64;
                 let mut sdk_bytes = 0_u64;
                 let mut sdk_entries = 0;
@@ -1541,6 +1593,58 @@ mod tests {
                         .count(),
                     0,
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn full_source_reuse_succeeds_without_a_scratch_directory() {
+        for disposition in [ToolchainDisposition::Upload, ToolchainDisposition::Reuse] {
+            let mut fixture = InputFixture::new();
+            let plan = SourcePlan::new(fixture.bundle.source.manifest(), Vec::new()).unwrap();
+            let peer = fixture.upload_peer(disposition, plan);
+            let output = Arc::clone(&peer.output);
+            let mut wire = Wire::new(peer);
+            let stopped = AtomicBool::new(false);
+            let scratch = fixture.owner.path().join("absent-scratch");
+            native(async {
+                let (deadline, disposition, source_plan) = await_input_admission(
+                    &mut wire,
+                    fixture.bundle.source.manifest(),
+                    &stopped,
+                    "fixture",
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+                upload_inputs(
+                    &mut wire,
+                    &mut fixture.bundle,
+                    &scratch,
+                    disposition,
+                    &source_plan,
+                    &stopped,
+                    deadline,
+                )
+                .await
+                .unwrap();
+                wire.send(&Message::InputsDone {}, &stopped, deadline)
+                    .await
+                    .unwrap();
+            });
+            assert!(
+                !scratch.exists(),
+                "warm inputs need no local spool directory"
+            );
+            let messages = admission_messages(&output);
+            assert_eq!(messages.last().unwrap()["kind"], "inputs-done");
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message["kind"] != "source-chunk")
+            );
+            if disposition == ToolchainDisposition::Reuse {
+                assert_eq!(messages.len(), 1);
             }
         }
     }
