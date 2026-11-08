@@ -784,13 +784,12 @@ fn evaluate_pressure_with_metrics(
         _ => (None, None),
     };
 
-    // GH #117: the worker's tightest sample is the fullest of the project
-    // roots and `/tmp`, and its build sample the fullest of the roots alone,
-    // both copied from the same readings. So they differ exactly when `/tmp`
-    // is the tightest mount. Then the build disk gets the full rule set and
-    // `/tmp`, which holds no build trees, is judged by how close it is to
-    // full; the worse verdict wins. Without a build sample (older rch-wkr)
-    // the tightest mount is judged as before.
+    // Older workers only reported the lowest-ratio mount and the build
+    // mount. Different readings identify `/tmp` as the lowest-ratio mount.
+    // Keep that inference as a fallback for workers without a valid explicit
+    // `/tmp` reading, but do not rely on it: a 2 GB tmpfs with 1 GB free is
+    // below its absolute safety floor even when a roomy build disk has a
+    // lower free ratio. Both mounts need independent policy decisions.
     let tmp_is_tightest = matches!(
         (disk_free_gb, disk_total_gb, build_disk_free_gb, build_disk_total_gb),
         (Some(free), Some(total), Some(build_free), Some(build_total))
@@ -803,6 +802,16 @@ fn evaluate_pressure_with_metrics(
         (build_disk_free_gb, build_disk_total_gb, ratio)
     } else {
         (disk_free_gb, disk_total_gb, disk_free_ratio)
+    };
+    let tmp_sample = match (
+        capabilities.tmp_disk_free_gb,
+        capabilities.tmp_disk_total_gb,
+    ) {
+        (Some(free), Some(total)) if free.is_finite() && total.is_finite() && total > 0.0 => {
+            Some((free.max(0.0), (free / total).clamp(0.0, 1.0)))
+        }
+        _ if tmp_is_tightest => disk_free_gb.zip(disk_free_ratio),
+        _ => None,
     };
 
     // A zero or non-finite reading is a failed probe, not a full disk: it
@@ -846,14 +855,13 @@ fn evaluate_pressure_with_metrics(
             config,
         )
     };
-    let (state, confidence, reason_code, mut policy_rule) =
-        match (tmp_is_tightest, disk_free_gb, disk_free_ratio) {
-            (true, Some(tmp_free_gb), Some(tmp_free_ratio)) => worse_verdict(
-                verdict,
-                classify_tmp_mount(tmp_free_gb, tmp_free_ratio, telemetry_fresh, config),
-            ),
-            _ => verdict,
-        };
+    let (state, confidence, reason_code, mut policy_rule) = match tmp_sample {
+        Some((tmp_free_gb, tmp_free_ratio)) => worse_verdict(
+            verdict,
+            classify_tmp_mount(tmp_free_gb, tmp_free_ratio, telemetry_fresh, config),
+        ),
+        _ => verdict,
+    };
 
     // Explain why a low percentage did not zero this worker. The existing
     // status and capabilities surfaces already carry this rule, so operators
@@ -900,10 +908,10 @@ fn absolute_gb_thresholds_apply(disk_total_gb: f64, config: &DiskPressurePolicyC
 
 type Verdict = (PressureState, PressureConfidence, String, String);
 
-/// `/tmp` when it is the tightest mount but not the build disk (GH #117): it
-/// breaks scp and mktemp only when actually full, so it is Critical below an
-/// absolute floor, and its ratio rules give at most Warning. The reason codes
-/// name `/tmp` so every surface shows which mount drove the verdict.
+/// `/tmp` (GH #117) is Critical below an absolute safety floor, and its ratio
+/// rules give at most Warning. The reason codes and measured values name
+/// `/tmp` so every surface shows which mount drove the verdict, even when
+/// the legacy tightest sample describes the build disk.
 fn classify_tmp_mount(
     tmp_free_gb: f64,
     tmp_free_ratio: f64,
@@ -920,7 +928,10 @@ fn classify_tmp_mount(
             PressureState::Critical,
             confidence,
             "tmp_free_below_floor".to_string(),
-            "tmp_free_gb<tmp_critical_free_gb".to_string(),
+            format!(
+                "tmp_free_gb<tmp_critical_free_gb; /tmp free_gb={tmp_free_gb} < floor_gb={}",
+                config.tmp_critical_free_gb
+            ),
         );
     }
     if tmp_free_ratio <= config.warning_free_ratio {
@@ -928,7 +939,9 @@ fn classify_tmp_mount(
             PressureState::Warning,
             confidence,
             "tmp_ratio_below_warning".to_string(),
-            "tmp_free_ratio<=warning_free_ratio".to_string(),
+            format!(
+                "tmp_free_ratio<=warning_free_ratio; /tmp free_gb={tmp_free_gb}, free_ratio={tmp_free_ratio}"
+            ),
         );
     }
     (
@@ -1502,6 +1515,84 @@ mod tests {
         assert_eq!(pressure.state, PressureState::Critical);
         assert_eq!(pressure.reason_code, "tmp_free_below_floor");
         assert_eq!(pressure.capacity_free_gb(), Some(1700.0));
+    }
+
+    #[test]
+    fn explicit_tmp_floor_is_enforced_when_build_disk_has_the_lower_free_ratio() {
+        let config = DiskPressurePolicyConfig::default();
+        let mut caps = caps_with_build_disk((136.0, 387.0), Some((136.0, 387.0)));
+        caps.tmp_disk_free_gb = Some(1.0);
+        caps.tmp_disk_total_gb = Some(2.0);
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+
+        for received in [Some(&telemetry), None] {
+            let pressure = evaluate_pressure_policy(&caps, received, &config);
+            assert_eq!(pressure.state, PressureState::Critical);
+            assert_eq!(pressure.reason_code, "tmp_free_below_floor");
+            assert_eq!(pressure.capacity_free_gb(), Some(136.0));
+            assert_eq!(pressure.disk_free_gb, Some(136.0));
+            assert!(pressure.policy_rule.contains("/tmp free_gb=1 < floor_gb=2"));
+        }
+
+        // Reaching the absolute floor is sufficient when the ratio is also
+        // healthy; the independent probe must not permanently exclude tmpfs.
+        caps.tmp_disk_free_gb = Some(2.0);
+        caps.tmp_disk_total_gb = Some(3.0);
+        let pressure = evaluate_pressure_policy(&caps, Some(&telemetry), &config);
+        assert_eq!(pressure.state, PressureState::Healthy);
+    }
+
+    #[test]
+    fn explicit_tmp_reading_preserves_build_critical_pressure() {
+        let mut caps = caps_with_build_disk((9.0, 387.0), Some((9.0, 387.0)));
+        caps.tmp_disk_free_gb = Some(1.0);
+        caps.tmp_disk_total_gb = Some(2.0);
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let pressure = evaluate_pressure_policy(
+            &caps,
+            Some(&telemetry),
+            &DiskPressurePolicyConfig::default(),
+        );
+        assert_eq!(pressure.state, PressureState::Critical);
+        assert_eq!(pressure.reason_code, "disk_free_below_critical_gb");
+        assert_eq!(pressure.capacity_free_gb(), Some(9.0));
+    }
+
+    #[test]
+    fn invalid_explicit_tmp_samples_do_not_invent_pressure_or_hide_legacy_pressure() {
+        let config = DiskPressurePolicyConfig::default();
+        for (free, total) in [
+            (None, Some(2.0)),
+            (Some(1.0), None),
+            (Some(1.0), Some(0.0)),
+            (Some(1.0), Some(-2.0)),
+            (Some(f64::NAN), Some(2.0)),
+            (Some(f64::INFINITY), Some(2.0)),
+            (Some(1.0), Some(f64::NAN)),
+            (Some(1.0), Some(f64::INFINITY)),
+        ] {
+            let mut caps = caps_with_build_disk((136.0, 387.0), Some((136.0, 387.0)));
+            caps.tmp_disk_free_gb = free;
+            caps.tmp_disk_total_gb = total;
+            let pressure = evaluate_pressure_policy(&caps, None, &config);
+            assert_eq!(
+                pressure.state,
+                PressureState::TelemetryGap,
+                "{free:?}/{total:?}"
+            );
+
+            // Older tightest/build evidence still proves a full /tmp, even
+            // if an incomplete or failed explicit probe was also received.
+            caps.disk_free_gb = Some(0.2);
+            caps.disk_total_gb = Some(15.5);
+            let pressure = evaluate_pressure_policy(&caps, None, &config);
+            assert_eq!(
+                pressure.state,
+                PressureState::Critical,
+                "{free:?}/{total:?}"
+            );
+            assert_eq!(pressure.reason_code, "tmp_free_below_floor");
+        }
     }
 
     /// GH #117 reproduction: a 46 GiB tmpfs /tmp at 4.5% free (2.05 GiB) no

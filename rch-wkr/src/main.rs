@@ -634,32 +634,55 @@ async fn probe_declared_tools(
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
 async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
-    use std::process::Command;
-
     let mut capabilities = WorkerCapabilities::new();
-
-    // Probe rustc version. Resolve like the rustup inventory does so a
-    // minimal service PATH cannot silently drop the Rust capability facts.
     let mut warnings = Vec::new();
-    if let Some(rustc) = resolve_tool_binary("rustc") {
-        if let Ok(output) = Command::new(&rustc.path).args(["--version"]).output()
-            && output.status.success()
-        {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
-            if !rustc.from_path_lookup {
-                warnings.push(format!(
-                    "rustc resolved from fallback location {}",
-                    rustc.path.display()
-                ));
+
+    // Runtime wrappers can hang, fork pipe holders, or print unbounded output.
+    // Observe them concurrently under one deadline so one broken installation
+    // cannot block health refresh or suppress unrelated capability facts.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (rustc, bun, node, npm, nix, go, zig, cargo_zigbuild) = tokio::join!(
+        probe_runtime_version("rustc", &["--version"], deadline),
+        probe_runtime_version("bun", &["--version"], deadline),
+        probe_runtime_version("node", &["--version"], deadline),
+        probe_runtime_version("npm", &["--version"], deadline),
+        async {
+            // A working Nix binary without a populated store cannot build
+            // derivations, so it must not enable Nix routing.
+            if nix_store_is_populated() {
+                probe_runtime_version("nix", &["--version"], deadline).await
+            } else {
+                (None, None)
             }
-        }
-    } else if let Ok(output) = Command::new("rustc").args(["--version"]).output()
-        && output.status.success()
-    {
-        let version_str = String::from_utf8_lossy(&output.stdout);
-        capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
-    }
+        },
+        probe_runtime_version("go", &["version"], deadline),
+        probe_runtime_version("zig", &["version"], deadline),
+        // cargo-zigbuild rejects `cargo zigbuild --version`; invoke the
+        // hyphenated binary. Both this and Zig must work for has_zig().
+        probe_runtime_version("cargo-zigbuild", &["--version"], deadline),
+    );
+    capabilities.rustc_version = rustc.0.as_deref().and_then(parse_rustc_version_stdout);
+    capabilities.bun_version = bun.0;
+    capabilities.node_version = node.0.as_deref().and_then(parse_node_version_stdout);
+    capabilities.npm_version = npm.0;
+    capabilities.nix_version = nix.0;
+    capabilities.go_version = go.0;
+    capabilities.zig_version = zig.0;
+    capabilities.cargo_zigbuild_version = cargo_zigbuild.0;
+    warnings.extend(
+        [
+            rustc.1,
+            bun.1,
+            node.1,
+            npm.1,
+            nix.1,
+            go.1,
+            zig.1,
+            cargo_zigbuild.1,
+        ]
+        .into_iter()
+        .flatten(),
+    );
 
     // A compiler version alone does not establish that builds can run. A
     // dual-role worker may also have both the PATH shim and the direct
@@ -691,82 +714,6 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
 
     capabilities.probe_warnings = warnings;
 
-    // Probe bun version
-    let bun_cmd = run_bun_version_command();
-
-    if let Some(output) = bun_cmd
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.bun_version = Some(version);
-        }
-    }
-
-    // Probe node version
-    if let Ok(output) = runtime_command("node").args(["--version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout);
-        capabilities.node_version = parse_node_version_stdout(&version);
-    }
-
-    // Probe npm version
-    if let Ok(output) = runtime_command("npm").args(["--version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.npm_version = Some(version);
-        }
-    }
-
-    // Probe nix version. We require BOTH a working `nix --version` AND a
-    // populated `/nix/store`, since a `nix` binary alone (without a store) can't
-    // build derivations. This gates `nix build` / `nix develop -c` routing.
-    if nix_store_is_populated()
-        && let Ok(output) = Command::new("nix").args(["--version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.nix_version = Some(version);
-        }
-    }
-
-    // Probe Go toolchain. Presence gates `go build`/`go test`/`go vet` routing to
-    // this worker via `has_go()`.
-    if let Ok(output) = Command::new("go").args(["version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.go_version = Some(version);
-        }
-    }
-
-    // Probe the zig cross-compilation toolchain. Both halves are required: the
-    // `cargo-zigbuild` subcommand and the `zig` binary it drives as linker.
-    // Probed as the hyphenated binary because `cargo zigbuild --version` is
-    // rejected by cargo-zigbuild's own argument parser. Gates `cargo zigbuild`
-    // routing via `has_zig()`.
-    if let Ok(output) = Command::new("zig").args(["version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.zig_version = Some(version);
-        }
-    }
-    if let Ok(output) = Command::new("cargo-zigbuild").args(["--version"]).output()
-        && output.status.success()
-    {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            capabilities.cargo_zigbuild_version = Some(version);
-        }
-    }
-
     // Probe the x86-64 microarchitecture level (bd-6qchz / bd-68hon item 4):
     // a pre-v3 CPU (e.g. Ivy Bridge — AVX but no AVX2) SIGILLs any
     // build-script/proc-macro binary compiled for x86-64-v3, so the dispatcher
@@ -789,6 +736,10 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     if let Some((free_gb, total_gb)) = disk.build {
         capabilities.build_disk_free_gb = Some(free_gb);
         capabilities.build_disk_total_gb = Some(total_gb);
+    }
+    if let Some((free_gb, total_gb)) = disk.tmp {
+        capabilities.tmp_disk_free_gb = Some(free_gb);
+        capabilities.tmp_disk_total_gb = Some(total_gb);
     }
 
     let (canonical_root, alias_root) = resolved_topology_roots();
@@ -1244,6 +1195,126 @@ async fn cached_rustup_inventory(
     Ok((cache.toolchains, components, warnings))
 }
 
+/// Observe one optional runtime without allowing its wrapper to monopolize
+/// capability refresh. Each runtime has its own byte budget so a noisy tool
+/// does not consume the output allowance of an unrelated healthy tool.
+async fn probe_runtime_version(
+    name: &str,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+) -> (Option<String>, Option<String>) {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    probe_runtime_version_in(name, args, deadline, path_var.as_deref(), home.as_deref()).await
+}
+
+async fn probe_runtime_version_in(
+    name: &str,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> (Option<String>, Option<String>) {
+    // Let POSIX exec search PATH itself: a non-executable file or a script
+    // whose interpreter is missing must not shadow a later working binary.
+    // Windows still needs explicit resolution of npm.cmd and similar shims.
+    // Explicit paths are never reinterpreted as service-location fallbacks.
+    #[cfg(windows)]
+    let mut resolved = (std::path::Path::new(name).components().count() == 1)
+        .then(|| resolve_tool_binary_in(path_var, home, name))
+        .flatten();
+    #[cfg(not(windows))]
+    let mut resolved: Option<ResolvedTool> = None;
+    let command = runtime_probe_command(
+        resolved
+            .as_ref()
+            .map(|tool| tool.path.as_path())
+            .unwrap_or_else(|| std::path::Path::new(name)),
+        args,
+        path_var,
+        home,
+    );
+    let output_budget = std::sync::atomic::AtomicUsize::new(16 * 1024);
+    let mut observed = bounded_probe_command(command, name, deadline, &output_budget).await;
+    // Retry only when no process was started. A timeout, excessive output,
+    // nonzero exit or empty response is a failed installed runtime, not an
+    // invitation to substitute a different installation.
+    if observed
+        .as_ref()
+        .is_err_and(|error| error.downcast_ref::<ProbeSpawnFailure>().is_some())
+    {
+        if name == "bun" {
+            if let Some(path) = path_with_home_bun_bin(
+                home.map(std::ffi::OsStr::to_os_string),
+                path_var.map(std::ffi::OsStr::to_os_string),
+            ) {
+                let command = runtime_probe_command(name.as_ref(), args, Some(&path), home);
+                observed = bounded_probe_command(command, name, deadline, &output_budget).await;
+                resolved = None;
+            }
+        } else if matches!(name, "rustc" | "node" | "npm")
+            && let Some(fallback) = resolve_tool_binary_in(None, home, name)
+            && resolved
+                .as_ref()
+                .is_none_or(|previous| previous.path != fallback.path)
+        {
+            // Retain the existing minimal-service-PATH discovery for these
+            // runtimes. Other tools must be executable through the job's PATH.
+            let command = runtime_probe_command(&fallback.path, args, path_var, home);
+            observed = bounded_probe_command(command, name, deadline, &output_budget).await;
+            resolved = Some(fallback);
+        }
+    }
+    match observed {
+        Ok(output) => {
+            let version = output.trim();
+            if version.is_empty() {
+                return (
+                    None,
+                    Some(format!("{name} version probe returned no version")),
+                );
+            }
+            let warning = resolved.filter(|tool| !tool.from_path_lookup).map(|tool| {
+                format!(
+                    "{name} resolved from fallback location {}",
+                    tool.path.display()
+                )
+            });
+            (Some(version.to_owned()), warning)
+        }
+        // Optional runtimes that are not installed are ordinary absence.
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (None, None)
+        }
+        Err(error) => (
+            None,
+            Some(format!("{name} version probe failed: {error:#}")),
+        ),
+    }
+}
+
+fn runtime_probe_command(
+    program: &std::path::Path,
+    args: &[&str],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> tokio::process::Command {
+    let mut command = executor::managed_command(program);
+    command.args(args);
+    for (name, value) in [("PATH", path_var), ("HOME", home)] {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 /// Check Cargo using the same child-environment constructor as real worker
 /// execution. Bound all three commands together so a broken shim cannot hang
 /// the capability refresh or consume unbounded memory with diagnostic output.
@@ -1291,8 +1362,13 @@ async fn inventory_command(
     bounded_probe_command(command, "inventory", deadline, output_budget).await
 }
 
-/// Cancellation kills and reaps the owned foreground probe process; this does
-/// not promise to terminate descendants created by a tool on every platform.
+#[derive(Debug, thiserror::Error)]
+#[error("spawn {0} command")]
+struct ProbeSpawnFailure(String);
+
+/// Bound output and execution, and reap the foreground probe on failure. On
+/// Unix the process group remains owned until the leader is reaped, including
+/// when a successful wrapper leaves descendants holding its output pipes.
 async fn bounded_probe_command(
     mut command: tokio::process::Command,
     probe: &str,
@@ -1309,14 +1385,25 @@ async fn bounded_probe_command(
         output_budget.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "{probe} output limit exhausted before spawn"
     );
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let mut child = rch_common::ssh::OwnedProcessGroup::spawn(&mut command)
+        .with_context(|| ProbeSpawnFailure(probe.to_owned()))?;
+    #[cfg(not(unix))]
+    let mut child = command
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn {probe} command"))?;
+        .with_context(|| ProbeSpawnFailure(probe.to_owned()))?;
+    #[cfg(unix)]
+    let stdout = child.take_stdout().context("missing probe stdout")?;
+    #[cfg(unix)]
+    let stderr = child.take_stderr().context("missing probe stderr")?;
+    #[cfg(not(unix))]
     let stdout = child.stdout.take().context("missing probe stdout")?;
+    #[cfg(not(unix))]
     let stderr = child.stderr.take().context("missing probe stderr")?;
     let result = tokio::time::timeout_at(deadline, async {
         let (stdout, stderr, status) = tokio::try_join!(
@@ -1324,6 +1411,10 @@ async fn bounded_probe_command(
             read_probe_output(stderr, probe, output_budget),
             async { child.wait().await.map_err(anyhow::Error::from) },
         )?;
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "{probe} deadline reached before observation completed"
+        );
         anyhow::ensure!(
             status.success(),
             "{probe} command exited {status}: {}{}",
@@ -1799,6 +1890,321 @@ esac
         );
     }
 
+    fn write_runtime_probe_tool(
+        directory: &std::path::Path,
+        name: &str,
+        body: &str,
+        mode: u32,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(directory).unwrap();
+        let path = directory.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn runtime_probes_use_native_path_search_and_direct_explicit_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let denied = directory.path().join("denied");
+        let broken = directory.path().join("broken");
+        let working = directory.path().join("working");
+        let path = std::env::join_paths([&denied, &broken, &working]).unwrap();
+        let missing_interpreter = format!(
+            "#!{}\nprintf broken\n",
+            directory.path().join("missing-interpreter").display()
+        );
+        for name in [
+            "rustc",
+            "bun",
+            "node",
+            "npm",
+            "nix",
+            "go",
+            "zig",
+            "cargo-zigbuild",
+        ] {
+            write_runtime_probe_tool(&denied, name, "#!/bin/sh\nprintf denied\n", 0o600);
+            write_runtime_probe_tool(&broken, name, &missing_interpreter, 0o700);
+            let executable = write_runtime_probe_tool(
+                &working,
+                name,
+                "#!/bin/sh\nprintf 'runtime-ready\\n'\n",
+                0o700,
+            );
+            for (program, path_var) in [
+                (name, Some(path.as_os_str())),
+                (executable.to_str().unwrap(), None),
+            ] {
+                let observed = probe_runtime_version_in(
+                    program,
+                    &["--version"],
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    path_var,
+                    None,
+                )
+                .await;
+                assert_eq!(observed, (Some("runtime-ready".into()), None), "{program}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_probes_retain_only_existing_service_location_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty-path");
+        let home = directory.path().join("home");
+        for name in ["rustc", "node", "npm", "go"] {
+            let fallback = write_runtime_probe_tool(
+                &home.join(".cargo/bin"),
+                name,
+                "#!/bin/sh\nprintf 'fallback-version\\n'\n",
+                0o700,
+            );
+            let observed = probe_runtime_version_in(
+                name,
+                &["--version"],
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                Some(path.as_os_str()),
+                Some(home.as_os_str()),
+            )
+            .await;
+            if name == "go" {
+                assert_eq!(
+                    observed,
+                    (None, None),
+                    "Go must be available through the job PATH"
+                );
+            } else {
+                assert_eq!(observed.0.as_deref(), Some("fallback-version"));
+                assert!(
+                    observed
+                        .1
+                        .unwrap()
+                        .contains(&fallback.display().to_string())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_bun_retries_spawn_failures_with_a_bounded_home_fallback() {
+        for (mode, interpreter, fallback_body, expected) in [
+            (0o600, "/bin/sh", "printf '1.2.3\\n'", Some("1.2.3")),
+            (
+                0o700,
+                "/rch-missing-bun-interpreter",
+                "printf '1.2.3\\n'",
+                Some("1.2.3"),
+            ),
+            (
+                0o700,
+                "/rch-missing-bun-interpreter",
+                "exec /bin/sleep 30",
+                None,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("bin");
+            let home = directory.path().join("home");
+            write_runtime_probe_tool(
+                &path,
+                "bun",
+                &format!("#!{interpreter}\nprintf broken\n"),
+                mode,
+            );
+            write_runtime_probe_tool(
+                &home.join(".bun/bin"),
+                "bun",
+                &format!("#!/bin/sh\nprintf ran > \"$HOME/fallback-ran\"\n{fallback_body}\n"),
+                0o700,
+            );
+            let started = std::time::Instant::now();
+            let observed = probe_runtime_version_in(
+                "bun",
+                &["--version"],
+                tokio::time::Instant::now() + Duration::from_millis(250),
+                Some(path.as_os_str()),
+                Some(home.as_os_str()),
+            )
+            .await;
+            assert_eq!(observed.0.as_deref(), expected);
+            if expected.is_none() {
+                assert!(observed.1.unwrap().contains("timed out"));
+            } else {
+                assert!(observed.1.is_none());
+            }
+            assert!(home.join("fallback-ran").exists());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_bun_does_not_mask_failures_of_a_started_installation() {
+        for (body, expected_failure) in [
+            ("exit 23", "exited"),
+            ("printf '  \\n'", "returned no version"),
+            ("exec /bin/sleep 30", "timed out"),
+            (
+                "i=0; while [ \"$i\" -lt 4096 ]; do printf 12345678; i=$((i+1)); done",
+                "shared byte limit",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("bin");
+            let home = directory.path().join("home");
+            write_runtime_probe_tool(&path, "bun", &format!("#!/bin/sh\n{body}\n"), 0o700);
+            write_runtime_probe_tool(
+                &home.join(".bun/bin"),
+                "bun",
+                "#!/bin/sh\nprintf ran > \"$HOME/fallback-ran\"\nprintf '1.2.3\\n'\n",
+                0o700,
+            );
+            let observed = probe_runtime_version_in(
+                "bun",
+                &["--version"],
+                tokio::time::Instant::now() + Duration::from_millis(250),
+                Some(path.as_os_str()),
+                Some(home.as_os_str()),
+            )
+            .await;
+            assert!(observed.0.is_none());
+            assert!(observed.1.unwrap().contains(expected_failure));
+            assert!(!home.join("fallback-ran").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_probes_bound_hangs_and_noise_without_losing_healthy_facts() {
+        for (script, expected_failure) in [
+            ("sleep 30", "timed out"),
+            (
+                "i=0; while [ \"$i\" -lt 4096 ]; do printf 12345678; i=$((i+1)); done",
+                "shared byte limit",
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            let broken_args = ["-c", script];
+            let (broken, healthy) = tokio::join!(
+                probe_runtime_version("/bin/sh", &broken_args, deadline),
+                probe_runtime_version(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        "test \"$RCH_CARGO_WRAPPER_BYPASS:$RCH_CARGO_WRAPPER_ORIGIN\" = 1:rch || exit 91; printf 'v22.0.0\\n'",
+                    ],
+                    deadline,
+                ),
+            );
+            assert!(
+                broken.0.is_none(),
+                "failed probe must not advertise a runtime"
+            );
+            assert!(
+                broken
+                    .1
+                    .as_deref()
+                    .is_some_and(|warning| warning.contains(expected_failure)),
+                "{broken:?}"
+            );
+            assert_eq!(healthy, (Some("v22.0.0".to_owned()), None));
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_probes_distinguish_absence_empty_output_and_expired_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("not-installed");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            probe_runtime_version(missing.to_str().unwrap(), &["--version"], deadline).await,
+            (None, None)
+        );
+        let empty = probe_runtime_version("/bin/sh", &["-c", "printf '  \\n'"], deadline).await;
+        assert!(empty.0.is_none());
+        assert!(empty.1.unwrap().contains("returned no version"));
+
+        let marker = directory.path().join("must-not-run");
+        let expired = probe_runtime_version(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf started > \"$1\"",
+                "sh",
+                marker.to_str().unwrap(),
+            ],
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert!(expired.0.is_none());
+        assert!(expired.1.unwrap().contains("deadline reached before spawn"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_probe_process_stopped(pid: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Ok(stat)
+                    if stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z')) =>
+                {
+                    return;
+                }
+                observed => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "probe process {pid} survived cleanup: {observed:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inventory_probe_cleans_pipe_holders_after_success_and_timeout() {
+        use std::sync::atomic::AtomicUsize;
+        for wait_for_child in [false, true] {
+            let fixture = Fixture::new();
+            std::fs::write(
+                &fixture.executable,
+                format!(
+                    "#!/bin/sh\nroot=${{0%/*}}\nprintf '%s' $$ > \"$root/leader\"\nsleep 30 &\nprintf '%s' $! > \"$root/descendant\"\nprintf 'runtime-version\\n'\n{}\n",
+                    if wait_for_child { "wait" } else { "exit 0" },
+                ),
+            )
+            .unwrap();
+            let result = inventory_command(
+                &fixture.executable,
+                &[],
+                tokio::time::Instant::now() + Duration::from_millis(250),
+                &AtomicUsize::new(4096),
+            )
+            .await;
+            if wait_for_child {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            } else {
+                assert_eq!(result.unwrap(), "runtime-version\n");
+            }
+            let leader = std::fs::read_to_string(fixture.directory.path().join("leader")).unwrap();
+            let descendant =
+                std::fs::read_to_string(fixture.directory.path().join("descendant")).unwrap();
+            assert_probe_process_stopped(&descendant).await;
+            assert!(
+                !std::path::Path::new("/proc").join(leader).exists(),
+                "foreground probe must be reaped"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn inventory_timeout_reaps_owned_child_and_output_cap_is_shared() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2053,21 +2459,6 @@ fn nix_store_is_populated() -> bool {
         .is_some()
 }
 
-fn run_bun_version_command() -> Option<std::process::Output> {
-    if let Ok(output) = std::process::Command::new("bun")
-        .args(["--version"])
-        .output()
-    {
-        return Some(output);
-    }
-
-    let mut command = std::process::Command::new("bun");
-    if let Some(path) = path_with_home_bun_bin(std::env::var_os("HOME"), std::env::var_os("PATH")) {
-        command.env("PATH", path);
-    }
-    command.args(["--version"]).output().ok()
-}
-
 fn path_with_home_bun_bin(
     home: Option<std::ffi::OsString>,
     current_path: Option<std::ffi::OsString>,
@@ -2269,6 +2660,8 @@ struct DiskSamples {
     tightest: Option<(f64, f64)>,
     /// Fullest mount among the project roots only (capacity).
     build: Option<(f64, f64)>,
+    /// `/tmp` needs its own reading because its safety floor is absolute.
+    tmp: Option<(f64, f64)>,
 }
 
 fn summarize_disk_samples(build: &[Option<(f64, f64)>], tmp: Option<(f64, f64)>) -> DiskSamples {
@@ -2280,6 +2673,7 @@ fn summarize_disk_samples(build: &[Option<(f64, f64)>], tmp: Option<(f64, f64)>)
             .copied()
             .reduce(fuller_disk_sample),
         build: build.iter().flatten().copied().reduce(fuller_disk_sample),
+        tmp,
     }
 }
 
@@ -2706,27 +3100,44 @@ mod tests {
         let samples = summarize_disk_samples(&[Some(root), Some(root)], Some(tmpfs));
         assert_eq!(samples.tightest, Some(tmpfs), "pressure still sees /tmp");
         assert_eq!(samples.build, Some(root), "capacity sees the build disk");
+        assert_eq!(samples.tmp, Some(tmpfs));
 
         // The build sample is the fuller of canonical root and alias.
         let alias = (50.0, 1000.0);
         let samples = summarize_disk_samples(&[Some(root), Some(alias)], Some(tmpfs));
         assert_eq!(samples.build, Some(alias));
         assert_eq!(samples.tightest, Some(alias));
+        assert_eq!(samples.tmp, Some(tmpfs));
 
         // Missing roots leave no build sample; /tmp alone is still reported
         // for pressure.
         let samples = summarize_disk_samples(&[None, None], Some(tmpfs));
         assert_eq!(samples.build, None);
         assert_eq!(samples.tightest, Some(tmpfs));
+        assert_eq!(samples.tmp, Some(tmpfs));
 
         let samples = summarize_disk_samples(&[None, None], None);
         assert_eq!(
             samples,
             DiskSamples {
                 tightest: None,
-                build: None
+                build: None,
+                tmp: None,
             }
         );
+    }
+
+    #[test]
+    fn test_disk_samples_retain_tmp_below_absolute_floor_despite_higher_free_ratio() {
+        // The build disk is only 35% free, but has ample capacity. The small
+        // tmpfs is 50% free while below the 2 GB safety floor. Choosing just
+        // the lowest ratio silently discards the mount that must refuse work.
+        let root = (136.0, 387.0);
+        let tmpfs = (1.0, 2.0);
+        let samples = summarize_disk_samples(&[Some(root), Some(root)], Some(tmpfs));
+        assert_eq!(samples.tightest, Some(root));
+        assert_eq!(samples.build, Some(root));
+        assert_eq!(samples.tmp, Some(tmpfs));
     }
 
     #[test]

@@ -679,6 +679,8 @@ mod tests {
                             disk_total_gb,
                             build_disk_free_gb: disk_free_gb,
                             build_disk_total_gb: disk_total_gb,
+                            tmp_disk_free_gb: None,
+                            tmp_disk_total_gb: None,
                             projects_root_ok,
                             projects_root_topology: None,
                             projects_root_issue,

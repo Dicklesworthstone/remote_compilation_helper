@@ -1360,6 +1360,14 @@ pub struct WorkerCapabilities {
     /// Total size in GB of the mount reported in `build_disk_free_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_disk_total_gb: Option<f64>,
+    /// Free space in GB on `/tmp`, retained independently of the tightest
+    /// mount. Its absolute safety floor can be violated even when a build
+    /// filesystem has a lower free-space ratio. Older workers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmp_disk_free_gb: Option<f64>,
+    /// Total size in GB of the mount reported in `tmp_disk_free_gb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmp_disk_total_gb: Option<f64>,
     /// Worker-local path-topology preflight status.
     ///
     /// `Some(false)` indicates a hard preflight failure that should exclude this
@@ -7852,6 +7860,8 @@ retry_max = 2
             load_avg_15: Some(1.8),
             disk_free_gb: Some(50.5),
             disk_total_gb: Some(100.0),
+            tmp_disk_free_gb: Some(1.0),
+            tmp_disk_total_gb: Some(2.0),
             ..Default::default()
         };
         let json = serde_json::to_string(&caps).unwrap();
@@ -7859,6 +7869,16 @@ retry_max = 2
         assert_eq!(parsed.num_cpus, Some(8));
         assert_eq!(parsed.load_avg_1, Some(1.5));
         assert_eq!(parsed.disk_free_gb, Some(50.5));
+        assert_eq!(parsed.tmp_disk_free_gb, Some(1.0));
+        assert_eq!(parsed.tmp_disk_total_gb, Some(2.0));
+
+        let legacy: WorkerCapabilities =
+            serde_json::from_str(r#"{"disk_free_gb":50.5,"disk_total_gb":100.0}"#).unwrap();
+        assert_eq!(legacy.tmp_disk_free_gb, None);
+        assert_eq!(legacy.tmp_disk_total_gb, None);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("tmp_disk_free_gb").is_none());
+        assert!(legacy_json.get("tmp_disk_total_gb").is_none());
     }
 
     #[test]
