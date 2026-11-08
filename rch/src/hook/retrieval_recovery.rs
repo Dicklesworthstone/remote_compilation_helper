@@ -4937,6 +4937,76 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_recovery_skips_automatic_artifacts_but_keeps_declared_results() {
+        let _guard = test_guard!();
+        for (kind, command) in [
+            (CompilationKind::CargoCheck, "cargo check --workspace"),
+            (
+                CompilationKind::CargoClippy,
+                "cargo clippy --all-targets -- -D warnings",
+            ),
+        ] {
+            for forwarded_target in [false, true] {
+                for declared_results in [false, true] {
+                    let (directory, writer, worker) = preparation_fixture();
+                    let remote_source = "/data/projects/source-recovery";
+                    let target = directory.path().join("separate-target");
+                    let result_dirs = if declared_results {
+                        vec![PathBuf::from("reports")]
+                    } else {
+                        Vec::new()
+                    };
+                    let pipeline = TransferPipeline::new(
+                        directory.path().to_owned(),
+                        "diagnostic-recovery".into(),
+                        "diagnostic-recovery".into(),
+                        TransferConfig::default(),
+                    )
+                    .with_remote_path_override(remote_source);
+                    let session = RecoverySession::prepare(
+                        &writer,
+                        &worker,
+                        &pipeline,
+                        vec![remote_source.into()],
+                        None,
+                        None,
+                        None,
+                        TransferConfig::default(),
+                        directory.path().to_owned(),
+                        forwarded_target.then_some(target.as_path()),
+                        Some(kind),
+                        command,
+                        &result_dirs,
+                        "abc123".into(),
+                    )
+                    .unwrap();
+                    let restored: RecoveryRecipe = serde_json::from_value(
+                        writer.snapshot().recovery.expect("persisted output policy"),
+                    )
+                    .unwrap();
+                    for recipe in [&session.recipe, &restored] {
+                        assert!(recipe.prepared);
+                        assert_eq!(recipe.kind, Some(kind));
+                        assert_eq!(recipe.source_roots, [remote_source]);
+                        assert!(!recipe.sources_released);
+                        assert!(!recipe.retired);
+                        assert!(recipe.cargo_output_capture.is_none());
+                        assert_eq!(recipe.phases.len(), usize::from(declared_results));
+                        if declared_results {
+                            let phase = &recipe.phases[0];
+                            assert_eq!(phase.name, "result:reports");
+                            assert_eq!(phase.result_dir.as_deref(), Some(Path::new("reports")));
+                            assert_eq!(phase.local, directory.path());
+                            assert_eq!(phase.remote, remote_source);
+                            assert!(!phase.complete);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn clean_overlay_subdirectory_recovery_keeps_source_authority_and_cwd_outputs_separate() {
         let _guard = test_guard!();
         let (directory, writer, worker) = admitted_preparation_fixture();

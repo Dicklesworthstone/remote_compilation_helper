@@ -62,10 +62,11 @@ pub(super) fn artifact_delivery_kind(
 
 /// Get artifact patterns based on compilation kind.
 ///
-/// Test and diagnostic commands use minimal patterns since their output is
-/// streamed and the full target/ directory is not needed. This significantly
-/// reduces artifact transfer time for commands that do not produce runnable
-/// build artifacts.
+/// Tests use a report allowlist; check/clippy only stream diagnostics and have
+/// no automatic artifact retrieval. Returning test reports after a diagnostic
+/// command both pays unnecessary remote round trips and can publish stale
+/// reports from a previous test run. Explicit result directories are a separate
+/// output contract and remain retrievable for every command kind.
 ///
 /// `command` (the exact command string being offloaded) selects cargo
 /// profile-aware output globs: a custom `--profile <name>` writes to
@@ -105,12 +106,13 @@ pub(super) fn get_artifact_patterns(
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
             default_bun_artifact_patterns()
         }
-        // Test, bench, and diagnostic commands do not need full target/.
+        // Test and benchmark commands may produce reports, but not full target/.
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoNextest)
-        | Some(CompilationKind::CargoBench)
-        | Some(CompilationKind::CargoCheck)
-        | Some(CompilationKind::CargoClippy) => default_rust_test_artifact_patterns(),
+        | Some(CompilationKind::CargoBench) => default_rust_test_artifact_patterns(),
+        // Neither command executes tests. Diagnostics already travel on the
+        // build channel, so even an empty report scan is unnecessary (#132).
+        Some(CompilationKind::CargoCheck) | Some(CompilationKind::CargoClippy) => Vec::new(),
         Some(CompilationKind::Rustc)
         | Some(CompilationKind::CargoBuild)
         | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
