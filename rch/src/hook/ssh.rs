@@ -1127,6 +1127,11 @@ fn source_registry_invocation(
             peer = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
             lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
         )
+    } else if matches!(operation, "acquire" | "try-acquire" | "topology") {
+        // Only the short grant transaction owns this shared lease. The source
+        // holder's release waiter and compilation must never keep emergency
+        // bytes unavailable to worker GC.
+        rch_common::recovery_reserve::admission_command(registry, &command)
     } else {
         command
     }
@@ -2189,8 +2194,16 @@ fn clean_overlay_source_pair_lock_command(
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
         claim = source_pair_custody_command("claim", lock_path, source_root, token),
     );
+    let creation = rch_common::recovery_reserve::admission_command(
+        REMOTE_SOURCE_CLAIM_REGISTRY,
+        &format!(
+            "flock -x -- {} sh -c {}",
+            quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
+            quote(&creation),
+        ),
+    );
     let script = format!(
-        "{setup}flock -x -- {metadata_lock} sh -c {creation}; \
+        "{setup}{creation}; \
          printf '%s\\n' {ready}; {waiter}; {retire}; printf '%s\\n' {release}",
         ready = quote(ready),
         waiter = source_release_waiter_command(
@@ -2202,8 +2215,6 @@ fn clean_overlay_source_pair_lock_command(
         ),
         release = quote(release),
         setup = source_registry_setup(REMOTE_SOURCE_CLAIM_REGISTRY),
-        metadata_lock = quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
-        creation = quote(&creation),
         retire = source_pair_custody_command("release", lock_path, source_root, token),
     );
     format!(

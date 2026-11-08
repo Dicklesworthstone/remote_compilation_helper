@@ -37,6 +37,8 @@ def raw_constant(name):
 
 CAPTURE = raw_constant("GC_SNAPSHOT_CAPTURE")
 FILESYSTEM = raw_constant("GC_FILESYSTEM_SNAPSHOT")
+RESERVE_SOURCE = SOURCE.with_name("recovery_reserve.rs").read_text()
+SCRATCH = re.search(r'pub const GC_SHELL_HELPERS: &str = r#"(.*?)"#;', RESERVE_SOURCE, re.S).group(1)
 
 
 def gate_fragment():
@@ -50,7 +52,7 @@ def gate_fragment():
         if not item.endswith(","):
             raise AssertionError("unknown gate fragment syntax: " + item)
         parts.append(json.loads(item[:-1]))
-    expanded = CAPTURE + "".join(parts)
+    expanded = SCRATCH + CAPTURE + "".join(parts)
     compiled = os.environ.get("RCH_TEST_GC_GATE_SCRIPT")
     if compiled is not None and compiled != expanded:
         raise AssertionError("standalone expansion differs from compiled GC gates")
@@ -100,7 +102,7 @@ def claim_program(registry, apply=True):
     body = RUST.split("pub fn abandoned_gc_claims_command_with_registry(", 1)[1]
     template = body.split('r#"', 1)[1].split('"#', 1)[0]
     return template.format(
-        capture=CAPTURE, registry=shlex.quote(str(registry)),
+        scratch=SCRATCH, capture=CAPTURE, registry=shlex.quote(str(registry)),
         min_age_minutes=0, apply=int(apply),
     )
 

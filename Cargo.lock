@@ -5420,6 +5420,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dirs 7.0.0",
+ "flate2",
  "libproc",
  "memchr",
  "object 0.40.0",

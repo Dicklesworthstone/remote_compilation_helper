@@ -41,7 +41,8 @@
 //! with admission. A completed build may retain its outputs for recovery long
 //! after its processes and mtimes go quiet; its active claim still forbids GC.
 
-const SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
+/// Current worker ownership namespace, shared by admission, health and GC.
+pub const SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 
 /// Retirement failure leaves ambiguous durable ownership. Stop the entire
 /// supervisor before another candidate or successful metrics can hide it.
@@ -557,13 +558,17 @@ __gc_source_end() {
             || ! sync -f "$__gc_source_registry/released" || ! sync -f "$__gc_source_registry"; then
             exec 8>&-; return 1;
         fi;
+        if ! rch_gc_reserve_claim settle "${__gc_reservation##*/}"; then
+            exec 8>&-; return 1;
+        fi;
         __gc_retention_minutes=${RCH_SOURCE_CLAIM_RETENTION_MINUTES:-1440};
         case "$__gc_retention_minutes" in ''|*[!0-9]*) __gc_retention_minutes=1440;; esac;
-        for __gc_tdir in "$__gc_source_registry/released" "$__gc_source_registry/cancelled"; do
-            [ ! -L "$__gc_tdir" ] && [ -d "$__gc_tdir" ] || continue;
-            find "$__gc_tdir" -maxdepth 1 -type f -name '*.claim' \
-                ! -name "${__gc_reservation##*/}" -mmin +"$__gc_retention_minutes" -delete 2>/dev/null || true;
-        done;
+        # GC owns only its fc- retirement receipts. Source releases remain
+        # recovery evidence, and cancellation receipts require their own
+        # permanent-fence checks; their age cannot transfer authority to GC.
+        __gc_tdir="$__gc_source_registry/released";
+        find "$__gc_tdir" -maxdepth 1 -type f -name 'fc-*.claim' \
+            ! -name "${__gc_reservation##*/}" -mmin +"$__gc_retention_minutes" -delete 2>/dev/null || true;
         __gc_reservation="";
     fi;
     exec 8>&-;
@@ -620,11 +625,18 @@ __gc_source_begin() {
         __gc_source_end; return 2;
     fi;
     __gc_reservation=$__gc_active;
+    # Publication precedes reserve binding; deletion can start only after the
+    # spent generation durably names this exact claim. A failed bind grants no
+    # removal and leaves the already published ownership record conservative.
+    if ! rch_gc_reserve_claim bind "${__gc_reservation##*/}"; then
+        exec 8>&-; return 2;
+    fi;
 };
 "#;
     format!(
-        "__gc_source_registry={}; {SOURCE_CLAIM_RECORD_HELPERS}\n{RETAINED_SOURCE_GC_GUARD}\n{GATE}",
-        shell_escape::escape(registry.into())
+        "__gc_source_registry={}; {}\n{SOURCE_CLAIM_RECORD_HELPERS}\n{RETAINED_SOURCE_GC_GUARD}\n{GATE}",
+        shell_escape::escape(registry.into()),
+        crate::recovery_reserve::GC_SHELL_HELPERS,
     )
 }
 
@@ -678,8 +690,8 @@ const TMPBASE_MAXDEPTH: u32 = 6;
 /// tolerates via its leading `[ -d "$d" ] || continue`.
 fn dedup_candidate_file(var: &str) -> String {
     format!(
-        "if __ded=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
-           if sort -u \"${var}\" -o \"$__ded\" 2>/dev/null; then mv -f \"$__ded\" \"${var}\"; \
+        "if __ded=$(rch_gc_mktemp); then \
+           if TMPDIR=\"${{RCH_GC_SCRATCH:-$__tmpbase}}\" sort -u \"${var}\" -o \"$__ded\" 2>/dev/null; then mv -f \"$__ded\" \"${var}\"; \
            else rm -f \"$__ded\"; fi; \
          fi; "
     )
@@ -804,7 +816,7 @@ sys.exit(0 if success and not cancelled else 1)
 fn gate_snapshot_fragment() -> String {
     let snapshots = concat!(
         "__held=\"\"; __held_ok=0; __hsrc=none; __proc=\"\"; __proc_ok=0; ",
-        "if __held=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
+        "if __held=$(rch_gc_mktemp); then ",
         "  if [ -d /proc/self/fd ] && ",
         "    __gc_capture \"$__held\" find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -printf '%l\\n' && ",
         "    [ -s \"$__held\" ]; then __hsrc=proc; __held_ok=1; ",
@@ -828,7 +840,7 @@ fn gate_snapshot_fragment() -> String {
         "  case \"$__pp\" in ''|0|1) break;; *[!0-9]*) break;; esac; ",
         "  __self_pids=\"$__self_pids$__pp \"; __i=$((__i + 1)); ",
         "done; ",
-        "if __proc=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
+        "if __proc=$(rch_gc_mktemp); then ",
         // A successful nonwide ps can silently truncate argv at COLUMNS and
         // omit the target path. Unsupported unlimited width is unknown.
         "  if __gc_capture \"$__proc\" ps -ww -eo pid=,args= && [ -s \"$__proc\" ]; then __proc_ok=1; fi; ",
@@ -854,7 +866,10 @@ fn gate_snapshot_fragment() -> String {
         "}; ",
         "printf 'RCH_GC_GATES handles=%s handles_source=%s procs=%s\\n' \"$__held_ok\" \"$__hsrc\" \"$__proc_ok\"; ",
     );
-    format!("{GC_SNAPSHOT_CAPTURE}{snapshots}")
+    format!(
+        "{}{GC_SNAPSHOT_CAPTURE}{snapshots}",
+        crate::recovery_reserve::GC_SHELL_HELPERS,
+    )
 }
 
 /// Shell fragment removing the gate-snapshot temp files. Safe when a snapshot
@@ -937,13 +952,13 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str, names: 
          case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
          printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
          {gates}\
-         __all=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
+         __all=$(rch_gc_mktemp) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune 2>/dev/null > \"$__all\"; \
          if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__all\"; \
            find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; fi; \
          {dedup}\
          {SELECT_CANDIDATES}\
-         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
+         __tmpf=$(rch_gc_mktemp) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
          __gc_select \"$__tmpf\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \"rch_target_*\"; ",
         gates = gate_snapshot_fragment(),
         cleanup = gate_snapshot_cleanup(),
@@ -1094,7 +1109,7 @@ fn worker_sweep_script(
                 true,
             );
             format!(
-                "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+                "if __tmpf2=$(rch_gc_mktemp); then \
                    __gc_select \"$__tmpf2\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\"; \
                    while IFS= read -r d; do {pooled_gate}{pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
@@ -1121,8 +1136,8 @@ fn worker_sweep_script(
     let cap_pass = match max_cache_kb {
         Some(cap_kb) => format!(
             "if [ {cap_kb} -gt 0 ] \
-               && __lst=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
-               && __tmpf3=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+               && __lst=$(rch_gc_mktemp) \
+               && __tmpf3=$(rch_gc_mktemp); then \
                __gc_select \"$__tmpf3\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \"rch_target_*\"; \
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
@@ -1134,7 +1149,7 @@ fn worker_sweep_script(
                done < \"$__tmpf3\"; \
                if [ \"$total_kb\" -gt {cap_kb} ]; then \
                  printf 'RCH_REAP_CAP initial_kb=%s cap_kb={cap_kb}\\n' \"$total_kb\"; \
-                 sort -n \"$__lst\" > \"$__tmpf3\"; \
+                 TMPDIR=\"${{RCH_GC_SCRATCH:-$__tmpbase}}\" sort -n \"$__lst\" > \"$__tmpf3\"; \
                  while IFS=' ' read -r __n __k d; do \
                    [ \"$total_kb\" -le {cap_kb} ] && break; \
                    [ -d \"$d\" ] || continue; \
@@ -1240,8 +1255,8 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
            [ \"$__pa\" -lt \"$__want_kb\" ]; \
          }}; \
          if [ \"$__want_kb\" -gt 0 ] && [ -n \"$__rt_mnt\" ] && __under_pressure \
-           && __lst4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
-           && __tmpf4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+           && __lst4=$(rch_gc_mktemp) \
+           && __tmpf4=$(rch_gc_mktemp); then \
            printf 'RCH_REAP_PRESSURE start avail_kb=%s want_kb=%s\\n' \"$__pa\" \"$__want_kb\"; \
            __gc_select \"$__tmpf4\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\" \"rch_target_*\"; \
            : > \"$__lst4\"; \
@@ -1250,7 +1265,7 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
              __n=$(date -r \"$d\" +%s 2>/dev/null); [ -n \"$__n\" ] || __n=0; \
              printf '%s %s\\n' \"$__n\" \"$d\" >> \"$__lst4\"; \
            done < \"$__tmpf4\"; \
-           sort -n \"$__lst4\" > \"$__tmpf4\"; \
+           TMPDIR=\"${{RCH_GC_SCRATCH:-$__tmpbase}}\" sort -n \"$__lst4\" > \"$__tmpf4\"; \
            while IFS=' ' read -r __n d; do \
              __under_pressure || break; \
              [ -d \"$d\" ] || continue; \
@@ -2168,6 +2183,18 @@ pub fn parse_gc_skips(stdout: &str) -> Vec<GcSkip> {
 /// judged abandoned (bd-gyehj).
 pub const ABANDONED_GC_CLAIM_MIN_MINUTES: u64 = 6 * 60;
 
+/// Add the worker-owned byte reserve to a known, finite GC transaction. This
+/// wrapper must precede every scratch allocation. It does not change candidate
+/// policy or waive ownership, liveness, retention, or retirement checks.
+#[must_use]
+pub fn with_gc_recovery_reserve(registry: &str, command: &str) -> String {
+    crate::recovery_reserve::gc_command(
+        registry,
+        command,
+        &abandoned_gc_claims_command_with_registry(true, registry, ABANDONED_GC_CLAIM_MIN_MINUTES),
+    )
+}
+
 /// Report, and with `apply` release, abandoned GC reservations on a worker.
 ///
 /// A GC supervisor that dies between `__gc_source_begin` and
@@ -2204,14 +2231,14 @@ pub fn abandoned_gc_claims_command_with_registry(
     let registry = shell_escape::escape(registry.into());
     let apply = u8::from(apply);
     format!(
-        r#"{capture}r={registry}; min={min_age_minutes}; apply={apply};
+        r#"{scratch}{capture}r={registry}; min={min_age_minutes}; apply={apply};
 if [ ! -d "$r" ] || [ -L "$r" ]; then printf 'RCH_GC_CLAIMS none\n'; exit 0; fi;
 if [ -L "$r/metadata.lock" ]; then printf 'RCH_GC_CLAIMS unsafe-lock\n'; exit 0; fi;
 if ! command -v flock >/dev/null 2>&1; then printf 'RCH_GC_CLAIMS no-flock\n'; exit 0; fi;
 exec 8>"$r/metadata.lock" || exit 1;
 if ! flock -x -w 30 8; then printf 'RCH_GC_CLAIMS busy\n'; exit 0; fi;
 if [ ! -d /proc/self/fd ]; then printf 'RCH_GC_CLAIMS no-proc\n'; exit 0; fi;
-refs=$(mktemp) && args=$(mktemp) || exit 1;
+refs=$(rch_gc_mktemp) && args=$(rch_gc_mktemp) || exit 1;
 trap 'rm -f -- "$refs" "$args"' EXIT;
 # A nonempty prefix is not a complete inventory. Avoid pipelines that mask
 # producer errors and refuse retirement if either capture could be partial.
@@ -2224,6 +2251,9 @@ now=$(date +%s);
 for c in "$r"/fc-*.claim; do
   [ -e "$c" ] || [ -L "$c" ] || continue;
   n=${{c##*/}}; p=-; age=0; v=keep;
+  # Automatic reserve recovery can retire only the exact generation-bound
+  # claim; ordinary operator scans retain their existing all-claim behavior.
+  if [ -n "${{RCH_RECOVERY_GC_CLAIM-}}" ] && [ "$n" != "$RCH_RECOVERY_GC_CLAIM" ]; then continue; fi;
   if [ -L "$c" ] || [ ! -f "$c" ]; then why=unsafe-record;
   else
     m=$(stat -c %Y -- "$c" 2>/dev/null) || m=$now; age=$(( (now - m) / 60 ));
@@ -2246,6 +2276,7 @@ done;
 sync -f "$r" 2>/dev/null || :;
 "#,
         capture = GC_SNAPSHOT_CAPTURE,
+        scratch = crate::recovery_reserve::GC_SHELL_HELPERS,
     )
 }
 

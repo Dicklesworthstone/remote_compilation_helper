@@ -5086,7 +5086,15 @@ async fn handle_gc(
                     }),
                 }
             } else {
-                reap::enumerate_targets_command(base)
+                let command = reap::enumerate_targets_command(base);
+                if apply {
+                    // Enumeration is the first phase of this requested
+                    // mutation. Full TMPDIR must not prevent discovery before
+                    // the later collection transaction can release space.
+                    reap::with_gc_recovery_reserve(reap::SOURCE_CLAIM_REGISTRY, &command)
+                } else {
+                    command
+                }
             };
             match run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
                 Ok(result) if result.success() => {
@@ -5259,7 +5267,9 @@ async fn handle_gc(
         if apply && !embeddable.is_empty() {
             for (batch_index, batch) in embeddable.chunks(GC_COLLECT_BATCH).enumerate() {
                 let command = match reap::collect_paths_command(batch) {
-                    Ok(command) => command,
+                    Ok(command) => {
+                        reap::with_gc_recovery_reserve(reap::SOURCE_CLAIM_REGISTRY, &command)
+                    }
                     Err(e) => {
                         apply_error = Some(e);
                         break;
@@ -5322,6 +5332,12 @@ async fn handle_gc(
 
         // Stranded GC reservations fence their tree for every build (bd-gyehj).
         // Their scan never fails the worker's dir report; its error is shown.
+        let claims_command = reap::abandoned_gc_claims_command(apply);
+        let claims_command = if apply {
+            reap::with_gc_recovery_reserve(reap::SOURCE_CLAIM_REGISTRY, &claims_command)
+        } else {
+            claims_command
+        };
         let gc_claims = if windows {
             serde_json::json!({
                 "status": "unsupported-platform", "claims": [],
@@ -5329,7 +5345,7 @@ async fn handle_gc(
             })
         } else { match run_gc_surface_command(
             worker,
-            &reap::abandoned_gc_claims_command(apply),
+            &claims_command,
             deadline,
             &mut output_budget,
         )

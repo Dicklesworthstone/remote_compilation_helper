@@ -71,6 +71,7 @@ mod proptest_tests;
 pub mod protocol;
 pub mod queue_contract;
 pub mod readiness;
+pub mod recovery_reserve;
 pub mod redaction;
 pub mod remediation_config;
 pub mod remediation_view;
