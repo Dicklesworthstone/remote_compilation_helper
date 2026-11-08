@@ -144,6 +144,15 @@ Once the atomic replacement commits under valid evidence, its outcome remains
 explicit even if the directory flush takes longer; unconfirmed durability
 retains the live quarantine for a later recovery attempt.
 
+Newly durable, owner-validated job completion requests a fresh probe of the
+saved worker endpoint when recovery is waiting on backoff. The hint bounds
+queued local waits to one second; an admitted durable schedule write finishes
+synchronously. It preserves administrative disable/drain intent, quarantine,
+failure counters, active probes, and the spacing between successful recovery
+probes. Duplicate completion acknowledgments do not renew the hint. Returning
+slots supplies no health evidence: normal probes and any required canary must
+still pass before the worker can accept builds again.
+
 The affected operations are worker toolchain/capability/telemetry probes,
 embedded disk-monitor admission and heartbeat observations, source-namespace
 control, cancellation observation and settlement, and completion-receipt

@@ -312,6 +312,71 @@ const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// probes use their own budget, so a stalled recovery cannot starve liveness.
 const MAX_CONCURRENT_RECOVERY_PROBES: usize = 16;
 
+/// Bound queued local waits for an advisory hint after job completion. Native
+/// durable publication finishes synchronously once started. This allowance
+/// authorizes no remote work; probes retain their existing bounded trials.
+const SETTLEMENT_REPROBE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Request fresh evidence after a newly durable, owner-validated completion.
+/// Duplicate terminal receipts must return before calling this function, so
+/// retrying an acknowledgment cannot defeat failed-probe backoff.
+pub(crate) async fn request_recovery_after_settlement(
+    pool: &WorkerPool,
+    store: Option<&Mutex<BypassRecordStore>>,
+    endpoint: &WorkerEndpointSnapshot,
+) {
+    let deadline = Instant::now() + SETTLEMENT_REPROBE_BUDGET;
+    let _ = before_recovery_commit(deadline, async {
+        let Some(worker) = pool.get(&endpoint.config.id).await else {
+            return;
+        };
+        let mut store = match store {
+            Some(store) => Some(store.lock().await),
+            None => None,
+        };
+        let requested = worker
+            .request_probe_after_settlement(endpoint, deadline, || {
+                let Some(store) = store.as_mut() else {
+                    return false;
+                };
+                let Some(mut record) = store.get(endpoint.config.id.as_str()).cloned() else {
+                    return false;
+                };
+                // A scheduled probe may have become due while this hint
+                // queued. Sample only here so that active trial's unchanged
+                // record is not mistaken for a future retry and replaced.
+                let now_ms = now_unix_ms();
+                if record.host != endpoint.config.host
+                    || record.user != endpoint.config.user
+                    || record.details.get(RECOVERY_ENDPOINT)
+                        != Some(&recovery_endpoint(&endpoint.config))
+                    || record.state != BypassState::TemporaryBypass
+                    || record.consecutive_passes != 0
+                    || record.probe_due(now_ms)
+                {
+                    // Do not disturb an in-progress trial/canary or shorten
+                    // the normal interval between successful recovery probes.
+                    return false;
+                }
+                record.next_probe_unix_ms = now_ms;
+                if let Err(error) = store.upsert(record) {
+                    // Upsert retains the changed live record on error. The
+                    // hint may be lost on restart, but no quarantine or
+                    // ownership evidence is removed from either document.
+                    warn!(worker = %endpoint.config.id, %error, "recovery probe schedule after settlement is not durable; retaining live quarantine");
+                }
+                true
+            })
+            .await;
+        if requested {
+            // Both health and bypass recovery listen to this scheduler watch.
+            // A wake changes no endpoint/network epoch and cancels no trial.
+            pool.notify_endpoint_change();
+        }
+    })
+    .await;
+}
+
 /// Tunable knobs for the recovery loop and the real SSH prober.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BypassRecoveryConfig {
@@ -2040,6 +2105,7 @@ mod tests {
         canary_gate: Option<Arc<tokio::sync::Notify>>,
         probe_calls: std::sync::atomic::AtomicUsize,
         canary_calls: std::sync::atomic::AtomicUsize,
+        probe_started: tokio::sync::Notify,
     }
 
     impl GatedRecoveryProber {
@@ -2054,6 +2120,7 @@ mod tests {
                 canary_gate,
                 probe_calls: std::sync::atomic::AtomicUsize::new(0),
                 canary_calls: std::sync::atomic::AtomicUsize::new(0),
+                probe_started: tokio::sync::Notify::new(),
             }
         }
     }
@@ -2071,6 +2138,7 @@ mod tests {
             );
             self.probe_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.probe_started.notify_one();
             if let Some(gate) = &self.probe_gate {
                 gate.notified().await;
             }
@@ -2160,6 +2228,435 @@ mod tests {
     }
 
     const T0: u64 = 1_700_000_000_000;
+
+    fn settled_release_request(
+        build: &crate::history::ActiveBuildState,
+    ) -> rch_common::ReleaseRequest {
+        serde_json::from_value(serde_json::json!({
+            "worker_id": build.worker_id,
+            "slots": build.slots,
+            "build_id": build.id,
+            "local_wrapper_id": build.local_wrapper_id,
+            "exit_code": 137,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_fleet_reprobes_without_releasing_an_active_peer_across_restart() {
+        use std::sync::atomic::Ordering;
+
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let bypass_path = directory.path().join("bypasses.json");
+        let ids = ["fleet-1", "fleet-2", "fleet-3", "fleet-4"];
+        let pool = pool_with(&ids).await;
+        let history = Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&bypass_path)));
+        let mut abandoned = Vec::new();
+        for (index, (id, slots)) in [
+            ("fleet-1", 2),
+            ("fleet-1", 1),
+            ("fleet-1", 1),
+            ("fleet-2", 2),
+            ("fleet-2", 2),
+            ("fleet-3", 2),
+            ("fleet-3", 2),
+            ("fleet-4", 1),
+            ("fleet-4", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+            assert!(worker.reserve_slots(slots).await);
+            let build = history
+                .try_start_active_build_with_waiter(
+                    format!("abandoned-{index}"),
+                    id.into(),
+                    "cargo build".into(),
+                    0,
+                    Some(format!("rchw-abandoned-{index}")),
+                    slots,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(!build.remote_command_started());
+            abandoned.push(build);
+        }
+        let peer_worker = pool.get(&WorkerId::new("fleet-4")).await.unwrap();
+        assert!(peer_worker.reserve_slots(2).await);
+        let peer = history
+            .try_start_active_build_with_waiter(
+                "live-peer".into(),
+                "fleet-4".into(),
+                "cargo test".into(),
+                std::process::id(),
+                Some("rchw-live-peer".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(peer_worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: peer.id,
+                worker_id: WorkerId::new("fleet-4"),
+                hook_pid: None,
+                local_wrapper_id: peer.local_wrapper_id.clone(),
+                remote_pgid_file: Some("/owned/live-peer.pgid".into()),
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .unwrap();
+        for id in ids {
+            let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+            assert_eq!(worker.used_slots(), 4);
+            record_worker_bypass(
+                &store,
+                &worker,
+                BypassFailureClass::ProcessObservation,
+                "unconfirmed cancellation",
+                T0,
+            )
+            .await;
+            let mut record = store.lock().await.get(id).cloned().unwrap();
+            for _ in 0..3 {
+                record.record_failure(T0 + 1, "automatic recovery still unconfirmed");
+            }
+            record.next_probe_unix_ms = u64::MAX;
+            store.lock().await.upsert(record).unwrap();
+        }
+
+        // Restart from real durable history and bypass records. No process-local
+        // endpoint incarnation survives, but every owned slot must survive.
+        let pool = pool_with(&ids).await;
+        let history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+        for active in history.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(Mutex::new(BypassRecordStore::load(&bypass_path)));
+        let mut context = crate::test_daemon_context(pool.clone());
+        Arc::make_mut(&mut context.worker_selector).set_build_history(history.clone());
+        context.history = history.clone();
+        context.bypass_store = Some(store.clone());
+        let failing = BypassRecoveryService::new(
+            pool.clone(),
+            store.clone(),
+            FakeProber::new(
+                Vec::new(),
+                probe_failing("process_observation"),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig::default(),
+        )
+        .with_history(history.clone());
+        failing.reconcile_on_start().await;
+        let mut wake = pool.subscribe_endpoint_changes();
+        let unchanged = store.lock().await.get("fleet-1").cloned().unwrap();
+        let mut wrong_owner = settled_release_request(&abandoned[0]);
+        wrong_owner.local_wrapper_id = Some("rchw-other-build".into());
+        assert!(
+            crate::api::handle_release_worker(&context, wrong_owner)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.lock().await.get("fleet-1"), Some(&unchanged));
+        assert!(!wake.has_changed().unwrap());
+
+        // The production terminal boundary consumes exact, confirmed releases.
+        // Concurrent retries share that boundary and can release each owner once.
+        for build in &abandoned {
+            let request = settled_release_request(build);
+            let (first, retry) = tokio::join!(
+                crate::api::handle_release_worker(&context, request.clone()),
+                crate::api::handle_release_worker(&context, request),
+            );
+            first.unwrap();
+            retry.unwrap();
+        }
+        assert!(wake.has_changed().unwrap());
+        wake.borrow_and_update();
+        assert_eq!(history.active_builds().len(), 1);
+        assert!(
+            history
+                .active_build(peer.id)
+                .unwrap()
+                .remote_command_started()
+        );
+        for id in ids {
+            let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+            assert_eq!(worker.used_slots(), if id == "fleet-4" { 2 } else { 0 });
+            assert_eq!(
+                worker.eligibility().await,
+                EligibilityState::TemporaryBypass
+            );
+            assert!(
+                !worker.reserve_slots(1).await,
+                "free slots are not recovery evidence"
+            );
+            let current = store.lock().await.get(id).cloned().unwrap();
+            assert!(current.probe_due(now_unix_ms()));
+            assert_eq!(current.consecutive_failures, unchanged.consecutive_failures);
+            assert_eq!(current.backoff, unchanged.backoff);
+            assert_eq!(current.auto_rejoin, unchanged.auto_rejoin);
+        }
+
+        // A failed new probe reinstates normal backoff. Replaying all nine
+        // acknowledgments cannot renew the settlement hint or reset failure age.
+        let settled_at = store
+            .lock()
+            .await
+            .all()
+            .iter()
+            .map(|record| record.next_probe_unix_ms)
+            .max()
+            .unwrap();
+        failing.evaluate_once(settled_at).await;
+        let failed: Vec<_> = store.lock().await.all().into_iter().cloned().collect();
+        for build in &abandoned {
+            crate::api::handle_release_worker(&context, settled_release_request(build))
+                .await
+                .unwrap();
+        }
+        assert!(!wake.has_changed().unwrap());
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .all()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            failed
+        );
+
+        // A second restart retains the failed-probe schedule and only the live
+        // peer's slots. Recovery still needs both complete probes and a canary.
+        let pool = pool_with(&ids).await;
+        let restored = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+        for active in restored.active_builds() {
+            pool.restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(Mutex::new(BypassRecordStore::load(&bypass_path)));
+        let healthy = BypassRecoveryService::new(
+            pool.clone(),
+            store.clone(),
+            GatedRecoveryProber::new(
+                RecoveryObservation::fixture(RecoveryProbe::all_ok()),
+                None,
+                None,
+            ),
+            BypassRecoveryConfig::default(),
+        )
+        .with_history(restored.clone());
+        healthy.reconcile_on_start().await;
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .all()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            failed
+        );
+        healthy.evaluate_once(settled_at).await;
+        assert_eq!(healthy.prober.probe_calls.load(Ordering::SeqCst), 0);
+        let due = failed
+            .iter()
+            .map(|record| record.next_probe_unix_ms)
+            .max()
+            .unwrap();
+        healthy.evaluate_once(due).await;
+        assert_eq!(healthy.prober.probe_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(healthy.prober.canary_calls.load(Ordering::SeqCst), 0);
+        let next = store
+            .lock()
+            .await
+            .all()
+            .iter()
+            .map(|record| record.next_probe_unix_ms)
+            .max()
+            .unwrap();
+        healthy.evaluate_once(due).await;
+        assert_eq!(healthy.prober.probe_calls.load(Ordering::SeqCst), 4);
+        healthy.evaluate_once(next).await;
+        assert_eq!(healthy.prober.probe_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(healthy.prober.canary_calls.load(Ordering::SeqCst), 4);
+        assert!(store.lock().await.all().is_empty());
+        assert!(BypassRecordStore::load(&bypass_path).all().is_empty());
+        assert!(restored.active_build(peer.id).is_some());
+        for id in ids {
+            let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+            let remaining = if id == "fleet-4" { 2 } else { 4 };
+            assert!(worker.lifecycle().await.is_schedulable());
+            assert_eq!(worker.available_slots().await, remaining);
+            assert!(worker.reserve_slots(remaining).await);
+            assert!(!worker.reserve_slots(1).await);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settlement_wake_preserves_an_inflight_probe_and_success_spacing() {
+        use std::sync::atomic::Ordering;
+
+        let pool = pool_with(&["settled-pending"]).await;
+        let worker = pool.get(&WorkerId::new("settled-pending")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = store();
+        record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+        let original = store.lock().await.get("settled-pending").cloned().unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let service = BypassRecoveryService::new(
+            pool.clone(),
+            store.clone(),
+            GatedRecoveryProber::new(
+                RecoveryObservation::fixture(RecoveryProbe::all_ok()),
+                Some(gate.clone()),
+                None,
+            ),
+            BypassRecoveryConfig::default(),
+        );
+        let scan = tokio::spawn({
+            let service = service.clone();
+            async move { service.evaluate_once(now_unix_ms()).await }
+        });
+        service.prober.probe_started.notified().await;
+        request_recovery_after_settlement(&pool, Some(store.as_ref()), &endpoint).await;
+        service.evaluate_once(now_unix_ms()).await;
+        assert_eq!(service.prober.probe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.lock().await.get("settled-pending"), Some(&original));
+        gate.notify_one();
+        scan.await.unwrap();
+        let passed = store.lock().await.get("settled-pending").cloned().unwrap();
+        assert_eq!(passed.consecutive_passes, 1);
+        request_recovery_after_settlement(&pool, Some(store.as_ref()), &endpoint).await;
+        assert_eq!(store.lock().await.get("settled-pending"), Some(&passed));
+        gate.notify_one();
+        service.evaluate_once(passed.next_probe_unix_ms).await;
+        assert_eq!(service.prober.probe_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(service.prober.canary_calls.load(Ordering::SeqCst), 1);
+        assert!(worker.lifecycle().await.is_schedulable());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settlement_hint_queued_on_store_expires_without_changing_schedules() {
+        let pool = pool_with(&["settled-blocked"]).await;
+        let worker = pool.get(&WorkerId::new("settled-blocked")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = store();
+        record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+        let original = store.lock().await.get("settled-blocked").cloned().unwrap();
+        let held = store.lock().await;
+        let old_due = worker.next_health_probe_in().await;
+        let mut request = Box::pin(request_recovery_after_settlement(
+            &pool,
+            Some(store.as_ref()),
+            &endpoint,
+        ));
+        pending_recovery(request.as_mut()).await;
+        tokio::time::advance(SETTLEMENT_REPROBE_BUDGET).await;
+        request.await;
+        assert_eq!(held.get("settled-blocked"), Some(&original));
+        assert_eq!(worker.next_health_probe_in().await, old_due);
+    }
+
+    #[tokio::test]
+    async fn settlement_hint_persistence_failure_keeps_quarantine_and_durable_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let bypass_path = directory.path().join("bypasses.json");
+        let saved_path = directory.path().join("saved-bypasses.json");
+        let pool = pool_with(&["settled-write-failure"]).await;
+        let worker = pool
+            .get(&WorkerId::new("settled-write-failure"))
+            .await
+            .unwrap();
+        let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+        let mut builds = Vec::new();
+        for (project, slots) in [("settled", 2), ("active-peer", 1)] {
+            assert!(worker.reserve_slots(slots).await);
+            builds.push(
+                history
+                    .try_start_active_build_with_waiter(
+                        project.into(),
+                        "settled-write-failure".into(),
+                        "cargo build".into(),
+                        0,
+                        Some(format!("rchw-{project}")),
+                        slots,
+                        rch_common::BuildLocation::Remote,
+                        None,
+                        crate::disk_pressure::DiskHeadroomAdmission::default(),
+                        Some(worker.endpoint_snapshot().await),
+                    )
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&bypass_path)));
+        record_worker_bypass(
+            &store,
+            &worker,
+            BypassFailureClass::ProcessObservation,
+            "retained failure",
+            T0,
+        )
+        .await;
+        let mut original = store
+            .lock()
+            .await
+            .get("settled-write-failure")
+            .cloned()
+            .unwrap();
+        original.next_probe_unix_ms = u64::MAX;
+        store.lock().await.upsert(original.clone()).unwrap();
+        std::fs::rename(&bypass_path, &saved_path).unwrap();
+        std::fs::create_dir(&bypass_path).unwrap();
+        let mut context = crate::test_daemon_context(pool);
+        Arc::make_mut(&mut context.worker_selector).set_build_history(history.clone());
+        context.history = history;
+        context.bypass_store = Some(store.clone());
+        crate::api::handle_release_worker(&context, settled_release_request(&builds[0]))
+            .await
+            .unwrap();
+        let current = store
+            .lock()
+            .await
+            .get("settled-write-failure")
+            .cloned()
+            .unwrap();
+        assert!(current.next_probe_unix_ms < original.next_probe_unix_ms);
+        assert_eq!(current.consecutive_failures, original.consecutive_failures);
+        assert_eq!(current.auto_rejoin, original.auto_rejoin);
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+        assert_eq!(worker.used_slots(), 1);
+        assert!(!worker.reserve_slots(1).await);
+        let history = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        assert!(history.has_terminal_build(builds[0].id));
+        assert!(history.active_build(builds[1].id).is_some());
+        assert_eq!(
+            BypassRecordStore::load(&saved_path).get("settled-write-failure"),
+            Some(&original)
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn recovery_deadlines_preserve_defaults_and_cap_complete_trials() {

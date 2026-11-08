@@ -1244,6 +1244,14 @@ impl CancellationOrchestrator {
                             )
                             .await;
                     }
+                    if let Some(endpoint) = state.worker_endpoint.as_ref() {
+                        crate::bypass_recovery_service::request_recovery_after_settlement(
+                            &ctx.pool,
+                            ctx.bypass_store.as_deref(),
+                            endpoint,
+                        )
+                        .await;
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -3044,6 +3052,116 @@ wait
             vec!["requested", "escalated", "remote_kill_sent", "completed"]
         );
         assert_eq!(cancellation_escalation_stage(&record), "remote_kill");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_new_confirmed_cancellation_requests_worker_reprobe() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("settled-cancellation"),
+            total_slots: 4,
+            ..Default::default()
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let history = Arc::new(
+            BuildHistory::new(100).with_persistence(directory.path().join("history.jsonl")),
+        );
+        let owner = history
+            .try_start_active_build_with_waiter(
+                "abandoned-preparation".into(),
+                config.id.to_string(),
+                "cargo build".into(),
+                0,
+                Some("rchw-settled-cancellation".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        let peer = history.start_active_build(
+            "active-peer".into(),
+            config.id.to_string(),
+            "cargo check".into(),
+            std::process::id(),
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        assert!(worker.reserve_slots(3).await);
+        let store = Arc::new(tokio::sync::Mutex::new(
+            rch_common::BypassRecordStore::with_path(directory.path().join("bypass.json")),
+        ));
+        crate::bypass_recovery_service::record_process_observation_failure(
+            &store,
+            &worker,
+            &endpoint,
+            "original-observation-failure",
+            1,
+        )
+        .await
+        .unwrap();
+        let mut original = store.lock().await.get(config.id.as_str()).cloned().unwrap();
+        original.next_probe_unix_ms = u64::MAX;
+        store.lock().await.upsert(original.clone()).unwrap();
+        let mut context = make_test_context(pool.clone(), history.clone());
+        context.bypass_store = Some(store.clone());
+        let mut wake = pool.subscribe_endpoint_changes();
+        let orchestrator = CancellationOrchestrator::new(test_config(), test_events());
+        let mut record = test_record(CancellationState::Failed, 0, false);
+        record.build_id = owner.id;
+        record.worker_id.clone_from(&owner.worker_id);
+        record.worker_endpoint = Some(endpoint);
+        record.slots = owner.slots;
+        record.slots_released = 0;
+        for _ in 0..2 {
+            orchestrator.run_cleanup(&context, &mut record).await;
+            assert_eq!(store.lock().await.get(config.id.as_str()), Some(&original));
+            assert!(history.active_build(owner.id).is_some());
+            assert_eq!(worker.used_slots(), 3);
+            assert!(!wake.has_changed().unwrap());
+        }
+
+        // Model the confirmed terminal result at the orchestrator's real
+        // cleanup boundary, without starting a worker process or sending SSH.
+        record.state = CancellationState::Completed;
+        record.cleanup_ok = true;
+        record.abandoned_unlaunched = true;
+        orchestrator.run_cleanup(&context, &mut record).await;
+        assert_eq!(record.state, CancellationState::Completed);
+        assert_eq!(record.slots_released, 2);
+        assert_eq!(worker.used_slots(), 1);
+        assert!(history.active_build(owner.id).is_none());
+        assert!(history.active_build(peer.id).is_some());
+        let mut scheduled = store.lock().await.get(config.id.as_str()).cloned().unwrap();
+        assert!(scheduled.next_probe_unix_ms < original.next_probe_unix_ms);
+        assert_eq!(
+            scheduled.consecutive_failures,
+            original.consecutive_failures
+        );
+        assert_eq!(scheduled.backoff, original.backoff);
+        assert_eq!(
+            worker.eligibility().await,
+            crate::workers::EligibilityState::TemporaryBypass
+        );
+        assert!(wake.has_changed().unwrap());
+        wake.borrow_and_update();
+
+        // A subsequent failed probe owns its new schedule. Repeated terminal
+        // cleanup has no new durable transition and cannot advance it again.
+        scheduled.record_failure(scheduled.next_probe_unix_ms, "new probe failed");
+        store.lock().await.upsert(scheduled.clone()).unwrap();
+        for _ in 0..2 {
+            orchestrator.run_cleanup(&context, &mut record).await;
+            assert_eq!(store.lock().await.get(config.id.as_str()), Some(&scheduled));
+            assert_eq!(worker.used_slots(), 1);
+            assert!(history.active_build(peer.id).is_some());
+            assert!(!wake.has_changed().unwrap());
+        }
     }
 
     #[tokio::test]

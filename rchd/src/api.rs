@@ -4144,7 +4144,10 @@ fn lease_waits_for_restart_admission(lease: &DurableJobLease) -> bool {
 
 /// Handle a release-worker request that has no connection peer.
 #[cfg(test)]
-async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
+pub(crate) async fn handle_release_worker(
+    ctx: &DaemonContext,
+    request: ReleaseRequest,
+) -> Result<()> {
     handle_release_worker_from(ctx, request, None).await
 }
 
@@ -4372,6 +4375,22 @@ async fn handle_release_worker_from(
                 .await;
         }
     }
+
+    // This path is reached only for a newly durable terminal transition.
+    // Returning slots does not prove worker health: request a fresh trial on
+    // the build's exact endpoint while retaining every recovery/admin fence.
+    // Duplicate acknowledgments returned above cannot reset failure backoff.
+    if quarantine_result.is_ok()
+        && let Some(endpoint) = worker_endpoint.as_ref()
+    {
+        crate::bypass_recovery_service::request_recovery_after_settlement(
+            &ctx.pool,
+            ctx.bypass_store.as_deref(),
+            endpoint,
+        )
+        .await;
+    }
+
     // The hook fails a finished build closed when this ack is late, so name
     // the slow stage instead of leaving only the client-side timeout.
     let total = started.elapsed();

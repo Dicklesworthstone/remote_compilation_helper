@@ -1258,6 +1258,60 @@ impl WorkerState {
         )
     }
 
+    /// Newly settled ownership may make a failed worker worth probing again.
+    /// This schedules work only: it does not supply health evidence, clear a
+    /// circuit/quarantine, reopen connections, or release any reservations.
+    /// The caller holds the bypass store before entering this endpoint/admin
+    /// fence, and its callback may only advance the matching probe schedule.
+    pub(crate) async fn request_probe_after_settlement(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+        deadline: tokio::time::Instant,
+        request_bypass_probe: impl FnOnce() -> bool,
+    ) -> bool {
+        let config = self.config.read().await;
+        // A restored durable owner has no process-local incarnation. Its
+        // exact saved coordinates can request a new probe, never publish a
+        // recovered status. Live owners retain the stronger ABA fence.
+        if self.is_endpoint_retired()
+            || !same_endpoint(&config, &endpoint.config)
+            || endpoint.incarnation.as_ref().is_some_and(|incarnation| {
+                !Arc::ptr_eq(incarnation, &self.endpoint_incarnation)
+                    || endpoint.generation
+                        != self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            })
+        {
+            return false;
+        }
+        let _publication = self.network_transition.lock().await;
+        let lifecycle = self.lifecycle.read().await;
+        if lifecycle.admin != AdminIntent::Active
+            || self.removal_pending.load(Ordering::Acquire)
+            || matches!(
+                *self.drain_completion.read().await,
+                DrainCompletionAction::Disable { .. }
+            )
+        {
+            return false;
+        }
+        let transport = self.transport();
+        // A running probe owns its next outcome and backoff. Do not queue an
+        // extra transport trial behind it or renew its original deadline.
+        let probe = transport.probe.try_lock();
+        let mut state = transport.state.lock().await;
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let health_requested = probe.is_ok()
+            && (state.down || !self.connection_is_ready() || !lifecycle.is_schedulable());
+        let bypass_requested = request_bypass_probe();
+        let health_requested = health_requested && tokio::time::Instant::now() < deadline;
+        if health_requested {
+            state.next_probe = None;
+        }
+        health_requested || bypass_requested
+    }
+
     pub(crate) async fn attach_ssh_pool(&self, pool: Arc<rch_common::SshPool>) {
         let _transition = self.network_transition.lock().await;
         let enabled = self.background_network_allowed().await;
@@ -5669,6 +5723,179 @@ mod tests {
                 .health_probe_permit(heartbeat, &config)
                 .await
                 .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settlement_probe_hint_preserves_endpoint_admin_and_health_authority() {
+        for case in [
+            "current", "restored", "retarget", "aba", "disabled", "draining", "removing",
+            "retired", "expired",
+        ] {
+            let config = recovered_worker_config("settled-worker", 4);
+            let worker = WorkerState::new(config.clone());
+            assert!(worker.reserve_slots(2).await);
+            let mut endpoint = worker.endpoint_snapshot().await;
+            worker
+                .enter_bypass(BypassFailureClass::ProcessObservation)
+                .await;
+            worker.open_circuit().await;
+            worker
+                .set_error("retained observation failure".into())
+                .await;
+            let circuit = CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_cooldown_secs: 900,
+                ..Default::default()
+            };
+            worker
+                .record_transport_result(false, Duration::from_secs(30), &circuit)
+                .await;
+            match case {
+                "restored" => {
+                    endpoint =
+                        serde_json::from_slice(&serde_json::to_vec(&endpoint).unwrap()).unwrap();
+                    assert!(!endpoint.has_runtime_identity());
+                }
+                "retarget" | "aba" => {
+                    let mut replacement = config.clone();
+                    replacement.host = "replacement.invalid".into();
+                    worker.update_config(replacement).await;
+                    if case == "aba" {
+                        worker.update_config(config).await;
+                    }
+                }
+                "disabled" => worker.disable(Some("operator maintenance".into())).await,
+                "draining" => worker.drain().await,
+                "removing" => worker.drain_for_removal().await,
+                "retired" => worker.retire_endpoint().await,
+                _ => {}
+            }
+            let lifecycle = worker.lifecycle().await;
+            let old_circuit = worker.circuit_stats().await;
+            let old_error = worker.last_error().await;
+            let old_due = worker.next_health_probe_in().await;
+            let called = std::cell::Cell::new(false);
+            let deadline = tokio::time::Instant::now()
+                + if case == "expired" {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                };
+            let requested = worker
+                .request_probe_after_settlement(&endpoint, deadline, || {
+                    called.set(true);
+                    false
+                })
+                .await;
+            let allowed = matches!(case, "current" | "restored");
+            assert_eq!(requested, allowed, "{case}");
+            assert_eq!(called.get(), allowed, "{case}");
+            assert_eq!(worker.lifecycle().await, lifecycle, "{case}");
+            let current_circuit = worker.circuit_stats().await;
+            assert_eq!(current_circuit.state(), old_circuit.state(), "{case}");
+            assert_eq!(
+                current_circuit.opened_at(),
+                old_circuit.opened_at(),
+                "{case}"
+            );
+            assert_eq!(
+                current_circuit.consecutive_failures(),
+                old_circuit.consecutive_failures(),
+                "{case}"
+            );
+            assert_eq!(
+                current_circuit.consecutive_command_failures(),
+                old_circuit.consecutive_command_failures(),
+                "{case}"
+            );
+            assert_eq!(worker.last_error().await, old_error, "{case}");
+            assert_eq!(worker.used_slots(), 2, "{case}");
+            assert_eq!(
+                worker.next_health_probe_in().await,
+                if allowed {
+                    Some(Duration::ZERO)
+                } else {
+                    old_due
+                },
+                "{case}",
+            );
+            assert!(
+                !worker.reserve_slots(1).await,
+                "a scheduling hint is not health: {case}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settlement_probe_hint_preserves_health_singleflight_and_failure_backoff() {
+        let worker = WorkerState::new(recovered_worker_config("settlement-singleflight", 4));
+        let endpoint = worker.endpoint_snapshot().await;
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_cooldown_secs: 900,
+            ..Default::default()
+        };
+        let heartbeat = Duration::from_secs(30);
+        worker
+            .record_transport_result(false, heartbeat, &circuit)
+            .await;
+        assert!(
+            worker
+                .request_probe_after_settlement(
+                    &endpoint,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    || false,
+                )
+                .await
+        );
+        let permit = worker
+            .health_probe_permit(heartbeat, &circuit)
+            .await
+            .unwrap();
+        assert!(permit.isolated);
+        for _ in 0..3 {
+            assert!(
+                !worker
+                    .request_probe_after_settlement(
+                        &endpoint,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                        || false,
+                    )
+                    .await
+            );
+            assert!(
+                worker
+                    .health_probe_permit(heartbeat, &circuit)
+                    .await
+                    .is_none()
+            );
+        }
+        worker
+            .record_health_transport_result(&permit, false, heartbeat, &circuit)
+            .await
+            .unwrap();
+        drop(permit);
+        assert_eq!(
+            worker.next_health_probe_in().await,
+            Some(Duration::from_secs(900))
+        );
+        assert!(
+            worker
+                .health_probe_permit(heartbeat, &circuit)
+                .await
+                .is_none()
+        );
+        tokio::time::advance(Duration::from_secs(900)).await;
+        assert!(
+            worker
+                .health_probe_permit(heartbeat, &circuit)
+                .await
+                .is_some()
+        );
+        assert!(
+            worker.transport_is_down().await,
+            "retry admission supplies no positive evidence"
         );
     }
 
