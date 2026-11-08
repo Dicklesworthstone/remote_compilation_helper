@@ -685,6 +685,91 @@ fn dedup_candidate_file(var: &str) -> String {
     )
 }
 
+/// Capture both producer completion and the snapshot writer's status. Some
+/// lsof versions return success after stdout hit ENOSPC, so redirecting the
+/// producer straight to disk is insufficient. Python streams its pipe into
+/// the existing snapshot and keeps the producer unreaped until group cleanup.
+/// Shell job PIDs cannot provide that custody: a shell can reap before wait.
+/// There is no in-band marker for process arguments or readlink paths to forge.
+/// Missing Python or non-reaping wait support leaves the inventory unavailable.
+const GC_SNAPSHOT_CAPTURE: &str = r#"__gc_capture() {
+  python3 -I -S -c '
+import errno, os, signal, stat, subprocess, sys
+
+if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+    sys.exit(1)
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+child = None
+owned = False
+settling = False
+cancelled = False
+output = None
+success = False
+
+def interrupted(number, frame):
+    global cancelled
+    cancelled = True
+    # Defer interruption across Popen publication and final reaping. A signal
+    # must not lose a newly spawned child or interrupt after waitpid reaped it.
+    if owned and not settling:
+        raise InterruptedError("GC inventory interrupted")
+
+for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, interrupted)
+
+def retire():
+    global owned, settling
+    if owned:
+        settling = True
+        # No poll/waitpid has reaped this session leader. Even an exited
+        # producer still reserves its PID/PGID while its descendants stop.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        owned = False
+        child.wait()
+
+try:
+    output = os.open(sys.argv[1], os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    info = os.fstat(output)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise ValueError("unsafe GC snapshot")
+    os.ftruncate(output, 0)
+    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+    owned = True
+    if cancelled:
+        raise InterruptedError("GC inventory interrupted")
+    while True:
+        chunk = os.read(child.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        remaining = memoryview(chunk)
+        while remaining:
+            count = os.write(output, remaining)
+            if count == 0:
+                raise OSError(errno.EIO, "short GC snapshot write")
+            remaining = remaining[count:]
+    completed_output = output
+    output = None
+    os.close(completed_output)
+    result = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+    success = result.si_code == os.CLD_EXITED and result.si_status == 0
+    retire()
+except (OSError, ValueError):
+    success = False
+finally:
+    retire()
+    if child is not None and child.stdout is not None:
+        child.stdout.close()
+    if output is not None:
+        os.close(output)
+sys.exit(0 if success and not cancelled else 1)
+' "$@";
+}; "#;
+
 /// Shell fragment that builds the two GATE SNAPSHOTS every collection of a
 /// pooled/cache dir is required to clear, plus the `__gc_gates_ok` helper that
 /// tests one dir against them.
@@ -697,11 +782,13 @@ fn dedup_candidate_file(var: &str) -> String {
 ///   `/proc/<pid>/{cwd,fd}` with one GNU `find -printf '%l'` (no fork per
 ///   pid); if `/proc` is unusable it falls back to a single system-wide
 ///   `lsof -F n`. `$__held_ok` is 1 only when a snapshot was actually
-///   produced.
-/// * `$__proc` — every process's full command line (`ps -eo args=`), so a
+///   produced by a successful command and checked writer. Raw lsof records
+///   are filtered during matching, after capture has proved completion.
+/// * `$__proc` — every process's full command line (`ps -ww -eo args=`), so a
 ///   build rooted at a dir is caught even when it holds no descriptor open at
 ///   the instant of the sweep (a `rustc` between writes, a `cargo` driver
-///   whose child does the I/O). `$__proc_ok` is 1 only when it is non-empty.
+///   whose child does the I/O). `$__proc_ok` is 1 only when the producer
+///   succeeded and its snapshot is non-empty.
 ///
 /// `__gc_gates_ok <dir>` returns 0 (safe to collect) ONLY when BOTH snapshots
 /// exist AND neither matches the dir. Every failure mode — no `/proc`, no
@@ -711,20 +798,20 @@ fn dedup_candidate_file(var: &str) -> String {
 /// live build.
 ///
 /// Matching is exact-prefix via `awk index()`, never a regex: candidate paths
-/// come from `find` output and must never be reinterpreted as a pattern.
+/// come from `find` output and must never be reinterpreted as a pattern. Both
+/// production and consumption must succeed: a partial ENOSPC write or a failed
+/// later read is unknown, never evidence that a directory is free.
 fn gate_snapshot_fragment() -> String {
-    concat!(
+    let snapshots = concat!(
         "__held=\"\"; __held_ok=0; __hsrc=none; __proc=\"\"; __proc_ok=0; ",
         "if __held=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
-        "  if [ -d /proc/self/fd ]; then ",
-        "    find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -printf '%l\\n' 2>/dev/null > \"$__held\" || :; ",
+        "  if [ -d /proc/self/fd ] && ",
+        "    __gc_capture \"$__held\" find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -printf '%l\\n' && ",
+        "    [ -s \"$__held\" ]; then __hsrc=proc; __held_ok=1; ",
+        "  elif command -v lsof >/dev/null 2>&1 && ",
+        "    __gc_capture \"$__held\" lsof -w -n -P -F n && ",
+        "    [ -s \"$__held\" ]; then __hsrc=lsof; __held_ok=1; ",
         "  fi; ",
-        "  if [ -s \"$__held\" ]; then __hsrc=proc; ",
-        "  elif command -v lsof >/dev/null 2>&1; then ",
-        "    lsof -w -n -P -F n 2>/dev/null | sed -n 's/^n//p' > \"$__held\" || :; ",
-        "    if [ -s \"$__held\" ]; then __hsrc=lsof; fi; ",
-        "  fi; ",
-        "  if [ -s \"$__held\" ]; then __held_ok=1; fi; ",
         "fi; ",
         // The sweep's OWN process chain is excluded from the command-line
         // snapshot. `collect_paths_command` embeds the paths it is about to
@@ -736,26 +823,29 @@ fn gate_snapshot_fragment() -> String {
         // `find`, `du`) that carry a candidate path are not in it.
         "__self_pids=\" $$ \"; __pp=$$; __i=0; ",
         "while [ \"$__i\" -lt 12 ]; do ",
-        "  __pp=$(ps -o ppid= -p \"$__pp\" 2>/dev/null | tr -d ' '); ",
+        "  __pp=$(ps -o ppid= -p \"$__pp\" 2>/dev/null) || break; ",
+        "  __pp=$(printf '%s' \"$__pp\" | tr -d ' '); ",
         "  case \"$__pp\" in ''|0|1) break;; *[!0-9]*) break;; esac; ",
         "  __self_pids=\"$__self_pids$__pp \"; __i=$((__i + 1)); ",
         "done; ",
         "if __proc=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
-        "  ps -ww -eo pid=,args= > \"$__proc\" 2>/dev/null ",
-        "    || ps -eo pid=,args= > \"$__proc\" 2>/dev/null || :; ",
-        "  if [ -s \"$__proc\" ]; then __proc_ok=1; fi; ",
+        // A successful nonwide ps can silently truncate argv at COLUMNS and
+        // omit the target path. Unsupported unlimited width is unknown.
+        "  if __gc_capture \"$__proc\" ps -ww -eo pid=,args= && [ -s \"$__proc\" ]; then __proc_ok=1; fi; ",
         "fi; ",
         "__gc_handles() { ",
         "  if [ \"$__held_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
-        "  if awk -v p=\"$1\" '$0==p || index($0, p \"/\")==1 {f=1; exit} END{exit(f?0:1)}' \"$__held\"; ",
-        "  then printf held; else printf free; fi; ",
+        "  if __evidence=$(awk -v p=\"$1\" -v source=\"$__hsrc\" ",
+        "    'source==\"lsof\" {if (substr($0,1,1)!=\"n\") next; $0=substr($0,2)} ",
+        "     $0==p || index($0, p \"/\")==1 {f=1; exit} END{print(f?\"held\":\"free\")}' \"$__held\"); ",
+        "  then printf '%s' \"$__evidence\"; else printf unknown; fi; ",
         "}; ",
         "__gc_procs() { ",
         "  if [ \"$__proc_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
-        "  if awk -v p=\"$1\" -v skip=\"$__self_pids\" ",
+        "  if __evidence=$(awk -v p=\"$1\" -v skip=\"$__self_pids\" ",
         "    '{ if (index(skip, \" \" $1 \" \") > 0) next; if (index($0, p) > 0) { f=1; exit } } ",
-        "     END{exit(f?0:1)}' \"$__proc\"; ",
-        "  then printf held; else printf free; fi; ",
+        "     END{print(f?\"held\":\"free\")}' \"$__proc\"); ",
+        "  then printf '%s' \"$__evidence\"; else printf unknown; fi; ",
         "}; ",
         "__gc_gates_ok() { ",
         "  [ \"$(__gc_handles \"$1\")\" = free ] || return 1; ",
@@ -763,8 +853,8 @@ fn gate_snapshot_fragment() -> String {
         "  return 0; ",
         "}; ",
         "printf 'RCH_GC_GATES handles=%s handles_source=%s procs=%s\\n' \"$__held_ok\" \"$__hsrc\" \"$__proc_ok\"; ",
-    )
-    .to_string()
+    );
+    format!("{GC_SNAPSHOT_CAPTURE}{snapshots}")
 }
 
 /// Shell fragment removing the gate-snapshot temp files. Safe when a snapshot
@@ -1091,6 +1181,26 @@ fn worker_sweep_script(
     )
 }
 
+/// Capture one complete POSIX `df` response before parsing it. Checking only
+/// awk's status would accept a plausible row emitted before `df` failed. Keep
+/// the whole mount path, including spaces, for the same-filesystem gate.
+const GC_FILESYSTEM_SNAPSHOT: &str = r#"__gc_df_field() {
+  __gc_df_output=$(LC_ALL=C df -Pk "$1" 2>/dev/null) || return 1;
+  printf '%s\n' "$__gc_df_output" | awk -v field="$2" '
+    NR == 2 && NF >= 6 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+%$/ {
+      if (field == "mount") {
+        mount = $0;
+        for (i = 0; i < 5; i++) sub(/^[ \t]*[^ \t]+[ \t]+/, "", mount);
+        if (substr(mount, 1, 1) != "/") { bad = 1; next; }
+        print mount;
+      } else if (field == "2" || field == "4") print $field;
+      else { bad = 1; next; }
+      seen = 1;
+    }
+    END { if (NR != 2 || !seen || bad) exit 1; }
+  ';
+}; "#;
+
 /// Disk-pressure eviction for [`worker_sweep_command_under_pressure`].
 ///
 /// rchd gives a worker zero slots once its free ratio reaches the placement
@@ -1119,12 +1229,13 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
     // idleness, are what protect a build.
     let idle_minutes = idle_minutes.min(u64::from(MIN_IDLE_HOURS) * 60);
     format!(
-        "__fs_kb=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
+        "{filesystem_snapshot}\
+         __fs_kb=$(__gc_df_field \"$__rt\" 2) || __fs_kb=0; \
          case \"$__fs_kb\" in ''|*[!0-9]*) __fs_kb=0;; esac; \
          __want_kb=$((__fs_kb / 1000 * {low_disk_permille})); __pa=unknown; \
-         __rt_mnt=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $6}}'); \
+         __rt_mnt=$(__gc_df_field \"$__rt\" mount) || __rt_mnt=\"\"; \
          __under_pressure() {{ \
-           __pa=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
+           __pa=$(__gc_df_field \"$__rt\" 4) || {{ __pa=unknown; return 1; }}; \
            case \"$__pa\" in ''|*[!0-9]*) __pa=unknown; return 1;; esac; \
            [ \"$__pa\" -lt \"$__want_kb\" ]; \
          }}; \
@@ -1143,7 +1254,8 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
            while IFS=' ' read -r __n d; do \
              __under_pressure || break; \
              [ -d \"$d\" ] || continue; \
-             [ \"$(df -Pk \"$d\" 2>/dev/null | awk 'NR==2 {{print $6}}')\" = \"$__rt_mnt\" ] || continue; \
+             __candidate_mnt=$(__gc_df_field \"$d\" mount) || continue; \
+             [ \"$__candidate_mnt\" = \"$__rt_mnt\" ] || continue; \
              {early_recent}\
              if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pressure gate %s\\n' \"$d\"; continue; fi; \
              {source_begin}\
@@ -1161,6 +1273,7 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
            printf 'RCH_REAP_PRESSURE final avail_kb=%s want_kb=%s\\n' \"$__pa\" \"$__want_kb\"; \
            rm -f \"$__lst4\" \"$__tmpf4\"; \
          fi; ",
+        filesystem_snapshot = GC_FILESYSTEM_SNAPSHOT,
         source_begin = checked_source_admission("pressure"),
         source_end = SOURCE_GC_CHECKED_RETIREMENT,
         early_recent = checked_source_recent_activity(&idle_minutes.to_string(), "pressure", false),
@@ -2091,7 +2204,7 @@ pub fn abandoned_gc_claims_command_with_registry(
     let registry = shell_escape::escape(registry.into());
     let apply = u8::from(apply);
     format!(
-        r#"r={registry}; min={min_age_minutes}; apply={apply};
+        r#"{capture}r={registry}; min={min_age_minutes}; apply={apply};
 if [ ! -d "$r" ] || [ -L "$r" ]; then printf 'RCH_GC_CLAIMS none\n'; exit 0; fi;
 if [ -L "$r/metadata.lock" ]; then printf 'RCH_GC_CLAIMS unsafe-lock\n'; exit 0; fi;
 if ! command -v flock >/dev/null 2>&1; then printf 'RCH_GC_CLAIMS no-flock\n'; exit 0; fi;
@@ -2100,8 +2213,12 @@ if ! flock -x -w 30 8; then printf 'RCH_GC_CLAIMS busy\n'; exit 0; fi;
 if [ ! -d /proc/self/fd ]; then printf 'RCH_GC_CLAIMS no-proc\n'; exit 0; fi;
 refs=$(mktemp) && args=$(mktemp) || exit 1;
 trap 'rm -f -- "$refs" "$args"' EXIT;
-find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' 2>/dev/null | grep '^/' | sort -u > "$refs";
-for p in /proc/[0-9]*; do tr '\0' ' ' 2>/dev/null < "$p/cmdline"; echo; done > "$args";
+# A nonempty prefix is not a complete inventory. Avoid pipelines that mask
+# producer errors and refuse retirement if either capture could be partial.
+if ! __gc_capture "$refs" find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' \
+  || [ ! -s "$refs" ]; then printf 'RCH_GC_CLAIMS incomplete-handles\n'; exit 0; fi;
+if __gc_capture "$args" ps -ww -eo pid=,args= && [ -s "$args" ]; then :;
+else printf 'RCH_GC_CLAIMS incomplete-processes\n'; exit 0; fi;
 printf 'RCH_GC_CLAIMS ok\n';
 now=$(date +%s);
 for c in "$r"/fc-*.claim; do
@@ -2113,8 +2230,10 @@ for c in "$r"/fc-*.claim; do
     p=$(head -n 1 -- "$c"); d=${{n#*.}}; d=${{d%%.*}}; a=$(sha256sum -- "$c");
     if [ "${{a%% *}}" != "$d" ] || [ -z "$p" ]; then why=unsafe-record;
     elif [ "$age" -lt "$min" ]; then why=young;
-    elif awk -v p="$p/" -v q="$p" 'index($0,p)==1 || $0==q {{f=1; exit}} END{{exit !f}}' "$refs"; then why=open-handle;
-    elif grep -qF -- "$p" "$args"; then why=live-process;
+    elif ! h=$(awk -v p="$p/" -v q="$p" 'index($0,p)==1 || $0==q {{f=1; exit}} END{{print(f?"held":"free")}}' "$refs"); then why=unreadable-handles;
+    elif [ "$h" != free ]; then why=open-handle;
+    elif ! h=$(awk -v p="$p" 'index($0,p)>0 {{f=1; exit}} END{{print(f?"held":"free")}}' "$args"); then why=unreadable-processes;
+    elif [ "$h" != free ]; then why=live-process;
     elif [ "$apply" = 1 ]; then
       dest="$r/released/$n";
       if [ ! -L "$r/released" ] && mkdir -p -- "$r/released" && [ ! -e "$dest" ] && [ ! -L "$dest" ] \
@@ -2125,7 +2244,8 @@ for c in "$r"/fc-*.claim; do
   printf 'RCH_GC_CLAIM %s %s %s %s %s\n' "$v" "$why" "$age" "$n" "$p";
 done;
 sync -f "$r" 2>/dev/null || :;
-"#
+"#,
+        capture = GC_SNAPSHOT_CAPTURE,
     )
 }
 
@@ -3096,6 +3216,28 @@ exec /usr/bin/find "$@"
         assert!(cmd.contains("[ \"$(__gc_procs \"$1\")\" = free ] || return 1"));
         assert!(cmd.contains("__held_ok\" -ne 1 ]; then printf unknown"));
         assert!(cmd.contains("__proc_ok\" -ne 1 ]; then printf unknown"));
+    }
+
+    /// The companion executes these exact compiled bytes, including a private
+    /// Linux tmpfs filled to ENOSPC. It also runs standalone on recovery hosts
+    /// where the workspace's native dependencies cannot be built.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_inventory_completion_and_disk_failure_contract() {
+        let output = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/gc_gate_snapshots.py"
+            ))
+            .env("RCH_TEST_GC_GATE_SCRIPT", gate_snapshot_fragment())
+            .output()
+            .expect("GC inventory integration tests require python3");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The gates must ride on the SAME temp-base resolution that creates the
