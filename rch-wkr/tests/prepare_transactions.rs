@@ -10,6 +10,7 @@ fn prepare_transaction_process_contract() {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/prepare_pnpm_workspaces.py"
         ),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/prepare_outputs.py"),
     ] {
         let status = std::process::Command::new("python3")
             .args(["-I", script])

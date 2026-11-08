@@ -163,6 +163,33 @@ enum Commands {
         #[arg(long)]
         log_dir: Option<String>,
     },
+
+    /// Inspect, install or verify exact dependency ownership for a source proof.
+    /// Inspect/install accept a bounded PreparedDependencyRequest on stdin.
+    /// Verify loads the completed request and never runs an installer.
+    PrepareProof {
+        #[arg(long, value_enum)]
+        mode: PrepareProofMode,
+
+        #[arg(long)]
+        project: String,
+
+        #[arg(long, value_enum)]
+        runtime: PrepareRuntime,
+
+        #[arg(long)]
+        expected_request_digest: Option<String>,
+
+        #[arg(long)]
+        expected_attestation_digest: Option<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum PrepareProofMode {
+    Inspect,
+    Install,
+    Verify,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -404,6 +431,58 @@ async fn run_worker(cli: Cli) -> Result<()> {
                 prepare::PrepareAction::Failed => std::process::exit(1),
                 prepare::PrepareAction::Timeout => std::process::exit(2),
             }
+        }
+        Commands::PrepareProof {
+            mode,
+            project,
+            runtime,
+            expected_request_digest,
+            expected_attestation_digest,
+        } => {
+            use rch_common::prepared_dependencies::{
+                MAX_PREPARED_DEPENDENCY_JSON_BYTES, PreparedDependencyRequest,
+            };
+            use std::io::Read;
+            let project = std::path::Path::new(&project);
+            let runtime = runtime.into();
+            if matches!(mode, PrepareProofMode::Verify) {
+                let request_digest = expected_request_digest
+                    .context("prepared verification requires --expected-request-digest")?;
+                let attestation_digest = expected_attestation_digest
+                    .context("prepared verification requires --expected-attestation-digest")?;
+                prepare::proof_verify(project, runtime, &request_digest, &attestation_digest)
+                    .await?;
+                println!("RCH_PREPARED_DEPENDENCIES_VERIFIED");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                expected_request_digest.is_none() && expected_attestation_digest.is_none(),
+                "expected preparation digests are valid only in verify mode"
+            );
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(MAX_PREPARED_DEPENDENCY_JSON_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_PREPARED_DEPENDENCY_JSON_BYTES,
+                "prepared dependency request exceeds byte limit"
+            );
+            let request: PreparedDependencyRequest =
+                serde_json::from_slice(&bytes).context("invalid prepared dependency request")?;
+            request.validate()?;
+            match mode {
+                PrepareProofMode::Inspect => {
+                    let state = prepare::proof_inspect(project, runtime, &request).await?;
+                    println!("{}", serde_json::to_string(&state)?);
+                }
+                PrepareProofMode::Install => {
+                    let attestation = prepare::proof_install(project, runtime, &request).await?;
+                    println!("{}", serde_json::to_string(&attestation)?);
+                }
+                PrepareProofMode::Verify => unreachable!("verify returned before reading stdin"),
+            }
+            Ok(())
         }
     }
 }

@@ -25,11 +25,15 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 schemars = { workspace = true }
 tempfile = "3.25.0"
 rch-telemetry = { path = "../rch-telemetry", version = "2.1.0", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [lints.rust]
 unsafe_code = "forbid"

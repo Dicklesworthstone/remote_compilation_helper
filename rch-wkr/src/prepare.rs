@@ -8,12 +8,14 @@
 //! into a cache hit or start a competing installer in the same directory.
 
 mod install;
+mod outputs;
 mod workspace_inputs;
 
 use install::{INPUT_NAMES, InstallPlan};
 pub use install::{PrepareAction, PrepareReport};
 #[cfg(target_os = "linux")]
 pub(crate) use install::{exec_installer, run_installer_supervisor};
+pub use outputs::{proof_inspect, proof_install, proof_verify};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;

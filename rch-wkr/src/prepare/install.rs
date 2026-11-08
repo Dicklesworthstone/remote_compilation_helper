@@ -270,6 +270,21 @@ pub(super) struct InstallPlan {
 }
 
 impl InstallPlan {
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_frozen(self) -> bool {
+        self.locked
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn manager_name(self) -> &'static str {
+        match self.manager {
+            PackageManager::Bun => "bun",
+            PackageManager::Pnpm => "pnpm",
+            PackageManager::Yarn => "yarn",
+            PackageManager::Npm => "npm",
+        }
+    }
+
     pub(super) fn for_sources(sources: &[String], runtime: RequiredRuntime) -> Result<Self> {
         let families: &[(PackageManager, &[&str])] = &[
             (PackageManager::Bun, &["bun.lock", "bun.lockb"]),
@@ -550,7 +565,7 @@ pub async fn prepare(
     let started = Instant::now();
     match runtime {
         RequiredRuntime::Bun | RequiredRuntime::Node => {
-            prepare_node_like(project_root, runtime, log_dir, started).await
+            prepare_node_like(project_root, runtime, log_dir, started, true).await
         }
         // Nix fetches its own inputs into /nix/store at build time and needs no
         // node_modules-style prepare step, so it is skipped like Rust/None.
@@ -575,11 +590,31 @@ pub async fn prepare(
     }
 }
 
+/// Proof-aware callers must disable the fingerprint-only cache path until a
+/// prior completed exact output inventory has been independently revalidated.
+#[cfg(target_os = "linux")]
+pub(super) async fn prepare_proven_node(
+    project_root: &Path,
+    runtime: RequiredRuntime,
+    log_dir: &Path,
+    allow_cache_hit: bool,
+) -> Result<PrepareReport> {
+    prepare_node_like(
+        project_root,
+        runtime,
+        log_dir,
+        Instant::now(),
+        allow_cache_hit,
+    )
+    .await
+}
+
 async fn prepare_node_like(
     project_root: &Path,
     runtime: RequiredRuntime,
     log_dir: &Path,
     started: Instant,
+    allow_cache_hit: bool,
 ) -> Result<PrepareReport> {
     // Serialize concurrent prepare() calls for the same project. Without
     // this, two callers race on the fingerprint write + invoke `bun install`
@@ -594,7 +629,8 @@ async fn prepare_node_like(
     let cached = read_cached_fingerprint(project_root).await;
 
     // Cache hit: skip install
-    if let Some(prev) = &cached
+    if allow_cache_hit
+        && let Some(prev) = &cached
         && plan.locked
         && prev.hash == fingerprint.hash
         && project_root.join("node_modules").exists()
