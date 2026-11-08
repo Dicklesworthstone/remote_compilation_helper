@@ -1191,7 +1191,7 @@ impl SshClient {
         // directives. Older clients do not understand ForkAfterAuthentication;
         // a global IgnoreUnknown override would break the user's own list.
         let can_disable_background =
-            ssh_can_disable_background_in(ssh_program, control_dir.clone(), deadline).await?;
+            ssh_can_disable_background_before(ssh_program, deadline).await?;
         let mut command = self.master_command(
             ssh_program,
             destination,
@@ -1696,6 +1696,8 @@ fn ssh_control_directory() -> PathBuf {
 /// their process group owned. Older SSH clients lack this setting; inspect
 /// their built-in configuration without evaluating the user's SSH config or
 /// replacing the user's `IgnoreUnknown` list. No remote connection is made.
+/// The bounded response stays in memory: cancellation must still be able to
+/// inspect its SSH client when local temporary storage is full or unavailable.
 ///
 /// # Errors
 /// Returns an error if the local client probe fails or exceeds `timeout`.
@@ -1703,8 +1705,7 @@ pub async fn ssh_can_disable_background(ssh_program: &Path, timeout: Duration) -
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("SSH client probe timeout exceeds the supported clock range")?;
-    let control_dir = Arc::new(tempfile::tempdir().context("SSH client probe directory")?);
-    ssh_can_disable_background_in(ssh_program, control_dir, deadline).await
+    ssh_can_disable_background_before(ssh_program, deadline).await
 }
 
 /// Configure one owned foreground SSH attempt, without borrowing or creating
@@ -1727,36 +1728,29 @@ fn oneshot_ssh_options(can_disable_background: bool) -> impl Iterator<Item = &'s
     .chain(can_disable_background.then_some("ForkAfterAuthentication=no"))
 }
 
-async fn ssh_can_disable_background_in(
-    ssh_program: &Path,
-    control_dir: Arc<tempfile::TempDir>,
-    deadline: Instant,
-) -> Result<bool> {
-    use std::io::Read;
-
+async fn ssh_can_disable_background_before(ssh_program: &Path, deadline: Instant) -> Result<bool> {
     anyhow::ensure!(
         Instant::now() < deadline,
         "SSH connection timed out before capability probe"
     );
-    let configuration = control_dir.path().join("client-config");
     let mut command = tokio::process::Command::new(ssh_program);
-    command
-        .args(["-G", "-F", "/dev/null", "-T", "none"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::fs::File::create(&configuration)?)
-        .stderr(std::process::Stdio::null());
-    let mut probe = OwnedSshProcess::spawn(&mut command, Some(control_dir.clone()), None)?;
-    let checked = probe.wait_until(deadline).await;
-    let _ = probe.stop_before(deadline).await;
-    anyhow::ensure!(checked?.success(), "SSH client capability probe failed");
-    let mut output = String::new();
-    std::fs::File::open(configuration)?
-        .take(65_537)
-        .read_to_string(&mut output)?;
+    command.args(["-G", "-F", "/dev/null", "-T", "none"]);
+    let response = capture_control_output(&mut command, None, 65_536, 65_536, deadline)
+        .await
+        .map_err(|error| {
+            let timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+            anyhow::Error::new(error).context(if timed_out {
+                "SSH connection timed out during capability probe"
+            } else {
+                "SSH client capability capture failed"
+            })
+        })?;
     anyhow::ensure!(
-        output.len() <= 65_536,
-        "SSH client capability response is too large"
+        response.status.success(),
+        "SSH client capability probe failed"
     );
+    let output = std::str::from_utf8(&response.stdout)
+        .context("SSH client capability response is not valid UTF-8")?;
     anyhow::ensure!(
         output.lines().any(|line| {
             let mut words = line.split_whitespace();
@@ -2053,9 +2047,8 @@ async fn system_ssh_execute_before(
         .context("SSH command timeout exceeds the supported clock range")?;
     let deadline = caller_deadline.map_or(deadline, |caller| deadline.min(caller));
     ensure_ssh_deadline(Some(deadline))?;
-    let control_dir = Arc::new(tempfile::tempdir().context("SSH client probe directory")?);
     let can_disable_background =
-        ssh_can_disable_background_in(Path::new("ssh"), control_dir, deadline).await?;
+        ssh_can_disable_background_before(Path::new("ssh"), deadline).await?;
     let prepared = remote_shell_command(config, command);
     let argv = system_ssh_argv(
         config,
@@ -2656,6 +2649,254 @@ impl SshPool {
 impl Default for SshPool {
     fn default() -> Self {
         Self::new(SshOptions::default())
+    }
+}
+
+#[cfg(test)]
+mod capability_probe_tests {
+    use super::{capture_control_output, ssh_can_disable_background};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn executable_client(body: &str) -> PathBuf {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let program = directory.join("ssh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/usr/bin/env python3\n\
+                 import pathlib, sys\n\
+                 assert sys.argv[1:] == ['-G', '-F', '/dev/null', '-T', 'none']\n\
+                 root = pathlib.Path(__file__).parent\n{body}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        program
+    }
+
+    fn response_client(stdout: &[u8], stderr: &[u8], exit_code: u8) -> PathBuf {
+        let program = executable_client(
+            "sys.stdout.buffer.write((root / 'stdout').read_bytes())\n\
+             sys.stdout.buffer.flush()\n\
+             sys.stderr.buffer.write((root / 'stderr').read_bytes())\n\
+             sys.stderr.buffer.flush()\n\
+             sys.exit(int((root / 'exit-code').read_text()))",
+        );
+        let directory = program.parent().unwrap();
+        std::fs::write(directory.join("stdout"), stdout).unwrap();
+        std::fs::write(directory.join("stderr"), stderr).unwrap();
+        std::fs::write(directory.join("exit-code"), exit_code.to_string()).unwrap();
+        program
+    }
+
+    #[tokio::test]
+    async fn capability_probe_works_without_temporary_storage() {
+        let program = response_client(b"hostname none\nforkafterauthentication no\n", b"", 0);
+        let unavailable = program.parent().unwrap().join("not-a-directory");
+        std::fs::write(&unavailable, b"cannot contain temporary files").unwrap();
+        // Only the disposable test process receives this environment. The
+        // shared test runner never changes TMPDIR or races other temp fixtures.
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "ssh::capability_probe_tests::capability_probe_unusable_temporary_storage_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TMPDIR", &unavailable)
+            .env("RCH_TEST_DISKLESS_SSH_PROGRAM", &program);
+        let output = capture_control_output(
+            &mut command,
+            None,
+            16 * 1024,
+            16 * 1024,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "diskless capability child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("diskless-capability-verified"),
+            "the exact child test must run, not an empty filtered suite"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "invoked with an unusable TMPDIR by the parent regression"]
+    async fn capability_probe_unusable_temporary_storage_child() {
+        assert!(std::env::temp_dir().is_file());
+        assert!(tempfile::tempdir().is_err());
+        let program = PathBuf::from(std::env::var_os("RCH_TEST_DISKLESS_SSH_PROGRAM").unwrap());
+        assert!(
+            ssh_can_disable_background(&program, Duration::from_secs(3))
+                .await
+                .unwrap()
+        );
+        println!("diskless-capability-verified");
+    }
+
+    #[tokio::test]
+    async fn capability_probe_accepts_exact_stream_limits() {
+        let mut stdout = b"hostname none\nforkafterauthentication no\n".to_vec();
+        stdout.resize(65_536, b'\n');
+        let program = response_client(&stdout, &vec![b'd'; 65_536], 0);
+        assert!(
+            ssh_can_disable_background(&program, Duration::from_secs(3))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_probe_rejects_stream_overflow() {
+        for stream in ["stdout", "stderr"] {
+            let mut stdout = b"hostname none\nforkafterauthentication no\n".to_vec();
+            let mut stderr = Vec::new();
+            if stream == "stdout" {
+                stdout.resize(65_537, b'\n');
+            } else {
+                stderr.resize(65_537, b'd');
+            }
+            let program = response_client(&stdout, &stderr, 0);
+            let error = ssh_can_disable_background(&program, Duration::from_secs(3))
+                .await
+                .expect_err("a valid capability prefix must not hide stream overflow");
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+            }));
+            assert!(format!("{error:#}").contains(&format!("{stream} exceeds 65536-byte limit")));
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_probe_rejects_invalid_or_failed_responses() {
+        for (stdout, exit_code, expected) in [
+            (
+                b"hostname none\nforkafterauthentication no\n\xff".as_slice(),
+                0,
+                "not valid UTF-8",
+            ),
+            (
+                b"forkafterauthentication no\n".as_slice(),
+                0,
+                "invalid capability response",
+            ),
+            (
+                b"hostname none\nforkafterauthentication no\n".as_slice(),
+                23,
+                "capability probe failed",
+            ),
+        ] {
+            let program = response_client(stdout, b"", exit_code);
+            let error = ssh_can_disable_background(&program, Duration::from_secs(3))
+                .await
+                .expect_err("malformed or failed probes must not supply capabilities");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_probe_accepts_legacy_hostname_only_response() {
+        let program = response_client(b"hostname none\n", b"", 0);
+        assert!(
+            !ssh_can_disable_background(&program, Duration::from_secs(3))
+                .await
+                .unwrap(),
+            "an older client remains usable without the unsupported option"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capability_probe_times_out_pipe_holder_and_reaps_leader() {
+        use rustix::fd::{AsFd, OwnedFd};
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+
+        struct Processes(OwnedFd, OwnedFd);
+        impl Drop for Processes {
+            fn drop(&mut self) {
+                // Keep failing assertions from leaving the fixture alive.
+                let _ = rustix::process::pidfd_send_signal(&self.0, Signal::KILL);
+                let _ = rustix::process::pidfd_send_signal(&self.1, Signal::KILL);
+            }
+        }
+
+        let program = executable_client(
+            r"import os, subprocess, time
+proxy = subprocess.Popen(['sleep', '30'])
+(root / 'ready.tmp').write_text(f'{os.getpid()} {proxy.pid}')
+os.replace(root / 'ready.tmp', root / 'ready')
+while not (root / 'release').exists():
+    time.sleep(0.01)
+sys.stdout.write('hostname none\nforkafterauthentication no\n')
+sys.stdout.flush()",
+        );
+        let directory = program.parent().unwrap();
+        let mut probe = Box::pin(ssh_can_disable_background(&program, Duration::from_secs(5)));
+        let identities = tokio::select! {
+            result = &mut probe => panic!("probe ended before its fixture was ready: {result:?}"),
+            identities = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(directory.join("ready")) {
+                        break text
+                            .split_whitespace()
+                            .map(|pid| pid.parse::<i32>().unwrap())
+                            .collect::<Vec<_>>();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => identities.expect("probe fixture must publish its process identities"),
+        };
+        assert_eq!(identities.len(), 2);
+        let open = |pid| {
+            rustix::process::pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap()
+        };
+        let processes = Processes(open(identities[0]), open(identities[1]));
+        let leader = tokio::io::unix::AsyncFd::new(processes.0.as_fd()).unwrap();
+        let proxy = tokio::io::unix::AsyncFd::new(processes.1.as_fd()).unwrap();
+        std::fs::write(directory.join("release"), b"exit now").unwrap();
+        tokio::select! {
+            result = &mut probe => panic!("a valid prefix without natural EOF was accepted: {result:?}"),
+            exited = tokio::time::timeout(Duration::from_secs(3), leader.readable()) => {
+                let _ = exited.expect("probe leader must exit while its descendant holds the pipes").unwrap();
+            }
+        }
+        let error = tokio::time::timeout(Duration::from_secs(6), probe)
+            .await
+            .expect("capability deadline must bound a pipe-holding descendant")
+            .expect_err("a descendant holding the pipe prevents complete capability evidence");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let _ = tokio::try_join!(leader.readable(), proxy.readable()).unwrap();
+            loop {
+                match rustix::process::waitid(
+                    WaitId::PidFd(processes.0.as_fd()),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                ) {
+                    Err(rustix::io::Errno::CHILD) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("observe capability probe reaping: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("expired probe must stop its descendant and reap its leader");
     }
 }
 
@@ -4846,10 +5087,9 @@ exec sleep 30
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        let capability =
-            ssh_can_disable_background_in(Path::new("ssh"), directory.clone(), deadline)
-                .await
-                .unwrap();
+        let capability = ssh_can_disable_background_before(Path::new("ssh"), deadline)
+            .await
+            .unwrap();
         let client = SshClient::new(WorkerConfig::default(), SshOptions::default());
         let master = client.master_command(
             Path::new("ssh"),
