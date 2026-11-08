@@ -14,12 +14,20 @@ use super::dependency_closure::{
 };
 use super::ssh::run_offload_ssh_command_with_stdin;
 use super::*;
+use rch_common::prepared_dependencies::PreparedDependencyAttestation;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 
+#[path = "source_fidelity/prepared_dependencies.rs"]
+mod prepared_dependencies;
+pub(super) use prepared_dependencies::{
+    attach_prepared_attestation, attach_prepared_state, prepare_dependency_request,
+};
+
 const ROOT_SCHEMA: &str = "rch.source_content_root.v1";
 const RECEIPT_SCHEMA: &str = "rch.source_content_receipt.v1";
+const PREPARED_RECEIPT_SCHEMA: &str = "rch.source_content_receipt.v2";
 // Large tracked conformance corpora are legitimate source inputs.  The
 // FrankenNetworkX dependency currently contributes about 74k selected files,
 // so keep a finite one-over boundary without rejecting that authentic tree.
@@ -136,6 +144,9 @@ pub(super) struct PreparedSourceContentRoot {
     // Names only, never source bytes or authority. Keep this private bounded
     // skeleton alive through both namespace barriers and source retirement.
     clean_overlay_namespace: Option<Arc<tempfile::TempDir>>,
+    // Preparation is a distinct, attempt-bound input obligation. It never
+    // changes which Git/overlay entries the selected source manifest proves.
+    prepared_dependencies: Option<prepared_dependencies::PreparedDependencyProof>,
     // Absorbed selections remain live proof obligations, not extra transfers.
     coalesced: Vec<PreparedSourceContentRoot>,
 }
@@ -151,6 +162,8 @@ pub(super) struct SourceContentReceipt {
     command_exit_code: i32,
     root_count: usize,
     roots: Vec<SourceContentRootManifest>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prepared_dependencies: Vec<PreparedDependencyAttestation>,
     receipt_root: String,
 }
 
@@ -177,6 +190,8 @@ struct SourceContentReceiptPreimage<'a> {
     command_exit_code: i32,
     root_count: usize,
     roots: &'a [SourceContentRootManifest],
+    #[serde(skip_serializing_if = "<[PreparedDependencyAttestation]>::is_empty")]
+    prepared_dependencies: &'a [PreparedDependencyAttestation],
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -511,6 +526,7 @@ pub(super) async fn prepare_source_content_root(
         directories,
         clean_overlay: None,
         clean_overlay_namespace: None,
+        prepared_dependencies: None,
         coalesced: Vec::new(),
     })
 }
@@ -885,6 +901,7 @@ pub(super) async fn prepare_clean_overlay_source_content_root(
         directories,
         clean_overlay: Some(spec.clone()),
         clean_overlay_namespace: Some(Arc::new(namespace)),
+        prepared_dependencies: None,
         coalesced: Vec::new(),
     };
     // Runtime-owned exclusions must not silently hide a selected source path.
@@ -953,16 +970,12 @@ async fn clean_overlay_namespace_pipeline(
         .clone()
         .with_local_root(namespace.path().to_owned());
     let (files, directories) = pipeline.enumerate_clean_overlay_source_namespace().await?;
-    let mut expected_files = root
-        .manifest
-        .files
-        .iter()
-        .map(|file| PathBuf::from(&file.path))
-        .collect::<Vec<_>>();
+    let (mut expected_files, expected_directories) =
+        prepared_dependencies::namespace_inventory(root)?;
     // Archive manifests use String order; enumeration uses PathBuf order.
     expected_files.sort();
     anyhow::ensure!(
-        files == expected_files && directories == root.directories,
+        files == expected_files && directories == expected_directories,
         "selected source collides with an owned RCH runtime namespace or its namespace skeleton changed"
     );
     Ok(pipeline)
@@ -1991,8 +2004,28 @@ async fn verify_remote_root(
             }
         }
     }
-    let payload = remote_manifest_payload(&root.manifest)?;
-    let command = remote_verify_command(&root.manifest);
+    verify_remote_manifest(worker, &root.manifest, source_identity).await?;
+    if let Some(manifest) = prepared_dependencies::verification_manifest(root)? {
+        anyhow::ensure!(
+            source_identity
+                == root
+                    .prepared_dependencies
+                    .as_ref()
+                    .map(|proof| proof.source_owner()),
+            "prepared dependency verification requires its exact source owner"
+        );
+        verify_remote_manifest(worker, &manifest, source_identity).await?;
+    }
+    Ok(())
+}
+
+async fn verify_remote_manifest(
+    worker: &WorkerConfig,
+    manifest: &SourceContentRootManifest,
+    source_identity: Option<&str>,
+) -> anyhow::Result<()> {
+    let payload = remote_manifest_payload(manifest)?;
+    let command = remote_verify_command(manifest);
     let (command, payload) = match source_identity {
         Some(identity) => {
             let script = remote_manifest_verifier_script(&command, &payload)?;
@@ -2012,7 +2045,7 @@ async fn verify_remote_root(
         anyhow::bail!(
             "remote source-content verification failed on {} for {} (exit {:?}): {}",
             worker.id,
-            root.manifest.project_id,
+            manifest.project_id,
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -2021,19 +2054,19 @@ async fn verify_remote_root(
         anyhow::bail!(
             "remote source-content verification produced stderr on {} for {}: {}",
             worker.id,
-            root.manifest.project_id,
+            manifest.project_id,
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     let expected = format!(
         "RCH_SOURCE_CONTENT_VERIFIED\t{}\t{}\n",
-        root.manifest.file_count, root.manifest.byte_count
+        manifest.file_count, manifest.byte_count
     );
     if output.stdout != expected.as_bytes() {
         anyhow::bail!(
             "remote source-content verification envelope mismatch on {} for {}: {:?}",
             worker.id,
-            root.manifest.project_id,
+            manifest.project_id,
             String::from_utf8_lossy(&output.stdout)
         );
     }
@@ -2137,24 +2170,33 @@ fn source_content_receipt_for_verified_roots(
         .collect::<Vec<_>>();
     let command_sha256 = sha256_hex(command.as_bytes());
     let build_id = build_id.to_string();
+    let prepared_dependencies =
+        prepared_dependencies::receipt_attestations(prepared, &build_id, &command_sha256)?;
+    let schema = if prepared_dependencies.is_empty() {
+        RECEIPT_SCHEMA
+    } else {
+        PREPARED_RECEIPT_SCHEMA
+    };
     let preimage = SourceContentReceiptPreimage {
-        schema: RECEIPT_SCHEMA,
+        schema,
         worker_id: worker.id.as_str(),
         build_id: &build_id,
         command_sha256: &command_sha256,
         command_exit_code,
         root_count: roots.len(),
         roots: &roots,
+        prepared_dependencies: &prepared_dependencies,
     };
     let receipt_root = sha256_hex(&serde_json::to_vec(&preimage)?);
     Ok(SourceContentReceipt {
-        schema: RECEIPT_SCHEMA,
+        schema,
         worker_id: worker.id.as_str().to_string(),
         build_id,
         command_sha256,
         command_exit_code,
         root_count: roots.len(),
         roots,
+        prepared_dependencies,
         receipt_root,
     })
 }
@@ -3584,6 +3626,7 @@ sys.exit(99)
                         command_exit_code: exit_code,
                         root_count: roots.len(),
                         roots,
+                        prepared_dependencies: &[],
                     })
                     .unwrap(),
                 )
@@ -3604,6 +3647,7 @@ sys.exit(99)
             command_exit_code: 0,
             root_count: 1,
             roots: vec![root],
+            prepared_dependencies: Vec::new(),
             receipt_root: baseline,
         };
         let wire: serde_json::Value = serde_json::from_str(&receipt.canonical_json().unwrap())
@@ -4267,6 +4311,417 @@ sys.exit(99)
         .with_sync_delete(false)
         .with_sync_checksum(true);
         (entry, pipeline)
+    }
+
+    #[cfg(unix)]
+    mod prepared_node_dependencies {
+        use super::*;
+        use rch_common::prepared_dependencies::{
+            PREPARED_DEPENDENCY_VERSION, PreparedDependencyAttestation,
+            PreparedDependencyDisposition, PreparedDependencyFile, PreparedDependencyFileKind,
+            PreparedDependencyInventory, PreparedDependencyRequest, PreparedDependencyState,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        const COMMAND: &str = "bun test tests/selected.test.ts";
+        const BUILD_ID: u64 = 30_095_696_984_016_289;
+
+        struct Fixture {
+            roots: Vec<PreparedSourceContentRoot>,
+            remote: PathBuf,
+            request: PreparedDependencyRequest,
+            state: PreparedDependencyState,
+        }
+
+        async fn fixture() -> Fixture {
+            let (local, _) = build_source_stamp_fixture_repo();
+            for (relative, bytes) in [
+                (
+                    "vittles/package.json",
+                    b"{\"name\":\"proof-fixture\"}\n".as_slice(),
+                ),
+                ("vittles/bun.lock", b"frozen fixture lock\n".as_slice()),
+                (
+                    "vittles/node_modules/pinned.txt",
+                    b"selected vendored source\n".as_slice(),
+                ),
+            ] {
+                let path = local.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            build_source_stamp_git(&local, &["add", "-f", "."]);
+            build_source_stamp_git_commit(&local, "selected Node proof fixture");
+            let spec = prepare_clean_overlay_spec(
+                &local.join("vittles"),
+                Some("HEAD".into()),
+                true,
+                vec![],
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let remote = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+            let root = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+                .await
+                .unwrap();
+            let archive =
+                TransferPipeline::create_selected_git_archive(&local, spec.base_commit(), &[], &[])
+                    .await
+                    .unwrap();
+            tar::Archive::new(archive.reopen().unwrap())
+                .unpack(&remote)
+                .unwrap();
+            let roots = vec![root];
+            let request = prepare_dependency_request(
+                &roots,
+                remote.join("vittles").to_str().unwrap(),
+                Some(CompilationKind::BunTest),
+                BUILD_ID,
+                "prepared-node-attempt",
+                &"a".repeat(64),
+                COMMAND,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(request.project_relative, "vittles");
+            assert_eq!(request.source_root, remote.to_str().unwrap());
+
+            let output_bytes = b"console.log('prepared');\n";
+            for directory in ["vittles/node_modules/.bin", "vittles/node_modules/pkg"] {
+                std::fs::create_dir_all(remote.join(directory)).unwrap();
+            }
+            let output = remote.join("vittles/node_modules/pkg/bin.js");
+            std::fs::write(&output, output_bytes).unwrap();
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink(
+                "../pkg/bin.js",
+                remote.join("vittles/node_modules/.bin/tool"),
+            )
+            .unwrap();
+            let inventory = PreparedDependencyInventory {
+                files: vec![
+                    PreparedDependencyFile {
+                        path: "vittles/node_modules/.bin/tool".into(),
+                        kind: PreparedDependencyFileKind::Symlink,
+                        sha256: sha256_hex(b"../pkg/bin.js"),
+                        byte_count: 13,
+                        executable: false,
+                        symlink_target: Some("../pkg/bin.js".into()),
+                    },
+                    PreparedDependencyFile {
+                        path: "vittles/node_modules/pkg/bin.js".into(),
+                        kind: PreparedDependencyFileKind::Regular,
+                        sha256: sha256_hex(output_bytes),
+                        byte_count: output_bytes.len() as u64,
+                        executable: true,
+                        symlink_target: None,
+                    },
+                ],
+                directories: vec![
+                    "vittles/node_modules".into(),
+                    "vittles/node_modules/.bin".into(),
+                    "vittles/node_modules/pkg".into(),
+                ],
+            };
+            let metadata = std::fs::metadata(remote.join("vittles")).unwrap();
+            let state = PreparedDependencyState {
+                version: PREPARED_DEPENDENCY_VERSION,
+                project: remote.join("vittles").to_str().unwrap().into(),
+                root_device: metadata.dev(),
+                root_inode: metadata.ino(),
+                input_fingerprint: "b".repeat(64),
+                package_manager: "bun".into(),
+                frozen: true,
+                inventory_digest: inventory.digest().unwrap(),
+                inventory,
+            };
+            state.validate_for(&request).unwrap();
+            Fixture {
+                roots,
+                remote,
+                request,
+                state,
+            }
+        }
+
+        fn attestation(fixture: &Fixture) -> PreparedDependencyAttestation {
+            PreparedDependencyAttestation {
+                version: PREPARED_DEPENDENCY_VERSION,
+                request_digest: fixture.request.digest().unwrap(),
+                state_digest: fixture.state.digest().unwrap(),
+                state: fixture.state.clone(),
+                disposition: PreparedDependencyDisposition::Fresh,
+            }
+        }
+
+        async fn worker_names(fixture: &Fixture) -> (Vec<PathBuf>, Vec<PathBuf>) {
+            // Actual rsync enumeration applies the production namespace filter
+            // to the real worker tree, including symlinks and empty directories.
+            fixture.roots[0]
+                .pipeline
+                .clone()
+                .with_local_root(fixture.remote.clone())
+                .enumerate_clean_overlay_source_namespace()
+                .await
+                .unwrap()
+        }
+
+        fn verify_bytes(manifest: &SourceContentRootManifest) -> std::process::Output {
+            run_source_verifier(
+                manifest,
+                &remote_manifest_payload(manifest).unwrap(),
+                None,
+                true,
+            )
+        }
+
+        #[tokio::test]
+        async fn completed_preparation_joins_exact_namespace_and_receipt_without_changing_source() {
+            let mut fixture = fixture().await;
+            let selected = fixture.roots[0].manifest.clone();
+            let selected_directories = fixture.roots[0].directories.clone();
+            let before = prepared_dependencies::namespace_inventory(&fixture.roots[0]).unwrap();
+            let actual = worker_names(&fixture).await;
+            assert_ne!(
+                before, actual,
+                "selected-only namespace must reject installer outputs"
+            );
+            assert!(verify_bytes(&selected).status.success());
+            let worker = WorkerConfig::default();
+            let ordinary = source_content_receipt_for_verified_roots(
+                &worker,
+                BUILD_ID,
+                COMMAND,
+                0,
+                &fixture.roots,
+            )
+            .unwrap();
+            assert_eq!(ordinary.schema, RECEIPT_SCHEMA);
+            assert!(
+                serde_json::to_value(&ordinary)
+                    .unwrap()
+                    .get("prepared_dependencies")
+                    .is_none()
+            );
+
+            attach_prepared_state(&mut fixture.roots, &fixture.request, &fixture.state)
+                .await
+                .unwrap();
+            assert_eq!(
+                prepared_dependencies::namespace_inventory(&fixture.roots[0]).unwrap(),
+                actual
+            );
+            clean_overlay_namespace_pipeline(&fixture.roots[0])
+                .await
+                .unwrap();
+            assert!(
+                source_content_receipt_for_verified_roots(
+                    &worker,
+                    BUILD_ID,
+                    COMMAND,
+                    0,
+                    &fixture.roots,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("prior prepared dependency state")
+            );
+            let evidence = attestation(&fixture);
+            attach_prepared_attestation(&mut fixture.roots, &fixture.request, &evidence)
+                .await
+                .unwrap();
+            assert_eq!(fixture.roots[0].manifest, selected);
+            assert_eq!(fixture.roots[0].directories, selected_directories);
+            let outputs = prepared_dependencies::verification_manifest(&fixture.roots[0])
+                .unwrap()
+                .unwrap();
+            let checked = verify_bytes(&outputs);
+            assert!(checked.status.success(), "{checked:?}");
+            assert!(checked.stderr.is_empty());
+            let receipt = source_content_receipt_for_verified_roots(
+                &worker,
+                BUILD_ID,
+                COMMAND,
+                0,
+                &fixture.roots,
+            )
+            .unwrap();
+            assert_eq!(receipt.schema, PREPARED_RECEIPT_SCHEMA);
+            assert_eq!(receipt.roots, vec![selected]);
+            assert_eq!(receipt.prepared_dependencies, vec![evidence]);
+            assert_ne!(receipt.receipt_root, ordinary.receipt_root);
+            let encoded = receipt.canonical_json().unwrap();
+            assert!(encoded.contains("vittles/node_modules/pinned.txt"));
+            assert!(encoded.contains("vittles/node_modules/pkg/bin.js"));
+            assert!(
+                source_content_receipt_for_verified_roots(
+                    &worker,
+                    BUILD_ID + 1,
+                    COMMAND,
+                    0,
+                    &fixture.roots,
+                )
+                .is_err()
+            );
+            assert!(
+                source_content_receipt_for_verified_roots(
+                    &worker,
+                    BUILD_ID,
+                    "bun test other.test.ts",
+                    0,
+                    &fixture.roots,
+                )
+                .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn prepared_namespace_and_sha_still_refuse_unknown_outputs_and_mutations() {
+            for unknown in [
+                "vittles/node_modules/pkg/unregistered.js",
+                "vittles/.cargo/config.toml",
+                "vittles/Cargo.toml",
+            ] {
+                let mut fixture = fixture().await;
+                let evidence = attestation(&fixture);
+                attach_prepared_attestation(&mut fixture.roots, &fixture.request, &evidence)
+                    .await
+                    .unwrap();
+                let path = fixture.remote.join(unknown);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"unregistered input\n").unwrap();
+                assert_ne!(
+                    prepared_dependencies::namespace_inventory(&fixture.roots[0]).unwrap(),
+                    worker_names(&fixture).await,
+                    "unknown path must still refuse: {unknown}"
+                );
+            }
+            let mut fixture = fixture().await;
+            let evidence = attestation(&fixture);
+            attach_prepared_attestation(&mut fixture.roots, &fixture.request, &evidence)
+                .await
+                .unwrap();
+            let output = prepared_dependencies::verification_manifest(&fixture.roots[0])
+                .unwrap()
+                .unwrap();
+            std::fs::write(
+                fixture.remote.join("vittles/node_modules/pkg/bin.js"),
+                b"console.log('corrupt!');\n",
+            )
+            .unwrap();
+            assert_eq!(
+                prepared_dependencies::namespace_inventory(&fixture.roots[0]).unwrap(),
+                worker_names(&fixture).await
+            );
+            let changed = verify_bytes(&output);
+            assert!(!changed.status.success(), "{changed:?}");
+            assert!(changed.stdout.is_empty());
+            std::fs::write(
+                fixture.remote.join("vittles/node_modules/pinned.txt"),
+                b"installer changed selected source\n",
+            )
+            .unwrap();
+            let selected = verify_bytes(&fixture.roots[0].manifest);
+            assert!(
+                !selected.status.success(),
+                "tracked node_modules is still source: {selected:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn preparation_attachment_refuses_other_attempts_roots_and_selected_changes() {
+            let mut fixture = fixture().await;
+            for kind in [
+                None,
+                Some(CompilationKind::CargoCheck),
+                Some(CompilationKind::GoTest),
+            ] {
+                assert!(
+                    prepare_dependency_request(
+                        &fixture.roots,
+                        fixture.remote.to_str().unwrap(),
+                        kind,
+                        BUILD_ID,
+                        "prepared-node-attempt",
+                        &"a".repeat(64),
+                        COMMAND,
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            for cwd in [
+                fixture.remote.clone(),
+                fixture.remote.join("vittles/../vittles"),
+            ] {
+                assert!(
+                    prepare_dependency_request(
+                        &fixture.roots,
+                        cwd.to_str().unwrap(),
+                        Some(CompilationKind::BunTest),
+                        BUILD_ID,
+                        "prepared-node-attempt",
+                        &"a".repeat(64),
+                        COMMAND,
+                    )
+                    .is_err()
+                );
+            }
+            let mut replaced = fixture.request.clone();
+            replaced.files[0].sha256 = "f".repeat(64);
+            assert!(
+                attach_prepared_state(&mut fixture.roots, &replaced, &fixture.state)
+                    .await
+                    .is_err()
+            );
+            assert!(fixture.roots[0].prepared_dependencies.is_none());
+            attach_prepared_state(&mut fixture.roots, &fixture.request, &fixture.state)
+                .await
+                .unwrap();
+            let original_runtime =
+                prepared_dependencies::verification_manifest(&fixture.roots[0]).unwrap();
+            replaced = fixture.request.clone();
+            replaced.attempt_id.push_str("-other");
+            assert!(
+                attach_prepared_state(&mut fixture.roots, &replaced, &fixture.state)
+                    .await
+                    .is_err()
+            );
+            let mut changed = fixture.state.clone();
+            changed.inventory.files.push(
+                fixture
+                    .request
+                    .files
+                    .iter()
+                    .find(|file| file.path == "vittles/node_modules/pinned.txt")
+                    .unwrap()
+                    .clone(),
+            );
+            changed
+                .inventory
+                .files
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            changed
+                .inventory
+                .files
+                .iter_mut()
+                .find(|file| file.path.ends_with("pinned.txt"))
+                .unwrap()
+                .executable = true;
+            changed.inventory_digest = changed.inventory.digest().unwrap();
+            assert!(
+                attach_prepared_state(&mut fixture.roots, &fixture.request, &changed)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                prepared_dependencies::verification_manifest(&fixture.roots[0]).unwrap(),
+                original_runtime
+            );
+        }
     }
 
     #[cfg(unix)]

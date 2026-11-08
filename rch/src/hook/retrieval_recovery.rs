@@ -75,6 +75,11 @@ pub(crate) struct RecoveryRecipe {
     /// until its complete, same-attempt Cargo receipt supplies the output set.
     #[serde(default)]
     cargo_output_capture: Option<CargoOutputCapture>,
+    /// A required source-qualified dependency phase must be accepted before
+    /// execution. Recovery retains this binding but never reconstructs a
+    /// source receipt from post-workload files or ordinary delivery success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_dependencies: Option<PreparedDependencyRequirement>,
     /// Complete same-attempt stdout retained outside disposable staging trees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cargo_stdout: Option<RetainedCargoStdout>,
@@ -125,6 +130,17 @@ pub(crate) struct RecoveryRecipe {
     pair_released: bool,
     #[serde(default)]
     retired: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedDependencyRequirement {
+    request_digest: String,
+    source_content_root: String,
+    command_sha256: String,
+    source_root: String,
+    project_relative: String,
+    attestation_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1383,6 +1399,7 @@ impl RecoverySession {
             allow_foreign: false,
             package_archive: false,
             cargo_output_capture: None,
+            prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
             caller_json_policy: None,
@@ -1568,6 +1585,7 @@ impl RecoverySession {
             allow_foreign: foreign_artifact_gate_disabled(),
             package_archive: sync_back_verified_zero_package_archives(Some(0), command),
             cargo_output_capture,
+            prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
             caller_json_policy: None,
@@ -2367,12 +2385,74 @@ impl RecoverySession {
         Ok(())
     }
 
+    pub(crate) fn require_prepared_dependencies(
+        &mut self,
+        request: &rch_common::prepared_dependencies::PreparedDependencyRequest,
+    ) -> anyhow::Result<()> {
+        request.validate()?;
+        anyhow::ensure!(
+            self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && self.recipe.prepared_dependencies.is_none()
+                && request.attempt_id == self.recipe.identity
+                && request.source_owner == self.recipe.identity
+                && request.build_id == self.recipe.build_id.to_string()
+                && self.recipe.source_roots.contains(&request.source_root),
+            "dependency preparation requires the current unconsumed source grant"
+        );
+        let mut next_recipe = self.recipe.clone();
+        next_recipe.prepared_dependencies = Some(PreparedDependencyRequirement {
+            request_digest: request.digest()?,
+            source_content_root: request.source_content_root.clone(),
+            command_sha256: request.command_sha256.clone(),
+            source_root: request.source_root.clone(),
+            project_relative: request.project_relative.clone(),
+            attestation_digest: None,
+        });
+        self.persist_next_recipe(next_recipe)
+    }
+
+    pub(crate) fn accept_prepared_dependencies(
+        &mut self,
+        request: &rch_common::prepared_dependencies::PreparedDependencyRequest,
+        attestation: &rch_common::prepared_dependencies::PreparedDependencyAttestation,
+    ) -> anyhow::Result<()> {
+        attestation.validate_for(request)?;
+        let required = self
+            .recipe
+            .prepared_dependencies
+            .as_ref()
+            .context("dependency attestation has no persisted requirement")?;
+        anyhow::ensure!(
+            !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && required.attestation_digest.is_none()
+                && required.request_digest == request.digest()?,
+            "dependency attestation does not match the pending preparation"
+        );
+        let mut next_recipe = self.recipe.clone();
+        next_recipe
+            .prepared_dependencies
+            .as_mut()
+            .context("dependency requirement disappeared")?
+            .attestation_digest = Some(attestation.digest()?);
+        self.persist_next_recipe(next_recipe)
+    }
+
     pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recipe.prepared
                 && !self.recipe.execution_started
                 && !self.recipe.preparation_cancelled
-                && !self.recipe.sources_released,
+                && !self.recipe.sources_released
+                && self
+                    .recipe
+                    .prepared_dependencies
+                    .as_ref()
+                    .is_none_or(|required| { required.attestation_digest.is_some() }),
             "execution requires an unconsumed prepared source grant"
         );
         let mut next_recipe = self.recipe.clone();
@@ -11520,6 +11600,95 @@ mod tests {
         assert!(
             session.starting_execution().is_err(),
             "a prepared execution is consumed once"
+        );
+    }
+
+    #[test]
+    fn prepared_dependencies_must_be_accepted_and_durable_before_execution() {
+        use rch_common::prepared_dependencies::{
+            PREPARED_DEPENDENCY_VERSION, PreparedDependencyAttestation,
+            PreparedDependencyDisposition, PreparedDependencyFile, PreparedDependencyFileKind,
+            PreparedDependencyInventory, PreparedDependencyRequest, PreparedDependencyState,
+        };
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+        };
+        session.recipe.prepared = true;
+        let request = PreparedDependencyRequest {
+            schema_version: PREPARED_DEPENDENCY_VERSION,
+            attempt_id: session.recipe.identity.clone(),
+            source_owner: session.recipe.identity.clone(),
+            build_id: session.recipe.build_id.to_string(),
+            command_sha256: "a".repeat(64),
+            source_content_root: "b".repeat(64),
+            source_root: session.recipe.source_roots[0].clone(),
+            project_relative: String::new(),
+            files: vec![PreparedDependencyFile {
+                path: "package.json".into(),
+                kind: PreparedDependencyFileKind::Regular,
+                sha256: "c".repeat(64),
+                byte_count: 2,
+                executable: false,
+                symlink_target: None,
+            }],
+            directories: Vec::new(),
+        };
+        session.require_prepared_dependencies(&request).unwrap();
+        let pending = load_recipe(&writer).unwrap();
+        assert!(pending.prepared_dependencies.is_some());
+        assert!(
+            pending
+                .prepared_dependencies
+                .unwrap()
+                .attestation_digest
+                .is_none()
+        );
+        assert!(session.starting_execution().is_err());
+
+        let inventory = PreparedDependencyInventory::default();
+        let state = PreparedDependencyState {
+            version: PREPARED_DEPENDENCY_VERSION,
+            project: request.source_root.clone(),
+            root_device: 1,
+            root_inode: 2,
+            input_fingerprint: "d".repeat(64),
+            package_manager: "bun".into(),
+            frozen: true,
+            inventory_digest: inventory.digest().unwrap(),
+            inventory,
+        };
+        let attestation = PreparedDependencyAttestation {
+            version: PREPARED_DEPENDENCY_VERSION,
+            request_digest: request.digest().unwrap(),
+            state_digest: state.digest().unwrap(),
+            state,
+            disposition: PreparedDependencyDisposition::Fresh,
+        };
+        let mut other_attempt = request.clone();
+        other_attempt.attempt_id.push_str("-other");
+        assert!(
+            session
+                .accept_prepared_dependencies(&other_attempt, &attestation)
+                .is_err()
+        );
+        assert!(session.starting_execution().is_err());
+        session
+            .accept_prepared_dependencies(&request, &attestation)
+            .unwrap();
+        let accepted = load_recipe(&writer).unwrap();
+        assert_eq!(
+            accepted.prepared_dependencies.unwrap().attestation_digest,
+            Some(attestation.digest().unwrap())
+        );
+        assert!(!accepted.execution_started);
+        session.starting_execution().unwrap();
+        assert!(load_recipe(&writer).unwrap().execution_started);
+        assert!(
+            session
+                .accept_prepared_dependencies(&request, &attestation)
+                .is_err()
         );
     }
 

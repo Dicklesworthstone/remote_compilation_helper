@@ -15,8 +15,31 @@ if [ "$#" -lt 2 ]; then
     printf 'rch: missing prepared workload; the command was not run\n' >&2
     exit 121
 fi
-if [ -e package.json ] || [ -L package.json ]; then
-    if rch-wkr prepare --project . --runtime "$1" </dev/null 1>&2; then
+rch_prepare_runtime=$1
+shift
+rch_prepare_proved=0
+if [ "${1-}" = --source-proof ]; then
+    if [ "$#" -lt 4 ]; then
+        printf 'rch: incomplete dependency proof binding; the command was not run\n' >&2
+        exit 121
+    fi
+    # The accepted request is durable worker state. Only its small digests
+    # cross exec argv; the complete source manifest never enters shell argv.
+    if rch-wkr prepare-proof --mode verify --project . --runtime "$rch_prepare_runtime" \
+        --expected-request-digest "$2" --expected-attestation-digest "$3" </dev/null 1>&2; then
+        rch_prepare_proved=1
+        shift 3
+    else
+        rch_prepare_status=$?
+        printf 'rch: prepared dependency verification failed (exit %s); the command was not run\n' \
+            "$rch_prepare_status" >&2
+        exit 121
+    fi
+fi
+if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ]; then
+    if [ "$rch_prepare_proved" = 1 ]; then
+        :
+    elif rch-wkr prepare --project . --runtime "$rch_prepare_runtime" </dev/null 1>&2; then
         :
     else
         rch_prepare_status=$?
@@ -51,5 +74,4 @@ if [ -e package.json ] || [ -L package.json ]; then
         export PATH
     fi
 fi
-shift
 exec "$@"

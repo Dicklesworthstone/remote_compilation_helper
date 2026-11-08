@@ -47,13 +47,15 @@ use super::progress_reporting::{
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
-    PreparedSourceContentRoot, attach_coalesced_source_roots, bind_build_source_aliases,
-    build_source_commit_env, capture_build_source_stamp, coalesce_source_content_plan,
+    PreparedSourceContentRoot, attach_coalesced_source_roots, attach_prepared_attestation,
+    attach_prepared_state, bind_build_source_aliases, build_source_commit_env,
+    capture_build_source_stamp, coalesce_source_content_plan,
     finalize_owned_source_content_receipt, finalize_source_content_receipt,
     guard_owned_source_content_cargo_config, owned_source_content_freshness_identity,
-    prepare_clean_overlay_source_content_root, prepare_source_content_root,
-    reconcile_build_source_stamps, validate_owned_source_content_closure,
-    verify_coalesced_source_plan, verify_owned_source_content_roots, verify_source_content_roots,
+    prepare_clean_overlay_source_content_root, prepare_dependency_request,
+    prepare_source_content_root, reconcile_build_source_stamps,
+    validate_owned_source_content_closure, verify_coalesced_source_plan,
+    verify_owned_source_content_roots, verify_source_content_roots,
 };
 use super::ssh::{
     acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
@@ -2491,7 +2493,7 @@ async fn execute_remote_compilation_inner(
                 &normalized_project_root,
             )?;
     }
-    let pipeline = match recovery_session.as_ref() {
+    let mut pipeline = match recovery_session.as_ref() {
         Some(session) => session.completion_pipeline(pipeline),
         None => pipeline,
     };
@@ -2574,6 +2576,47 @@ async fn execute_remote_compilation_inner(
         .await?;
     }
 
+    let dependency_request = source_content_build_id
+        .map(|build_id| {
+            prepare_dependency_request(
+                &prepared_source_roots,
+                &pipeline.remote_path(),
+                kind,
+                build_id,
+                &recovery_identity,
+                source_identity.unwrap_or_default(),
+                caller_command,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if let Some(request) = dependency_request.as_ref() {
+        recovery_session
+            .as_mut()
+            .context("qualified dependency preparation requires durable recovery ownership")?
+            .require_prepared_dependencies(request)?;
+        let timeout = rch_common::timing::scale_duration(Duration::from_secs(180));
+        let script = pipeline.inspect_prepared_dependencies_script(request, timeout)?;
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            script.as_bytes(),
+            timeout,
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "retained dependency verification failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let state: Option<rch_common::prepared_dependencies::PreparedDependencyState> =
+            serde_json::from_slice(&output.stdout)
+                .context("worker returned an invalid retained dependency inventory")?;
+        if let Some(state) = state.as_ref() {
+            attach_prepared_state(&mut prepared_source_roots, request, state).await?;
+        }
+    }
+
     if source_content_build_id.is_some() {
         if prepared_source_roots.len() != sync_plan.len() {
             anyhow::bail!(
@@ -2634,6 +2677,49 @@ async fn execute_remote_compilation_inner(
             verify_source_content_roots(&worker_config, &prepared_source_roots, source_identity)
                 .await?;
         }
+    }
+    if let Some(request) = dependency_request.as_ref() {
+        reporter.verbose("[RCH] preparing and verifying frozen Node dependencies");
+        let (phase, timeout) = pipeline.dependency_preparation_phase()?;
+        let script = phase.install_prepared_dependencies_script(request, timeout)?;
+        let started = std::time::Instant::now();
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            script.as_bytes(),
+            timeout,
+        )
+        .await
+        .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+        let mut result = rch_common::CommandResult {
+            exit_code: output
+                .status
+                .code()
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?,
+            stdout: String::from_utf8(output.stdout)
+                .context("dependency attestation is not UTF-8")?,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        // The complete phase receipt is outside the bounded SSH preview. It
+        // cannot be confused with the workload's independently named receipt.
+        if let Some(receipt) = phase.read_remote_disk_receipt(&worker_config).await? {
+            result.stderr.push_str(&receipt);
+        }
+        let growth_bytes = phase.confirm_dependency_preparation(&result)?;
+        let attestation: rch_common::prepared_dependencies::PreparedDependencyAttestation =
+            serde_json::from_str(&result.stdout)
+                .context("worker returned an invalid completed dependency attestation")?;
+        attach_prepared_attestation(&mut prepared_source_roots, request, &attestation).await?;
+        // This barrier detects installer writes anywhere in the source root,
+        // including unselected configuration outside the admitted runtime set.
+        verify_source_content_roots(&worker_config, &prepared_source_roots, source_identity)
+            .await?;
+        pipeline.accept_prepared_dependencies(request, &attestation, growth_bytes)?;
+        recovery_session
+            .as_mut()
+            .context("prepared dependencies lost their recovery owner")?
+            .accept_prepared_dependencies(request, &attestation)?;
     }
     if let Some(lock) = source_authority_lock.as_mut() {
         lock.ensure_held()?;
@@ -2757,6 +2843,7 @@ async fn execute_remote_compilation_inner(
     let mut suppress_telemetry = false;
     let defer_cargo_stdout = reporter.cargo_json_stdout;
 
+    pipeline.ensure_prepared_execution_time()?;
     if let Some(session) = recovery_session.as_mut() {
         session.verify_publication_suitability().await?;
         session.starting_execution()?;

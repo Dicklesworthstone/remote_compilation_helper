@@ -75,8 +75,11 @@ pub struct PreparedDependencyRequest {
 pub struct PreparedDependencyState {
     pub version: u32,
     pub project: String,
-    /// Device and inode of the canonical preparation project directory.
+    /// Device and inode of the canonical preparation project directory. Their
+    /// decimal-string wire representation preserves all bits in Node/Bun.
+    #[serde(with = "decimal_u64")]
     pub root_device: u64,
+    #[serde(with = "decimal_u64")]
     pub root_inode: u64,
     pub input_fingerprint: String,
     pub package_manager: String,
@@ -100,6 +103,25 @@ pub struct PreparedDependencyAttestation {
     pub state_digest: String,
     pub state: PreparedDependencyState,
     pub disposition: PreparedDependencyDisposition,
+}
+
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(super) fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        // String deserialization deliberately refuses JSON numbers, including
+        // small ones: one canonical wire type keeps digest reconstruction exact.
+        let value = String::deserialize(deserializer)?;
+        let parsed = value.parse::<u64>().map_err(D::Error::custom)?;
+        if parsed.to_string() != value {
+            return Err(D::Error::custom("expected a canonical decimal u64 string"));
+        }
+        Ok(parsed)
+    }
 }
 
 fn require(condition: bool, reason: impl Into<String>) -> Result<()> {
@@ -1000,6 +1022,57 @@ mod tests {
         let mut changed = state();
         changed.frozen = false;
         assert!(changed.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn filesystem_identifiers_preserve_full_u64_values_in_json_strings() {
+        let mut state = state();
+        state.root_device = (1_u64 << 53) + 1;
+        state.root_inode = u64::MAX;
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["root_device"], "9007199254740993");
+        assert_eq!(wire["root_inode"], "18446744073709551615");
+        let restored: PreparedDependencyState = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.digest().unwrap(), state.digest().unwrap());
+        state.root_device = 0;
+        state.root_inode = 1;
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["root_device"], "0");
+        assert_eq!(wire["root_inode"], "1");
+        assert_eq!(
+            serde_json::from_value::<PreparedDependencyState>(wire).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn filesystem_identifiers_refuse_numeric_and_noncanonical_wire_values() {
+        for field in ["root_device", "root_inode"] {
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(1),
+                serde_json::json!((1_u64 << 53) + 1),
+                serde_json::json!(u64::MAX),
+                serde_json::json!(""),
+                serde_json::json!("01"),
+                serde_json::json!("+1"),
+                serde_json::json!("-1"),
+                serde_json::json!(" 1"),
+                serde_json::json!("1 "),
+                serde_json::json!("1.0"),
+                serde_json::json!("1e3"),
+                serde_json::json!("18446744073709551616"),
+                serde_json::json!(null),
+            ] {
+                let mut wire = serde_json::to_value(state()).unwrap();
+                wire[field] = value.clone();
+                assert!(
+                    serde_json::from_value::<PreparedDependencyState>(wire).is_err(),
+                    "{field} accepted {value}"
+                );
+            }
+        }
     }
 
     #[test]

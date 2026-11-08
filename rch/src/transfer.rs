@@ -6,6 +6,7 @@
 #[cfg(test)]
 #[path = "transfer/node_prepare_tests.rs"]
 mod node_prepare_tests;
+mod prepared_dependencies;
 mod retrieval_space;
 #[cfg(all(test, unix))]
 mod retrieval_space_tests;
@@ -3112,6 +3113,13 @@ struct CargoDiskCache {
 pub struct TransferPipeline {
     /// Correlates deadline enforcement with this execution, independently of exit 137.
     deadline_marker: String,
+    /// One wall-clock budget covers qualified preparation and the workload.
+    prepared_execution_deadline: Option<TokioInstant>,
+    /// A finite source RPC already owns the preparation process group. Its
+    /// disk guardian must remain inside that group through activity teardown.
+    source_activity_owns_execution: bool,
+    /// An accepted preparation is verified again, never installed by execution.
+    prepared_dependencies: Option<prepared_dependencies::PreparedDependencyExecution>,
     /// Absolute worker headroom and allocated-output growth reservation.
     disk_budget: Option<rch_common::BuildDiskBudget>,
     /// Whole selected source root when execution is rebased to a subdirectory.
@@ -3311,6 +3319,9 @@ impl TransferPipeline {
 
         Self {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
+            prepared_execution_deadline: None,
+            source_activity_owns_execution: false,
+            prepared_dependencies: None,
             disk_budget: None,
             disk_source_root: None,
             cargo_disk_cache: None,
@@ -5868,7 +5879,7 @@ impl TransferPipeline {
         let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
         let plan = escape(Cow::Owned(plan.to_string()));
         let command = escape(Cow::Borrowed(command));
-        let mode = if self.build_id.is_some() {
+        let mode = if self.build_id.is_some() || self.source_activity_owns_execution {
             "tracked"
         } else {
             "standalone"
@@ -6128,10 +6139,23 @@ exit \"$__rch_disk_status\"; }}"
 
     /// Build the full remote command string with all wrappers.
     fn build_remote_command(&self, command: &str, toolchain: Option<&ToolchainInfo>) -> String {
+        self.build_remote_command_with_preparation(command, toolchain, true)
+    }
+
+    fn build_remote_command_with_preparation(
+        &self,
+        command: &str,
+        toolchain: Option<&ToolchainInfo>,
+        prepare_dependencies: bool,
+    ) -> String {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
-        let toolchain_command = self.wrap_with_dependency_preparation(toolchain_command);
+        let toolchain_command = if prepare_dependencies {
+            self.wrap_with_dependency_preparation(toolchain_command)
+        } else {
+            toolchain_command
+        };
 
         let env_plan = self.build_remote_env_plan(&remote_path);
         if !env_plan.env_prefix.applied.is_empty() {
@@ -6157,13 +6181,7 @@ exit \"$__rch_disk_status\"; }}"
         // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
         // Same source of truth as `wrap_with_external_timeout`, applied via an
         // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
-        let external_timeout_secs = if self.compilation_config.external_timeout_enabled() {
-            self.compilation_config
-                .timeout_for_kind(self.compilation_kind)
-                .as_secs()
-        } else {
-            0
-        };
+        let external_timeout_secs = self.prepared_execution_timeout_seconds();
         let colored_command = self.wrap_with_disk_budget(
             &colored_command,
             &env_plan.ensure_dirs,
@@ -6352,14 +6370,22 @@ mkdir -p {} && rm -f {} && {launch}",
     /// Prepare TypeScript and Bun dependencies through the worker's fingerprint
     /// and transaction checks, including when `node_modules` already exists.
     fn wrap_with_dependency_preparation(&self, command: String) -> String {
-        let runtime = match self.compilation_kind {
-            Some(CompilationKind::Tsc) => "node",
-            Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => "bun",
-            _ => return command,
+        let Some(runtime) = self.dependency_runtime() else {
+            return command;
         };
         let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
         let command = escape(Cow::from(command.as_str()));
-        format!("sh -c {script} rch-prepare {runtime} sh -c {command}")
+        let proof = self
+            .prepared_dependencies
+            .as_ref()
+            .map(|proof| {
+                format!(
+                    " --source-proof {} {}",
+                    proof.request_digest, proof.attestation_digest
+                )
+            })
+            .unwrap_or_default();
+        format!("sh -c {script} rch-prepare {runtime}{proof} sh -c {command}")
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
@@ -6386,16 +6412,11 @@ mkdir -p {} && rm -f {} && {launch}",
         }
 
         // Check if external timeout protection is enabled
-        if !self.compilation_config.external_timeout_enabled() {
+        let timeout_secs = self.prepared_execution_timeout_seconds();
+        if timeout_secs == 0 {
             debug!("External timeout protection disabled by config");
             return command.to_string();
         }
-
-        // Get the appropriate timeout for this command type
-        let timeout_duration = self
-            .compilation_config
-            .timeout_for_kind(self.compilation_kind);
-        let timeout_secs = timeout_duration.as_secs();
 
         // Log the timeout being applied
         let kind_name = match self.compilation_kind {

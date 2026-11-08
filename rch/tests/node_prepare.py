@@ -26,6 +26,20 @@ printf '%s\n' "$@"
 exit "$COMPILER_STATUS"
 """
 
+PROOF_WORKER = """#!/bin/sh
+set -eu
+[ "$#" = 11 ] && [ "$1" = prepare-proof ] && [ "$2" = --mode ] &&
+[ "$3" = verify ] && [ "$4" = --project ] && [ "$5" = . ] &&
+[ "$6" = --runtime ] && [ "$7" = "$RUNTIME" ] &&
+[ "$8" = --expected-request-digest ] && [ "$9" = request-digest ] &&
+[ "${10}" = --expected-attestation-digest ] &&
+[ "${11}" = attestation-digest ] || exit 91
+printf 'verify:%s\n' "$7" >> "$ROOT/events"
+if IFS= read -r ignored; then exit 92; fi
+printf 'verified preparation metadata\n'
+exit "$PREPARE_STATUS"
+"""
+
 def executable(path, body):
     path.write_text(body)
     path.chmod(0o700)
@@ -75,6 +89,47 @@ class Fixture:
         return path.read_text().splitlines() if path.exists() else []
 
 class Tests(unittest.TestCase):
+    def test_accepted_proof_verifies_without_installing_again(self):
+        for shell in ("sh", "bash"):
+            for runtime in ("node", "bun"):
+                f = Fixture(shell, runtime)
+                executable(f.tools / "rch-wkr", PROOF_WORKER)
+                f.env["COMPILER_STATUS"] = "23"
+                result = f.run(args=[
+                    "--source-proof", "request-digest", "attestation-digest",
+                    "compiler", "literal $value; not shell code",
+                ])
+                self.assertEqual(result.returncode, 23, result.stderr)
+                self.assertEqual(f.events(), [f"verify:{runtime}", "compiler"])
+                self.assertEqual(result.stdout, b"literal $value; not shell code\n")
+                self.assertEqual(result.stderr, b"verified preparation metadata\n")
+
+    def test_failed_or_incomplete_proof_never_starts_the_workload(self):
+        for shell in ("sh", "bash"):
+            for package in (False, True):
+                f = Fixture(shell, "bun", package=package)
+                executable(f.tools / "rch-wkr", PROOF_WORKER)
+                f.env["PREPARE_STATUS"] = "73"
+                result = f.run(args=[
+                    "--source-proof", "request-digest", "attestation-digest", "compiler",
+                ])
+                self.assertEqual(result.returncode, 121, result.stderr)
+                self.assertEqual(f.events(), ["verify:bun"])
+                self.assertIn(b"the command was not run", result.stderr)
+                self.assertEqual(result.stdout, b"")
+                invalid = f.run(args=["--source-proof", "request-digest"])
+                self.assertEqual(invalid.returncode, 121, invalid.stderr)
+                self.assertEqual(f.events(), ["verify:bun"])
+
+    def test_proof_rejects_a_worker_without_the_qualified_protocol(self):
+        for shell in ("sh", "bash"):
+            f = Fixture(shell)
+            result = f.run(args=[
+                "--source-proof", "request-digest", "attestation-digest", "compiler",
+            ])
+            self.assertEqual(result.returncode, 121, result.stderr)
+            self.assertEqual(f.events(), [])
+
     def test_cold_and_warm_always_prepare(self):
         for shell in ("sh", "bash"):
             for runtime in ("node", "bun"):

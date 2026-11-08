@@ -27,14 +27,37 @@ fn dependency_preparation_is_inside_the_tracked_workload() {
         // Linux selects setsid(1) as the session launcher, then runs `"$@" sh -c`.
         assert!(command.contains("*) set -- setsid;;"));
         let session = command.find("\"$@\" sh -c").expect("tracked process group");
-        let preparation = command.find("rch-wkr prepare").expect("worker preparation");
+        let preparation = command
+            .find("rch-wkr prepare --project")
+            .expect("worker preparation");
         assert!(preparation > session);
-        assert_eq!(command.matches("rch-wkr prepare").count(), 1);
+        assert_eq!(command.matches("rch-wkr prepare --project").count(), 1);
         assert!(command.contains(&format!("rch-prepare {runtime} sh -c")));
         assert!(!command.contains("npm ci"));
         assert!(!command.contains("npm install"));
         assert!(!command.contains("bun install"));
     }
+}
+
+#[test]
+fn qualified_preparation_keeps_disk_guard_inside_the_source_activity_group() {
+    let _guard = rch_common::test_guard!();
+    let mut pipeline = pipeline(CompilationKind::BunTest, true, WorkerPlatform::Posix);
+    pipeline.source_authority_prefix = Some("env".to_owned());
+    pipeline.disk_budget = Some(rch_common::BuildDiskBudget {
+        max_growth_bytes: 1 << 30,
+        min_free_bytes: 0,
+        warm_policy: None,
+    });
+    let (phase, timeout) = pipeline.dependency_preparation_phase().unwrap();
+    assert!(phase.build_id.is_none());
+    assert!(phase.recovery_completion.is_none());
+    assert_ne!(phase.deadline_marker, pipeline.deadline_marker);
+    let command = phase.wrap_with_disk_budget("printf prepared", &[], timeout.as_secs());
+    assert!(command.contains(" tracked sh -lc "));
+    assert!(!command.contains(" standalone sh -lc "));
+    assert!(pipeline.prepared_execution_deadline.is_some());
+    assert!(!pipeline.source_activity_owns_execution);
 }
 
 #[test]
@@ -48,7 +71,7 @@ fn untracked_and_windows_commands_still_require_preparation_success() {
         ] {
             let pipeline = pipeline(kind, false, platform);
             let command = pipeline.build_remote_command("compiler", None);
-            assert_eq!(command.matches("rch-wkr prepare").count(), 1);
+            assert_eq!(command.matches("rch-wkr prepare --project").count(), 1);
             assert!(!command.contains("setsid sh -c"));
         }
     }
