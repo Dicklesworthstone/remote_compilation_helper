@@ -476,32 +476,41 @@ fn print_system_info() {
     }
 }
 
-/// Probe runtime capabilities and return structured data.
-///
-/// Run the operator-declared named tool probes and split them into verified and
-/// failed, alongside any warnings about declarations that could not be run.
+#[derive(Debug, Default)]
+struct DeclaredToolProbeResults {
+    present: Vec<String>,
+    absent: Vec<String>,
+    pending: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Run the operator-declared named tool probes within one shared deadline.
 ///
 /// Each probe runs the declared argv DIRECTLY — no shell, no PATH games beyond
 /// the ordinary exec lookup — and is judged solely by exit status, because the
 /// question is "can this worker run the tool", not "what did it print". stdin is
-/// closed so a tool that waits for input fails fast instead of wedging the whole
-/// capabilities probe; the daemon's probe timeout bounds the rest.
-fn probe_declared_tools(spec_json: Option<&str>) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// closed and output is discarded. A timed-out or unstarted declaration stays
+/// pending: it supplies no evidence that the tool is present or absent.
+async fn probe_declared_tools(
+    spec_json: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> DeclaredToolProbeResults {
     use rch_common::capability_probe::NamedToolProbe;
     use rch_common::types::WorkerToolProbe;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
+    use tokio::time::{Instant, timeout, timeout_at};
 
-    let (mut present, mut absent, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
+    let mut results = DeclaredToolProbeResults::default();
     let Some(raw) = spec_json.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return (present, absent, warnings);
+        return results;
     };
     let declared: Vec<WorkerToolProbe> = match serde_json::from_str(raw) {
         Ok(declared) => declared,
         Err(error) => {
-            warnings.push(format!(
+            results.warnings.push(format!(
                 "tool probe declarations were not parseable: {error}"
             ));
-            return (present, absent, warnings);
+            return results;
         }
     };
     for entry in &declared {
@@ -510,14 +519,25 @@ fn probe_declared_tools(spec_json: Option<&str>) -> (Vec<String>, Vec<String>, V
         let probe = match NamedToolProbe::try_from(entry) {
             Ok(probe) => probe,
             Err(error) => {
-                warnings.push(format!("ignored tool declaration: {error}"));
+                results
+                    .warnings
+                    .push(format!("ignored tool declaration: {error}"));
                 continue;
             }
         };
         let Some((program, args)) = probe.command().split_first() else {
             continue;
         };
-        let succeeded = Command::new(program)
+        let name = probe.name().to_string();
+        if Instant::now() >= deadline {
+            results.warnings.push(format!(
+                "tool probe {name}: shared deadline reached before spawn"
+            ));
+            results.pending.push(name);
+            continue;
+        }
+        let mut command = tokio::process::Command::new(program);
+        command
             // These fixed, operator-declared probes run on this worker just
             // like admitted jobs. Cargo invoked by a probe or its descendants
             // must neither recurse into offload nor inherit an unpaired bypass.
@@ -525,17 +545,64 @@ fn probe_declared_tools(spec_json: Option<&str>) -> (Vec<String>, Vec<String>, V
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        let name = probe.name().to_string();
-        if succeeded {
-            present.push(name);
-        } else {
-            absent.push(name);
+            .stderr(Stdio::null());
+        // These control-plane probes own their groups; unlike installers,
+        // they are not nested inside the job's disk-budget process group.
+        #[cfg(unix)]
+        let child = rch_common::ssh::OwnedProcessGroup::spawn(&mut command);
+        #[cfg(not(unix))]
+        let child = command.kill_on_drop(true).spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                results.absent.push(name);
+                continue;
+            }
+            Err(error) => {
+                results
+                    .warnings
+                    .push(format!("tool probe {name} could not start: {error}"));
+                results.pending.push(name);
+                continue;
+            }
+        };
+        let result = timeout_at(deadline, child.wait()).await;
+        let mut warning = match result {
+            // A ready future can win over an expired timer after a scheduler
+            // stall. Do not turn a late zero into verified capability evidence.
+            Ok(Ok(status)) if Instant::now() < deadline => {
+                if status.success() {
+                    results.present.push(name);
+                } else {
+                    results.absent.push(name);
+                }
+                continue;
+            }
+            Ok(Ok(_)) => format!("tool probe {name} completed after the shared deadline"),
+            Ok(Err(error)) => format!("tool probe {name} wait failed: {error}"),
+            Err(_) => format!("tool probe {name} timed out at the shared deadline"),
+        };
+        // Cancellation is bounded too. On Unix, signal descendants while the
+        // unreaped leader still pins the group's identity; never signal a
+        // remembered PID after reaping. Other platforms own the direct child.
+        let _ = child.start_kill();
+        if !matches!(
+            timeout(std::time::Duration::from_secs(1), child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            warning.push_str("; owned child reap was not confirmed");
         }
+        results.warnings.push(warning);
+        results.pending.push(name);
     }
-    (present, absent, warnings)
+    results
 }
 
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
@@ -586,10 +653,15 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     capabilities.rustup_components = components;
     warnings.extend(inventory_warnings);
 
-    let (tools_present, tools_absent, tool_warnings) = probe_declared_tools(tool_probe);
-    capabilities.tools_present = tools_present;
-    capabilities.tools_absent = tools_absent;
-    warnings.extend(tool_warnings);
+    let tool_results = probe_declared_tools(
+        tool_probe,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await;
+    capabilities.tools_present = tool_results.present;
+    capabilities.tools_absent = tool_results.absent;
+    capabilities.tools_pending = tool_results.pending;
+    warnings.extend(tool_results.warnings);
 
     capabilities.probe_warnings = warnings;
 
@@ -3025,44 +3097,82 @@ mod tests {
         assert_eq!(std::fs::read_link(&alias).unwrap(), physical);
     }
 
-    #[test]
-    fn declared_tool_probes_are_judged_by_exit_status() {
+    #[tokio::test]
+    async fn declared_tool_probes_are_judged_by_exit_status() {
         let _guard = test_guard!();
+        let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         // No declarations => nothing probed, nothing reported. A worker whose
         // operator declared no tools must produce the same facts it always did.
         for empty in [None, Some(""), Some("   ")] {
-            let (present, absent, warnings) = probe_declared_tools(empty);
-            assert!(present.is_empty() && absent.is_empty() && warnings.is_empty());
+            let results = probe_declared_tools(empty, deadline()).await;
+            assert!(results.present.is_empty() && results.absent.is_empty());
+            assert!(results.pending.is_empty() && results.warnings.is_empty());
         }
 
         // Exit status decides, and ONLY exit status: the successful probe here
         // prints nothing useful and the failing one exists but exits nonzero,
         // so neither could be classified by its output.
-        let (present, absent, warnings) = probe_declared_tools(Some(
-            r#"[{"name":"present","command":["true"]},
+        let results = probe_declared_tools(
+            Some(
+                r#"[{"name":"present","command":["true"]},
                 {"name":"failing","command":["false"]},
                 {"name":"missing","command":["rch-no-such-binary-9f3a"]}]"#,
-        ));
-        assert_eq!(present, vec!["present".to_string()]);
-        assert_eq!(absent, vec!["failing".to_string(), "missing".to_string()]);
-        assert!(warnings.is_empty(), "{warnings:?}");
+            ),
+            deadline(),
+        )
+        .await;
+        assert_eq!(results.present, ["present"]);
+        assert_eq!(results.absent, ["failing", "missing"]);
+        assert!(
+            results.pending.is_empty() && results.warnings.is_empty(),
+            "{results:?}"
+        );
 
         // A malformed declaration is reported, never silently treated as a
         // verified tool.
-        let (present, absent, warnings) =
-            probe_declared_tools(Some(r#"[{"name":"bad name","command":["true"]}]"#));
-        assert!(present.is_empty() && absent.is_empty());
-        assert_eq!(warnings.len(), 1);
+        let results = probe_declared_tools(
+            Some(r#"[{"name":"bad name","command":["true"]}]"#),
+            deadline(),
+        )
+        .await;
         assert!(
-            warnings[0].contains("ignored tool declaration"),
-            "{warnings:?}"
+            results.present.is_empty() && results.absent.is_empty() && results.pending.is_empty()
+        );
+        assert_eq!(results.warnings.len(), 1);
+        assert!(
+            results.warnings[0].contains("ignored tool declaration"),
+            "{results:?}"
         );
 
         // Unparseable JSON degrades to "no verified tools" WITH a warning, so
         // the gate stays closed rather than opening on a broken payload.
-        let (present, absent, warnings) = probe_declared_tools(Some("{not json"));
-        assert!(present.is_empty() && absent.is_empty());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("not parseable"), "{warnings:?}");
+        let results = probe_declared_tools(Some("{not json"), deadline()).await;
+        assert!(
+            results.present.is_empty() && results.absent.is_empty() && results.pending.is_empty()
+        );
+        assert_eq!(results.warnings.len(), 1);
+        assert!(results.warnings[0].contains("not parseable"), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn declared_tool_probes_with_expired_deadline_remain_pending() {
+        // Even a missing executable is unknown if the batch never started it.
+        let results = probe_declared_tools(
+            Some(
+                r#"[{"name":"available","command":["true"]},
+                {"name":"unknown","command":["rch-no-such-binary-9f3a"]}]"#,
+            ),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert!(results.present.is_empty() && results.absent.is_empty());
+        assert_eq!(results.pending, ["available", "unknown"]);
+        assert_eq!(results.warnings.len(), 2);
+        assert!(
+            results
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("before spawn"))
+        );
     }
 }

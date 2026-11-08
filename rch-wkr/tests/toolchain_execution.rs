@@ -590,6 +590,117 @@ fn declared_tool_probes_stamp_both_markers_for_cargo_descendants() {
 }
 
 #[test]
+fn declared_tool_probe_deadline_preserves_partial_facts_and_reaps_owned_child() {
+    let fixture = Fixture::new("available");
+    let mut command = fixture.capability_command("ok");
+    // The finite sleeper exceeds the named-probe phase budget but stays below
+    // this harness's outer timeout. The old blocking implementation therefore
+    // fails this test after naturally reaping its child, without leaking it.
+    let sleeper = r#"import os, pathlib, time
+state = pathlib.Path(os.environ["RCH_TEST_STATE"])
+(state / "named-probe-pid").write_text(str(os.getpid()))
+(state / "named-probe-markers").write_text(
+    os.environ.get("RCH_CARGO_WRAPPER_BYPASS", "unset") + "|" +
+    os.environ.get("RCH_CARGO_WRAPPER_ORIGIN", "unset"))
+time.sleep(12)
+"#;
+    let late_probe = r#"import os, pathlib
+pathlib.Path(os.environ["RCH_TEST_STATE"], "late-probe-started").write_text("started")
+"#;
+    let probes = serde_json::json!([
+        {"name": "healthy-tool", "command": ["sh", "-c", "exit 0"]},
+        {"name": "hung-tool", "command": ["python3", "-I", "-c", sleeper]},
+        {"name": "late-tool", "command": ["python3", "-I", "-c", late_probe]}
+    ]);
+    command.args(["--tool-probe", &probes.to_string()]);
+
+    let started = Instant::now();
+    let output = Fixture::collect(command);
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    let capabilities: rch_common::WorkerCapabilities =
+        serde_json::from_slice(&output.stdout).expect("worker capability JSON");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(capabilities.has_rust(), "{capabilities:?}");
+    assert!(capabilities.has_node(), "{capabilities:?}");
+    assert_eq!(capabilities.tools_present, ["healthy-tool"]);
+    assert!(capabilities.tools_absent.is_empty(), "{capabilities:?}");
+    assert_eq!(capabilities.tools_pending, ["hung-tool", "late-tool"]);
+    for name in ["hung-tool", "late-tool"] {
+        assert!(
+            capabilities.probe_warnings.iter().any(|warning| {
+                warning.contains(name)
+                    && (warning.contains("timed out")
+                        || warning.contains("deadline")
+                        || warning.contains("budget"))
+            }),
+            "missing deadline diagnostic for {name}: {capabilities:?}"
+        );
+    }
+    assert!(
+        !fixture.path("late-probe-started").exists(),
+        "the shared deadline must prevent later declarations from starting"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("named-probe-markers")).unwrap(),
+        "1|rch"
+    );
+    let pid = fs::read_to_string(fixture.path("named-probe-pid")).expect("owned probe PID");
+    assert!(pid.parse::<u32>().expect("numeric probe PID") > 1);
+    // kill(0) observes zombies too, so ESRCH confirms the foreground child
+    // was reaped. Inspecting /proc by PID is unreliable in nested namespaces.
+    let reaped = Command::new(fixture.path("bin/python3"))
+        .args([
+            "-I",
+            "-c",
+            "import os, sys\ntry:\n    os.kill(int(sys.argv[1]), 0)\nexcept ProcessLookupError:\n    pass\nelse:\n    raise SystemExit('named probe is still alive or unreaped')\n",
+            &pid,
+        ])
+        .status()
+        .expect("inspect owned probe lifecycle");
+    assert!(
+        reaped.success(),
+        "owned named probe must be killed and reaped"
+    );
+}
+
+#[test]
+fn declared_tool_probes_discard_large_non_utf8_output_and_use_exit_status() {
+    let fixture = Fixture::new("available");
+    let mut command = fixture.capability_command("ok");
+    // Named probes are fixed argv judged only by status. Their output is not
+    // a version string and must not enter the Cargo/inventory output parser.
+    let noisy_probe = r#"import os, sys
+assert os.read(0, 1) == b""
+assert os.environ["RCH_CARGO_WRAPPER_BYPASS"] == "1"
+assert os.environ["RCH_CARGO_WRAPPER_ORIGIN"] == "rch"
+os.write(1, b"\xff" * 65536)
+os.write(2, b"\xfe" * 65536)
+sys.exit(int(sys.argv[1]))
+"#;
+    let probes = serde_json::json!([
+        {"name": "loud-success", "command": ["python3", "-I", "-c", noisy_probe, "0"]},
+        {"name": "loud-failure", "command": ["python3", "-I", "-c", noisy_probe, "23"]},
+        {"name": "missing", "command": ["rch-no-such-declared-tool-fixture"]}
+    ]);
+    command.args(["--tool-probe", &probes.to_string()]);
+
+    let output = Fixture::collect(command);
+    assert!(output.status.success(), "{output:?}");
+    let capabilities: rch_common::WorkerCapabilities =
+        serde_json::from_slice(&output.stdout).expect("only capability JSON reaches stdout");
+    assert!(capabilities.has_rust(), "{capabilities:?}");
+    assert!(capabilities.has_node(), "{capabilities:?}");
+    assert_eq!(capabilities.tools_present, ["loud-success"]);
+    assert_eq!(capabilities.tools_absent, ["loud-failure", "missing"]);
+    assert!(capabilities.tools_pending.is_empty(), "{capabilities:?}");
+    assert!(
+        !output.stderr.contains(&0xfe),
+        "probe stderr must be discarded"
+    );
+}
+
+#[test]
 fn worker_capabilities_refuse_unusable_cargo_without_hiding_other_runtimes() {
     for (mode, route, expected_probes) in [
         ("path_refusal", "PATH Cargo", "PATH|1|rch|--version\n"),

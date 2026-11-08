@@ -670,6 +670,7 @@ mod tests {
                             cpu_microarch_level: None,
                             tools_present: Vec::new(),
                             tools_absent: Vec::new(),
+                            tools_pending: Vec::new(),
                             num_cpus,
                             load_avg_1,
                             load_avg_5,

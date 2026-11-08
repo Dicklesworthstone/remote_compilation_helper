@@ -55,26 +55,48 @@ pub(super) fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
         || capabilities.npm_version.is_some()
         || !capabilities.tools_present.is_empty()
         || !capabilities.tools_absent.is_empty()
+        || !capabilities.tools_pending.is_empty()
 }
 
-/// Operator-declared named tools, rendered as verified/failed (bd-ceewf).
+/// Operator-declared named tools, rendered as verified/failed/pending (bd-ceewf).
 ///
-/// Both halves are shown: a worker whose declared probe FAILED is a different
-/// operational state from one that was never asked, and only the first is
-/// actionable.
+/// Keep unfinished probes visible without describing them as failed or never
+/// declared. Conflicting snapshots use the same conservative precedence as
+/// admission, so a pending or failed tool is never displayed as verified.
 fn format_named_tool_matrix(capabilities: &WorkerCapabilities) -> String {
-    if capabilities.tools_present.is_empty() && capabilities.tools_absent.is_empty() {
+    if capabilities.tools_present.is_empty()
+        && capabilities.tools_absent.is_empty()
+        && capabilities.tools_pending.is_empty()
+    {
         return "none declared".to_string();
     }
+    let present = capabilities
+        .tools_present
+        .iter()
+        .filter(|tool| {
+            !capabilities.tools_pending.contains(*tool)
+                && !capabilities.tools_absent.contains(*tool)
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let absent = capabilities
+        .tools_absent
+        .iter()
+        .filter(|tool| !capabilities.tools_pending.contains(*tool))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let mut parts = Vec::new();
-    if !capabilities.tools_present.is_empty() {
-        parts.push(format!(
-            "verified: {}",
-            capabilities.tools_present.join(", ")
-        ));
+    if !present.is_empty() {
+        parts.push(format!("verified: {}", present.join(", ")));
     }
-    if !capabilities.tools_absent.is_empty() {
-        parts.push(format!("failed: {}", capabilities.tools_absent.join(", ")));
+    if !absent.is_empty() {
+        parts.push(format!("failed: {}", absent.join(", ")));
+    }
+    if !capabilities.tools_pending.is_empty() {
+        parts.push(format!(
+            "pending: {}",
+            capabilities.tools_pending.join(", ")
+        ));
     }
     parts.join("; ")
 }
@@ -2235,6 +2257,27 @@ mod probe_summary_tests {
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::WorkerId;
+
+    #[test]
+    fn pending_named_tools_remain_visible_without_becoming_verified_or_absent() {
+        assert_eq!(
+            format_named_tool_matrix(&WorkerCapabilities::default()),
+            "none declared"
+        );
+        let mut capabilities = WorkerCapabilities {
+            tools_pending: vec!["clang".into()],
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&capabilities));
+        assert_eq!(format_named_tool_matrix(&capabilities), "pending: clang");
+
+        capabilities.tools_present = vec!["cargo-check".into(), "clang".into(), "ld.lld".into()];
+        capabilities.tools_absent = vec!["ld.lld".into(), "clang".into()];
+        assert_eq!(
+            format_named_tool_matrix(&capabilities),
+            "verified: cargo-check; failed: ld.lld; pending: clang"
+        );
+    }
 
     fn mk(status: &str, error_code: Option<&str>, error: Option<&str>) -> WorkerProbeResult {
         WorkerProbeResult {

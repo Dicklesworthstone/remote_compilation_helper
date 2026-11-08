@@ -51,9 +51,10 @@ pub enum ToolProbeError {
 /// a capability-probe hat. Declaring the argv in operator config keeps the set
 /// of commands a worker will run for a probe finite and reviewable.
 ///
-/// Verification is by EXIT STATUS: zero means present, anything else — missing
-/// binary, error exit, signal — means absent. Output is discarded so a chatty
-/// tool cannot corrupt the fact stream.
+/// Verification is by EXIT STATUS: a completed zero exit means present; a
+/// missing binary, error exit, or signal means absent. A deadline or an
+/// inconclusive wait supplies neither fact and remains pending. Output is
+/// discarded so a chatty tool cannot corrupt the fact stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedToolProbe {
     /// The name selection and `--require-tool` refer to.

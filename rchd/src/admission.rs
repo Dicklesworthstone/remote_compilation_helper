@@ -188,7 +188,7 @@ pub(crate) fn required_component_toolchain(request: &SelectionRequest) -> Option
 }
 
 /// The first unverified named tool or exact runtime version. Preserve the
-/// diagnostic distinction between a failed probe and an undeclared tool.
+/// distinction between a pending probe, a failed probe, and an undeclared tool.
 pub(crate) fn required_tool_capability_mismatch(
     request: &SelectionRequest,
     capabilities: &WorkerCapabilities,
@@ -201,13 +201,18 @@ pub(crate) fn required_tool_capability_mismatch(
         ) {
             return check.err();
         }
-        (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
-            if capabilities.tools_absent.iter().any(|t| t == tool) {
-                format!("capability_missing:tool:{tool}:probe_failed")
-            } else {
-                format!("capability_missing:tool:{tool}:not_declared")
-            }
-        })
+        // Incomplete or contradictory observations cannot authorize a job.
+        // Pending takes precedence over both stale positive and negative facts.
+        let reason = if capabilities.tools_pending.contains(tool) {
+            Some("probe_pending")
+        } else if capabilities.tools_absent.contains(tool) {
+            Some("probe_failed")
+        } else if capabilities.tools_present.contains(tool) {
+            None
+        } else {
+            Some("not_declared")
+        };
+        reason.map(|reason| format!("capability_missing:tool:{tool}:{reason}"))
     })
 }
 
@@ -632,6 +637,99 @@ mod tests {
     use crate::headroom::HeadroomConfig;
     use crate::history::BuildHistory;
     use rch_common::{BuildLocation, BuildRecord, WorkerConfig, test_guard};
+
+    #[test]
+    fn named_tool_admission_distinguishes_pending_and_rejects_conflicting_facts() {
+        let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+            "project": "named-probe-admission",
+            "estimated_cores": 1,
+            "required_runtime": RequiredRuntime::None,
+            "required_tools": ["clang"],
+        }))
+        .unwrap();
+        let requirements = ExecutionRequirements::new(&request);
+        for (present, absent, pending, reason) in [
+            (false, false, false, Some("not_declared")),
+            (true, false, false, None),
+            (false, true, false, Some("probe_failed")),
+            (true, true, false, Some("probe_failed")),
+            (false, false, true, Some("probe_pending")),
+            (true, false, true, Some("probe_pending")),
+            (false, true, true, Some("probe_pending")),
+            (true, true, true, Some("probe_pending")),
+        ] {
+            let names = |included| {
+                if included {
+                    vec!["clang".to_string()]
+                } else {
+                    Vec::new()
+                }
+            };
+            let mut capabilities = WorkerCapabilities {
+                tools_present: names(present),
+                tools_absent: names(absent),
+                tools_pending: names(pending),
+                ..Default::default()
+            };
+            // Another tool's unfinished probe must not reject verified clang.
+            capabilities.tools_pending.push("clang-format".into());
+            let expected = reason.map(|reason| format!("capability_missing:tool:clang:{reason}"));
+            assert_eq!(
+                requirements.tool_mismatch(&capabilities),
+                expected,
+                "present={present}, absent={absent}, pending={pending}"
+            );
+            assert_eq!(
+                requirements.capabilities_satisfied(&capabilities),
+                expected.is_none(),
+                "present={present}, absent={absent}, pending={pending}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn named_tool_pending_refresh_replaces_stale_verified_snapshot() {
+        let _guard = test_guard!();
+        let worker = make_worker(
+            "named-probe-refresh",
+            make_assessment(PressureState::Healthy, Some(50.0)),
+        )
+        .await;
+        let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+            "project": "named-probe-refresh",
+            "estimated_cores": 1,
+            "required_runtime": RequiredRuntime::None,
+            "required_tools": ["clang"],
+        }))
+        .unwrap();
+        let requirements = ExecutionRequirements::new(&request);
+        let verified = WorkerCapabilities {
+            tools_present: vec!["clang".into()],
+            ..Default::default()
+        };
+        worker.set_capabilities(verified.clone()).await;
+        assert!(requirements.capabilities_satisfied(&worker.capabilities().await));
+
+        worker
+            .set_capabilities(WorkerCapabilities {
+                tools_pending: vec!["clang".into()],
+                ..Default::default()
+            })
+            .await;
+        let pending = worker.capabilities().await;
+        assert!(pending.tools_present.is_empty());
+        assert!(pending.tools_absent.is_empty());
+        assert!(!requirements.capabilities_satisfied(&pending));
+        assert_eq!(
+            requirements.tool_mismatch(&pending).as_deref(),
+            Some("capability_missing:tool:clang:probe_pending")
+        );
+
+        worker.set_capabilities(verified).await;
+        let refreshed = worker.capabilities().await;
+        assert!(refreshed.tools_pending.is_empty());
+        assert!(requirements.capabilities_satisfied(&refreshed));
+    }
 
     #[test]
     fn component_admission_distinguishes_absent_and_unresolved_command_pins() {

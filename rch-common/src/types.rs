@@ -1312,13 +1312,23 @@ pub struct WorkerCapabilities {
     /// verified capability and a tag somebody wrote by hand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_present: Vec<String>,
-    /// Operator-declared named tools whose probe RAN and did not exit zero.
+    /// Operator-declared named tools whose probe completed unsuccessfully or
+    /// whose executable was missing or unusable.
     ///
     /// Kept separate from "never declared" so an operator can tell a worker
     /// that is missing a tool from a fleet that never probed for it — the two
     /// have different fixes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_absent: Vec<String>,
+    /// Operator-declared named tools without a timely, definitive probe result.
+    /// This includes timeouts, an exhausted phase budget, and temporary errors
+    /// starting or waiting for the probe.
+    ///
+    /// These are unverified rather than absent. A requirement for one of these
+    /// tools remains inadmissible until a fresh completed probe verifies it,
+    /// even if an inconsistent snapshot also lists it as present or absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_pending: Vec<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -5130,6 +5140,35 @@ retry_max = 2
         assert!(!parsed.has_rust());
         assert!(!parsed.has_bun());
         assert!(!parsed.has_node());
+    }
+
+    #[test]
+    fn test_worker_capabilities_preserve_pending_tool_facts_on_the_wire() {
+        let legacy = serde_json::json!({
+            "node_version": "v20.11.0",
+            "tools_present": ["clang"],
+            "tools_absent": ["missing-linker"],
+        });
+        let capabilities: WorkerCapabilities = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(capabilities.tools_pending.is_empty());
+        assert_eq!(serde_json::to_value(&capabilities).unwrap(), legacy);
+
+        let partial = serde_json::json!({
+            "node_version": "v20.11.0",
+            "tools_present": ["clang"],
+            "tools_absent": ["missing-linker"],
+            "tools_pending": ["slow-formatter", "unstarted-checker"],
+            "probe_warnings": ["slow-formatter probe timed out"],
+        });
+        let capabilities: WorkerCapabilities = serde_json::from_value(partial.clone()).unwrap();
+        assert_eq!(
+            capabilities.tools_pending,
+            ["slow-formatter", "unstarted-checker"]
+        );
+        assert_eq!(capabilities.tools_present, ["clang"]);
+        assert_eq!(capabilities.tools_absent, ["missing-linker"]);
+        assert!(capabilities.has_node());
+        assert_eq!(serde_json::to_value(&capabilities).unwrap(), partial);
     }
 
     #[test]
