@@ -340,6 +340,139 @@ impl Drop for OwnedProcessGroup {
     }
 }
 
+/// Capture a finite control response within one deadline and fixed stream bounds.
+///
+/// Upload and both output streams are polled together, so a peer can emit
+/// diagnostics before consuming its input without filling a pipe and deadlocking.
+/// Each stream must reach EOF within its limit; a truncated receipt is never
+/// returned as successful output. The local child and its process group remain
+/// owned until both pipes drain and the child is reaped. A pipe-holding descendant
+/// therefore expires the operation even if its leader already exited.
+///
+/// SSH callers must configure a foreground transport before calling this helper.
+/// Local transport cleanup does not establish that a remote workload has stopped.
+///
+/// # Errors
+/// Returns an error on an invalid limit, allocation/spawn/I/O failure, stream
+/// overflow, or deadline expiry. Any started transport group is stopped on error
+/// or if the caller drops this future.
+pub async fn capture_control_output(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    deadline: Instant,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let expired = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control command deadline exceeded",
+        )
+    };
+    if Instant::now() >= deadline {
+        return Err(expired());
+    }
+    // Allocate before spawning: an invalid/unallocatable limit must not launch
+    // a command. Fixed buffers bound capacity as well as retained output bytes.
+    let stdout_buffer = control_output_buffer(stdout_limit)?;
+    let stderr_buffer = control_output_buffer(stderr_limit)?;
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let capture = async {
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        let mut process = OwnedProcessGroup::spawn(command)?;
+        let stdin = process.take_stdin();
+        let stdout = process
+            .take_stdout()
+            .ok_or_else(|| std::io::Error::other("control command stdout pipe missing"))?;
+        let stderr = process
+            .take_stderr()
+            .ok_or_else(|| std::io::Error::other("control command stderr pipe missing"))?;
+        let upload = async {
+            if let Some(input) = input {
+                let mut stdin = stdin
+                    .ok_or_else(|| std::io::Error::other("control command stdin pipe missing"))?;
+                stdin.write_all(input).await?;
+                // Close stdin after the finite program, allowing the peer to
+                // finish parsing it while output collection continues.
+                drop(stdin);
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let ((), stdout, stderr) = tokio::try_join!(
+            upload,
+            read_control_stream(stdout, "stdout", stdout_buffer),
+            read_control_stream(stderr, "stderr", stderr_buffer),
+        )?;
+        // Natural EOF must precede wait(): wait stops residual descendants, and
+        // locally forcing pipe EOF must not turn partial evidence into success.
+        let status = process.wait().await?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    let output = tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => return Err(expired()),
+        output = capture => output?,
+    };
+    // A ready response polled at the boundary is still expired evidence.
+    if Instant::now() >= deadline {
+        return Err(expired());
+    }
+    Ok(output)
+}
+
+fn control_output_buffer(limit: usize) -> std::io::Result<Vec<u8>> {
+    let length = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid control output limit",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    bytes.resize(length, 0);
+    Ok(bytes)
+}
+
+async fn read_control_stream(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    stream: &str,
+    mut bytes: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let limit = bytes.len() - 1;
+    let mut length = 0;
+    while length <= limit {
+        let read = reader.read(&mut bytes[length..]).await?;
+        if read == 0 {
+            bytes.truncate(length);
+            return Ok(bytes);
+        }
+        length += read;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("control command {stream} exceeds {limit}-byte limit"),
+    ))
+}
+
 /// Owns a foreground SSH process from spawn through wait/reap. Dropping a
 /// connect future or a client requests termination; the supervisor retains the
 /// child and socket directory until it has reaped the child.
@@ -2467,6 +2600,103 @@ mod tests {
     use super::*;
     use crate::test_guard;
 
+    #[tokio::test]
+    async fn control_capture_drains_both_outputs_while_uploading() {
+        let input = vec![0x80; 512 * 1024];
+        let limit = 256 * 1024;
+        let mut command = tokio::process::Command::new("python3");
+        command.args([
+            "-c",
+            "import sys\n\
+             sys.stdout.buffer.write(bytes([254]) * 262144)\n\
+             sys.stdout.buffer.flush()\n\
+             sys.stderr.buffer.write(bytes([255]) * 262144)\n\
+             sys.stderr.buffer.flush()\n\
+             data = sys.stdin.buffer.read()\n\
+             sys.exit(17 if data == bytes([128]) * 524288 else 23)",
+        ]);
+        let output = capture_control_output(
+            &mut command,
+            Some(&input),
+            limit,
+            limit,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .expect("peer output must drain before the peer starts reading input");
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(output.stdout, vec![0xfe; limit]);
+        assert_eq!(output.stderr, vec![0xff; limit]);
+    }
+
+    #[tokio::test]
+    async fn control_capture_requires_complete_input_upload() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "exec 0<&-; printf 'receipt\\n'"]);
+        let input = vec![b'x'; 512 * 1024];
+        let error = capture_control_output(
+            &mut command,
+            Some(&input),
+            128,
+            128,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a receipt cannot hide a broken script upload");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn control_capture_rejects_expiry_and_invalid_limits_before_spawn() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let marker = directory.join("started");
+        for (stdout, stderr, budget, expected) in [
+            (0, 0, Duration::ZERO, std::io::ErrorKind::TimedOut),
+            (
+                usize::MAX,
+                0,
+                Duration::from_secs(10),
+                std::io::ErrorKind::InvalidInput,
+            ),
+            (
+                0,
+                usize::MAX,
+                Duration::from_secs(10),
+                std::io::ErrorKind::InvalidInput,
+            ),
+        ] {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "printf started > \"$1\"", "sh"])
+                .arg(&marker);
+            let error =
+                capture_control_output(&mut command, None, stdout, stderr, Instant::now() + budget)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert!(!marker.exists(), "invalid control capture must not spawn");
+        }
+    }
+
+    #[tokio::test]
+    async fn control_stream_requires_eof_within_its_exact_limit() {
+        for (bytes, limit) in [
+            (&b""[..], 0),
+            (&b"x"[..], 0),
+            (&b"\x00\xff\x80"[..], 3),
+            (&b"\x00\xff\x80x"[..], 3),
+        ] {
+            let result =
+                read_control_stream(bytes, "stdout", control_output_buffer(limit).unwrap()).await;
+            if bytes.len() <= limit {
+                assert_eq!(result.unwrap(), bytes);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("stdout"));
+            }
+        }
+    }
     #[test]
     fn test_command_result_success() {
         let _guard = test_guard!();

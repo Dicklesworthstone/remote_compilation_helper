@@ -399,45 +399,43 @@ where
 /// output before reaping so the owned leader pins the group identity on drop.
 async fn completion_probe_output(
     mut command: tokio::process::Command,
+    deadline: TokioInstant,
 ) -> std::io::Result<std::process::Output> {
     #[cfg(not(unix))]
     {
-        command.output().await
-    }
-    #[cfg(unix)]
-    {
-        use std::process::Stdio;
-        use tokio::io::AsyncReadExt;
-
+        // Unix transports additionally own proxy descendants as a group. Keep
+        // the same finite output/deadline contract on other controller hosts.
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut process = rch_common::ssh::OwnedProcessGroup::spawn(&mut command)?;
-        let mut stdout = process
-            .take_stdout()
-            .ok_or_else(|| std::io::Error::other("completion probe stdout missing"))?;
-        let mut stderr = process
-            .take_stderr()
-            .ok_or_else(|| std::io::Error::other("completion probe stderr missing"))?;
-        let (stdout, stderr) = tokio::try_join!(
-            async {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-            async {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-        )?;
-        let status = process.wait().await?;
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        receipt_probe_before(deadline, async {
+            let mut child = command.spawn()?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| std::io::Error::other("completion probe stdout missing"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| std::io::Error::other("completion probe stderr missing"))?;
+            let (stdout, stderr) = tokio::try_join!(
+                read_bounded_output_stream(stdout, 8192),
+                read_bounded_output_stream(stderr, 64 * 1024),
+            )?;
+            let status = child.wait().await?;
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         })
+        .await
+    }
+    #[cfg(unix)]
+    {
+        rch_common::ssh::capture_control_output(&mut command, None, 8192, 64 * 1024, deadline).await
     }
 }
 
@@ -3894,6 +3892,7 @@ impl TransferPipeline {
                         .connect_timeout
                         .min(deadline.saturating_duration_since(TokioInstant::now())),
                 ),
+                deadline,
             ),
         )
         .await?;
@@ -6096,6 +6095,7 @@ exit \"$__rch_disk_status\"; }}"
                         .connect_timeout
                         .min(deadline.saturating_duration_since(TokioInstant::now())),
                 ),
+                deadline,
             ),
         )
         .await?;
@@ -8115,56 +8115,52 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let pgid_file = Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id);
         let script = remote_timeout_kill_script(&pgid_file, build_id);
-
-        let destination = format!("{}@{}", worker.user, worker.host);
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let mut cmd = Command::new("ssh");
-        cmd.arg("-o").arg("BatchMode=yes");
-        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-        cmd.arg("-o").arg(format!(
-            "ConnectTimeout={}",
-            rch_common::timing::ceil_seconds(self.ssh_options.connect_timeout).max(1)
-        ));
-        cmd.arg("-i").arg(identity_file.as_ref());
-        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
-            cmd.args(opts);
-        }
-        cmd.arg(&destination).arg("sh").arg("-s");
-        cmd.kill_on_drop(true);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let cleanup_budget = rch_common::timing::scale_duration(REMOTE_TIMEOUT_KILL_BUDGET);
+        let deadline = TokioInstant::now() + cleanup_budget;
 
         let attempt = async {
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| format!("failed to spawn kill ssh: {e}"))?;
-            let stdin = child.stdin.take();
-
-            // Recovery must not inherit the build transport's historical
-            // upload-before-drain deadlock. Poll script upload and output
-            // collection together inside REMOTE_TIMEOUT_KILL_BUDGET so a
-            // diagnostic-producing remote shell cannot fill stdout/stderr
-            // while this side is still blocked writing the cancellation script.
-            let upload = async move {
-                if let Some(mut stdin) = stdin {
-                    stdin
-                        .write_all(script.as_bytes())
-                        .await
-                        .map_err(|e| format!("failed to write kill script: {e}"))?;
-                    drop(stdin);
-                }
-                Ok::<(), String>(())
-            };
-            let collect = async move {
-                child
-                    .wait_with_output()
-                    .await
-                    .map_err(|e| format!("failed to await kill ssh: {e}"))
-            };
-            let (upload, output) = tokio::join!(upload, collect);
-            upload?;
-            let output = output?;
+            // This recovery attempt must be independent of the failed build
+            // channel and remain a foreground child even when user SSH config
+            // enables persistent masters or background authentication.
+            let foreground = rch_common::ssh::ssh_can_disable_background(
+                Path::new("ssh"),
+                deadline.saturating_duration_since(TokioInstant::now()),
+            )
+            .await
+            .map_err(|e| format!("failed to inspect kill ssh: {e}"))?;
+            let destination = format!("{}@{}", worker.user, worker.host);
+            let identity_file = shellexpand::tilde(&worker.identity_file);
+            let mut cmd = Command::new("ssh");
+            rch_common::ssh::configure_oneshot_ssh(&mut cmd, foreground);
+            cmd.arg("-o").arg("BatchMode=yes");
+            cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+            cmd.arg("-o").arg(format!(
+                "ConnectTimeout={}",
+                rch_common::timing::ceil_seconds(
+                    self.ssh_options
+                        .connect_timeout
+                        .min(deadline.saturating_duration_since(TokioInstant::now())),
+                )
+                .max(1)
+            ));
+            cmd.arg("-i").arg(identity_file.as_ref());
+            if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref())
+            {
+                cmd.args(opts);
+            }
+            cmd.arg(&destination).arg("sh").arg("-s");
+            // Upload and bounded output collection run together. Overflow,
+            // expiry, or cancellation stops the entire local proxy group and
+            // leaves the remote termination verdict unverified.
+            let output = rch_common::ssh::capture_control_output(
+                &mut cmd,
+                Some(script.as_bytes()),
+                4 * 1024,
+                64 * 1024,
+                deadline,
+            )
+            .await
+            .map_err(|e| format!("kill channel failed: {e}"))?;
             if !output.status.success() {
                 return Err(format!(
                     "kill channel exited with {}: {}",
@@ -8175,12 +8171,15 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         };
 
-        let cleanup_budget = rch_common::timing::scale_duration(REMOTE_TIMEOUT_KILL_BUDGET);
-        match tokio::time::timeout(cleanup_budget, attempt).await {
+        match tokio::time::timeout_at(deadline, attempt).await {
             Ok(Ok(stdout)) => match parse_remote_timeout_kill_output(&stdout) {
-                Some(RemoteTimeoutCleanup::Verified) => (
+                Some(RemoteTimeoutCleanup::Verified) if TokioInstant::now() < deadline => (
                     RemoteTimeoutCleanup::Verified,
                     "remote process group SIGKILLed and verified dead".to_string(),
+                ),
+                Some(RemoteTimeoutCleanup::Verified) => (
+                    RemoteTimeoutCleanup::Unverified,
+                    "kill confirmation arrived after the cleanup deadline".to_string(),
                 ),
                 Some(RemoteTimeoutCleanup::Unverified)
                 | Some(RemoteTimeoutCleanup::NotAttempted) => (
@@ -12193,9 +12192,10 @@ while True:
 "#,
             )
             .arg(&ready);
+        let deadline = TokioInstant::now() + Duration::from_secs(60);
         let mut capture = Box::pin(receipt_probe_before(
-            TokioInstant::now() + Duration::from_secs(60),
-            completion_probe_output(command),
+            deadline,
+            completion_probe_output(command, deadline),
         ));
         let identities = tokio::time::timeout(Duration::from_secs(5), async {
             let announced = async {

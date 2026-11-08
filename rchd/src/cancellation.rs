@@ -1528,48 +1528,27 @@ where
     .await
 }
 
+// Cancellation stdout is one short receipt; stderr may contain SSH/control
+// diagnostics. Both streams together retain at most 68 KiB plus two overflow
+// probe bytes, even if a worker or ProxyCommand writes continuously.
+const REMOTE_CANCELLATION_STDOUT_LIMIT: usize = 4 * 1024;
+const REMOTE_CANCELLATION_STDERR_LIMIT: usize = 64 * 1024;
+
 /// Own the cancellation transport and its ProxyCommand descendants together.
-/// The caller's deadline drops this owner on timeout or cancellation, but never
-/// treats a killed local SSH process as evidence that remote work has stopped.
+/// A stream error, overflow, or the caller's deadline drops this owner and
+/// stops the group, without treating local termination as remote completion.
 async fn remote_cancellation_output(
     command: &mut tokio::process::Command,
     deadline: TokioInstant,
 ) -> std::io::Result<std::process::Output> {
-    use rch_common::ssh::OwnedProcessGroup;
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if TokioInstant::now() >= deadline {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Remote cancellation deadline exceeded before SSH spawn",
-        ));
-    }
-    let mut process = OwnedProcessGroup::spawn(command)?;
-    let mut stdout = process
-        .take_stdout()
-        .ok_or_else(|| std::io::Error::other("Missing cancellation stdout pipe"))?;
-    let mut stderr = process
-        .take_stderr()
-        .ok_or_else(|| std::io::Error::other("Missing cancellation stderr pipe"))?;
-    let mut output = Vec::new();
-    let mut errors = Vec::new();
-    tokio::try_join!(
-        stdout.read_to_end(&mut output),
-        stderr.read_to_end(&mut errors)
-    )?;
-    // Reap only after draining the pipes so the unreaped leader still pins
-    // the process-group identity while cancellation can signal descendants.
-    let status = process.wait().await?;
-    Ok(std::process::Output {
-        status,
-        stdout: output,
-        stderr: errors,
-    })
+    rch_common::ssh::capture_control_output(
+        command,
+        None,
+        REMOTE_CANCELLATION_STDOUT_LIMIT,
+        REMOTE_CANCELLATION_STDERR_LIMIT,
+        deadline,
+    )
+    .await
 }
 
 fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
@@ -1785,9 +1764,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn remote_cancellation_capture_preserves_exact_limits_and_complete_receipts() {
+        for mode in ["both-limits", "receipt"] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    r#"set -eu
+if [ "$1" = receipt ]; then
+    printf 'RCH_REMOTE_CANCELLED_V1:42\n'
+else
+    dd if=/dev/zero bs="$2" count=1 2>/dev/null
+fi
+dd if=/dev/zero bs="$3" count=1 >&2 2>/dev/null
+"#,
+                    "cancellation-capture-limits",
+                    mode,
+                ])
+                .arg(REMOTE_CANCELLATION_STDOUT_LIMIT.to_string())
+                .arg(REMOTE_CANCELLATION_STDERR_LIMIT.to_string());
+            let deadline = TokioInstant::now() + Duration::from_secs(5);
+            let output = tokio::time::timeout_at(
+                deadline,
+                remote_cancellation_output(&mut command, deadline),
+            )
+            .await
+            .expect("bounded capture must drain both streams concurrently")
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stderr, vec![0; REMOTE_CANCELLATION_STDERR_LIMIT]);
+            if mode == "both-limits" {
+                assert_eq!(output.stdout, vec![0; REMOTE_CANCELLATION_STDOUT_LIMIT]);
+                assert!(!remote_kill_confirmed(&output, 42));
+            } else {
+                assert_eq!(output.stdout, b"RCH_REMOTE_CANCELLED_V1:42\n");
+                assert!(remote_kill_confirmed(&output, 42));
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn offline_worker_remote_cancellation_owns_proxy_on_timeout_abort_and_exit() {
+    async fn remote_cancellation_capture_owns_proxy_on_overflow_timeout_abort_and_exit() {
         struct ProxyGuard {
             pid: u32,
             identity: String,
@@ -1802,7 +1821,14 @@ mod tests {
             }
         }
 
-        for termination in ["timeout", "abort", "exit"] {
+        for termination in [
+            "timeout",
+            "abort",
+            "exit",
+            "stdout-overflow",
+            "stderr-overflow",
+            "pipe-holder",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let mut unrelated = tokio::process::Command::new("sleep")
                 .arg("30")
@@ -1814,11 +1840,18 @@ mod tests {
                 .args([
                     "-c",
                     r#"printf '%s\n' "$$" > "$1/leader"
-sleep 30 </dev/null >/dev/null 2>&1 &
+case "$2" in
+  stdout-overflow|stderr-overflow|pipe-holder) sleep 30 </dev/null &;;
+  *) sleep 30 </dev/null >/dev/null 2>&1 &;;
+esac
 printf '%s\n' "$!" > "$1/proxy"
-if [ "$2" = exit ]; then
+if [ "$2" != timeout ] && [ "$2" != abort ]; then
     while [ ! -e "$1/release" ]; do sleep 0.01; done
     printf '%s\n' 'RCH_REMOTE_CANCELLED_V1:42'
+    case "$2" in
+      stdout-overflow) dd if=/dev/zero bs="$3" count=1 2>/dev/null;;
+      stderr-overflow) dd if=/dev/zero bs="$4" count=1 >&2 2>/dev/null;;
+    esac
     exit 0
 fi
 wait
@@ -1826,11 +1859,13 @@ wait
                     "cancellation-proxy-fixture",
                 ])
                 .arg(directory.path())
-                .arg(termination);
-            let budget = if termination == "timeout" {
-                Duration::from_secs(3)
-            } else {
-                Duration::from_secs(30)
+                .arg(termination)
+                .arg((REMOTE_CANCELLATION_STDOUT_LIMIT + 1).to_string())
+                .arg((REMOTE_CANCELLATION_STDERR_LIMIT + 1).to_string());
+            let budget = match termination {
+                "timeout" | "pipe-holder" => Duration::from_secs(3),
+                "stdout-overflow" | "stderr-overflow" => Duration::from_secs(5),
+                _ => Duration::from_secs(30),
             };
             let task = tokio::spawn(async move {
                 tokio::time::timeout(
@@ -1864,11 +1899,44 @@ wait
                     task.abort();
                     assert!(task.await.unwrap_err().is_cancelled());
                 }
-                "timeout" => assert!(task.await.unwrap().is_err()),
+                "timeout" | "pipe-holder" => {
+                    if termination == "pipe-holder" {
+                        std::fs::write(directory.path().join("release"), b"exit").unwrap();
+                        // A receipt and an exited leader do not complete capture
+                        // while a descendant keeps either pipe open. The outer
+                        // deadline must kill that group while its leader is pinned.
+                        assert!(
+                            wait_for_process_exit(leader, Duration::from_secs(1)).await,
+                            "transport leader must exit before the pipe-holder timeout"
+                        );
+                        assert!(!task.is_finished(), "open pipes must keep capture pending");
+                    }
+                    match task.await.unwrap() {
+                        Err(_) => {}
+                        Ok(Err(error)) => {
+                            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                        }
+                        Ok(Ok(_)) => panic!("{termination}: capture must not confirm cancellation"),
+                    }
+                }
                 "exit" => {
                     std::fs::write(directory.path().join("release"), b"exit").unwrap();
                     let output = task.await.unwrap().unwrap().unwrap();
                     assert!(remote_kill_confirmed(&output, 42));
+                }
+                "stdout-overflow" | "stderr-overflow" => {
+                    std::fs::write(directory.path().join("release"), b"overflow").unwrap();
+                    let error = task
+                        .await
+                        .unwrap()
+                        .expect("overflow must fail before the transport deadline")
+                        .expect_err("overflow must not return truncated transport output");
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(termination.strip_suffix("-overflow").unwrap())
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -4453,6 +4521,8 @@ sleep() { rch_cancel_test_clock=$((rch_cancel_test_clock + 1500)); }
                 "duplicate",
                 "failed",
                 "absent",
+                "stdout-overflow",
+                "stderr-overflow",
                 "hang",
                 "confirmed",
             ] {
@@ -4564,6 +4634,8 @@ case "$mode" in
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
   absent) printf 'RCH_REMOTE_RECORD_ABSENT_V1:%s\n' "$id"; exit 42;;
+  stdout-overflow) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; dd if=/dev/zero bs=1048576 count=1 2>/dev/null;;
+  stderr-overflow) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; dd if=/dev/zero bs=1048576 count=1 >&2 2>/dev/null;;
   hang) exec /bin/sleep 60;;
   confirmed) /bin/sleep 11; printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
