@@ -678,21 +678,26 @@ async fn eligible_recoveries(
         return eligible;
     };
     for candidate in candidates {
-        // Admission only inspects readiness here. The permit claims the
-        // shared endpoint flight and any due probe when recovery actually
-        // runs, so speculative scans cannot consume the recovery deadline.
-        // Invalid journals keep their ordinary error/backoff path.
-        let Some(admitted) = before_recovery_deadline(
-            deadline,
-            recovery_admission(admin_store, pool, lease_dir, candidate),
-        )
+        // Readiness is speculative. A queued local lock defers only this
+        // candidate; actual recovery rechecks and claims its flight in run_until.
+        let Some(admitted) = before_recovery_deadline(deadline, async {
+            // A fresh cooperative budget keeps later ready peers from looking
+            // contended after a long prefix. This yields within the original
+            // shared deadline instead of granting each candidate a new budget.
+            tokio::task::yield_now().await;
+            let mut admission =
+                std::pin::pin!(recovery_admission(admin_store, pool, lease_dir, candidate));
+            std::future::poll_fn(|cx| std::task::Poll::Ready(admission.as_mut().poll(cx))).await
+        })
         .await
         else {
             // A queued scan must not wedge completion accounting for all
             // workers. Keep uninspected candidates for the next normal scan.
             break;
         };
-        if !matches!(admitted, Ok(None)) {
+        // Pending observations drop their queued locks without claiming a
+        // transport lane. Ready errors keep the ordinary error/backoff path.
+        if matches!(admitted, std::task::Poll::Ready(Ok(Some(_)) | Err(_))) {
             eligible.insert(candidate.wrapper_id.clone());
         }
     }
@@ -1214,6 +1219,334 @@ mod tests {
                 .contains(&candidate.wrapper_id),
             "a fresh scan can admit the same still-owned candidate"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_defers_only_the_contended_worker_and_preserves_singleflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let slow_endpoint = recovery_worker("queued-readiness-worker");
+        let healthy_endpoint = recovery_worker("ready-readiness-worker");
+        let retired_endpoint = recovery_worker("retired-readiness-worker");
+        let (slow_lease, slow) = owned_recovery_fixture(directory.path(), &slow_endpoint);
+        let (healthy_lease, healthy) = owned_recovery_fixture(directory.path(), &healthy_endpoint);
+        let (retired_lease, retired) =
+            retired_recovery_fixture(directory.path(), &retired_endpoint);
+        let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+        let pool = WorkerPool::new();
+        for endpoint in [&slow_endpoint, &healthy_endpoint, &retired_endpoint] {
+            pool.add_worker(endpoint.clone()).await;
+            pool.get(&endpoint.id)
+                .await
+                .unwrap()
+                .restore_slots(2)
+                .unwrap();
+        }
+        let slow_worker = pool.get(&slow_endpoint.id).await.unwrap();
+        let held_config = slow_worker.config.write().await;
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(vec![slow.clone(), healthy.clone(), retired.clone()]);
+        queue
+            .backoff
+            .record_failure(&slow.wrapper_id, Instant::now());
+        let original_backoff = queue.backoff.failures[&slow.wrapper_id];
+        let ready_peers = HashSet::from([healthy.wrapper_id.clone(), retired.wrapper_id.clone()]);
+
+        for _ in 0..3 {
+            let started = Instant::now();
+            assert_eq!(
+                eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await,
+                ready_peers,
+                "a queued oldest worker must not hide independent recovery work"
+            );
+            assert_eq!(
+                Instant::now(),
+                started,
+                "readiness must not wait for a worker lock"
+            );
+            assert_eq!(queue.starts_remaining, MAX_RECOVERIES_PER_CYCLE);
+            assert!(queue.running.is_empty());
+            assert_eq!(queue.backoff.failures[&slow.wrapper_id], original_backoff);
+        }
+
+        // Cancellation between observations drops the pending lock request;
+        // the pool must remain writable even while this worker stays blocked.
+        let mut scan = Box::pin(eligible_recoveries(
+            &queue.pending,
+            &store,
+            &pool,
+            directory.path(),
+        ));
+        for _ in 0..2 {
+            std::future::poll_fn(|cx| {
+                assert!(Future::poll(scan.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(scan);
+        assert!(store.try_lock().is_ok());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.add_worker(recovery_worker("after-readiness-cancellation")),
+        )
+        .await
+        .expect("cancelled readiness must not retain the pool read guard");
+
+        // Scanning grants no transport lane. The real admission owns it only
+        // while run_until is polled, and dropping that operation returns it.
+        let mut admission = recovery_admission(&store, &pool, directory.path(), &healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let mut running = Box::pin(admission.run_until(
+            async {
+                entered.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+            test_recovery_window().deadline,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(Future::poll(running.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        observed.await.unwrap();
+        assert_eq!(
+            eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await,
+            HashSet::from([retired.wrapper_id.clone()]),
+            "an in-flight healthy worker must retain its singleflight lane"
+        );
+        let mut local = recovery_admission(&store, &pool, directory.path(), &retired)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(local, RecoveryAdmission::Local));
+        assert_eq!(
+            local
+                .run_until(
+                    async { read_lease(directory.path(), &retired.wrapper_id) },
+                    test_recovery_window().deadline,
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            retired_lease
+        );
+        drop(running);
+        assert_eq!(
+            eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await,
+            ready_peers
+        );
+        drop(held_config);
+        assert_eq!(
+            eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await,
+            HashSet::from([
+                slow.wrapper_id.clone(),
+                healthy.wrapper_id.clone(),
+                retired.wrapper_id.clone(),
+            ])
+        );
+        assert_eq!(queue.backoff.failures[&slow.wrapper_id], original_backoff);
+        assert!(!queue.backoff.ready(&slow.wrapper_id, Instant::now()));
+        for lease in [slow_lease, healthy_lease, retired_lease] {
+            assert_eq!(
+                read_lease(directory.path(), &lease.identity.local_wrapper_id).unwrap(),
+                lease
+            );
+            assert_eq!(
+                pool.get(&WorkerId::new(lease.worker_id.as_ref().unwrap()))
+                    .await
+                    .unwrap()
+                    .used_slots(),
+                2,
+                "readiness and cancellation supply no reservation-release authority"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_busy_admin_does_not_block_local_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("admin-queued-readiness");
+        let (owned, network) = owned_recovery_fixture(directory.path(), &endpoint);
+        let (settled, local) = retired_recovery_fixture(directory.path(), &endpoint);
+        let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+        let pool = WorkerPool::new();
+        pool.add_worker(endpoint.clone()).await;
+        pool.get(&endpoint.id)
+            .await
+            .unwrap()
+            .restore_slots(3)
+            .unwrap();
+        let pending = VecDeque::from([network.clone(), local.clone()]);
+        let blocked = store.lock().await;
+        let started = Instant::now();
+        assert_eq!(
+            eligible_recoveries(&pending, &store, &pool, directory.path()).await,
+            HashSet::from([local.wrapper_id.clone()])
+        );
+        assert_eq!(Instant::now(), started);
+        assert!(blocked.all().is_empty());
+        assert_eq!(
+            read_lease(directory.path(), &network.wrapper_id).unwrap(),
+            owned
+        );
+        assert_eq!(
+            read_lease(directory.path(), &local.wrapper_id).unwrap(),
+            settled
+        );
+        assert_eq!(pool.get(&endpoint.id).await.unwrap().used_slots(), 3);
+        drop(blocked);
+        assert_eq!(
+            eligible_recoveries(&pending, &store, &pool, directory.path()).await,
+            HashSet::from([network.wrapper_id, local.wrapper_id])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_keeps_one_deadline_across_candidates() {
+        for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = recovery_worker("readiness-deadline");
+            let (first_lease, first) = retired_recovery_fixture(directory.path(), &endpoint);
+            let (second_lease, second) = retired_recovery_fixture(directory.path(), &endpoint);
+            let pending = VecDeque::from([first.clone(), second.clone()]);
+            let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+            let pool = WorkerPool::new();
+            let mut scan = Box::pin(eligible_recoveries(
+                &pending,
+                &store,
+                &pool,
+                directory.path(),
+            ));
+            // Finish the first observation and stop at the second candidate's
+            // cooperative yield. It must not receive a fresh full allowance.
+            for _ in 0..2 {
+                std::future::poll_fn(|cx| {
+                    assert!(Future::poll(scan.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            tokio::time::advance(
+                rch_common::timing::scale_duration(RECOVERY_PREFLIGHT_TIMEOUT) + lateness,
+            )
+            .await;
+            assert_eq!(scan.await, HashSet::from([first.wrapper_id.clone()]));
+            for lease in [first_lease, second_lease] {
+                assert_eq!(
+                    read_lease(directory.path(), &lease.identity.local_wrapper_id).unwrap(),
+                    lease
+                );
+            }
+            assert_eq!(
+                eligible_recoveries(&pending, &store, &pool, directory.path()).await,
+                HashSet::from([first.wrapper_id, second.wrapper_id])
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_yields_through_a_large_deferred_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let offline_endpoint = recovery_worker("deferred-prefix-worker");
+        let healthy_endpoint = recovery_worker("after-deferred-prefix-worker");
+        let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+        let pool = WorkerPool::new();
+        pool.add_worker(offline_endpoint.clone()).await;
+        pool.add_worker(healthy_endpoint.clone()).await;
+        let offline = pool.get(&offline_endpoint.id).await.unwrap();
+        offline.restore_slots(2).unwrap();
+        offline
+            .record_transport_result(
+                false,
+                Duration::from_secs(30),
+                &rch_common::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        // These completed local lock acquisitions exceed one Tokio task's
+        // cooperative budget. Exhaustion must not masquerade as a busy peer.
+        let mut pending: VecDeque<_> = (0..160)
+            .map(|_| owned_recovery_fixture(directory.path(), &offline_endpoint).1)
+            .collect();
+        let (healthy_lease, healthy) = owned_recovery_fixture(directory.path(), &healthy_endpoint);
+        pending.push_back(healthy.clone());
+        for _ in 0..2 {
+            let started = Instant::now();
+            assert_eq!(
+                eligible_recoveries(&pending, &store, &pool, directory.path()).await,
+                HashSet::from([healthy.wrapper_id.clone()])
+            );
+            assert_eq!(Instant::now(), started);
+            assert_eq!(offline.used_slots(), 2);
+            assert!(offline.transport_is_down().await);
+            assert_eq!(
+                read_lease(directory.path(), &healthy.wrapper_id).unwrap(),
+                healthy_lease
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_readiness_invalid_journal_keeps_existing_error_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("invalid-readiness-journal");
+        let (mut owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+        owned.schema_version = 0;
+        let bytes = serde_json::to_vec(&owned).unwrap();
+        let path = directory
+            .path()
+            .join(format!("{}.json", candidate.wrapper_id));
+        std::fs::write(&path, &bytes).unwrap();
+        let store = Arc::new(Mutex::new(AdminDisableStore::with_path(
+            directory.path().join("admin"),
+        )));
+        let pool = WorkerPool::new();
+        pool.add_worker(endpoint.clone()).await;
+        pool.get(&endpoint.id)
+            .await
+            .unwrap()
+            .restore_slots(2)
+            .unwrap();
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(vec![candidate.clone()]);
+        let eligible = eligible_recoveries(&queue.pending, &store, &pool, directory.path()).await;
+        assert_eq!(eligible, HashSet::from([candidate.wrapper_id.clone()]));
+        queue.start_ready_if(
+            Instant::now(),
+            |candidate| eligible.contains(&candidate.wrapper_id),
+            |candidate| {
+                let store = store.clone();
+                let pool = pool.clone();
+                let directory = directory.path().to_owned();
+                async move {
+                    recover_before(
+                        Path::new("/must-not-spawn-a-recovery-client"),
+                        &directory.join("unused.sock"),
+                        &directory,
+                        &candidate,
+                        &store,
+                        &pool,
+                        test_recovery_window(),
+                    )
+                    .await
+                }
+            },
+        );
+        let (completed, outcome) = queue.next_completed().await.unwrap();
+        assert_eq!(completed.wrapper_id, candidate.wrapper_id);
+        assert_eq!(
+            outcome.unwrap_err(),
+            "recovery journal schema or filename identity is invalid"
+        );
+        assert_eq!(queue.backoff.failures[&candidate.wrapper_id].0, 1);
+        assert!(!queue.backoff.ready(&candidate.wrapper_id, Instant::now()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(pool.get(&endpoint.id).await.unwrap().used_slots(), 2);
     }
 
     #[cfg(unix)]
