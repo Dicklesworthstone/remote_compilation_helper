@@ -8,7 +8,7 @@
 use crate::config::CacheCleanupConfig;
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::timing::scale_duration;
-use rch_common::{SshClient, SshOptions, WorkerId, WorkerStatus};
+use rch_common::{SshClient, SshOptions, WorkerId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -286,7 +286,7 @@ fn build_cleanup_command_with_source_guard(
     // garbage. A launch racing its removal fails typed setup and fails over.
     let empty_run_dir_minutes = 1440_u64;
     format!(
-        "{timing}set -u; \
+        "{timing}{scratch}\nset -u; \
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
@@ -305,7 +305,7 @@ fn build_cleanup_command_with_source_guard(
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
          run_root={run_root}; \
          if [ -d \"$run_root\" ]; then \
-           tally=$(mktemp /tmp/rch-cleanup.XXXXXX); \
+           tally=$(rch_gc_mktemp) || {{ printf 'RCH_CLEANUP_SCRATCH_FAILED tally\\n' >&2; exit 1; }}; \
            (set -- \"$run_root\"/*/*.pgid\n{identity}\n killed=0; \
              for pgf in \"$@\"; do \
                [ -f \"$pgf\" ] && [ ! -L \"$pgf\" ] || continue; \
@@ -332,7 +332,7 @@ fn build_cleanup_command_with_source_guard(
          {source_guard}\n\
          {activity_guard}\n\
          {source_transaction}\n\
-         candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
+         candidates=$(rch_gc_mktemp) || {{ printf 'RCH_CLEANUP_SCRATCH_FAILED candidates\\n' >&2; exit 1; }}; \
          if [ \"$low_disk\" -eq 1 ]; then \
            {{ \
              if find \"$base\" -maxdepth 0 -printf '' >/dev/null 2>&1; then \
@@ -346,7 +346,7 @@ fn build_cleanup_command_with_source_guard(
                  find \"$base/offroot\" -mindepth 2 -maxdepth 2 -type d -exec stat -f '%m %N' {{}} + 2>/dev/null; \
                fi; \
              fi; \
-           }} | sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
+           }} | TMPDIR=\"${{RCH_GC_SCRATCH:-${{TMPDIR:-/tmp}}}}\" sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
          else \
            find \"$base\" -mindepth 2 -maxdepth 2 -type d ! -path \"$base/offroot/*\" -mmin +\"$max_age_minutes\" -print 2>/dev/null > \"$candidates\"; \
            if [ -d \"$base/offroot\" ]; then \
@@ -420,6 +420,7 @@ fn build_cleanup_command_with_source_guard(
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
          if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         timing = rch_common::timing::shell_prefix(),
+        scratch = rch_common::recovery_reserve::GC_SHELL_HELPERS,
         base = escaped_base,
         run_root = escaped_run_root,
         max_age_minutes = max_age_minutes,
@@ -615,17 +616,11 @@ impl CacheCleanupScheduler {
 
     /// Check if a worker is eligible for cleanup.
     async fn is_worker_eligible(&self, worker_state: &WorkerState) -> bool {
-        if !worker_state.background_network_allowed().await {
-            return false;
-        }
         let worker_id = worker_state.config.read().await.id.clone();
-
-        // Check worker status
-        let status = worker_state.status().await;
-        if status != WorkerStatus::Healthy {
+        if !worker_state.background_disk_recovery_allowed().await {
             debug!(
-                "Worker {:?} not healthy (status={:?}), skipping cleanup",
-                worker_id, status
+                "Worker {} is unavailable for background disk recovery, skipping cleanup",
+                worker_id
             );
             self.idle_since.write().await.remove(&worker_id);
             return false;
@@ -639,7 +634,13 @@ impl CacheCleanupScheduler {
         // every starved one). The script protects live trees itself (recent
         // activity, retention holds, the source registry), so a starved
         // worker is swept while it drains.
-        let disk_starved = disk_starved(&worker_state.pressure_assessment().await);
+        // Registry pressure can precede a disk telemetry update, and a spent
+        // reserve can await checked claim retirement after bytes were freed.
+        // Both require recovery without waiting for idle slots. The worker
+        // predicate above still enforces current endpoint, admin and circuit
+        // evidence; neither condition authorizes deleting an active tree.
+        let disk_starved = disk_starved(&worker_state.pressure_assessment().await)
+            || worker_state.registry_storage_pressure().await.is_some();
 
         // Check if worker is busy (has active slots)
         let used_slots = worker_state.used_slots();
@@ -670,17 +671,9 @@ impl CacheCleanupScheduler {
             }
         }
 
-        // Check circuit breaker state
-        let circuit_state = worker_state.circuit_state().await;
-        if circuit_state != Some(rch_common::CircuitState::Closed) {
-            debug!(
-                "Worker {} circuit not closed ({:?}), skipping cleanup",
-                worker_id, circuit_state
-            );
-            return false;
-        }
-
-        true
+        // Recheck after the asynchronous telemetry/idle observations. The
+        // actual SSH call also retains its revocable background permit.
+        worker_state.background_disk_recovery_allowed().await
     }
 
     /// Perform cleanup on a single worker.
@@ -708,6 +701,10 @@ impl CacheCleanupScheduler {
             REMOTE_RUN_ROOT,
             self.config.max_cache_age_hours,
             self.config.min_free_gb,
+        );
+        let cleanup_script = rch_common::stale_target_reap::with_gc_recovery_reserve(
+            rch_common::stale_target_reap::SOURCE_CLAIM_REGISTRY,
+            &cleanup_script,
         );
         // The worker's login shell may be zsh, which neither word-splits nor
         // tolerates unmatched globs the way the POSIX script expects.
@@ -815,7 +812,7 @@ impl CacheCleanupScheduler {
 mod tests {
     use super::*;
     use rch_common::test_guard;
-    use rch_common::{CircuitState, WorkerConfig};
+    use rch_common::{CircuitState, WorkerConfig, WorkerStatus};
 
     #[test]
     fn test_cleanup_config_defaults() {
@@ -1263,6 +1260,47 @@ mod tests {
             worker.set_pressure_assessment(other).await;
             assert!(!scheduler.is_worker_eligible(&worker).await, "{reason}");
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_registry_pressure_bypasses_busy_and_idle_delays_only_for_recovery() {
+        use crate::workers::RegistryStoragePressure;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_test_worker_config("registry-recovery"))
+            .await;
+        let worker = pool.get(&WorkerId::new("registry-recovery")).await.unwrap();
+        let scheduler = CacheCleanupScheduler::new(pool, CacheCleanupConfig::default());
+        assert!(worker.reserve_slots(1).await);
+        let endpoint = worker.endpoint_snapshot().await;
+        let network = worker.background_probe().await.unwrap();
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert!(!scheduler.is_worker_eligible(&worker).await);
+
+        for reason in [
+            RegistryStoragePressure::NoSpace,
+            RegistryStoragePressure::RecoveryPending,
+        ] {
+            assert!(
+                worker
+                    .record_registry_storage_pressure(&endpoint, &network, Some(reason))
+                    .await
+            );
+            assert!(scheduler.is_worker_eligible(&worker).await);
+            assert_eq!(worker.used_slots(), 1, "existing ownership is retained");
+            assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+            assert!(
+                !worker.reserve_slots(1).await,
+                "recovery cannot admit builds"
+            );
+        }
+
+        assert!(
+            worker
+                .record_registry_storage_pressure(&endpoint, &network, None)
+                .await
+        );
+        assert!(!scheduler.is_worker_eligible(&worker).await);
     }
 
     #[tokio::test]
@@ -2158,6 +2196,80 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         );
         assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(runs.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_allocates_every_snapshot_on_the_recovery_filesystem() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("cache");
+        let runs = fixture.path().join("runs");
+        let scratch = fixture.path().join("recovery-scratch");
+        for path in [&base, &runs, &scratch] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let unavailable = fixture.path().join("not-a-temporary-directory");
+        std::fs::write(&unavailable, b"temporary storage is unavailable").unwrap();
+        let log = fixture.path().join("scratch-allocations");
+        let cleanup = build_cleanup_command_with_source_guard(
+            &shell_escape::escape(base.to_string_lossy()),
+            &shell_escape::escape(runs.to_string_lossy()),
+            72,
+            0,
+            2000,
+            "",
+        );
+        let command = format!(
+            r#"mktemp() {{
+                case "$1" in "$RCH_GC_SCRATCH"/rch-gc.*) ;;
+                    *) printf 'scratch escaped recovery filesystem\n' >&2; return 98;; esac
+                printf '%s\n' "$1" >> "$RCH_TEST_SCRATCH_LOG"
+                command mktemp "$@"
+            }}
+            sort() {{
+                [ "$TMPDIR" = "$RCH_GC_SCRATCH" ] || return 97
+                printf 'sort\n' >> "$RCH_TEST_SCRATCH_LOG"
+                command sort "$@"
+            }}
+            {cleanup}"#
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &unavailable)
+            .env("RCH_GC_SCRATCH", &scratch)
+            .env("RCH_TEST_SCRATCH_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("RCH_CLEANUP_METRICS removed=0"));
+        let allocations = std::fs::read_to_string(log).unwrap();
+        assert_eq!(allocations.lines().count(), 3);
+        assert!(allocations.lines().any(|line| line == "sort"));
+        assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_snapshot_allocation_failure_before_reporting_success() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cleanup = build_cleanup_command_with_source_guard(
+            &shell_escape::escape(fixture.path().to_string_lossy()),
+            &shell_escape::escape(fixture.path().to_string_lossy()),
+            72,
+            0,
+            0,
+            "",
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("mktemp() {{ return 28; }}\n{cleanup}")])
+            .env("RCH_GC_SCRATCH", fixture.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("RCH_CLEANUP_SCRATCH_FAILED tally")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("RCH_CLEANUP_METRICS"));
     }
 
     /// Backdate a file far past the 240-minute orphan threshold.

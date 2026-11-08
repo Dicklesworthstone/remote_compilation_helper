@@ -34,13 +34,14 @@
 //! - The `remote_base` is validated against
 //!   [`rch_common::stale_target_reap::is_safe_reap_base`] before being embedded in
 //!   the generated shell (the security boundary).
-//! - Only `WorkerStatus::Healthy` workers with a closed circuit are swept; SSH and
-//!   reap failures are swallowed (best-effort, never load-bearing).
+//! - Workers must have a closed circuit and current background permission.
+//!   Confirmed registry pressure also permits recovery on an otherwise excluded
+//!   worker; ordinary network failures and administrative exclusions do not.
 
 use crate::config::StaleTargetReapConfig;
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::stale_target_reap;
-use rch_common::{CommandResult, SshClient, SshOptions, WorkerId, WorkerStatus};
+use rch_common::{CommandResult, SshClient, SshOptions, WorkerId};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
@@ -332,17 +333,8 @@ impl StaleTargetReaper {
 
     /// Whether a worker is in a state where SSH-based sweeping is sensible.
     async fn is_worker_sweepable(&self, worker_state: &WorkerState, worker_id: &WorkerId) -> bool {
-        if !worker_state.background_network_allowed().await {
-            return false;
-        }
-        let status = worker_state.status().await;
-        if status != WorkerStatus::Healthy {
-            debug!(worker = %worker_id, ?status, "Skipping non-healthy worker for stale-target sweep");
-            return false;
-        }
-        let circuit_state = worker_state.circuit_state().await;
-        if circuit_state != Some(rch_common::CircuitState::Closed) {
-            debug!(worker = %worker_id, ?circuit_state, "Skipping worker with non-closed circuit for stale-target sweep");
+        if !worker_state.background_disk_recovery_allowed().await {
+            debug!(worker = %worker_id, "Skipping worker without current background disk recovery eligibility");
             return false;
         }
         true
@@ -392,6 +384,10 @@ impl StaleTargetReaper {
                 // The same line the cache sweep evicts to: critical placement
                 // ratio plus headroom.
                 crate::cache_cleanup::placement_low_disk_permille(),
+            );
+            let cmd = stale_target_reap::with_gc_recovery_reserve(
+                stale_target_reap::SOURCE_CLAIM_REGISTRY,
+                &cmd,
             );
 
             debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
@@ -459,6 +455,7 @@ fn log_reap_audit(worker_id: &WorkerId, stdout: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::WorkerStatus;
 
     #[test]
     fn sweep_timeout_outlasts_default_ssh_timeout_and_never_overlaps_next_cycle() {
@@ -948,6 +945,32 @@ mod tests {
         assert_eq!(stats.workers_skipped, 1);
         assert_eq!(stats.workers_swept, 0);
         assert_eq!(stats.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_reaches_confirmed_storage_failure_without_bypassing_circuit() {
+        use crate::workers::RegistryStoragePressure;
+
+        let worker = WorkerState::new(rch_common::WorkerConfig::default());
+        let worker_id = worker.config.read().await.id.clone();
+        let reaper = StaleTargetReaper::new(WorkerPool::new(), StaleTargetReapConfig::default());
+        let endpoint = worker.endpoint_snapshot().await;
+        let network = worker.background_probe().await.unwrap();
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert!(!reaper.is_worker_sweepable(&worker, &worker_id).await);
+        assert!(
+            worker
+                .record_registry_storage_pressure(
+                    &endpoint,
+                    &network,
+                    Some(RegistryStoragePressure::NoSpace),
+                )
+                .await
+        );
+        assert!(reaper.is_worker_sweepable(&worker, &worker_id).await);
+        assert!(!worker.reserve_slots(1).await);
+        worker.open_circuit().await;
+        assert!(!reaper.is_worker_sweepable(&worker, &worker_id).await);
     }
 
     /// Issue #64: pooled stores placed off the mirror tree must still be

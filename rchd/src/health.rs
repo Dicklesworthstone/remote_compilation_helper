@@ -7,7 +7,7 @@
 use crate::alerts::AlertManager;
 use crate::metrics;
 use crate::ui::workers::WorkerStatusPanel;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{RegistryStoragePressure, WorkerPool, WorkerState};
 use rch_common::mock::{self, MockConfig, MockSshClient};
 use rch_common::timing::scale_duration;
 use rch_common::{
@@ -142,6 +142,9 @@ pub struct HealthCheckResult {
     /// and trips the breaker on its own threshold. Always `false` for healthy
     /// results and for connect-stage failures.
     pub command_failure: bool,
+    /// Exact storage-pressure subtype from the completed registry protocol.
+    /// Generic storage errors and diagnostic text never populate this field.
+    pub(crate) registry_storage_pressure: Option<RegistryStoragePressure>,
     /// Timestamp of the check.
     #[allow(dead_code)] // May be used for monitoring metrics
     pub checked_at: Instant,
@@ -155,6 +158,7 @@ impl HealthCheckResult {
             error: None,
             transient: false,
             command_failure: false,
+            registry_storage_pressure: None,
             checked_at: Instant::now(),
         }
     }
@@ -166,6 +170,7 @@ impl HealthCheckResult {
             error: Some(error),
             transient: false,
             command_failure: false,
+            registry_storage_pressure: None,
             checked_at: Instant::now(),
         }
     }
@@ -179,6 +184,7 @@ impl HealthCheckResult {
             error: Some(error),
             transient: true,
             command_failure: false,
+            registry_storage_pressure: None,
             checked_at: Instant::now(),
         }
     }
@@ -194,7 +200,20 @@ impl HealthCheckResult {
             error: Some(error),
             transient,
             command_failure: true,
+            registry_storage_pressure: None,
             checked_at: Instant::now(),
+        }
+    }
+
+    fn from_probe_error(error: HealthProbeError) -> Self {
+        if error.stage == ProbeStage::Command {
+            let mut result = Self::command_failure(error.message, error.retryable);
+            result.registry_storage_pressure = error.registry_storage_pressure;
+            result
+        } else if error.retryable {
+            Self::transient_failure(error.message)
+        } else {
+            Self::failure(error.message)
         }
     }
 
@@ -556,6 +575,16 @@ impl HealthMonitor {
                     continue;
                 };
                 let previous_effective_status = worker.status().await;
+                if !worker
+                    .record_registry_storage_pressure(
+                        &endpoint,
+                        &permit.network,
+                        result.registry_storage_pressure,
+                    )
+                    .await
+                {
+                    continue;
+                }
                 let Some((was_down, transport_down)) = worker
                     .record_health_transport_result(
                         &permit,
@@ -591,22 +620,7 @@ impl HealthMonitor {
                 // probes now execute storage operations too, so they can
                 // supply command-class recovery rather than just liveness.
                 let (previous_circuit_state, mut new_circuit_state) =
-                    if registry_health::is_degraded(&result) {
-                        // Storage probe writes succeeded, but registry filesystem headroom is
-                        // low. Surface Degraded status and the diagnostic warning without
-                        // tripping the command-failure circuit breaker into Open (bd-3n17z).
-                        worker
-                            .record_health_check(true, false, &config.circuit)
-                            .await
-                    } else if result.command_failure || result.healthy {
-                        worker
-                            .record_command_outcome(result.healthy, &config.circuit)
-                            .await
-                    } else {
-                        worker
-                            .record_health_check(result.healthy, result.transient, &config.circuit)
-                            .await
-                    };
+                    record_probe_circuit_outcome(&worker, &result, &config).await;
 
                 if permit.isolated && result.healthy {
                     // This probe ran the real storage/command check on a
@@ -1091,11 +1105,7 @@ async fn check_worker_health_once(
         // retryable: three consecutive command-stage timeouts over an
         // established session is the signature of a host that cannot fork,
         // not of a network blip. See `HealthCheckResult::command_failure`.
-        Err(err) if err.stage == ProbeStage::Command => {
-            HealthCheckResult::command_failure(err.message, err.retryable)
-        }
-        Err(err) if err.retryable => HealthCheckResult::transient_failure(err.message),
-        Err(err) => HealthCheckResult::failure(err.message),
+        Err(err) => HealthCheckResult::from_probe_error(err),
     }
 }
 
@@ -1114,6 +1124,32 @@ struct HealthProbeError {
     message: String,
     retryable: bool,
     stage: ProbeStage,
+    registry_storage_pressure: Option<RegistryStoragePressure>,
+}
+
+async fn record_probe_circuit_outcome(
+    worker: &WorkerState,
+    result: &HealthCheckResult,
+    config: &HealthConfig,
+) -> (CircuitState, CircuitState) {
+    if registry_health::is_degraded(result) || result.registry_storage_pressure.is_some() {
+        // A complete storage refusal proves the control command ran; it is
+        // not fork exhaustion or a hung transport. Keep placement excluded by
+        // status_after_probe, but let disk recovery reach the worker before
+        // every heartbeat poisons the circuit that recovery must respect.
+        // Existing open/half-open cooldown and unrelated command debt remain.
+        worker
+            .record_health_check(true, false, &config.circuit)
+            .await
+    } else if result.command_failure || result.healthy {
+        worker
+            .record_command_outcome(result.healthy, &config.circuit)
+            .await
+    } else {
+        worker
+            .record_health_check(result.healthy, result.transient, &config.circuit)
+            .await
+    }
 }
 
 fn require_health_probe_time(
@@ -1129,6 +1165,7 @@ fn require_health_probe_time(
             .to_owned(),
             retryable: true,
             stage,
+            registry_storage_pressure: None,
         });
     }
     Ok(())
@@ -1180,6 +1217,7 @@ async fn probe_health_once(
                 retryable: is_retryable_transport_error(&e),
                 message: format!("Health connection failed: {e}"),
                 stage: ProbeStage::Connect,
+                registry_storage_pressure: None,
             })?;
         connected.store(true, Ordering::Release);
         require_health_probe_time(deadline, ProbeStage::Command)?;
@@ -1202,6 +1240,7 @@ async fn probe_health_once(
                     message,
                     retryable,
                     stage,
+                    registry_storage_pressure: None,
                 })
             }
         };
@@ -1234,6 +1273,7 @@ async fn probe_health_once(
                         message: format!("Command failed: {}", e),
                         retryable,
                         stage,
+                        registry_storage_pressure: None,
                     })
                 }
             }
@@ -1244,6 +1284,7 @@ async fn probe_health_once(
                 message: format!("Connection failed: {}", e),
                 retryable,
                 stage: ProbeStage::Connect,
+                registry_storage_pressure: None,
             })
         }
     }

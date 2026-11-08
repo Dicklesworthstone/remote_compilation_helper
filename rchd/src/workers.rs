@@ -729,6 +729,24 @@ pub(crate) struct HealthProbePermit {
     _singleflight: OwnedMutexGuard<()>,
 }
 
+/// A completed registry probe established storage pressure or an intact
+/// pending recovery claim, rather than an unavailable transport, unsafe
+/// namespace, or unknown recovery state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryStoragePressure {
+    InsufficientHeadroom,
+    NoSpace,
+    QuotaExhausted,
+    RecoveryPending,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryStoragePressureEvidence {
+    reason: RegistryStoragePressure,
+    endpoint_generation: u64,
+    network: BackgroundProbe,
+}
+
 /// Speculative admission is side-effect free. The operation lane and any due
 /// historical probe are claimed only when `run` is polled under the caller's
 /// stable worker-ID administrative permit.
@@ -979,6 +997,9 @@ pub struct WorkerState {
     circuit: RwLock<CircuitStats>,
     /// Last error message.
     last_error_msg: RwLock<Option<String>>,
+    /// Exact storage-pressure evidence from this endpoint's latest health
+    /// result. Diagnostic text alone never authorizes background recovery.
+    registry_storage_pressure: RwLock<Option<RegistryStoragePressureEvidence>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
     disk_capacity_generation: Arc<AtomicU64>,
@@ -1153,6 +1174,7 @@ impl WorkerState {
             cached_projects: RwLock::new(Vec::new()),
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
+            registry_storage_pressure: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
             disk_capacity_generation: Arc::new(AtomicU64::new(0)),
             disk_capacity_observation: RwLock::new(None),
@@ -1210,6 +1232,77 @@ impl WorkerState {
     pub(crate) async fn background_probe(&self) -> Option<BackgroundProbe> {
         let permit = self.network_revision_guard();
         (self.background_network_allowed().await && permit.is_current()).then_some(permit)
+    }
+
+    /// Publish or clear the latest exact registry-storage result while the
+    /// health monitor holds its endpoint and network-publication guards.
+    /// Every non-pressure result, including an inconclusive/failed transport,
+    /// clears the previous exception before that transport generation changes.
+    pub(crate) async fn record_registry_storage_pressure(
+        &self,
+        endpoint: &WorkerEndpointSnapshot,
+        network: &BackgroundProbe,
+        pressure: Option<RegistryStoragePressure>,
+    ) -> bool {
+        let mut evidence = self.registry_storage_pressure.write().await;
+        if self.is_endpoint_retired()
+            || endpoint.generation != self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            || !endpoint
+                .incarnation
+                .as_ref()
+                .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
+        {
+            return false;
+        }
+        let next = pressure.map(|reason| RegistryStoragePressureEvidence {
+            reason,
+            endpoint_generation: endpoint.generation,
+            network: network.clone(),
+        });
+        network.with_current(|| *evidence = next).is_some()
+    }
+
+    /// Current storage evidence can skip a cleanup service's idle delay; it
+    /// cannot bypass that service's lifecycle, transport, or circuit gates.
+    pub(crate) async fn registry_storage_pressure(&self) -> Option<RegistryStoragePressure> {
+        let evidence = self.registry_storage_pressure.read().await;
+        let evidence = evidence.as_ref()?;
+        (!self.is_endpoint_retired()
+            && evidence.endpoint_generation
+                == self.endpoint_incarnation.generation.load(Ordering::Acquire)
+            && evidence.network.is_current())
+        .then_some(evidence.reason)
+    }
+
+    /// Permit disk recovery on healthy workers and on a responsive worker
+    /// excluded specifically by confirmed registry storage pressure. This is
+    /// not build admission or recovery from an open command/transport circuit.
+    /// Callers still execute under a revocable background network permit.
+    pub(crate) async fn background_disk_recovery_allowed(&self) -> bool {
+        let Some(network) = self.background_probe().await else {
+            return false;
+        };
+        // Match circuit-before-lifecycle publication order. Holding the read
+        // guards prevents a mixed snapshot from blessing an open/quarantined
+        // worker; the returned bool remains only a preflight, not a permit.
+        let circuit = self.circuit.read().await;
+        let pressure = self.registry_storage_pressure.read().await;
+        let lifecycle = self.lifecycle.read().await;
+        if circuit.state() != CircuitState::Closed || lifecycle.admin != AdminIntent::Active {
+            return false;
+        }
+        let eligible = match lifecycle.eligibility {
+            EligibilityState::Healthy => true,
+            EligibilityState::Degraded | EligibilityState::Unreachable => {
+                pressure.as_ref().is_some_and(|evidence| {
+                    evidence.endpoint_generation
+                        == self.endpoint_incarnation.generation.load(Ordering::Acquire)
+                        && evidence.network.is_current()
+                })
+            }
+            EligibilityState::TemporaryBypass | EligibilityState::RecoveredPendingCanary => false,
+        };
+        eligible && !self.is_endpoint_retired() && network.is_current()
     }
 
     /// Capture cancellation only. Recovery of a recorded orphan may use this
@@ -1532,6 +1625,7 @@ impl WorkerState {
             // operator's administrative intent, including an active bypass.
             *self.circuit.write().await = CircuitStats::new();
             *self.last_error_msg.write().await = None;
+            *self.registry_storage_pressure.write().await = None;
             self.last_latency_ms.store(0, Ordering::Relaxed);
             self.cached_projects.write().await.clear();
             self.toolchain_preflight.write().await.clear();
@@ -8773,6 +8867,202 @@ mod tests {
 
         state.set_last_latency_ms(None);
         assert!(state.last_latency_ms().is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_requires_current_typed_pressure_for_nonhealthy_workers() {
+        let worker = WorkerState::new(test_config("registry-pressure"));
+        assert!(worker.background_disk_recovery_allowed().await);
+        let endpoint = worker.endpoint_snapshot().await;
+        let network = worker.background_probe().await.unwrap();
+        for status in [WorkerStatus::Degraded, WorkerStatus::Unreachable] {
+            worker.apply_health_status(status).await;
+            assert!(!worker.background_disk_recovery_allowed().await);
+            worker
+                .set_error("RCH_SOURCE_REGISTRY_UNWRITABLE: no space left on device".into())
+                .await;
+            assert!(
+                !worker.background_disk_recovery_allowed().await,
+                "untyped diagnostic text cannot authorize recovery"
+            );
+            for pressure in [
+                RegistryStoragePressure::InsufficientHeadroom,
+                RegistryStoragePressure::NoSpace,
+                RegistryStoragePressure::QuotaExhausted,
+                RegistryStoragePressure::RecoveryPending,
+            ] {
+                assert!(
+                    worker
+                        .record_registry_storage_pressure(&endpoint, &network, Some(pressure))
+                        .await
+                );
+                assert_eq!(worker.registry_storage_pressure().await, Some(pressure));
+                assert!(worker.background_disk_recovery_allowed().await);
+                assert_eq!(worker.status().await, status, "recovery is not admission");
+                assert!(
+                    worker
+                        .record_registry_storage_pressure(&endpoint, &network, None)
+                        .await
+                );
+                assert!(worker.registry_storage_pressure().await.is_none());
+                assert!(!worker.background_disk_recovery_allowed().await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_respects_admin_quarantine_and_circuit_guards() {
+        for denied in [
+            "draining",
+            "drained",
+            "disabled",
+            "bypass",
+            "canary",
+            "open",
+            "half-open",
+        ] {
+            let worker = WorkerState::new(test_config(denied));
+            let endpoint = worker.endpoint_snapshot().await;
+            let network = worker.background_probe().await.unwrap();
+            worker
+                .record_registry_storage_pressure(
+                    &endpoint,
+                    &network,
+                    Some(RegistryStoragePressure::NoSpace),
+                )
+                .await;
+            worker.apply_health_status(WorkerStatus::Unreachable).await;
+            assert!(worker.background_disk_recovery_allowed().await);
+            match denied {
+                "draining" => worker.set_status(WorkerStatus::Draining).await,
+                "drained" => worker.set_status(WorkerStatus::Drained).await,
+                "disabled" => worker.disable(Some("operator maintenance".into())).await,
+                "bypass" => {
+                    worker
+                        .enter_bypass(BypassFailureClass::DiskInodePressure)
+                        .await
+                }
+                "canary" => {
+                    worker
+                        .enter_bypass(BypassFailureClass::DiskInodePressure)
+                        .await;
+                    worker.recover_to_canary().await.unwrap();
+                }
+                "open" => worker.open_circuit().await,
+                "half-open" => worker.half_open_circuit().await,
+                _ => unreachable!(),
+            }
+            let lifecycle = worker.lifecycle().await;
+            let circuit = worker.circuit_state().await;
+            assert!(!worker.background_disk_recovery_allowed().await, "{denied}");
+            assert_eq!(worker.lifecycle().await, lifecycle);
+            assert_eq!(worker.circuit_state().await, circuit);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_rejects_stale_endpoint_and_network_generations() {
+        let config = test_config("registry-generations");
+        let worker = WorkerState::new(config.clone());
+        let original_endpoint = worker.endpoint_snapshot().await;
+        let original_network = worker.background_probe().await.unwrap();
+        worker
+            .record_registry_storage_pressure(
+                &original_endpoint,
+                &original_network,
+                Some(RegistryStoragePressure::NoSpace),
+            )
+            .await;
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert!(worker.background_disk_recovery_allowed().await);
+        let mut replacement = config.clone();
+        replacement.host = "replacement.example".into();
+        worker.update_config(replacement).await;
+        worker.update_config(config).await;
+        assert!(worker.registry_storage_pressure().await.is_none());
+        assert!(!worker.background_disk_recovery_allowed().await);
+        worker
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &CircuitBreakerConfig::default(),
+            )
+            .await;
+        assert!(!worker.background_disk_recovery_allowed().await);
+        let current_network = worker.background_probe().await.unwrap();
+        assert!(
+            !worker
+                .record_registry_storage_pressure(
+                    &original_endpoint,
+                    &current_network,
+                    Some(RegistryStoragePressure::NoSpace),
+                )
+                .await,
+            "an A-B-A endpoint change must not reuse old storage evidence"
+        );
+        let current_endpoint = worker.endpoint_snapshot().await;
+        assert!(
+            !worker
+                .record_registry_storage_pressure(
+                    &current_endpoint,
+                    &original_network,
+                    Some(RegistryStoragePressure::NoSpace),
+                )
+                .await
+        );
+        assert!(
+            worker
+                .record_registry_storage_pressure(
+                    &current_endpoint,
+                    &current_network,
+                    Some(RegistryStoragePressure::NoSpace),
+                )
+                .await
+        );
+        assert!(worker.background_disk_recovery_allowed().await);
+        worker.retire_endpoint().await;
+        assert!(worker.registry_storage_pressure().await.is_none());
+        assert!(!worker.background_disk_recovery_allowed().await);
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_does_not_survive_transport_failure_and_reconnect() {
+        let worker = WorkerState::new(test_config("registry-outage"));
+        let endpoint = worker.endpoint_snapshot().await;
+        let network = worker.background_probe().await.unwrap();
+        worker
+            .record_registry_storage_pressure(
+                &endpoint,
+                &network,
+                Some(RegistryStoragePressure::QuotaExhausted),
+            )
+            .await;
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert!(worker.background_disk_recovery_allowed().await);
+        let config = CircuitBreakerConfig::default();
+        worker
+            .record_transport_result(false, Duration::from_secs(30), &config)
+            .await;
+        assert!(worker.registry_storage_pressure().await.is_none());
+        assert!(!worker.background_disk_recovery_allowed().await);
+        worker
+            .record_transport_result(true, Duration::from_secs(30), &config)
+            .await;
+        assert!(worker.background_network_allowed().await);
+        assert!(worker.registry_storage_pressure().await.is_none());
+        assert!(
+            !worker.background_disk_recovery_allowed().await,
+            "network recovery cannot refresh an old filesystem-pressure result"
+        );
+        assert!(
+            !worker
+                .record_registry_storage_pressure(
+                    &endpoint,
+                    &network,
+                    Some(RegistryStoragePressure::QuotaExhausted),
+                )
+                .await
+        );
     }
 
     #[tokio::test]

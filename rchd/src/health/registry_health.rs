@@ -5,6 +5,7 @@
 //! until a real probe succeeds, without changing admin intent or claim state.
 
 use super::{HealthCheckResult, HealthConfig, HealthProbeError, ProbeStage, derive_worker_status};
+use crate::workers::RegistryStoragePressure;
 use rch_common::{CircuitState, CommandResult, WorkerStatus};
 
 // The wire/storage protocol path also used by the hook and worker GC. A test
@@ -12,10 +13,13 @@ use rch_common::{CircuitState, CommandResult, WorkerStatus};
 const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const REFUSAL: &str = "RCH_SOURCE_REGISTRY_UNWRITABLE";
 const DEGRADED: &str = "RCH_SOURCE_REGISTRY_DEGRADED";
+const PRESSURE: &str = "RCH_SOURCE_REGISTRY_PRESSURE";
+const RESERVE_UNSAFE: &str = "RCH_RECOVERY_RESERVE_UNSAFE";
 
 pub(super) fn command() -> String {
+    let ready = rch_common::recovery_reserve::readiness_command(REGISTRY);
     format!(
-        "{}\nrch_source_registry_health '{}'",
+        "{ready}\n__rch_ready=$?; [ \"$__rch_ready\" -eq 0 ] || exit \"$__rch_ready\";\n{}\nrch_source_registry_health '{}'",
         include_str!("../source_registry_health.sh"),
         REGISTRY,
     )
@@ -69,11 +73,51 @@ fn excerpt(output: &str) -> String {
     result
 }
 
+fn has_marker(output: &str, marker: &str) -> bool {
+    output.lines().any(|line| {
+        line.strip_prefix(marker)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+    })
+}
+
+/// Only the complete, dedicated pressure protocol grants a recovery attempt.
+/// Error prose, an unrelated path, an unsafe reserve, or truncated/contradictory
+/// output remains an ordinary refusal. Inspect before truncating diagnostics.
+fn pressure_evidence(result: &CommandResult) -> Option<RegistryStoragePressure> {
+    if result.exit_code != 75
+        || !result.stdout.is_empty()
+        || has_marker(&result.stderr, REFUSAL)
+        || has_marker(&result.stderr, RESERVE_UNSAFE)
+        || has_marker(&result.stderr, DEGRADED)
+    {
+        return None;
+    }
+    let prefix = format!("{PRESSURE} {REGISTRY}: ");
+    let mut pressure = None;
+    for line in result.stderr.split_inclusive('\n') {
+        if !line.starts_with(PRESSURE) {
+            continue;
+        }
+        let reason = line.strip_suffix('\n')?.strip_prefix(&prefix)?;
+        let reason = match reason {
+            "insufficient-headroom" => RegistryStoragePressure::InsufficientHeadroom,
+            "no-space" => RegistryStoragePressure::NoSpace,
+            "quota-exhausted" => RegistryStoragePressure::QuotaExhausted,
+            "recovery-pending" => RegistryStoragePressure::RecoveryPending,
+            _ => return None,
+        };
+        if pressure.replace(reason).is_some() {
+            return None;
+        }
+    }
+    pressure
+}
+
 pub(super) fn classify_output(result: &CommandResult) -> Result<(), HealthProbeError> {
-    let storage_refused = result.stderr.lines().any(|line| {
-        line.strip_prefix(REFUSAL)
-            .is_some_and(|suffix| suffix.starts_with(' '))
-    });
+    let registry_storage_pressure = pressure_evidence(result);
+    let storage_refused = has_marker(&result.stderr, REFUSAL)
+        || has_marker(&result.stderr, PRESSURE)
+        || has_marker(&result.stderr, RESERVE_UNSAFE);
     let storage_degraded = result.stderr.lines().any(|line| {
         line.strip_prefix(DEGRADED)
             .is_some_and(|suffix| suffix.starts_with(' '))
@@ -101,6 +145,7 @@ pub(super) fn classify_output(result: &CommandResult) -> Result<(), HealthProbeE
         ),
         retryable: false,
         stage: ProbeStage::Command,
+        registry_storage_pressure,
     })
 }
 
@@ -126,6 +171,202 @@ mod tests {
         ))
         .expect_err("the storage probe must refuse");
         HealthCheckResult::command_failure(error.message, error.retryable)
+    }
+
+    #[test]
+    fn exact_pressure_protocol_preserves_reason_before_diagnostic_excerpting() {
+        for (reason, expected) in [
+            (
+                "insufficient-headroom",
+                RegistryStoragePressure::InsufficientHeadroom,
+            ),
+            ("no-space", RegistryStoragePressure::NoSpace),
+            ("quota-exhausted", RegistryStoragePressure::QuotaExhausted),
+            ("recovery-pending", RegistryStoragePressure::RecoveryPending),
+        ] {
+            let stderr = format!("{}\n{PRESSURE} {REGISTRY}: {reason}\n", "λ".repeat(1500));
+            let error = classify_output(&output(75, "", &stderr)).expect_err("storage refused");
+            assert_eq!(error.registry_storage_pressure, Some(expected));
+            let result = HealthCheckResult::from_probe_error(error);
+            assert_eq!(result.registry_storage_pressure, Some(expected));
+            assert_eq!(
+                status_after_probe(
+                    WorkerStatus::Healthy,
+                    CircuitState::Closed,
+                    &result,
+                    &HealthConfig::default(),
+                ),
+                WorkerStatus::Unreachable,
+                "recovery permission must never admit ordinary builds"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_exception_requires_one_complete_matching_uncontradicted_record() {
+        let valid = format!("{PRESSURE} {REGISTRY}: no-space\n");
+        for candidate in [
+            output(0, "", &valid),
+            output(74, "", &valid),
+            output(75, "health_check\n", &valid),
+            output(75, "", valid.trim_end()),
+            output(
+                75,
+                "",
+                &format!("{PRESSURE} /unrelated/registry: no-space\n"),
+            ),
+            output(
+                75,
+                "",
+                &format!("{PRESSURE} {REGISTRY}/released: no-space\n"),
+            ),
+            output(75, "", &format!("{PRESSURE} {REGISTRY}: unknown-header\n")),
+            output(75, "", &format!("{PRESSURE} {REGISTRY}: no-space extra\n")),
+            output(75, "", &format!("{valid}{valid}")),
+            output(75, "", &format!("{valid}{REFUSAL} {REGISTRY}: symlink\n")),
+            output(
+                75,
+                "",
+                &format!("{valid}{RESERVE_UNSAFE} {REGISTRY}: identity\n"),
+            ),
+            output(
+                75,
+                "",
+                &format!(
+                    "{PRESSURE} {REGISTRY}: recovery-pending\n{RESERVE_UNSAFE} {REGISTRY}: substituted-claim\n"
+                ),
+            ),
+            output(
+                75,
+                "",
+                &format!("{valid}{DEGRADED} {REGISTRY}: free_bytes=0\n"),
+            ),
+        ] {
+            let error = classify_output(&candidate).expect_err("invalid pressure must refuse");
+            assert_eq!(error.registry_storage_pressure, None, "{candidate:?}");
+            let result = HealthCheckResult::from_probe_error(error);
+            assert_eq!(
+                status_after_probe(
+                    WorkerStatus::Healthy,
+                    CircuitState::Closed,
+                    &result,
+                    &HealthConfig::default(),
+                ),
+                WorkerStatus::Unreachable,
+                "uncertain storage must stay excluded: {candidate:?}"
+            );
+        }
+        for stderr in [
+            format!("{REFUSAL} {REGISTRY}: no space left on device\n"),
+            format!("{REFUSAL} {REGISTRY}: quota exceeded\n"),
+            format!("{RESERVE_UNSAFE} {REGISTRY}: unknown-header\n"),
+            format!("tool mentioned {PRESSURE} {REGISTRY}: no-space\n"),
+        ] {
+            let error = classify_output(&output(74, "", &stderr)).expect_err("failed probe");
+            assert_eq!(error.registry_storage_pressure, None, "{stderr}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_storage_pressure_allows_recovery_without_reopening_build_placement() {
+        use crate::workers::{WorkerPool, WorkerState};
+        use rch_common::{WorkerConfig, WorkerId};
+        use std::time::Duration;
+
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("pressure-recovery");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        let config = HealthConfig::default();
+        let endpoint = worker.endpoint_snapshot().await;
+        let network = worker.background_probe().await.unwrap();
+        let pressure = format!("{PRESSURE} {REGISTRY}: insufficient-headroom\n");
+        let pending = format!("{PRESSURE} {REGISTRY}: recovery-pending\n");
+        for diagnostic in [&pressure, &pending] {
+            for _ in
+                0..config.circuit.failure_threshold + config.circuit.command_failure_threshold + 2
+            {
+                let result = HealthCheckResult::from_probe_error(
+                    classify_output(&output(75, "", diagnostic)).expect_err("storage refused"),
+                );
+                let endpoint_guard = worker.lock_current_endpoint(&endpoint).await.unwrap();
+                let publication_guard = worker.lock_network_publication(&network).await.unwrap();
+                assert!(
+                    worker
+                        .record_registry_storage_pressure(
+                            &endpoint,
+                            &network,
+                            result.registry_storage_pressure,
+                        )
+                        .await
+                );
+                worker
+                    .record_transport_result(true, config.check_interval, &config.circuit)
+                    .await;
+                let (_, circuit) =
+                    super::super::record_probe_circuit_outcome(&worker, &result, &config).await;
+                let status = status_after_probe(worker.status().await, circuit, &result, &config);
+                worker.apply_health_status(status).await;
+                drop(publication_guard);
+                drop(endpoint_guard);
+                assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+                assert_eq!(circuit, CircuitState::Closed);
+                assert_eq!(
+                    worker.circuit_stats().await.consecutive_command_failures(),
+                    0
+                );
+                assert!(worker.background_disk_recovery_allowed().await);
+                assert!(pool.healthy_workers().await.is_empty());
+            }
+        }
+
+        // A later failed exchange clears the typed exception before revoking
+        // this network generation, just as the health publisher does.
+        let failed = HealthCheckResult::transient_failure("connection reset".into());
+        assert!(
+            worker
+                .record_registry_storage_pressure(
+                    &endpoint,
+                    &network,
+                    failed.registry_storage_pressure
+                )
+                .await
+        );
+        worker
+            .record_transport_result(false, config.check_interval, &config.circuit)
+            .await;
+        super::super::record_probe_circuit_outcome(&worker, &failed, &config).await;
+        assert!(worker.registry_storage_pressure().await.is_none());
+        assert!(!worker.background_disk_recovery_allowed().await);
+
+        // Completed pressure probes do not force an already-open circuit shut
+        // or erase unrelated command-failure debt during its cooldown.
+        let blocked = WorkerState::new(WorkerConfig::default());
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                command_failure_threshold: 1,
+                open_cooldown_secs: 60,
+                ..Default::default()
+            },
+            check_interval: Duration::from_secs(30),
+            ..Default::default()
+        };
+        blocked.record_command_outcome(false, &config.circuit).await;
+        let result = HealthCheckResult::from_probe_error(
+            classify_output(&output(75, "", &pressure)).expect_err("storage refused"),
+        );
+        let (_, circuit) =
+            super::super::record_probe_circuit_outcome(&blocked, &result, &config).await;
+        assert_eq!(circuit, CircuitState::Open);
+        assert_eq!(
+            blocked.circuit_stats().await.consecutive_command_failures(),
+            1
+        );
+        assert!(!blocked.background_disk_recovery_allowed().await);
     }
 
     #[test]

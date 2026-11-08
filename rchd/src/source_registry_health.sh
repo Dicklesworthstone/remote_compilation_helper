@@ -85,12 +85,7 @@ RCH_DF_OUTPUT
     free_inodes=$(df_available "$df_inodes_out" inodes) || free_inodes=
     if { [ -n "$free_kb" ] && [ "$free_kb" -lt "$min_free_kb" ]; } \
         || { [ -n "$free_inodes" ] && [ "$free_inodes" -lt "$min_free_inodes" ]; }; then
-        free_bytes=unknown
-        if [ -n "$free_kb" ]; then
-            free_bytes=$((free_kb * 1024))
-        fi
-        printf 'RCH_SOURCE_REGISTRY_DEGRADED %s: free_bytes=%s free_kb=%s free_inodes=%s\n' \
-            "$registry" "$free_bytes" "${free_kb:-unknown}" "${free_inodes:-unknown}" >&2
+        printf 'RCH_SOURCE_REGISTRY_PRESSURE %s: insufficient-headroom\n' "$registry" >&2
         exit 75
     fi
     printf 'health_check\n'
