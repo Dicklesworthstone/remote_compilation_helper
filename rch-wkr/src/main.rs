@@ -44,6 +44,15 @@ enum Commands {
         #[arg(long)]
         toolchain: String,
     },
+    /// Internal dependency-installer supervisor, dispatched before Tokio starts.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    PrepareInstaller {
+        #[arg(long)]
+        supervisor_pid: Option<u32>,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Run a compilation command
     Execute {
         /// Working directory
@@ -191,6 +200,19 @@ fn main() -> Result<()> {
     if let Commands::ProcessIdentity { pid } = &cli.command {
         return print_process_identity(*pid);
     }
+    #[cfg(target_os = "linux")]
+    if let Commands::PrepareInstaller {
+        supervisor_pid,
+        command,
+    } = &cli.command
+    {
+        // Subreaper ownership and all-child waits must not share a process
+        // with Tokio's child reaper or unrelated capability probes.
+        if let Some(parent) = supervisor_pid {
+            return prepare::exec_installer(command, *parent);
+        }
+        return prepare::run_installer_supervisor(command);
+    }
     run_worker(cli)
 }
 
@@ -239,6 +261,10 @@ async fn run_worker(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
+        #[cfg(target_os = "linux")]
+        Commands::PrepareInstaller { .. } => {
+            anyhow::bail!("installer supervision requires the synchronous worker entry point")
+        }
         Commands::PrepareToolchain { toolchain: name } => {
             let info = toolchain::parse_toolchain_string(&name);
             toolchain::ensure_toolchain(&info).with_context(|| {

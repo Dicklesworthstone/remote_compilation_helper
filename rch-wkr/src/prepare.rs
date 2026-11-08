@@ -12,6 +12,8 @@ mod workspace_inputs;
 
 use install::{INPUT_NAMES, InstallPlan};
 pub use install::{PrepareAction, PrepareReport};
+#[cfg(target_os = "linux")]
+pub(crate) use install::{exec_installer, run_installer_supervisor};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
@@ -456,9 +458,11 @@ pub async fn prepare(
                 transaction.record(IDLE)?;
             }
             PrepareAction::Failed => {
-                // The installer reported a terminal nonzero exit. Retire its
-                // transaction only if its old success stamp really is absent;
-                // the legacy installer invalidates that stamp best-effort.
+                // Linux reports a terminal installer failure only after its
+                // supervisor confirms the descendant tree is reaped. Missing
+                // or invalid completion evidence returns Err above, retaining
+                // RUNNING. Also require the old success stamp to be absent.
+                // Other platforms retain their foreground-only wait behavior.
                 if matches!(
                     std::fs::symlink_metadata(transaction.project.join(FINGERPRINT_FILE)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -467,8 +471,8 @@ pub async fn prepare(
                 }
             }
             PrepareAction::Timeout => {
-                // Killing the immediate installer does not prove all lifecycle
-                // script descendants stopped. Keep the write-ahead fence.
+                // Stopping the installer/supervisor does not prove that all
+                // lifecycle descendants stopped. Keep the write-ahead fence.
                 tracing::warn!(
                     target: "rch::wkr::prepare", journal = %transaction.path.display(),
                     "timed-out preparation requires isolated retry or descendant reconciliation"
