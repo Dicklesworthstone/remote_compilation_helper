@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tracing::{info, warn};
 
 /// Default timeout for an install subprocess (npm/bun/yarn/pnpm). A wedged
@@ -511,7 +510,9 @@ async fn prepare_node_like(
 
     let log_clone = log_file.try_clone().context("clone install log handle")?;
     let timeout = install_timeout();
-    let mut child = Command::new(&cmd[0])
+    // Dependency lifecycle scripts can invoke Cargo before the managed job
+    // shell exists, including when `rch-wkr prepare` is called directly.
+    let mut child = crate::executor::managed_command(&cmd[0])
         .args(&cmd[1..])
         .current_dir(project_root)
         .stdout(log_clone)

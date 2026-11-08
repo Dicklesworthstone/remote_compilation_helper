@@ -518,6 +518,10 @@ fn probe_declared_tools(spec_json: Option<&str>) -> (Vec<String>, Vec<String>, V
             continue;
         };
         let succeeded = Command::new(program)
+            // These fixed, operator-declared probes run on this worker just
+            // like admitted jobs. Cargo invoked by a probe or its descendants
+            // must neither recurse into offload nor inherit an unpaired bypass.
+            .envs(rch_common::MANAGED_CARGO_ENV)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

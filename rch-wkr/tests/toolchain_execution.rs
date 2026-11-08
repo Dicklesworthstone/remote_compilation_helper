@@ -437,7 +437,7 @@ impl Fixture {
         fs::read_to_string(self.path("cargo-probes")).expect("read Cargo execution records")
     }
 
-    fn capabilities(&self, mode: &str) -> (rch_common::WorkerCapabilities, Duration) {
+    fn capability_command(&self, mode: &str) -> Command {
         self.prepare_managed_cargo();
         executable(&self.path("bin/rustup"), CAPABILITY_RUSTUP);
         executable(
@@ -456,6 +456,11 @@ impl Fixture {
             .env("RCH_TEST_PROBE_MODE", mode)
             .env("RCH_WKR_CANONICAL_ROOT", self.path("work"))
             .env("RCH_WKR_ALIAS_ROOT", self.path("work"));
+        command
+    }
+
+    fn capabilities(&self, mode: &str) -> (rch_common::WorkerCapabilities, Duration) {
+        let command = self.capability_command(mode);
         let started = Instant::now();
         let output = Self::collect(command);
         assert!(output.status.success(), "{output:?}");
@@ -521,6 +526,67 @@ fn worker_capabilities_execute_path_and_direct_toolchain_cargo() {
         fixture.cargo_probes(),
         "PATH|1|rch|--version\ntoolchain|1|rch|--version\n"
     );
+}
+
+#[test]
+fn declared_tool_probes_stamp_both_markers_for_cargo_descendants() {
+    for (bypass, origin) in [
+        (None, None),
+        (Some("1"), None),
+        (Some("1"), Some("")),
+        (Some("0"), Some("caller")),
+        (None, Some("rch")),
+    ] {
+        let fixture = Fixture::new("available");
+        let mut command = fixture.capability_command("ok");
+        let probes = serde_json::json!([
+            {"name": "cargo-path", "command": ["cargo", "--version"]},
+            {
+                "name": "cargo-toolchain",
+                "command": [fixture.path("toolchain bin/cargo"), "--version"]
+            },
+            {
+                "name": "cargo-nested",
+                "command": ["sh", "-c", "cargo --version && sh -c 'cargo --version'"]
+            },
+            {
+                "name": "cargo-failing",
+                "command": ["sh", "-c", "cargo --version && exit 23"]
+            }
+        ]);
+        command.args(["--tool-probe", &probes.to_string()]);
+        for (key, value) in [
+            ("RCH_CARGO_WRAPPER_BYPASS", bypass),
+            ("RCH_CARGO_WRAPPER_ORIGIN", origin),
+        ] {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+
+        let output = Fixture::collect(command);
+        assert!(output.status.success(), "{bypass:?}/{origin:?}: {output:?}");
+        let capabilities: rch_common::WorkerCapabilities =
+            serde_json::from_slice(&output.stdout).expect("worker capability JSON");
+        assert!(capabilities.has_rust(), "{capabilities:?}");
+        assert_eq!(
+            capabilities.tools_present,
+            ["cargo-path", "cargo-toolchain", "cargo-nested"],
+            "{bypass:?}/{origin:?}: {capabilities:?}"
+        );
+        assert_eq!(capabilities.tools_absent, ["cargo-failing"]);
+        assert_eq!(
+            fixture.cargo_probes(),
+            concat!(
+                "PATH|1|rch|--version\ntoolchain|1|rch|--version\n",
+                "PATH|1|rch|--version\ntoolchain|1|rch|--version\n",
+                "PATH|1|rch|--version\nPATH|1|rch|--version\n",
+                "PATH|1|rch|--version\n",
+            ),
+            "{bypass:?}/{origin:?}"
+        );
+    }
 }
 
 #[test]
