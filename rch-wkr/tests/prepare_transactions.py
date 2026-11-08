@@ -13,7 +13,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -51,6 +53,33 @@ if [ "${RCH_PREPARE_TEST_CARGO_LIFECYCLE-}" = 1 ]; then
     sh -c 'cargo build --features "native feature" --release'
 fi
 case "$RCH_PREPARE_TEST_MODE" in
+    descendants)
+        mkdir -p node_modules
+        printf 'leader output\n' > node_modules/fixture-dependency
+        # Even receipt-shaped installer output belongs only in the log.
+        printf '{"version":1,"exit_code":0,"signal":null}\n'
+        printf 'installer stderr before descendant completion\n' >&2
+        printf '%s\n' "$PPID" > "$RCH_PREPARE_TEST_STATE/supervisor-pid"
+        (
+            printf ready > "$RCH_PREPARE_TEST_STATE/descendant-ready"
+            n=0
+            while [ ! -f "$RCH_PREPARE_TEST_STATE/release" ]; do
+                n=$((n + 1))
+                [ "$n" -lt 2000 ] || exit 91
+                sleep 0.01
+            done
+            printf 'descendant output\n' > node_modules/fixture-dependency
+            printf finished > "$RCH_PREPARE_TEST_STATE/descendant-finished"
+        ) &
+        printf '%s\n' "$!" > "$RCH_PREPARE_TEST_STATE/descendant-pid"
+        n=0
+        while [ ! -f "$RCH_PREPARE_TEST_STATE/release-leader" ]; do
+            n=$((n + 1))
+            [ "$n" -lt 2000 ] || exit 91
+            sleep 0.01
+        done
+        exit "${RCH_PREPARE_TEST_LEADER_EXIT:-19}"
+        ;;
     blocked)
         n=0
         while [ ! -f "$RCH_PREPARE_TEST_STATE/release" ]; do
@@ -133,6 +162,7 @@ class PrepareTransactions(unittest.TestCase):
     def tearDown(self):
         for state in self.states:
             (state / "release").write_bytes(b"release\n")
+            (state / "release-leader").write_bytes(b"release\n")
         for child in self.children:
             try:
                 child.communicate(timeout=5)
@@ -194,6 +224,155 @@ class PrepareTransactions(unittest.TestCase):
     def invocations(self, state):
         path = state / "argv"
         return path.read_text().splitlines() if path.exists() else []
+
+    def release_installer_leader(self, child, state):
+        eventually(lambda: (state / "descendant-pid").exists()
+                   and (state / "descendant-ready").exists(), "installer descendant did not start")
+        leader = int((state / "started").read_text())
+        supervisor = int((state / "supervisor-pid").read_text())
+        descendant = int((state / "descendant-pid").read_text())
+        group = os.getpgid(child.pid)
+        self.assertEqual(os.getpgid(supervisor), group, "helper must remain inside the outer job group")
+        self.assertEqual(os.getpgid(leader), group, "installer must remain inside the outer job group")
+        self.assertEqual(os.getpgid(descendant), group, "lifecycle writer must remain inside the outer job group")
+        # A kernel handle observes the exact live fixture, even when procfs
+        # exposes a different PID namespace. Open it before releasing exit.
+        descriptor = os.pidfd_open(leader)
+        try:
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN)
+            (state / "release-leader").write_text("release\n")
+            self.assertTrue(poller.poll(3000), "installer leader did not exit")
+        finally:
+            os.close(descriptor)
+
+    def test_installer_exit_waits_for_descendants_before_success_or_retry(self):
+        for code in (0, 19):
+            with self.subTest(installer_exit=code):
+                project, state = self.project(f"descendant-{code}")
+                previous_journals = set(self.journals())
+                child = self.start(project, state, mode="descendants",
+                                   extra_env={"RCH_PREPARE_TEST_LEADER_EXIT": str(code)})
+                self.release_installer_leader(child, state)
+                journal, = set(self.journals()) - previous_journals
+                try:
+                    with self.assertRaises(subprocess.TimeoutExpired,
+                                           msg="foreground exit must not release a live dependency writer"):
+                        child.communicate(timeout=0.2)
+                    self.assertEqual(journal.read_bytes(), RUNNING)
+                    self.assertFalse((project / ".rch_dep_fingerprint.json").exists())
+                finally:
+                    (state / "release").write_text("release\n")
+                report = self.report(child, 0 if code == 0 else 1)
+                self.assertEqual(report["action"], "Installed" if code == 0 else "Failed")
+                self.assertTrue((state / "descendant-finished").is_file())
+                dependency = project / "node_modules/fixture-dependency"
+                self.assertEqual(dependency.read_text(), "descendant output\n")
+                self.assertEqual(journal.read_bytes(), IDLE)
+                log = Path(report["install_log_path"]).read_text()
+                self.assertIn('{"version":1,"exit_code":0,"signal":null}', log)
+                self.assertIn("installer stderr before descendant completion", log)
+                if code != 0:
+                    self.assertFalse((project / ".rch_dep_fingerprint.json").exists())
+                    self.assertEqual(self.report(self.start(project, state), 0)["action"], "Installed")
+                self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
+                self.assertEqual(dependency.read_text(), "descendant output\n" if code == 0 else "complete\n")
+
+    def test_supervisor_crash_cannot_certify_a_failed_install(self):
+        project, state = self.project("supervisor-crash")
+        child = self.start(project, state, mode="descendants")
+        eventually(lambda: (state / "descendant-ready").exists(), "installer descendant did not start")
+        supervisor = int((state / "supervisor-pid").read_text())
+        descriptor = os.pidfd_open(supervisor)
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.report(child, 1)["action"], "Failed")
+        journal, = self.journals()
+        self.assertEqual(journal.read_bytes(), RUNNING, "no completion receipt means no settled transaction")
+        self.assertFalse((project / ".rch_dep_fingerprint.json").exists())
+        self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+        self.assertEqual(self.events(state), ["install"])
+        (state / "release-leader").write_text("release\n")
+        (state / "release").write_text("release\n")
+        eventually(lambda: (state / "descendant-finished").exists(), "released fixture descendant did not finish")
+        self.assertEqual(journal.read_bytes(), RUNNING)
+
+    def test_descendant_timeout_retains_the_unconfirmed_transaction(self):
+        project, state = self.project("descendant-timeout")
+        child = self.start(project, state, mode="descendants", extra_env={
+            "RCH_PREPARE_TEST_LEADER_EXIT": "0", "RCH_PREPARE_INSTALL_TIMEOUT_SECS": "1",
+        })
+        self.release_installer_leader(child, state)
+        self.assertEqual(self.report(child, 2)["action"], "Timeout")
+        journal, = self.journals()
+        self.assertEqual(journal.read_bytes(), RUNNING)
+        self.assertFalse((project / ".rch_dep_fingerprint.json").exists())
+        self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+        self.assertEqual(self.events(state), ["install"])
+        # Timeout has not claimed to kill descendants. Release this bounded
+        # fixture explicitly and prove late completion cannot clear the fence.
+        (state / "release").write_text("release\n")
+        eventually(lambda: (state / "descendant-finished").exists(), "released fixture descendant did not finish")
+        self.assertEqual(journal.read_bytes(), RUNNING)
+
+    def test_install_timeout_stops_foreground_manager_and_retains_fence(self):
+        project, state = self.project("foreground-timeout")
+        child = self.start(project, state, mode="blocked",
+                           extra_env={"RCH_PREPARE_INSTALL_TIMEOUT_SECS": "1"})
+        eventually(lambda: (state / "started").exists(), "installer did not start")
+        descriptor = os.pidfd_open(int((state / "started").read_text()))
+        try:
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN)
+            self.assertEqual(self.report(child, 2)["action"], "Timeout")
+            self.assertTrue(poller.poll(3000), "timed-out foreground manager remained alive")
+        finally:
+            os.close(descriptor)
+        journal, = self.journals()
+        self.assertEqual(journal.read_bytes(), RUNNING)
+        self.assertFalse((state / "finished").exists())
+        self.assertFalse((project / ".rch_dep_fingerprint.json").exists())
+        self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+        self.assertEqual(self.events(state), ["install"])
+
+    def test_installer_exec_refuses_a_changed_supervisor_before_running_manager(self):
+        _, state = self.project("wrong-supervisor")
+        manager = self.bin / "launch-probe"
+        manager.write_text('#!/bin/sh\nprintf ran > "$RCH_PREPARE_TEST_STATE/launcher-ran"\n')
+        manager.chmod(0o700)
+        result = subprocess.run(
+            [WORKER, "prepare-installer", "--supervisor-pid", str(os.getppid()), "--", str(manager)],
+            env={"PATH": str(self.bin), "RCH_PREPARE_TEST_STATE": str(state)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+        )
+        self.assertNotEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn(b"installer supervisor is no longer the parent", result.stderr)
+        self.assertFalse((state / "launcher-ran").exists())
+
+    def test_bun_cache_miss_reports_install_outcomes_with_logs_and_fingerprints(self):
+        # Moved from the ambient real-Bun unit smoke: this runs the real worker
+        # and supervisor with deterministic managers and no registry access.
+        for mode, code, action in [("immediate", 0, "Installed"), ("failure", 1, "Failed"),
+                                   ("blocked", 2, "Timeout")]:
+            with self.subTest(action=action):
+                project, state = self.project(f"bun-cache-miss-{mode}", lock="bun.lockb")
+                stamp = project / ".rch_dep_fingerprint.json"
+                self.assertFalse(stamp.exists())
+                report = self.report(self.start(project, state, mode=mode, runtime="bun",
+                                                manager="bun", plan="frozen", extra_env={
+                                                    "RCH_PREPARE_INSTALL_TIMEOUT_SECS": "1",
+                                                }), code)
+                self.assertEqual(report["action"], action)
+                self.assertIsNotNone(report["fingerprint"])
+                self.assertTrue(Path(report["install_log_path"]).is_file())
+                self.assertEqual(self.invocations(state), ["bun", "2", "install", "--frozen-lockfile"])
+                if action == "Installed":
+                    self.assertTrue((project / "node_modules").is_dir())
+                    self.assertEqual(json.loads(stamp.read_text())["hash"], report["fingerprint"]["hash"])
+                else:
+                    self.assertFalse(stamp.exists())
 
     def assert_cargo_lifecycle(self, project, state):
         self.assertEqual((state / "installer-env").read_text(), "1|rch\n")

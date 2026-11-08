@@ -7,7 +7,7 @@
 //!
 //! For non-Node runtimes (Rust, C/C++, plain shell) `prepare()` is a no-op.
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use rch_common::types::RequiredRuntime;
@@ -22,6 +22,139 @@ use tracing::{info, warn};
 /// install (network hang, registry stall) MUST NOT block the worker
 /// indefinitely. Override via `RCH_PREPARE_INSTALL_TIMEOUT_SECS`.
 const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 300; // 5 minutes
+const INSTALLER_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+const INSTALLER_RECEIPT_LIMIT: u64 = 256;
+
+/// Only the dedicated supervisor writes this frame, after reaping the complete
+/// installer tree. Installer output goes to a separate log descriptor.
+#[cfg(target_os = "linux")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerCompletion {
+    version: u8,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl InstallerCompletion {
+    fn succeeded(&self) -> Result<bool> {
+        ensure!(
+            self.version == 1,
+            "unsupported installer completion version"
+        );
+        match (self.exit_code, self.signal) {
+            (Some(code @ 0..=255), None) => Ok(code == 0),
+            (None, Some(1..=127)) => Ok(false),
+            _ => anyhow::bail!("invalid installer completion status"),
+        }
+    }
+}
+
+/// Run only through the hidden worker command before a Tokio runtime exists.
+/// Keep the inherited process group so outer job cancellation still contains
+/// the installer, including preparation under the disk supervisor.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_installer_supervisor(command: &[std::ffi::OsString]) -> Result<()> {
+    use std::os::fd::AsFd;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    ensure!(!command.is_empty(), "missing installer command");
+    let installer_output = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .context("duplicate installer log descriptor")?;
+    // A tiny pre-runtime exec child arms its own parent-death signal. Killing
+    // this supervisor at the deadline therefore still stops the foreground
+    // manager, without moving either process outside the outer job group.
+    let mut installer = std::process::Command::new(std::env::current_exe()?);
+    installer
+        .args(["prepare-installer", "--supervisor-pid"])
+        .arg(std::process::id().to_string())
+        .arg("--")
+        .args(command)
+        .envs(rch_common::MANAGED_CARGO_ENV)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::from(installer_output))
+        .stderr(Stdio::inherit());
+    let status = rch_common::ssh::run_subreaped_command(&mut installer)
+        .context("run and settle dependency installer")?;
+    let completion = InstallerCompletion {
+        version: 1,
+        exit_code: status.code(),
+        signal: status.signal(),
+    };
+    completion.succeeded()?;
+    serde_json::to_writer(std::io::stdout().lock(), &completion)
+        .context("write installer completion receipt")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn exec_installer(command: &[std::ffi::OsString], supervisor_pid: u32) -> Result<()> {
+    let (program, args) = command.split_first().context("missing installer command")?;
+    let mut installer = std::process::Command::new(program);
+    installer.args(args).envs(rch_common::MANAGED_CARGO_ENV);
+    rch_common::ssh::exec_parent_bound_command(&mut installer, supervisor_pid)
+        .context("exec dependency installer under its supervisor")
+}
+
+async fn wait_for_installer(child: &mut tokio::process::Child) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use tokio::io::AsyncReadExt;
+
+        let output = child
+            .stdout
+            .take()
+            .context("missing installer receipt pipe")?;
+        let read_receipt = async {
+            let mut receipt = Vec::new();
+            output
+                .take(INSTALLER_RECEIPT_LIMIT + 1)
+                .read_to_end(&mut receipt)
+                .await
+                .context("read installer completion receipt")?;
+            ensure!(
+                receipt.len() as u64 <= INSTALLER_RECEIPT_LIMIT,
+                "oversized installer completion receipt"
+            );
+            Ok::<_, anyhow::Error>(receipt)
+        };
+        let (status, receipt) = tokio::try_join!(
+            async { child.wait().await.context("wait for installer supervisor") },
+            read_receipt,
+        )?;
+        ensure!(status.success(), "installer supervisor exited {status}");
+        let completion: InstallerCompletion =
+            serde_json::from_slice(&receipt).context("invalid installer completion receipt")?;
+        completion.succeeded()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Linux's subreaper proof is not available on these platforms. Keep
+        // their existing foreground wait rather than disable working installs.
+        Ok(child.wait().await?.success())
+    }
+}
+
+async fn stop_installer(child: &mut tokio::process::Child) {
+    if child.id().is_some() {
+        let _ = child.start_kill();
+    }
+    if !matches!(
+        tokio::time::timeout(INSTALLER_REAP_TIMEOUT, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        warn!(
+            target: "rch::wkr::prepare",
+            "installer supervisor reap remains unconfirmed"
+        );
+    }
+}
 
 // One vocabulary for installation, cache identity and the outer transaction's
 // stable-input checks. In particular, npm-shrinkwrap.json takes precedence over
@@ -66,8 +199,9 @@ pub enum PrepareAction {
     /// Install command was attempted but exited non-zero. See
     /// `install_log_path` for the captured stdout/stderr.
     Failed,
-    /// Install command exceeded the timeout
-    /// (`RCH_PREPARE_INSTALL_TIMEOUT_SECS`, default 300s) and was killed.
+    /// Preparation exceeded the timeout
+    /// (`RCH_PREPARE_INSTALL_TIMEOUT_SECS`, default 300s). Descendant
+    /// completion remains unconfirmed, so the transaction stays fenced.
     /// `install_log_path` may contain partial output.
     Timeout,
 }
@@ -508,35 +642,47 @@ async fn prepare_node_like(
 
     let pre_size = dir_size(&project_root.join("node_modules")).await;
 
-    let log_clone = log_file.try_clone().context("clone install log handle")?;
     let timeout = install_timeout();
     // Dependency lifecycle scripts can invoke Cargo before the managed job
     // shell exists, including when `rch-wkr prepare` is called directly.
-    let mut child = crate::executor::managed_command(&cmd[0])
+    #[cfg(target_os = "linux")]
+    let mut installer = crate::executor::managed_command(
+        std::env::current_exe().context("resolve worker installer supervisor")?,
+    );
+    #[cfg(target_os = "linux")]
+    installer
+        .arg("prepare-installer")
+        .arg("--")
+        .args(&cmd)
+        .stdout(std::process::Stdio::piped());
+    #[cfg(not(target_os = "linux"))]
+    let mut installer = crate::executor::managed_command(&cmd[0]);
+    #[cfg(not(target_os = "linux"))]
+    installer
         .args(&cmd[1..])
+        .stdout(log_file.try_clone().context("clone install log handle")?);
+    let mut child = installer
         .current_dir(project_root)
-        .stdout(log_clone)
         .stderr(log_file)
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn {:?}", cmd))?;
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        .with_context(|| format!("spawn installer supervisor for {cmd:?}"))?;
+    let succeeded = match tokio::time::timeout(timeout, wait_for_installer(&mut child)).await {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            return Err(anyhow!("install command wait failed: {e}"));
+            stop_installer(&mut child).await;
+            return Err(e).context("dependency installer completion is unconfirmed");
         }
         Err(_elapsed) => {
-            // Timeout: kill the child and report PrepareAction::Timeout
-            // so agents can distinguish a wedged install (network /
-            // registry stall) from a genuine install error.
-            // kill_on_drop ensures the process is reaped even if
-            // kill().await races.
-            let _ = child.kill().await;
+            // The supervisor's death cannot attest descendant completion.
+            // Stop/reap it under a bounded grace and retain the outer RUNNING
+            // fence; timeout never authorizes another install in this tree.
+            stop_installer(&mut child).await;
             warn!(
                 target: "rch::wkr::prepare",
                 timeout_secs = timeout.as_secs(),
                 log_path = %log_path.display(),
-                "install command timed out; killed"
+                "install command timed out; descendant completion is unconfirmed"
             );
             // Invalidate stale fingerprint since node_modules is in an
             // indeterminate state.
@@ -554,7 +700,7 @@ async fn prepare_node_like(
         }
     };
 
-    if !status.success() {
+    if !succeeded {
         warn!(
             target: "rch::wkr::prepare",
             log_path = %log_path.display(),
@@ -614,6 +760,7 @@ async fn prepare_node_like(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use tempfile::TempDir;
 
     fn plan(sources: &[&str], runtime: RequiredRuntime) -> InstallPlan {
@@ -975,75 +1122,44 @@ mod tests {
         // TEST PASS
     }
 
-    #[tokio::test]
-    async fn test_prepare_cache_miss_attempts_install() {
-        // TEST START: cache miss fires install — verify by structural
-        // assertions that hold whether bun is present or not.
-        let tmp = TempDir::new().unwrap();
-        make_node_project(
-            tmp.path(),
-            r#"{"name":"x"}"#,
-            Some(("bun.lockb", "fake-lockfile-bytes-for-test")),
-        );
-        let log_dir = tmp.path().join("logs");
-        // Sanity: precondition has no fingerprint cached.
-        assert!(read_cached_fingerprint(tmp.path()).await.is_none());
+    // Installer execution, including Bun cache-miss report/cache/log behavior,
+    // lives in prepare_transactions.py against the actual worker executable.
+    // A libtest binary's autogenerated main cannot dispatch the hidden helper.
 
-        let report = prepare(tmp.path(), RequiredRuntime::Bun, &log_dir).await;
-        match report {
-            Ok(r) => {
-                // Property A: cache-miss must yield Installed/Failed/Timeout,
-                // never Skipped (no fingerprint was cached).
-                assert!(
-                    matches!(
-                        r.action,
-                        PrepareAction::Installed | PrepareAction::Failed | PrepareAction::Timeout
-                    ),
-                    "cache miss must yield Installed/Failed/Timeout, not {:?}",
-                    r.action
-                );
-                // Property B: fingerprint always populated for Bun/Node.
-                assert!(r.fingerprint.is_some(), "fingerprint must be set");
-                // Property C: log_dir created on the cache-miss path.
-                assert!(
-                    log_dir.exists(),
-                    "log_dir must be created on cache-miss path"
-                );
-                if r.action == PrepareAction::Installed {
-                    // Property D: success persists fingerprint + node_modules survives.
-                    let cached = read_cached_fingerprint(tmp.path()).await;
-                    assert!(cached.is_some(), "Installed must persist fingerprint");
-                    assert_eq!(cached.unwrap().hash, r.fingerprint.unwrap().hash);
-                    assert!(tmp.path().join("node_modules").exists());
-                }
-                if matches!(r.action, PrepareAction::Failed | PrepareAction::Timeout) {
-                    // Property E: failure / timeout invalidates fingerprint
-                    // cache and records install_log_path for diagnostics.
-                    assert!(
-                        r.install_log_path.is_some(),
-                        "{:?} must include install_log_path",
-                        r.action
-                    );
-                    assert!(
-                        read_cached_fingerprint(tmp.path()).await.is_none(),
-                        "{:?} must invalidate cached fingerprint",
-                        r.action
-                    );
-                }
-            }
-            Err(e) => {
-                // Spawn-not-found is acceptable when bun isn't in PATH.
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("spawn")
-                        || msg.contains("No such file")
-                        || msg.contains("not found"),
-                    "unexpected error: {}",
-                    msg
-                );
-            }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installer_completion_requires_complete_valid_status() {
+        for invalid in [
+            "{}",
+            r#"{"version":1}"#,
+            r#"{"version":2,"exit_code":0}"#,
+            r#"{"version":1,"exit_code":0,"signal":9}"#,
+            r#"{"version":1,"exit_code":-1}"#,
+            r#"{"version":1,"exit_code":256}"#,
+            r#"{"version":1,"signal":0}"#,
+            r#"{"version":1,"exit_code":0,"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<InstallerCompletion>(invalid)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|completion| completion.succeeded())
+                    .is_err(),
+                "invalid completion was accepted: {invalid}"
+            );
         }
-        // TEST PASS
+        for (receipt, expected) in [
+            (r#"{"version":1,"exit_code":0,"signal":null}"#, true),
+            (r#"{"version":1,"exit_code":19,"signal":null}"#, false),
+            (r#"{"version":1,"exit_code":null,"signal":9}"#, false),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<InstallerCompletion>(receipt)
+                    .unwrap()
+                    .succeeded()
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

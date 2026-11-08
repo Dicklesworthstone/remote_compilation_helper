@@ -128,6 +128,81 @@ struct SshProcessState {
     outcome: Option<std::result::Result<ExitStatus, String>>,
 }
 
+/// Run one command and wait for its entire descendant tree on Linux.
+///
+/// Call only from a dedicated, single-threaded helper before starting a runtime
+/// or any other children: subreaper ownership and the all-child wait are process
+/// wide. The inherited process group is preserved, so an outer job supervisor
+/// continues to contain the command. The original command's exit status is
+/// returned only after the kernel reports that no adopted children remain.
+/// The caller must enforce the helper's deadline; an interrupted helper cannot
+/// attest that its descendants have stopped.
+///
+/// # Errors
+/// Returns an error if subreaper setup, spawn, or any child wait fails.
+#[cfg(target_os = "linux")]
+pub fn run_subreaped_command(command: &mut std::process::Command) -> std::io::Result<ExitStatus> {
+    use rustix::process::{Pid, WaitOptions, set_child_subreaper, wait};
+
+    // PR_SET_CHILD_SUBREAPER takes a boolean; rustix represents its nonzero
+    // value with Pid. No process is signalled or selected by this argument.
+    set_child_subreaper(Some(Pid::INIT))?;
+    let status = command.spawn()?.wait()?;
+    loop {
+        // wait(), not waitpid(None): the latter waits only for children in
+        // our process group and would omit descendants that changed groups.
+        match wait(WaitOptions::empty()) {
+            Ok(Some(_)) | Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::CHILD) => return Ok(status),
+            Err(error) => return Err(error.into()),
+            Ok(None) => {
+                return Err(std::io::Error::other(
+                    "blocking descendant wait returned without a child status",
+                ));
+            }
+        }
+    }
+}
+
+/// Replace a dedicated Linux child with a command bound to its supervisor.
+///
+/// Arm the parent-death signal before checking the expected parent, closing the
+/// spawn/setup race. Exec preserves the PID and inherited process group; do not
+/// fork after arming, since fork clears this setting. The parent must be the
+/// dedicated single-threaded supervisor, not a transient runtime thread.
+/// Linux may clear this setting on privileged exec/credential changes, and a
+/// program may explicitly reset it; this is not arbitrary-tool containment.
+///
+/// # Errors
+/// Returns an error on setup, changed parent, or failed exec. A successful exec
+/// replaces the calling process and never returns.
+#[cfg(target_os = "linux")]
+pub fn exec_parent_bound_command(
+    command: &mut std::process::Command,
+    expected_parent: u32,
+) -> std::io::Result<()> {
+    use rustix::process::{Pid, Signal, getppid, set_parent_process_death_signal};
+    use std::os::unix::process::CommandExt;
+
+    let expected_parent = i32::try_from(expected_parent)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid installer supervisor PID",
+            )
+        })?;
+    set_parent_process_death_signal(Some(Signal::KILL))?;
+    if getppid() != Some(expected_parent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "installer supervisor is no longer the parent",
+        ));
+    }
+    Err(command.exec())
+}
+
 /// A local process and its descendants share one owned process group. This
 /// covers SSH proxy commands and rsync's SSH child as well as the direct child.
 /// Keep the child unreaped until its output has drained: its PID then pins the
