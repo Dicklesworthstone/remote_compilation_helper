@@ -135,7 +135,9 @@ impl SourceInput {
                 if file.len == 0 {
                     continue;
                 }
-                let snapshot = cache.cache.load(file);
+                let snapshot = cache
+                    .cache
+                    .load_with_cloner(file, rabs_cas::materialization::try_verified_reflink);
                 // load intentionally treats unavailable/corrupt objects as
                 // misses, including a spent cache control budget. Recheck the
                 // operation budget before interpreting absence as upload work.

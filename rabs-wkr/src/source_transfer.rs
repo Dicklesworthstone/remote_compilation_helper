@@ -1759,10 +1759,13 @@ impl SourceTransferState {
                 if file.len == 0 {
                     continue;
                 }
-                if let Some(snapshot) = cache.as_ref().and_then(|cache| cache.load(&file)) {
+                if let Some(snapshot) = cache.as_ref().and_then(|cache| {
+                    cache.load_with_cloner(&file, rabs_cas::materialization::try_verified_reflink)
+                }) {
                     // Lookup verifies a complete anonymous snapshot before any
-                    // receiver write. Large archives use a fixed-size buffer,
-                    // and later cache corruption cannot change this snapshot.
+                    // receiver write, using an independent verified CoW clone
+                    // where supported. Hashing stays bounded, and later cache
+                    // corruption cannot change this snapshot.
                     snapshot
                         .install_with_cloner(
                             &mut receiver,

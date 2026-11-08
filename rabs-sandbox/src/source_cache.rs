@@ -182,15 +182,11 @@ fn owned_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
-/// Stream exactly the declared bytes plus one bounded EOF check. The destination
-/// is private scratch, never an execution receiver. Source and storage failures
-/// remain distinct so optional cache writes cannot hide a changed sealed input.
-fn copy_verified(
+fn open_source_object(
     path: &Path,
     expected: &SourceFile,
     control: &CacheControl,
-    output: &mut (impl Write + ?Sized),
-) -> Result<File, RememberError> {
+) -> Result<(File, Metadata), RememberError> {
     control.check()?;
     if expected.len > MAX_FILE_BYTES {
         return Err(RememberError::Source(invalid(
@@ -204,7 +200,7 @@ fn copy_verified(
         )));
     }
     #[cfg(target_os = "linux")]
-    let mut input = File::from(
+    let input = File::from(
         rustix::fs::open(
             path,
             rustix::fs::OFlags::RDONLY
@@ -216,13 +212,43 @@ fn copy_verified(
         .map_err(|error| RememberError::Source(error.into()))?,
     );
     #[cfg(not(target_os = "linux"))]
-    let mut input = File::open(path).map_err(RememberError::Source)?;
+    let input = File::open(path).map_err(RememberError::Source)?;
     let before = input.metadata().map_err(RememberError::Source)?;
     if !ordinary(&before) || !same_state(&named, &before) {
         return Err(RememberError::Source(invalid(
             "source object changed while opening",
         )));
     }
+    Ok((input, before))
+}
+
+fn verify_source_generation(
+    path: &Path,
+    input: &File,
+    before: &Metadata,
+) -> Result<(), RememberError> {
+    if !same_state(before, &input.metadata().map_err(RememberError::Source)?)
+        || !same_state(
+            before,
+            &fs::symlink_metadata(path).map_err(RememberError::Source)?,
+        )
+    {
+        return Err(RememberError::Source(invalid(
+            "source object generation changed during verification",
+        )));
+    }
+    Ok(())
+}
+
+/// Stream exactly the declared bytes plus one bounded EOF check. The destination
+/// is private scratch, never an execution receiver. Source and storage failures
+/// remain distinct so optional cache writes cannot hide a changed sealed input.
+fn copy_verified_stream(
+    input: &mut File,
+    expected: &SourceFile,
+    control: &CacheControl,
+    output: &mut (impl Write + ?Sized),
+) -> Result<(), RememberError> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
     let mut remaining = expected.len;
@@ -241,18 +267,59 @@ fn copy_verified(
         .read(&mut buffer[..1])
         .map_err(RememberError::Source)?
         != 0
-        || !same_state(&before, &input.metadata().map_err(RememberError::Source)?)
-        || !same_state(
-            &before,
-            &fs::symlink_metadata(path).map_err(RememberError::Source)?,
-        )
         || <[u8; 32]>::from(hash.finalize()) != expected.sha256
     {
         return Err(RememberError::Source(invalid(
             "source object content verification failed",
         )));
     }
+    Ok(())
+}
+
+fn copy_verified(
+    path: &Path,
+    expected: &SourceFile,
+    control: &CacheControl,
+    output: &mut (impl Write + ?Sized),
+) -> Result<File, RememberError> {
+    let (mut input, before) = open_source_object(path, expected, control)?;
+    copy_verified_stream(&mut input, expected, control, output)?;
+    verify_source_generation(path, &input, &before)?;
     Ok(input)
+}
+
+fn private_snapshot(meta: &Metadata, len: u64) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.is_file()
+            && meta.len() == len
+            && meta.nlink() == 0
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (meta, len);
+        false
+    }
+}
+
+fn same_snapshot_identity(before: &Metadata, after: &Metadata, len: u64) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        private_snapshot(after, len)
+            && same_inode(before, after)
+            && before.mode() == after.mode()
+            && before.uid() == after.uid()
+            && before.gid() == after.gid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, after, len);
+        false
+    }
 }
 
 /// Read an immutable captured stream through its bounded range interface. The
@@ -748,19 +815,80 @@ impl SourceCache {
     /// An unavailable or corrupt object is a MISS before any staging write.
     /// Recency is eviction policy only; it never establishes content identity.
     pub fn load(&self, expected: &SourceFile) -> Option<VerifiedSource> {
+        self.load_with_cloner(expected, |_, _, _| false)
+    }
+
+    /// Snapshot cached bytes through an optional independent CoW clone. The
+    /// held cache object is still fully hashed and generation-checked. A claimed
+    /// clone is independently hashed through its actual anonymous descriptor,
+    /// with exact EOF, inode, metadata and generation checks before reuse.
+    ///
+    /// The callback must establish content and metadata isolation, never a
+    /// hardlink. A failed clone may leave bytes or change file positions; reset
+    /// the private destination and both positions before the ordinary copy.
+    /// Corruption, mutation, cancellation or uncertain ownership is a MISS and
+    /// never writes to an execution receiver.
+    pub fn load_with_cloner(
+        &self,
+        expected: &SourceFile,
+        cloner: impl FnOnce(&File, &File, &Path) -> bool,
+    ) -> Option<VerifiedSource> {
         if expected.len > self.max_bytes || expected.len > MAX_FILE_BYTES {
             return None;
         }
         self.control.check().ok()?;
         private_directory(&self.root).ok()?;
         let mut snapshot = tempfile::tempfile_in(&self.root).ok()?;
-        let file = copy_verified(
-            &self.object_path(&expected.sha256),
-            expected,
-            &self.control,
-            &mut snapshot,
-        )
-        .ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Linux O_TMPFILE inherits OpenOptions' 0666 creation mode and
+            // the process umask. Establish private permissions on this new,
+            // anonymous inode before recording its identity or invoking code
+            // that may populate it; do not depend on a restrictive umask.
+            snapshot
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .ok()?;
+        }
+        let original_snapshot = snapshot.metadata().ok()?;
+        if !private_snapshot(&original_snapshot, 0) {
+            return None;
+        }
+        let path = self.object_path(&expected.sha256);
+        let (mut file, before) = open_source_object(&path, expected, &self.control).ok()?;
+        if same_inode(&before, &original_snapshot) {
+            return None;
+        }
+        self.control.check().ok()?;
+        let cloned = cloner(&file, &snapshot, &self.root);
+        self.control.check().ok()?;
+        verify_source_generation(&path, &file, &before).ok()?;
+        file.rewind().ok()?;
+        if cloned {
+            let cloned_snapshot = snapshot.metadata().ok()?;
+            if !same_snapshot_identity(&original_snapshot, &cloned_snapshot, expected.len) {
+                return None;
+            }
+            // The clone callback is a copy optimization, not a byte witness.
+            // Verify both the retained object and the actual private clone.
+            copy_verified_stream(&mut file, expected, &self.control, &mut io::sink()).ok()?;
+            verify_source_generation(&path, &file, &before).ok()?;
+            snapshot.rewind().ok()?;
+            copy_verified_stream(&mut snapshot, expected, &self.control, &mut io::sink()).ok()?;
+            if !same_state(&cloned_snapshot, &snapshot.metadata().ok()?) {
+                return None;
+            }
+        } else {
+            // An unsupported or failed clone is not proof of an empty target.
+            // Keep the held source descriptor; never reopen a new generation.
+            snapshot.set_len(0).ok()?;
+            snapshot.rewind().ok()?;
+            copy_verified_stream(&mut file, expected, &self.control, &mut snapshot).ok()?;
+        }
+        if !same_snapshot_identity(&original_snapshot, &snapshot.metadata().ok()?, expected.len) {
+            return None;
+        }
+        verify_source_generation(&path, &file, &before).ok()?;
         snapshot.rewind().ok()?;
         self.control.check().ok()?;
         let _ = file.set_modified(SystemTime::now());
@@ -1759,6 +1887,228 @@ mod tests {
         assert!(cache.load(&wrong).is_none());
         wrong.len = MAX_FILE_BYTES + 1;
         assert!(cache.load(&wrong).is_none());
+    }
+
+    #[test]
+    fn failed_lookup_clone_resets_partial_bytes_and_both_file_positions() {
+        for partial in [false, true] {
+            let parent = private();
+            let input = private();
+            let bytes = vec![0x51; MAX_SOURCE_CHUNK * 3 + 17];
+            let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+            let expected = &source.manifest().files()[0];
+            let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+            cache.remember(&source).unwrap();
+            let mut attempted = false;
+            let snapshot = cache
+                .load_with_cloner(expected, |mut input, mut output, parent| {
+                    attempted = true;
+                    assert_eq!(parent, cache.root);
+                    assert_eq!(output.metadata().unwrap().nlink(), 0);
+                    assert_ne!(
+                        input.metadata().unwrap().ino(),
+                        output.metadata().unwrap().ino()
+                    );
+                    if partial {
+                        // A failed ioctl is not a promise of an empty output
+                        // or unchanged file positions. Force a stale suffix
+                        // and make a missing rewind lose the input prefix.
+                        output.write_all(&vec![0xff; bytes.len() + 31]).unwrap();
+                        input.seek(io::SeekFrom::Start(13)).unwrap();
+                    }
+                    false
+                })
+                .unwrap();
+            assert!(attempted);
+            assert_eq!(snapshot.file.metadata().unwrap().nlink(), 0);
+            assert_eq!(snapshot.bytes(), bytes);
+            assert_eq!(cache.load(expected).unwrap().bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn cache_lookup_privacy_does_not_depend_on_process_umask() {
+        const CHILD: &str = "RABS_CACHE_LOOKUP_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Only the isolated child changes its umask. Other tests in this
+            // process may create private files concurrently.
+            let test = concat!(
+                module_path!(),
+                "::cache_lookup_privacy_does_not_depend_on_process_umask"
+            );
+            let (_, test) = test.split_once("::").unwrap();
+            let result = std::process::Command::new("sh")
+                .args(["-c", "umask 000; exec \"$@\"", "cache-lookup-umask"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "permissive-umask child failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let parent = private();
+        let input = private();
+        let source = staged(input.path(), &[("lib.rs", b"good")]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        for cloned in [false, true] {
+            let snapshot = cache
+                .load_with_cloner(expected, |mut input, mut output, _| {
+                    assert_eq!(output.metadata().unwrap().mode() & 0o777, 0o600);
+                    if cloned {
+                        io::copy(&mut input, &mut output).unwrap();
+                    }
+                    cloned
+                })
+                .unwrap();
+            assert_eq!(snapshot.file.metadata().unwrap().mode() & 0o777, 0o600);
+            assert_eq!(snapshot.file.metadata().unwrap().nlink(), 0);
+            assert_eq!(snapshot.bytes(), b"good");
+        }
+    }
+
+    #[test]
+    fn lookup_clone_success_must_verify_its_actual_anonymous_destination() {
+        let parent = private();
+        let input = private();
+        let source = staged(input.path(), &[("lib.rs", b"good")]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        for candidate in [&b""[..], &b"go"[..], &b"evil"[..], &b"good!"[..]] {
+            assert!(
+                cache
+                    .load_with_cloner(expected, |_, mut output, _| {
+                        output.write_all(candidate).unwrap();
+                        true
+                    })
+                    .is_none(),
+                "a success claim cannot bless absent, short, corrupt, or extra bytes"
+            );
+        }
+        // This deliberately copied candidate exercises the validation branch;
+        // the worker's real-filesystem fixture separately requires FICLONE.
+        let snapshot = cache
+            .load_with_cloner(expected, |mut input, mut output, _| {
+                assert_eq!(io::copy(&mut input, &mut output).unwrap(), expected.len);
+                true
+            })
+            .unwrap();
+        assert_eq!(cache.load(expected).unwrap().bytes(), b"good");
+        let path = cache.object_path(&expected.sha256);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"evil").unwrap();
+        assert!(cache.load(expected).is_none());
+        assert_eq!(snapshot.bytes(), b"good");
+    }
+
+    #[test]
+    fn correct_clone_bytes_cannot_mask_a_corrupt_cache_object() {
+        let parent = private();
+        let input = private();
+        let source = staged(input.path(), &[("lib.rs", b"good")]);
+        let expected = &source.manifest().files()[0];
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        let path = cache.object_path(&expected.sha256);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"evil").unwrap();
+        let mut attempted = false;
+        assert!(
+            cache
+                .load_with_cloner(expected, |_, mut output, _| {
+                    attempted = true;
+                    // The callback is not a new authority for the named cache
+                    // object, even if it somehow supplies the expected bytes.
+                    output.write_all(b"good").unwrap();
+                    true
+                })
+                .is_none()
+        );
+        assert!(attempted);
+        assert!(cache.load(expected).is_none());
+    }
+
+    #[test]
+    fn lookup_clone_refuses_source_mutation_or_replacement_before_either_branch() {
+        for cloned in [false, true] {
+            for change in ["content", "generation", "replacement"] {
+                let parent = private();
+                let input = private();
+                let source = staged(input.path(), &[("lib.rs", b"good")]);
+                let expected = &source.manifest().files()[0];
+                let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+                cache.remember(&source).unwrap();
+                let path = cache.object_path(&expected.sha256);
+                assert!(
+                    cache
+                        .load_with_cloner(expected, |_, mut output, _| {
+                            output.write_all(b"good").unwrap();
+                            match change {
+                                "content" => {
+                                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                                        .unwrap();
+                                    fs::write(&path, b"evil").unwrap();
+                                }
+                                "generation" => File::open(&path)
+                                    .unwrap()
+                                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(42))
+                                    .unwrap(),
+                                "replacement" => {
+                                    fs::rename(&path, cache.root.join("old-generation")).unwrap();
+                                    fs::write(&path, b"good").unwrap();
+                                }
+                                _ => unreachable!(),
+                            }
+                            cloned
+                        })
+                        .is_none(),
+                    "changed source must not survive the {change} callback (cloned={cloned})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_clone_refuses_destination_metadata_changes_and_late_cancellation() {
+        for cloned in [false, true] {
+            let parent = private();
+            let input = private();
+            let source = staged(input.path(), &[("lib.rs", b"good")]);
+            let expected = &source.manifest().files()[0];
+            let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+            cache.remember(&source).unwrap();
+            assert!(
+                cache
+                    .load_with_cloner(expected, |_, mut output, _| {
+                        output.write_all(b"good").unwrap();
+                        output
+                            .set_permissions(fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                        cloned
+                    })
+                    .is_none()
+            );
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let session = cache.clone().with_cancellation(Arc::clone(&cancelled));
+            assert!(
+                session
+                    .load_with_cloner(expected, |_, mut output, _| {
+                        output.write_all(b"good").unwrap();
+                        cancelled.store(true, Ordering::Release);
+                        cloned
+                    })
+                    .is_none()
+            );
+            assert_eq!(cache.load(expected).unwrap().bytes(), b"good");
+        }
     }
 
     #[test]

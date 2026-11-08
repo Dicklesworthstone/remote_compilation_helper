@@ -1,8 +1,8 @@
 //! Worker integration for the shared verified source-byte cache.
 //!
 //! Storage, bounds, checkpointing and eviction live in rabs-sandbox. The worker
-//! supplies the CAS layer's verified clone callback at installation and retains
-//! the real-filesystem integration test for that dependency boundary here.
+//! supplies the CAS layer's verified clone callback at lookup and installation,
+//! and retains the real-filesystem integration test for that boundary here.
 
 pub use rabs_sandbox::source_cache::{
     DEFAULT_SOURCE_CACHE_BYTES, MAX_SOURCE_CACHE_BYTES, SourceCache,
@@ -21,7 +21,7 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::fs;
-    use std::io::{Seek, Write};
+    use std::io::{Read, Seek, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
@@ -73,7 +73,20 @@ mod tests {
         let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         cache.remember(&source).unwrap();
         let expected = &source.manifest().files()[0];
-        let snapshot = cache.load(expected).unwrap();
+        let mut retained_cache = None;
+        let mut lookup_cloned = false;
+        let snapshot = cache
+            .load_with_cloner(expected, |input, output, parent| {
+                retained_cache = Some(input.try_clone().unwrap());
+                lookup_cloned =
+                    rabs_cas::materialization::try_verified_reflink(input, output, parent);
+                lookup_cloned
+            })
+            .unwrap();
+        assert!(
+            lookup_cloned,
+            "cache lookup must avoid the payload copy on this real CoW fixture"
+        );
         let next = private_in(parent.path());
         let mut receiver =
             SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
@@ -90,10 +103,19 @@ mod tests {
         );
         assert!(receiver.sealed_root().is_none());
         let mut retained_snapshot = retained_snapshot.expect("clone callback retained its input");
+        let mut retained_cache = retained_cache.expect("lookup callback retained its input");
+        assert_ne!(
+            retained_snapshot.metadata().unwrap().ino(),
+            retained_cache.metadata().unwrap().ino()
+        );
         retained_snapshot.rewind().unwrap();
         retained_snapshot
             .write_all(b"changed private spool")
             .unwrap();
+        retained_cache.rewind().unwrap();
+        let mut cached_bytes = Vec::new();
+        retained_cache.read_to_end(&mut cached_bytes).unwrap();
+        assert_eq!(cached_bytes, bytes, "lookup clone must isolate cache bytes");
         let installed = receiver.seal().unwrap().join("lib.rlib");
         assert_eq!(fs::read(&installed).unwrap(), bytes);
         assert_ne!(
@@ -113,6 +135,43 @@ mod tests {
             .unwrap();
         assert_eq!(
             fs::read(confirmed.seal().unwrap().join("lib.rlib")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn failed_filesystem_reflink_probe_falls_back_to_a_verified_cache_copy() {
+        let parent = private_in(std::env::temp_dir());
+        let input = private_in(parent.path());
+        let bytes = vec![0x37; MAX_SOURCE_CHUNK * 2 + 9];
+        let source = staged(input.path(), &[("lib.rlib", &bytes)]);
+        let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
+        cache.remember(&source).unwrap();
+        let expected = &source.manifest().files()[0];
+        // A regular file cannot host the anonymous isolation probe. This
+        // exercises the actual filesystem callback's unsupported/error route,
+        // independent of whether the test machine supports reflinks elsewhere.
+        let invalid_parent = parent.path().join("not-a-directory");
+        fs::write(&invalid_parent, b"probe cannot run here").unwrap();
+        let mut attempted = false;
+        let snapshot = cache
+            .load_with_cloner(expected, |input, output, _| {
+                attempted = true;
+                let cloned =
+                    rabs_cas::materialization::try_verified_reflink(input, output, &invalid_parent);
+                assert!(!cloned);
+                cloned
+            })
+            .unwrap();
+        assert!(attempted);
+        let next = private_in(parent.path());
+        let mut receiver =
+            SourceReceiver::create(&next.path().join("workspace"), source.manifest().clone())
+                .unwrap();
+        snapshot.install(&mut receiver).unwrap();
+        assert!(receiver.sealed_root().is_none());
+        assert_eq!(
+            fs::read(receiver.seal().unwrap().join("lib.rlib")).unwrap(),
             bytes
         );
     }
