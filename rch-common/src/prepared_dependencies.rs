@@ -64,8 +64,12 @@ pub struct PreparedDependencyRequest {
     pub command_sha256: String,
     pub source_content_root: String,
     pub source_root: String,
-    /// Empty denotes the source root; `.` is not a canonical spelling.
+    /// Invocation directory. Empty denotes the source root; `.` is not canonical.
     pub project_relative: String,
+    /// A declared workspace ancestor that owns installation and its transaction.
+    /// Absent when preparation belongs to the invocation directory itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_relative: Option<String>,
     pub files: Vec<PreparedDependencyFile>,
     pub directories: Vec<String>,
 }
@@ -374,7 +378,45 @@ fn validate_request_shape(request: &PreparedDependencyRequest) -> Result<()> {
             .ok()
             .is_some_and(|index| request.files[index].kind == PreparedDependencyFileKind::Regular),
         "preparation project has no selected regular package.json",
-    )
+    )?;
+    if let Some(preparation) = request.preparation_relative.as_deref() {
+        require(
+            preparation.is_empty() || relative_path(preparation),
+            "workspace preparation path is not canonical",
+        )?;
+        require(
+            !request.project_relative.is_empty()
+                && (preparation.is_empty() || below(&request.project_relative, preparation)),
+            "workspace preparation root must be a strict invocation ancestor",
+        )?;
+        require(
+            !request
+                .project_relative
+                .split('/')
+                .any(|part| matches!(part, "node_modules" | ".git")),
+            "workspace invocation names dependency or version-control internals",
+        )?;
+        require(
+            preparation.is_empty()
+                || request
+                    .directories
+                    .binary_search_by(|path| path.as_str().cmp(preparation))
+                    .is_ok(),
+            "workspace preparation root is not a selected directory",
+        )?;
+        let manifest = join_relative(preparation, "package.json");
+        require(
+            request
+                .files
+                .binary_search_by(|file| file.path.cmp(&manifest))
+                .ok()
+                .is_some_and(|index| {
+                    request.files[index].kind == PreparedDependencyFileKind::Regular
+                }),
+            "workspace preparation root has no selected regular package.json",
+        )?;
+    }
+    Ok(())
 }
 
 /// Validate the complete selected-source request and its serialized size.
@@ -393,7 +435,8 @@ pub fn request_digest(request: &PreparedDependencyRequest) -> Result<String> {
 pub fn admitted_dependency_roots(request: &PreparedDependencyRequest) -> Result<Vec<String>> {
     validate_request(request)?;
     let mut roots = BTreeSet::new();
-    roots.insert(join_relative(&request.project_relative, "node_modules"));
+    let preparation = request.preparation_relative();
+    roots.insert(join_relative(preparation, "node_modules"));
     for file in &request.files {
         if file.kind != PreparedDependencyFileKind::Regular {
             continue;
@@ -401,10 +444,7 @@ pub fn admitted_dependency_roots(request: &PreparedDependencyRequest) -> Result<
         let Some(parent) = file.path.strip_suffix("/package.json") else {
             continue;
         };
-        if !request.project_relative.is_empty()
-            && parent != request.project_relative
-            && !below(parent, &request.project_relative)
-        {
+        if !preparation.is_empty() && parent != preparation && !below(parent, preparation) {
             continue;
         }
         if parent
@@ -609,7 +649,7 @@ pub fn validate_state(
     validate_request(request)?;
     validate_state_shape(state)?;
     require(
-        state.project == project_path(request),
+        state.project == request.preparation_path(),
         "state belongs to another preparation project",
     )?;
     validate_inventory(request, &state.inventory)?;
@@ -678,6 +718,28 @@ pub fn union_selected_inventory(
 }
 
 impl PreparedDependencyRequest {
+    /// Literal worker directory in which the admitted command will begin.
+    pub fn invocation_path(&self) -> String {
+        project_path(self)
+    }
+
+    /// Relative directory whose lockfile, outputs and transaction are shared.
+    pub fn preparation_relative(&self) -> &str {
+        self.preparation_relative
+            .as_deref()
+            .unwrap_or(&self.project_relative)
+    }
+
+    /// Literal worker path to the preparation root, within the selected source.
+    pub fn preparation_path(&self) -> String {
+        let relative = self.preparation_relative();
+        if relative.is_empty() {
+            self.source_root.clone()
+        } else {
+            format!("{}/{relative}", self.source_root.trim_end_matches('/'))
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_request(self)
     }
@@ -753,6 +815,7 @@ mod tests {
             source_content_root: "d".repeat(64),
             source_root: "/tmp/source".to_owned(),
             project_relative: "vittles".to_owned(),
+            preparation_relative: None,
             files: vec![
                 regular("vittles/bun.lock"),
                 regular("vittles/node_modules/pinned.txt"),
@@ -1142,5 +1205,105 @@ mod tests {
         assert_eq!(admitted_dependency_roots(&root).unwrap(), ["node_modules"]);
         root.project_relative = ".".to_owned();
         assert!(root.validate().is_err());
+    }
+
+    fn workspace_request() -> PreparedDependencyRequest {
+        let mut request = request();
+        request.project_relative = "vittles/packages/app".to_owned();
+        request.preparation_relative = Some("vittles".to_owned());
+        request.files.extend([
+            regular("vittles/packages/app/package.json"),
+            regular("vittles/packages/other/package.json"),
+        ]);
+        request
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        request.directories.extend([
+            "vittles/packages".to_owned(),
+            "vittles/packages/app".to_owned(),
+            "vittles/packages/other".to_owned(),
+        ]);
+        request.directories.sort();
+        request
+    }
+
+    #[test]
+    fn workspace_preparation_binds_the_invocation_and_shared_output_root() {
+        let request = workspace_request();
+        request.validate().unwrap();
+        assert_eq!(request.preparation_relative(), "vittles");
+        assert_eq!(request.preparation_path(), "/tmp/source/vittles");
+        assert_eq!(
+            admitted_dependency_roots(&request).unwrap(),
+            [
+                "vittles/node_modules",
+                "vittles/packages/app/node_modules",
+                "vittles/packages/other/node_modules",
+            ]
+        );
+        state().validate_for(&request).unwrap();
+        let attestation = PreparedDependencyAttestation {
+            version: PREPARED_DEPENDENCY_VERSION,
+            request_digest: request.digest().unwrap(),
+            state_digest: state().digest().unwrap(),
+            state: state(),
+            disposition: PreparedDependencyDisposition::Retained,
+        };
+        attestation.validate_for(&request).unwrap();
+        let mut other_member = request.clone();
+        other_member.project_relative = "vittles/packages/other".to_owned();
+        // Ownership is shared; accepted execution remains bound to one member.
+        state().validate_for(&other_member).unwrap();
+        assert_ne!(request.digest().unwrap(), other_member.digest().unwrap());
+        assert!(attestation.validate_for(&other_member).is_err());
+        let mut member_owned = state();
+        member_owned.project = "/tmp/source/vittles/packages/app".to_owned();
+        assert!(member_owned.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn workspace_preparation_requires_a_selected_strict_ancestor() {
+        let valid = workspace_request();
+        for root in [
+            "vittles/packages/app",
+            "vittles/packages/other",
+            "vittles/packages/app/nested",
+            "vittles2",
+            "../vittles",
+            ".",
+            "vittles/../vittles",
+        ] {
+            let mut request = valid.clone();
+            request.preparation_relative = Some(root.to_owned());
+            assert!(request.validate().is_err(), "{root}");
+        }
+        let mut unselected = valid.clone();
+        unselected.preparation_relative = Some("vittles/packages".to_owned());
+        assert!(unselected.validate().is_err());
+        let mut linked = valid.clone();
+        let manifest = linked
+            .files
+            .iter_mut()
+            .find(|file| file.path == "vittles/package.json")
+            .unwrap();
+        *manifest = link("vittles/package.json", "src/index.ts");
+        assert!(linked.validate().is_err());
+        let mut source_root = valid;
+        source_root.preparation_relative = Some(String::new());
+        assert!(source_root.validate().is_err());
+        source_root.files.insert(0, regular("package.json"));
+        source_root.validate().unwrap();
+        assert_eq!(source_root.preparation_path(), "/tmp/source");
+    }
+
+    #[test]
+    fn local_preparation_omits_the_workspace_extension_from_its_digest() {
+        let request = request();
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("preparation_relative"));
+        let restored: PreparedDependencyRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(request, restored);
+        assert_eq!(request.digest().unwrap(), restored.digest().unwrap());
+        assert_eq!(request.preparation_relative(), request.project_relative);
     }
 }

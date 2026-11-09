@@ -7,6 +7,7 @@ use rch_common::prepared_dependencies::{PreparedDependencyAttestation, PreparedD
 pub(super) struct PreparedDependencyExecution {
     pub(super) request_digest: String,
     pub(super) attestation_digest: String,
+    pub(super) workspace_root: Option<String>,
 }
 
 /// The request is stdin data, outside every nested exec argument. In
@@ -57,7 +58,7 @@ impl TransferPipeline {
         request: &PreparedDependencyRequest,
         timeout: Duration,
     ) -> Result<String> {
-        let command = self.prepared_dependency_command("inspect")?;
+        let command = self.prepared_dependency_command("inspect", request)?;
         let environment = self.build_remote_env_plan(&self.remote_path());
         let command = format!("{}{command}", environment.env_prefix.prefix);
         let script = request_stdin(&command, request)?;
@@ -70,7 +71,16 @@ impl TransferPipeline {
         ))
     }
 
-    fn prepared_dependency_command(&self, mode: &str) -> Result<String> {
+    fn prepared_dependency_command(
+        &self,
+        mode: &str,
+        request: &PreparedDependencyRequest,
+    ) -> Result<String> {
+        request.validate()?;
+        anyhow::ensure!(
+            request.invocation_path() == self.remote_path(),
+            "dependency preparation request belongs to another invocation directory"
+        );
         anyhow::ensure!(
             !self.worker_platform.is_windows(),
             "qualified dependency preparation requires a Unix worker"
@@ -78,7 +88,7 @@ impl TransferPipeline {
         let runtime = self
             .dependency_runtime()
             .context("command has no Node dependency preparation policy")?;
-        let project = escape(Cow::Owned(self.remote_path()));
+        let project = escape(Cow::Owned(request.preparation_path()));
         Ok(format!(
             "rch-wkr prepare-proof --mode {mode} --project {project} --runtime {runtime}"
         ))
@@ -140,7 +150,7 @@ impl TransferPipeline {
                 && self.source_activity_owns_execution,
             "dependency preparation must not reuse workload completion identity"
         );
-        let command = self.prepared_dependency_command("install")?;
+        let command = self.prepared_dependency_command("install", request)?;
         let command = self.build_remote_command_with_preparation(&command, None, false);
         let script = request_stdin(&command, request)?;
         Ok(source_activity_bounded_script(
@@ -189,6 +199,10 @@ impl TransferPipeline {
         preparation_growth_bytes: u64,
     ) -> Result<()> {
         attestation.validate_for(request)?;
+        anyhow::ensure!(
+            request.invocation_path() == self.remote_path(),
+            "accepted dependency preparation belongs to another invocation directory"
+        );
         self.ensure_prepared_execution_time()?;
         if let Some(mut budget) = self.disk_budget {
             budget.max_growth_bytes = budget
@@ -201,6 +215,10 @@ impl TransferPipeline {
         self.prepared_dependencies = Some(PreparedDependencyExecution {
             request_digest: request.digest()?,
             attestation_digest: attestation.digest()?,
+            workspace_root: request
+                .preparation_relative
+                .as_ref()
+                .map(|_| request.preparation_path()),
         });
         Ok(())
     }

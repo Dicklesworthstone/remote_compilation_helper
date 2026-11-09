@@ -208,6 +208,108 @@ fn check_generated_wrapper(
 }
 
 #[cfg(unix)]
+#[test]
+fn rust_generated_workspace_wrapper_preserves_member_context_and_hoisted_tools() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = rch_common::test_guard!();
+    for kind in [CompilationKind::Tsc, CompilationKind::BunTest] {
+        for (member_tool, preparation_status) in [(false, "0"), (true, "0"), (false, "2")] {
+            let fixture = tempfile::Builder::new()
+                .prefix("rch-workspace-wrapper-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let root = fixture.path().join("workspace with ' quotes and $value");
+            let member = root.join("packages/member");
+            let tools = fixture.path().join("worker-tools");
+            let root_bin = root.join("node_modules/.bin");
+            let member_bin = member.join("node_modules/.bin");
+            for path in [&tools, &root_bin, &member_bin] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let write_tool = |path: &Path, source: &str| {
+                std::fs::write(path, source).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            };
+            write_tool(
+                &tools.join("rch-wkr"),
+                "#!/bin/sh\nset -eu\n\
+                 [ \"$#\" = 13 ] || exit 91\n\
+                 [ \"$1 $2 $3 $4\" = 'prepare-proof --mode verify --project' ] || exit 92\n\
+                 [ \"$5\" = \"$EXPECTED_ROOT\" ] || exit 93\n\
+                 shift 5\n\
+                 [ \"$*\" = \"--runtime $EXPECTED_RUNTIME --expected-request-digest $EXPECTED_REQUEST --expected-attestation-digest $EXPECTED_ATTESTATION --invocation-project .\" ] || exit 94\n\
+                 [ \"$PWD\" = \"$EXPECTED_MEMBER\" ] || exit 95\n\
+                 if IFS= read -r ignored; then exit 96; fi\n\
+                 printf 'verified\\n' >> \"$EVENTS\"\n\
+                 exit \"$PREPARATION_STATUS\"\n",
+            );
+            write_tool(&tools.join("compiler"), "#!/bin/sh\nexit 97\n");
+            for (bin, label) in [(&root_bin, "root"), (&member_bin, "member")] {
+                if label == "member" && !member_tool {
+                    continue;
+                }
+                write_tool(
+                    &bin.join("compiler"),
+                    &format!(
+                        "#!/bin/sh\nprintf '{label}\\n' >> \"$EVENTS\"\n\
+                         printf '[%s]\\n' \"$@\"\ncat\nexit 23\n"
+                    ),
+                );
+            }
+            let request = "a".repeat(64);
+            let attestation = "b".repeat(64);
+            let mut pipeline = pipeline(kind, false, WorkerPlatform::Posix);
+            pipeline.prepared_dependencies =
+                Some(prepared_dependencies::PreparedDependencyExecution {
+                    request_digest: request.clone(),
+                    attestation_digest: attestation.clone(),
+                    workspace_root: Some(root.to_str().unwrap().to_owned()),
+                });
+            let command = pipeline.wrap_with_dependency_preparation(
+                "cd / && compiler 'literal $value; not shell code'".to_owned(),
+            );
+            let input = b"binary\0workload\xff\n";
+            let stdin_path = fixture.path().join("workload-stdin");
+            std::fs::write(&stdin_path, input).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .current_dir(&member)
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+                .env("EXPECTED_ROOT", &root)
+                .env("EXPECTED_MEMBER", &member)
+                .env("EXPECTED_RUNTIME", pipeline.dependency_runtime().unwrap())
+                .env("EXPECTED_REQUEST", request)
+                .env("EXPECTED_ATTESTATION", attestation)
+                .env("PREPARATION_STATUS", preparation_status)
+                .env("EVENTS", member.join("events"))
+                .stdin(std::fs::File::open(stdin_path).unwrap())
+                .output()
+                .unwrap();
+            let events = std::fs::read_to_string(member.join("events")).unwrap();
+            if preparation_status == "0" {
+                assert_eq!(output.status.code(), Some(23), "{output:?}");
+                let label = if member_tool { "member" } else { "root" };
+                assert_eq!(events, format!("verified\n{label}\n"));
+                let mut expected = b"[literal $value; not shell code]\n".to_vec();
+                expected.extend_from_slice(input);
+                assert_eq!(output.stdout, expected);
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(output.status.code(), Some(121), "{output:?}");
+                assert_eq!(events, "verified\n");
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("the command was not run")
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn source_refresh_preserves_only_worker_owned_dependency_state() {
     let fixture = tempfile::tempdir().unwrap();

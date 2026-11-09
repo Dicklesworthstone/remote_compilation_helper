@@ -60,13 +60,16 @@ sys.exit(7)
     def package(self):
         (self.project / "package.json").write_text('{"name":"fixture","version":"1.0.0"}\n')
 
-    def invoke(self, *, destination=None, arguments=(), data=b"", runtime="node", prefix=""):
+    def invoke(self, *, destination=None, arguments=(), data=b"", runtime="node", prefix="",
+               proof_root=None):
         if destination is None:
             command = ["tsc", *arguments]
         else:
             command = [SHELL, "-c", 'cd "$1" || exit 93; shift; exec tsc "$@"',
                        "workload", str(destination), *arguments]
-        return subprocess.run([SHELL, "-c", prefix + self.script, "rch-prepare", runtime, *command],
+        proof = ([] if proof_root is None else
+                 ["--source-proof", "a" * 64, "b" * 64, "--preparation-root", str(proof_root)])
+        return subprocess.run([SHELL, "-c", prefix + self.script, "rch-prepare", runtime, *proof, *command],
                               cwd=self.project, env=self.env, input=data,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
 
@@ -97,6 +100,66 @@ sys.exit(7)
         nested = self.project / "src"
         nested.mkdir()
         self.assert_tool(self.invoke(destination=nested), "prepared", cwd=nested)
+
+    def workspace_member(self):
+        workspace = self.root / "workspace with 'quotes' $literal"
+        self.project.rename(workspace)
+        (workspace / "package.json").write_text('{"workspaces":["packages/*"]}\n')
+        self.project = workspace / "packages/app"
+        self.project.mkdir(parents=True)
+        self.package()
+        return workspace
+
+    def test_workspace_hoisted_tools_keep_member_cwd_arguments_and_binary_stdin(self):
+        workspace = self.workspace_member()
+        self.compiler(workspace / "node_modules/.bin", "workspace")
+        nested = self.project / "src"
+        nested.mkdir()
+        arguments = ("", "--project", "space 'quotes' $() ;", "café")
+        data = bytes(range(256)) * 64 + b"tail\x00\xff"
+        for runtime in ("node", "bun"):
+            with self.subTest(runtime=runtime):
+                result = self.invoke(destination=nested, arguments=arguments, data=data,
+                                     runtime=runtime, proof_root=workspace)
+                self.assert_tool(result, "workspace", args=arguments, data=data, cwd=nested)
+                prepared = json.loads((self.root / "preparation.json").read_text())
+                self.assertEqual(prepared, {
+                    'args': ['prepare-proof', '--mode', 'verify', '--project', str(workspace),
+                             '--runtime', runtime, '--expected-request-digest', 'a' * 64,
+                             '--expected-attestation-digest', 'b' * 64,
+                             '--invocation-project', '.'],
+                    'cwd': str(self.project), 'stdin': '',
+                })
+
+    def test_workspace_member_tools_precede_hoisted_and_global_tools(self):
+        workspace = self.workspace_member()
+        self.compiler(workspace / "node_modules/.bin", "workspace")
+        self.compiler(self.project / "node_modules/.bin", "member")
+        self.assert_tool(self.invoke(proof_root=workspace), "member")
+        # Absolute entries continue selecting the same prepared member tools.
+        self.assert_tool(self.invoke(destination=workspace, proof_root=workspace),
+                         "member", cwd=workspace)
+
+    def test_failed_workspace_proof_never_runs_a_hoisted_tool(self):
+        workspace = self.workspace_member()
+        self.compiler(workspace / "node_modules/.bin", "workspace")
+        self.env["RCH_TEST_PREPARE_EXIT"] = "73"
+        result = self.invoke(proof_root=workspace)
+        self.assertEqual(result.returncode, 121, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse((self.root / "executed").exists())
+        prepared = json.loads((self.root / "preparation.json").read_text())
+        self.assertEqual(prepared["args"][0], "prepare-proof")
+        self.assertEqual(prepared["args"][4], str(workspace))
+        self.assertIn(b"the command was not run", result.stderr)
+
+    def test_relative_workspace_root_is_refused_before_verification(self):
+        self.workspace_member()
+        result = self.invoke(proof_root="../..")
+        self.assertEqual(result.returncode, 121, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse((self.root / "preparation.json").exists())
+        self.assertFalse((self.root / "executed").exists())
 
     def test_special_path_bytes_and_literal_workload_arguments_survive(self):
         moved = self.root / "project with 'quotes' $literal\n\n"

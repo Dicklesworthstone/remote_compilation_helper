@@ -18,17 +18,44 @@ fi
 rch_prepare_runtime=$1
 shift
 rch_prepare_proved=0
+rch_prepare_project=.
+rch_prepare_workspace=0
 if [ "${1-}" = --source-proof ]; then
     if [ "$#" -lt 4 ]; then
         printf 'rch: incomplete dependency proof binding; the command was not run\n' >&2
         exit 121
     fi
+    rch_prepare_request=$2
+    rch_prepare_attestation=$3
+    shift 3
+    if [ "${1-}" = --preparation-root ]; then
+        if [ "$#" -lt 3 ]; then
+            printf 'rch: incomplete workspace preparation binding; the command was not run\n' >&2
+            exit 121
+        fi
+        rch_prepare_project=$2
+        case "$rch_prepare_project" in
+            /*) ;;
+            *) printf 'rch: workspace preparation root is not absolute; the command was not run\n' >&2
+               exit 121 ;;
+        esac
+        rch_prepare_workspace=1
+        shift 2
+    fi
     # The accepted request is durable worker state. Only its small digests
     # cross exec argv; the complete source manifest never enters shell argv.
-    if rch-wkr prepare-proof --mode verify --project . --runtime "$rch_prepare_runtime" \
-        --expected-request-digest "$2" --expected-attestation-digest "$3" </dev/null 1>&2; then
+    # A workspace proof additionally binds this actual invocation directory;
+    # verifying the root's outputs cannot authorize another member's command.
+    rch_prepare_verify() {
+        if [ "$rch_prepare_workspace" = 1 ]; then
+            set -- --invocation-project .
+        fi
+        rch-wkr prepare-proof --mode verify --project "$rch_prepare_project" \
+            --runtime "$rch_prepare_runtime" --expected-request-digest "$rch_prepare_request" \
+            --expected-attestation-digest "$rch_prepare_attestation" "$@"
+    }
+    if rch_prepare_verify </dev/null 1>&2; then
         rch_prepare_proved=1
-        shift 3
     else
         rch_prepare_status=$?
         printf 'rch: prepared dependency verification failed (exit %s); the command was not run\n' \
@@ -47,13 +74,14 @@ if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ]; 
             "$rch_prepare_status" >&2
         exit 121
     fi
-    if [ -d node_modules/.bin ]; then
+    rch_prepare_add_bin() {
+        [ -d "$1/node_modules/.bin" ] || return 0
         # The workload can change directory before invoking a project tool.
         # A relative PATH entry would then select another package's compiler
         # (or a global one), not the tools whose installation just succeeded.
         # Resolve the prepared bin directory now, independently of PWD/CDPATH.
         # Keep pwd's terminating newline distinct from newlines in the path.
-        rch_prepare_bin=$(CDPATH= cd node_modules/.bin && pwd -P && printf x) || {
+        rch_prepare_bin=$(CDPATH= cd "$1/node_modules/.bin" && pwd -P && printf x) || {
             printf 'rch: prepared tool directory is unavailable; the command was not run\n' >&2
             exit 121
         }
@@ -72,6 +100,12 @@ if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ]; 
         esac
         PATH="$rch_prepare_bin${PATH:+:$PATH}"
         export PATH
+    }
+    # Prepend the shared root first, then the member. Member-local tools win,
+    # and hoisted tools remain available after the workload changes directory.
+    if [ "$rch_prepare_workspace" = 1 ]; then
+        rch_prepare_add_bin "$rch_prepare_project"
     fi
+    rch_prepare_add_bin .
 fi
 exec "$@"

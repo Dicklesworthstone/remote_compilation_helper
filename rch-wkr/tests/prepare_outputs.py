@@ -4,17 +4,28 @@
 The isolated package managers are deterministic lifecycle fixtures, not a
 claim of fleet or registry acceptance. All transaction, inventory, hashing,
 publication and installer-descendant logic is the actual worker binary.
+
+Pass the compiled worker as the only argument. Verification uses real BLAKE3:
+set RCH_TEST_BLAKE3 to a stdin-to-hex executable, install b3sum, or retain the
+worker's Cargo dependency artifacts and a matching rustc (optionally RUSTC).
+The last option compiles a small hasher against the already-built blake3 crate;
+it neither downloads dependencies nor substitutes a Python hash implementation.
+RCH_TEST_REAL_NPM=1 additionally requires npm and Node for an offline workspace
+install and consumer run with only local dependencies.
 """
 
 import copy
+import functools
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -23,7 +34,77 @@ spec = importlib.util.spec_from_file_location(
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
+BLAKE3_HELPER = r'''
+use std::io::Read;
+fn main() -> std::io::Result<()> {
+    let mut input = std::io::stdin().lock();
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 65536];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 { break; }
+        hasher.update(&buffer[..count]);
+    }
+    println!("{}", hasher.finalize().to_hex());
+    Ok(())
+}
+'''
+
+
+@functools.cache
+def blake3_command():
+    explicit = os.environ.get("RCH_TEST_BLAKE3") or shutil.which("b3sum")
+    if explicit:
+        return [explicit]
+    profile = Path(fixture.WORKER).parent
+    if profile.name == "deps":
+        profile = profile.parent
+    artifacts = sorted(
+        [*profile.glob("deps/libblake3-*.rlib"),
+         *profile.glob("build/blake3/*/out/libblake3-*.rlib")],
+        key=lambda path: path.stat().st_mtime_ns, reverse=True,
+    )
+    rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+    if not rustc or not artifacts:
+        raise RuntimeError("verification needs RCH_TEST_BLAKE3, b3sum, or matching "
+                           "rustc and the candidate worker's built blake3 artifact")
+    helper = Path(tempfile.mkdtemp(prefix="rch-proof-blake3-")) / "hasher"
+    directories = [profile / "deps", *sorted(profile.glob("build/*/*/out"))]
+    search = [argument for path in directories if path.is_dir()
+              for argument in ("-L", "dependency=" + str(path))]
+    diagnostic = b""
+    # A target may contain a few artifacts from previous build flags. Try at
+    # most four, newest first; mismatched compiler/dependency sets fail clearly.
+    for artifact in artifacts[:4]:
+        extern = ["--extern", "blake3=" + str(artifact)]
+        metadata = artifact.with_suffix(".rmeta")
+        if metadata.is_file():
+            # Cargo can emit the archive and its metadata separately.
+            extern.extend(["--extern", "blake3=" + str(metadata)])
+        result = subprocess.run(
+            [rustc, "--edition=2024", "--crate-name=rch_proof_blake3", "-C", "debuginfo=0",
+             *search, *extern, "-o", str(helper), "-"],
+            input=BLAKE3_HELPER.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return [str(helper)]
+        diagnostic = result.stderr
+    raise RuntimeError("cannot build the verification BLAKE3 helper; set RCH_TEST_BLAKE3: "
+                       + diagnostic.decode(errors="replace")[-2000:])
+
+
+def blake3_digest(data):
+    result = subprocess.run(blake3_command(), input=data, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=8, check=True)
+    words = result.stdout.decode("ascii").split()
+    if not words or len(words[0]) != 64 or any(c not in "0123456789abcdef" for c in words[0]):
+        raise RuntimeError("BLAKE3 helper did not return a 64-character lowercase hex digest")
+    return words[0]
+
+
 EXTRA_OUTPUTS = r'''
+pwd > "$RCH_PREPARE_TEST_STATE/install-cwd"
 mkdir -p node_modules/pkg/empty node_modules/.bin
 printf 'module.exports = 1;\n' > node_modules/pkg/index.js
 ln -s ../pkg/index.js node_modules/.bin/fixture-tool
@@ -47,8 +128,9 @@ class PreparedOutputs(fixture.PrepareTransactions):
         for name in ("npm", "bun", "pnpm", "yarn"):
             (self.bin / name).write_text(fixture.NPM + EXTRA_OUTPUTS)
 
-    def request(self, project, paths=None, *, source=None, attempt="attempt-1"):
-        source = project if source is None else source
+    def request(self, project, paths=None, *, source=None, preparation=None, attempt="attempt-1"):
+        inputs = project if preparation is None else preparation
+        source = inputs if source is None else source
         if paths is None:
             paths = ["package.json", "package-lock.json"]
         files = []
@@ -57,7 +139,7 @@ class PreparedOutputs(fixture.PrepareTransactions):
         if prefix == ".":
             prefix = ""
         for project_path in paths:
-            path = project / project_path
+            path = inputs / project_path
             relative = path.relative_to(source).as_posix()
             metadata = path.lstat()
             target = os.readlink(path) if path.is_symlink() else None
@@ -74,7 +156,11 @@ class PreparedOutputs(fixture.PrepareTransactions):
             while parent != Path("."):
                 directories.add(parent.as_posix())
                 parent = parent.parent
-        return {
+        invocation = Path(prefix)
+        while invocation != Path("."):
+            directories.add(invocation.as_posix())
+            invocation = invocation.parent
+        request = {
             "schema_version": 1, "attempt_id": attempt,
             "source_owner": "12345678-1234-1234-1234-123456789abc",
             "build_id": "12345", "command_sha256": "a" * 64,
@@ -82,9 +168,12 @@ class PreparedOutputs(fixture.PrepareTransactions):
             "project_relative": prefix, "files": sorted(files, key=lambda item: item["path"]),
             "directories": sorted(directories),
         }
+        if preparation is not None:
+            relative = preparation.relative_to(source).as_posix()
+            request["preparation_relative"] = "" if relative == "." else relative
+        return request
 
-    def proof(self, project, state, request, *, mode="install", manager="npm",
-              runtime="node", install_mode="immediate", extra_env=None):
+    def proof_environment(self, state, *, manager="npm", install_mode="immediate", extra_env=None):
         env = {
             "PATH": str(self.bin), "HOME": str(self.home), "LC_ALL": "C",
             "XDG_CACHE_HOME": str(self.home / ".cache"),
@@ -98,10 +187,16 @@ class PreparedOutputs(fixture.PrepareTransactions):
         }
         if extra_env:
             env.update(extra_env)
+        return env
+
+    def proof(self, project, state, request, *, mode="install", manager="npm",
+              runtime="node", install_mode="immediate", extra_env=None):
         child = subprocess.Popen(
             [fixture.WORKER, "prepare-proof", "--mode", mode,
              "--project", str(project), "--runtime", runtime],
-            env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self.proof_environment(state, manager=manager, install_mode=install_mode,
+                                       extra_env=extra_env),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.children.append(child)
         child.stdin.write(json.dumps(request).encode())
@@ -109,13 +204,62 @@ class PreparedOutputs(fixture.PrepareTransactions):
         child.stdin = None
         return child
 
+    def verify(self, project, state, attestation, *, invocation=None, cwd=None, runtime="node",
+               extra_env=None):
+        # Preserve the field order returned by the worker. Its canonical digest
+        # is the compact UTF-8 JSON envelope, with no trailing newline.
+        digest = blake3_digest(json.dumps(
+            attestation, ensure_ascii=False, separators=(",", ":")
+        ).encode())
+        argv = [fixture.WORKER, "prepare-proof", "--mode", "verify",
+                "--project", str(project), "--runtime", runtime,
+                "--expected-request-digest", attestation["request_digest"],
+                "--expected-attestation-digest", digest]
+        if invocation is not None:
+            argv.extend(["--invocation-project", str(invocation)])
+        child = subprocess.Popen(
+            argv, cwd=cwd, env=self.proof_environment(state, extra_env=extra_env), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.children.append(child)
+        return child
+
+    def assert_verified(self, child):
+        output, error = child.communicate(timeout=8)
+        self.assertEqual(child.returncode, 0, (output, error))
+        self.assertEqual(output, b"RCH_PREPARED_DEPENDENCIES_VERIFIED\n")
+
+    def workspace(self, name, lock="package-lock.json", declaration=None):
+        project, state = self.project(name, lock=lock)
+        (project / "package.json").write_text(json.dumps({
+            "name": "root", "private": True,
+            "workspaces": ["packages/*"] if declaration is None else declaration,
+        }))
+        paths = ["package.json", lock]
+        if lock == "pnpm-lock.yaml":
+            (project / "pnpm-workspace.yaml").write_text("packages:\n  - 'packages/*'\n")
+            paths.append("pnpm-workspace.yaml")
+        for name in ("a", "b"):
+            member = project / "packages" / name
+            member.mkdir(parents=True)
+            (member / "package.json").write_text(json.dumps({"name": name, "version": "1.0.0"}))
+            (member / "index.js").write_text("selected member " + name + "\n")
+            paths.extend([f"packages/{name}/package.json", f"packages/{name}/index.js"])
+        return project, state, paths
+
     def completed_records(self):
         return sorted((self.home / ".cache/rch/prepare-transactions").glob("*.outputs-v1.json"))
 
     def accepted(self, child):
         output, error = child.communicate(timeout=8)
         self.assertEqual(child.returncode, 0, (output, error))
-        return json.loads(output)
+        value = json.loads(output)
+        # The worker emits serde_json::to_string in declaration field order.
+        # Prove our bytes match that exact canonical framing before hashing an
+        # accepted envelope, including UTF-8, decimal inode strings and escapes.
+        self.assertEqual(output, json.dumps(value, ensure_ascii=False,
+                                           separators=(",", ":")).encode() + b"\n")
+        return value
 
     def refused(self, child, reason=None):
         output, error = child.communicate(timeout=8)
@@ -248,12 +392,272 @@ class PreparedOutputs(fixture.PrepareTransactions):
         member = project / "packages/a"
         member.mkdir(parents=True)
         (member / "package.json").write_text('{"name":"member"}')
-        request = self.request(project, ["package.json", "package-lock.json", "packages/a/package.json"], source=source)
+        request = self.request(member, ["package.json", "package-lock.json", "packages/a/package.json"],
+                               source=source, preparation=project)
         accepted = self.accepted(self.proof(project, state, request, extra_env={"RCH_PROOF_WORKSPACE": "1"}))
+        self.assertEqual(accepted["state"]["project"], str(project))
         files = [entry["path"] for entry in accepted["state"]["inventory"]["files"]]
         self.assertIn("vittles/packages/a/node_modules/member/index.js", files)
         self.assertTrue(all(path.startswith("vittles/") for path in files))
         self.assertEqual(self.accepted(self.proof(project, state, request, mode="inspect")), accepted["state"])
+
+    def test_workspace_members_share_frozen_root_install_and_retained_outputs(self):
+        for lock, manager in (("package-lock.json", "npm"), ("bun.lock", "bun"),
+                              ("pnpm-lock.yaml", "pnpm")):
+            for runtime in ("node", "bun"):
+                with self.subTest(manager=manager, runtime=runtime):
+                    project, state, paths = self.workspace(manager + "-" + runtime, lock=lock)
+                    before_journals = set(self.journals())
+                    before_records = set(self.completed_records())
+                    original_lock = (project / lock).read_bytes()
+                    member_a = project / "packages/a"
+                    first_request = self.request(member_a, paths, preparation=project)
+                    options = dict(manager=manager, runtime=runtime)
+                    self.assertIsNone(self.accepted(
+                        self.proof(project, state, first_request, mode="inspect", **options)))
+                    first = self.accepted(self.proof(
+                        project, state, first_request, extra_env={"RCH_PROOF_WORKSPACE": "1"}, **options))
+                    self.assertEqual(first["disposition"], "fresh")
+                    self.assertEqual(first["state"]["package_manager"], manager)
+                    self.assertEqual(first["state"]["project"], str(project))
+                    self.assertEqual(first["state"]["root_inode"], str(project.stat().st_ino))
+                    self.assertEqual((state / "install-cwd").read_text(), str(project) + "\n")
+                    inventory = {entry["path"] for entry in first["state"]["inventory"]["files"]}
+                    self.assertIn("node_modules/pkg/index.js", inventory)
+                    self.assertIn("packages/a/node_modules/member/index.js", inventory)
+
+                    member_b = project / "packages/b"
+                    second_request = self.request(member_b, paths, preparation=project,
+                                                  attempt="other-member-attempt")
+                    self.assertEqual(first_request["files"], second_request["files"])
+                    self.assertEqual(first_request["directories"], second_request["directories"])
+                    second = self.accepted(self.proof(project, state, second_request, **options))
+                    self.assertEqual(second["disposition"], "retained")
+                    self.assertEqual(second["state"], first["state"])
+                    self.assertNotEqual(second["request_digest"], first["request_digest"])
+                    self.assertEqual(self.events(state), ["install"])
+                    expected = [manager, "1", "ci"] if manager == "npm" else [
+                        manager, "2", "install", "--frozen-lockfile"]
+                    self.assertEqual(self.invocations(state), expected)
+                    self.assertEqual((project / lock).read_bytes(), original_lock)
+                    self.assertFalse((member_a / lock).exists())
+                    self.assertFalse((member_b / lock).exists())
+                    self.assertEqual(len(set(self.journals()) - before_journals), 1)
+                    self.assertEqual(len(set(self.completed_records()) - before_records), 1)
+                    self.assert_verified(self.verify(project, state, second, invocation=".",
+                                                     cwd=member_b, runtime=runtime))
+
+    def test_workspace_verify_binds_actual_member_cwd_and_latest_attempt(self):
+        project, state, paths = self.workspace("verify-member")
+        member_a, member_b = project / "packages/a", project / "packages/b"
+        request = self.request(member_a, paths, preparation=project)
+        first = self.accepted(self.proof(project, state, request))
+        self.refused(self.verify(project, state, first, cwd=member_a), "requires --invocation-project")
+        for wrong in (project, member_b):
+            with self.subTest(cwd=wrong):
+                self.refused(self.verify(project, state, first, invocation=".", cwd=wrong),
+                             "invocation directory")
+        self.assert_verified(self.verify(project, state, first, invocation=".", cwd=member_a))
+        next_request = self.request(member_b, paths, preparation=project, attempt="next-member")
+        second = self.accepted(self.proof(project, state, next_request))
+        self.assertEqual(second["disposition"], "retained")
+        self.refused(self.verify(project, state, first, invocation=".", cwd=member_a), "does not match")
+        self.assert_verified(self.verify(project, state, second, invocation=".", cwd=member_b))
+        self.assertEqual(self.events(state), ["install"])
+
+    def test_workspace_exclusions_and_unmatched_prefixes_refuse_forged_root(self):
+        for label, declaration in (("excluded", ["packages/*", "!packages/a"]),
+                                   ("unmatched", ["packages/b*"]),
+                                   ("negative-only", ["!packages/b"])):
+            with self.subTest(declaration=declaration):
+                project, state, paths = self.workspace(label, declaration=declaration)
+                before = set(self.journals())
+                request = self.request(project / "packages/a", paths, preparation=project)
+                self.refused(self.proof(project, state, request))
+                self.assertEqual(self.events(state), [])
+                journal, = set(self.journals()) - before
+                self.assertEqual(journal.read_bytes(), b"", "membership must be checked before RUNNING")
+        self.assertFalse(self.completed_records())
+
+    def test_workspace_install_requires_selected_root_lock_and_declarations(self):
+        for omitted in ("package-lock.json", "package.json", "pnpm-workspace.yaml"):
+            with self.subTest(omitted=omitted):
+                pnpm = omitted == "pnpm-workspace.yaml"
+                project, state, paths = self.workspace(
+                    "unselected-" + omitted,
+                    lock="pnpm-lock.yaml" if pnpm else "package-lock.json",
+                )
+                paths.remove(omitted)
+                request = self.request(project / "packages/a", paths, preparation=project)
+                self.refused(self.proof(project, state, request, manager="pnpm" if pnpm else "npm"))
+                self.assertEqual(self.events(state), [])
+        self.assertFalse(self.completed_records())
+        self.assertTrue(all(path.read_bytes() == b"" for path in self.journals()))
+
+    def test_nearer_locked_package_prevents_forged_outer_workspace_root(self):
+        for boundary in ("own", "independent", "excluded", "conflicting"):
+            with self.subTest(boundary=boundary):
+                project, state, paths = self.workspace("boundary-" + boundary,
+                                                       declaration=["packages/**"])
+                before = set(self.journals())
+                if boundary in ("own", "conflicting"):
+                    member = project / "packages/a"
+                    (member / "bun.lock").write_text("member-owned frozen resolution\n")
+                    paths.append("packages/a/bun.lock")
+                    if boundary == "conflicting":
+                        (member / "package-lock.json").write_text("another manager\n")
+                        paths.append("packages/a/package-lock.json")
+                else:
+                    group = project / "packages/group"
+                    member = group / "app"
+                    member.mkdir(parents=True)
+                    declaration = {"name": "independent-root"}
+                    if boundary == "excluded":
+                        declaration["workspaces"] = ["other/*"]
+                    (group / "package.json").write_text(json.dumps(declaration))
+                    (group / "package-lock.json").write_text("nearest frozen resolution\n")
+                    (member / "package.json").write_text('{"name":"app"}')
+                    paths.extend(["packages/group/package.json", "packages/group/package-lock.json",
+                                  "packages/group/app/package.json"])
+                request = self.request(member, paths, preparation=project)
+                self.refused(self.proof(project, state, request))
+                self.assertEqual(self.events(state), [])
+                journal, = set(self.journals()) - before
+                self.assertEqual(journal.read_bytes(), b"")
+        self.assertFalse(self.completed_records())
+
+    def test_pnpm_workspace_ascent_requires_explicit_positive_yaml_membership(self):
+        for label, yaml in (("omitted", "linkWorkspacePackages: true\n"),
+                            ("null", "packages: null\n"),
+                            ("empty", "packages: []\n"),
+                            ("excluded", "packages:\n  - 'packages/*'\n  - '!packages/a'\n")):
+            with self.subTest(declaration=label):
+                project, state, paths = self.workspace("pnpm-" + label, lock="pnpm-lock.yaml")
+                (project / "pnpm-workspace.yaml").write_text(yaml)
+                before = set(self.journals())
+                # The JSON manifest still lists packages/*; pnpm's own YAML
+                # declarations must decide whether the root owns this member.
+                request = self.request(project / "packages/a", paths, preparation=project)
+                self.refused(self.proof(project, state, request, manager="pnpm"))
+                self.assertEqual(self.events(state), [])
+                journal, = set(self.journals()) - before
+                self.assertEqual(journal.read_bytes(), b"")
+        self.assertFalse(self.completed_records())
+
+    def test_workspace_selected_source_change_refreshes_root_lifecycle_outputs(self):
+        project, state, paths = self.workspace("member-source-change")
+        (self.bin / "npm").write_text(fixture.NPM + r'''
+IFS= read -r selected < packages/a/index.js
+printf '%s\n' "$selected" > node_modules/member-source
+''')
+        member = project / "packages/a"
+        request = self.request(member, paths, preparation=project)
+        first = self.accepted(self.proof(project, state, request))
+        lock = (project / "package-lock.json").read_bytes()
+        (member / "index.js").write_text("new selected member input\n")
+        self.refused(self.verify(project, state, first, invocation=".", cwd=member), "selected source changed")
+        current = self.request(member, paths, preparation=project, attempt="changed-member-source")
+        current["source_content_root"] = "c" * 64
+        second = self.accepted(self.proof(project, state, current))
+        self.assertEqual(second["disposition"], "fresh")
+        self.assertEqual(second["state"]["input_fingerprint"], first["state"]["input_fingerprint"])
+        self.assertNotEqual(second["state"]["inventory_digest"], first["state"]["inventory_digest"])
+        self.assertEqual((project / "node_modules/member-source").read_text(), "new selected member input\n")
+        self.assertEqual((project / "package-lock.json").read_bytes(), lock)
+        self.assertEqual(self.events(state), ["install", "install"])
+
+    def test_workspace_declaration_change_during_install_fences_every_member(self):
+        project, state, paths = self.workspace("declaration-during-install")
+        first_request = self.request(project / "packages/a", paths, preparation=project)
+        child = self.proof(project, state, first_request, install_mode="blocked")
+        fixture.eventually(lambda: (state / "started").exists(), "root installer did not start")
+        (project / "package.json").write_text('{"workspaces":["packages/b"]}')
+        (state / "release").write_text("release\n")
+        self.refused(child)
+        second_request = self.request(project / "packages/b", paths, preparation=project,
+                                      attempt="other-member-after-mutation")
+        self.refused(self.proof(project, state, second_request), "interrupted or invalid transaction")
+        self.assertEqual(self.events(state), ["install"])
+        self.assertFalse(self.completed_records())
+        journal, = self.journals()
+        self.assertEqual(journal.read_bytes(), fixture.RUNNING)
+
+    @unittest.skipUnless(os.environ.get("RCH_TEST_REAL_NPM") == "1",
+                         "opt-in offline proof test requires actual npm and node")
+    def test_real_npm_root_proof_serves_hoisted_member_dependencies_and_reuses_them(self):
+        npm, node = shutil.which("npm"), shutil.which("node")
+        self.assertIsNotNone(npm, "RCH_TEST_REAL_NPM=1 requires npm")
+        self.assertIsNotNone(node, "RCH_TEST_REAL_NPM=1 requires node")
+        project, state = self.project("real-npm-proof", lock=None)
+        consumer, provider = project / "packages/consumer", project / "packages/provider"
+        consumer.mkdir(parents=True)
+        provider.mkdir()
+        (project / "package.json").write_text(json.dumps({
+            "name": "rch-offline-root", "private": True, "workspaces": ["packages/*"],
+        }))
+        (consumer / "package.json").write_text(json.dumps({
+            "name": "rch-offline-consumer", "version": "1.0.0",
+            "dependencies": {"rch-offline-provider": "1.0.0"},
+        }))
+        (provider / "package.json").write_text(json.dumps({
+            "name": "rch-offline-provider", "version": "1.0.0", "main": "index.js",
+        }))
+        (provider / "index.js").write_text("module.exports = 73;\n")
+        for name in ("npmrc", "npm-globalrc"):
+            (self.root / name).write_text("")
+        manager_bin = self.root / "real-manager-bin"
+        manager_bin.mkdir()
+        manager = manager_bin / "npm"
+        # This launcher only records argv and execs the actual installed npm.
+        # No installation, lockfile, workspace link, or package layout is faked.
+        manager.write_text("#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> "
+                           + shlex.quote(str(state / "real-npm-argv"))
+                           + "\nexec " + shlex.quote(npm) + ' "$@"\n')
+        manager.chmod(0o700)
+        environment = {
+            "PATH": os.pathsep.join([str(manager_bin), str(Path(node).parent),
+                                     str(Path(npm).parent), "/usr/bin", "/bin"]),
+            "npm_config_offline": "true", "npm_config_audit": "false", "npm_config_fund": "false",
+            "npm_config_update_notifier": "false", "npm_config_cache": str(self.root / "npm-cache"),
+            "npm_config_userconfig": str(self.root / "npmrc"),
+            "npm_config_globalconfig": str(self.root / "npm-globalrc"),
+        }
+        actual_environment = self.proof_environment(state, extra_env=environment)
+        result = subprocess.run([npm, "install", "--package-lock-only"], cwd=project,
+                                env=actual_environment, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=25, check=False)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertFalse((project / "node_modules").exists())
+        lock = (project / "package-lock.json").read_bytes()
+        paths = ["package.json", "package-lock.json", "packages/consumer/package.json",
+                 "packages/provider/package.json", "packages/provider/index.js"]
+        request = self.request(consumer, paths, preparation=project)
+        first = self.accepted(self.proof(project, state, request, extra_env=environment))
+        self.assertEqual(first["disposition"], "fresh")
+        self.assertEqual(first["state"]["project"], str(project))
+        links = {entry["path"]: entry["symlink_target"]
+                 for entry in first["state"]["inventory"]["files"] if entry["kind"] == "symlink"}
+        self.assertEqual(links["node_modules/rch-offline-provider"], "../packages/provider")
+        self.assertFalse((consumer / "node_modules").exists())
+        self.assert_verified(self.verify(project, state, first, invocation=".", cwd=consumer,
+                                         extra_env=environment))
+        result = subprocess.run(
+            [node, "-e", "if(require('rch-offline-provider')!==73)process.exit(1)"],
+            cwd=consumer, env=actual_environment, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=25, check=False,
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+
+        other = self.request(provider, paths, preparation=project, attempt="real-provider-member")
+        second = self.accepted(self.proof(project, state, other, extra_env=environment))
+        self.assertEqual(second["disposition"], "retained")
+        self.assertEqual(second["state"], first["state"])
+        self.assert_verified(self.verify(project, state, second, invocation=".", cwd=provider,
+                                         extra_env=environment))
+        self.assertEqual((state / "real-npm-argv").read_text(), "ci\n")
+        self.assertEqual((project / "package-lock.json").read_bytes(), lock)
+        self.assertEqual(len(self.journals()), 1)
+        self.assertEqual(len(self.completed_records()), 1)
 
     def test_input_change_requires_a_new_frozen_install_but_inspect_preserves_ownership(self):
         project, state = self.project("new-input")

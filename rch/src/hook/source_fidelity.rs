@@ -41,6 +41,8 @@ const MAX_REMOTE_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_CONTENT_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 
+type WorkspaceDeclarations = std::collections::BTreeMap<String, Vec<u8>>;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct SourceContentFilterPolicy {
     schema: &'static str,
@@ -144,6 +146,10 @@ pub(super) struct PreparedSourceContentRoot {
     // Names only, never source bytes or authority. Keep this private bounded
     // skeleton alive through both namespace barriers and source retirement.
     clean_overlay_namespace: Option<Arc<tempfile::TempDir>>,
+    // Only ancestor workspace declarations, captured from the same archive or
+    // selected overlay bytes as the manifest. Never read ambient checkout
+    // manifests when deciding which directory owns dependency installation.
+    workspace_declarations: Arc<WorkspaceDeclarations>,
     // Preparation is a distinct, attempt-bound input obligation. It never
     // changes which Git/overlay entries the selected source manifest proves.
     prepared_dependencies: Option<prepared_dependencies::PreparedDependencyProof>,
@@ -526,6 +532,7 @@ pub(super) async fn prepare_source_content_root(
         directories,
         clean_overlay: None,
         clean_overlay_namespace: None,
+        workspace_declarations: Arc::new(WorkspaceDeclarations::new()),
         prepared_dependencies: None,
         coalesced: Vec::new(),
     })
@@ -616,13 +623,26 @@ fn hash_clean_overlay_selection(
     local_root: &Path,
     overlay_files: &[PathBuf],
     overlay_directories: &[PathBuf],
-) -> anyhow::Result<(Vec<SourceContentFile>, Vec<PathBuf>, u64)> {
+    declaration_paths: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<(
+    Vec<SourceContentFile>,
+    Vec<PathBuf>,
+    u64,
+    WorkspaceDeclarations,
+)> {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read as _;
 
     let mut archive = tar::Archive::new(archive_file.reopen()?);
     let mut files = BTreeMap::new();
     let mut directories = BTreeSet::new();
+    let mut declarations = WorkspaceDeclarations::new();
+    let mut declaration_bytes = 0_usize;
+    let overridden_declarations = overlay_files
+        .iter()
+        .filter_map(|path| path.to_str())
+        .filter(|path| declaration_paths.contains(*path))
+        .collect::<BTreeSet<_>>();
     let mut archive_bytes = 0_u64;
     // Overlay hashing also uses a large read buffer; keep this one off the
     // blocking worker's stack while the two hashing frames overlap.
@@ -662,6 +682,23 @@ fn hash_clean_overlay_selection(
                 expected <= MAX_SOURCE_CONTENT_BYTES.saturating_sub(archive_bytes),
                 "source-content byte cap exceeded"
             );
+            let mut declaration = if declaration_paths.contains(path)
+                && !overridden_declarations.contains(path)
+            {
+                anyhow::ensure!(
+                    expected <= rch_common::node_workspace::MAX_DECLARATION_DOCUMENT_BYTES as u64,
+                    "selected workspace declaration exceeds byte limit: {path}"
+                );
+                declaration_bytes = declaration_bytes
+                    .checked_add(expected as usize)
+                    .filter(|total| {
+                        *total <= rch_common::node_workspace::MAX_DECLARATION_TOTAL_BYTES
+                    })
+                    .context("selected workspace declarations exceed total byte limit")?;
+                Some(Vec::with_capacity(expected as usize))
+            } else {
+                None
+            };
             let mut hasher = Sha256::new();
             let mut bytes = 0_u64;
             loop {
@@ -677,8 +714,14 @@ fn hash_clean_overlay_selection(
                     "Git archive entry exceeded its declared size"
                 );
                 hasher.update(&buffer[..read]);
+                if let Some(declaration) = declaration.as_mut() {
+                    declaration.extend_from_slice(&buffer[..read]);
+                }
             }
             anyhow::ensure!(bytes == expected, "Git archive entry was truncated: {path}");
+            if let Some(declaration) = declaration {
+                declarations.insert(path.to_owned(), declaration);
+            }
             SourceContentFile {
                 path: path.to_owned(),
                 kind: SourceContentEntryKind::Regular,
@@ -732,6 +775,28 @@ fn hash_clean_overlay_selection(
                 "overlay changes selected base entry type: {text}"
             );
         }
+        if declaration_paths.contains(text) {
+            anyhow::ensure!(
+                file.byte_count
+                    <= rch_common::node_workspace::MAX_DECLARATION_DOCUMENT_BYTES as u64,
+                "selected workspace declaration exceeds byte limit: {text}"
+            );
+            let previous_bytes = declarations.get(text).map_or(0, Vec::len);
+            declaration_bytes = declaration_bytes
+                .checked_sub(previous_bytes)
+                .and_then(|total| total.checked_add(file.byte_count as usize))
+                .filter(|total| *total <= rch_common::node_workspace::MAX_DECLARATION_TOTAL_BYTES)
+                .context("selected workspace declarations exceed total byte limit")?;
+            let mut bytes = Vec::with_capacity(file.byte_count as usize);
+            File::open(local_root.join(path))?
+                .take(file.byte_count + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 == file.byte_count && sha256_hex(&bytes) == file.sha256,
+                "selected workspace declaration changed during capture: {text}"
+            );
+            declarations.insert(text.to_owned(), bytes);
+        }
         files.insert(text.to_owned(), file);
         anyhow::ensure!(
             files.len() <= MAX_SOURCE_CONTENT_FILES,
@@ -768,6 +833,7 @@ fn hash_clean_overlay_selection(
         files.into_values().collect(),
         directories.into_iter().collect(),
         byte_count,
+        declarations,
     ))
 }
 
@@ -776,7 +842,11 @@ async fn capture_clean_overlay_manifest(
     entry: &SyncClosurePlanEntry,
     pipeline: &TransferPipeline,
     spec: &CleanOverlaySpec,
-) -> anyhow::Result<(SourceContentRootManifest, Vec<PathBuf>)> {
+) -> anyhow::Result<(
+    SourceContentRootManifest,
+    Vec<PathBuf>,
+    WorkspaceDeclarations,
+)> {
     let local_root = canonical_root_path(&entry.local_root)?;
     anyhow::ensure!(
         Path::new(&local_root) == spec.repository_root,
@@ -830,8 +900,24 @@ async fn capture_clean_overlay_manifest(
     )
     .await?;
     let hash_root = PathBuf::from(&local_root);
-    let (files, directories, byte_count) = tokio::task::spawn_blocking(move || {
-        hash_clean_overlay_selection(archive, &hash_root, &paths, &overlay_directories)
+    let declaration_paths = if entry.is_primary && pipeline.dependency_runtime().is_some() {
+        rch_common::node_workspace::declaration_paths(
+            spec.invocation_directory
+                .to_str()
+                .context("workspace invocation directory is not UTF-8")?,
+        )
+        .map_err(anyhow::Error::msg)?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let (files, directories, byte_count, declarations) = tokio::task::spawn_blocking(move || {
+        hash_clean_overlay_selection(
+            archive,
+            &hash_root,
+            &paths,
+            &overlay_directories,
+            &declaration_paths,
+        )
     })
     .await
     .context("join clean-overlay source-content hashing")??;
@@ -868,7 +954,7 @@ async fn capture_clean_overlay_manifest(
         }),
     };
     let manifest = assemble_manifest(ordinal, entry, local_root, filter_policy, files, byte_count)?;
-    Ok((manifest, directories))
+    Ok((manifest, directories, declarations))
 }
 
 pub(super) async fn prepare_clean_overlay_source_content_root(
@@ -877,7 +963,7 @@ pub(super) async fn prepare_clean_overlay_source_content_root(
     pipeline: &TransferPipeline,
     spec: &CleanOverlaySpec,
 ) -> anyhow::Result<PreparedSourceContentRoot> {
-    let (manifest, directories) =
+    let (manifest, directories, workspace_declarations) =
         capture_clean_overlay_manifest(ordinal, entry, pipeline, spec).await?;
     anyhow::ensure!(
         manifest.files.len() <= MAX_SOURCE_CONTENT_FILES
@@ -901,6 +987,7 @@ pub(super) async fn prepare_clean_overlay_source_content_root(
         directories,
         clean_overlay: Some(spec.clone()),
         clean_overlay_namespace: Some(Arc::new(namespace)),
+        workspace_declarations: Arc::new(workspace_declarations),
         prepared_dependencies: None,
         coalesced: Vec::new(),
     };
@@ -1177,15 +1264,21 @@ async fn verify_local_source_content_manifest(
         is_primary: root.manifest.is_primary,
         mode: root.manifest.mode,
     };
-    let (recaptured, directories) = match &root.clean_overlay {
+    let (recaptured, directories, declarations) = match &root.clean_overlay {
         Some(spec) => {
             capture_clean_overlay_manifest(root.manifest.ordinal, &entry, &root.pipeline, spec)
                 .await?
         }
-        None => capture_manifest(root.manifest.ordinal, &entry, &root.pipeline).await?,
+        None => {
+            let (manifest, directories) =
+                capture_manifest(root.manifest.ordinal, &entry, &root.pipeline).await?;
+            (manifest, directories, WorkspaceDeclarations::new())
+        }
     };
     anyhow::ensure!(
-        recaptured == root.manifest && directories == root.directories,
+        recaptured == root.manifest
+            && directories == root.directories
+            && &declarations == root.workspace_declarations.as_ref(),
         "local source-content changed during transfer proof for {}",
         root.manifest.project_id
     );
@@ -4373,6 +4466,7 @@ sys.exit(99)
             .unwrap();
             let remote = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
             let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+            let pipeline = pipeline.with_compilation_kind(Some(CompilationKind::BunTest));
             let root = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
                 .await
                 .unwrap();
@@ -4464,6 +4558,100 @@ sys.exit(99)
                 state: fixture.state.clone(),
                 disposition: PreparedDependencyDisposition::Fresh,
             }
+        }
+
+        async fn workspace_selection(
+            base_manifest: &str,
+            working_manifest: &str,
+            select_overlay: bool,
+        ) -> (PreparedSourceContentRoot, PreparedDependencyRequest) {
+            let (local, _) = build_source_stamp_fixture_repo();
+            std::fs::create_dir_all(local.join("packages/app")).unwrap();
+            std::fs::write(local.join("package.json"), base_manifest).unwrap();
+            std::fs::write(local.join("bun.lock"), "selected frozen lock\n").unwrap();
+            std::fs::write(
+                local.join("packages/app/package.json"),
+                r#"{"name":"workspace-app"}"#,
+            )
+            .unwrap();
+            build_source_stamp_git(&local, &["add", "-f", "."]);
+            build_source_stamp_git_commit(&local, "workspace authority selection");
+            std::fs::write(local.join("package.json"), working_manifest).unwrap();
+            let spec = prepare_clean_overlay_spec(
+                &local.join("packages/app"),
+                Some("HEAD".to_owned()),
+                true,
+                if select_overlay {
+                    vec![PathBuf::from("package.json")]
+                } else {
+                    Vec::new()
+                },
+                !select_overlay,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let remote = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+            let pipeline = pipeline.with_compilation_kind(Some(CompilationKind::BunTest));
+            let root = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+                .await
+                .unwrap();
+            let expected = if select_overlay {
+                working_manifest
+            } else {
+                base_manifest
+            };
+            assert_eq!(
+                root.workspace_declarations["package.json"],
+                expected.as_bytes()
+            );
+            let request = prepare_dependency_request(
+                std::slice::from_ref(&root),
+                remote.join("packages/app").to_str().unwrap(),
+                Some(CompilationKind::BunTest),
+                BUILD_ID,
+                "workspace-node-attempt",
+                &"a".repeat(64),
+                COMMAND,
+            )
+            .unwrap()
+            .unwrap();
+            verify_local_source_content_manifest(&root).await.unwrap();
+            (root, request)
+        }
+
+        #[tokio::test]
+        async fn workspace_preparation_uses_selected_archive_not_ambient_manifest() {
+            let declared = r#"{"workspaces":["packages/*"]}"#;
+            let excluded = r#"{"workspaces":["other/*"]}"#;
+            let (_, request) = workspace_selection(declared, excluded, false).await;
+            assert_eq!(request.project_relative, "packages/app");
+            assert_eq!(request.preparation_relative.as_deref(), Some(""));
+            assert_eq!(request.preparation_path(), request.source_root);
+
+            let (_, request) = workspace_selection(excluded, declared, false).await;
+            assert_eq!(request.project_relative, "packages/app");
+            assert!(request.preparation_relative.is_none());
+            assert!(request.preparation_path().ends_with("/packages/app"));
+        }
+
+        #[tokio::test]
+        async fn workspace_preparation_tracks_explicit_selected_manifest_overlays() {
+            let declared = r#"{"workspaces":["packages/*"]}"#;
+            let excluded = r#"{"workspaces":["other/*"]}"#;
+            let (root, request) = workspace_selection(excluded, declared, true).await;
+            assert_eq!(request.preparation_relative.as_deref(), Some(""));
+            let manifest = root
+                .manifest
+                .files
+                .iter()
+                .find(|file| file.path == "package.json")
+                .unwrap();
+            assert_eq!(manifest.sha256, sha256_hex(declared.as_bytes()));
+
+            let (_, request) = workspace_selection(declared, excluded, true).await;
+            assert!(request.preparation_relative.is_none());
         }
 
         async fn worker_names(fixture: &Fixture) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -4910,7 +5098,7 @@ sys.exit(99)
         let archive = TransferPipeline::create_selected_git_archive(&root, &head, &[], &deletions)
             .await
             .unwrap();
-        let (files, directories, byte_count) = hash_clean_overlay_selection(
+        let (files, directories, byte_count, declarations) = hash_clean_overlay_selection(
             archive,
             &root,
             &[
@@ -4922,8 +5110,10 @@ sys.exit(99)
                 PathBuf::from("src/new"),
                 PathBuf::from("src/only"),
             ],
+            &std::collections::BTreeSet::new(),
         )
         .unwrap();
+        assert!(declarations.is_empty());
         let indexed: std::collections::BTreeMap<_, _> = files
             .iter()
             .map(|file| (file.path.as_str(), file))

@@ -6379,8 +6379,18 @@ mkdir -p {} && rm -f {} && {launch}",
             .prepared_dependencies
             .as_ref()
             .map(|proof| {
+                let workspace = proof
+                    .workspace_root
+                    .as_ref()
+                    .map(|root| {
+                        format!(
+                            " --preparation-root {}",
+                            escape(Cow::Borrowed(root.as_str()))
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    " --source-proof {} {}",
+                    " --source-proof {} {}{workspace}",
                     proof.request_digest, proof.attestation_digest
                 )
             })

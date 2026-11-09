@@ -75,7 +75,29 @@ fn validate_root_request(
             && request.directories == selected.directories,
         "prepared dependency request does not bind the exact selected execution root"
     );
+    anyhow::ensure!(
+        request.preparation_relative() == selected_preparation_root(root, request)?,
+        "prepared dependency root differs from the selected workspace declaration"
+    );
     Ok(())
+}
+
+fn selected_preparation_root(
+    root: &PreparedSourceContentRoot,
+    request: &PreparedDependencyRequest,
+) -> anyhow::Result<String> {
+    let regular = request
+        .files
+        .iter()
+        .filter(|file| file.kind == PreparedDependencyFileKind::Regular)
+        .map(|file| file.path.clone())
+        .collect();
+    rch_common::node_workspace::resolve_preparation_root(
+        &request.project_relative,
+        &regular,
+        &root.workspace_declarations,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// Only classified Node/Bun clean-overlay executions acquire this obligation.
@@ -146,7 +168,7 @@ pub(in crate::hook) fn prepare_dependency_request(
     {
         return Ok(None);
     }
-    let request = PreparedDependencyRequest {
+    let mut request = PreparedDependencyRequest {
         schema_version: PREPARED_DEPENDENCY_VERSION,
         attempt_id: attempt_id.to_owned(),
         source_owner: source_identity.to_owned(),
@@ -155,9 +177,14 @@ pub(in crate::hook) fn prepare_dependency_request(
         source_content_root: root.manifest.content_root.clone(),
         source_root: root.manifest.remote_root.clone(),
         project_relative,
+        preparation_relative: None,
         files: selected.files,
         directories: selected.directories,
     };
+    let preparation = selected_preparation_root(root, &request)?;
+    if preparation != request.project_relative {
+        request.preparation_relative = Some(preparation);
+    }
     validate_root_request(root, &request)?;
     Ok(Some(request))
 }

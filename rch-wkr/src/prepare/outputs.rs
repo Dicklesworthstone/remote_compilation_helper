@@ -50,6 +50,7 @@ pub async fn proof_verify(
     runtime: RequiredRuntime,
     expected_request_digest: &str,
     expected_attestation_digest: &str,
+    invocation_project: Option<&Path>,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -58,6 +59,7 @@ pub async fn proof_verify(
             runtime,
             expected_request_digest,
             expected_attestation_digest,
+            invocation_project,
         )
         .await
     }
@@ -68,6 +70,7 @@ pub async fn proof_verify(
             runtime,
             expected_request_digest,
             expected_attestation_digest,
+            invocation_project,
         );
         anyhow::bail!("qualified dependency preparation requires Linux descendant completion")
     }
@@ -81,6 +84,10 @@ mod linux {
         install as installer, preflight_cache_files, verified_fingerprint,
     };
     use anyhow::{Context, bail, ensure};
+    use rch_common::node_workspace::{
+        MAX_DECLARATION_DOCUMENT_BYTES, MAX_DECLARATION_TOTAL_BYTES, declaration_paths,
+        resolve_preparation_root,
+    };
     use rch_common::prepared_dependencies::{
         MAX_PREPARED_DEPENDENCY_BYTES, MAX_PREPARED_DEPENDENCY_DIRECTORIES,
         MAX_PREPARED_DEPENDENCY_FILES, MAX_PREPARED_DEPENDENCY_JSON_BYTES,
@@ -287,8 +294,32 @@ mod linux {
         }
 
         fn file(&mut self, path: &str) -> Result<PreparedDependencyFile> {
+            self.file_with_contents(path, None).map(|(file, _)| file)
+        }
+
+        /// Retain declaration bytes during the same bounded descriptor read
+        /// that verifies selected source, rather than reopening a named path
+        /// later to decide whether an ancestor may own the installation.
+        fn file_with_contents(
+            &mut self,
+            path: &str,
+            content_limit: Option<usize>,
+        ) -> Result<(PreparedDependencyFile, Option<Vec<u8>>)> {
             let (parent, name) = self.parent(path)?;
             let before = Identity::at(&parent, &name)?;
+            let mut contents = if let Some(limit) = content_limit {
+                ensure!(
+                    before.kind() == FileType::RegularFile,
+                    "workspace declaration is not a regular file: {path}"
+                );
+                ensure!(
+                    before.bytes <= limit as u64,
+                    "workspace declaration byte limit exceeded: {path}"
+                );
+                Some(Vec::with_capacity(before.bytes as usize))
+            } else {
+                None
+            };
             self.bytes_left = self
                 .bytes_left
                 .checked_sub(before.bytes)
@@ -313,6 +344,9 @@ mod linux {
                         let count = file.read(&mut buffer[..limit])?;
                         ensure!(count != 0, "dependency file shortened during read: {path}");
                         digest.update(&buffer[..count]);
+                        if let Some(contents) = &mut contents {
+                            contents.extend_from_slice(&buffer[..count]);
+                        }
                         remaining -= count as u64;
                     }
                     ensure!(
@@ -362,28 +396,46 @@ mod linux {
                 sha256.push(char::from(HEX[usize::from(byte >> 4)]));
                 sha256.push(char::from(HEX[usize::from(byte & 0x0f)]));
             }
-            Ok(PreparedDependencyFile {
-                path: path.to_owned(),
-                kind,
-                sha256,
-                byte_count: before.bytes,
-                executable,
-                symlink_target: target,
-            })
+            Ok((
+                PreparedDependencyFile {
+                    path: path.to_owned(),
+                    kind,
+                    sha256,
+                    byte_count: before.bytes,
+                    executable,
+                    symlink_target: target,
+                },
+                contents,
+            ))
         }
 
-        fn selected(&mut self, request: &PreparedDependencyRequest) -> Result<()> {
+        fn selected(
+            &mut self,
+            request: &PreparedDependencyRequest,
+        ) -> Result<BTreeMap<String, Vec<u8>>> {
+            let needed =
+                declaration_paths(&request.project_relative).map_err(anyhow::Error::msg)?;
+            let mut declarations = BTreeMap::new();
+            let mut remaining = MAX_DECLARATION_TOTAL_BYTES;
             for directory in &request.directories {
                 self.directory(directory)?;
             }
             for expected in &request.files {
+                let capture = (expected.kind == PreparedDependencyFileKind::Regular
+                    && needed.contains(&expected.path))
+                .then_some(remaining.min(MAX_DECLARATION_DOCUMENT_BYTES));
+                let (observed, contents) = self.file_with_contents(&expected.path, capture)?;
                 ensure!(
-                    self.file(&expected.path)? == *expected,
+                    observed == *expected,
                     "selected source changed before prepared execution: {}",
                     expected.path
                 );
+                if let Some(contents) = contents {
+                    remaining -= contents.len();
+                    declarations.insert(expected.path.clone(), contents);
+                }
             }
-            Ok(())
+            Ok(declarations)
         }
 
         fn walk(
@@ -462,14 +514,28 @@ mod linux {
         project: &Path,
         request: &PreparedDependencyRequest,
         inputs: &DependencyInputs,
+        invocation_project: Option<&Path>,
     ) -> Result<Snapshot> {
         let mut view = View::new(request)?;
-        let held_project = view.directory(&request.project_relative)?;
+        let preparation = request.preparation_relative();
+        let held_project = view.directory(preparation)?;
         let project_identity = Identity::held(&held_project)?;
         ensure!(
-            project.canonicalize()? == view.canonical_source.join(&request.project_relative),
+            project.canonicalize()? == view.canonical_source.join(preparation),
             "prepared request names a different project"
         );
+        view.directory(&request.project_relative)?;
+        let expected_invocation = view.canonical_source.join(&request.project_relative);
+        let verify_invocation = || -> Result<()> {
+            if let Some(invocation) = invocation_project {
+                ensure!(
+                    invocation.canonicalize()? == expected_invocation,
+                    "prepared execution invocation directory does not match its accepted request"
+                );
+            }
+            Ok(())
+        };
+        verify_invocation()?;
         let selected_files: BTreeMap<_, _> = request
             .files
             .iter()
@@ -478,10 +544,10 @@ mod linux {
         let selected_directories = request.directories.iter().map(String::as_str).collect();
         let mut roots = BTreeSet::new();
         for name in &inputs.fingerprint.sources {
-            let relative = if request.project_relative.is_empty() {
+            let relative = if preparation.is_empty() {
                 name.clone()
             } else {
-                format!("{}/{name}", request.project_relative)
+                format!("{preparation}/{name}")
             };
             ensure!(
                 selected_files
@@ -503,7 +569,19 @@ mod linux {
             roots.is_subset(&allowed),
             "dependency output roots exceed selected workspace namespace"
         );
-        view.selected(request)?;
+        let declarations = view.selected(request)?;
+        let regular_paths = request
+            .files
+            .iter()
+            .filter(|file| file.kind == PreparedDependencyFileKind::Regular)
+            .map(|file| file.path.clone())
+            .collect();
+        ensure!(
+            resolve_preparation_root(&request.project_relative, &regular_paths, &declarations)
+                .map_err(anyhow::Error::msg)?
+                == preparation,
+            "requested preparation root is not the declared workspace root for this invocation"
+        );
         let mut inventory = PreparedDependencyInventory {
             files: Vec::new(),
             directories: Vec::new(),
@@ -534,6 +612,7 @@ mod linux {
         inventory.validate_for(request)?;
         let source = view.root_identity.clone();
         view.finish()?;
+        verify_invocation()?;
         Ok(Snapshot {
             inventory,
             source,
@@ -796,7 +875,7 @@ mod linux {
         let mut store = Store::open(&transaction)?;
         let completed = store.read()?;
         let inputs = DependencyInputs::capture(&transaction.project)?;
-        let snapshot = scan(&transaction.project, request, &inputs)?;
+        let snapshot = scan(&transaction.project, request, &inputs, None)?;
         let state = completed.map(|completed| completed.attestation.state);
         verify_baseline(request, &snapshot, state.as_ref())?;
         transaction.verify_path()?;
@@ -820,7 +899,7 @@ mod linux {
             plan.is_frozen(),
             "source-qualified dependency preparation requires a selected frozen lockfile"
         );
-        let before = scan(&transaction.project, request, &inputs)?;
+        let before = scan(&transaction.project, request, &inputs, None)?;
         let prior_state = previous
             .as_ref()
             .map(|completed| &completed.attestation.state);
@@ -866,7 +945,7 @@ mod linux {
         );
         preflight_cache_files(&transaction.project)?;
         verified_fingerprint(&transaction.project, &report)?;
-        let after = scan(&transaction.project, request, &after_inputs)?;
+        let after = scan(&transaction.project, request, &after_inputs, None)?;
         ensure!(
             before.source.same_inode(&after.source) && before.project.same_inode(&after.project),
             "prepared source/project root was replaced during installation"
@@ -876,15 +955,7 @@ mod linux {
         }
         let state = PreparedDependencyState {
             version: PREPARED_DEPENDENCY_VERSION,
-            project: if request.project_relative.is_empty() {
-                request.source_root.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    request.source_root.trim_end_matches('/'),
-                    request.project_relative
-                )
-            },
+            project: request.preparation_path(),
             root_device: after.project.device,
             root_inode: after.project.inode,
             input_fingerprint: after_inputs.fingerprint.hash,
@@ -918,6 +989,7 @@ mod linux {
         runtime: RequiredRuntime,
         expected_request_digest: &str,
         expected_attestation_digest: &str,
+        invocation_project: Option<&Path>,
     ) -> Result<()> {
         check_runtime(runtime)?;
         let transaction = PrepareTransaction::acquire(project).await?;
@@ -931,6 +1003,11 @@ mod linux {
                 && completed.attestation.digest()? == expected_attestation_digest,
             "prepared execution attempt does not match its accepted attestation"
         );
+        ensure!(
+            invocation_project.is_some()
+                || completed.request.preparation_relative() == completed.request.project_relative,
+            "workspace prepared verification requires --invocation-project"
+        );
         let inputs = DependencyInputs::capture(&transaction.project)?;
         let plan = InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
         ensure!(
@@ -939,7 +1016,12 @@ mod linux {
                 && inputs.fingerprint.hash == completed.attestation.state.input_fingerprint,
             "prepared execution inputs changed after acceptance"
         );
-        let snapshot = scan(&transaction.project, &completed.request, &inputs)?;
+        let snapshot = scan(
+            &transaction.project,
+            &completed.request,
+            &inputs,
+            invocation_project,
+        )?;
         verify_baseline(
             &completed.request,
             &snapshot,

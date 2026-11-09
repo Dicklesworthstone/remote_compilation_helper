@@ -140,6 +140,8 @@ struct PreparedDependencyRequirement {
     command_sha256: String,
     source_root: String,
     project_relative: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_relative: Option<String>,
     attestation_digest: Option<String>,
 }
 
@@ -2409,6 +2411,7 @@ impl RecoverySession {
             command_sha256: request.command_sha256.clone(),
             source_root: request.source_root.clone(),
             project_relative: request.project_relative.clone(),
+            preparation_relative: request.preparation_relative.clone(),
             attestation_digest: None,
         });
         self.persist_next_recipe(next_recipe)
@@ -11690,6 +11693,7 @@ mod tests {
             source_content_root: "b".repeat(64),
             source_root: session.recipe.source_roots[0].clone(),
             project_relative: String::new(),
+            preparation_relative: None,
             files: vec![PreparedDependencyFile {
                 path: "package.json".into(),
                 kind: PreparedDependencyFileKind::Regular,

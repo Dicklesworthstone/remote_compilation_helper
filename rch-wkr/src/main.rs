@@ -171,8 +171,13 @@ enum Commands {
         #[arg(long, value_enum)]
         mode: PrepareProofMode,
 
+        /// Dependency installation root on the worker.
         #[arg(long)]
         project: String,
+
+        /// Actual command cwd; required to verify a workspace member's proof.
+        #[arg(long)]
+        invocation_project: Option<String>,
 
         #[arg(long, value_enum)]
         runtime: PrepareRuntime,
@@ -435,6 +440,7 @@ async fn run_worker(cli: Cli) -> Result<()> {
         Commands::PrepareProof {
             mode,
             project,
+            invocation_project,
             runtime,
             expected_request_digest,
             expected_attestation_digest,
@@ -450,14 +456,22 @@ async fn run_worker(cli: Cli) -> Result<()> {
                     .context("prepared verification requires --expected-request-digest")?;
                 let attestation_digest = expected_attestation_digest
                     .context("prepared verification requires --expected-attestation-digest")?;
-                prepare::proof_verify(project, runtime, &request_digest, &attestation_digest)
-                    .await?;
+                prepare::proof_verify(
+                    project,
+                    runtime,
+                    &request_digest,
+                    &attestation_digest,
+                    invocation_project.as_deref().map(std::path::Path::new),
+                )
+                .await?;
                 println!("RCH_PREPARED_DEPENDENCIES_VERIFIED");
                 return Ok(());
             }
             anyhow::ensure!(
-                expected_request_digest.is_none() && expected_attestation_digest.is_none(),
-                "expected preparation digests are valid only in verify mode"
+                expected_request_digest.is_none()
+                    && expected_attestation_digest.is_none()
+                    && invocation_project.is_none(),
+                "expected preparation digests and invocation project are valid only in verify mode"
             );
             let mut bytes = Vec::new();
             std::io::stdin()
