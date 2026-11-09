@@ -524,7 +524,14 @@ mod tests {
 
     #[test]
     fn shrinkwrap_and_project_config_cannot_change_during_installation() {
-        for name in ["npm-shrinkwrap.json", ".npmrc"] {
+        for name in [
+            "npm-shrinkwrap.json",
+            ".npmrc",
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".pnpmfile.cjs",
+            ".pnpmfile.mjs",
+        ] {
             let fixture = tempfile::tempdir().unwrap();
             std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
             std::fs::write(fixture.path().join(name), b"first").unwrap();

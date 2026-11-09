@@ -2,8 +2,10 @@
 //!
 //! Runs on the worker before the actual build/test command. For Bun/Node
 //! projects, this caches `node_modules` keyed by a fingerprint of the
-//! manifest + lockfiles, so a `bun test` against an unchanged project
-//! doesn't pay the install cost twice.
+//! manifests, lockfiles and project package-manager configuration, so a
+//! `bun test` against unchanged installation inputs avoids another install.
+//! Source-qualified preparation additionally binds all selected lifecycle
+//! inputs before it permits retained-output reuse.
 //!
 //! For non-Node runtimes (Rust, C/C++, plain shell) `prepare()` is a no-op.
 
@@ -159,6 +161,9 @@ async fn stop_installer(child: &mut tokio::process::Child) {
 // One vocabulary for installation, cache identity and the outer transaction's
 // stable-input checks. In particular, npm-shrinkwrap.json takes precedence over
 // package-lock.json in npm, and .npmrc can change the installed dependency tree.
+// Yarn configuration and pnpm hooks likewise affect resolution and lifecycle
+// behavior without changing package.json or a lockfile. Observe their absence
+// as well as their contents so installation cannot introduce them unnoticed.
 pub(super) const INPUT_NAMES: &[&str] = &[
     "package.json",
     "bun.lock",
@@ -169,6 +174,10 @@ pub(super) const INPUT_NAMES: &[&str] = &[
     "bunfig.toml",
     "npm-shrinkwrap.json",
     ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    ".pnpmfile.mjs",
 ];
 
 pub(super) fn fingerprint_hasher() -> Hasher {
