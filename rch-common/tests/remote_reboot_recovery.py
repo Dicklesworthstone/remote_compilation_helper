@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import runpy
 import shutil
 from pathlib import Path
 import shlex
@@ -19,7 +20,9 @@ import sys
 import tempfile
 import unittest
 
-SOURCE = Path(__file__).resolve().parents[1] / "src" / "remote_process.sh"
+# Explicit file loading also works under -I and never writes source bytecode.
+assemble_protocol = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))["assemble_protocol"]
+
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 BOOT_PATH = "/proc/sys/kernel/random/boot_id"
 OLD_BOOT = "13572468-1234-4abc-8def-135724681357"
@@ -27,14 +30,7 @@ OTHER_BOOT = "24681357-abcd-4123-8567-246813572468"
 
 
 def protocol() -> str:
-    supplied = os.environ.get("RCH_TEST_PROTOCOL_SCRIPT")
-    core = SOURCE.read_text()
-    if not supplied:
-        return core
-    compiled = Path(supplied).read_text()
-    if compiled.count(core) != 1:
-        raise AssertionError("compiled protocol does not contain the exact production core")
-    return compiled
+    return assemble_protocol()
 
 
 def birth(pid: int) -> int:

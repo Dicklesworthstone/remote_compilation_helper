@@ -9,10 +9,9 @@ writers, power-loss durability, or systemd containment. Fixtures are retained.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
+import runpy
 from pathlib import Path
-import re
 import shlex
 import signal
 import subprocess
@@ -21,33 +20,25 @@ import tempfile
 import time
 import unittest
 
+# Explicit file loading also works under -I and never writes source bytecode.
+_protocol_support = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))
+assemble_protocol = _protocol_support["assemble_protocol"]
+replace_protocol_source = _protocol_support["replace_protocol_source"]
+
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 
 
 def assemble() -> str:
-    rust = (SOURCE / "remote_scoped_launch.rs").read_text()
-    expression = rust.split("= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((SOURCE / json.loads(include[1])).read_text() if include else json.loads(item))
-    source = "".join(parts)
-    compiled = os.environ.get("RCH_TEST_PROTOCOL_SCRIPT")
-    if compiled and Path(compiled).read_text() != source:
-        raise AssertionError("literal source expansion differs from compiled protocol")
-    return source
+    return assemble_protocol()
 
 
 def protocol(*, slow_parent=False, pause_before_child=False, extra="") -> str:
     source = assemble()
     core = (SOURCE / "remote_process.sh").read_text()
     launch = (SOURCE / "remote_scoped_launch.sh").read_text()
-    if source.count(core) != 1 or source.count(launch) != 1:
-        raise AssertionError("expected exactly one shared copy of each production source")
     # No host configuration or service is changed. Use the existing V1 lane.
-    source = source.replace(core, core + '\nrch_policy_select_file() { rch_policy_file=; }\n')
+    source = replace_protocol_source(source, core, core + '\nrch_policy_select_file() { rch_policy_file=; }\n')
     adapted = launch
     if slow_parent:
         # Delegate the original clock unchanged; delay only the observer so
@@ -74,7 +65,7 @@ rch_scope_launch_save_input() {
     rch_fixture_save_input
 }
 '''
-    source = source.replace(launch, adapted + extra)
+    source = replace_protocol_source(source, launch, adapted + extra)
     return source
 
 

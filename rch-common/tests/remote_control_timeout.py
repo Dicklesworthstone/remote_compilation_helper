@@ -7,6 +7,8 @@ functions independently of the complete repository.
 """
 import os
 from pathlib import Path
+import resource
+import runpy
 import shlex
 import shutil
 import signal
@@ -20,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CORE = Path(os.environ.get("RCH_CONTROL_TEST_PROTOCOL",
                            str(ROOT / "rch-common/src/remote_process.sh"))).read_text()
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
+# Explicit file loading also works under -I and never writes source bytecode.
+PROTOCOL = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))["PROTOCOL"]
 # Deliberately exclude timeout, gtimeout and gnutimeout. Symlink real utilities;
 # changing uname or returning fake identity observations would hide this bug.
 TOOLS = (
@@ -263,8 +267,6 @@ class DisklessControlCapture(ControlTimeout):
         return result
 
     def run_complete_protocol(self, body, **environment):
-        from remote_process_platform import PROTOCOL
-
         result = subprocess.run(
             [SHELL, "-c", PROTOCOL + "\n" + body, "rch-observer"],
             env={key: value for key, value in {**self.env, **environment}.items()
@@ -394,7 +396,7 @@ class DisklessControlCapture(ControlTimeout):
                 self.assertTrue(completed.exists(), "fixture command did not complete")
 
     def test_complete_protocol_bootstraps_with_unavailable_tmpdir(self):
-        # Exercise the exact Rust concat! composition, including its heredoc,
+        # Exercise the complete literal protocol and its quoted bootstrap,
         # rather than only evaluating the standalone function definitions.
         result = self.run_complete_protocol(
             "rch_control_diskless=1\n"
@@ -402,6 +404,43 @@ class DisklessControlCapture(ControlTimeout):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "complete protocol\n\n")
+
+    def run_without_file_writes(self, shell, body):
+        def deny_file_writes():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+        # Unlike TMPDIR alone, this also denies a shell's silent /tmp fallback.
+        # This is a real kernel write limit, not a full-filesystem qualification.
+        return subprocess.run(
+            [shell, "-c", PROTOCOL + "\n" + body, "rch-observer"],
+            env=self.env, text=True, capture_output=True, start_new_session=True,
+            preexec_fn=deny_file_writes, timeout=8,
+        )
+
+    def test_complete_source_bootstraps_when_the_kernel_denies_regular_file_writes(self):
+        expected = (ROOT / "rch-common/src/remote_process.sh").read_text() + "\n" + (
+            ROOT / "rch-common/src/remote_scoped_launch.sh").read_text()
+        for shell in dict.fromkeys((SHELL, shutil.which("bash"))):
+            if shell is None:
+                continue
+            with self.subTest(shell=shell):
+                result = self.run_without_file_writes(shell, 'printf "%s" "$rch_launch_source"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.stderr, "")
+
+    def test_kernel_write_denial_preserves_invalid_output_and_timeout_refusals(self):
+        for shell in dict.fromkeys((SHELL, shutil.which("bash"))):
+            if shell is None:
+                continue
+            for payload in ("printf 'invalid\\000bytes'", "printf partial; sleep 30"):
+                with self.subTest(shell=shell, payload=payload):
+                    started = time.monotonic()
+                    result = self.run_without_file_writes(
+                        shell, "rch_control_diskless=1\nrch_control_capture 1s /bin/sh -c " + shlex.quote(payload))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertLess(time.monotonic() - started, 5)
 
     def test_cancellation_exports_mode_to_nested_observer_without_leaking(self):
         # This is an explicit unavailable-census double, not native process
@@ -493,15 +532,17 @@ class DisklessCancellation(WithoutTimeout):
         path.chmod(0o600)
         return path
 
-    def cancel(self, path, build=115):
-        from remote_process_platform import PROTOCOL
+    def cancel(self, path, build=115, *, shell=SHELL, deny_file_writes=False, env=None):
+        def forbid_file_writes():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
 
         # Do not set rch_control_diskless here: real cancellation must select
         # its own storage-independent observation route.
         result = subprocess.run(
-            [SHELL, "-c", PROTOCOL + '\nrch_remote_cancel "$1" "$2" kill\n',
+            [shell, "-c", PROTOCOL + '\nrch_remote_cancel "$1" "$2" kill\n',
              "rch-cancel", str(path), str(build)],
-            env=self.env, text=True, capture_output=True, start_new_session=True, timeout=35,
+            env=env or self.env, text=True, capture_output=True, start_new_session=True,
+            preexec_fn=forbid_file_writes if deny_file_writes else None, timeout=35,
         )
         self.assertEqual(self.unavailable.read_bytes(), b"scratch must remain unchanged\n")
         self.assert_no_capture_files()
@@ -518,6 +559,38 @@ class DisklessCancellation(WithoutTimeout):
         # Repeat with the original receipt after the exact group has exited.
         result = self.cancel(path)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), receipt)
+
+    def test_bash_cancels_and_reconfirms_a_real_group_with_kernel_file_write_denial(self):
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("Bash is unavailable")
+        child = self.group()
+        path = self.record(child)
+        receipt = path.read_bytes()
+        # The old heredoc bootstrap fails before reaching cancellation even
+        # though its census is diskless. Neither the process nor ps is doubled.
+        result = self.cancel(path, shell=bash, deny_file_writes=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(child.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(path.read_bytes(), receipt)
+        result = self.cancel(path, shell=bash, deny_file_writes=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), receipt)
+
+    def test_failed_census_cannot_confirm_cancellation_under_kernel_write_denial(self):
+        child = self.group()
+        path = self.record(child)
+        receipt = path.read_bytes()
+        binaries = self.root / "failed-census"
+        binaries.mkdir()
+        ps = binaries / "ps"
+        ps.write_text("#!/bin/sh\nprintf 'invalid census\\n'\n")
+        ps.chmod(0o700)
+        result = self.cancel(path, deny_file_writes=True,
+                             env={**self.env, "PATH": str(binaries) + ":" + self.env["PATH"]})
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(path.read_bytes(), receipt)
 
     def test_missing_record_cannot_confirm_or_signal_under_storage_failure(self):

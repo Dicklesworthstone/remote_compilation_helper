@@ -5,8 +5,8 @@ Fast tests double ONLY policy discovery and systemd/cgroup operations. Actual
 shell launch, niceness, V2 records, gates, result parsing, deadlines, process
 identity, streams and cancellation/recovery are exercised. These are not live
 cgroup or SSH/daemon tests. RCH_TEST_SYSTEMD_SLICE opts into real systemd tests.
-Cargo passes the compiled protocol; standalone execution expands the exact
-literal concat! expression and rejects any unknown Rust syntax.
+Cargo passes the compiled protocol; standalone execution expands the same
+literal inputs and quoting and compares bytes whenever Cargo supplies them.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ import json
 import fcntl
 import inspect
 import os
+import runpy
 from pathlib import Path
-import re
 import shlex
 import signal
 import string
@@ -24,6 +24,12 @@ import sys
 import tempfile
 import time
 import unittest
+
+# Explicit file loading also works under -I and never writes source bytecode.
+_protocol_support = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))
+assemble_protocol = _protocol_support["assemble_protocol"]
+quote_protocol_source = _protocol_support["quote_protocol_source"]
+replace_protocol_source = _protocol_support["replace_protocol_source"]
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 THIS = Path(__file__).resolve()
@@ -82,20 +88,6 @@ def _neutral_shell(shell: str) -> str:
 
 SHELL = _neutral_shell(SHELL)
 
-
-
-def assemble_protocol() -> str:
-    rust = (SOURCE / "remote_scoped_launch.rs").read_text()
-    expression = rust.split("= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        if include:
-            parts.append((SOURCE / json.loads(include[1])).read_text())
-        else:
-            parts.append(json.loads(item))
-    return "".join(parts)
 
 
 SELECT = r'''
@@ -262,9 +254,7 @@ def protocol(instrument: bool = True, fixture: bool = True) -> str:
     if not instrument:
         return expanded
     core = (SOURCE / "remote_process.sh").read_text()
-    if expanded.count(core) != 1:
-        raise AssertionError("expected one literal source shared by parent and child")
-    return expanded.replace(core, core + SELECT + (MOCK_RESOURCE_BACKEND if fixture else ""))
+    return replace_protocol_source(expanded, core, core + SELECT + (MOCK_RESOURCE_BACKEND if fixture else ""))
 
 
 def transport_quote(value: str) -> str:
@@ -430,9 +420,9 @@ rch_control_capture 1s /bin/sh -c 'printf UNEXPECTED'
         source = protocol(instrument=False)
         core = (SOURCE / "remote_process.sh").read_text()
         launch = (SOURCE / "remote_scoped_launch.sh").read_text()
-        self.assertEqual(source.count(core), 1)
-        self.assertEqual(source.count(launch), 1)
-        expected = (core + "\n" + launch).rstrip("\n").encode()
+        self.assertEqual(source.count(quote_protocol_source(core)), 1)
+        self.assertEqual(source.count(quote_protocol_source(launch)), 1)
+        expected = (core + "\n" + launch).encode()
         result = self.invoke(source + '\nprintf "%s" "$rch_launch_source"\n')
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b""))
 
@@ -454,14 +444,14 @@ rch_control_capture 1s /bin/sh -c 'printf UNEXPECTED'
         self.assertEqual((result.returncode, result.stdout, result.stderr),
                          (0, b"reached'!$()\\", b""))
 
-    def test_failed_source_capture_does_not_evaluate_partial_output(self):
+    def test_bootstrap_does_not_execute_a_path_supplied_source_reader(self):
         with tempfile.TemporaryDirectory(prefix="rch-source-capture-") as name:
             program = Path(name) / "cat"
             program.write_text("#!/bin/sh\nprintf 'printf INJECTED; exit 0\\n'\nexit 1\n")
             program.chmod(0o700)
             result = self.invoke(protocol(instrument=False) + '\nprintf AFTER\n',
                                  env={**os.environ, "PATH": name})
-            self.assertEqual((result.returncode, result.stdout, result.stderr), (125, b"", b""))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"AFTER", b""))
 
 
 # Workload fixture: detached descendants ignore TERM and keep writing after the
@@ -607,8 +597,7 @@ rch_scope_launch_clock() {
 }
 '''
         source = protocol()
-        self.assertEqual(source.count(launch), 1)
-        return source.replace(launch, adapted)
+        return replace_protocol_source(source, launch, adapted)
 
     def test_transient_unknown_admission_retries_before_running_payload_once(self) -> None:
         for failures in (2, 4):
@@ -748,7 +737,7 @@ rch_scope_launch_clock() {
     fi
 }
 '''
-        proc, job, record = self.start(script=protocol().replace(launch, adapted), env={
+        proc, job, record = self.start(script=replace_protocol_source(protocol(), launch, adapted), env={
             **self.env, "RCH_TEST_ADMISSION_EXPIRE": "1",
         })
         self.finish(proc, job, 255)
@@ -770,7 +759,7 @@ rch_scope_launch_clock() {
     fi
 }
 '''
-        proc, job, record = self.start(script=protocol().replace(launch, adapted), env={
+        proc, job, record = self.start(script=replace_protocol_source(protocol(), launch, adapted), env={
             **self.env, "RCH_TEST_ADMISSION_EXPIRE": "1",
         })
         self.finish(proc, job, 255)

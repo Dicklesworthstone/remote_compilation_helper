@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 from pathlib import Path
-import re
 import select
 import signal
 import subprocess
@@ -21,20 +21,15 @@ import tempfile
 import time
 import unittest
 
+# Explicit file loading also works under -I and never writes source bytecode.
+assemble_protocol = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))["assemble_protocol"]
+
+
 def checked_out_protocol() -> str:
     # Witness collection evaluates rch_launch_source in its bounded helper.
     # Reading remote_process.sh alone omits that shared source and silently
     # turns TERM tests into the authenticated immediate-KILL fallback.
-    source = Path(__file__).resolve().parents[1] / "src"
-    expression = (source / "remote_scoped_launch.rs").read_text().split(
-        "= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((source / json.loads(include[1])).read_text()
-                     if include else json.loads(item))
-    return "".join(parts)
+    return assemble_protocol()
 
 
 PROTOCOL = (Path(os.environ["RCH_CONTROL_TEST_PROTOCOL"]).read_text()

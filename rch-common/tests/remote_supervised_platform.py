@@ -7,10 +7,9 @@ on Linux; those tests are not native libproc or macOS qualification. Darwin
 needs the candidate rch-wkr and Python 3.7+ (the harness needs Python 3.9+).
 RCH_TEST_NO_TIMEOUT=1 removes GNU timeout aliases from PATH on either OS.
 """
-import json
 import os
+import runpy
 from pathlib import Path
-import re
 import shlex
 import shutil
 import signal
@@ -21,21 +20,15 @@ import time
 import unittest
 import venv
 
+# Explicit file loading also works under -I and never writes source bytecode.
+_protocol_support = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))
+assemble_protocol = _protocol_support["assemble_protocol"]
+quote_protocol_source = _protocol_support["quote_protocol_source"]
+replace_protocol_source = _protocol_support["replace_protocol_source"]
+
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 CORE = (SOURCE / "remote_process.sh").read_text()
-
-
-def assemble_protocol():
-    rust = (SOURCE / "remote_scoped_launch.rs").read_text()
-    expression = rust.split("= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((SOURCE / json.loads(include[1])).read_text()
-                     if include else json.loads(item))
-    return "".join(parts)
 
 
 PROTOCOL = assemble_protocol()
@@ -238,7 +231,7 @@ fi
 ''' if resume_before_term else ""
         core += ("\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
                  + shlex.quote(str(trace)) + '; ' + resume + 'rch_real_signal_group "$@"; }\n')
-        script = PROTOCOL.replace(CORE, core) + (
+        script = replace_protocol_source(PROTOCOL, CORE, core) + (
             f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
         started = time.monotonic()
         result = subprocess.run([SHELL, "-c", script], env=self.env,
@@ -311,7 +304,7 @@ rch_read_process() { rch_real_read_process "$1"; }
         core += f'''
 rch_read_process() {{ sleep 15; rch_real_read_process "$1"; }}
 '''
-        script = PROTOCOL.replace(CORE, core) + "\n" + setup + f'''
+        script = replace_protocol_source(PROTOCOL, CORE, core) + "\n" + setup + f'''
 rch_witness_identity="$rch_boot:$rch_pgid:$rch_start"
 rch_witnesses={member}:{birth}
 rch_remote_witness_matches
@@ -416,7 +409,7 @@ if rch_remote_witness_matches; then exit 88; fi
         # the requested command nor an unconfirmed-execution verdict is valid.
         needle = "rch_scope_launch_child() {\n"
         self.assertEqual(PROTOCOL.count(needle), 1)
-        refused = PROTOCOL.replace(needle, needle + "    exit 125\n")
+        refused = replace_protocol_source(PROTOCOL, needle, needle + "    exit 125\n")
         out, err = self.finish(self.start("printf MUST_NOT_RUN", protocol=refused), 125)
         self.assertEqual(out, b"")
         self.assertIn(b"IDENTITY_UNAVAILABLE", err)
@@ -460,7 +453,7 @@ if rch_remote_witness_matches; then exit 88; fi
         # Only the all-process census is unavailable before execution. The
         # child, boot/start identity and scope binding remain native. Cleanup
         # must still execute the genuine census after the payload starts.
-        fault = PROTOCOL.replace(
+        fault = replace_protocol_source(PROTOCOL,
             needle, needle + '    [ -f "$RCH_TEST_PAYLOAD_READY" ] || return 2\n')
         payload = f"printf ready > {shlex.quote(str(self.ready))}; exit 7"
         self.finish(self.start(payload, protocol=fault), 7)
@@ -490,8 +483,8 @@ os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
         self.env["PATH"] = f"{binaries}:{self.env.get('PATH', os.defpath)}"
         late = self.root / "late-write"
         signal_needle = '    kill -"$1" -"$rch_pgid" 2>/dev/null || :\n'
-        self.assertEqual(PROTOCOL.count(signal_needle), 1)
-        protocol = PROTOCOL.replace(
+        self.assertEqual(PROTOCOL.count(quote_protocol_source(signal_needle)), 1)
+        protocol = replace_protocol_source(PROTOCOL,
             signal_needle,
             signal_needle + '    [ "$1" != KILL ] || printf "authorized KILL\\n" >> '
             + shlex.quote(str(order)) + '\n')
@@ -514,15 +507,17 @@ os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
         needle = "rch_group_state() {\n"
         signal_needle = '    kill -"$1" -"$rch_pgid" 2>/dev/null || :\n'
         self.assertEqual(PROTOCOL.count(needle), 1)
-        self.assertEqual(PROTOCOL.count(signal_needle), 1)
+        self.assertEqual(PROTOCOL.count(quote_protocol_source(signal_needle)), 1)
         # Inject one unavailable observation after the real authenticated KILL.
         # No process result or identity is faked; the next census must prove
         # absence using the kernel, as does the independent assertion below.
-        fault = PROTOCOL.replace(needle, needle + '''    if [ -f "$RCH_TEST_KILLED" ] && [ ! -f "$RCH_TEST_RETRIED" ]; then
+        fault = replace_protocol_source(PROTOCOL, needle, needle + '''    if [ -f "$RCH_TEST_KILLED" ] && [ ! -f "$RCH_TEST_RETRIED" ]; then
         printf retried > "$RCH_TEST_RETRIED"
         return 2
     fi
-''').replace(signal_needle, signal_needle + '    [ "$1" != KILL ] || printf killed > "$RCH_TEST_KILLED"\n')
+''')
+        fault = replace_protocol_source(fault, signal_needle,
+                                        signal_needle + '    [ "$1" != KILL ] || printf killed > "$RCH_TEST_KILLED"\n')
         self.finish(self.start("exit 7", protocol=fault), 7)
         self.assertTrue(killed.exists())
         self.assertTrue(retried.exists())
@@ -535,7 +530,7 @@ os.execv({real_ps!r}, ["ps", *sys.argv[1:]])
         # identity/death evidence is supplied. Fresh recovery uses real census.
         needle = "rch_group_state() {\n"
         self.assertEqual(PROTOCOL.count(needle), 1)
-        fault = PROTOCOL.replace(needle, needle + '    [ ! -f "$RCH_TEST_CENSUS_LOSS" ] || return 2\n')
+        fault = replace_protocol_source(PROTOCOL, needle, needle + '    [ ! -f "$RCH_TEST_CENSUS_LOSS" ] || return 2\n')
         run = self.start(self.blocking_payload(), protocol=fault)
         self.wait_ready(run[0])
         loss.touch()

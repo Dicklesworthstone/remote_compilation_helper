@@ -9,10 +9,9 @@ completion pass: the consumer remains alive and unread through process exit.
 from __future__ import annotations
 
 import fcntl
-import json
 import os
+import runpy
 from pathlib import Path
-import re
 import select
 import signal
 import subprocess
@@ -21,27 +20,19 @@ import tempfile
 import time
 import unittest
 
+# Explicit file loading also works under -I and never writes source bytecode.
+_protocol_support = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))
+assemble_protocol = _protocol_support["assemble_protocol"]
+replace_protocol_source = _protocol_support["replace_protocol_source"]
+
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 
 
 def protocol():
-    expression = (SOURCE / "remote_scoped_launch.rs").read_text().split(
-        "= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((SOURCE / json.loads(include[1])).read_text()
-                     if include else json.loads(item))
-    source = "".join(parts)
-    supplied = os.environ.get("RCH_TEST_PROTOCOL_SCRIPT")
-    if supplied and Path(supplied).read_text() != source:
-        raise AssertionError("source expansion does not match the compiled protocol")
+    source = assemble_protocol()
     core = (SOURCE / "remote_process.sh").read_text()
-    if source.count(core) != 1:
-        raise AssertionError("expected one shared identity implementation")
-    return source.replace(core, core + '\nrch_policy_select_file() { rch_policy_file=; }\n')
+    return replace_protocol_source(source, core, core + '\nrch_policy_select_file() { rch_policy_file=; }\n')
 
 
 PAYLOAD = '''
