@@ -697,15 +697,14 @@ impl RustcOutputDiscovery {
             // absent from that query; a POSIX worker is not a POSIX target.
             return None;
         }
-        if let Some(directory) = &selection.output_dir {
-            if directory.is_empty()
+        if let Some(directory) = &selection.output_dir
+            && (directory.is_empty()
                 || directory.chars().any(char::is_control)
                 || !Path::new(directory)
                     .components()
-                    .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
-            {
-                return None;
-            }
+                    .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)))
+        {
+            return None;
         }
         let args = compiler_arguments(command, &["rustc"])?;
         let mut words = literal_words(command)?;
@@ -1583,6 +1582,74 @@ mod tests {
             } else {
                 assert!(output.stdout.is_empty(), "compiler stdout was changed");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_rustc_named_multi_crate_outputs_match_required_contract() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        fn entries(directory: &Path) -> BTreeSet<PathBuf> {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        }
+
+        let owner = tempfile::tempdir().unwrap();
+        for (index, command) in [
+            "rustc main.rs --crate-type=rlib,cdylib -o products/selected",
+            "rustc main.rs --crate-type=rlib,cdylib --emit=link=products/selected",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = owner.path().join(index.to_string());
+            std::fs::create_dir_all(root.join("products")).unwrap();
+            let source =
+                "#![crate_name = \"attribute_name\"]\npub fn value() -> u32 { 37 }\nfn main() {}\n";
+            std::fs::write(root.join("main.rs"), source).unwrap();
+            // With multiple crate types, --print=file-names reports per-type
+            // filenames even though an explicit link destination produces only
+            // that selected file. The static contract must follow the actual
+            // invocation, not substitute the query's incompatible naming rule.
+            assert!(RustcOutputDiscovery::for_command(command).is_none());
+            let contract =
+                native_output_contract(Some(rch_common::CompilationKind::Rustc), command, true)
+                    .unwrap();
+            assert_eq!(
+                contract.required_files,
+                BTreeSet::from([PathBuf::from("products/selected")])
+            );
+            assert!(contract.verify_staged(&root).is_err());
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", command]).current_dir(&root);
+            let output = rch_common::ssh::capture_control_output(
+                &mut compiler,
+                None,
+                1024 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("owned rustc compilation failed or exceeded its deadline");
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert!(output.stdout.is_empty());
+            contract.verify_staged(&root).unwrap();
+            assert_eq!(
+                entries(&root),
+                BTreeSet::from([root.join("main.rs"), root.join("products")])
+            );
+            assert_eq!(
+                entries(&root.join("products")),
+                BTreeSet::from([root.join("products/selected")])
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("main.rs")).unwrap(),
+                source
+            );
         }
     }
 
