@@ -168,15 +168,17 @@ pub(crate) fn negotiated_dependency_context(
         }
         let invocation = rabs_key::invocation::parse(&argv, None)
             .map_err(|error| invalid(&format!("dependency execution invocation: {error:?}")))?;
-        if selected == DependencyExecutionMode::Metadata
-            && (!invocation.native_libs.is_empty()
-                || invocation
-                    .lib_search
-                    .iter()
-                    .any(|search| search.starts_with("native=")))
+        if matches!(
+            selected,
+            DependencyExecutionMode::Metadata | DependencyExecutionMode::ClosedMetadata
+        ) && (!invocation.native_libs.is_empty()
+            || invocation
+                .lib_search
+                .iter()
+                .any(|search| search.starts_with("native=")))
         {
-            // Use the same argv parser as planning and worker validation. An
-            // ordinary metadata capability does not imply this newer input
+            // Use the same argv parser as planning and worker validation.
+            // Neither metadata execution capability implies this newer input
             // class; fail before source/toolchain upload or execution ownership.
             require(
                 hello["dependency_native_inputs"]
@@ -2904,6 +2906,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn closed_native_metadata_capability_precedes_grant_upload_and_dispatch() {
+        use super::super::source_delivery::SourcePeer;
+
+        let version = CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION;
+        for arguments in [
+            json!(["-Lnative=/__rabs/out/cargo/debug/build/leaf/out", "lib.rs"]),
+            json!(["-l", "static=leaf", "lib.rs"]),
+            json!([
+                "-L",
+                "native=/__rabs/out/cargo/debug/build/leaf/out",
+                "-lstatic=leaf",
+                "lib.rs"
+            ]),
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            let (upload, mut request) = source_request(source.path());
+            request["args"] = arguments;
+            request["dependency_context"] =
+                json!({"version":version, "execution_mode":"closed-metadata"});
+            request["dependency_execution_host"] =
+                json!(DependencyExecutionHost::LinuxX86_64.as_str());
+            for (offered, accepted) in [
+                (None, false),
+                (Some(Value::Null), false),
+                (Some(json!([])), false),
+                (Some(json!(CANONICAL_NATIVE_METADATA_CAPABILITY)), false),
+                (
+                    Some(json!(["canonical-generated-static-metadata-v0"])),
+                    false,
+                ),
+                (
+                    Some(json!([
+                        CANONICAL_NATIVE_ROOTS_CAPABILITY,
+                        CANONICAL_NATIVE_MODIFIERS_CAPABILITY
+                    ])),
+                    false,
+                ),
+                (Some(json!([CANONICAL_NATIVE_METADATA_CAPABILITY])), true),
+            ] {
+                let parent = tempfile::tempdir().unwrap();
+                let destination = parent.path().join("delivery");
+                let mut peer = fixture(&destination);
+                source_replies(&mut peer, &request);
+                peer.replies[0]["canonical"] = json!(false);
+                peer.replies[0]["dependency_contexts"] = json!([version]);
+                peer.replies[0]["dependency_execution_modes"] = json!(["closed-metadata"]);
+                if let Some(offered) = offered {
+                    peer.replies[0]["dependency_native_inputs"] = offered;
+                }
+                let result = receive_execution(
+                    &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+                    &request,
+                    "worker",
+                    &destination,
+                );
+                if accepted {
+                    let delivery = result.unwrap();
+                    assert!(delivery.acknowledgments_confirmed);
+                    assert_eq!(peer.sent[0]["dependency_context"], version);
+                    assert_eq!(peer.sent[0]["dependency_execution_mode"], "closed-metadata");
+                    assert_eq!(peer.sent[4], request);
+                } else {
+                    let failure = result.unwrap_err();
+                    assert!(!failure.execution_may_have_run);
+                    assert!(failure.detail.contains("static native metadata capability"));
+                    assert!(peer.sent.is_empty());
+                    assert!(!destination.exists());
+                    assert_eq!(peer.replies.len(), 9, "only the hello may have been read");
+                }
+            }
+            assert_eq!(
+                negotiated_dependency_context(&json!({}), &request, DeliveryMode::Resume).unwrap(),
+                None,
+                "sealed-result recovery must not acquire new execution authority"
+            );
+        }
+    }
+
     const CANONICAL_NATIVE_MODIFIER_PROFILES: [(&str, &str); 5] = [
         (CANONICAL_DEPENDENCY_CONTEXT_VERSION, "metadata"),
         (CANONICAL_DEPENDENCY_CONTEXT_VERSION, "rlib"),
@@ -3034,7 +3115,7 @@ mod tests {
                 CANONICAL_NATIVE_MODIFIERS_CAPABILITY
             ]);
             let result = validate_worker_execution_capabilities(&hello, &projection);
-            if mode == "metadata" {
+            if matches!(mode, "metadata" | "closed-metadata") {
                 assert!(
                     result
                         .unwrap_err()
