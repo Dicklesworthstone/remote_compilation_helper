@@ -1107,8 +1107,10 @@ impl CanonicalPaths {
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceNativeGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedDagRlib
             | DependencySourceKind::WorkspaceGeneratedDagMetadata
+            | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -2578,6 +2580,7 @@ mod tests {
             CommittedDependencyPolicy::WorkspaceDagRlib,
             CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+            CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let archive = matches!(
@@ -2585,6 +2588,7 @@ mod tests {
                 CommittedDependencyPolicy::ImmutableDagRlib
                     | CommittedDependencyPolicy::WorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
             );
             let workspace = matches!(
                 policy,
@@ -2592,6 +2596,7 @@ mod tests {
                     | CommittedDependencyPolicy::WorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
             );
             let mut parent_outputs =
                 vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
@@ -2679,6 +2684,7 @@ mod tests {
                 policy,
                 CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
             ) {
                 let ordinary = if archive {
                     CommittedDependencyPolicy::WorkspaceDagRlib
@@ -3391,6 +3397,7 @@ mod tests {
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagRlib,
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+            CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let parent = fixture.commit_immutable_leaf(
@@ -3578,6 +3585,7 @@ mod tests {
             DependencySourceKind::WorkspaceClosedMetadata,
             DependencySourceKind::WorkspaceGeneratedRlib,
             DependencySourceKind::WorkspaceGeneratedMetadata,
+            DependencySourceKind::WorkspaceNativeGeneratedRlib,
             DependencySourceKind::RegistryPackage,
         ] {
             assert!(CommittedDependencyPolicy::from_source_kind(kind).is_none());

@@ -481,6 +481,7 @@ const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2"
 // record. They earn independent evidence without retiring existing pure keys.
 const LIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
 const LIVE_GENERATED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
+const LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-native-generated-rlib-v1";
 const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
 const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
 const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
@@ -492,6 +493,8 @@ const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-m
 const LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
 const LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-generated-dag-metadata-v1";
+const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str =
+    "rustc-workspace-native-generated-dag-rlib-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
@@ -545,6 +548,9 @@ fn record_descriptor_class(
             CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
                 LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
             }
+            CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
+                LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
             }
@@ -559,6 +565,9 @@ fn record_descriptor_class(
             ClosedWorkspaceLibraryClass::GeneratedRlib => LIVE_GENERATED_WORKSPACE_RLIB_CLASS,
             ClosedWorkspaceLibraryClass::GeneratedMetadata => {
                 LIVE_GENERATED_WORKSPACE_METADATA_CLASS
+            }
+            ClosedWorkspaceLibraryClass::NativeGeneratedRlib => {
+                LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS
             }
         }
     } else if uses_committed_dependency_namespace(descriptor)
@@ -609,6 +618,9 @@ fn recorded_action_risk(
             [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_METADATA_CLASS => {
                 Ok(ActionClassRisk::GeneratedWorkspaceMetadata)
             }
+            [SqlValue::Text(class)] if class == LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS => {
+                Ok(ActionClassRisk::NativeGeneratedWorkspaceRlib)
+            }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceRlib)
             }
@@ -638,6 +650,9 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
                 Ok(ActionClassRisk::GeneratedWorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::NativeGeneratedWorkspaceDagRlib)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -5619,7 +5634,9 @@ mod tests {
         // writer. Compiler execution is covered by the canonical Cargo fixture.
         let descriptor_with_generated = |emit: &str,
                                          policy: Option<CommittedDependencyPolicy>,
-                                         generated: bool| {
+                                         generated: bool,
+                                         native: bool| {
+            assert!(!native || generated);
             assert!(
                 !generated
                     || policy.is_none()
@@ -5628,6 +5645,7 @@ mod tests {
                         Some(
                             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                                | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                         )
                     )
             );
@@ -5694,6 +5712,12 @@ mod tests {
                     "/__rabs/out/cargo/debug/build/leaf-generated/out".into(),
                 ));
             }
+            if native {
+                argv.extend([
+                    "-Lnative=/__rabs/out/cargo/debug/build/leaf-generated/out".into(),
+                    "-lstatic=leaf_native".into(),
+                ]);
+            }
             let request = LiveRustcRequest {
                 argv: &argv,
                 env: &env,
@@ -5715,7 +5739,8 @@ mod tests {
                 }
                 Some(
                     CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
-                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
                 ) => plan_generated_workspace_dag_library(&execution),
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -5768,6 +5793,24 @@ mod tests {
                     virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
                     entries: vec![RawBytes::from("config.rs")],
                 });
+            }
+            if native {
+                inputs.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("libleaf_native.a")
+                            .into_bytes(),
+                    ),
+                    object: ObjectId(identity.clone()),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                });
+                inputs
+                    .directory_enumerations
+                    .last_mut()
+                    .unwrap()
+                    .entries
+                    .push(RawBytes::from("libleaf_native.a"));
             }
             let toolchain = ToolchainFacts {
                 compiler_binary_digest: identity.clone(),
@@ -5872,7 +5915,7 @@ mod tests {
             .unwrap()
             .descriptor
         };
-        let descriptor = |emit, policy| descriptor_with_generated(emit, policy, false);
+        let descriptor = |emit, policy| descriptor_with_generated(emit, policy, false, false);
         let descriptors = [
             (
                 descriptor("--emit=dep-info,metadata,link", None),
@@ -5883,11 +5926,11 @@ mod tests {
                 ActionClassRisk::ClosedWorkspaceMetadata,
             ),
             (
-                descriptor_with_generated("--emit=dep-info,metadata,link", None, true),
+                descriptor_with_generated("--emit=dep-info,metadata,link", None, true, false),
                 ActionClassRisk::GeneratedWorkspaceRlib,
             ),
             (
-                descriptor_with_generated("--emit=dep-info,metadata", None, true),
+                descriptor_with_generated("--emit=dep-info,metadata", None, true, false),
                 ActionClassRisk::GeneratedWorkspaceMetadata,
             ),
             (
@@ -5951,6 +5994,7 @@ mod tests {
                     "--emit=dep-info,metadata,link",
                     Some(CommittedDependencyPolicy::GeneratedWorkspaceDagRlib),
                     true,
+                    false,
                 ),
                 ActionClassRisk::GeneratedWorkspaceDagRlib,
             ),
@@ -5959,8 +6003,22 @@ mod tests {
                     "--emit=dep-info,metadata",
                     Some(CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata),
                     true,
+                    false,
                 ),
                 ActionClassRisk::GeneratedWorkspaceDagMetadata,
+            ),
+            (
+                descriptor_with_generated("--emit=dep-info,metadata,link", None, true, true),
+                ActionClassRisk::NativeGeneratedWorkspaceRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::NativeGeneratedWorkspaceDagRlib,
             ),
             (
                 descriptor(
@@ -5978,7 +6036,7 @@ mod tests {
             ),
         ];
         for ((descriptor, _), expected_epoch) in descriptors.iter().zip([
-            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 24, 25,
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 31, 24, 25,
         ]) {
             assert_eq!(descriptor.key_epoch, expected_epoch);
         }

@@ -55,7 +55,8 @@ impl ProducerPolicy {
             CommittedDependencyPolicy::ImmutableDagRlib => (false, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::WorkspaceDagRlib
-            | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
+            | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
                 (false, ProducerDomain::WorkspaceDag)
             }
             CommittedDependencyPolicy::WorkspaceDagMetadata
@@ -97,6 +98,9 @@ impl ProducerPolicy {
             ActionClassRisk::GeneratedWorkspaceDagMetadata => {
                 CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
             }
+            ActionClassRisk::NativeGeneratedWorkspaceDagRlib => {
+                CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+            }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
             }
@@ -122,6 +126,7 @@ impl ProducerPolicy {
         match risk {
             ActionClassRisk::ClosedWorkspaceRlib
             | ActionClassRisk::GeneratedWorkspaceRlib
+            | ActionClassRisk::NativeGeneratedWorkspaceRlib
             | ActionClassRisk::CommittedWorkspaceRlib => workspace,
             ActionClassRisk::ClosedWorkspaceMetadata
             | ActionClassRisk::GeneratedWorkspaceMetadata
@@ -130,7 +135,9 @@ impl ProducerPolicy {
             ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
             ActionClassRisk::ImmutableDagRlib => immutable_dag,
             ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
-            ActionClassRisk::WorkspaceDagRlib | ActionClassRisk::GeneratedWorkspaceDagRlib => {
+            ActionClassRisk::WorkspaceDagRlib
+            | ActionClassRisk::GeneratedWorkspaceDagRlib
+            | ActionClassRisk::NativeGeneratedWorkspaceDagRlib => {
                 self.domain == ProducerDomain::WorkspaceDag
             }
             ActionClassRisk::WorkspaceDagMetadata
@@ -490,7 +497,9 @@ pub(super) fn check_offer(
     let risk = recorded_action_risk(store, &offer.manifest.action_key).map_err(store_error)?;
     if matches!(
         risk,
-        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+        ActionClassRisk::GeneratedWorkspaceRlib
+            | ActionClassRisk::GeneratedWorkspaceMetadata
+            | ActionClassRisk::NativeGeneratedWorkspaceRlib
     ) {
         return if offer.provisional_ancestors.is_empty() {
             Ok(())
@@ -539,7 +548,9 @@ pub(super) fn check_serving(
     let risk = recorded_action_risk(store, action).map_err(store_error)?;
     if matches!(
         risk,
-        ActionClassRisk::GeneratedWorkspaceRlib | ActionClassRisk::GeneratedWorkspaceMetadata
+        ActionClassRisk::GeneratedWorkspaceRlib
+            | ActionClassRisk::GeneratedWorkspaceMetadata
+            | ActionClassRisk::NativeGeneratedWorkspaceRlib
     ) {
         return if store
             .list_provisional_ancestors(&digest_key(action))
@@ -818,6 +829,7 @@ fn verify_graph(
                 | ActionClassRisk::ClosedWorkspaceMetadata
                 | ActionClassRisk::GeneratedWorkspaceRlib
                 | ActionClassRisk::GeneratedWorkspaceMetadata
+                | ActionClassRisk::NativeGeneratedWorkspaceRlib
                 | ActionClassRisk::LowRiskRegistry
         ) && !ancestors.is_empty())
             || (matches!(
@@ -832,6 +844,7 @@ fn verify_graph(
                     | ActionClassRisk::WorkspaceDagMetadata
                     | ActionClassRisk::GeneratedWorkspaceDagRlib
                     | ActionClassRisk::GeneratedWorkspaceDagMetadata
+                    | ActionClassRisk::NativeGeneratedWorkspaceDagRlib
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -1090,6 +1103,9 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
                     LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
+                    LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
+                }
                 _ => panic!("DAG fixture requires an independently keyed DAG policy"),
             };
             self.prepare_class(tag, parents, outputs, class)
@@ -1168,6 +1184,8 @@ pub(crate) mod tests {
                 LIVE_GENERATED_WORKSPACE_METADATA_CLASS => 27,
                 LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => 28,
                 LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 29,
+                LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS => 30,
+                LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => 31,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 _ => manifest.key_epoch,
@@ -1483,6 +1501,159 @@ pub(crate) mod tests {
         );
         fixture.commit(&c);
         [a, b, c]
+    }
+
+    #[test]
+    fn native_generated_archive_producers_keep_roles_ancestry_and_current_closure() {
+        for revoke_producer in [false, true] {
+            let fixture = WorkspaceLineageFixture::new();
+            let leaf = fixture.prepare_class(
+                120,
+                Vec::new(),
+                &[
+                    (
+                        "libnative.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"native metadata",
+                    ),
+                    (
+                        "libnative.rlib",
+                        OutputRole::Materializable,
+                        b"bundled native implementation",
+                    ),
+                ],
+                LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS,
+            );
+            assert_eq!(leaf.manifest.key_epoch, 30);
+            fixture.commit(&leaf);
+            let archive = leaf
+                .manifest
+                .logical_outputs
+                .iter()
+                .find(|output| output.role == OutputRole::Materializable)
+                .unwrap();
+            let mut archive_witness = witness(&leaf);
+            archive_witness.path = format!(
+                "/__rabs/inputs/deps/{}",
+                String::from_utf8_lossy(archive.virtual_path.as_bytes())
+            );
+            archive_witness.role = archive.role;
+            archive_witness.virtual_path = archive.virtual_path.clone();
+            archive_witness.object = archive.object.clone();
+            // This exact materializable edge catches accidental classification
+            // of a native Rlib producer as metadata-only.
+            fixture
+                .coord
+                .verify_committed_dependencies(
+                    std::slice::from_ref(&archive_witness),
+                    CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                )
+                .unwrap();
+            let archive_edge = ProvisionalAncestorRef {
+                producer_action_key: leaf.manifest.action_key.clone(),
+                role: archive.role,
+                virtual_path: archive.virtual_path.clone(),
+                consumed_object: archive.object.clone(),
+            };
+            let consumer = fixture.prepare_dag(
+                121,
+                vec![archive_edge.clone()],
+                &[
+                    (
+                        "libconsumer.rmeta",
+                        OutputRole::ProvisionalMetadata,
+                        b"consumer metadata",
+                    ),
+                    (
+                        "libconsumer.rlib",
+                        OutputRole::Materializable,
+                        b"native DAG consumer",
+                    ),
+                ],
+                CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+            );
+            assert_eq!(consumer.manifest.key_epoch, 31);
+            fixture.commit(&consumer);
+            fixture.compare_twice(&consumer);
+            fixture.assert_unsampled(&leaf);
+            let healthy = fixture.root.path().join("native-dag-healthy");
+            assert!(matches!(
+                fixture.replay(&consumer, &healthy, None).unwrap(),
+                ServeOutcome::Served { .. }
+            ));
+
+            let metadata_only = fixture.prepare_generated_leaf(
+                122,
+                &[(
+                    "libmetadata.rmeta",
+                    OutputRole::ProvisionalMetadata,
+                    b"only metadata",
+                )],
+                true,
+            );
+            fixture.commit(&metadata_only);
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_dependencies(
+                        &[witness(&metadata_only)],
+                        CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                    )
+                    .is_err()
+            );
+            let invalid_leaf = fixture.prepare_class(
+                123,
+                vec![archive_edge],
+                &[(
+                    "libinvalid.rlib",
+                    OutputRole::Materializable,
+                    b"invalid leaf",
+                )],
+                LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS,
+            );
+            assert!(
+                matches!(fixture.coord.commit_offer(&invalid_leaf, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason)) if reason.contains("generated workspace leaf offer"))
+            );
+            fixture.assert_unpublished(&invalid_leaf);
+            let orphan = fixture.prepare_class(
+                124,
+                Vec::new(),
+                &[(
+                    "liborphan.rlib",
+                    OutputRole::Materializable,
+                    b"orphan native DAG",
+                )],
+                LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS,
+            );
+            assert!(
+                matches!(fixture.coord.commit_offer(&orphan, &sample_expected_descriptor()),
+                Err(CommitRefusal::CommittedDependency(reason)) if reason.contains("lacks bounded producer ancestry"))
+            );
+            fixture.assert_unpublished(&orphan);
+
+            if revoke_producer {
+                fixture.quarantine(&leaf.manifest.action_key);
+            } else {
+                fixture.expire_archive_closure(&leaf);
+            }
+            let reason = fixture
+                .coord
+                .verify_committed_dependencies(
+                    &[archive_witness],
+                    CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                )
+                .unwrap_err();
+            assert!(
+                reason.contains(&digest_key(&leaf.manifest.action_key)),
+                "{reason}"
+            );
+            let refused = fixture.root.path().join("native-dag-refused");
+            assert!(matches!(fixture.replay(&consumer, &refused, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                    if reason.contains(&digest_key(&leaf.manifest.action_key))));
+            assert!(!refused.exists());
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod generated;
 pub use generated::plan_generated_workspace_dag_library;
 pub(super) use generated::{
     GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
+    NATIVE_GENERATED_DAG_RLIB_ISOLATION_PROFILE,
 };
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
@@ -237,6 +238,9 @@ pub enum CommittedDependencyPolicy {
     /// Closed workspace metadata with complete own generated inputs and an
     /// exact committed workspace/immutable producer DAG, epoch 29.
     GeneratedWorkspaceDagMetadata,
+    /// Workspace archive with complete own-OUT_DIR static native inputs and
+    /// exact committed Rust producer ancestry, independently qualified, epoch 31.
+    NativeGeneratedWorkspaceDagRlib,
 }
 
 impl CommittedDependencyPolicy {
@@ -257,6 +261,9 @@ impl CommittedDependencyPolicy {
             DependencySourceKind::WorkspaceGeneratedDagMetadata => {
                 Some(Self::GeneratedWorkspaceDagMetadata)
             }
+            DependencySourceKind::WorkspaceNativeGeneratedDagRlib => {
+                Some(Self::NativeGeneratedWorkspaceDagRlib)
+            }
             // The source kind requires a retained policy capability. Only that
             // capability may select the separately qualified empty-input class.
             DependencySourceKind::WorkspaceTerminalMetadata => {
@@ -275,7 +282,8 @@ impl CommittedDependencyPolicy {
             | Self::MixedWorkspaceRlib
             | Self::ImmutableDagRlib
             | Self::WorkspaceDagRlib
-            | Self::GeneratedWorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
+            | Self::GeneratedWorkspaceDagRlib
+            | Self::NativeGeneratedWorkspaceDagRlib => RemoteDependencyOutputClass::Rlib,
             Self::WorkspaceMetadata
             | Self::MixedWorkspaceMetadata
             | Self::ImmutableDagMetadata
@@ -293,9 +301,9 @@ impl CommittedDependencyPolicy {
     /// A different source/mode, noncanonical layout, or unsupported inputs.
     pub fn validate_plan(self, plan: &DependencyActionPlan) -> Result<(), LiveRefusal> {
         match self {
-            Self::GeneratedWorkspaceDagRlib | Self::GeneratedWorkspaceDagMetadata => {
-                generated::validate_plan(plan, self)
-            }
+            Self::GeneratedWorkspaceDagRlib
+            | Self::GeneratedWorkspaceDagMetadata
+            | Self::NativeGeneratedWorkspaceDagRlib => generated::validate_plan(plan, self),
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
             Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
@@ -422,6 +430,7 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
         CommittedDependencyPolicy::WorkspaceTerminalMetadata => Some(&WORKSPACE_TERMINAL_METADATA),
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => Some(&generated::RLIB),
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => Some(&generated::METADATA),
+        CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => Some(&generated::NATIVE_RLIB),
         _ => None,
     }
 }
@@ -777,7 +786,8 @@ pub fn remote_committed_dependency_shape(
     policy.validate_plan(plan)?;
     match policy {
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
-        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => {
+        | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
             generated::shape(plan, policy, directories, dependencies, toolchain_root)
         }
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -1013,6 +1023,7 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::WorkspaceTerminalMetadata,
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+        CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -1041,6 +1052,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
         || (28..=29).contains(&descriptor.key_epoch)
+        || descriptor.key_epoch == 31
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1058,6 +1070,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
                 "rabs.canonical-workspace-terminal-leaf-metadata.",
                 "rabs.canonical-workspace-terminal-metadata.",
                 "rabs.canonical-workspace-generated-dag-rlib.",
+                "rabs.canonical-workspace-native-generated-dag-rlib.",
                 "rabs.canonical-workspace-generated-dag-metadata.",
             ]
             .into_iter()
@@ -1217,6 +1230,7 @@ pub fn remote_committed_dependency_key(
         policy,
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
+            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
     ) {
         return generated::key(
             plan,

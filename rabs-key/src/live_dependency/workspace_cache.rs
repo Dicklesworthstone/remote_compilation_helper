@@ -10,8 +10,10 @@
 //! Ordinary workspace metadata execution is not this closed profile.
 //! Generated leaf libraries use separate classes that also bind the complete
 //! own OUT_DIR tree and exact completed Cargo build-script record. The build
-//! script itself is not cached. Native searches, explicit externs and loadable
-//! implicit crate candidates remain in the fresh execution-only class. Exact
+//! script itself is not cached. A separately qualified archive class admits
+//! explicit bundled static libraries from that same complete own OUT_DIR.
+//! Search-only, foreign-root, dynamic and metadata-native inputs remain fresh,
+//! as do explicit externs and loadable implicit crate candidates. Exact
 //! empty metadata is still keyed and supplied as an inert read-only input.
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
@@ -46,6 +48,11 @@ const METADATA_SEMANTICS: &str = "completed independently supervised pure Rust l
 // and component bytes above remain unchanged, including already earned evidence.
 const GENERATED_KEY_EPOCH: u32 = 26;
 const GENERATED_METADATA_KEY_EPOCH: u32 = 27;
+const NATIVE_GENERATED_KEY_EPOCH: u32 = 30;
+const NATIVE_GENERATED_POLICY_DOMAIN: &str =
+    "rabs.canonical-workspace-native-generated-rlib.isolation.v1";
+const NATIVE_GENERATED_SEMANTICS_DOMAIN: &str =
+    "rabs.canonical-workspace-native-generated-rlib.semantics.v1";
 const GENERATED_POLICY_DOMAIN: &str = "rabs.canonical-workspace-generated-rlib.isolation.v1";
 const GENERATED_METADATA_POLICY_DOMAIN: &str =
     "rabs.canonical-workspace-generated-metadata.isolation.v1";
@@ -148,6 +155,25 @@ pub(super) const GENERATED_METADATA_ISOLATION_PROFILE: &str = "canonical-workspa
     independent generated-metadata samples, release, quarantine and private \
     installation gates; no provisional, adopted or request-owned producer authority";
 
+pub(super) const NATIVE_GENERATED_ISOLATION_PROFILE: &str = "canonical-workspace-native-generated-rlib-v1: \
+    driver-retained selected ordinary leaf library; complete immutable workspace \
+    and disjoint own OUT_DIR files and directory membership; exact completed \
+    Cargo build-script stdout and fully keyed matching environment; build script \
+    runs normally and supplies no compiler authority; independently negotiated \
+    canonical-workspace-exec-v3 Rlib namespace without procfs or entropy devices; \
+    static native search inputs confined to the complete own OUT_DIR, every \
+    selected directory and named bundled archive retained and validated; exact \
+    native search order and supported bundle, whole-archive and verbatim \
+    modifiers; no foreign generated root, dynamic or framework search, external \
+    linker, Rust extern or loadable crate candidate; exact empty metadata remains \
+    keyed without producer authority; exact toolchain and measured ELF runtime; \
+    original source, generated tree and Cargo record revalidated at capture and \
+    delivery; complete output rlib native closure required including source link \
+    attributes, thin archives and linker scripts; authenticated completed drained \
+    worker receipt, dep-info and tracked-control read veto; separate native \
+    generated samples, class quarantine and private installation gates; no local \
+    completion, provisional or adopted authority";
+
 /// Independently qualified workspace library profiles. Identifying a profile
 /// never supplies the driver's graph or an authenticated worker receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +189,9 @@ pub enum ClosedWorkspaceLibraryClass {
     /// Closed leaf-library check with complete generated input and Cargo
     /// run-record evidence, never ordinary metadata execution authority.
     GeneratedMetadata,
+    /// Closed archive with static native inputs in the complete own OUT_DIR.
+    /// Its independent evidence cannot be borrowed from generated Rust leaves.
+    NativeGeneratedRlib,
 }
 
 impl ClosedWorkspaceLibraryClass {
@@ -172,18 +201,24 @@ impl ClosedWorkspaceLibraryClass {
             Self::Metadata => DependencySourceKind::WorkspaceClosedMetadata,
             Self::GeneratedRlib => DependencySourceKind::WorkspaceGeneratedRlib,
             Self::GeneratedMetadata => DependencySourceKind::WorkspaceGeneratedMetadata,
+            Self::NativeGeneratedRlib => DependencySourceKind::WorkspaceNativeGeneratedRlib,
         }
     }
 
     const fn output_class(self) -> RemoteDependencyOutputClass {
         match self {
-            Self::Rlib | Self::GeneratedRlib => RemoteDependencyOutputClass::Rlib,
+            Self::Rlib | Self::GeneratedRlib | Self::NativeGeneratedRlib => {
+                RemoteDependencyOutputClass::Rlib
+            }
             Self::Metadata | Self::GeneratedMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
     const fn requires_generated_inputs(self) -> bool {
-        matches!(self, Self::GeneratedRlib | Self::GeneratedMetadata)
+        matches!(
+            self,
+            Self::GeneratedRlib | Self::GeneratedMetadata | Self::NativeGeneratedRlib
+        )
     }
 
     const fn key_epoch(self) -> u32 {
@@ -192,6 +227,7 @@ impl ClosedWorkspaceLibraryClass {
             Self::Metadata => METADATA_KEY_EPOCH,
             Self::GeneratedRlib => GENERATED_KEY_EPOCH,
             Self::GeneratedMetadata => GENERATED_METADATA_KEY_EPOCH,
+            Self::NativeGeneratedRlib => NATIVE_GENERATED_KEY_EPOCH,
         }
     }
 
@@ -210,6 +246,10 @@ impl ClosedWorkspaceLibraryClass {
                 GENERATED_METADATA_POLICY_DOMAIN,
                 GENERATED_METADATA_ISOLATION_PROFILE.as_bytes(),
             ),
+            Self::NativeGeneratedRlib => compute(
+                NATIVE_GENERATED_POLICY_DOMAIN,
+                NATIVE_GENERATED_ISOLATION_PROFILE.as_bytes(),
+            ),
         }
     }
 
@@ -224,6 +264,10 @@ impl ClosedWorkspaceLibraryClass {
                 GENERATED_METADATA_SEMANTICS_DOMAIN,
                 GENERATED_METADATA_SEMANTICS.as_bytes(),
             ),
+            Self::NativeGeneratedRlib => compute(
+                NATIVE_GENERATED_SEMANTICS_DOMAIN,
+                NATIVE_GENERATED_ISOLATION_PROFILE.as_bytes(),
+            ),
         }
     }
 
@@ -233,6 +277,9 @@ impl ClosedWorkspaceLibraryClass {
             Self::Metadata => "rabs.canonical-workspace-closed-metadata.environment.v2",
             Self::GeneratedRlib => "rabs.canonical-workspace-generated-rlib.environment.v1",
             Self::GeneratedMetadata => "rabs.canonical-workspace-generated-metadata.environment.v1",
+            Self::NativeGeneratedRlib => {
+                "rabs.canonical-workspace-native-generated-rlib.environment.v1"
+            }
         }
     }
 
@@ -242,6 +289,9 @@ impl ClosedWorkspaceLibraryClass {
             Self::Metadata => "rabs.canonical-workspace-closed-metadata.invocation.v2",
             Self::GeneratedRlib => "rabs.canonical-workspace-generated-rlib.invocation.v1",
             Self::GeneratedMetadata => "rabs.canonical-workspace-generated-metadata.invocation.v1",
+            Self::NativeGeneratedRlib => {
+                "rabs.canonical-workspace-native-generated-rlib.invocation.v1"
+            }
         }
     }
 
@@ -251,6 +301,9 @@ impl ClosedWorkspaceLibraryClass {
             Self::GeneratedRlib => Some("rabs.canonical-workspace-generated-rlib.dependencies.v1"),
             Self::GeneratedMetadata => {
                 Some("rabs.canonical-workspace-generated-metadata.dependencies.v1")
+            }
+            Self::NativeGeneratedRlib => {
+                Some("rabs.canonical-workspace-native-generated-rlib.dependencies.v1")
             }
         }
     }
@@ -277,6 +330,11 @@ pub fn plan_closed_workspace_library(
     let class = match (output, execution.generated_root.is_some()) {
         (RemoteDependencyOutputClass::Rlib, false) => ClosedWorkspaceLibraryClass::Rlib,
         (RemoteDependencyOutputClass::Metadata, false) => ClosedWorkspaceLibraryClass::Metadata,
+        (RemoteDependencyOutputClass::Rlib, true)
+            if !remote::validate_plan_native_roots(execution)?.is_empty() =>
+        {
+            ClosedWorkspaceLibraryClass::NativeGeneratedRlib
+        }
         (RemoteDependencyOutputClass::Rlib, true) => ClosedWorkspaceLibraryClass::GeneratedRlib,
         (RemoteDependencyOutputClass::Metadata, true) => {
             ClosedWorkspaceLibraryClass::GeneratedMetadata
@@ -292,9 +350,10 @@ pub fn plan_closed_workspace_library(
 ///
 /// # Errors
 /// A noncanonical plan, mismatched output/profile, nonlibrary output, or
-/// executable/native/extern inputs. Generated inputs require their distinct
-/// profile; the key builder additionally requires a complete tree and matching
-/// Cargo record. Directory candidates are checked by the remote shape.
+/// executable/extern or unclosed native inputs. Generated inputs require their
+/// distinct profile; only the native Rlib profile admits explicit bundled
+/// static libraries in its complete own OUT_DIR. The key builder additionally
+/// requires every native directory/archive and a matching Cargo record.
 pub fn validate_closed_workspace_library_plan(
     plan: &DependencyActionPlan,
 ) -> Result<ClosedWorkspaceLibraryClass, LiveRefusal> {
@@ -305,6 +364,9 @@ pub fn validate_closed_workspace_library_plan(
         DependencySourceKind::WorkspaceGeneratedRlib => ClosedWorkspaceLibraryClass::GeneratedRlib,
         DependencySourceKind::WorkspaceGeneratedMetadata => {
             ClosedWorkspaceLibraryClass::GeneratedMetadata
+        }
+        DependencySourceKind::WorkspaceNativeGeneratedRlib => {
+            ClosedWorkspaceLibraryClass::NativeGeneratedRlib
         }
         _ => {
             return Err(LiveRefusal::Facts(
@@ -320,17 +382,41 @@ pub fn validate_closed_workspace_library_plan(
             .any(|arg| arg == "--test")
         || plan.generated_root.is_some() != class.requires_generated_inputs()
         || !plan.native_roots.is_empty()
-        || !plan.invocation.native_libs.is_empty()
-        || !remote::validate_plan_native_roots(plan)?.is_empty()
+        || (class != ClosedWorkspaceLibraryClass::NativeGeneratedRlib
+            && (!plan.invocation.native_libs.is_empty()
+                || !remote::validate_plan_native_roots(plan)?.is_empty()))
         || !plan.externs.is_empty()
         || !plan.invocation.externs.is_empty()
         || remote::remote_dependency_output_class(&plan.invocation) != Ok(class.output_class())
     {
         return Err(LiveRefusal::Facts(
-            "workspace cache requires a matching closed Rust leaf-library generated-input profile without native searches, native library directives or extern inputs".into(),
+            "workspace cache requires its exact closed leaf-library profile, own generated inputs and no externs; native inputs require the separate static Rlib class".into(),
         ));
     }
+    if class == ClosedWorkspaceLibraryClass::NativeGeneratedRlib {
+        validate_native_generated_inputs(plan)?;
+    }
     Ok(class)
+}
+
+/// Both native-generated cache classes retain exactly the already supported
+/// own-OUT_DIR static archive input contract. No newly trusted filesystem or
+/// linker input is introduced by granting cache reuse to that worker execution.
+pub(super) fn validate_native_generated_inputs(
+    plan: &DependencyActionPlan,
+) -> Result<(), LiveRefusal> {
+    if plan.generated_root.is_none()
+        || !plan.native_roots.is_empty()
+        || plan.invocation.native_libs.is_empty()
+        || remote::validate_plan_native_roots(plan)?.is_empty()
+        || remote::remote_dependency_output_class(&plan.invocation)
+            != Ok(RemoteDependencyOutputClass::Rlib)
+    {
+        return Err(LiveRefusal::Facts(
+            "native generated workspace caching requires explicit bundled static inputs in the complete own OUT_DIR and Rlib execution".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Invocation boundary for dependency-bearing archives only. Callers separately
@@ -414,6 +500,7 @@ pub fn closed_workspace_library_descriptor_class(
         ClosedWorkspaceLibraryClass::Metadata,
         ClosedWorkspaceLibraryClass::GeneratedRlib,
         ClosedWorkspaceLibraryClass::GeneratedMetadata,
+        ClosedWorkspaceLibraryClass::NativeGeneratedRlib,
     ]
     .into_iter()
     .find(|class| {
@@ -439,7 +526,11 @@ pub fn closed_workspace_library_descriptor_class(
 pub fn uses_closed_workspace_library_namespace(descriptor: &ActionDescriptor) -> bool {
     matches!(
         descriptor.key_epoch,
-        KEY_EPOCH | METADATA_KEY_EPOCH | GENERATED_KEY_EPOCH | GENERATED_METADATA_KEY_EPOCH
+        KEY_EPOCH
+            | METADATA_KEY_EPOCH
+            | GENERATED_KEY_EPOCH
+            | GENERATED_METADATA_KEY_EPOCH
+            | NATIVE_GENERATED_KEY_EPOCH
     ) || [
         descriptor.sandbox_semantic_policy.domain,
         descriptor.execution_semantics.domain,
@@ -451,6 +542,7 @@ pub fn uses_closed_workspace_library_namespace(descriptor: &ActionDescriptor) ->
             || domain.starts_with("rabs.canonical-workspace-closed-metadata.")
             || domain.starts_with("rabs.canonical-workspace-generated-rlib.")
             || domain.starts_with("rabs.canonical-workspace-generated-metadata.")
+            || domain.starts_with("rabs.canonical-workspace-native-generated-rlib.")
     })
 }
 
@@ -488,6 +580,7 @@ pub fn remote_closed_workspace_library_key(
         build_script_output,
         inputs,
     )?;
+    remote::validate_generated_native_manifest(plan, inputs)?;
     remote::bind_remote_execution_inputs(
         &mut key,
         plan,
@@ -564,9 +657,10 @@ mod tests {
     const GENERATED: &str = "/__rabs/out/cargo/debug/build/leaf-123/out";
     const GENERATED_RECORD: &[u8] =
         b"cargo:rerun-if-changed=build.rs\ncargo:rustc-env=GENERATED_MARKER=retained\n";
+    const NATIVE_RECORD: &[u8] = b"cargo:rerun-if-changed=native.h\ncargo:rustc-env=GENERATED_MARKER=retained\ncargo:rustc-link-search=native=/__rabs/out/cargo/debug/build/leaf-123/out\ncargo:rustc-link-lib=static=leaf_native\n";
 
     fn request(class: ClosedWorkspaceLibraryClass) -> (Vec<String>, Vec<(String, String)>) {
-        let (argv, mut env) = (
+        let (mut argv, mut env): (Vec<String>, Vec<(String, String)>) = (
             [
                 "/__rabs/toolchain/bin/rustc",
                 "--crate-name=leaf",
@@ -605,6 +699,12 @@ mod tests {
         if class.requires_generated_inputs() {
             env.push(("OUT_DIR".into(), GENERATED.into()));
             env.push(("GENERATED_MARKER".into(), "retained".into()));
+        }
+        if class == ClosedWorkspaceLibraryClass::NativeGeneratedRlib {
+            argv.extend([
+                format!("-Lnative={GENERATED}"),
+                "-lstatic=leaf_native".into(),
+            ]);
         }
         (argv, env)
     }
@@ -710,6 +810,160 @@ mod tests {
             sysroot_root_digest: compute("rabs.test.workspace-closed-input.v1", b"sysroot"),
             runtime_libraries: Vec::new(),
         }
+    }
+
+    fn native_generated_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut captured = generated_inputs(plan);
+        for relative in ["value.h", "libleaf_native.a", "nested/libleaf_native.a"] {
+            captured.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path(relative).into_bytes(),
+                ),
+                object: ObjectId(compute(
+                    "rabs.test.native-generated-input.v1",
+                    relative.as_bytes(),
+                )),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        for listing in &mut captured.directory_enumerations {
+            if listing.virtual_path.as_bytes() == plan.generated_virtual_root().as_bytes() {
+                listing.entries.push(RawBytes::from("value.h"));
+            }
+            if listing.virtual_path.as_bytes() == plan.generated_virtual_root().as_bytes()
+                || listing.virtual_path.as_bytes()
+                    == plan.generated_input_virtual_path("nested").as_bytes()
+            {
+                listing.entries.push(RawBytes::from("libleaf_native.a"));
+                listing
+                    .entries
+                    .sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            }
+        }
+        captured
+    }
+
+    #[test]
+    fn native_generated_leaf_has_separate_authority_and_binds_complete_native_inputs() {
+        let plan = plan(ClosedWorkspaceLibraryClass::NativeGeneratedRlib);
+        let captured = native_generated_inputs(&plan);
+        let keyed = key_with_record(&plan, &captured, Some(NATIVE_RECORD)).unwrap();
+        assert_eq!(keyed.descriptor.key_epoch, 30);
+        assert_eq!(
+            closed_workspace_library_descriptor_class(&keyed.descriptor),
+            Some(ClosedWorkspaceLibraryClass::NativeGeneratedRlib)
+        );
+        assert!(uses_closed_workspace_library_namespace(&keyed.descriptor));
+        assert!(
+            !super::super::workspace_dependency_cache::uses_committed_dependency_namespace(
+                &keyed.descriptor
+            )
+        );
+        for old in [
+            DependencySourceKind::WorkspaceGeneratedRlib,
+            DependencySourceKind::WorkspaceClosedRlib,
+        ] {
+            let mut changed = plan.clone();
+            changed.source_kind = old;
+            assert!(key_with_record(&changed, &captured, Some(NATIVE_RECORD)).is_err());
+        }
+        for epoch in [16, 26, 28, 31] {
+            let mut descriptor = keyed.descriptor.clone();
+            descriptor.key_epoch = epoch;
+            assert!(closed_workspace_library_descriptor_class(&descriptor).is_none());
+            assert!(uses_closed_workspace_library_namespace(&descriptor));
+        }
+        // The source manifest, generated header and every candidate archive are
+        // exact inputs, including
+        // a later search candidate which rustc need not open on this execution.
+        for index in [
+            0,
+            captured.inputs.len() - 3,
+            captured.inputs.len() - 2,
+            captured.inputs.len() - 1,
+        ] {
+            let mut changed = captured.clone();
+            changed.inputs[index].object.0.bytes[0] ^= 1;
+            assert_ne!(
+                keyed.action_key,
+                key_with_record(&plan, &changed, Some(NATIVE_RECORD))
+                    .unwrap()
+                    .action_key
+            );
+        }
+        let mut record = NATIVE_RECORD.to_vec();
+        record.extend_from_slice(b"cargo:warning=another complete build record\n");
+        assert_ne!(
+            keyed.action_key,
+            key_with_record(&plan, &captured, Some(&record))
+                .unwrap()
+                .action_key
+        );
+        assert!(key_with_record(&plan, &captured, None).is_err());
+
+        let (mut argv, env) = request(ClosedWorkspaceLibraryClass::NativeGeneratedRlib);
+        argv.push(format!("-Lnative={GENERATED}/nested"));
+        let first = plan_closed_workspace_library(&execution(&argv, &env)).unwrap();
+        let first_key = key_with_record(&first, &captured, Some(NATIVE_RECORD)).unwrap();
+        let root = argv
+            .iter()
+            .position(|arg| arg == &format!("-Lnative={GENERATED}"))
+            .unwrap();
+        let nested = argv.len() - 1;
+        argv.swap(root, nested);
+        let reordered = plan_closed_workspace_library(&execution(&argv, &env)).unwrap();
+        assert_ne!(
+            first_key.action_key,
+            key_with_record(&reordered, &captured, Some(NATIVE_RECORD))
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn native_generated_leaf_rejects_missing_archives_topology_and_unclosed_inputs() {
+        let original = plan(ClosedWorkspaceLibraryClass::NativeGeneratedRlib);
+        let captured = native_generated_inputs(&original);
+        for mutation in 0..7 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed.invocation.native_libs.clear(),
+                1 => changed.invocation.native_libs = vec!["dylib=leaf_native".into()],
+                2 => changed.invocation.native_libs = vec!["static:-bundle=leaf_native".into()],
+                3 => changed.invocation.native_libs = vec!["static:+verbatim=../outside.a".into()],
+                4 => changed
+                    .native_roots
+                    .push("/__rabs/out/cargo/debug/build/foreign/out".into()),
+                5 => changed.generated_root = None,
+                _ => changed.source_kind = DependencySourceKind::WorkspaceGeneratedMetadata,
+            }
+            assert!(
+                key_with_record(&changed, &captured, Some(NATIVE_RECORD)).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let mut missing = captured.clone();
+        missing
+            .inputs
+            .retain(|input| !input.virtual_path.as_bytes().ends_with(b".a"));
+        for listing in &mut missing.directory_enumerations {
+            listing
+                .entries
+                .retain(|name| name.as_bytes() != b"libleaf_native.a");
+        }
+        assert!(key_with_record(&original, &missing, Some(NATIVE_RECORD)).is_err());
+        let (mut argv, env) = request(ClosedWorkspaceLibraryClass::NativeGeneratedRlib);
+        argv.push(format!("-Lnative={GENERATED}/absent"));
+        let absent_directory = plan_closed_workspace_library(&execution(&argv, &env)).unwrap();
+        assert!(key_with_record(&absent_directory, &captured, Some(NATIVE_RECORD)).is_err());
+        let mut candidate = directories(&original);
+        candidate[0].artifacts.push(ExternFact {
+            path: format!("{OUTPUT}/libuncommitted.rlib"),
+            content_digest: compute("rabs.test.native-generated-input.v1", b"uncommitted"),
+        });
+        assert!(remote_closed_workspace_library_shape(&original, &candidate, TOOLCHAIN).is_err());
     }
 
     fn directories(plan: &DependencyActionPlan) -> Vec<DependencyDirectoryFact> {
@@ -1063,7 +1317,12 @@ mod tests {
                     },
                     HOST,
                 )
-                .and_then(|fresh| plan_closed_workspace_library(&fresh));
+                .and_then(|mut fresh| {
+                    // The newly qualified native class never widens this
+                    // existing generated-Rust class's authority.
+                    fresh.source_kind = class.source_kind();
+                    validate_closed_workspace_library_plan(&fresh)
+                });
                 assert!(candidate.is_err(), "{class:?}: {flags:?}");
             }
             let plan = plan_closed_workspace_library(&execution(&argv, &env)).unwrap();
@@ -1165,6 +1424,8 @@ mod tests {
                         "canonical-workspace-generated-rlib-v1",
                     ClosedWorkspaceLibraryClass::GeneratedMetadata =>
                         "canonical-workspace-generated-metadata-v1",
+                    ClosedWorkspaceLibraryClass::NativeGeneratedRlib =>
+                        "canonical-workspace-native-generated-rlib-v1",
                 }
             );
             assert_eq!(
@@ -1351,8 +1612,8 @@ mod tests {
     }
 
     #[test]
-    fn pure_workspace_libraries_refuse_generated_inputs_and_all_leaf_classes_refuse_native_inputs()
-    {
+    fn pure_workspace_libraries_refuse_generated_inputs_and_rust_only_profiles_refuse_native_inputs()
+     {
         for class in CLASSES {
             for flags in [
                 vec!["--emit=dep-info,metadata", "--crate-type=bin"],
@@ -1385,7 +1646,14 @@ mod tests {
             relabeled.source_kind = class.source_kind();
             assert!(validate_closed_workspace_library_plan(&relabeled).is_err());
             argv.extend([format!("-Lnative={generated}"), "-lstatic=leaf".into()]);
-            assert!(plan_closed_workspace_library(&execution(&argv, &env)).is_err());
+            let mut old_generated = execution(&argv, &env);
+            old_generated.source_kind = match class.output_class() {
+                RemoteDependencyOutputClass::Rlib => DependencySourceKind::WorkspaceGeneratedRlib,
+                RemoteDependencyOutputClass::Metadata => {
+                    DependencySourceKind::WorkspaceGeneratedMetadata
+                }
+            };
+            assert!(validate_closed_workspace_library_plan(&old_generated).is_err());
             let plan = plan(class);
             assert!(
                 remote_closed_workspace_library_key(
@@ -1618,6 +1886,9 @@ mod tests {
                 ClosedWorkspaceLibraryClass::GeneratedRlib => GENERATED_ISOLATION_PROFILE,
                 ClosedWorkspaceLibraryClass::GeneratedMetadata => {
                     GENERATED_METADATA_ISOLATION_PROFILE
+                }
+                ClosedWorkspaceLibraryClass::NativeGeneratedRlib => {
+                    NATIVE_GENERATED_ISOLATION_PROFILE
                 }
             };
             assert!(profile.contains("other units in the operation may execute project code"));

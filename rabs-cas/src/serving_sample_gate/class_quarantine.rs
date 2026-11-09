@@ -23,6 +23,7 @@ const WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-closed-rlib-v2";
 const WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2";
 const WORKSPACE_GENERATED_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
 const WORKSPACE_GENERATED_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
+const WORKSPACE_NATIVE_GENERATED_RLIB_CLASS: &str = "rustc-workspace-native-generated-rlib-v1";
 const WORKSPACE_COMMITTED_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
 const WORKSPACE_COMMITTED_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
 const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
@@ -33,6 +34,8 @@ const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
 const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
 const GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
 const GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-generated-dag-metadata-v1";
+const NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str =
+    "rustc-workspace-native-generated-dag-rlib-v1";
 const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v2";
 const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 
@@ -108,6 +111,9 @@ pub(super) fn refusal(
             [SqlValue::Text(class)] if class == WORKSPACE_GENERATED_METADATA_CLASS => {
                 WORKSPACE_GENERATED_METADATA_CLASS
             }
+            [SqlValue::Text(class)] if class == WORKSPACE_NATIVE_GENERATED_RLIB_CLASS => {
+                WORKSPACE_NATIVE_GENERATED_RLIB_CLASS
+            }
             [SqlValue::Text(class)] if class == WORKSPACE_COMMITTED_RLIB_CLASS => {
                 WORKSPACE_COMMITTED_RLIB_CLASS
             }
@@ -137,6 +143,9 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
                 GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
+                NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
             }
             [SqlValue::Text(class)] if class == WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
@@ -650,6 +659,10 @@ mod tests {
                 ActionClassRisk::GeneratedWorkspaceMetadata,
             ),
             (
+                WORKSPACE_NATIVE_GENERATED_RLIB_CLASS,
+                ActionClassRisk::NativeGeneratedWorkspaceRlib,
+            ),
+            (
                 WORKSPACE_COMMITTED_RLIB_CLASS,
                 ActionClassRisk::CommittedWorkspaceRlib,
             ),
@@ -684,6 +697,10 @@ mod tests {
                 ActionClassRisk::GeneratedWorkspaceDagMetadata,
             ),
             (
+                NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS,
+                ActionClassRisk::NativeGeneratedWorkspaceDagRlib,
+            ),
+            (
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 ActionClassRisk::WorkspaceTerminalLeafMetadata,
             ),
@@ -703,6 +720,7 @@ mod tests {
                 WORKSPACE_METADATA_CLASS,
                 WORKSPACE_GENERATED_RLIB_CLASS,
                 WORKSPACE_GENERATED_METADATA_CLASS,
+                WORKSPACE_NATIVE_GENERATED_RLIB_CLASS,
                 DEPENDENCY_CLASS,
                 WORKSPACE_COMMITTED_RLIB_CLASS,
                 WORKSPACE_COMMITTED_METADATA_CLASS,
@@ -714,6 +732,7 @@ mod tests {
                 WORKSPACE_DAG_METADATA_CLASS,
                 GENERATED_WORKSPACE_DAG_RLIB_CLASS,
                 GENERATED_WORKSPACE_DAG_METADATA_CLASS,
+                NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS,
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 WORKSPACE_TERMINAL_METADATA_CLASS,
             ]

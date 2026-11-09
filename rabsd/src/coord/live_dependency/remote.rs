@@ -962,6 +962,7 @@ impl RemoteValidation {
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib
         ) {
             request
                 .canonical_paths
@@ -985,7 +986,8 @@ impl RemoteValidation {
                 DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
-                | DependencySourceKind::WorkspaceGeneratedMetadata => {
+                | DependencySourceKind::WorkspaceGeneratedMetadata
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
                     remote_closed_workspace_library_shape(&request.plan, &directories, &toolchain)
                 }
                 _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
@@ -1060,6 +1062,7 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
         plan.source_kind,
         DependencySourceKind::WorkspaceGeneratedDagRlib
             | DependencySourceKind::WorkspaceGeneratedDagMetadata
+            | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
     ) {
         let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
             .ok_or("generated workspace DAG lost its committed-input policy")?;
@@ -1096,12 +1099,13 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceNativeGeneratedRlib
     ) {
         return validate_closed_workspace_library_plan(plan)
             .map(|class| match class {
-                ClosedWorkspaceLibraryClass::Rlib | ClosedWorkspaceLibraryClass::GeneratedRlib => {
-                    DependencyExecutionMode::Rlib
-                }
+                ClosedWorkspaceLibraryClass::Rlib
+                | ClosedWorkspaceLibraryClass::GeneratedRlib
+                | ClosedWorkspaceLibraryClass::NativeGeneratedRlib => DependencyExecutionMode::Rlib,
                 ClosedWorkspaceLibraryClass::Metadata
                 | ClosedWorkspaceLibraryClass::GeneratedMetadata => {
                     DependencyExecutionMode::ClosedMetadata
@@ -1153,7 +1157,8 @@ fn verify_execution_policy(
             DependencySourceKind::WorkspaceClosedRlib
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
-            | DependencySourceKind::WorkspaceGeneratedMetadata => {
+            | DependencySourceKind::WorkspaceGeneratedMetadata
+            | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
                 let class = validate_closed_workspace_library_plan(plan)
                     .map_err(|error| error.to_string())?;
                 if closed_workspace_library_descriptor_class(&key.descriptor) != Some(class) {
@@ -1306,6 +1311,7 @@ impl RemoteDependencies {
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib
         ) {
             canonical
                 .ok_or("closed workspace library requires its retained Cargo graph")?
@@ -1341,7 +1347,8 @@ impl RemoteDependencies {
                 DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
-                | DependencySourceKind::WorkspaceGeneratedMetadata => {
+                | DependencySourceKind::WorkspaceGeneratedMetadata
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
                     remote_closed_workspace_library_shape(plan, directories, &visible_root)
                 }
                 _ => remote_dependency_shape(plan, directories, &visible_root),
@@ -1391,7 +1398,8 @@ impl RemoteDependencies {
                 DependencySourceKind::WorkspaceClosedRlib
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
-                | DependencySourceKind::WorkspaceGeneratedMetadata => {
+                | DependencySourceKind::WorkspaceGeneratedMetadata
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
                     remote_closed_workspace_library_key
                 }
                 _ => remote_dependency_key,
@@ -5391,7 +5399,14 @@ mod execution_resource_tests {
         // This boundary exercises actual request/key/policy assemblers. Real
         // retained trees and record generations are tested in canonical.rs;
         // these inventory facts do not assert compiler or TLS execution.
-        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (archive, dag, native) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
             let root = "/__rabs/out/cargo/debug/build/workspace_app-123/out";
             let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
             let dependency_path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
@@ -5406,6 +5421,12 @@ mod execution_resource_tests {
                     .iter_mut()
                     .find(|arg| arg.starts_with("--emit="))
                     .unwrap() = "--emit=dep-info,metadata,link".into();
+            }
+            if native {
+                fixture.argv.extend([
+                    format!("-Lnative={root}/nested"),
+                    "-lstatic=generated".into(),
+                ]);
             }
             let mut env = fixture.plan.execution_env.clone();
             env.extend([
@@ -5583,6 +5604,24 @@ mod execution_resource_tests {
                     entries: entries.into_iter().map(RawBytes::from).collect(),
                 }),
             );
+            if native {
+                inputs.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(
+                        plan.generated_input_virtual_path("nested/libgenerated.a")
+                            .into_bytes(),
+                    ),
+                    object: ObjectId(digest(b"exact retained static archive")),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                });
+                inputs
+                    .directory_enumerations
+                    .last_mut()
+                    .unwrap()
+                    .entries
+                    .insert(0, RawBytes::from("libgenerated.a"));
+            }
             let runtime = rabs_key::typed_digest::compute(
                 rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
                 b"runtime",
@@ -5615,11 +5654,14 @@ mod execution_resource_tests {
             .unwrap();
             assert_eq!(
                 key.descriptor.key_epoch,
-                match (archive, dag) {
-                    (true, false) => 26,
-                    (false, false) => 27,
-                    (true, true) => 28,
-                    (false, true) => 29,
+                match (archive, dag, native) {
+                    (true, false, true) => 30,
+                    (true, true, true) => 31,
+                    (true, false, false) => 26,
+                    (false, false, false) => 27,
+                    (true, true, false) => 28,
+                    (false, true, false) => 29,
+                    (false, _, true) => unreachable!("native inputs require an archive"),
                 }
             );
             verify_execution_policy(plan, &key, mode, policy).unwrap();
@@ -5632,8 +5674,12 @@ mod execution_resource_tests {
                 for other in [
                     CommittedDependencyPolicy::WorkspaceDagRlib,
                     CommittedDependencyPolicy::WorkspaceDagMetadata,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+                    CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
                 ] {
-                    assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());
+                    if Some(other) != policy {
+                        assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());
+                    }
                 }
             }
             for mutation in 0..3 {
