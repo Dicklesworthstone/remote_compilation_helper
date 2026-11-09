@@ -183,10 +183,11 @@ pub(super) const INPUT_NAMES: &[&str] = &[
 pub(super) fn fingerprint_hasher() -> Hasher {
     let mut hasher = Hasher::new();
     // Prior stamps can describe outputs retained across changed selected
-    // lifecycle inputs, or a pnpm invocation that skipped those scripts.
+    // lifecycle inputs, a skipped pnpm lifecycle, or changed install settings
+    // such as NODE_ENV and npm_config_omit that were absent from their keys.
     // Invalidate their reuse authority while preserving the completed output
     // inventory as ownership evidence for one new frozen installation.
-    hasher.update(b"rch-dependency-install-v4\0");
+    hasher.update(b"rch-dependency-install-v5\0");
     hasher
 }
 

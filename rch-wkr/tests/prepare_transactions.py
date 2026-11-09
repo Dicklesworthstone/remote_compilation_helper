@@ -520,6 +520,32 @@ class PrepareTransactions(unittest.TestCase):
         self.assertEqual(self.events(state), ["install"])
         self.assertEqual(self.invocations(state), ["npm", "1", "ci"])
 
+    def test_install_environment_changes_invalidate_ordinary_reuse_without_disclosing_values(self):
+        project, state = self.project("install-environment")
+        secret = "fixture-registry-credential-must-stay-private"
+        shared = {"npm_config__authToken": secret}
+        previous = None
+        for settings in ({"NODE_ENV": "production"}, {"NODE_ENV": "development"},
+                         {"NODE_ENV": "development", "npm_config_omit": "dev"}):
+            with self.subTest(settings=settings):
+                env = shared | settings
+                current = self.report(self.start(project, state, extra_env=env), 0)
+                self.assertEqual(current["action"], "Installed")
+                if previous is not None:
+                    self.assertNotEqual(current["fingerprint"]["hash"], previous)
+                    self.assertEqual(current["fingerprint_changed_from"], previous)
+                # An unrelated per-attempt value must not defeat warm reuse.
+                warm = self.report(self.start(project, state,
+                    extra_env=env | {"RCH_BUILD_ID": "different-attempt"}), 0)
+                self.assertEqual(warm["action"], "Skipped")
+                self.assertEqual(warm["fingerprint"], current["fingerprint"])
+                self.assertNotIn(secret, json.dumps(current))
+                self.assertNotIn(secret, (project / ".rch_dep_fingerprint.json").read_text())
+                self.assertEqual(current["fingerprint"]["sources"], ["package.json", "package-lock.json"])
+                previous = current["fingerprint"]["hash"]
+        self.assertEqual(self.events(state), ["install"] * 3)
+        self.assertEqual(self.invocations(state), ["npm", "1", "ci"] * 3)
+
     def test_pnpm_repeat_shortcut_is_disabled_without_changing_frozen_arguments(self):
         inherited = {"PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL": "true",
                      "pnpm_config_optimistic_repeat_install": "true",

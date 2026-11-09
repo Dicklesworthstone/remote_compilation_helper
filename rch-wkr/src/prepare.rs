@@ -7,6 +7,7 @@
 //! write-ahead refusal fence. Another process must not turn that uncertainty
 //! into a cache hit or start a competing installer in the same directory.
 
+mod environment;
 mod install;
 mod outputs;
 mod workspace_inputs;
@@ -73,6 +74,7 @@ struct InputObservation {
 struct DependencyInputs {
     names: Vec<String>,
     members: Vec<Option<InputObservation>>,
+    environment: blake3::Hash,
     fingerprint: install::DependencyFingerprint,
     #[cfg(unix)]
     root: (u64, u64),
@@ -85,10 +87,12 @@ impl DependencyInputs {
             root.file_type().is_dir(),
             "dependency project is not a real directory"
         );
+        let environment = environment::capture()?;
         let inventory = workspace_inputs::discover(project, INPUT_NAMES)?;
         let names = inventory.names.clone();
         let mut budget = MAX_INPUT_BYTES;
         let mut hasher = install::fingerprint_hasher();
+        hasher.update(environment.as_bytes());
         let mut sources = Vec::new();
         let mut members = Vec::new();
         for name in &names {
@@ -158,6 +162,10 @@ impl DependencyInputs {
             );
             (root.dev(), root.ino())
         };
+        ensure!(
+            environment::capture()? == environment,
+            "package-manager environment changed during dependency capture"
+        );
         let fingerprint = install::DependencyFingerprint {
             hash: hasher.finalize().to_hex().to_string(),
             sources,
@@ -169,6 +177,7 @@ impl DependencyInputs {
         Ok(Self {
             names,
             members,
+            environment,
             fingerprint,
             #[cfg(unix)]
             root,
@@ -181,6 +190,10 @@ impl DependencyInputs {
         runtime: RequiredRuntime,
         action: PrepareAction,
     ) -> Result<()> {
+        ensure!(
+            self.environment == after.environment,
+            "package-manager environment changed during preparation"
+        );
         #[cfg(unix)]
         ensure!(
             self.root == after.root,
@@ -627,6 +640,25 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn generated_lockfile_cannot_hide_an_install_environment_change() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+        let before = DependencyInputs::capture(fixture.path()).unwrap();
+        std::fs::write(fixture.path().join("package-lock.json"), b"new lock").unwrap();
+        let mut after = DependencyInputs::capture(fixture.path()).unwrap();
+        before
+            .verify_after(&after, RequiredRuntime::Node, PrepareAction::Installed)
+            .unwrap();
+        // Inject changed capture evidence without mutating the process-wide
+        // environment used concurrently by other tests.
+        after.environment = blake3::hash(b"different installation environment");
+        let error = before
+            .verify_after(&after, RequiredRuntime::Node, PrepareAction::Installed)
+            .unwrap_err();
+        assert!(error.to_string().contains("environment changed"));
     }
 
     #[test]
