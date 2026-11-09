@@ -363,6 +363,114 @@ pub async fn capture_control_output(
     stderr_limit: usize,
     deadline: Instant,
 ) -> std::io::Result<std::process::Output> {
+    capture_control_output_with_ownership(
+        command,
+        input,
+        stdout_limit,
+        stderr_limit,
+        deadline,
+        ControlCaptureOwnership::ProcessGroup,
+    )
+    .await
+}
+
+/// Capture a dedicated local supervisor without leaving the caller's process group.
+///
+/// The byte limits, concurrent pipe handling and deadline match
+/// [`capture_control_output`]. Keeping the inherited group lets an enclosing
+/// workload owner stop the supervisor and its ordinary descendants together.
+/// The supervisor must separately prove descendant completion before publishing
+/// its response; EOF and the supervisor's exit alone do not prove that children
+/// with closed pipes have stopped.
+///
+/// On timeout, overflow, error or future cancellation, only the owned direct
+/// child is killed. Never signal the inherited group: it contains the caller.
+/// Callers must retain an interrupted-operation fence and must not claim that
+/// cancellation stopped descendants which escaped their enclosing owner. A
+/// dedicated supervisor may bind its foreground child to its own lifetime.
+///
+/// # Errors
+/// Returns the same capture errors as [`capture_control_output`]. An interrupted
+/// capture cannot authorize successful or complete supervised work.
+pub async fn capture_supervised_output_inherited_group(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    deadline: Instant,
+) -> std::io::Result<std::process::Output> {
+    capture_control_output_with_ownership(
+        command,
+        input,
+        stdout_limit,
+        stderr_limit,
+        deadline,
+        ControlCaptureOwnership::InheritedGroup,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ControlCaptureOwnership {
+    ProcessGroup,
+    InheritedGroup,
+}
+
+enum CapturedControlProcess {
+    ProcessGroup(OwnedProcessGroup),
+    InheritedGroup(tokio::process::Child),
+}
+
+impl CapturedControlProcess {
+    fn spawn(
+        command: &mut tokio::process::Command,
+        ownership: ControlCaptureOwnership,
+    ) -> std::io::Result<Self> {
+        match ownership {
+            ControlCaptureOwnership::ProcessGroup => {
+                OwnedProcessGroup::spawn(command).map(Self::ProcessGroup)
+            }
+            ControlCaptureOwnership::InheritedGroup => command
+                // Explicitly replace any earlier command-builder group setting.
+                // No cleanup path may signal this shared group.
+                .process_group(rustix::process::getpgrp().as_raw_nonzero().get())
+                .kill_on_drop(true)
+                .spawn()
+                .map(Self::InheritedGroup),
+        }
+    }
+
+    fn child(&mut self) -> &mut tokio::process::Child {
+        match self {
+            Self::ProcessGroup(process) => &mut process.child,
+            Self::InheritedGroup(child) => child,
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::ProcessGroup(process) => process.wait().await,
+            Self::InheritedGroup(child) => loop {
+                // Do not rely solely on SIGCHLD notification: the caller may
+                // inherit a blocked mask. Pipes already reached natural EOF,
+                // so reaping this exact child cannot hide a partial response.
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            },
+        }
+    }
+}
+
+async fn capture_control_output_with_ownership(
+    command: &mut tokio::process::Command,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    deadline: Instant,
+    ownership: ControlCaptureOwnership,
+) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -392,13 +500,17 @@ pub async fn capture_control_output(
         if Instant::now() >= deadline {
             return Err(expired());
         }
-        let mut process = OwnedProcessGroup::spawn(command)?;
-        let stdin = process.take_stdin();
+        let mut process = CapturedControlProcess::spawn(command, ownership)?;
+        let stdin = process.child().stdin.take();
         let stdout = process
-            .take_stdout()
+            .child()
+            .stdout
+            .take()
             .ok_or_else(|| std::io::Error::other("control command stdout pipe missing"))?;
         let stderr = process
-            .take_stderr()
+            .child()
+            .stderr
+            .take()
             .ok_or_else(|| std::io::Error::other("control command stderr pipe missing"))?;
         let upload = async {
             if let Some(input) = input {
@@ -416,8 +528,9 @@ pub async fn capture_control_output(
             read_control_stream(stdout, "stdout", stdout_buffer),
             read_control_stream(stderr, "stderr", stderr_buffer),
         )?;
-        // Natural EOF must precede wait(): wait stops residual descendants, and
-        // locally forcing pipe EOF must not turn partial evidence into success.
+        // Natural EOF must precede wait(): transport ownership stops residual
+        // group members there. Locally forcing EOF must never turn partial
+        // evidence into success; supervised callers verify their own receipt.
         let status = process.wait().await?;
         Ok(std::process::Output {
             status,
@@ -3117,31 +3230,37 @@ while True: signal.pause()
 
     #[tokio::test]
     async fn control_capture_drains_both_outputs_while_uploading() {
-        let input = vec![0x80; 512 * 1024];
-        let limit = 256 * 1024;
-        let mut command = tokio::process::Command::new("python3");
-        command.args([
-            "-c",
-            "import sys\n\
-             sys.stdout.buffer.write(bytes([254]) * 262144)\n\
-             sys.stdout.buffer.flush()\n\
-             sys.stderr.buffer.write(bytes([255]) * 262144)\n\
-             sys.stderr.buffer.flush()\n\
-             data = sys.stdin.buffer.read()\n\
-             sys.exit(17 if data == bytes([128]) * 524288 else 23)",
-        ]);
-        let output = capture_control_output(
-            &mut command,
-            Some(&input),
-            limit,
-            limit,
-            Instant::now() + Duration::from_secs(10),
-        )
-        .await
-        .expect("peer output must drain before the peer starts reading input");
-        assert_eq!(output.status.code(), Some(17));
-        assert_eq!(output.stdout, vec![0xfe; limit]);
-        assert_eq!(output.stderr, vec![0xff; limit]);
+        for ownership in [
+            ControlCaptureOwnership::ProcessGroup,
+            ControlCaptureOwnership::InheritedGroup,
+        ] {
+            let input = vec![0x80; 512 * 1024];
+            let limit = 256 * 1024;
+            let mut command = tokio::process::Command::new("python3");
+            command.args([
+                "-c",
+                "import sys\n\
+                 sys.stdout.buffer.write(bytes([254]) * 262144)\n\
+                 sys.stdout.buffer.flush()\n\
+                 sys.stderr.buffer.write(bytes([255]) * 262144)\n\
+                 sys.stderr.buffer.flush()\n\
+                 data = sys.stdin.buffer.read()\n\
+                 sys.exit(17 if data == bytes([128]) * 524288 else 23)",
+            ]);
+            let output = capture_control_output_with_ownership(
+                &mut command,
+                Some(&input),
+                limit,
+                limit,
+                Instant::now() + Duration::from_secs(10),
+                ownership,
+            )
+            .await
+            .expect("peer output must drain before the peer starts reading input");
+            assert_eq!(output.status.code(), Some(17));
+            assert_eq!(output.stdout, vec![0xfe; limit]);
+            assert_eq!(output.stderr, vec![0xff; limit]);
+        }
     }
 
     #[tokio::test]
@@ -3165,31 +3284,187 @@ while True: signal.pause()
     async fn control_capture_rejects_expiry_and_invalid_limits_before_spawn() {
         let directory = tempfile::tempdir().unwrap().keep();
         let marker = directory.join("started");
-        for (stdout, stderr, budget, expected) in [
-            (0, 0, Duration::ZERO, std::io::ErrorKind::TimedOut),
-            (
-                usize::MAX,
-                0,
-                Duration::from_secs(10),
-                std::io::ErrorKind::InvalidInput,
-            ),
-            (
-                0,
-                usize::MAX,
-                Duration::from_secs(10),
-                std::io::ErrorKind::InvalidInput,
-            ),
+        for ownership in [
+            ControlCaptureOwnership::ProcessGroup,
+            ControlCaptureOwnership::InheritedGroup,
         ] {
-            let mut command = tokio::process::Command::new("sh");
+            for (stdout, stderr, budget, expected) in [
+                (0, 0, Duration::ZERO, std::io::ErrorKind::TimedOut),
+                (
+                    usize::MAX,
+                    0,
+                    Duration::from_secs(10),
+                    std::io::ErrorKind::InvalidInput,
+                ),
+                (
+                    0,
+                    usize::MAX,
+                    Duration::from_secs(10),
+                    std::io::ErrorKind::InvalidInput,
+                ),
+            ] {
+                let mut command = tokio::process::Command::new("sh");
+                command
+                    .args(["-c", "printf started > \"$1\"", "sh"])
+                    .arg(&marker);
+                let error = capture_control_output_with_ownership(
+                    &mut command,
+                    None,
+                    stdout,
+                    stderr,
+                    Instant::now() + budget,
+                    ownership,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind(), expected);
+                assert!(!marker.exists(), "invalid control capture must not spawn");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_capture_keeps_the_outer_group_without_changing_transport_ownership() {
+        let parent_group = rustix::process::getpgrp().as_raw_nonzero().get();
+        for inherited in [false, true] {
+            let mut command = tokio::process::Command::new("python3");
             command
-                .args(["-c", "printf started > \"$1\"", "sh"])
-                .arg(&marker);
-            let error =
-                capture_control_output(&mut command, None, stdout, stderr, Instant::now() + budget)
+                // An earlier builder setting must not silently defeat either
+                // API's ownership. The APIs explicitly select their own mode.
+                .process_group(if inherited { 0 } else { parent_group })
+                .args(["-c", "import os\nprint(os.getpid(), os.getpgrp())"]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let output = if inherited {
+                capture_supervised_output_inherited_group(&mut command, None, 128, 128, deadline)
                     .await
-                    .unwrap_err();
-            assert_eq!(error.kind(), expected);
-            assert!(!marker.exists(), "invalid control capture must not spawn");
+            } else {
+                capture_control_output(&mut command, None, 128, 128, deadline).await
+            }
+            .unwrap();
+            assert!(output.status.success());
+            let identities = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .split_whitespace()
+                .map(|word| word.parse::<i32>().unwrap())
+                .collect::<Vec<_>>();
+            let [pid, group] = identities.as_slice() else {
+                panic!("invalid process identity fixture: {identities:?}");
+            };
+            if inherited {
+                assert_eq!(*group, parent_group);
+                assert_ne!(pid, group);
+            } else {
+                assert_eq!(pid, group);
+                assert_ne!(*group, parent_group);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn supervised_capture_timeout_overflow_and_drop_stop_only_the_owned_child() {
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+        use std::os::fd::{AsFd, OwnedFd};
+
+        struct Process(OwnedFd);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = rustix::process::pidfd_send_signal(&self.0, Signal::KILL);
+            }
+        }
+
+        for mode in ["timeout", "overflow", "drop"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let ready = directory.join("ready");
+            let release = directory.join("release");
+            let mut command = tokio::process::Command::new("python3");
+            command
+                .args([
+                    "-c",
+                    r#"import os, signal, sys, time
+signal.alarm(30)
+with open(sys.argv[1] + '.pending', 'x') as output:
+    output.write(f'{os.getpid()} {os.getpgrp()}')
+os.rename(sys.argv[1] + '.pending', sys.argv[1])
+while not os.path.exists(sys.argv[2]): time.sleep(0.01)
+os.write(1, b'x' * 129)
+while True: signal.pause()
+"#,
+                ])
+                .arg(&ready)
+                .arg(&release);
+            let mut capture = Box::pin(capture_supervised_output_inherited_group(
+                &mut command,
+                None,
+                128,
+                128,
+                Instant::now() + Duration::from_secs(5),
+            ));
+            let identities = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    tokio::select! {
+                        result = &mut capture => panic!("fixture exited before readiness: {result:?}"),
+                        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&ready) {
+                        break text
+                            .split_whitespace()
+                            .map(|word| word.parse::<i32>().unwrap())
+                            .collect::<Vec<_>>();
+                    }
+                }
+            })
+            .await
+            .expect("supervised capture must publish its exact child identity");
+            assert_eq!(identities.len(), 2);
+            assert_eq!(
+                identities[1],
+                rustix::process::getpgrp().as_raw_nonzero().get()
+            );
+            let process = Process(
+                rustix::process::pidfd_open(
+                    Pid::from_raw(identities[0]).unwrap(),
+                    PidfdFlags::empty(),
+                )
+                .unwrap(),
+            );
+            let stopped = tokio::io::unix::AsyncFd::new(process.0.as_fd()).unwrap();
+            if mode == "drop" {
+                drop(capture);
+            } else {
+                if mode == "overflow" {
+                    std::fs::write(&release, b"emit").unwrap();
+                }
+                let error = capture.await.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if mode == "timeout" {
+                        std::io::ErrorKind::TimedOut
+                    } else {
+                        std::io::ErrorKind::InvalidData
+                    }
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let _ = stopped.readable().await.unwrap();
+                loop {
+                    match rustix::process::waitid(
+                        WaitId::PidFd(process.0.as_fd()),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                    ) {
+                        Err(rustix::io::Errno::CHILD) => break,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(error) => panic!("inspect supervised child reaping: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("interrupted capture must stop and reap its exact child");
+            assert_eq!(
+                rustix::process::getpgrp().as_raw_nonzero().get(),
+                identities[1],
+                "capture must leave its caller's group unchanged"
+            );
         }
     }
 
