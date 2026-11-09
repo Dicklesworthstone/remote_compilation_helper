@@ -1489,6 +1489,7 @@ impl WorkerSelector {
     /// - The worker satisfies the request's runtime, tools, and toolchain
     /// - The worker has available slots
     /// - The worker's circuit is not open
+    /// - Repo convergence and reliability do not impose a hard exclusion
     async fn try_fallback(
         &self,
         pool: &WorkerPool,
@@ -1524,6 +1525,20 @@ impl WorkerSelector {
                 .is_some()
         {
             return None;
+        }
+        if let Some(convergence) = &self.repo_convergence {
+            let state = convergence.get_drift_state(&worker_id).await;
+            if matches!(
+                state,
+                crate::repo_convergence::ConvergenceDriftState::Converging
+                    | crate::repo_convergence::ConvergenceDriftState::Failed
+            ) {
+                debug!(
+                    "Affinity fallback worker {} skipped: repo convergence is {}",
+                    fallback_id, state
+                );
+                return None;
+            }
         }
         if self
             .disk_headroom_failure(&worker, &fallback_id, request)
@@ -1618,6 +1633,24 @@ impl WorkerSelector {
             .is_some()
         {
             return None;
+        }
+
+        // A different worker's transient contention can reach this fallback
+        // even after the last-success worker failed reliability preflight.
+        // Reuse that assessment, as diagnostics do: evaluating twice in one
+        // selection must not consume another quarantine recovery tick.
+        if let Some(reliability) = &self.reliability {
+            let assessment = match reliability.get_assessment(&fallback_id).await {
+                Some(assessment) => assessment,
+                None => reliability.evaluate(worker.as_ref(), &fallback_id).await,
+            };
+            if assessment.hard_exclude {
+                debug!(
+                    "Affinity fallback worker {} skipped: reliability is {}",
+                    fallback_id, assessment.health_state
+                );
+                return None;
+            }
         }
 
         Some(fallback_id)
@@ -11138,6 +11171,187 @@ mod tests {
         assert_last_success_contention_refused(
             selector.select(&pool, &request).await,
             "toolchain.preflight_failed",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rechecks_convergence_during_contention() {
+        let _guard = test_guard!();
+        for state in ["converging", "failed", "ready", "drifting", "stale"] {
+            let (pool, mut selector, _last_success, request) =
+                last_success_contention_fixture().await;
+            let convergence = Arc::new(crate::repo_convergence::RepoConvergenceService::new(
+                crate::events::EventBus::new(64),
+            ));
+            let worker_id = WorkerId::new("last-success");
+            match state {
+                "converging" => convergence.mark_converging(&worker_id).await,
+                "ready" => {
+                    convergence
+                        .update_required_repos(&worker_id, vec!["repo".into()], vec!["repo".into()])
+                        .await;
+                }
+                "failed" | "drifting" => {
+                    convergence
+                        .update_required_repos(&worker_id, vec!["repo".into()], vec![])
+                        .await;
+                    if state == "failed" {
+                        for _ in 0..3 {
+                            let _ = convergence
+                                .record_convergence_attempt(
+                                    &worker_id,
+                                    0,
+                                    1,
+                                    0,
+                                    10_000,
+                                    Some("fixture failure".into()),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            assert_eq!(
+                convergence.get_drift_state(&worker_id).await.to_string(),
+                state
+            );
+            selector.set_repo_convergence(convergence);
+
+            if let Some(code) = match state {
+                "converging" => Some("convergence.in_progress"),
+                "failed" => Some("convergence.failed"),
+                _ => None,
+            } {
+                // The healthy full worker makes the pool queueable. That must
+                // not revive the idle last-success worker's hard refusal.
+                assert_last_success_contention_refused(
+                    selector.select(&pool, &request).await,
+                    code,
+                );
+            } else {
+                assert_eq!(
+                    selector
+                        .try_fallback(&pool, &request, &HashSet::new())
+                        .await,
+                    Some("last-success".to_string()),
+                    "non-blocking convergence state {state} must preserve fallback"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_rechecks_quarantine_during_contention() {
+        let _guard = test_guard!();
+        let (pool, mut selector, last_success, request) = last_success_contention_fixture().await;
+        let mut reliability = ReliabilityAggregator::new(ReliabilityConfig {
+            weights: process_only_weights(),
+            quarantine_threshold: 0.05,
+            ..ReliabilityConfig::default()
+        });
+        reliability
+            .set_remediation(seeded_remediation_pipeline("last-success", &[2001, 2002]).await);
+        let reliability = Arc::new(reliability);
+        selector.set_reliability(reliability.clone());
+
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "reliability.quarantined",
+        );
+        assert_eq!(last_success.used_slots(), 0);
+        assert!(
+            reliability
+                .get_assessment("last-success")
+                .await
+                .unwrap()
+                .hard_exclude
+        );
+
+        // A direct fallback with no prior assessment must evaluate the same
+        // live debt rather than treating missing cached evidence as healthy.
+        reliability.reset("last-success").await;
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await,
+            None
+        );
+        assert!(
+            reliability
+                .get_assessment("last-success")
+                .await
+                .unwrap()
+                .hard_exclude
+        );
+    }
+
+    #[tokio::test]
+    async fn test_last_success_fallback_does_not_advance_quarantine_recovery() {
+        let _guard = test_guard!();
+        let (pool, mut selector, last_success, request) = last_success_contention_fixture().await;
+        let reliability = Arc::new(ReliabilityAggregator::new(ReliabilityConfig {
+            weights: SignalWeights {
+                circuit: 1.0,
+                convergence: 0.0,
+                pressure: 0.0,
+                process: 0.0,
+                cancellation: 0.0,
+            },
+            quarantine_threshold: 0.9,
+            recovery_threshold: 0.1,
+            recovery_ticks: 2,
+            min_quarantine_duration: Duration::ZERO,
+            ..ReliabilityConfig::default()
+        }));
+        for _ in 0..10 {
+            last_success
+                .record_failure(Some("fixture failure".into()))
+                .await;
+        }
+        assert!(
+            reliability
+                .evaluate(last_success.as_ref(), "last-success")
+                .await
+                .hard_exclude
+        );
+        for _ in 0..500 {
+            last_success.record_success().await;
+        }
+        selector.set_reliability(reliability.clone());
+
+        // This selection supplies only the first of two recovery ticks. Its
+        // fallback and diagnostics must not count as additional observations.
+        assert_last_success_contention_refused(
+            selector.select(&pool, &request).await,
+            "reliability.quarantined",
+        );
+        assert_eq!(
+            reliability
+                .get_assessment("last-success")
+                .await
+                .unwrap()
+                .health_state,
+            WorkerHealthState::Quarantined
+        );
+
+        let selected = selector.select(&pool, &request).await.worker.unwrap();
+        assert_eq!(selected.config.read().await.id.as_str(), "last-success");
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await,
+            Some("last-success".to_string()),
+            "a permitted recovery probe remains eligible for fallback"
+        );
+        assert_eq!(
+            reliability
+                .get_assessment("last-success")
+                .await
+                .unwrap()
+                .health_state,
+            WorkerHealthState::ProbingRecovery,
+            "fallback must not advance a recovery probe to fully healthy"
         );
     }
 
