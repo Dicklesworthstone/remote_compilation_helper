@@ -74,7 +74,7 @@ struct InputObservation {
 struct DependencyInputs {
     names: Vec<String>,
     members: Vec<Option<InputObservation>>,
-    environment: blake3::Hash,
+    environment: environment::CapturedEnvironment,
     fingerprint: install::DependencyFingerprint,
     #[cfg(unix)]
     root: (u64, u64),
@@ -87,12 +87,12 @@ impl DependencyInputs {
             root.file_type().is_dir(),
             "dependency project is not a real directory"
         );
-        let environment = environment::capture()?;
+        let environment = environment::capture(project)?;
         let inventory = workspace_inputs::discover(project, INPUT_NAMES)?;
         let names = inventory.names.clone();
         let mut budget = MAX_INPUT_BYTES;
         let mut hasher = install::fingerprint_hasher();
-        hasher.update(environment.as_bytes());
+        hasher.update(environment.digest.as_bytes());
         let mut sources = Vec::new();
         let mut members = Vec::new();
         for name in &names {
@@ -163,7 +163,7 @@ impl DependencyInputs {
             (root.dev(), root.ino())
         };
         ensure!(
-            environment::capture()? == environment,
+            environment::capture(project)? == environment,
             "package-manager environment changed during dependency capture"
         );
         let fingerprint = install::DependencyFingerprint {
@@ -190,10 +190,6 @@ impl DependencyInputs {
         runtime: RequiredRuntime,
         action: PrepareAction,
     ) -> Result<()> {
-        ensure!(
-            self.environment == after.environment,
-            "package-manager environment changed during preparation"
-        );
         #[cfg(unix)]
         ensure!(
             self.root == after.root,
@@ -219,6 +215,10 @@ impl DependencyInputs {
                 _ => bail!("dependency input {name} changed during preparation"),
             }
         }
+        ensure!(
+            self.environment == after.environment,
+            "package-manager environment changed during preparation"
+        );
         Ok(())
     }
 }
@@ -654,7 +654,7 @@ mod tests {
             .unwrap();
         // Inject changed capture evidence without mutating the process-wide
         // environment used concurrently by other tests.
-        after.environment = blake3::hash(b"different installation environment");
+        after.environment.digest = blake3::hash(b"different installation environment");
         let error = before
             .verify_after(&after, RequiredRuntime::Node, PrepareAction::Installed)
             .unwrap_err();
