@@ -86,7 +86,7 @@ const fn compile_protocol() -> [u8; PROTOCOL_LENGTH] {
     output
 }
 
-const PROTOCOL_BYTES: [u8; PROTOCOL_LENGTH] = compile_protocol();
+static PROTOCOL_BYTES: [u8; PROTOCOL_LENGTH] = compile_protocol();
 
 /// Bootstrap from literal bytes without a disk-backed heredoc. Bash can spill
 /// even a quoted heredoc to /tmp, regardless of an unavailable TMPDIR, so the
