@@ -53,6 +53,35 @@ pub struct PreparedDependencyInventory {
     pub directories: Vec<String>,
 }
 
+/// Candidate output names, never an instruction to ignore a directory tree.
+/// The worker further restricts these candidates to its captured manager and
+/// workspace layout. Each vector is unique and in literal `String` order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmittedDependencyOutputs {
+    /// Descendant files and this directory's complete subtree may be outputs.
+    pub subtree_roots: Vec<String>,
+    /// Only the named regular files may be outputs, not any descendants.
+    pub exact_files: Vec<String>,
+    /// Parent directories may be recorded without admitting their children.
+    pub structural_directories: Vec<String>,
+}
+
+impl AdmittedDependencyOutputs {
+    pub fn contains_file(&self, path: &str) -> bool {
+        self.exact_files
+            .binary_search_by(|candidate| candidate.as_str().cmp(path))
+            .is_ok()
+            || has_admitted_ancestor(path, &self.subtree_roots, false)
+    }
+
+    pub fn contains_directory(&self, path: &str) -> bool {
+        self.structural_directories
+            .binary_search_by(|candidate| candidate.as_str().cmp(path))
+            .is_ok()
+            || has_admitted_ancestor(path, &self.subtree_roots, true)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedDependencyRequest {
@@ -458,6 +487,44 @@ pub fn admitted_dependency_roots(request: &PreparedDependencyRequest) -> Result<
     Ok(roots.into_iter().collect())
 }
 
+/// Extend the ordinary package dependency roots with the standard local Yarn
+/// PnP output names when the preparation root has a selected regular lockfile.
+/// This is only a candidate namespace: effective configuration and retained
+/// output ownership must still be verified by the worker. In particular,
+/// `.yarn` itself grants no authority over releases, plugins, patches, or any
+/// other neighboring source. Selected zero-install files remain selected.
+pub fn admitted_dependency_outputs(
+    request: &PreparedDependencyRequest,
+) -> Result<AdmittedDependencyOutputs> {
+    let mut outputs = AdmittedDependencyOutputs {
+        subtree_roots: admitted_dependency_roots(request)?,
+        ..AdmittedDependencyOutputs::default()
+    };
+    let preparation = request.preparation_relative();
+    let lockfile = join_relative(preparation, "yarn.lock");
+    let selected_lockfile = request
+        .files
+        .binary_search_by(|file| file.path.cmp(&lockfile))
+        .ok()
+        .is_some_and(|index| request.files[index].kind == PreparedDependencyFileKind::Regular);
+    if selected_lockfile {
+        outputs.subtree_roots.extend(
+            [".yarn/cache", ".yarn/unplugged"].map(|path| join_relative(preparation, path)),
+        );
+        outputs.subtree_roots.sort();
+        outputs.exact_files = [
+            ".pnp.cjs",
+            ".pnp.data.json",
+            ".pnp.loader.mjs",
+            ".yarn/install-state.gz",
+        ]
+        .map(|path| join_relative(preparation, path))
+        .into();
+        outputs.structural_directories = vec![join_relative(preparation, ".yarn")];
+    }
+    Ok(outputs)
+}
+
 fn merge_inventory(
     request: &PreparedDependencyRequest,
     inventory: &PreparedDependencyInventory,
@@ -587,17 +654,23 @@ pub fn validate_inventory(
     request: &PreparedDependencyRequest,
     inventory: &PreparedDependencyInventory,
 ) -> Result<()> {
-    let roots = admitted_dependency_roots(request)?;
+    let outputs = admitted_dependency_outputs(request)?;
     inventory_digest(inventory)?;
     for file in &inventory.files {
         require(
-            has_admitted_ancestor(&file.path, &roots, false),
+            outputs.contains_file(&file.path),
             "runtime file is outside admitted dependency roots",
         )?;
+        if outputs.exact_files.binary_search(&file.path).is_ok() {
+            require(
+                file.kind == PreparedDependencyFileKind::Regular,
+                "exact package-manager output is not a regular file",
+            )?;
+        }
     }
     for directory in &inventory.directories {
         require(
-            has_admitted_ancestor(directory, &roots, true),
+            outputs.contains_directory(directory),
             "runtime directory is outside admitted dependency roots",
         )?;
     }
@@ -653,6 +726,22 @@ pub fn validate_state(
         "state belongs to another preparation project",
     )?;
     validate_inventory(request, &state.inventory)?;
+    if state.package_manager != "yarn" {
+        let roots = admitted_dependency_roots(request)?;
+        require(
+            state
+                .inventory
+                .files
+                .iter()
+                .all(|file| has_admitted_ancestor(&file.path, &roots, false))
+                && state
+                    .inventory
+                    .directories
+                    .iter()
+                    .all(|directory| has_admitted_ancestor(directory, &roots, true)),
+            "PnP outputs require a frozen Yarn preparation state",
+        )?;
+    }
     canonical_digest(state).map(|_| ())
 }
 
@@ -859,6 +948,45 @@ mod tests {
         }
     }
 
+    fn pnp_request() -> PreparedDependencyRequest {
+        let mut request = request();
+        request.files[0] = regular("vittles/yarn.lock");
+        request
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        request
+    }
+
+    fn pnp_inventory() -> PreparedDependencyInventory {
+        PreparedDependencyInventory {
+            files: vec![
+                regular("vittles/.pnp.cjs"),
+                regular("vittles/.pnp.data.json"),
+                regular("vittles/.pnp.loader.mjs"),
+                regular("vittles/.yarn/cache/tool.zip"),
+                regular("vittles/.yarn/install-state.gz"),
+                link("vittles/.yarn/unplugged/tool/bin", "index.js"),
+                regular("vittles/.yarn/unplugged/tool/index.js"),
+            ],
+            directories: vec![
+                "vittles/.yarn".to_owned(),
+                "vittles/.yarn/cache".to_owned(),
+                "vittles/.yarn/unplugged".to_owned(),
+                "vittles/.yarn/unplugged/tool".to_owned(),
+            ],
+        }
+    }
+
+    fn pnp_state() -> PreparedDependencyState {
+        let inventory = pnp_inventory();
+        PreparedDependencyState {
+            package_manager: "yarn".to_owned(),
+            inventory_digest: inventory.digest().unwrap(),
+            inventory,
+            ..state()
+        }
+    }
+
     fn attestation() -> PreparedDependencyAttestation {
         let state = state();
         PreparedDependencyAttestation {
@@ -1017,6 +1145,203 @@ mod tests {
             .unwrap();
         request.files[index] = link("vittles/packages/ui/package.json", "../../package.json");
         assert!(inventory.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn yarn_pnp_candidates_are_exact_files_subtrees_and_structural_parents() {
+        let request = pnp_request();
+        let outputs = admitted_dependency_outputs(&request).unwrap();
+        assert_eq!(
+            outputs.subtree_roots,
+            [
+                "vittles/.yarn/cache",
+                "vittles/.yarn/unplugged",
+                "vittles/node_modules",
+            ]
+        );
+        assert_eq!(
+            outputs.exact_files,
+            [
+                "vittles/.pnp.cjs",
+                "vittles/.pnp.data.json",
+                "vittles/.pnp.loader.mjs",
+                "vittles/.yarn/install-state.gz",
+            ]
+        );
+        assert_eq!(outputs.structural_directories, ["vittles/.yarn"]);
+        assert_eq!(
+            admitted_dependency_roots(&request).unwrap(),
+            ["vittles/node_modules"]
+        );
+        let state = pnp_state();
+        state.validate_for(&request).unwrap();
+        for disposition in [
+            PreparedDependencyDisposition::Fresh,
+            PreparedDependencyDisposition::Retained,
+        ] {
+            PreparedDependencyAttestation {
+                version: PREPARED_DEPENDENCY_VERSION,
+                request_digest: request.digest().unwrap(),
+                state_digest: state.digest().unwrap(),
+                state: state.clone(),
+                disposition,
+            }
+            .validate_for(&request)
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn yarn_pnp_outputs_require_selected_root_lock_and_yarn_manager() {
+        let inventory = pnp_inventory();
+        assert!(inventory.validate_for(&request()).is_err());
+        let mut symlink_lock = pnp_request();
+        let lock = symlink_lock
+            .files
+            .iter_mut()
+            .find(|file| file.path == "vittles/yarn.lock")
+            .unwrap();
+        *lock = link("vittles/yarn.lock", "package.json");
+        assert!(inventory.validate_for(&symlink_lock).is_err());
+        for manager in ["npm", "pnpm", "bun"] {
+            let mut state = pnp_state();
+            state.package_manager = manager.to_owned();
+            assert!(state.validate_for(&pnp_request()).is_err(), "{manager}");
+        }
+        let mut workspace = pnp_request();
+        workspace.project_relative = "vittles/member".to_owned();
+        workspace.preparation_relative = Some("vittles".to_owned());
+        workspace.directories.push("vittles/member".to_owned());
+        workspace.directories.sort();
+        workspace.files.push(regular("vittles/member/package.json"));
+        workspace
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        inventory.validate_for(&workspace).unwrap();
+        let mut wrong_root = inventory.clone();
+        wrong_root.files = vec![regular("vittles/member/.pnp.cjs")];
+        assert!(wrong_root.validate_for(&workspace).is_err());
+        let lock = workspace
+            .files
+            .iter_mut()
+            .find(|file| file.path == "vittles/yarn.lock")
+            .unwrap();
+        lock.path = "vittles/member/yarn.lock".to_owned();
+        workspace
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        assert!(inventory.validate_for(&workspace).is_err());
+    }
+
+    #[test]
+    fn yarn_pnp_parent_does_not_admit_neighboring_source_or_special_singletons() {
+        let request = pnp_request();
+        for path in [
+            "vittles/.yarn",
+            "vittles/.yarn/releases/yarn.cjs",
+            "vittles/.yarn/plugins/plugin.cjs",
+            "vittles/.yarn/patches/package.patch",
+            "vittles/.yarn/unexpected",
+            "vittles/.yarn/cache-extra/file",
+            "vittles/.yarn/unplugged-extra/file",
+            "vittles/.pnp.cjs/child",
+            "vittles/.pnp.cjs.extra",
+            "vittles/.yarn/install-state.gz/child",
+            "vittles/.yarn/cache",
+        ] {
+            let mut inventory = pnp_inventory();
+            inventory.files = vec![regular(path)];
+            assert!(inventory.validate_for(&request).is_err(), "{path}");
+        }
+        for path in [
+            "vittles/.pnp.cjs",
+            "vittles/.pnp.cjs/child",
+            "vittles/.yarn/releases",
+            "vittles/.yarn/install-state.gz",
+        ] {
+            let inventory = PreparedDependencyInventory {
+                files: Vec::new(),
+                directories: vec![path.to_owned()],
+            };
+            assert!(inventory.validate_for(&request).is_err(), "{path}");
+        }
+        let mut linked_loader = pnp_inventory();
+        linked_loader.files[0] = link("vittles/.pnp.cjs", "src/index.ts");
+        assert!(linked_loader.validate_for(&request).is_err());
+        let mut missing_parent = pnp_inventory();
+        missing_parent.directories.remove(0);
+        assert!(missing_parent.validate_for(&request).is_err());
+        for target in ["../../../../../../outside", "missing.js", "bin"] {
+            let mut inventory = pnp_inventory();
+            inventory.files[5] = link("vittles/.yarn/unplugged/tool/bin", target);
+            assert!(inventory.validate_for(&request).is_err(), "{target}");
+        }
+    }
+
+    #[test]
+    fn zero_install_pnp_files_remain_source_and_cannot_be_republished() {
+        let mut request = pnp_request();
+        let prior = pnp_state();
+        request.files.extend([
+            regular("vittles/.pnp.cjs"),
+            regular("vittles/.yarn/cache/tool.zip"),
+            regular("vittles/.yarn/releases/yarn.cjs"),
+            regular("vittles/.yarn/plugins/plugin.cjs"),
+            regular("vittles/.yarn/patches/tool.patch"),
+        ]);
+        request
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        request.directories.extend([
+            "vittles/.yarn".to_owned(),
+            "vittles/.yarn/cache".to_owned(),
+            "vittles/.yarn/releases".to_owned(),
+            "vittles/.yarn/plugins".to_owned(),
+            "vittles/.yarn/patches".to_owned(),
+        ]);
+        request.directories.sort();
+        prior.validate_for(&request).unwrap();
+        let mut current = PreparedDependencyAttestation {
+            version: PREPARED_DEPENDENCY_VERSION,
+            request_digest: request.digest().unwrap(),
+            state_digest: prior.digest().unwrap(),
+            state: prior.clone(),
+            disposition: PreparedDependencyDisposition::Fresh,
+        };
+        assert!(current.validate_for(&request).is_err());
+        current.state.inventory.files.retain(|file| {
+            request
+                .files
+                .binary_search_by(|selected| selected.path.cmp(&file.path))
+                .is_err()
+        });
+        current.state.inventory_digest = current.state.inventory.digest().unwrap();
+        current.state_digest = current.state.digest().unwrap();
+        current.validate_for(&request).unwrap();
+        let union = union_selected_inventory(&request, &current.state.inventory).unwrap();
+        for selected in &request.files {
+            assert_eq!(
+                union.files.iter().find(|file| file.path == selected.path),
+                Some(selected)
+            );
+        }
+        for path in ["vittles/.pnp.cjs", "vittles/.yarn/cache/tool.zip"] {
+            for change in 0..4 {
+                let mut inventory = prior.inventory.clone();
+                let file = inventory
+                    .files
+                    .iter_mut()
+                    .find(|file| file.path == path)
+                    .unwrap();
+                match change {
+                    0 => file.sha256 = "f".repeat(64),
+                    1 => file.byte_count += 1,
+                    2 => file.executable = true,
+                    _ => *file = link(path, "../package.json"),
+                }
+                assert!(union_selected_inventory(&request, &inventory).is_err());
+            }
+        }
     }
 
     #[test]
