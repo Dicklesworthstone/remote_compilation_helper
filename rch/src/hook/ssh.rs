@@ -1496,9 +1496,14 @@ fn source_intent_command(
             shell_escape::escape(format!("{registry}/{identity}.activity.lock").into()),
         );
     }
+    // Bash spills large heredocs to a regular file. Recovery must remain
+    // callable after the build fills the worker, so stream the literal roots
+    // through a builtin instead. Registry matching/hashed publication still
+    // rejects incomplete input; no closure enters an external exec argument.
     Ok(format!(
-        "{}{invocation} <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
+        "{}printf '%s' {roots} | {invocation}\n",
         source_registry_recovery_setup(registry),
+        roots = shell_escape::escape(roots.into()),
     ))
 }
 
@@ -1707,8 +1712,8 @@ fn source_cancellation_settlement_command(
         SOURCE_CLAIM_REGISTRY,
     );
     Ok(format!(
-        "exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected} \
-         <<'RCH_SOURCE_CLAIM_ROOTS'\n{roots}RCH_SOURCE_CLAIM_ROOTS\n",
+        "printf '%s' {roots} | exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected}\n",
+        roots = quote(&roots),
         coordinator = quote(include_str!("source_cancel_settlement.py")),
         registry = quote(registry),
         legacy = quote(legacy_registry),
@@ -4535,6 +4540,139 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
             assert!(!directory.path().join("expanded-dollar").exists());
             assert!(!directory.path().join("expanded-backtick").exists());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn large_source_cancellation_commands_need_no_regular_file_writes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        async fn run(command: &str, directory: &Path) -> Output {
+            // Execute the actual generated upload under Bash with the kernel
+            // denying regular-file writes. Large heredocs cannot silently
+            // spool into /tmp; pipes and metadata-only hard links remain real.
+            let mut child = Command::new("bash")
+                .args(["-c", "ulimit -f 0; exec bash -s"])
+                .current_dir(directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(command.as_bytes()).await.unwrap();
+            drop(input);
+            timeout(Duration::from_secs(30), child.wait_with_output())
+                .await
+                .expect("source cancellation did not terminate")
+                .unwrap()
+        }
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let registry = directory.path().join("registry ' literal");
+        let legacy = directory.path().join("absent-legacy");
+        for path in [
+            directory.path().to_path_buf(),
+            registry.clone(),
+            registry.join("released"),
+            registry.join("cancelled"),
+            registry.join("quarantine"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let identity = "ac04";
+        for name in [
+            "metadata.lock".to_owned(),
+            format!("{identity}.activity.lock"),
+        ] {
+            let path = registry.join(name);
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let source = directory
+            .path()
+            .join("source ' ; $(touch expanded-dollar) `touch expanded-backtick`");
+        let roots: Vec<_> = (0..384)
+            .map(|index| {
+                source
+                    .join(format!("unit-{index:04}-{}", "x".repeat(160)))
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let (body, digest) = source_claim_roots(&roots).unwrap();
+        assert!(body.len() > 65536, "must exceed Bash's heredoc pipe limit");
+        let active = registry.join(format!("{identity}.{digest}.claim"));
+        let fence = active.with_extension("cancelling");
+        let receipt = registry.join("cancelled").join(active.file_name().unwrap());
+        std::fs::write(&active, &body).unwrap();
+        std::fs::set_permissions(&active, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = std::fs::metadata(&active).unwrap().ino();
+        let cancel =
+            source_intent_command(registry.to_str().unwrap(), &roots, identity, "cancel").unwrap();
+        let output = run(&cancel, directory.path()).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"owned");
+        assert!(output.stderr.is_empty());
+        for (operation, expected, response) in [
+            (
+                "locate",
+                "",
+                b"RCH_SOURCE_AUTHORITY_NAMESPACE current\n".as_slice(),
+            ),
+            (
+                "settle-cancel",
+                "current",
+                b"RCH_SOURCE_CANCELLATION_SETTLED\n".as_slice(),
+            ),
+            (
+                "settle-cancel",
+                "current",
+                b"RCH_SOURCE_CANCELLATION_SETTLED\n".as_slice(),
+            ),
+        ] {
+            let command = source_cancellation_settlement_command(
+                registry.to_str().unwrap(),
+                legacy.to_str().unwrap(),
+                &roots,
+                identity,
+                operation,
+                expected,
+            )
+            .unwrap();
+            let output = run(&command, directory.path()).await;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, response);
+            assert!(output.stderr.is_empty());
+        }
+        assert!(!active.exists());
+        for path in [&fence, &receipt] {
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(path).unwrap(), body.as_bytes());
+        }
+        let output = run(&cancel, directory.path()).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"unowned");
+        assert!(!source.exists());
+        assert!(!directory.path().join("expanded-dollar").exists());
+        assert!(!directory.path().join("expanded-backtick").exists());
     }
 
     #[cfg(target_os = "linux")]

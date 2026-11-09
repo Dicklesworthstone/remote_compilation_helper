@@ -273,9 +273,18 @@ physical_roots() {
     # No physical result is cached across transactions: aliases may change.
     LC_ALL=C
     export LC_ALL
+    physical_framing=${1-}
+    case "$physical_framing" in ''|complete) ;; *) refuse 'invalid physical source framing' ;; esac
+    physical_complete=0
     set --
     batch_bytes=0
     while IFS= read -r batch_root || [ -n "$batch_root" ]; do
+        if [ "$physical_framing" = complete ] && [ "$batch_root" = RCH_PHYSICAL_ROOTS_END ]; then
+            [ "$physical_complete" -eq 0 ] || refuse 'duplicate physical source end marker'
+            physical_complete=1
+            continue
+        fi
+        [ "$physical_complete" -eq 0 ] || refuse 'physical source data after end marker'
         root_bytes=$((${#batch_root} + 1))
         [ "$root_bytes" -le 61440 ] || refuse 'physical source root exceeds argument budget'
         if [ "$#" -ge 64 ] || [ "$((batch_bytes + root_bytes))" -gt 61440 ]; then
@@ -286,6 +295,9 @@ physical_roots() {
         set -- "$@" "$batch_root"
         batch_bytes=$((batch_bytes + root_bytes))
     done
+    if [ "$physical_framing" = complete ] && [ "$physical_complete" -ne 1 ]; then
+        refuse 'incomplete physical source input'
+    fi
     if [ "$#" -gt 0 ]; then
         physical_batch "$@"
     fi
@@ -493,10 +505,16 @@ check_held_claim_batch() {
     fi
 }
 
-describe_cancelling_overlap() {
+describe_cancelling_overlap() (
     # Only the rejected batch is examined again. Name an actual overlapping
     # cancelling owner, not an unrelated marker elsewhere on the worker.
-    while IFS= read -r held_name; do
+    # Names are already validated and newline-delimited. Iterate in memory:
+    # a large legacy inventory must not allocate a shell heredoc on a full disk.
+    # Isolate splitting/glob policy from the transaction and its caller.
+    IFS='
+'
+    set -f
+    for held_name in $held_claim_names; do
         case "$held_name" in
             /*) held_path=$held_name ;;
             *) held_path="$registry/$held_name" ;;
@@ -514,13 +532,14 @@ describe_cancelling_overlap() {
         printf 'RCH_SOURCE_CANCELLATION_FENCE identity=%s record=%s\n' \
             "${held_identity%%.*}" "$held_fence" >&2
         return 0
-    done <<RCH_HELD_CANCELLING_NAMES
-$held_claim_names
-RCH_HELD_CANCELLING_NAMES
-}
+    done
+)
 
-emit_held_claim_roots() {
-    while IFS= read -r held_name; do
+emit_held_claim_roots() (
+    IFS='
+'
+    set -f
+    for held_name in $held_claim_names; do
         # Individual framing prevents an unterminated/empty record from being
         # hidden by concatenation with the next owner's roots. The outer end
         # marker is emitted ONLY if every read/resolution succeeds.
@@ -535,10 +554,8 @@ emit_held_claim_roots() {
             *) return 1 ;;
         esac
         printf 'RCH_HELD_RECORD_END\n' || return 1
-    done <<RCH_HELD_CLAIM_NAMES
-$held_claim_names
-RCH_HELD_CLAIM_NAMES
-}
+    done
+)
 
 prune_terminal_claims() {
     retention_minutes=${RCH_SOURCE_CLAIM_RETENTION_MINUTES:-1440}
@@ -878,9 +895,9 @@ if [ "$operation" = cancel ]; then
         # Check both namespaces before any promotion or cancellation write;
         # keep the valid active blocker until cleanup finishes.
         requested_physical=$(
-            physical_roots <<RCH_CANCELLATION_ROOTS
-$requested
-RCH_CANCELLATION_ROOTS
+            # The final non-path marker makes a failed producer a refusal,
+            # never a partial closure that appears physically disjoint.
+            printf '%s\nRCH_PHYSICAL_ROOTS_END\n' "$requested" | physical_roots complete
         ) || refuse 'cannot resolve cancellation source roots'
         check_held_claims
     fi
@@ -1013,9 +1030,7 @@ fi
 # Resolve in bounded batches while holding the same registry lock. A resolver
 # failure in ANY batch refuses the whole closure before publishing a claim.
 requested_physical=$(
-    physical_roots <<RCH_REQUESTED_ROOTS
-$requested
-RCH_REQUESTED_ROOTS
+    printf '%s\nRCH_PHYSICAL_ROOTS_END\n' "$requested" | physical_roots complete
 ) || refuse 'cannot resolve physical source roots'
 
 # Stream batches through reusable requested-root indexes while retaining the

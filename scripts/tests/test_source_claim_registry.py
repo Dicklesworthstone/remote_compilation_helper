@@ -11,6 +11,7 @@ import fcntl
 import os
 from pathlib import Path
 import random
+import resource
 import shlex
 import shutil
 import subprocess
@@ -75,6 +76,19 @@ class SourceClaimRegistryTests(unittest.TestCase):
         return subprocess.run(self.command(token, roots, operation),
                               input=body(roots), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, env=env or self.env,
+                              timeout=20, check=False)
+
+    def transact_without_file_writes(self, token, roots, operation, env=None):
+        def deny_regular_file_writes():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+        # A kernel-enforced limit catches shell heredoc spooling as well as
+        # explicit writes. Metadata-only links/renames of existing immutable
+        # records are still permitted; this is not physical ENOSPC/fleet proof.
+        return subprocess.run(self.command(token, roots, operation),
+                              input=body(roots), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=env or self.env,
+                              preexec_fn=deny_regular_file_writes,
                               timeout=20, check=False)
 
     def assert_granted(self, result):
@@ -525,6 +539,106 @@ os.open = without_allocation
                 self.assert_refused(self.transact("aa", roots, env=env))
                 self.assertEqual(sentinel.read_bytes(), b"source bytes are not cancellation metadata")
                 self.assertEqual(set(self.registry.glob(".record-write.*")), private_before)
+
+    def large_cancellation_roots(self):
+        source = self.root / "source ' ; $(literal-dollar) `literal-backtick`"
+        source.mkdir()
+        (source / "sentinel").write_bytes(b"source remains unchanged\n")
+        tail = Path(*("x" * 200 for _ in range(4)))
+        roots = [source / f"unit-{index:04d}" / tail for index in range(96)]
+        self.assertGreater(len(body(roots)), 65536, "must exceed Bash's heredoc pipe limit")
+        return roots, source
+
+    def test_large_owned_cancellation_needs_no_regular_file_writes(self):
+        roots, source = self.large_cancellation_roots()
+        self.assert_granted(self.transact("aa", roots))
+        active = self.registry / ("aa." + digest(roots) + ".claim")
+        before = active.stat().st_ino, active.read_bytes()
+        fence = active.with_suffix(".cancelling")
+        receipt = self.registry / "cancelled" / active.name
+        for operation, expected in (("cancel", b"owned"), ("finish-cancel", b""),
+                                    ("cancel", b"unowned"), ("settle-cancel", b"settled")):
+            with self.subTest(operation=operation):
+                result = self.transact_without_file_writes("aa", roots, operation)
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+        self.assertFalse(active.exists())
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        self.assertEqual((source / "sentinel").read_bytes(), b"source remains unchanged\n")
+
+    def test_large_cancellation_keeps_conflicting_physical_owner_without_file_writes(self):
+        roots, source = self.large_cancellation_roots()
+        self.assert_granted(self.transact("aa", roots))
+        alias = self.root / "alias"
+        alias.symlink_to(source, target_is_directory=True)
+        # The overlap is in the final batch, so a partial physical closure
+        # cannot be accepted as a complete disjointness proof.
+        competing = self.record("bb", [alias / roots[-1].relative_to(source)])
+        active = self.registry / ("aa." + digest(roots) + ".claim")
+        before = {path: (path.stat().st_ino, path.read_bytes()) for path in (active, competing)}
+        result = self.transact_without_file_writes("aa", roots, "cancel")
+        self.assert_refused(result)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"unfinished overlapping physical source owner", result.stderr)
+        self.assertFalse(active.with_suffix(".cancelling").exists())
+        self.assertEqual({path: (path.stat().st_ino, path.read_bytes()) for path in before}, before)
+        self.assertEqual((source / "sentinel").read_bytes(), b"source remains unchanged\n")
+
+    def test_large_held_inventory_streams_without_regular_file_writes(self):
+        legacy = self.root.joinpath(*("legacy-" + "x" * 200 for _ in range(6)))
+        legacy.mkdir(parents=True)
+        names, expected = [], b""
+        for index in range(64):
+            # Legacy inventory names are absolute. A full 64-record batch in
+            # this valid nested registry exceeds Bash's heredoc pipe limit.
+            token = f"bb{index:03d}" + "c" * 120
+            held = [self.root / f"disjoint-{index:03d}"]
+            path = legacy / (token + "." + digest(held) + ".claim")
+            path.write_bytes(body(held))
+            names.append(path)
+            expected += b"RCH_HELD_RECORD_BEGIN\n" + body(held) + b"RCH_HELD_RECORD_END\n"
+        before = {path: path.read_bytes() for path in legacy.glob("bb*.claim")}
+        self.assertGreater(len(body(names)), 65536)
+        functions = SCRIPT.split("# An identity is bound", 1)[0]
+        functions = functions[functions.index("refuse() {"):]
+        program = ("set -eu\n" + functions + '\nregistry=$1\nheld_claim_names=$(cat)\n'
+                   'emit_held_claim_roots lexical\n')
+
+        def deny_regular_file_writes():
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+        result = subprocess.run([self.shell, "-c", program, "held-inventory", str(self.registry)],
+                                input=body(names), capture_output=True, env=self.env,
+                                preexec_fn=deny_regular_file_writes, timeout=20)
+        self.assert_granted(result)
+        self.assertEqual(result.stdout, expected)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_physical_root_pipe_requires_a_complete_unambiguous_frame(self):
+        roots = [self.root / "first", self.root / "last"]
+        marker = b"RCH_PHYSICAL_ROOTS_END\n"
+        functions = SCRIPT.split("# An identity is bound", 1)[0]
+        functions = functions[functions.index("refuse() {"):]
+        program = ("set -eu\n" + HELPERS + "\n" + functions +
+                   '\nresolved=$(physical_roots complete) || exit $?\n'
+                   'printf "%s\\n" "$resolved"\n')
+        for content, valid in ((body(roots) + marker, True),
+                               (body(roots), False),
+                               (body(roots) + marker[:-4], False),
+                               (body(roots) + marker + marker, False),
+                               (body(roots) + marker + body(roots), False)):
+            with self.subTest(content=content):
+                result = subprocess.run([self.shell, "-c", program], input=content,
+                                        capture_output=True, env=self.env, timeout=10)
+                if valid:
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, body(roots))
+                else:
+                    self.assert_refused(result)
+                    self.assertEqual(result.stdout, b"")
 
     def test_terminal_cancellation_reuses_exact_record_without_allocation(self):
         for frontier, operation in (("marker", "settle-cancel"), ("marker", "cancel"),
@@ -1367,8 +1481,8 @@ class TerminalCancellationSettlementTests(unittest.TestCase):
                       str(self.registry if current_registry is None else current_registry),
                       str(self.legacy if legacy_registry is None else legacy_registry), token, digest(roots),
                       transaction or self.script.read_text(), operation, expected]
-        program = ("exec " + shlex.join(invocation) + " <<'RCH_SOURCE_CLAIM_ROOTS'\n"
-                   + body(roots).decode() + "RCH_SOURCE_CLAIM_ROOTS\n")
+        program = ("printf '%s' " + shlex.quote(body(roots).decode()) +
+                   " | exec " + shlex.join(invocation) + "\n")
         contract = {"locate": "RCH_SOURCE_AUTHORITY_NAMESPACE",
                     "discover": "RCH_SOURCE_AUTHORITY_DISCOVERY"}.get(
                         operation, "RCH_SOURCE_CANCELLATION_SETTLED")

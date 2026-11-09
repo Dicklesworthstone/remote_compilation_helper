@@ -265,9 +265,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
                               capture_output=True, timeout=8)
 
     def cancellation_state(self, token=None, registry=None):
-        program = (self.invocation("cancellation-state", token, registry) +
-                   " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
-                   "RCH_SOURCE_CLAIM_ROOTS\n")
+        program = self.roots_program(self.invocation("cancellation-state", token, registry))
         client = self.start(program, "set -- RCH_SOURCE_INTENT_CANCELLATION_STATE\n" + CONTROL)
         stdout, stderr = client.finish()
         return client.process.returncode, stdout, stderr
@@ -298,8 +296,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
                               input=self.roots.encode(), capture_output=True, timeout=8)
 
     def roots_program(self, command):
-        return (command + " <<'RCH_SOURCE_CLAIM_ROOTS'\n" + self.roots +
-                "RCH_SOURCE_CLAIM_ROOTS\n")
+        return "printf '%s' " + QUOTE(self.roots) + " | " + command + "\n"
 
     def settlement_program(self, operation, expected="", token=None):
         return self.roots_program(shlex.join([
