@@ -2175,26 +2175,186 @@ fn classify_full(cmd: &str) -> Classification {
 ///
 /// `args` is the command with the leading `tsc ` / `npx tsc ` already stripped.
 fn classify_tsc(args: &str) -> Classification {
-    let tokens = args.split_whitespace();
-    let mut no_emit = false;
-    for token in tokens {
-        // --watch is interactive and never terminates; never intercept.
-        if token.eq("-w") || token.eq("--watch") || token.eq("--watchFile") {
-            return Classification::not_compilation("tsc --watch is interactive (not intercepted)");
-        }
-        // tsc's flag parsing is case-insensitive (--noemit == --noEmit).
-        if token.eq_ignore_ascii_case("--noemit") {
-            no_emit = true;
-        }
-    }
-
-    if !no_emit {
+    let Some(words) = literal_flag_words(args) else {
         return Classification::not_compilation(
-            "tsc without --noEmit emits output files locally (not intercepted)",
+            "tsc requires literal non-emitting typecheck arguments",
+        );
+    };
+    if tsc_typecheck_flags(&words).is_none() {
+        return Classification::not_compilation(
+            "tsc requires --noEmit without emitting, build, watch or response-file options",
         );
     }
 
     Classification::compilation(CompilationKind::Tsc, 0.95, "tsc --noEmit typecheck")
+}
+
+/// Validate a bounded command line and return whether it explicitly disables
+/// both incremental and composite output. Values are consumed as values, so a
+/// project/outDir named `--noEmit` cannot masquerade as the compiler flag.
+fn tsc_typecheck_flags(words: &[&str]) -> Option<bool> {
+    let mut no_emit = false;
+    let mut incremental_disabled = false;
+    let mut composite_disabled = false;
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
+        index += 1;
+        if word.starts_with('@') {
+            return None;
+        }
+        if !word.starts_with('-') {
+            continue;
+        }
+        let flag = word.to_ascii_lowercase();
+        match flag.as_str() {
+            "--noemit" | "--incremental" | "--composite" => {
+                let enabled = match words.get(index).copied() {
+                    Some("false") => {
+                        index += 1;
+                        false
+                    }
+                    Some("true") => {
+                        index += 1;
+                        true
+                    }
+                    Some(value)
+                        if value.eq_ignore_ascii_case("false")
+                            || value.eq_ignore_ascii_case("true") =>
+                    {
+                        return None;
+                    }
+                    _ => true,
+                };
+                match flag.as_str() {
+                    "--noemit" if enabled => no_emit = true,
+                    "--incremental" if !enabled => incremental_disabled = true,
+                    "--composite" if !enabled => composite_disabled = true,
+                    // Even a contradictory later flag stays local rather
+                    // than weakening the required output contract.
+                    _ => return None,
+                }
+            }
+            "-p"
+            | "--project"
+            | "-t"
+            | "--target"
+            | "-m"
+            | "--module"
+            | "--lib"
+            | "--types"
+            | "--typeroots"
+            | "--rootdir"
+            | "--rootdirs"
+            | "--baseurl"
+            | "--moduleresolution"
+            | "--modulesuffixes"
+            | "--customconditions"
+            | "--moduledetection"
+            | "--jsx"
+            | "--jsxfactory"
+            | "--jsxfragmentfactory"
+            | "--jsximportsource"
+            | "--reactnamespace"
+            | "--locale"
+            | "--newline"
+            | "--maxnodemodulejsdepth"
+            | "--ignoredeprecations"
+            | "--outdir"
+            | "--outfile"
+            | "--declarationdir"
+            | "--maproot"
+            | "--sourceroot" => {
+                let value = *words.get(index)?;
+                if value.is_empty() || value.starts_with(['-', '@']) {
+                    return None;
+                }
+                index += 1;
+            }
+            "--strict"
+            | "--strictnullchecks"
+            | "--strictfunctiontypes"
+            | "--strictbindcallapply"
+            | "--strictpropertyinitialization"
+            | "--noimplicitany"
+            | "--noimplicitthis"
+            | "--useunknownincatchvariables"
+            | "--alwaysstrict"
+            | "--nounusedlocals"
+            | "--nounusedparameters"
+            | "--exactoptionalpropertytypes"
+            | "--noimplicitreturns"
+            | "--nofallthroughcasesinswitch"
+            | "--nouncheckedindexedaccess"
+            | "--noimplicitoverride"
+            | "--nopropertyaccessfromindexsignature"
+            | "--allowunusedlabels"
+            | "--allowunreachablecode"
+            | "--skiplibcheck"
+            | "--skipdefaultlibcheck"
+            | "--esmoduleinterop"
+            | "--allowsyntheticdefaultimports"
+            | "--allowjs"
+            | "--checkjs"
+            | "--resolvejsonmodule"
+            | "--resolvepackagejsonexports"
+            | "--resolvepackagejsonimports"
+            | "--allowimportingtsextensions"
+            | "--rewriterelativeimportextensions"
+            | "--allowarbitraryextensions"
+            | "--verbatimmodulesyntax"
+            | "--isolatedmodules"
+            | "--isolateddeclarations"
+            | "--noresolve"
+            | "--preservesymlinks"
+            | "--forceconsistentcasinginfilenames"
+            | "--pretty"
+            | "--diagnostics"
+            | "--extendeddiagnostics"
+            | "--traceresolution"
+            | "--listfiles"
+            | "--listfilesonly"
+            | "--showconfig"
+            | "--disablesizelimit"
+            | "--disablesourceofprojectreferenceredirect"
+            | "--disablesolutionsearching"
+            | "--disablereferencedprojectload"
+            | "--declaration"
+            | "--declarationmap"
+            | "--emitdeclarationonly"
+            | "--sourcemap"
+            | "--inlinesourcemap"
+            | "--inlinesources"
+            | "--noemitonerror" => {
+                if matches!(words.get(index).copied(), Some("true" | "false")) {
+                    index += 1;
+                }
+            }
+            // This includes every spelling of build/watch/init, output
+            // profiling/tracing, response options and unknown future flags.
+            _ => return None,
+        }
+    }
+    no_emit.then_some(incremental_disabled && composite_disabled)
+}
+
+/// Exact argv for the bounded Yarn PnP TypeScript execution path. This accepts
+/// only a literal bare `tsc` command; shell/environment wrappers and `npx`
+/// retain their original semantics outside this path. Explicitly disabling
+/// incremental and composite output prevents inherited tsconfig settings
+/// writing buildinfo, including on a compiler-option error.
+pub fn tsc_invocation(command: &str) -> Option<Vec<String>> {
+    let words = literal_flag_words(command)?;
+    let (program, arguments) = words.split_first()?;
+    if *program != "tsc" || arguments.len() > 256 || !tsc_typecheck_flags(arguments)? {
+        return None;
+    }
+    Some(
+        arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+    )
 }
 
 /// Parse a bounded literal argv without interpreting shell expansions. Whole
@@ -8489,12 +8649,107 @@ mod tests_go_and_typescript {
         assert_eq!(kind_of("tsc"), None);
         assert_eq!(kind_of("tsc -p tsconfig.json"), None);
         assert_eq!(kind_of("npx tsc --outDir dist"), None);
+        for command in [
+            "tsc --noEmit false",
+            "npx tsc --noEmit true --noEmit false",
+            "tsc --NOEMIT FALSE",
+            "tsc --noEmit --incremental",
+            "tsc --noEmit --incremental true",
+            "tsc --noEmit --composite true",
+            "tsc --noEmit --build",
+            "tsc --noEmit -b",
+            "tsc --noEmit --init",
+            "tsc --noEmit --generateCpuProfile profile.cpuprofile",
+            "tsc --noEmit --generateTrace trace",
+            "tsc --noEmit @response.args",
+            "tsc --project --noEmit --incremental false",
+            "tsc --outDir --noEmit --incremental false input.ts",
+        ] {
+            assert_eq!(kind_of(command), None, "{command}");
+        }
     }
 
     #[test]
     fn tsc_watch_is_not_intercepted() {
         assert_eq!(kind_of("tsc --noEmit --watch"), None);
         assert_eq!(kind_of("tsc --noEmit -w"), None);
+        assert_eq!(kind_of("tsc --noEmit --WATCH"), None);
+        assert_eq!(kind_of("tsc --noEmit -W"), None);
+        assert_eq!(
+            kind_of("tsc --noEmit --watchFile dynamicPriorityPolling"),
+            None
+        );
+    }
+
+    #[test]
+    fn tsc_invocation_preserves_literal_arguments_and_requires_no_buildinfo() {
+        assert_eq!(
+            tsc_invocation(
+                "tsc --noEmit --incremental false --composite false --project 'config with spaces.json' --pretty false"
+            ),
+            Some(Vec::from(
+                [
+                    "--noEmit",
+                    "--incremental",
+                    "false",
+                    "--composite",
+                    "false",
+                    "--project",
+                    "config with spaces.json",
+                    "--pretty",
+                    "false",
+                ]
+                .map(str::to_owned)
+            ))
+        );
+        assert_eq!(
+            tsc_invocation(
+                "'tsc' '--NOEMIT' '--incremental' 'false' '--composite' 'false' 'literal $value; file.ts'"
+            ),
+            Some(Vec::from(
+                [
+                    "--NOEMIT",
+                    "--incremental",
+                    "false",
+                    "--composite",
+                    "false",
+                    "literal $value; file.ts"
+                ]
+                .map(str::to_owned)
+            ))
+        );
+        for command in [
+            "tsc --noEmit",
+            "tsc --noEmit --incremental false",
+            "tsc --noEmit --composite false",
+            "npx tsc --noEmit --incremental false --composite false",
+            "env tsc --noEmit --incremental false --composite false",
+            "env -i tsc --noEmit --incremental false --composite false",
+            "NODE_OPTIONS= tsc --noEmit --incremental false --composite false",
+            "PATH=/caller/bin tsc --noEmit --incremental false --composite false",
+            "nice tsc --noEmit --incremental false --composite false",
+            "./tsc --noEmit --incremental false --composite false",
+            "tsc --noEmit --incremental true --incremental false --composite false",
+            "tsc --noEmit false --incremental false --composite false",
+            "tsc --noEmit --incremental false --composite true",
+            "tsc --noEmit --incremental false --composite true --composite false",
+            "tsc --noEmit --incremental false --composite false --project $CONFIG",
+            "tsc --noEmit --incremental false --composite false && echo completed",
+            "tsc --noEmit --incremental false --composite false; echo completed",
+            "tsc --noEmit --incremental false --composite false @response.args",
+            "tsc --noEmit --incremental false --composite false --future-output-mode file",
+        ] {
+            assert!(tsc_invocation(command).is_none(), "{command}");
+        }
+        let maximum = format!(
+            "tsc --noEmit --incremental false --composite false {}",
+            std::iter::repeat_n("input.ts", 251)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert_eq!(tsc_invocation(&maximum).unwrap().len(), 256);
+        let too_many = format!("{maximum} input.ts");
+        assert!(tsc_invocation(&too_many).is_none());
     }
 
     #[test]
