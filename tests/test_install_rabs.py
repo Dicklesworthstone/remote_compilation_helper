@@ -362,6 +362,11 @@ class MainInstallerTests(unittest.TestCase):
             (self.bundle / name).chmod(0o755)
         for name in ("rustup", "rsync", "zstd"):
             self.command(name, "printf '%s\\n' 'installer fixture'\n")
+        self.source_host = next(target for target, machine in installer.TARGET_MACHINES.items()
+                                if machine == installer.host_machine())
+        self.command("rustc", '[ "$*" = -vV ] || exit 97\nprintf \'%s\\n\' '
+                     + shlex.quote("rustc fixture") + " "
+                     + shlex.quote("host: " + self.source_host) + "\n")
         self.command("curl", "echo 'unexpected network access' >&2\nexit 90\n")
         self.command("ssh", "echo 'unexpected SSH access' >&2\nexit 91\n")
         self.environment = dict(os.environ, HOME=str(self.home),
@@ -511,23 +516,60 @@ esac
         for name in ("install-rabs", "cargo-rabs"):
             shutil.copyfile(self.bundle / name, project / "scripts" / name)
             (project / "scripts" / name).chmod(0o755)
-        target = self.root / "custom target"
+        target_base = self.root / "custom target"
+        target = target_base / self.source_host
         (target / "wrapper-release").mkdir(parents=True)
         (target / "daemon-release").mkdir()
+        # Retained executable outputs must not stand in for this invocation's
+        # artifacts. The Cargo double below overwrites only its selected paths.
+        stale_marker = b"\nretained source build output\n"
         for name in ("rch", "rabs-wrap"):
-            shutil.copyfile(self.bundle / name, target / "wrapper-release" / name)
+            (target / "wrapper-release" / name).write_bytes(
+                (self.bundle / name).read_bytes() + stale_marker)
             (target / "wrapper-release" / name).chmod(0o755)
         for name in ("rchd", "rch-wkr", "rabsd", "rabs-wkr", "rabs-cargo-root"):
-            shutil.copyfile(self.bundle / name, target / "daemon-release" / name)
+            (target / "daemon-release" / name).write_bytes(
+                (self.bundle / name).read_bytes() + stale_marker)
             (target / "daemon-release" / name).chmod(0o755)
-        self.environment["CARGO_TARGET_DIR"] = str(target)
+        self.environment["CARGO_TARGET_DIR"] = str(target_base)
         return project
+
+    def source_cargo(self, builds, failing_package=""):
+        # An explicit compiler double emits real native ELF fixtures into the
+        # requested Cargo layout; it does not claim to compile Rust sources.
+        self.command("cargo", "printf '%s\\n' \"$*\" >> " + shlex.quote(str(builds)) + "\n"
+                     + ("case \" $* \" in *' -p " + failing_package + " '*) exit 23;; esac\n"
+                        if failing_package else "") + r'''
+target_dir=${CARGO_TARGET_DIR:-target}
+target=${CARGO_BUILD_TARGET:-}
+profile= packages=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --target-dir) target_dir=$2; shift 2 ;;
+        --target) target=$2; shift 2 ;;
+        --profile) profile=$2; shift 2 ;;
+        -p) packages="$packages $2"; shift 2 ;;
+        --bin) shift 2 ;;
+        *) shift ;;
+    esac
+done
+output="$target_dir${target:+/$target}/$profile"
+mkdir -p "$output"
+for package in $packages; do
+    case "$package" in
+        rabs-wkr) names='rabs-wkr rabs-cargo-root' ;;
+        *) names=$package ;;
+    esac
+    for name in $names; do
+        cp ''' + shlex.quote(str(self.bundle)) + r'''/"$name" "$output/$name"
+        chmod 755 "$output/$name"
+    done
+done
+''')
 
     def run_source(self, project, with_rabs=True, failing_package=""):
         builds = self.root / "build-commands"
-        self.command("cargo", "printf '%s\\n' \"$*\" >> " + shlex.quote(str(builds)) + "\n"
-                     + ("case \" $* \" in *' -p " + failing_package + " '*) exit 23;; esac\n"
-                        if failing_package else ""))
+        self.source_cargo(builds, failing_package)
         body = ("MODE=worker\nVERSION_EXPLICIT=false\nWITH_RABS="
                 + ("true" if with_rabs else "false")
                 + '\nmkdir -m 0755 -p "$INSTALL_DIR"\nbuild_from_source\n')
@@ -537,11 +579,15 @@ esac
         result, builds = self.run_source(self.source_tree())
         self.assert_success(result)
         self.assert_complete_generation()
+        layout = (f" --target-dir {self.environment['CARGO_TARGET_DIR']}"
+                  f" --target {self.source_host}")
         self.assertEqual(builds.read_text().splitlines(), [
-            "build --locked --profile wrapper-release -p rch",
-            "build --locked --profile daemon-release -p rchd -p rch-wkr",
-            "build --locked --profile wrapper-release -p rabs-wrap",
-            "build --locked --profile daemon-release -p rabsd -p rabs-wkr",
+            "build --locked --profile wrapper-release -p rch --bin rch" + layout,
+            "build --locked --profile daemon-release -p rchd -p rch-wkr"
+            " --bin rchd --bin rch-wkr" + layout,
+            "build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap" + layout,
+            "build --locked --profile daemon-release -p rabsd -p rabs-wkr"
+            " --bin rabsd --bin rabs-wkr --bin rabs-cargo-root" + layout,
         ])
 
     def test_release_source_fallback_clones_the_tag_and_installs_all_rabs_tools(self):
@@ -554,7 +600,7 @@ esac
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             self.assert_success(result)
         builds = self.root / "cloned-build-commands"
-        self.command("cargo", "printf '%s\\n' \"$*\" >> " + shlex.quote(str(builds)) + "\n")
+        self.source_cargo(builds)
         result = self.shell('MODE=worker\nWITH_RABS=true\nREPO_URL="$1"\n'
                             'mkdir -m 0755 -p "$INSTALL_DIR"\nclone_and_build_from_source\n',
                             [project.as_uri()])
@@ -562,7 +608,11 @@ esac
         self.assert_complete_generation()
         self.assertIn("--profile wrapper-release -p rabs-wrap", builds.read_text())
         self.assertIn("--profile daemon-release -p rabsd -p rabs-wkr", builds.read_text())
-        self.assertTrue((self.bin / "rch-wkr").is_file())
+        for invocation in builds.read_text().splitlines():
+            self.assertIn(f"--target-dir {self.environment['CARGO_TARGET_DIR']}"
+                          f" --target {self.source_host}", invocation)
+        self.assertEqual((self.bin / "rch-wkr").read_bytes(),
+                         (self.bundle / "rch-wkr").read_bytes())
 
     def test_source_failure_never_installs_stale_rabs_build_outputs(self):
         result, _ = self.run_source(self.source_tree(), failing_package="rabsd")
@@ -574,7 +624,10 @@ esac
     def test_core_only_source_skips_rabs_builds_and_leftover_outputs(self):
         result, builds = self.run_source(self.source_tree(), with_rabs=False)
         self.assert_success(result)
-        self.assertNotIn("rabs", builds.read_text())
+        self.assertNotIn(" -p rabs", builds.read_text())
+        self.assertNotIn(" --bin rabs", builds.read_text())
+        self.assertEqual((self.bin / "rch-wkr").read_bytes(),
+                         (self.bundle / "rch-wkr").read_bytes())
         self.assertFalse((self.bin / installer.CURRENT).exists())
         self.assertFalse((self.bin / "rabs-wkr").exists())
 

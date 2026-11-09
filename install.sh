@@ -835,14 +835,48 @@ install_rabs_toolset() {
     success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr and rabs-cargo-root"
 }
 
+# Bind native source builds and installation to the same output layout. Cargo
+# can otherwise honor build.target-dir/build.target from environment or config
+# while an older executable remains at the installer's guessed profile path.
+configure_source_build_layout() {
+    local project_dir="$1" compiler_version line host_fields=0
+    SOURCE_BUILD_HOST=""
+    if ! compiler_version=$(rustc -vV); then
+        error "Cannot determine native Rust host; source build refused before replacing binaries"
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" == host:* ]]; then
+            host_fields=$((host_fields + 1))
+            SOURCE_BUILD_HOST="${line#host: }"
+        fi
+    done <<< "$compiler_version"
+    if [[ "$host_fields" != 1 ||
+          ! "$SOURCE_BUILD_HOST" =~ ^[A-Za-z0-9_]+(-[A-Za-z0-9_]+){2,}$ ]]; then
+        error "Invalid native Rust host reported by rustc -vV; source build refused before replacing binaries"
+        return 1
+    fi
+
+    SOURCE_BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$project_dir/target}"
+    if [[ "$SOURCE_BUILD_TARGET_DIR" != /* ]]; then
+        SOURCE_BUILD_TARGET_DIR="$project_dir/$SOURCE_BUILD_TARGET_DIR"
+    fi
+    # --target places final artifacts beneath the triple, even for the host.
+    # Keep the base separate so repeated source setup never nests the triple.
+    TARGET_DIR="${SOURCE_BUILD_TARGET_DIR%/}/$SOURCE_BUILD_HOST"
+}
+
 build_rabs_toolset() {
     [[ "${WITH_RABS:-false}" == "true" ]] || return 0
     local project_dir="$1"
     info "Building the requested RABS toolset..."
-    if ! cargo build --locked --profile wrapper-release -p rabs-wrap; then
+    if ! cargo build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap \
+        --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS wrapper build failed; installation stopped"
     fi
-    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; then
+    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr \
+        --bin rabsd --bin rabs-wkr --bin rabs-cargo-root \
+        --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS daemon/worker build failed; installation stopped"
     fi
     install_rabs_toolset "$project_dir/scripts/install-rabs" --from-build "$TARGET_DIR"
@@ -873,29 +907,29 @@ build_from_source() {
     # footprint first), daemon/worker under daemon-release (throughput,
     # symbols retained for crashpacks). RABS is built only when requested and
     # its complete generation must install successfully before reporting success.
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        TARGET_DIR="${CARGO_TARGET_DIR%/}"
-    else
-        TARGET_DIR="$project_dir/target"
-    fi
+    configure_source_build_layout "$project_dir" || return 1
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch; then
+        if ! spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             error "RCH wrapper build failed; existing binaries were not replaced"
             return 1
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             error "RCH daemon/worker build failed; existing binaries were not replaced"
             return 1
         fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        if ! cargo build --locked --profile wrapper-release -p rch; then
+        if ! cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             error "RCH wrapper build failed; existing binaries were not replaced"
             return 1
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             error "RCH daemon/worker build failed; existing binaries were not replaced"
             return 1
         fi
@@ -1140,26 +1174,26 @@ clone_and_build_from_source() {
     verify_source_release "$TEMP_DIR/rch" "$source_tag" || return 1
 
     # A021 split profiles (see build_from_source for rationale).
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        TARGET_DIR="${CARGO_TARGET_DIR%/}"
-    else
-        TARGET_DIR="$TEMP_DIR/rch/target"
-    fi
+    configure_source_build_layout "$TEMP_DIR/rch" || return 1
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch; then
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
-        if ! cargo build --locked --profile wrapper-release -p rch; then
+        if ! cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     fi

@@ -17,6 +17,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
+SOURCE_HOST = "x86_64-unknown-linux-gnu"
 
 PROLOGUE = r'''
 set -euo pipefail
@@ -46,6 +47,11 @@ launchctl() {
     return 0
 }
 uname() { printf '%s\n' "${RCH_TEST_OS:-Linux}"; }
+rustc() {
+    [[ "$*" == -vV ]] || return 97
+    printf '%s\n' "$RCH_TEST_RUSTC_VERSION"
+    return "${RCH_TEST_RUSTC_RESULT:-0}"
+}
 # Service-preservation tests must return before creating/writing a definition.
 mkdir() { trace "UNEXPECTED mkdir $*"; return 99; }
 '''
@@ -130,6 +136,47 @@ mktemp() { printf '%s\n' "$RCH_TEST_EXTRACT"; }
 rm() { trace "retained cleanup $*"; }
 '''
 
+SOURCE_CLONE_FIXTURE = r'''
+VERSION=2.1.35
+git() {
+    trace "git $*"
+    if [[ "$1" == clone ]]; then
+        cp -R "$RCH_TEST_SOURCE" "$TEMP_DIR/rch"
+    elif [[ "$1" == -C && "$3" == rev-parse ]]; then
+        printf 'fixture-release\n'
+    elif [[ "$1" != -C || "$3" != status ]]; then
+        return 97
+    fi
+}
+'''
+
+SOURCE_CARGO_FIXTURE = r'''
+# Explicit Cargo double: model configured destinations and command-line
+# overrides, then produce real fixture executables at that selected location.
+cargo() {
+    trace "cargo $*"
+    local target_dir="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$RCH_TEST_CONFIG_TARGET_DIR}}"
+    local target="${CARGO_BUILD_TARGET:-$RCH_TEST_CONFIG_TARGET}" profile= package
+    local packages=()
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --target-dir) target_dir="$2"; shift 2 ;;
+            --target) target="$2"; shift 2 ;;
+            --profile) profile="$2"; shift 2 ;;
+            -p) packages+=("$2"); shift 2 ;;
+            --bin) shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    local output="$target_dir${target:+/$target}/$profile"
+    command mkdir -p "$output"
+    for package in ${packages[@]+"${packages[@]}"}; do
+        cp "$RCH_TEST_BUNDLE/$package" "$output/$package"
+        chmod 755 "$output/$package"
+    done
+}
+'''
+
 
 class InstallerDaemonUpgradeTests(unittest.TestCase):
     @classmethod
@@ -153,6 +200,7 @@ class InstallerDaemonUpgradeTests(unittest.TestCase):
             RCH_CONFIG_DIR=str(self.case / "config"),
             RCH_TEST_TRACE=str(self.trace),
             RCH_TEST_LAUNCHD_LIST="PID\tStatus\tLabel\n42\t0\tcom.rch.daemon",
+            RCH_TEST_RUSTC_VERSION=f"rustc fixture\nhost: {SOURCE_HOST}",
         )
         self.invocations = 0
 
@@ -223,9 +271,10 @@ class InstallerDaemonUpgradeTests(unittest.TestCase):
 
     def prepare_split_build(self):
         target = self.case / "target"
+        self.source_target = target / SOURCE_HOST
         for profile, names in (("wrapper-release", ("rch",)),
                                ("daemon-release", ("rchd", "rch-wkr"))):
-            directory = target / profile
+            directory = self.source_target / profile
             directory.mkdir(parents=True)
             for name in names:
                 destination = directory / name
@@ -450,6 +499,107 @@ download_binaries
         self.assertEqual((self.case / "rch-wkr").read_bytes(),
                          (self.bundle / "rch-wkr").read_bytes())
 
+    def assert_source_build_uses_native_outputs(self, cloned):
+        self.prepare_upgrade()
+        project = self.case / "source"
+        (project / ".cargo").mkdir(parents=True)
+        (project / "Cargo.toml").write_text("# remote_compilation_helper source fixture\n")
+        configured = self.case / "configured build output"
+        foreign = "aarch64-unknown-linux-musl"
+        (project / ".cargo/config.toml").write_text(
+            f'[build]\ntarget-dir = "{configured}"\ntarget = "{foreign}"\n')
+        self.env.pop("CARGO_TARGET_DIR", None)
+        relative_target = "target" if cloned else "chosen output"
+        if not cloned:
+            # A supported relative override with spaces and a trailing slash
+            # must remain rooted in this source tree, not the caller's cwd.
+            self.env["CARGO_TARGET_DIR"] = relative_target + "/"
+        self.env.update(
+            CARGO_BUILD_TARGET_DIR=str(configured), CARGO_BUILD_TARGET=foreign,
+            RCH_TEST_CONFIG_TARGET_DIR=str(configured), RCH_TEST_CONFIG_TARGET=foreign,
+            RCH_TEST_SOURCE=str(project),
+        )
+        stale = b"#!/bin/sh\n# retained output from another Cargo destination\nexit 0\n"
+        profiles = (("wrapper-release", ("rch",)),
+                    ("daemon-release", ("rchd", "rch-wkr")))
+        for base in (project / relative_target,
+                     project / relative_target / foreign, configured / foreign):
+            for profile, names in profiles:
+                directory = base / profile
+                directory.mkdir(parents=True)
+                for name in names:
+                    (directory / name).write_bytes(stale)
+                    (directory / name).chmod(0o755)
+
+        action = ("clone_and_build_from_source" if cloned else
+                  'cd "$RCH_TEST_SOURCE"\nbuild_from_source')
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + SOURCE_CLONE_FIXTURE + SOURCE_CARGO_FIXTURE
+            + "\n" + action + "\nrestart_daemon_if_needed\n"
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assert_installed_client()
+        built_project = self.extract / "rch" if cloned else project
+        selected = built_project / relative_target
+        for profile, names in profiles:
+            for name in names:
+                fresh = (self.bundle / name).read_bytes()
+                self.assertEqual((self.case / name).read_bytes(), fresh)
+                self.assertEqual((selected / SOURCE_HOST / profile / name).read_bytes(), fresh)
+                for old_base in (selected, selected / foreign, configured / foreign):
+                    self.assertEqual((old_base / profile / name).read_bytes(), stale)
+        builds = [event for event in self.events() if event.startswith("cargo ")]
+        self.assertEqual(len(builds), 2)
+        selected_argument = str(selected) + ("" if cloned else "/")
+        for event in builds:
+            self.assertIn(f"--target-dir {selected_argument} --target {SOURCE_HOST}", event)
+        self.assertIn("--bin rch ", builds[0])
+        self.assertIn("--bin rchd --bin rch-wkr ", builds[1])
+
+    def test_source_build_installs_fresh_native_outputs_despite_cargo_config(self):
+        self.assert_source_build_uses_native_outputs(cloned=False)
+
+    def test_cloned_source_installs_fresh_native_outputs_despite_cargo_config(self):
+        self.assert_source_build_uses_native_outputs(cloned=True)
+
+    def test_invalid_native_rust_host_preserves_existing_binaries_before_builds(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        project = self.case / "source"
+        project.mkdir()
+        (project / "Cargo.toml").write_text("# remote_compilation_helper source fixture\n")
+        versions = (
+            ("missing", "rustc fixture\nrelease: nightly", "0"),
+            ("duplicate", f"host: {SOURCE_HOST}\nhost: {SOURCE_HOST}", "0"),
+            ("invalid", "host: ../outside-target", "0"),
+            ("failed", f"host: {SOURCE_HOST}", "17"),
+        )
+        for cloned in (False, True):
+            for label, version, status in versions:
+                with self.subTest(cloned=cloned, host=label):
+                    extract = self.case / f"extracted-host-{cloned}-{label}"
+                    extract.mkdir()
+                    action = ("clone_and_build_from_source" if cloned else
+                              'cd "$RCH_TEST_SOURCE"\nbuild_from_source')
+                    result = self.run_installer(
+                        REAL_INSTALL_HELPERS + SOURCE_CLONE_FIXTURE
+                        + '\ncargo() { trace UNEXPECTED-cargo; }\n'
+                        'build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }\n'
+                        'if {\n' + action + '\n}; then\n'
+                        '    trace UNEXPECTED-source-success\n'
+                        'else\n    trace source-host-refused\nfi\n',
+                        RCH_TEST_SOURCE=str(project), RCH_TEST_EXTRACT=str(extract),
+                        RCH_TEST_RUSTC_VERSION=version, RCH_TEST_RUSTC_RESULT=status,
+                    )
+                    self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                    self.assertIn("Rust host", result.stderr)
+                    self.assertIn("source-host-refused", self.events())
+                    self.assertNotIn("UNEXPECTED-cargo", self.events())
+                    self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+                    self.assertNotIn("UNEXPECTED-source-success", self.events())
+                    self.assert_installed_binaries_preserved(original)
+
     def test_failed_source_build_cannot_install_retained_outputs_in_checked_call(self):
         self.prepare_upgrade()
         self.prepare_split_build()
@@ -491,7 +641,7 @@ fi
                                ("rchd", "daemon-release"),
                                ("rch-wkr", "daemon-release")):
             with self.subTest(missing=name):
-                path = Path(self.env["CARGO_TARGET_DIR"]) / profile / name
+                path = self.source_target / profile / name
                 retained = path.with_name(name + ".retained")
                 path.rename(retained)
                 try:
@@ -511,7 +661,7 @@ fi
         self.prepare_upgrade()
         self.prepare_split_build()
         original = self.preserve_installed_binaries()
-        target = Path(self.env["CARGO_TARGET_DIR"])
+        target = self.source_target
         (target / "release").mkdir()
         hook = target / "wrapper-release/rch"
         hook.rename(target / "release/rch")
@@ -529,7 +679,7 @@ fi
         self.prepare_upgrade()
         self.prepare_split_build()
         original = self.preserve_installed_binaries()
-        hook = Path(self.env["CARGO_TARGET_DIR"]) / "wrapper-release/rch"
+        hook = self.source_target / "wrapper-release/rch"
         for kind in ("empty", "not-executable", "symlink", "directory"):
             with self.subTest(kind=kind):
                 hook.rename(hook.with_name("rch.before-" + kind))
@@ -557,7 +707,7 @@ fi
         self.prepare_upgrade()
         self.prepare_split_build()
         original = self.preserve_installed_binaries()
-        hook = Path(self.env["CARGO_TARGET_DIR"]) / "wrapper-release/rch"
+        hook = self.source_target / "wrapper-release/rch"
         hook.rename(hook.with_name("rch.retained"))
         project = self.case / "source"
         project.mkdir()
@@ -588,7 +738,7 @@ clone_and_build_from_source
         self.prepare_upgrade()
         self.prepare_split_build()
         original = self.preserve_installed_binaries()
-        target = Path(self.env["CARGO_TARGET_DIR"])
+        target = self.source_target
         for relative in ("wrapper-release/rch", "daemon-release/rchd"):
             path = target / relative
             path.rename(path.with_name(path.name + ".retained"))
