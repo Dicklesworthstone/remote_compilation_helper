@@ -1553,17 +1553,13 @@ async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Resu
         return Ok(());
     }
 
-    // Validation/checksum failed (or an interrupted transfer): the rename never
-    // ran, so the old binary is intact. Best-effort remove the staged temp.
-    if let Ok(staging_path) = remote_shell_path(&staging_path) {
-        let cleanup_cmd = format!("rm -f {staging_path}");
-        let _ = ssh.run_command(&cleanup_cmd).await;
-    }
-
+    // Keep the rejected bytes for diagnosis and operator-controlled cleanup.
+    // The staged validation failed before rename, so the old binary is intact.
     Err(anyhow::anyhow!(
-        "staged install rejected before switch (exit {}: {}); previous binary left active",
+        "staged install rejected before switch (exit {}: {}); previous binary left active; staged artifact retained at {}",
         output.exit_code,
-        output.stderr.trim()
+        output.stderr.trim(),
+        staging_path
     ))
 }
 

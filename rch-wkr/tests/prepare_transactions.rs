@@ -13,7 +13,7 @@ fn prepare_transaction_process_contract() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/prepare_outputs.py"),
     ] {
         let status = std::process::Command::new("python3")
-            .args(["-I", script])
+            .args(["-B", "-I", script])
             .arg(env!("CARGO_BIN_EXE_rch-wkr"))
             .status()
             .expect("run real-worker preparation regressions (requires python3)");

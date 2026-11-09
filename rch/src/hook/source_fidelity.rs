@@ -4266,7 +4266,16 @@ sys.exit(99)
     }
 
     fn build_source_stamp_fixture_repo() -> (PathBuf, String) {
-        let root = tempfile::tempdir().unwrap().keep();
+        // Retained Git fixtures must stay outside the selected source tree:
+        // the transport correctly refuses a receiver containing a checkout.
+        let scratch = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let root = tempfile::Builder::new()
+            .prefix("rch-source-stamp-fixture-")
+            .tempdir_in(scratch)
+            .unwrap()
+            .keep();
         build_source_stamp_git(&root, &["init", "-q", "-b", "main"]);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(

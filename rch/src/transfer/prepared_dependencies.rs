@@ -31,7 +31,7 @@ impl TransferPipeline {
         }
     }
 
-    fn prepared_execution_timeout_seconds(&self) -> u64 {
+    pub(super) fn prepared_execution_timeout_seconds(&self) -> u64 {
         if let Some(deadline) = self.prepared_execution_deadline {
             // The admission method rejects an already exhausted budget. Keep
             // a deadline that expires while constructing the command enabled:

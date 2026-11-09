@@ -545,6 +545,20 @@ fn supports_owned_source_content_cargo(kind: Option<CompilationKind>, command: &
     ) && rch_common::patterns::cargo_xwin_compilation_kind(command).is_none()
 }
 
+fn planned_source_pair(
+    container: Option<&str>,
+    has_target_pool: bool,
+    retained_root: Option<&str>,
+    identity: &str,
+) -> Option<(String, String)> {
+    (has_target_pool || retained_root.is_some()).then(|| {
+        (
+            container.expect("paired source container").to_owned(),
+            identity.to_owned(),
+        )
+    })
+}
+
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
     // Use newline instead of semicolon to ensure trailing comments in command
@@ -1269,17 +1283,19 @@ async fn execute_remote_compilation_inner(
     // Probe before persisting an intent or mutating any worker path. Other Unix
     // platforms keep invocation-isolated source until their rename protocol is
     // implemented and qualified; a Linux capability failure is a refusal.
-    let owned_source_content_pair = if source_content_receipt
+    let ordinary_source_content_pair = source_content_receipt
         && clean_overlay.is_none()
         && exact_dependency_closure_sync
         && supports_owned_source_content_cargo(kind, command)
-        && !reuse_disabled
-    {
+        && !reuse_disabled;
+    let clean_overlay_retention =
+        source_content_receipt && clean_overlay.is_some() && !worker_is_windows;
+    let retain_source = if ordinary_source_content_pair || clean_overlay_retention {
         anyhow::ensure!(
             durable_lease.is_some()
                 && !super::ssh::should_skip_remote_preflight(&worker_config)
-                && forwarded_cargo_target_dir.is_some(),
-            "owned source-content staging requires a durable Unix Cargo target route"
+                && (!ordinary_source_content_pair || forwarded_cargo_target_dir.is_some()),
+            "retained source staging requires a durable Unix source route"
         );
         let probe = format!(
             "set -eu; if [ \"$(uname -s)\" = Linux ]; then {}; \
@@ -1302,12 +1318,19 @@ async fn execute_remote_compilation_inner(
         );
         match output.stdout.as_slice() {
             b"RCH_SOURCE_RETENTION_CAPABLE\n" => true,
-            b"RCH_SOURCE_RETENTION_LEGACY_PLATFORM\n" => false,
+            b"RCH_SOURCE_RETENTION_LEGACY_PLATFORM\n" => {
+                anyhow::ensure!(
+                    !clean_overlay_retention,
+                    "source-qualified clean overlays require Linux source retention"
+                );
+                false
+            }
             _ => anyhow::bail!("owned source retention admission returned an invalid envelope"),
         }
     } else {
         false
     };
+    let owned_source_content_pair = ordinary_source_content_pair && retain_source;
     if owned_source_content_pair {
         // A managed build directory must win over ambient Cargo settings and
         // cannot be added safely to arbitrary shell grammar.
@@ -1522,7 +1545,7 @@ async fn execute_remote_compilation_inner(
             worker_config.id
         ));
     }
-    let retained_source_root = owned_source_content_pair.then(|| {
+    let retained_source_root = retain_source.then(|| {
         format!(
             "{}.retained-{recovery_identity}",
             overlay_remote_root
@@ -1802,11 +1825,15 @@ async fn execute_remote_compilation_inner(
         });
     // Keep the complete dependency closure, any already-locked pair container,
     // retirement/freshness siblings and target pool in the same immutable grant.
+    let planned_pair = planned_source_pair(
+        overlay_remote_root.as_deref(),
+        source_pair_pool.is_some(),
+        retained_source_root.as_deref(),
+        &recovery_identity,
+    );
     let mut mutable_source_authority_roots = source_namespace::build_source_roots(
         &sync_plan,
-        source_pair_pool
-            .as_ref()
-            .and(overlay_remote_root.as_deref()),
+        planned_pair.as_ref().map(|(root, _)| root.as_str()),
         retained_source_root.as_deref(),
         source_freshness_control.as_deref(),
         source_target_root.as_deref(),
@@ -1815,14 +1842,6 @@ async fn execute_remote_compilation_inner(
         mutable_source_authority_roots.clear();
     }
     let source_identity = durable_sources.then_some(recovery_identity.as_str());
-    let planned_pair = source_pair_pool.as_ref().map(|_| {
-        (
-            overlay_remote_root
-                .clone()
-                .expect("paired source container"),
-            recovery_identity.clone(),
-        )
-    });
     if durable_sources {
         recovery::RecoverySession::begin(
             durable_lease.context(

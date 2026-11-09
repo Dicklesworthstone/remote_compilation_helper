@@ -9908,6 +9908,71 @@ mod tests {
     }
 
     #[test]
+    fn clean_overlay_retention_without_cargo_pool_binds_container_and_siblings() {
+        let _guard = test_guard!();
+        for suffix in ["", "/repository/nested"] {
+            let (directory, writer, worker) = admitted_preparation_fixture();
+            let directory = directory.keep();
+            let root = "/data/tmp/rch/unpooled-bun-source";
+            let identity = "0123456789abcdef0123456789abcdef";
+            let retained = format!("{root}.retained-{identity}");
+            let pair =
+                super::super::planned_source_pair(Some(root), false, Some(&retained), identity);
+            let plan = [SyncClosurePlanEntry {
+                local_root: directory.clone(),
+                remote_root: format!("{root}{suffix}"),
+                project_id: "bun-source".into(),
+                root_hash: "bun-source".into(),
+                is_primary: true,
+                mode: SyncClosureMode::Full,
+            }];
+            let roots = super::super::source_namespace::build_source_roots(
+                &plan,
+                pair.as_ref().map(|(root, _)| root.as_str()),
+                Some(&retained),
+                None,
+                None,
+            );
+            let before = std::fs::read(&writer.path).unwrap();
+            assert!(
+                RecoverySession::begin(
+                    &writer,
+                    &worker,
+                    roots.clone(),
+                    None,
+                    Some(root.into()),
+                    Some(retained.clone()),
+                    TransferConfig::default(),
+                    directory.clone(),
+                    identity.into(),
+                )
+                .is_err(),
+                "retention without a real source pair must not journal"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            RecoverySession::begin(
+                &writer,
+                &worker,
+                roots,
+                pair,
+                Some(root.into()),
+                Some(retained.clone()),
+                TransferConfig::default(),
+                directory,
+                identity.into(),
+            )
+            .unwrap();
+            let recipe: RecoveryRecipe =
+                serde_json::from_value(writer.snapshot().recovery.unwrap()).unwrap();
+            assert_eq!(recipe.pair, Some((root.into(), identity.into())));
+            assert_eq!(recipe.retained_root.as_deref(), Some(retained.as_str()));
+            assert!(recipe.source_roots.iter().any(|path| path == root));
+            assert!(recipe.source_roots.contains(&retained));
+            assert!(recipe.source_roots.contains(&format!("{root}{suffix}")));
+        }
+    }
+
+    #[test]
     fn retained_source_intent_binds_siblings_pair_and_authority_before_journaling() {
         let _guard = test_guard!();
         for case in [
