@@ -38,6 +38,9 @@ if [ "${1-}" = test ]; then
     exit 0
 fi
 printf '%s\n' "$manager" "$#" "$@" >> "$RCH_PREPARE_TEST_STATE/argv"
+printf '%s\n' "${PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL-unset}" \
+    "${pnpm_config_optimistic_repeat_install-unset}" "${PNPM_CONFIG_IGNORE_SCRIPTS-unset}" \
+    > "$RCH_PREPARE_TEST_STATE/pnpm-environment"
 [ "$manager" = "$RCH_PREPARE_EXPECT_MANAGER" ] || exit 93
 case "$RCH_PREPARE_EXPECT_PLAN" in
     ci) [ "$#" = 1 ] && [ "$1" = ci ] || exit 90 ;;
@@ -496,6 +499,44 @@ class PrepareTransactions(unittest.TestCase):
                 self.assertNotEqual(second["fingerprint"]["hash"], first["fingerprint"]["hash"])
                 self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
                 self.assertEqual(self.invocations(state), ["npm", "1", "ci"] * 2)
+
+    def test_pre_lifecycle_policy_stamp_requires_one_frozen_install(self):
+        project, state = self.project("legacy-lifecycle-policy")
+        # Exact stamp emitted by worker 31784b7 for project()'s unchanged
+        # package.json and package-lock.json. It predates lifecycle closure.
+        legacy_hash = "7e50f83183a53914625c35e05a28dc9b71d9c802a75ea03340f1d8131f2033fd"
+        (project / "node_modules").mkdir()
+        output = project / "node_modules/fixture-dependency"
+        output.write_text("stale lifecycle output\n")
+        (project / ".rch_dep_fingerprint.json").write_text(json.dumps({
+            "hash": legacy_hash, "sources": ["package.json", "package-lock.json"],
+        }))
+        refreshed = self.report(self.start(project, state), 0)
+        self.assertEqual(refreshed["action"], "Installed")
+        self.assertEqual(refreshed["fingerprint_changed_from"], legacy_hash)
+        self.assertNotEqual(refreshed["fingerprint"]["hash"], legacy_hash)
+        self.assertEqual(output.read_text(), "complete\n")
+        self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
+        self.assertEqual(self.events(state), ["install"])
+        self.assertEqual(self.invocations(state), ["npm", "1", "ci"])
+
+    def test_pnpm_repeat_shortcut_is_disabled_without_changing_frozen_arguments(self):
+        inherited = {"PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL": "true",
+                     "pnpm_config_optimistic_repeat_install": "true",
+                     "PNPM_CONFIG_IGNORE_SCRIPTS": "true"}
+        for manager, lock, plan in (("pnpm", "pnpm-lock.yaml", "frozen"),
+                                    ("npm", "package-lock.json", "ci")):
+            with self.subTest(manager=manager):
+                project, state = self.project("repeat-policy-" + manager, lock=lock)
+                options = dict(manager=manager, plan=plan, extra_env=inherited)
+                self.assertEqual(self.report(self.start(project, state, **options), 0)["action"], "Installed")
+                values = (state / "pnpm-environment").read_text().splitlines()
+                self.assertEqual(values, ["false", "unset", "true"] if manager == "pnpm"
+                                 else ["true", "true", "true"])
+                self.assertEqual(self.report(self.start(project, state, **options), 0)["action"], "Skipped")
+                self.assertEqual(self.events(state), ["install"])
+                self.assertEqual(self.invocations(state), ["pnpm", "2", "install", "--frozen-lockfile"]
+                                 if manager == "pnpm" else ["npm", "1", "ci"])
 
     def test_package_manager_configuration_changes_invalidate_the_cached_install(self):
         cases = [(".yarnrc", "yarn.lock", "yarn"),
