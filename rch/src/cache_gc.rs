@@ -6,13 +6,12 @@
 //! so on a busy multi-agent host they accumulate to tens of GB — the largest
 //! `/tmp` consumer and a disk-full risk mid-swarm.
 //!
-//! This adds a sanctioned GC: enumerate the staging trees, then a **pure**
-//! [`plan_staging_gc`] decides which to prune by age while never touching a
-//! tree that was modified inside the in-flight window (the same freshness guard
-//! the remote reaper uses, so an active build's tree is protected). The
-//! `rch cache clean` command reports the plan and, unless `--dry-run`, removes
-//! the prunable trees — each path re-validated with
-//! [`rch_common::stale_target_reap::is_safe_reap_path`] before any `remove`.
+//! Age proposes candidates; it cannot establish that source or recovery
+//! custody ended. Preview observes the shared source registry, retention
+//! markers and live process gates. Explicit execution repeats those checks
+//! under the same durable GC claim used by worker cleanup, verifies the
+//! enumerated directory identities and metadata, and keeps that claim through
+//! descriptor-relative removal and checked retirement.
 //!
 //! Default is **dry-run**: a bare `rch cache clean` never deletes.
 
@@ -20,6 +19,23 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Metadata only: no source contents are read or hashed. The witness prevents
+/// a stale proposal from authorizing a replaced tree or newly changed inputs.
+#[derive(Debug, Clone, Serialize)]
+struct StagingWitness {
+    canonical_base: PathBuf,
+    base: DirectoryIdentity,
+    parent: DirectoryIdentity,
+    tree: DirectoryIdentity,
+    metadata_digest: String,
+}
 
 /// One enumerated staging tree.
 #[derive(Debug, Clone)]
@@ -29,14 +45,15 @@ pub struct StagingTree {
     pub size_bytes: u64,
     /// Age of the most recently modified file in the tree (`now - newest_mtime`).
     pub age: Duration,
+    witness: Option<StagingWitness>,
 }
 
 /// GC policy.
 #[derive(Debug, Clone, Copy)]
 pub struct StagingGcPolicy {
-    /// Only prune trees whose newest file is older than this. Doubles as the
-    /// in-flight guard: an active build touches files continuously, so its tree
-    /// stays younger than any sane `min_age`.
+    /// Only propose trees whose newest entry is older than this. Quiet live
+    /// builds and completed recovery inputs additionally require custody and
+    /// process checks; old mtimes alone never authorize collection.
     pub min_age: Duration,
 }
 
@@ -50,6 +67,14 @@ pub enum GcAction {
     KeepRecent,
     /// Path failed the safe-reap validation — kept, never touched.
     KeepUnsafePath,
+    /// Source ownership or a retention marker forbids collection.
+    KeepSourceCustody,
+    /// A process has an open handle, cwd, or command referring to this tree.
+    KeepInUse,
+    /// The proposal no longer describes the same directory and metadata.
+    KeepChanged,
+    /// A required ownership, metadata, or liveness observation was unavailable.
+    KeepUnavailable,
 }
 
 /// Per-tree plan entry.
@@ -60,6 +85,10 @@ pub struct StagingGcEntry {
     pub age_secs: u64,
     pub action: GcAction,
     pub reason: String,
+    #[serde(skip)]
+    witness: Option<StagingWitness>,
+    #[serde(skip)]
+    min_age: Duration,
 }
 
 /// The full GC plan.
@@ -82,13 +111,31 @@ fn is_prunable_path(path: &str, base: &Path) -> bool {
     let candidate = Path::new(path);
     candidate.starts_with(base)
         && candidate != base
+        && candidate.strip_prefix(base).is_ok_and(|relative| {
+            relative.components().count() == 2
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        })
         && rch_common::stale_target_reap::is_safe_reap_path(path)
+}
+
+fn is_source_container(path: &Path, base: &Path) -> bool {
+    path.strip_prefix(base)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|part| {
+            part.as_os_str()
+                .to_string_lossy()
+                .starts_with("source-content-")
+        })
 }
 
 /// Decide, per tree, whether to prune — pure, no filesystem access.
 ///
-/// A tree is pruned iff it is under the staging `base`, is a safe reap path,
-/// AND its newest file is older than `policy.min_age` (the in-flight guard).
+/// An old legacy staging tree under `base` becomes a proposal. Source-content
+/// containers remain in custody; inspection and execution must establish the
+/// remaining ownership, liveness, and identity requirements.
 #[must_use]
 pub fn plan_staging_gc(
     trees: &[StagingTree],
@@ -107,6 +154,11 @@ pub fn plan_staging_gc(
             (
                 GcAction::KeepUnsafePath,
                 "path is not a safe reap path under the staging root".to_string(),
+            )
+        } else if is_source_container(&tree.path, base) {
+            (
+                GcAction::KeepSourceCustody,
+                "source-content containers are not legacy project/hash staging".to_string(),
             )
         } else if tree.age < policy.min_age {
             (
@@ -131,6 +183,8 @@ pub fn plan_staging_gc(
             age_secs: tree.age.as_secs(),
             action,
             reason,
+            witness: tree.witness.clone(),
+            min_age: policy.min_age,
         });
     }
 
@@ -194,7 +248,13 @@ pub fn enumerate_staging_trees(
             {
                 continue;
             }
-            let (size_bytes, newest) = tree_size_and_newest_mtime(&tree_path);
+            let observation = observe_tree(remote_base, &tree_path);
+            // An incomplete traversal never contributes deletion authority.
+            // Keep the path visible so preview can explain the refusal.
+            let (size_bytes, newest, witness) = match observation {
+                Ok((bytes, modified, witness)) => (bytes, Some(modified), Some(witness)),
+                Err(_) => (0, None, None),
+            };
             let age = newest
                 .and_then(|m| now.duration_since(m).ok())
                 .unwrap_or(Duration::ZERO);
@@ -202,6 +262,7 @@ pub fn enumerate_staging_trees(
                 path: tree_path,
                 size_bytes,
                 age,
+                witness,
             });
         }
     }
@@ -255,70 +316,419 @@ pub struct StagingGcOutcome {
     pub failed: Vec<String>,
 }
 
-/// Remove the `Prune` entries of a plan. Each path is **re-validated** with
-/// [`is_prunable_path`] (safe reap path AND under `base`) immediately before
-/// removal as a final guard, so a plan can never drive a `remove_dir_all` on an
-/// unsafe or out-of-tree path. Returns counts; per-path failures are collected,
-/// not fatal.
+/// Enrich the age proposal with read-only custody and liveness observations.
+/// This does not create a source registry, repair records, or acquire a claim.
+pub fn inspect_staging_gc_plan(plan: StagingGcPlan, base: &Path) -> StagingGcPlan {
+    inspect_staging_gc_plan_with_registry(
+        plan,
+        base,
+        rch_common::stale_target_reap::SOURCE_CLAIM_REGISTRY,
+    )
+}
+
+fn inspect_staging_gc_plan_with_registry(
+    mut plan: StagingGcPlan,
+    base: &Path,
+    registry: &str,
+) -> StagingGcPlan {
+    for entry in &mut plan.entries {
+        if entry.action != GcAction::Prune {
+            continue;
+        }
+        let verdict = inspect_or_collect(entry, base, registry, false);
+        if verdict != "ready" {
+            entry.action = match verdict.as_str() {
+                "source-ownership" | "retention" => GcAction::KeepSourceCustody,
+                "in-use" => GcAction::KeepInUse,
+                "changed" => GcAction::KeepChanged,
+                "recent" => GcAction::KeepRecent,
+                _ => GcAction::KeepUnavailable,
+            };
+            entry.reason = format!("collection refused: {verdict}");
+        }
+    }
+    plan.prunable_count = 0;
+    plan.prunable_bytes = 0;
+    for entry in &plan.entries {
+        if entry.action == GcAction::Prune {
+            plan.prunable_count += 1;
+            plan.prunable_bytes = plan.prunable_bytes.saturating_add(entry.size_bytes);
+        }
+    }
+    plan
+}
+
+/// A plan is a proposal, never deletion authority. Apply reacquires the shared
+/// source transaction and all process gates, verifies the exact enumerated
+/// metadata and directory identities, and retires its claim only after the
+/// removal child has finished. Unknown observations retain the candidate.
 pub fn execute_staging_gc(plan: &StagingGcPlan, base: &Path) -> StagingGcOutcome {
+    execute_staging_gc_with_registry(
+        plan,
+        base,
+        rch_common::stale_target_reap::SOURCE_CLAIM_REGISTRY,
+    )
+}
+
+fn execute_staging_gc_with_registry(
+    plan: &StagingGcPlan,
+    base: &Path,
+    registry: &str,
+) -> StagingGcOutcome {
     let mut outcome = StagingGcOutcome::default();
     for entry in &plan.entries {
         if entry.action != GcAction::Prune {
             continue;
         }
-        // Final defensive re-validation right before the destructive call.
-        if !is_prunable_path(&entry.path, base) {
+        if inspect_or_collect(entry, base, registry, true) == "removed" {
+            outcome.removed_count += 1;
+            outcome.removed_bytes = outcome.removed_bytes.saturating_add(entry.size_bytes);
+        } else {
             outcome.failed.push(entry.path.clone());
-            continue;
-        }
-        match std::fs::remove_dir_all(&entry.path) {
-            Ok(()) => {
-                outcome.removed_count += 1;
-                outcome.removed_bytes = outcome.removed_bytes.saturating_add(entry.size_bytes);
-            }
-            Err(_) => outcome.failed.push(entry.path.clone()),
         }
     }
     outcome
 }
 
-/// Recursively sum file sizes and find the newest mtime under `root`.
-/// Best-effort: unreadable entries are skipped.
-fn tree_size_and_newest_mtime(root: &Path) -> (u64, Option<std::time::SystemTime>) {
-    let mut total = 0u64;
-    let mut newest: Option<std::time::SystemTime> = None;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            // file_type() and DirEntry::metadata() both report the entry itself
-            // and do NOT follow symlinks. This matters for the idle-detection
-            // contract: a symlink inside the tree must contribute only its own
-            // (lstat) mtime, never its target's — otherwise a link to an
-            // unrelated quiescent directory could mask live build activity and
-            // get the active tree pruned.
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let Ok(meta) = entry.metadata() else { continue };
-            if let Ok(mtime) = meta.modified() {
-                newest = Some(match newest {
-                    Some(cur) if cur >= mtime => cur,
-                    _ => mtime,
-                });
-            }
-            // Recurse only into real directories; never descend a symlinked dir.
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total = total.saturating_add(meta.len());
-            }
+fn inspect_or_collect(entry: &StagingGcEntry, base: &Path, registry: &str, apply: bool) -> String {
+    if !is_prunable_path(&entry.path, base) || is_source_container(Path::new(&entry.path), base) {
+        return "source-ownership".into();
+    }
+    let Some(witness) = &entry.witness else {
+        return "unavailable".into();
+    };
+    let Ok(witness) = serde_json::to_string(witness) else {
+        return "unavailable".into();
+    };
+    let (gates, cleanup) = rch_common::stale_target_reap::gc_liveness_guard_fragments();
+    let script = format!(
+        r#"set -u
+{source_guard}
+mode=$3
+if [ "$mode" = apply ]; then
+    if __gc_source_begin "$1"; then :; else
+        status=$?
+        case "$status" in 1) verdict=source-ownership;; 3) verdict=retention;; 4) verdict=changed;; *) verdict=unavailable;; esac
+        printf 'RCH_STAGING_GC_V1 %s\n' "$verdict"
+        exit 0
+    fi
+else
+    if __gc_source_inspect "$1"; then :; else
+        status=$?
+        case "$status" in 1) verdict=source-ownership;; 3) verdict=retention;; *) verdict=unavailable;; esac
+        printf 'RCH_STAGING_GC_V1 %s\n' "$verdict"
+        exit 0
+    fi
+fi
+{gates}
+handles=$(__gc_handles "$__gc_candidate")
+processes=$(__gc_procs "$__gc_candidate")
+if [ "$handles" = held ] || [ "$processes" = held ]; then
+    verdict=in-use
+elif [ "$handles" != free ] || [ "$processes" != free ]; then
+    verdict=unavailable
+elif verdict=$(python3 -I -S -c {program} "$1" "$2" "$3" "$4" "$5" "$__gc_candidate"); then
+    case "$verdict" in ready|removed|changed|recent|unavailable) ;; *) verdict=unavailable;; esac
+else
+    verdict=unavailable
+fi
+{cleanup}
+if [ "$mode" = apply ] && ! __gc_source_end; then
+    printf 'RCH_STAGING_GC_V1 unavailable\n'
+    exit 1
+fi
+printf 'RCH_STAGING_GC_V1 %s\n' "$verdict"
+"#,
+        source_guard =
+            rch_common::stale_target_reap::source_claim_gc_guard_fragment_with_registry(registry),
+        program = shell_escape::escape(STAGING_TREE_OPERATION.into()),
+    );
+    let output = match std::process::Command::new("sh")
+        .args(["-c", &script, "rch-cache-clean"])
+        .arg(&entry.path)
+        .arg(base)
+        .arg(if apply { "apply" } else { "preview" })
+        .arg(witness)
+        .arg(entry.min_age.as_nanos().to_string())
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return "unavailable".into(),
+    };
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return "unavailable".into();
+    };
+    let mut verdicts = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("RCH_STAGING_GC_V1 "));
+    match (verdicts.next(), verdicts.next()) {
+        (Some(verdict), None) => verdict.to_owned(),
+        _ => "unavailable".into(),
+    }
+}
+
+#[cfg(unix)]
+fn observe_tree(
+    base: &Path,
+    root: &Path,
+) -> std::io::Result<(u64, std::time::SystemTime, StagingWitness)> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    fn identity(metadata: &std::fs::Metadata) -> DirectoryIdentity {
+        DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         }
     }
-    (total, newest)
+    fn fields(metadata: &std::fs::Metadata) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\0",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.nlink(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        )
+    }
+    fn walk(
+        path: &Path,
+        relative: &Path,
+        digest: &mut Sha256,
+        size: &mut u64,
+        newest: &mut std::time::SystemTime,
+    ) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        let name = relative.as_os_str().as_bytes();
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name);
+        digest.update(fields(&metadata).as_bytes());
+        *newest = (*newest).max(metadata.modified()?);
+        if metadata.is_dir() {
+            let before = fields(&metadata);
+            let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.file_name().as_bytes().to_vec());
+            for entry in entries {
+                walk(
+                    &entry.path(),
+                    &relative.join(entry.file_name()),
+                    digest,
+                    size,
+                    newest,
+                )?;
+            }
+            if fields(&std::fs::symlink_metadata(path)?) != before {
+                return Err(std::io::Error::other(
+                    "staging directory changed during enumeration",
+                ));
+            }
+        } else {
+            *size = size.saturating_add(metadata.len());
+        }
+        Ok(())
+    }
+    let canonical_base = base.canonicalize()?;
+    let relative = root.strip_prefix(base).map_err(std::io::Error::other)?;
+    let canonical_root = canonical_base.join(relative);
+    if root.canonicalize()? != canonical_root {
+        return Err(std::io::Error::other("staging tree traverses a symlink"));
+    }
+    let base_metadata = std::fs::metadata(&canonical_base)?;
+    let parent_metadata = std::fs::symlink_metadata(
+        canonical_root
+            .parent()
+            .ok_or_else(|| std::io::Error::other("staging parent missing"))?,
+    )?;
+    let root_metadata = std::fs::symlink_metadata(&canonical_root)?;
+    if !base_metadata.is_dir() || !parent_metadata.is_dir() || !root_metadata.is_dir() {
+        return Err(std::io::Error::other(
+            "staging ancestors are not real directories",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"rch-staging-metadata-v1\0");
+    let mut size = 0;
+    let mut newest = root_metadata.modified()?;
+    walk(
+        &canonical_root,
+        Path::new(""),
+        &mut digest,
+        &mut size,
+        &mut newest,
+    )?;
+    if root.canonicalize()? != canonical_root
+        || identity(&std::fs::metadata(base)?) != identity(&base_metadata)
+        || identity(&std::fs::symlink_metadata(
+            canonical_root.parent().unwrap(),
+        )?) != identity(&parent_metadata)
+        || fields(&std::fs::symlink_metadata(&canonical_root)?) != fields(&root_metadata)
+    {
+        return Err(std::io::Error::other(
+            "staging ancestry changed during enumeration",
+        ));
+    }
+    Ok((
+        size,
+        newest,
+        StagingWitness {
+            canonical_base,
+            base: identity(&base_metadata),
+            parent: identity(&parent_metadata),
+            tree: identity(&root_metadata),
+            metadata_digest: digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        },
+    ))
 }
+
+#[cfg(not(unix))]
+fn observe_tree(
+    _base: &Path,
+    _root: &Path,
+) -> std::io::Result<(u64, std::time::SystemTime, StagingWitness)> {
+    Err(std::io::Error::other(
+        "staging collection requires POSIX directory identity",
+    ))
+}
+
+// Only this owned helper mutates a staging candidate. Open descriptors keep
+// traversal beneath the observed base/project/tree even if a name is replaced;
+// every unlink/rmdir rechecks the named directory chain. Shared source custody
+// excludes cooperating writers throughout the operation. No file data is read.
+const STAGING_TREE_OPERATION: &str = r#"import hashlib, json, os, stat, struct, sys, time
+
+path, base, mode, encoded, minimum, claimed = sys.argv[1:]
+witness = json.loads(encoded)
+minimum = int(minimum)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+held = []
+chain = []
+
+class Changed(Exception):
+    pass
+
+def identity(info):
+    return {'device': info.st_dev, 'inode': info.st_ino}
+
+def require(condition):
+    if not condition:
+        raise Changed()
+
+def fields(info):
+    mt, mn = divmod(info.st_mtime_ns, 1000000000)
+    ct, cn = divmod(info.st_ctime_ns, 1000000000)
+    return (':'.join(str(value) for value in (info.st_dev, info.st_ino, info.st_mode,
+        info.st_uid, info.st_gid, info.st_nlink, info.st_size, mt, mn, ct, cn)) + '\0').encode('ascii')
+
+def unchanged():
+    require(os.path.realpath(base) == witness['canonical_base'])
+    require(identity(os.stat(base)) == witness['base'])
+    for parent, name, expected in chain:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(stat.S_ISDIR(current.st_mode) and identity(current) == expected)
+
+def open_directory(parent, name, expected):
+    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    require(stat.S_ISDIR(info.st_mode) and identity(info) == expected)
+    descriptor = os.open(name, flags, dir_fd=parent)
+    held.append(descriptor)
+    require(identity(os.fstat(descriptor)) == expected)
+    chain.append((parent, name, expected))
+    return descriptor
+
+def observe(descriptor, relative, digest):
+    info = os.fstat(descriptor)
+    digest.update(struct.pack('<Q', len(relative)))
+    digest.update(relative)
+    digest.update(fields(info))
+    newest = info.st_mtime_ns
+    before = fields(info)
+    for name in sorted(os.listdir(descriptor), key=os.fsencode):
+        current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        nested = relative + (b'/' if relative else b'') + os.fsencode(name)
+        if stat.S_ISDIR(current.st_mode):
+            child = os.open(name, flags, dir_fd=descriptor)
+            try:
+                require(identity(os.fstat(child)) == identity(current))
+                newest = max(newest, observe(child, nested, digest))
+                require(fields(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) == fields(current))
+            finally:
+                os.close(child)
+        else:
+            digest.update(struct.pack('<Q', len(nested)))
+            digest.update(nested)
+            digest.update(fields(current))
+            newest = max(newest, current.st_mtime_ns)
+    require(fields(os.fstat(descriptor)) == before)
+    return newest
+
+def remove_contents(descriptor):
+    for name in os.listdir(descriptor):
+        unchanged()
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child = open_directory(descriptor, name, identity(info))
+            try:
+                remove_contents(child)
+                unchanged()
+                os.rmdir(name, dir_fd=descriptor)
+            finally:
+                chain.pop()
+                held.pop()
+                os.close(child)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+
+try:
+    relative = os.path.relpath(path, base).split('/')
+    require(len(relative) == 2 and all(part not in ('', '.', '..') for part in relative))
+    require(not relative[0].startswith('source-content-'))
+    # The registry claim and process snapshots name this physical candidate.
+    # A base alias changing away and back must not authorize a different tree.
+    require(claimed == os.path.join(witness['canonical_base'], *relative))
+    require(os.path.realpath(base) == witness['canonical_base'])
+    base_fd = os.open(witness['canonical_base'], flags)
+    held.append(base_fd)
+    require(identity(os.fstat(base_fd)) == witness['base'])
+    parent = open_directory(base_fd, relative[0], witness['parent'])
+    tree = open_directory(parent, relative[1], witness['tree'])
+    require(os.fstat(tree).st_uid == os.geteuid())
+    unchanged()
+    if mode == 'preview':
+        print('ready')
+    else:
+        require(mode == 'apply')
+        digest = hashlib.sha256(b'rch-staging-metadata-v1\0')
+        newest = observe(tree, b'', digest)
+        require(digest.hexdigest() == witness['metadata_digest'])
+        unchanged()
+        if time.time_ns() - newest < minimum:
+            print('recent')
+        else:
+            remove_contents(tree)
+            unchanged()
+            os.rmdir(relative[1], dir_fd=parent)
+            os.fsync(parent)
+            print('removed')
+except (Changed, FileNotFoundError, NotADirectoryError):
+    print('changed')
+except Exception:
+    print('unavailable')
+finally:
+    for descriptor in reversed(held):
+        os.close(descriptor)
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -330,6 +740,7 @@ mod tests {
             path: PathBuf::from(path),
             size_bytes,
             age: Duration::from_secs(age_secs),
+            witness: None,
         }
     }
 
@@ -499,48 +910,309 @@ mod tests {
         assert!(parse_human_duration("abch").is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn execute_only_removes_prune_entries_and_revalidates() {
-        // Build a real tree, plan it as Prune (age 0 with min_age 0), execute.
-        let base = tempfile::tempdir().expect("tempdir");
-        let tree_dir = base.path().join("proj/hash");
+        let root = retained_fixture("staging-gc-positive-");
+        let base = root.join("staging");
+        let registry = root.join("claims");
+        let tree_dir = base.join("proj/hash");
         std::fs::create_dir_all(&tree_dir).unwrap();
         std::fs::write(tree_dir.join("f"), b"data").unwrap();
-        // Path must be a safe reap path; tempdir paths under /tmp qualify when
-        // deep enough. Construct the plan entry directly to control the action.
-        let plan = StagingGcPlan {
-            entries: vec![
-                StagingGcEntry {
-                    path: tree_dir.to_string_lossy().to_string(),
-                    size_bytes: 4,
-                    age_secs: 9999,
-                    action: GcAction::Prune,
-                    reason: "test".to_string(),
-                },
-                StagingGcEntry {
-                    path: "/".to_string(),
-                    size_bytes: 0,
-                    age_secs: 9999,
-                    // Even if mislabeled Prune, the re-validation guard refuses "/".
-                    action: GcAction::Prune,
-                    reason: "adversarial".to_string(),
-                },
-            ],
-            prunable_bytes: 4,
-            prunable_count: 2,
-            total_bytes: 4,
-        };
-        // Only run when the tempdir path is actually a safe reap path; otherwise
-        // the assertion below would be environment-dependent.
-        if rch_common::stale_target_reap::is_safe_reap_path(&plan.entries[0].path) {
-            let outcome = execute_staging_gc(&plan, base.path());
-            assert_eq!(outcome.removed_count, 1, "only the safe tree removed");
-            assert!(!tree_dir.exists(), "safe tree was removed");
-            assert!(
-                outcome.failed.iter().any(|p| p == "/"),
-                "unsafe '/' refused by re-validation"
+        // Include directory-prefix ordering and a symlink whose target must
+        // survive. Rust enumeration and the actual descriptor-relative helper
+        // must agree on the metadata witness without reading file contents.
+        std::fs::create_dir(tree_dir.join("a")).unwrap();
+        std::fs::write(tree_dir.join("a/child"), b"nested").unwrap();
+        std::fs::write(tree_dir.join("a."), b"prefix sibling").unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("retained"), b"outside the proposal").unwrap();
+        std::os::unix::fs::symlink(&outside, tree_dir.join("link")).unwrap();
+        let mut plan = proposed(&base);
+        plan = inspect_staging_gc_plan_with_registry(plan, &base, registry.to_str().unwrap());
+        assert_eq!(
+            plan.entries[0].action,
+            GcAction::Prune,
+            "{:?}",
+            plan.entries
+        );
+        assert!(
+            !registry.exists(),
+            "preview must not create an ownership registry"
+        );
+        plan.entries.push(StagingGcEntry {
+            path: "/".into(),
+            size_bytes: 0,
+            age_secs: 9999,
+            action: GcAction::Prune,
+            reason: "adversarial".into(),
+            witness: None,
+            min_age: Duration::ZERO,
+        });
+        let outcome = execute_staging_gc_with_registry(&plan, &base, registry.to_str().unwrap());
+        assert_eq!(outcome.removed_count, 1, "{outcome:?}");
+        assert!(!tree_dir.exists());
+        assert_eq!(
+            std::fs::read(outside.join("retained")).unwrap(),
+            b"outside the proposal"
+        );
+        assert!(outcome.failed.iter().any(|path| path == "/"));
+        assert!(std::fs::read_dir(&registry).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "claim")
+        }));
+        assert_eq!(
+            std::fs::read_dir(registry.join("released"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_fixture(prefix: &str) -> PathBuf {
+        let path = tempfile::Builder::new()
+            .prefix(prefix)
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        eprintln!("Retained cache-clean fixture: {}", path.display());
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proposed(base: &Path) -> StagingGcPlan {
+        let trees = enumerate_staging_trees(base, None, SystemTime::now()).unwrap();
+        plan_staging_gc(&trees, policy(0), base)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_claim(registry: &Path, root: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(registry).unwrap();
+        std::fs::set_permissions(registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(registry.join("metadata.lock"), b"").unwrap();
+        let bytes = format!("{}\n", root.display());
+        let digest: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = registry.join(format!("{}.{}.claim", "a".repeat(32), digest));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_source_containers_and_marked_ancestors_never_authorize_cleanup() {
+        for project in ["source-content-pair-key.retained-owner", "legacy-project"] {
+            let root = retained_fixture("staging-gc-retention-");
+            let base = root.join("staging");
+            let registry = root.join("claims");
+            let tree = base.join(project).join("projects");
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("source"), b"retained original source").unwrap();
+            std::os::unix::fs::symlink(
+                "identity-only-not-a-path",
+                tree.parent().unwrap().join(".rch-retention-v1"),
+            )
+            .unwrap();
+            let proposal = proposed(&base);
+            let preview = inspect_staging_gc_plan_with_registry(
+                proposal.clone(),
+                &base,
+                registry.to_str().unwrap(),
+            );
+            assert_eq!(preview.entries[0].action, GcAction::KeepSourceCustody);
+            assert_eq!(preview.prunable_count, 0);
+            assert!(!registry.exists(), "retention preview must be read-only");
+            let outcome =
+                execute_staging_gc_with_registry(&proposal, &base, registry.to_str().unwrap());
+            assert_eq!(outcome.removed_count, 0);
+            assert_eq!(
+                std::fs::read(tree.join("source")).unwrap(),
+                b"retained original source"
+            );
+            assert!(!registry.join("released").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_rechecks_new_source_claims_and_retention_after_preview() {
+        for hold in ["claim", "marker"] {
+            let root = retained_fixture("staging-gc-new-custody-");
+            let base = root.join("staging");
+            let registry = root.join("claims");
+            let tree = base.join("project/hash");
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("source"), b"protected").unwrap();
+            let preview = inspect_staging_gc_plan_with_registry(
+                proposed(&base),
+                &base,
+                registry.to_str().unwrap(),
+            );
+            assert_eq!(
+                preview.entries[0].action,
+                GcAction::Prune,
+                "{:?}",
+                preview.entries
+            );
+            let claim = if hold == "claim" {
+                Some(source_claim(&registry, tree.parent().unwrap()))
+            } else {
+                std::os::unix::fs::symlink(
+                    "held",
+                    tree.parent().unwrap().join(".rch-retention-v1"),
+                )
+                .unwrap();
+                None
+            };
+            let held_preview = inspect_staging_gc_plan_with_registry(
+                preview.clone(),
+                &base,
+                registry.to_str().unwrap(),
+            );
+            assert_eq!(held_preview.entries[0].action, GcAction::KeepSourceCustody);
+            let outcome =
+                execute_staging_gc_with_registry(&preview, &base, registry.to_str().unwrap());
+            assert_eq!(outcome.removed_count, 0);
+            assert_eq!(std::fs::read(tree.join("source")).unwrap(), b"protected");
+            if let Some(claim) = claim {
+                assert!(claim.is_file(), "active source claim must remain untouched");
+            }
+            assert!(!registry.join("released").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_inputs_replaced_trees_and_aliased_parents_refuse_the_old_proposal() {
+        for change in ["input", "tree", "parent"] {
+            let root = retained_fixture("staging-gc-changed-");
+            let base = root.join("staging");
+            let registry = root.join("claims");
+            let tree = base.join("project/hash");
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("source"), b"old input").unwrap();
+            let plan = proposed(&base);
+            let saved = root.join("retained-original");
+            match change {
+                "input" => std::fs::write(tree.join("source"), b"new selected input").unwrap(),
+                "tree" => {
+                    std::fs::rename(&tree, &saved).unwrap();
+                    std::fs::create_dir(&tree).unwrap();
+                    std::fs::write(tree.join("source"), b"new selected input").unwrap();
+                }
+                "parent" => {
+                    std::fs::rename(tree.parent().unwrap(), &saved).unwrap();
+                    let outside = root.join("outside");
+                    std::fs::create_dir_all(outside.join("hash")).unwrap();
+                    std::fs::write(outside.join("hash/source"), b"new selected input").unwrap();
+                    std::os::unix::fs::symlink(&outside, tree.parent().unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                inspect_or_collect(&plan.entries[0], &base, registry.to_str().unwrap(), true),
+                "changed"
+            );
+            assert_eq!(
+                std::fs::read(tree.join("source")).unwrap(),
+                b"new selected input"
+            );
+            if change != "input" {
+                let original = if change == "tree" {
+                    saved.join("source")
+                } else {
+                    saved.join("hash/source")
+                };
+                assert_eq!(std::fs::read(original).unwrap(), b"old input");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removal_requires_the_same_physical_candidate_as_the_acquired_claim() {
+        let root = retained_fixture("staging-gc-claim-binding-");
+        let base = root.join("staging");
+        let tree = base.join("project/hash");
+        let other = root.join("other/project/hash");
+        for candidate in [&tree, &other] {
+            std::fs::create_dir_all(candidate).unwrap();
+            std::fs::write(candidate.join("source"), b"separate custody").unwrap();
+        }
+        let plan = proposed(&base);
+        let witness = serde_json::to_string(plan.entries[0].witness.as_ref().unwrap()).unwrap();
+        // Model the exact boundary after a configured base alias changed to
+        // another tree during source admission, then changed back. Every
+        // witnessed inode is still valid, but the acquired claim is foreign.
+        let result = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", STAGING_TREE_OPERATION])
+            .arg(&tree)
+            .arg(&base)
+            .arg("apply")
+            .arg(witness)
+            .arg("0")
+            .arg(&other)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(result.stdout, b"changed\n");
+        for candidate in [&tree, &other] {
+            assert_eq!(
+                std::fs::read(candidate.join("source")).unwrap(),
+                b"separate custody"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preview_preserves_unknown_pending_records_and_detects_live_descriptors() {
+        let root = retained_fixture("staging-gc-observation-");
+        let base = root.join("staging");
+        let registry = root.join("claims");
+        let tree = base.join("project/hash");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("source"), b"still open").unwrap();
+        let open = std::fs::File::open(tree.join("source")).unwrap();
+        let preview = inspect_staging_gc_plan_with_registry(
+            proposed(&base),
+            &base,
+            registry.to_str().unwrap(),
+        );
+        assert_eq!(
+            preview.entries[0].action,
+            GcAction::KeepInUse,
+            "{:?}",
+            preview.entries
+        );
+        assert!(!registry.exists());
+        drop(open);
+        std::fs::create_dir(&registry).unwrap();
+        std::fs::write(registry.join("metadata.lock"), b"").unwrap();
+        let pending = registry.join(format!("{}.{}.pending", "b".repeat(32), "0".repeat(64)));
+        std::fs::write(&pending, b"interrupted publication").unwrap();
+        let preview = inspect_staging_gc_plan_with_registry(
+            proposed(&base),
+            &base,
+            registry.to_str().unwrap(),
+        );
+        assert_eq!(preview.entries[0].action, GcAction::KeepUnavailable);
+        assert_eq!(std::fs::read(pending).unwrap(), b"interrupted publication");
+        assert!(!registry.join("quarantine").exists());
+        assert!(!registry.join("released").exists());
+        assert_eq!(std::fs::read(tree.join("source")).unwrap(), b"still open");
     }
 
     #[test]
