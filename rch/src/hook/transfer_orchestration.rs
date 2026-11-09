@@ -2503,6 +2503,18 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if kind == Some(CompilationKind::Rustc)
+        && let Some(session) = recovery_session.as_mut()
+        && let Some(discovery) =
+            super::artifact_patterns::direct_compiler::RustcOutputDiscovery::for_command(
+                policy_command,
+            )
+    {
+        let names = pipeline
+            .discover_rustc_output_names(&worker_config, discovery.query(), toolchain)
+            .await?;
+        session.require_rustc_outputs(discovery.resolve(&names)?)?;
+    }
     if reporter.cargo_json_stdout {
         recovery_session
             .as_mut()

@@ -2271,6 +2271,45 @@ impl RecoverySession {
             .iter()
             .any(|phase| phase.native_outputs.is_some())
     }
+
+    /// Install the compiler-resolved implicit Rust outputs before execution.
+    /// Replacing the old Cargo-shaped globs is essential: they can neither
+    /// discover a root-level rustc binary nor prove that it was delivered.
+    pub(crate) fn require_rustc_outputs(
+        &mut self,
+        contract: NativeOutputContract,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.kind == Some(CompilationKind::Rustc)
+                && self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && self.recipe.exit_code.is_none()
+                && !self.recipe.sources_released
+                && !self.recipe.retired
+                && !self.recipe.phases.iter().any(|phase| phase.custom_target),
+            "rustc output discovery requires an unconsumed project-output session"
+        );
+        let patterns = contract.patterns()?;
+        let mut next = self.recipe.clone();
+        let phase = next
+            .phases
+            .iter_mut()
+            .find(|phase| phase.name == "project")
+            .context("rustc output discovery has no project publication phase")?;
+        anyhow::ensure!(
+            phase.native_outputs.is_none()
+                && phase.cargo_outputs.is_none()
+                && !phase.complete
+                && phase.pending.is_none()
+                && phase.published.is_empty(),
+            "rustc output discovery cannot replace a previously bound output contract"
+        );
+        phase.patterns = patterns;
+        phase.native_outputs = Some(contract);
+        self.persist_next_recipe(next)
+    }
+
     fn verify_native_outputs(&self, index: usize) -> anyhow::Result<()> {
         if let Some(contract) = &self.recipe.phases[index].native_outputs {
             contract.verify_staged(&self.stage(index))?;
@@ -7390,6 +7429,159 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn rustc_implicit_outputs_survive_recovery_and_require_complete_publication() {
+        use super::super::artifact_patterns::direct_compiler::RustcOutputDiscovery;
+        use tokio::process::Command;
+
+        async fn run(command: &mut Command) -> std::process::Output {
+            rch_common::ssh::capture_control_output(
+                command,
+                None,
+                1024 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("owned Rust output fixture failed or exceeded its deadline")
+        }
+
+        let _guard = test_guard!();
+        for command in [
+            "rustc main.rs",
+            "rustc main.rs --crate-type=rlib --emit=link,metadata,dep-info --out-dir dist",
+            "rustc main.rs -o dist/explicit",
+        ] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let incomplete = base.join("incomplete");
+            for root in [&local, &remote, &incomplete] {
+                std::fs::create_dir_all(root.join("dist")).unwrap();
+            }
+            std::fs::write(remote.join("main.rs"),
+                "#![crate_name = \"selected_crate\"]\npub fn value() -> u32 { 37 }\nfn main() { println!(\"rustc-delivery-ok\"); }\n"
+            ).unwrap();
+            std::fs::write(local.join("main.rs"), b"local source sentinel\n").unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "rustc-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                None,
+                Some(CompilationKind::Rustc),
+                command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            if let Some(discovery) = RustcOutputDiscovery::for_command(command) {
+                let mut query = Command::new("sh");
+                query.args(["-c", discovery.query()]).current_dir(&remote);
+                let output = run(&mut query).await;
+                assert!(output.status.success(), "{command}: {output:?}");
+                let contract = discovery.resolve(&output.stdout).unwrap();
+                session.require_rustc_outputs(contract.clone()).unwrap();
+                assert!(session.require_rustc_outputs(contract).is_err());
+            }
+            assert!(session.has_native_output_contract());
+            assert_eq!(session.recipe.phases.len(), 1);
+            let required = session.recipe.phases[0]
+                .native_outputs
+                .as_ref()
+                .unwrap()
+                .required_files
+                .clone();
+            assert!(!required.is_empty());
+            for relative in &required {
+                std::fs::create_dir_all(local.join(relative).parent().unwrap()).unwrap();
+                std::fs::write(local.join(relative), b"stale local output\n").unwrap();
+            }
+            session.starting_execution().unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", command]).current_dir(&remote);
+            let output = run(&mut compiler).await;
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert!(output.stdout.is_empty());
+            session.completed(0).unwrap();
+            session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.phases[0]
+                    .native_outputs
+                    .as_ref()
+                    .unwrap()
+                    .required_files,
+                required
+            );
+            // A valid returned library cannot substitute for a missing depfile
+            // or executable. Only the exact complete staged set may publish.
+            if required.len() > 1 {
+                let one = required.first().unwrap();
+                std::fs::create_dir_all(incomplete.join(one).parent().unwrap()).unwrap();
+                std::fs::copy(remote.join(one), incomplete.join(one)).unwrap();
+            }
+            for complete in [false, true] {
+                let staged = session.staging_pipeline("project", &pipeline).unwrap();
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync = staged.local_artifact_retrieval_for_test(
+                    &worker,
+                    if complete { &remote } else { &incomplete },
+                    &patterns,
+                );
+                let output = run(&mut rsync).await;
+                assert!(output.status.success(), "{output:?}");
+                let before = std::fs::read(&writer.path).unwrap();
+                if complete {
+                    session.publish("project").await.unwrap();
+                    session.returned(0).unwrap();
+                    session = reload_publication(&session);
+                    session.publish("project").await.unwrap();
+                    for relative in &required {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            std::fs::read(remote.join(relative)).unwrap()
+                        );
+                    }
+                } else {
+                    assert!(session.publish("project").await.is_err());
+                    assert!(session.returned(0).is_err());
+                    assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+                    for relative in &required {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            b"stale local output\n"
+                        );
+                    }
+                    session = reload_publication(&session);
+                }
+            }
+            assert_eq!(
+                std::fs::read(local.join("main.rs")).unwrap(),
+                b"local source sentinel\n"
+            );
+            if !command.contains("--crate-type") {
+                let mut executable = Command::new(local.join(required.first().unwrap()));
+                let output = run(&mut executable).await;
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(output.stdout, b"rustc-delivery-ok\n");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn go_build_explicit_output_survives_recovery_and_missing_delivery() {
         use super::super::artifact_patterns::direct_compiler::{

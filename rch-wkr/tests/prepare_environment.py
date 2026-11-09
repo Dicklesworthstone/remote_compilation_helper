@@ -240,7 +240,10 @@ def load_suite(worker, previous_worker, npm, node):
                         lifecycle_output = project / "node_modules/lifecycle-env"
                         self.assertEqual(lifecycle_output.exists(), lifecycle)
                         if lifecycle:
-                            self.assertEqual(lifecycle_output.read_text(), "development")
+                            # npm sets NODE_ENV=production for lifecycle scripts
+                            # when the effective omit list includes dev.
+                            expected_environment = "development" if present else "production"
+                            self.assertEqual(lifecycle_output.read_text(), expected_environment)
                         self.assertEqual(selected, {name: (project / name).read_bytes() for name in SELECTED})
                         self.assertEqual(self.inspect(project, state, request, settings), current["state"])
                         warm_request = self.request(project, list(SELECTED), attempt=attempt + "-warm")

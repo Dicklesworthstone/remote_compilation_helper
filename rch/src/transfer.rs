@@ -3932,6 +3932,71 @@ impl TransferPipeline {
         Ok(Some(status))
     }
 
+    /// Resolve implicit rustc artifact names under the already-held source
+    /// grant. This is a bounded read-only compiler query, not a second build:
+    /// it never consumes the build's one-shot execution/completion identity.
+    pub(crate) async fn discover_rustc_output_names(
+        &self,
+        worker: &WorkerConfig,
+        query: &str,
+        toolchain: Option<&ToolchainInfo>,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "rustc output discovery requires an owned POSIX source grant"
+        );
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(30));
+        let deadline = TokioInstant::now() + budget;
+        let script = self.compiler_output_probe_script(query, toolchain);
+        let script = self.source_activity_rpc_script(&script, budget);
+        let mut command = self.worker_ssh_command_with_activity_and_connect_timeout(
+            worker,
+            &["sh", "-s"],
+            false,
+            self.ssh_options.connect_timeout.min(budget),
+        );
+        let output = rch_common::ssh::capture_control_output(
+            &mut command,
+            Some(script.as_bytes()),
+            8192,
+            64 * 1024,
+            deadline,
+        )
+        .await
+        .context("rustc output-name query failed")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "rustc output-name query failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output.stdout)
+    }
+
+    fn compiler_output_probe_script(
+        &self,
+        query: &str,
+        toolchain: Option<&ToolchainInfo>,
+    ) -> String {
+        let root = self.remote_path();
+        let env = self.build_remote_env_plan(&root);
+        let command = format!(
+            "exec 1>&3 3>&-; {}{}",
+            env.env_prefix.prefix,
+            wrap_command_with_toolchain(query, toolchain)
+        );
+        // The real compiler runs inside sh -lc after entering this same root.
+        // Preserve its tool lookup and forwarded/inline environment here, too.
+        // Login profiles may print banners; keep those on stderr and restore
+        // stdout only for the name query. Carry the finite command on fd 4,
+        // like normal execution, rather than imposing a shell argv-size limit.
+        let launch = shell_command_with_literal_script("sh -lc", &command);
+        format!(
+            "export LC_ALL=C; cd {} && {{\n{launch}\n}} 3>&1 1>&2",
+            escape(Cow::from(root)),
+        )
+    }
+
     /// Read the complete successful invocation's Cargo records and canonical
     /// output root while this job still owns the worker source grant. Recovery
     /// uses the same receipt after a disconnected streaming client is gone.

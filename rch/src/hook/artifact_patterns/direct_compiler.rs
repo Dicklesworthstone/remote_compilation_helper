@@ -1,14 +1,14 @@
 //! Direct-compiler outputs, relative to the project sync root.
 //!
 //! Cargo's target-directory convention does not apply to direct compilers.
-//! Explicit Rustc selections require names for every emission. Native GCC/Clang
+//! Rustc's implicit outputs are resolved by the selected worker compiler;
+//! explicit selections require names for every emission. Native GCC/Clang
 //! contracts also cover ordinary POSIX a.out/object/assembly defaults, while
-//! named selections include depfiles and Clang -MJ fragments. Never
-//! infer crate names from source filenames or transfer an arbitrary --out-dir
-//! tree: crate attributes and target specifications can change implicit names.
-//! Unsupported commands retain the caller's existing selection policy. Native
-//! contracts are persisted and checked before publication; Rustc's explicit
-//! selection alone is not an output-completeness or cache-publication proof.
+//! named selections include depfiles and Clang -MJ fragments. Never infer
+//! crate names from source filenames or transfer an arbitrary --out-dir tree:
+//! crate attributes and target specifications can change implicit names.
+//! Unsupported commands retain the caller's existing selection policy.
+//! Exact contracts are persisted and checked before publication.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -114,6 +114,13 @@ pub(crate) fn native_output_contract(
             c_family_outputs(command, &["clang++"], true, posix_defaults)
         }
         rch_common::CompilationKind::GoBuild if posix_defaults => go_output_contract(command),
+        rch_common::CompilationKind::Rustc if posix_defaults => {
+            let selection = rustc_output_selection(command)?;
+            if selection.explicit_target {
+                return None;
+            }
+            NativeOutputContract::from_paths(selection.explicit_paths()?)
+        }
         _ => None,
     }
 }
@@ -635,29 +642,204 @@ fn add_emissions(value: &str, emits: &mut BTreeMap<String, Option<String>>) -> O
     Some(())
 }
 
+struct RustcOutputSelection {
+    output: Option<String>,
+    output_dir: Option<String>,
+    emissions: BTreeMap<String, Option<String>>,
+    extra_filename: String,
+    explicit_target: bool,
+    query_arguments: Vec<String>,
+}
+
+impl RustcOutputSelection {
+    fn explicit_paths(&self) -> Option<Vec<String>> {
+        let unnamed = self
+            .emissions
+            .values()
+            .filter(|path| path.is_none())
+            .count();
+        if unnamed > 1 || unnamed == 1 && self.output.is_none() {
+            return None;
+        }
+        let mut paths = Vec::new();
+        for path in self.emissions.values() {
+            let path = path.as_ref().or(self.output.as_ref())?;
+            if path != "-" {
+                literal_file_pattern(path)?;
+                paths.push(path.clone());
+            }
+        }
+        Some(paths)
+    }
+}
+
+/// The worker compiler, not the source filename, selects implicit Rust outputs.
+/// A crate-name/type attribute, target specification or extra-filename setting
+/// can all change those names. Resolve them after source synchronization using
+/// a read-only query of the very compiler/toolchain selected for the build.
+/// The result becomes the existing durable native-output contract before any
+/// compiler execution; ordinary collection and detached recovery share it.
+pub(in crate::hook) struct RustcOutputDiscovery {
+    selection: RustcOutputSelection,
+    query: String,
+}
+
+impl RustcOutputDiscovery {
+    pub(in crate::hook) fn for_command(command: &str) -> Option<Self> {
+        let selection = rustc_output_selection(command)?;
+        if selection.explicit_paths().is_some()
+            || selection.output.is_some()
+            || selection.explicit_target
+        {
+            // Keep rustc's -o/multiple-unnamed-emissions adaptation outside
+            // this subset. --print=file-names does not describe that mapping.
+            // Cross targets can add import libraries and other linker sidecars
+            // absent from that query; a POSIX worker is not a POSIX target.
+            return None;
+        }
+        if let Some(directory) = &selection.output_dir {
+            if directory.is_empty()
+                || directory.chars().any(char::is_control)
+                || !Path::new(directory)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+            {
+                return None;
+            }
+        }
+        let args = compiler_arguments(command, &["rustc"])?;
+        let mut words = literal_words(command)?;
+        let compiler = words.len().checked_sub(args.len() + 1)?;
+        words.truncate(compiler + 1);
+        words.extend(selection.query_arguments.iter().cloned());
+        // A +toolchain selector belongs immediately after the rustup proxy.
+        // Insert before ordinary args, including a possible `--` separator.
+        let options =
+            compiler + 1 + usize::from(args.first().is_some_and(|arg| arg.starts_with('+')));
+        words.splice(
+            options..options,
+            [
+                "--print=file-names".into(),
+                "--print=crate-name".into(),
+                "--emit=link".into(),
+            ],
+        );
+        Some(Self {
+            selection,
+            query: super::super::join_exec_command(&words),
+        })
+    }
+
+    pub(in crate::hook) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(in crate::hook) fn resolve(&self, stdout: &[u8]) -> anyhow::Result<NativeOutputContract> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            stdout.len() <= 8192 && stdout.ends_with(b"\n"),
+            "incomplete or oversized rustc output-name response"
+        );
+        let text = std::str::from_utf8(stdout).context("non-UTF-8 rustc output names")?;
+        let mut names: Vec<_> = text.strip_suffix('\n').unwrap().split('\n').collect();
+        anyhow::ensure!(
+            (2..=32).contains(&names.len())
+                && names.iter().all(|name| {
+                    !name.is_empty()
+                        && !name.chars().any(char::is_control)
+                        && Path::new(name).components().count() == 1
+                        && matches!(
+                            Path::new(name).components().next(),
+                            Some(Component::Normal(_))
+                        )
+                }),
+            "invalid rustc output-name response"
+        );
+        let crate_name = names.pop().unwrap();
+        // Query output is a filename, not a directory path. rustc's print
+        // mode deliberately omits --out-dir, so apply that literal option
+        // exactly once. Explicit KIND=PATH emissions ignore --out-dir.
+        let directory = Path::new(self.selection.output_dir.as_deref().unwrap_or("."));
+        let mut paths = Vec::new();
+        for (kind, path) in &self.selection.emissions {
+            if let Some(path) = path {
+                if path != "-" {
+                    paths.push(path.clone());
+                }
+            } else if kind == "link" {
+                for name in &names {
+                    paths.push(directory.join(name).to_string_lossy().into_owned());
+                }
+            } else {
+                let (prefix, suffix) = match kind.as_str() {
+                    "asm" => ("", "s"),
+                    "dep-info" => ("", "d"),
+                    "llvm-bc" => ("", "bc"),
+                    "llvm-ir" => ("", "ll"),
+                    "metadata" => ("lib", "rmeta"),
+                    "mir" => ("", "mir"),
+                    "obj" => ("", "o"),
+                    _ => anyhow::bail!("unsupported rustc emission {kind}"),
+                };
+                let name = format!(
+                    "{prefix}{crate_name}{}.{suffix}",
+                    self.selection.extra_filename
+                );
+                paths.push(directory.join(name).to_string_lossy().into_owned());
+            }
+        }
+        NativeOutputContract::from_paths(paths)
+            .context("rustc outputs escape the project or are empty")
+    }
+}
+
 /// Resolve named primary rustc emissions. KIND=PATH outranks -o; rustc adapts
 /// -o into inferred filenames only when MORE THAN ONE emission is unnamed.
 /// Refuse that inference rather than copying a stale file at the original -o.
 /// No crate/source/target naming guesses or recursive --out-dir includes occur.
 /// `Some([])` is an explicitly stdout-only invocation, not an unknown layout.
 pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
+    let paths = rustc_output_selection(command)?.explicit_paths()?;
+    paths
+        .iter()
+        .map(|path| literal_file_pattern(path))
+        .collect::<Option<BTreeSet<_>>>()
+        .map(|patterns| patterns.into_iter().collect())
+}
+
+fn rustc_output_selection(command: &str) -> Option<RustcOutputSelection> {
     let args = compiler_arguments(command, &["rustc"])?;
     // Response-file expansion precedes ordinary option parsing, including --.
     if args.iter().any(|arg| arg.starts_with('@')) {
         return None;
     }
     let mut iter = args.iter().peekable();
+    let mut query_arguments = Vec::new();
     if iter.peek().is_some_and(|arg| arg.starts_with('+')) {
-        let _ = iter.next();
+        query_arguments.push(iter.next()?.clone());
     }
     let mut output: Option<String> = None;
+    let mut output_dir: Option<String> = None;
+    let mut extra_filename = String::new();
+    let mut explicit_target = false;
     let mut emits = BTreeMap::new();
     let mut sources = 0;
     while let Some(arg) = iter.next() {
+        let start = args.len() - iter.len() - 1;
         if arg == "--" {
+            query_arguments.extend_from_slice(&args[start..]);
             sources += iter.count();
             break;
         }
+        // --print does not suppress dep-info emission: retaining the caller's
+        // --emit flags can create files before execution is durably started.
+        // Strip output destinations and emission requests as parsed options,
+        // never by rescanning an opaque argument such as a --cfg value.
+        let output_option = arg.starts_with("-o")
+            || arg == "--emit"
+            || arg.starts_with("--emit=")
+            || arg == "--out-dir"
+            || arg.starts_with("--out-dir=");
         if arg == "-o" {
             if output.replace(iter.next()?.to_string()).is_some() {
                 return None;
@@ -670,9 +852,26 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
             add_emissions(iter.next()?, &mut emits)?;
         } else if let Some(value) = arg.strip_prefix("--emit=") {
             add_emissions(value, &mut emits)?;
-        } else if arg == "-C" || arg == "--codegen" {
-            if !named_output_codegen(iter.next()?) {
+        } else if arg == "--out-dir" {
+            if output_dir.replace(iter.next()?.to_string()).is_some() {
                 return None;
+            }
+        } else if let Some(value) = arg.strip_prefix("--out-dir=") {
+            if output_dir.replace(value.to_owned()).is_some() {
+                return None;
+            }
+        } else if arg == "--target" {
+            iter.next()?;
+            explicit_target = true;
+        } else if arg.starts_with("--target=") {
+            explicit_target = true;
+        } else if arg == "-C" || arg == "--codegen" {
+            let value = iter.next()?;
+            if !named_output_codegen(value) {
+                return None;
+            }
+            if let Some(value) = value.strip_prefix("extra-filename=") {
+                extra_filename = value.to_owned();
             }
         } else if let Some(value) = arg
             .strip_prefix("-C")
@@ -680,6 +879,9 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
         {
             if !named_output_codegen(value) {
                 return None;
+            }
+            if let Some(value) = value.strip_prefix("extra-filename=") {
+                extra_filename = value.to_owned();
             }
         } else if rustc_value_option(arg) {
             iter.next()?;
@@ -697,6 +899,9 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
         } else {
             sources += 1;
         }
+        if !output_option {
+            query_arguments.extend_from_slice(&args[start..args.len() - iter.len()]);
+        }
     }
     if sources != 1 {
         return None;
@@ -704,18 +909,14 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
     if emits.is_empty() {
         emits.insert("link".to_owned(), None);
     }
-    let unnamed = emits.values().filter(|path| path.is_none()).count();
-    if unnamed > 1 || unnamed == 1 && output.is_none() {
-        return None;
-    }
-    let mut patterns = BTreeSet::new();
-    for path in emits.values() {
-        let path = path.as_ref().or(output.as_ref())?;
-        if path != "-" {
-            patterns.insert(literal_file_pattern(path)?);
-        }
-    }
-    Some(patterns.into_iter().collect())
+    Some(RustcOutputSelection {
+        output,
+        output_dir,
+        emissions: emits,
+        extra_filename,
+        explicit_target,
+        query_arguments,
+    })
 }
 
 fn c_value_option(option: &str) -> bool {
@@ -1196,6 +1397,192 @@ mod tests {
                     vec!["dist/app"]
                 }
             );
+        }
+    }
+
+    #[test]
+    fn rustc_named_contract_requires_every_selected_native_output() {
+        let kind = Some(rch_common::CompilationKind::Rustc);
+        let command = "rustc main.rs --emit=link=products/app,dep-info=products/inputs.d";
+        let contract = native_output_contract(kind, command, true).unwrap();
+        assert_eq!(
+            contract.required_files,
+            BTreeSet::from([
+                PathBuf::from("products/app"),
+                PathBuf::from("products/inputs.d"),
+            ])
+        );
+        assert!(native_output_contract(kind, command, false).is_none());
+        let cross = "rustc main.rs --crate-type=cdylib --target=x86_64-pc-windows-gnu -o out.dll";
+        assert!(native_output_contract(kind, cross, true).is_none());
+        assert_eq!(rustc_patterns(cross).unwrap(), vec!["out.dll"]);
+    }
+
+    #[test]
+    fn rustc_output_discovery_preserves_literal_wrappers_and_declines_ambiguous_names() {
+        for command in [
+            "rustc main.rs",
+            "rustc +nightly main.rs --out-dir 'products with spaces'",
+            "env RUST_BACKTRACE=1 rustup run nightly rustc main.rs --emit=link,dep-info",
+            "sccache rustc --crate-type rlib -- ./main.rs",
+            "rustc main.rs --emit=metadata --codegen extra-filename=-unique",
+        ] {
+            let discovery = RustcOutputDiscovery::for_command(command).unwrap();
+            let query = shell_words::split(discovery.query()).unwrap();
+            assert!(query.iter().any(|word| word == "--print=file-names"));
+            assert!(query.iter().any(|word| word == "--print=crate-name"));
+            if command.contains("+nightly") {
+                assert_eq!(&query[..2], ["rustc", "+nightly"]);
+            }
+            if command.contains("-- ./main.rs") {
+                assert_eq!(&query[query.len() - 2..], ["--", "./main.rs"]);
+            }
+        }
+        let discovery = RustcOutputDiscovery::for_command(
+            "rustc main.rs --cfg '--emit=dep-info' --out-dir '--emit=metadata' --emit dep-info",
+        )
+        .unwrap();
+        assert_eq!(
+            shell_words::split(discovery.query()).unwrap(),
+            [
+                "rustc",
+                "--print=file-names",
+                "--print=crate-name",
+                "--emit=link",
+                "main.rs",
+                "--cfg",
+                "--emit=dep-info",
+            ]
+        );
+        for command in [
+            "rustc main.rs -o app",       // Already has an explicit contract.
+            "rustc main.rs --emit=asm=-", // Only stdout.
+            "rustc main.rs --emit=link,metadata -o adapted",
+            "rustc main.rs --out-dir ../outside",
+            "rustc main.rs --out-dir /outside",
+            "rustc main.rs --target=x86_64-pc-windows-gnu",
+            "rustc main.rs --target custom.json",
+            "rustc main.rs --target x86_64-unknown-linux-gnu",
+            "rustc @response",
+            "rustc main.rs -g",
+            "rustc main.rs -Csave-temps",
+            "rustc main.rs -Ccodegen-units=4 --emit=obj",
+            "rustc main.rs --print=sysroot",
+            "rustc main.rs --unknown",
+            "rustc main.rs; touch other",
+        ] {
+            assert!(
+                RustcOutputDiscovery::for_command(command).is_none(),
+                "{command}"
+            );
+        }
+        let discovery = RustcOutputDiscovery::for_command("rustc main.rs").unwrap();
+        for response in [
+            b"".as_slice(),
+            b"main\n",
+            b"main\ncrate",
+            b"../escape\ncrate\n",
+            b"/absolute\ncrate\n",
+            b"nested/name\ncrate\n",
+            b"main\ncrate\n\n",
+            b"main\0\ncrate\n",
+            b"main\r\ncrate\r\n",
+        ] {
+            assert!(discovery.resolve(response).is_err(), "{response:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_rustc_discovery_matches_exact_default_and_emitted_files() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        fn files(root: &Path, directory: &Path, found: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files(root, &path, found);
+                } else if path != root.join("main.rs") {
+                    found.insert(path.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+
+        let owner = tempfile::tempdir().unwrap();
+        let cases = [
+            "rustc main.rs",
+            "rustc main.rs --crate-type rlib",
+            "rustc main.rs --crate-type=rlib,cdylib --out-dir 'products with spaces'",
+            "rustc main.rs --emit=metadata",
+            "rustc main.rs --emit=asm,dep-info,llvm-bc,llvm-ir,metadata,mir,obj --out-dir dist -Cextra-filename=-v2",
+            "rustc main.rs --emit=link,metadata,dep-info --out-dir dist",
+            "rustc main.rs --emit=link,dep-info=explicit.d --out-dir dist",
+            "rustc main.rs --emit=asm=-,metadata --out-dir dist",
+            "rustc --crate-name overridden main.rs --emit=obj,dep-info -Cextra-filename=-v3",
+        ];
+        for (index, command) in cases.into_iter().enumerate() {
+            let root = owner.path().join(index.to_string());
+            std::fs::create_dir(&root).unwrap();
+            let source = if command.contains("--crate-name overridden") {
+                "pub fn value() -> u32 { 37 }\nfn main() {}\n"
+            } else {
+                "#![crate_name = \"attribute_name\"]\npub fn value() -> u32 { 37 }\nfn main() {}\n"
+            };
+            std::fs::write(root.join("main.rs"), source).unwrap();
+            let discovery = RustcOutputDiscovery::for_command(command).unwrap();
+            let mut query = Command::new("sh");
+            query.args(["-c", discovery.query()]).current_dir(&root);
+            let observed = rch_common::ssh::capture_control_output(
+                &mut query,
+                None,
+                8192,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .expect("owned rustc name query failed or exceeded its deadline");
+            assert!(observed.status.success(), "{command}: {observed:?}");
+            let contract = discovery.resolve(&observed.stdout).unwrap();
+            let before = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                before,
+                vec![root.join("main.rs")],
+                "name query created files or directories"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("main.rs")).unwrap(),
+                source
+            );
+            assert!(contract.verify_staged(&root).is_err());
+            if let Some(directory) = &discovery.selection.output_dir {
+                // rustc can write dep-info before creating --out-dir itself.
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+            }
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", command]).current_dir(&root);
+            let output = rch_common::ssh::capture_control_output(
+                &mut compiler,
+                None,
+                1024 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("owned rustc compilation failed or exceeded its deadline");
+            assert!(output.status.success(), "{command}: {output:?}");
+            let mut emitted = BTreeSet::new();
+            files(&root, &root, &mut emitted);
+            assert_eq!(contract.required_files, emitted, "{command}");
+            contract.verify_staged(&root).unwrap();
+            if command.contains("asm=-") {
+                assert!(!output.stdout.is_empty(), "stdout-only assembly was lost");
+            } else {
+                assert!(output.stdout.is_empty(), "compiler stdout was changed");
+            }
         }
     }
 

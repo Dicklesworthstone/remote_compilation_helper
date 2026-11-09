@@ -10417,6 +10417,30 @@ fn test_resolve_forwarded_cargo_target_dir_ignores_non_cargo() {
 }
 
 #[test]
+fn test_direct_rustc_does_not_forward_cargo_target_dir() {
+    let _guard = test_guard!();
+    let reporter = HookReporter::new(OutputVisibility::Verbose);
+    for command in [
+        "rustc main.rs",
+        "env CARGO_TARGET_DIR=/tmp/foreign-target rustc main.rs",
+        "CARGO_TARGET_DIR=/tmp/foreign-target rustc main.rs --out-dir products",
+    ] {
+        let tokens = shell_words::split(command).unwrap();
+        assert!(
+            resolve_forwarded_cargo_target_dir_with_lookup(
+                Some(CompilationKind::Rustc),
+                Path::new("/data/projects/remote_compilation_helper"),
+                &reporter,
+                |_| panic!("direct rustc must not consult the ambient Cargo target"),
+                Some(&tokens),
+            )
+            .is_none(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn test_resolve_forwarded_cargo_target_dir_resolves_relative_path() {
     let _guard = test_guard!();
     let reporter = HookReporter::new(OutputVisibility::Verbose);
