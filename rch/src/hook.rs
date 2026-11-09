@@ -8229,5 +8229,22 @@ mod source_cancellation_retirement_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) async fn guarded_go_build_for_test(
+    command: &str,
+    invocation_root: &Path,
+    source_root: &Path,
+    runtime: Option<&std::collections::BTreeMap<String, String>>,
+) -> anyhow::Result<String> {
+    let environment = artifact_patterns::direct_compiler::validate_go_build_output(
+        command,
+        invocation_root,
+        source_root,
+    )
+    .await?;
+    artifact_patterns::direct_compiler::go_build_execution_command(command, &environment, runtime)
+        .ok_or_else(|| anyhow::anyhow!("Go build lost its validated output contract"))
+}
+
 #[cfg(test)]
 mod tests;

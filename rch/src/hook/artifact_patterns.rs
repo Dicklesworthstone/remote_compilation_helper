@@ -135,9 +135,10 @@ pub(super) fn get_artifact_patterns(
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
-        // Explicit Go builds were selected by direct_compiler above. Other Go
-        // and TS commands stream their results; unsupported emitting forms
-        // are declined by their classifiers. Falling through to the
+        // Explicit Go outputs were selected by direct_compiler above. An
+        // implicit executable is resolved by Go preflight and bound to the
+        // recovery recipe before execution; no guessed glob may replace it.
+        // Other Go and TS commands stream their results. Falling through to the
         // `_ => default_rust_artifact_patterns()` catch-all would sync back
         // `target/**` — the wrong tree entirely.
         Some(CompilationKind::GoBuild)

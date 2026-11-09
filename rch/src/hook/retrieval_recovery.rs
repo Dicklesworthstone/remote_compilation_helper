@@ -449,6 +449,30 @@ impl HeldRetrievalStage {
 }
 
 impl RecoveryRecipe {
+    fn validate_go_output_contract(&self) -> anyhow::Result<()> {
+        let mut phases = self.phases.iter().filter(|phase| phase.name == "project");
+        let phase = phases
+            .next()
+            .context("Go execution has no project output phase")?;
+        let contract = phase
+            .native_outputs
+            .as_ref()
+            .context("Go execution requires its discovered executable output")?;
+        anyhow::ensure!(
+            phases.next().is_none()
+                && contract.required_files.len() == 1
+                && phase.patterns == contract.patterns()?
+                && phase.local == self.project_root
+                && phase.result_dir.is_none()
+                && !phase.custom_target
+                && phase.cargo_outputs.is_none()
+                && !self.phases.iter().any(|phase| phase.custom_target)
+                && !WorkerPlatform::from_worker(&self.worker).is_windows(),
+            "Go execution requires exactly one bound project executable"
+        );
+        Ok(())
+    }
+
     fn caller_local_source_root(&self) -> &Path {
         self.caller_json_local_source_root
             .as_deref()
@@ -1491,8 +1515,12 @@ impl RecoverySession {
             Some(contract) => contract.patterns()?,
             None => get_project_artifact_patterns(kind, Some(command), target.is_some()),
         };
-        let native_project_outputs = native_outputs.is_some();
-        if !project_patterns.is_empty() {
+        // Implicit Go executable names are resolved before execution. Retain
+        // the project destination now, even though no glob can yet authorize
+        // a file. The execution gate requires the exact discovered contract.
+        let pending_go_output = kind == Some(CompilationKind::GoBuild);
+        let native_project_outputs = native_outputs.is_some() || pending_go_output;
+        if !project_patterns.is_empty() || pending_go_output {
             phases.push(RecoveryPhase {
                 name: "project".into(),
                 local: project_root.clone(),
@@ -2272,6 +2300,58 @@ impl RecoverySession {
             .any(|phase| phase.native_outputs.is_some())
     }
 
+    /// Bind the one executable selected by Go's package/output preflight.
+    /// An explicit -o is already in the recipe and must agree exactly; an
+    /// implicit name may fill only its still-empty project publication phase.
+    /// Recovery retains this file contract without querying or rerunning Go.
+    pub(crate) fn require_go_outputs(
+        &mut self,
+        contract: NativeOutputContract,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.kind == Some(CompilationKind::GoBuild)
+                && self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && self.recipe.exit_code.is_none()
+                && !self.recipe.sources_released
+                && !self.recipe.retired
+                && !self.recipe.phases.iter().any(|phase| phase.custom_target)
+                && contract.required_files.len() == 1,
+            "Go output binding requires an unconsumed project-output session"
+        );
+        let patterns = contract.patterns()?;
+        let mut next = self.recipe.clone();
+        let phase = next
+            .phases
+            .iter_mut()
+            .find(|phase| phase.name == "project")
+            .context("Go output binding has no project publication phase")?;
+        anyhow::ensure!(
+            phase.cargo_outputs.is_none()
+                && !phase.complete
+                && phase.pending.is_none()
+                && phase.published.is_empty()
+                && phase.baseline.is_empty(),
+            "Go output binding cannot replace consumed publication state"
+        );
+        if let Some(existing) = &phase.native_outputs {
+            anyhow::ensure!(
+                existing == &contract && phase.patterns == patterns,
+                "Go discovery differs from its already bound executable output"
+            );
+            return self.recipe.validate_go_output_contract();
+        }
+        anyhow::ensure!(
+            phase.patterns.is_empty(),
+            "Go output binding cannot replace an existing artifact selection"
+        );
+        phase.patterns = patterns;
+        phase.native_outputs = Some(contract);
+        next.validate_go_output_contract()?;
+        self.persist_next_recipe(next)
+    }
+
     /// Install the compiler-resolved implicit Rust outputs before execution.
     /// Replacing the old Cargo-shaped globs is essential: they can neither
     /// discover a root-level rustc binary nor prove that it was delivered.
@@ -2497,6 +2577,9 @@ impl RecoverySession {
                     .is_none_or(|required| { required.attestation_digest.is_some() }),
             "execution requires an unconsumed prepared source grant"
         );
+        if self.recipe.kind == Some(CompilationKind::GoBuild) {
+            self.recipe.validate_go_output_contract()?;
+        }
         let mut next_recipe = self.recipe.clone();
         next_recipe.execution_started = true;
         self.persist_next_recipe(next_recipe)
@@ -4008,6 +4091,9 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         );
     }
     result_recovery::validate_missing_results(&recipe)?;
+    if recipe.kind == Some(CompilationKind::GoBuild) && recipe.execution_started {
+        recipe.validate_go_output_contract()?;
+    }
     for phase in &recipe.phases {
         if let Some(contract) = &phase.native_outputs {
             anyhow::ensure!(
@@ -7411,6 +7497,8 @@ mod tests {
                 "GOARCH=",
                 "CGO_ENABLED=0",
                 "GOMAXPROCS=1",
+                "GOPROXY=off",
+                "GOSUMDB=off",
             ]
             .into_iter()
             .chain(environment.iter().copied())
@@ -7426,6 +7514,575 @@ mod tests {
             .await
             .expect("Go output fixture exceeded its bound")
             .expect("Go and rsync are required for the Go delivery regression")
+    }
+
+    #[cfg(unix)]
+    struct GoImplicitFixture {
+        module: &'static str,
+        args: &'static [&'static str],
+        output: &'static str,
+        source: &'static str,
+        tagged: bool,
+        expected_stdout: &'static [u8],
+    }
+
+    #[cfg(unix)]
+    fn go_implicit_fixtures() -> [GoImplicitFixture; 5] {
+        [
+            GoImplicitFixture {
+                module: "fixture.invalid/bare-command",
+                args: &["build"],
+                output: "bare-command",
+                source: "main.go",
+                tagged: false,
+                expected_stdout: b"go-implicit-ok\n",
+            },
+            GoImplicitFixture {
+                module: "fixture.invalid/dot-command",
+                args: &["build", "-p=1", "-trimpath", "."],
+                output: "dot-command",
+                source: "main.go",
+                tagged: false,
+                expected_stdout: b"go-implicit-ok\n",
+            },
+            GoImplicitFixture {
+                module: "fixture.invalid/named-files",
+                args: &["build", "-p=1", "helper.go", "entry.go"],
+                // The first named Go file determines the executable name,
+                // even when the main function is in a different source file.
+                output: "helper",
+                source: "entry.go",
+                tagged: false,
+                expected_stdout: b"go-implicit-ok\n",
+            },
+            GoImplicitFixture {
+                module: "fixture.invalid/versioned-command/v2",
+                args: &[
+                    "build",
+                    "-p=1",
+                    "-tags=selected",
+                    "-ldflags",
+                    "-s -w -X main.label=go-tagged-ok",
+                    ".",
+                ],
+                output: "versioned-command",
+                source: "main.go",
+                tagged: true,
+                expected_stdout: b"go-tagged-ok\n",
+            },
+            GoImplicitFixture {
+                module: "fixture.invalid/glob-command",
+                args: &["build", "-p=1", "./..."],
+                output: "glob-command",
+                source: "main.go",
+                tagged: false,
+                expected_stdout: b"go-implicit-ok\n",
+            },
+        ]
+    }
+
+    #[cfg(unix)]
+    fn write_go_implicit_fixture(root: &Path, fixture: &GoImplicitFixture) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            format!("module {}\n\ngo 1.20\n", fixture.module),
+        )
+        .unwrap();
+        let tag = if fixture.tagged {
+            "//go:build selected\n\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join(fixture.source),
+            format!(
+                "{tag}package main\nimport \"fmt\"\nvar label = \"go-implicit-ok\"\nfunc main() {{ fmt.Println(label) }}\n"
+            ),
+        )
+        .unwrap();
+        if fixture.source == "entry.go" {
+            std::fs::write(root.join("helper.go"), b"package main\nfunc helper() {}\n").unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn go_fixture_tree(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        fn visit(root: &Path, relative: &Path, tree: &mut BTreeMap<PathBuf, (u32, Vec<u8>)>) {
+            for entry in std::fs::read_dir(root.join(relative)).unwrap() {
+                let entry = entry.unwrap();
+                let relative = relative.join(entry.file_name());
+                let path = root.join(&relative);
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let bytes = if metadata.file_type().is_symlink() {
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                } else if metadata.is_file() {
+                    std::fs::read(&path).unwrap()
+                } else {
+                    assert!(metadata.is_dir(), "unexpected Go fixture path: {path:?}");
+                    Vec::new()
+                };
+                tree.insert(relative.clone(), (metadata.mode(), bytes));
+                if metadata.is_dir() {
+                    visit(root, &relative, tree);
+                }
+            }
+        }
+
+        let mut tree = BTreeMap::new();
+        visit(root, Path::new(""), &mut tree);
+        tree
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_implicit_output_discovery_matches_native_names_without_source_mutation() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        for fixture in go_implicit_fixtures() {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let root = directory.path();
+            write_go_implicit_fixture(root, &fixture);
+            std::fs::write(
+                root.join(fixture.output),
+                b"old executable must not qualify",
+            )
+            .unwrap();
+            let before = go_fixture_tree(root);
+            // The install target's directory is a machine-local property.
+            // Only its compiler-selected basename defines this build output.
+            let caller_bin = format!("GOBIN={}", root.join("caller-bin").display());
+            let worker_bin = format!("GOBIN={}", root.join("worker-bin").display());
+            let command = go_fixture_command("go", fixture.args, &[&caller_bin]);
+            assert_eq!(
+                rch_common::classify_command(&command).kind,
+                Some(CompilationKind::GoBuild),
+                "{command}"
+            );
+            let environment = validate_go_build_output(&command, root, root)
+                .await
+                .unwrap();
+            assert_eq!(go_fixture_tree(root), before, "query changed {command}");
+            let contract = environment.output_contract();
+            assert_eq!(
+                contract.required_files,
+                std::collections::BTreeSet::from([PathBuf::from(fixture.output)]),
+                "{command}"
+            );
+            let worker_command = go_fixture_command("go", fixture.args, &[&worker_bin]);
+            let guarded = go_build_execution_command(&worker_command, &environment, None).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut compiler).await;
+            assert!(output.status.success(), "{command}: {output:?}");
+            contract.verify_staged(root).unwrap();
+            let mut executable = Command::new(root.join(fixture.output));
+            let output = run_go_fixture(&mut executable).await;
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert_eq!(output.stdout, fixture.expected_stdout, "{command}");
+            let mut after = go_fixture_tree(root);
+            after.insert(
+                PathBuf::from(fixture.output),
+                before[Path::new(fixture.output)].clone(),
+            );
+            assert_eq!(
+                after, before,
+                "build changed inputs or added outputs: {command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_explicit_output_still_preserves_embedded_old_input_and_exact_delivery() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("go.mod"),
+            b"module fixture.invalid/explicit\n\ngo 1.20\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.go"),
+            b"package main\nimport (\"fmt\"; _ \"embed\")\nvar label = \"unset\"\n//go:embed explicit-app\nvar previous string\nfunc main() { fmt.Println(label + \":\" + previous) }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("explicit-app"), b"old executable input").unwrap();
+        let before = go_fixture_tree(root);
+        let command = go_fixture_command(
+            "go",
+            &[
+                "build",
+                "-p=1",
+                "-o=explicit-app",
+                "-ldflags",
+                "-s -w -X main.label=go-explicit-ok",
+                "main.go",
+            ],
+            &[],
+        );
+        assert_eq!(
+            rch_common::classify_command(&command).kind,
+            Some(CompilationKind::GoBuild)
+        );
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        assert_eq!(go_fixture_tree(root), before);
+        let contract = environment.output_contract();
+        assert_eq!(
+            contract.required_files,
+            std::collections::BTreeSet::from([PathBuf::from("explicit-app")])
+        );
+        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert!(output.status.success(), "{output:?}");
+        contract.verify_staged(root).unwrap();
+        let mut executable = Command::new(root.join("explicit-app"));
+        let output = run_go_fixture(&mut executable).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"go-explicit-ok:old executable input\n");
+        let mut after = go_fixture_tree(root);
+        after.insert(
+            PathBuf::from("explicit-app"),
+            before[Path::new("explicit-app")].clone(),
+        );
+        assert_eq!(after, before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_implicit_package_probe_preserves_project_local_go_cache() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use std::os::unix::fs::symlink;
+        use tokio::process::Command;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let checkout = directory.path().join("checkout");
+        let root = checkout.as_path();
+        let fixture = go_implicit_fixtures().into_iter().next().unwrap();
+        write_go_implicit_fixture(root, &fixture);
+        // Go can skip file-hash cache writes for files created less than two
+        // seconds ago. Age the owned fixture deterministically so the probe
+        // must also preserve the usual stable-checkout case, without sleeping.
+        let modified = std::time::SystemTime::now() - Duration::from_secs(10);
+        for relative in ["go.mod", fixture.source] {
+            std::fs::File::open(root.join(relative))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        let cache = root.join("local-go-cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("sentinel"), b"existing caller cache bytes").unwrap();
+        let cache_environment = format!("GOCACHE={}", cache.display());
+        let command = go_fixture_command("go", fixture.args, &[&cache_environment]);
+        let before = go_fixture_tree(root);
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        assert_eq!(
+            environment.output_contract().required_files,
+            std::collections::BTreeSet::from([PathBuf::from(fixture.output)])
+        );
+        let after = go_fixture_tree(root);
+        assert!(
+            after == before,
+            "package discovery changed the caller tree ({} entries before, {} after); first changed paths: {:?}",
+            before.len(),
+            after.len(),
+            after
+                .iter()
+                .filter(|(path, value)| before.get(*path) != Some(*value))
+                .map(|(path, _)| path)
+                .take(8)
+                .collect::<Vec<_>>()
+        );
+
+        // Module downloads and zip extraction can mutate GOMODCACHE even for
+        // list -find with readonly go.mod/go.sum. Reject overlap with the
+        // complete selected source tree before either endpoint asks for a
+        // package, including a missing suffix under an outside symlink.
+        let modules = root.join("local-module-cache");
+        std::fs::create_dir(&modules).unwrap();
+        std::fs::write(modules.join("sentinel"), b"existing module cache bytes").unwrap();
+        let alias = directory.path().join("outside-module-cache-alias");
+        symlink(&modules, &alias).unwrap();
+        let invocation = root.join("nested-command");
+        std::fs::create_dir(&invocation).unwrap();
+        std::fs::write(
+            invocation.join("main.go"),
+            b"package main\nfunc main() {}\n",
+        )
+        .unwrap();
+        for (cwd, module_cache) in [
+            (root.to_path_buf(), modules.clone()),
+            (root.to_path_buf(), root.join("missing-module-cache")),
+            (root.to_path_buf(), alias.join("missing-child")),
+            (invocation, modules),
+        ] {
+            let environment = validate_go_build_output(&command, &cwd, root)
+                .await
+                .unwrap();
+            let module_cache_environment = format!("GOMODCACHE={}", module_cache.display());
+            let refused = go_fixture_command(
+                "go",
+                fixture.args,
+                &[&cache_environment, &module_cache_environment],
+            );
+            let before = go_fixture_tree(directory.path());
+            let error = validate_go_build_output(&refused, &cwd, root)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("module cache"), "{error:#}");
+            assert_eq!(go_fixture_tree(directory.path()), before);
+            let guarded = go_build_execution_command(&refused, &environment, None).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(&cwd);
+            let output = run_go_fixture(&mut compiler).await;
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("module cache"),
+                "{output:?}"
+            );
+            assert_eq!(go_fixture_tree(directory.path()), before);
+        }
+
+        // Toolchain selection runs before most Go commands, including env
+        // GOMODCACHE. Its downloader must not reach a protected source cache
+        // before the cheap cache-location guard has rejected that overlap.
+        let future = root.join("future-toolchain");
+        std::fs::create_dir(&future).unwrap();
+        std::fs::write(
+            future.join("go.mod"),
+            b"module fixture.invalid/future\n\ngo 1.99.0\n\ntoolchain go1.99.1\n",
+        )
+        .unwrap();
+        std::fs::write(future.join("main.go"), b"package main\nfunc main() {}\n").unwrap();
+        let module_cache_environment =
+            format!("GOMODCACHE={}", root.join("local-module-cache").display());
+        let future_command = go_fixture_command(
+            "go",
+            fixture.args,
+            &[
+                "GOTOOLCHAIN=auto",
+                "GOPROXY=off",
+                &cache_environment,
+                &module_cache_environment,
+            ],
+        );
+        let before = go_fixture_tree(directory.path());
+        let error = validate_go_build_output(&future_command, &future, root)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("module cache"), "{error:#}");
+        assert_eq!(go_fixture_tree(directory.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_implicit_output_guards_refuse_changed_packages_and_stale_files() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use tokio::process::Command;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        let fixture = GoImplicitFixture {
+            module: "fixture.invalid/guard-main",
+            args: &["build", "-p=1", "."],
+            output: "guard-main",
+            source: "main.go",
+            tagged: false,
+            expected_stdout: b"go-implicit-ok\n",
+        };
+        write_go_implicit_fixture(root, &fixture);
+        for (name, source) in [
+            (
+                "library",
+                "package library\nfunc Value() int { return 37 }\n",
+            ),
+            ("other", "package main\nfunc main() {}\n"),
+        ] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("main.go"), source).unwrap();
+        }
+        std::fs::write(root.join(fixture.output), b"old executable must survive").unwrap();
+        std::fs::set_permissions(root.join("go.mod"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+
+        // This recording wrapper runs the authentic Go env/list commands.
+        // Its marker detects a workload invocation on a refusal path; it is
+        // not an alternate implementation of package discovery or compilation.
+        let mut real_env = Command::new("sh");
+        real_env
+            .args(["-c", &go_fixture_command("go", &["env", "GOROOT"], &[])])
+            .current_dir(root);
+        let output = run_go_fixture(&mut real_env).await;
+        assert!(output.status.success(), "{output:?}");
+        let real_go =
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("bin/go");
+        let real_go = shell_escape::escape(real_go.to_string_lossy());
+        let shim = root.join("bin/go");
+        std::fs::create_dir(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nenv|list) exec {real_go} \"$@\";;\nbuild) printf '%s\\n' invoked > workload-invoked; exec {real_go} \"$@\";;\nesac\nexit 114\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = go_fixture_command(shim.to_str().unwrap(), fixture.args, &[]);
+        let before = go_fixture_tree(root);
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        assert_eq!(go_fixture_tree(root), before);
+        for args in [
+            vec!["build", "-p=1", "./library"],
+            vec!["build", "-p=1", ".", "./other"],
+            vec!["build", "-p=1", ".", "./library"],
+            vec!["build", "-p=1", "./..."],
+            vec!["build", "-p=1", "./missing"],
+        ] {
+            let refused = go_fixture_command(shim.to_str().unwrap(), &args, &[]);
+            assert!(
+                validate_go_build_output(&refused, root, root)
+                    .await
+                    .is_err(),
+                "{refused}"
+            );
+            assert_eq!(go_fixture_tree(root), before, "query changed {refused}");
+        }
+        // A workspace can write go.work.sum even under -mod=readonly. Keep
+        // that path outside implicit output discovery before any build runs.
+        let workspace = root.join("go.work");
+        std::fs::write(&workspace, b"go 1.20\nuse .\n").unwrap();
+        let workspace_env = format!("GOWORK={}", workspace.display());
+        let workspace_command =
+            go_fixture_command(shim.to_str().unwrap(), fixture.args, &[&workspace_env]);
+        let with_workspace = go_fixture_tree(root);
+        assert!(
+            validate_go_build_output(&workspace_command, root, root)
+                .await
+                .is_err()
+        );
+        assert_eq!(go_fixture_tree(root), with_workspace);
+
+        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+        let original_source = std::fs::read(root.join("main.go")).unwrap();
+        for source in [
+            b"package library\nfunc Value() int { return 1 }\n".as_slice(),
+            b"this is not a Go package declaration\n".as_slice(),
+        ] {
+            std::fs::write(root.join("main.go"), source).unwrap();
+            let changed = go_fixture_tree(root);
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut compiler).await;
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            assert_eq!(go_fixture_tree(root), changed);
+        }
+        std::fs::write(root.join("main.go"), original_source).unwrap();
+        // A renamed module changes the default executable even when the
+        // package remains main. Admission cannot be reused for that name.
+        let module = std::fs::read(root.join("go.mod")).unwrap();
+        std::fs::set_permissions(root.join("go.mod"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            b"module fixture.invalid/renamed\n\ngo 1.20\n",
+        )
+        .unwrap();
+        let renamed = go_fixture_tree(root);
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert_eq!(go_fixture_tree(root), renamed);
+        std::fs::write(root.join("go.mod"), module).unwrap();
+
+        // Failure injection only: real package discovery still succeeds, but
+        // a zero-status compiler that produces no new output cannot publish
+        // the stale file. The missing-output guard remains mandatory.
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\ncase \"$1\" in env|list) exec {real_go} \"$@\";; esac\nexit 0\n"),
+        )
+        .unwrap();
+        let no_output = go_fixture_tree(root);
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("without its required output file")
+        );
+        assert_eq!(go_fixture_tree(root), no_output);
+        assert!(!root.join("workload-invoked").exists());
+
+        // Both admission and final staged verification reject a symlink
+        // bearing the discovered name, even when its referent is regular.
+        let linked = root.join("linked-checkout");
+        write_go_implicit_fixture(&linked, &fixture);
+        symlink(root.join(fixture.output), linked.join(fixture.output)).unwrap();
+        let linked_before = go_fixture_tree(&linked);
+        assert!(
+            validate_go_build_output(&command, &linked, &linked)
+                .await
+                .is_err()
+        );
+        assert!(
+            environment
+                .output_contract()
+                .verify_staged(&linked)
+                .is_err()
+        );
+        assert_eq!(go_fixture_tree(&linked), linked_before);
+
+        std::fs::rename(root.join(fixture.output), root.join("retained-old-output")).unwrap();
+        symlink(root.join("retained-old-output"), root.join(fixture.output)).unwrap();
+        let changed_destination = go_fixture_tree(root);
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
+        assert_eq!(go_fixture_tree(root), changed_destination);
     }
 
     #[cfg(unix)]
@@ -7582,6 +8239,151 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_build_implicit_outputs_are_bound_before_execution_and_survive_recovery() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        for fixture in go_implicit_fixtures() {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let missing = base.join("missing-worker");
+            let unrelated_target = base.join("cargo-target");
+            for root in [&local, &remote] {
+                write_go_implicit_fixture(root, &fixture);
+                std::fs::write(root.join(fixture.output), b"stale executable").unwrap();
+            }
+            std::fs::create_dir(&missing).unwrap();
+            std::fs::create_dir(&unrelated_target).unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"unrelated Cargo target").unwrap();
+            let command = go_fixture_command("go", fixture.args, &[]);
+            assert_eq!(
+                rch_common::classify_command(&command).kind,
+                Some(CompilationKind::GoBuild),
+                "{command}"
+            );
+            let before = go_fixture_tree(&local);
+            let environment = validate_go_build_output(&command, &local, &local)
+                .await
+                .unwrap();
+            assert_eq!(go_fixture_tree(&local), before);
+            let contract = environment.output_contract();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "go-implicit-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::GoBuild),
+                &command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            assert_eq!(session.recipe.phases.len(), 1);
+            assert_eq!(session.recipe.phases[0].name, "project");
+            assert!(!session.has_native_output_contract());
+            let pending = std::fs::read(&writer.path).unwrap();
+            assert!(session.starting_execution().is_err());
+            assert!(session.returned(0).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), pending);
+            session = reload_publication(&session);
+            session.require_go_outputs(contract.clone()).unwrap();
+            let bound = std::fs::read(&writer.path).unwrap();
+            session.require_go_outputs(contract.clone()).unwrap();
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bound);
+            let different = NativeOutputContract {
+                required_files: std::collections::BTreeSet::from([PathBuf::from("other-output")]),
+            };
+            assert!(session.require_go_outputs(different).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bound);
+            session = reload_publication(&session);
+            session.starting_execution().unwrap();
+            assert!(session.require_go_outputs(contract.clone()).is_err());
+
+            // A recovered execution must retain the exact publication
+            // contract. Dropping it cannot turn Go into glob-only delivery.
+            let mut damaged = writer.snapshot();
+            damaged.recovery.as_mut().unwrap()["phases"][0]["native_outputs"] =
+                serde_json::Value::Null;
+            let damaged_writer = DurableLeaseWriter {
+                path: writer.path.clone(),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(damaged)),
+            };
+            assert!(load_recipe(&damaged_writer).is_err());
+
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(&remote);
+            let output = run_go_fixture(&mut compiler).await;
+            assert!(output.status.success(), "{command}: {output:?}");
+            session.completed(0).unwrap();
+            session = reload_publication(&session);
+            assert_eq!(session.recipe.phases[0].native_outputs, Some(contract));
+            for complete in [false, true] {
+                let staged = session.staging_pipeline("project", &pipeline).unwrap();
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync = staged.local_artifact_retrieval_for_test(
+                    &worker,
+                    if complete { &remote } else { &missing },
+                    &patterns,
+                );
+                let output = run_go_fixture(&mut rsync).await;
+                assert!(output.status.success(), "{command}: {output:?}");
+                let journal = std::fs::read(&writer.path).unwrap();
+                if complete {
+                    session.publish("project").await.unwrap();
+                    session.returned(0).unwrap();
+                    session = reload_publication(&session);
+                    session.publish("project").await.unwrap();
+                    let mut executable = Command::new(local.join(fixture.output));
+                    let output = run_go_fixture(&mut executable).await;
+                    assert!(output.status.success(), "{command}: {output:?}");
+                    assert_eq!(output.stdout, fixture.expected_stdout);
+                } else {
+                    assert!(session.publish("project").await.is_err());
+                    assert!(session.returned(0).is_err());
+                    assert!(session.retain_failed_delivery_evidence());
+                    assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+                    assert_eq!(go_fixture_tree(&local), before);
+                    session = reload_publication(&session);
+                    assert!(!session.recipe.phases[0].complete);
+                    assert!(session.recipe.phases[0].published.is_empty());
+                }
+            }
+            let mut after = go_fixture_tree(&local);
+            after.insert(
+                PathBuf::from(fixture.output),
+                before[Path::new(fixture.output)].clone(),
+            );
+            assert_eq!(after, before);
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"unrelated Cargo target"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn go_build_explicit_output_survives_recovery_and_missing_delivery() {
         use super::super::artifact_patterns::direct_compiler::{
@@ -7650,7 +8452,9 @@ mod tests {
                 rch_common::classify_command(&command).kind,
                 Some(CompilationKind::GoBuild)
             );
-            let environment = validate_go_build_output(&command, &local).await.unwrap();
+            let environment = validate_go_build_output(&command, &local, &local)
+                .await
+                .unwrap();
             assert_eq!(
                 std::fs::read(local.join(relative)).unwrap(),
                 b"old local output"
@@ -7680,11 +8484,14 @@ mod tests {
             )
             .unwrap();
             assert!(session.has_native_output_contract());
+            session
+                .require_go_outputs(environment.output_contract())
+                .unwrap();
             assert_eq!(session.recipe.phases.len(), 1);
             assert_eq!(session.recipe.phases[0].name, "project");
             assert!(session.returned(0).is_err());
             session.starting_execution().unwrap();
-            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
             let mut compiler = Command::new("sh");
             compiler.args(["-c", &guarded]).current_dir(&remote);
             let output = run_go_fixture(&mut compiler).await;
@@ -7804,7 +8611,7 @@ mod tests {
         };
         let baseline_command =
             go_fixture_command("go", &["build", "-p=1", "-o", "app", "main.go"], &[]);
-        let baseline = validate_go_build_output(&baseline_command, root)
+        let baseline = validate_go_build_output(&baseline_command, root, root)
             .await
             .unwrap();
         for (output_path, environment, reason) in [
@@ -7821,22 +8628,25 @@ mod tests {
                 &["build", "-p=1", "-o", output_path, "main.go"],
                 &environment,
             );
-            let error = validate_go_build_output(&command, root).await.unwrap_err();
+            let error = validate_go_build_output(&command, root, root)
+                .await
+                .unwrap_err();
             assert!(format!("{error:#}").contains(reason), "{error:#}");
-            let guarded = go_build_execution_command(&command, &baseline).unwrap();
-            let mut process = Command::new("sh");
-            process.args(["-c", &guarded]).current_dir(root);
-            let output = run_go_fixture(&mut process).await;
-            assert_eq!(output.status.code(), Some(113), "{output:?}");
-            let remote_reason = if environment.is_empty() {
-                reason
+            if output_path == "app" {
+                let guarded = go_build_execution_command(&command, &baseline, None).unwrap();
+                let mut process = Command::new("sh");
+                process.args(["-c", &guarded]).current_dir(root);
+                let output = run_go_fixture(&mut process).await;
+                assert_eq!(output.status.code(), Some(113), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("settings differ"),
+                    "{output:?}"
+                );
             } else {
-                "settings differ"
-            };
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(remote_reason),
-                "{output:?}"
-            );
+                // A captured explicit contract cannot authorize another
+                // destination. Refuse before even constructing its command.
+                assert!(go_build_execution_command(&command, &baseline, None).is_none());
+            }
             assert_eq!(
                 std::fs::read(root.join("app")).unwrap(),
                 b"old output must survive"
@@ -7851,8 +8661,10 @@ mod tests {
         for changed in ["CGO_ENABLED=1", "GOEXPERIMENT=none", "GOAMD64=v2"] {
             let command =
                 go_fixture_command("go", &["build", "-p=1", "-o", "app", "main.go"], &[changed]);
-            validate_go_build_output(&command, root).await.unwrap();
-            let guarded = go_build_execution_command(&command, &baseline).unwrap();
+            validate_go_build_output(&command, root, root)
+                .await
+                .unwrap();
+            let guarded = go_build_execution_command(&command, &baseline, None).unwrap();
             let mut process = Command::new("sh");
             process.args(["-c", &guarded]).current_dir(root);
             let output = run_go_fixture(&mut process).await;
@@ -7870,8 +8682,10 @@ mod tests {
             &["build", "-p=1", "-o", "cgo-enabled-app", "main.go"],
             &["CGO_ENABLED=1"],
         );
-        let cgo_environment = validate_go_build_output(&cgo_command, root).await.unwrap();
-        let guarded = go_build_execution_command(&cgo_command, &cgo_environment).unwrap();
+        let cgo_environment = validate_go_build_output(&cgo_command, root, root)
+            .await
+            .unwrap();
+        let guarded = go_build_execution_command(&cgo_command, &cgo_environment, None).unwrap();
         let mut process = Command::new("sh");
         process.args(["-c", &guarded]).current_dir(root);
         let output = run_go_fixture(&mut process).await;
@@ -7882,8 +8696,10 @@ mod tests {
         // case. Neither may replace a previous successful build's output.
         for package in ["broken.go", "./missing/..."] {
             let command = go_fixture_command("go", &["build", "-p=1", "-o", "app", package], &[]);
-            let environment = validate_go_build_output(&command, root).await.unwrap();
-            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let environment = validate_go_build_output(&command, root, root)
+                .await
+                .unwrap();
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
             let mut process = Command::new("sh");
             process.args(["-c", &guarded]).current_dir(root);
             let output = run_go_fixture(&mut process).await;
@@ -7916,8 +8732,10 @@ mod tests {
             .unwrap();
             assert!(!project.join("new-products").exists());
             let command = go_fixture_command("go", &["build", "-p=1", "-o", output_path, "."], &[]);
-            let environment = validate_go_build_output(&command, &project).await.unwrap();
-            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let environment = validate_go_build_output(&command, &project, &project)
+                .await
+                .unwrap();
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
             let mut compiler = Command::new("sh");
             compiler.args(["-c", &guarded]).current_dir(&project);
             let output = run_go_fixture(&mut compiler).await;
@@ -7958,8 +8776,10 @@ mod tests {
             &["build", "-o", "app", "main.go"],
             &[],
         );
-        let environment = validate_go_build_output(&command, root).await.unwrap();
-        let guarded = go_build_execution_command(&command, &environment).unwrap();
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
         let mut process = Command::new("sh");
         process.args(["-c", &guarded]).current_dir(root);
         let output = run_go_fixture(&mut process).await;

@@ -281,9 +281,9 @@ pub enum CompilationKind {
 
     // Go commands
     //
-    // Builds require an explicit file output and durable artifact delivery.
+    // Builds require a proven file output and durable artifact delivery.
     // Even ./... can select one main package and emit an implicit executable.
-    /// `go build -o <file>` (required output returned through staged retrieval)
+    /// `go build` (explicit or discovered required output uses staged retrieval)
     GoBuild,
     /// `go test ./...`
     GoTest,
@@ -581,7 +581,7 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
     // rewrite offloads EVERY build in the chain. Previously only the final
     // segment was wrapped and `cargo build --release && cargo test` compiled
     // the first half locally on the dispatcher with no summary line at all.
-    // Segments that do not classify (cd, touch, implicit `go build`, ...)
+    // Segments that do not classify (cd, touch, unsupported Go build modes, ...)
     // are re-emitted verbatim.
     let mut prefix = String::with_capacity(cmd.len() + segments.len() * EXEC_REWRITE_PREFIX.len());
     for segment in &segments[..segments.len() - 1] {
@@ -610,10 +610,10 @@ const EXEC_REWRITE_PREFIX: &str = "rch exec -- ";
 /// command but were not classified as one, and therefore stay local when the
 /// chain is rewritten by the hook (issue #50).
 ///
-/// Example: `go build ./cmd && cargo test` — an implicit Go output cannot yet
-/// be enumerated, so the hook rewrites only `cargo test`;
-/// this returns `["go build ./cmd"]` so the hook can say so instead of
-/// staying silent.
+/// Example: `go build -buildmode=plugin ./cmd && cargo test` — native-library
+/// outputs have no complete delivery contract, so the hook rewrites only
+/// `cargo test`; this returns `["go build -buildmode=plugin ./cmd"]` so the hook
+/// can report the local segment.
 /// Returns an empty vector for anything that is not a plain `&&` chain.
 pub fn compound_local_compilation_segments(cmd: &str) -> Vec<String> {
     let trimmed = cmd.trim();
@@ -2262,25 +2262,48 @@ pub struct GoBuildOutput {
     pub option_index: usize,
 }
 
-/// Plan the explicit file output of a supported Go build.
+/// Literal arguments of a Go build eligible for output planning.
+///
+/// An implicit invocation is only a candidate: the executor must ask the same
+/// compiler to prove that it selects exactly one main package and identify
+/// that package's default executable before offloading it. A package spelling
+/// alone does not establish either fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBuildInvocation {
+    /// An explicit project-relative output, when the command contains `-o`.
+    pub output: Option<GoBuildOutput>,
+    /// Validated build flags and their values, in original argument order.
+    /// Only the actual `-o` option and its value are omitted. In particular,
+    /// an opaque value such as `-tags -o` remains a pair in this list.
+    pub build_flags: Vec<String>,
+    /// Literal package selectors or named `.go` source files, in argument order.
+    /// An empty list means the current package, as it does for `go build`.
+    pub packages: Vec<String>,
+}
+
+/// Parse the literal arguments of a supported Go build.
 ///
 /// Classification and durable retrieval use this same parser. Implicit output
 /// names depend on the selected packages (including what ./... matches), and
-/// directories or native-library build modes can produce multiple files. Keep
-/// those forms local until their complete output sets can be planned.
+/// require compiler discovery. Directories or native-library build modes can
+/// produce multiple files and remain unsupported. No filesystem or compiler
+/// work occurs during classification.
 #[must_use]
-pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
+pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
     let normalized = normalize_command(command);
     let words = literal_flag_words(&normalized)?;
-    let mut args = words.into_iter().enumerate();
+    let mut args = words.iter().copied().enumerate().peekable();
     if args.next()?.1 != "go" || args.next()?.1 != "build" {
         return None;
     }
     let mut output = None;
+    let mut build_flags = Vec::new();
+    let mut packages = Vec::new();
     let mut packages_started = false;
     while let Some((option_index, arg)) = args.next() {
         if !arg.starts_with('-') {
             packages_started = true;
+            packages.push(arg.to_owned());
             continue;
         }
         if packages_started {
@@ -2364,13 +2387,33 @@ pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
             }
             _ => return None,
         }
+        if flag != "-o" {
+            let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
+            build_flags.extend(
+                words[option_index..next_index]
+                    .iter()
+                    .map(|arg| (*arg).to_owned()),
+            );
+        }
     }
-    output
+    Some(GoBuildInvocation {
+        output,
+        build_flags,
+        packages,
+    })
 }
 
-/// Classify Go builds with a complete explicit output contract, and streaming
-/// test/vet commands. File-producing test modes remain local until they have an
-/// equivalent contract; arbitrary subcommands are never offloaded here.
+/// Plan the explicit file output of a supported Go build. An implicit build
+/// has no static output contract, even when its arguments permit discovery.
+#[must_use]
+pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
+    go_build_invocation(command)?.output
+}
+
+/// Classify Go builds eligible for explicit or compiler-discovered output
+/// delivery, and streaming test/vet commands. File-producing test modes remain
+/// local until they have an equivalent contract; arbitrary subcommands are
+/// never offloaded here.
 fn classify_go(cmd: &str) -> Classification {
     let mut tokens = cmd.split_whitespace();
     // Skip the leading "go".
@@ -2386,9 +2429,9 @@ fn classify_go(cmd: &str) -> Classification {
 
     match subcommand {
         "build" => {
-            if go_build_output(cmd).is_none() {
+            if go_build_invocation(cmd).is_none() {
                 return Classification::not_compilation(
-                    "go build requires a supported explicit -o file for artifact delivery",
+                    "go build has unsupported arguments or output mode for artifact delivery",
                 );
             }
             if !cfg!(unix) {
@@ -7258,14 +7301,29 @@ mod regression_classification {
         let result = classify_command("cd /repo && cargo build");
         assert_eq!(result.command_prefix.as_deref(), Some("cd /repo && "));
 
-        // A build-looking segment that must stay local is left verbatim ...
+        // Implicit Go builds enter package-aware output discovery on Unix.
         let result = classify_command("go build ./cmd && cargo test");
         assert!(result.is_compilation);
-        assert_eq!(result.command_prefix.as_deref(), Some("go build ./cmd && "));
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some(if cfg!(unix) {
+                "rch exec -- go build ./cmd && "
+            } else {
+                "go build ./cmd && "
+            })
+        );
+
+        // A build-looking segment that must stay local is left verbatim ...
+        let result = classify_command("go build -buildmode=plugin ./cmd && cargo test");
+        assert!(result.is_compilation);
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some("go build -buildmode=plugin ./cmd && ")
+        );
         // ... and reported, so the hook can announce it instead of staying silent.
         assert_eq!(
-            compound_local_compilation_segments("go build ./cmd && cargo test"),
-            vec!["go build ./cmd".to_string()]
+            compound_local_compilation_segments("go build -buildmode=plugin ./cmd && cargo test"),
+            vec!["go build -buildmode=plugin ./cmd".to_string()]
         );
         assert!(
             compound_local_compilation_segments("cargo build --release && cargo test").is_empty()
@@ -7634,12 +7692,20 @@ mod regression_classification {
                 reason_contains: "go build command",
                 min_confidence: 0.9,
             },
-            // Implicit output names require package-aware output planning.
+            // Implicit Go outputs enter compiler-authoritative package discovery.
+            #[cfg(unix)]
             Case {
                 cmd: "go build ./cmd/app",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::GoBuild),
+                reason_contains: "go build command",
+                min_confidence: 0.9,
+            },
+            Case {
+                cmd: "go build -buildmode=plugin ./cmd/app",
                 expect_compilation: false,
                 expected_kind: None,
-                reason_contains: "requires a supported explicit -o file",
+                reason_contains: "unsupported arguments or output mode",
                 min_confidence: 0.0,
             },
             Case {
@@ -8134,7 +8200,13 @@ mod tests_go_and_typescript {
     fn go_commands_clear_the_confidence_threshold() {
         // Default confidence_threshold is 0.85; anything at or below it is never
         // intercepted, which would silently keep these local.
-        for cmd in ["go build -o app .", "go test ./...", "go vet ./..."] {
+        for cmd in [
+            "go build -o app .",
+            "go build",
+            "go build main.go",
+            "go test ./...",
+            "go vet ./...",
+        ] {
             if !cfg!(unix) && cmd.starts_with("go build") {
                 continue;
             }
@@ -8154,8 +8226,6 @@ mod tests_go_and_typescript {
         assert!(!CompilationKind::GoBuild.is_test_command());
         assert!(!CompilationKind::GoVet.is_test_command());
     }
-
-    // --- Go: forms that MUST stay local (would otherwise lose artifacts) ---
 
     #[test]
     fn go_build_explicit_outputs_share_one_literal_contract() {
@@ -8178,6 +8248,11 @@ mod tests_go_and_typescript {
             assert_eq!(selection.path, path, "{command}");
             assert_eq!(selection.option_index, option_index, "{command}");
             assert_eq!(
+                go_build_invocation(command).unwrap().output,
+                Some(selection),
+                "{command}"
+            );
+            assert_eq!(
                 kind_of(command),
                 cfg!(unix).then_some(CompilationKind::GoBuild),
                 "{command}"
@@ -8186,12 +8261,86 @@ mod tests_go_and_typescript {
     }
 
     #[test]
-    fn go_build_implicit_ambiguous_and_extra_outputs_stay_local() {
+    fn go_build_implicit_candidates_preserve_package_selection_arguments() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("go build", &[], &[]),
+            ("go build .", &[], &["."]),
+            ("go build ./...", &[], &["./..."]),
+            ("go build main.go", &[], &["main.go"]),
+            ("go build helper.go main.go", &[], &["helper.go", "main.go"]),
+            (
+                "go build ./cmd/app ./cmd/app",
+                &[],
+                &["./cmd/app", "./cmd/app"],
+            ),
+            ("go build './cmd/my tool'", &[], &["./cmd/my tool"]),
+            (
+                "env GOFLAGS= go build -tags 'debug e2e' -mod readonly -trimpath -ldflags '-s -X main.version=v2' ./cmd/app",
+                &[
+                    "-tags",
+                    "debug e2e",
+                    "-mod",
+                    "readonly",
+                    "-trimpath",
+                    "-ldflags",
+                    "-s -X main.version=v2",
+                ],
+                &["./cmd/app"],
+            ),
+            (
+                "go build -buildmode=pie -compiler gc -p=2 -race=false .",
+                &["-buildmode=pie", "-compiler", "gc", "-p=2", "-race=false"],
+                &["."],
+            ),
+            ("go build -tags -o app .", &["-tags", "-o"], &["app", "."]),
+        ];
+        for &(command, flags, packages) in cases {
+            let invocation = go_build_invocation(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(invocation.output, None, "{command}");
+            assert_eq!(invocation.build_flags, flags, "{command}");
+            assert_eq!(invocation.packages, packages, "{command}");
+            // Candidate classification does not invent a static output. The
+            // execution preflight must still prove exactly one main package.
+            assert!(go_build_output(command).is_none(), "{command}");
+            assert_eq!(
+                kind_of(command),
+                cfg!(unix).then_some(CompilationKind::GoBuild),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_build_invocation_removes_only_the_actual_output_option() {
+        let invocation = go_build_invocation(
+            "go build -tags -o -o bin/app -trimpath -ldflags '-X main.version=-o' .",
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.output,
+            Some(GoBuildOutput {
+                path: "bin/app".to_owned(),
+                option_index: 4,
+            })
+        );
+        assert_eq!(
+            invocation.build_flags,
+            ["-tags", "-o", "-trimpath", "-ldflags", "-X main.version=-o"]
+        );
+        assert_eq!(invocation.packages, ["."]);
+
+        let invocation =
+            go_build_invocation("go build -o=bin/app -tags=release -p 2 main.go").unwrap();
+        assert_eq!(invocation.build_flags, ["-tags=release", "-p", "2"]);
+        assert_eq!(invocation.packages, ["main.go"]);
+        assert_eq!(invocation.output.unwrap().option_index, 2);
+    }
+
+    // --- Go: forms that MUST stay local (would otherwise lose artifacts) ---
+
+    #[test]
+    fn go_build_ambiguous_and_extra_outputs_stay_local() {
         for command in [
-            "go build",
-            "go build .",
-            "go build ./...",
-            "go build main.go",
             "go build -o",
             "go build -o /tmp/app .",
             "go build -o ../app .",
@@ -8208,7 +8357,6 @@ mod tests_go_and_typescript {
             "go build -o $OUTPUT .",
             "go build -o app* .",
             "go build . -o app",
-            "go build -tags -o app .",
             "go build -overlay overlay.json -o app .",
             "go build -mod=mod -o app .",
             "go build -ldflags '-cpuprofile=cpu.out' -o app .",
@@ -8216,11 +8364,48 @@ mod tests_go_and_typescript {
             "go build -gcflags '-cpuprofile=cpu.out' -o app .",
             "go build -asmflags '-debug' -o app .",
         ] {
+            assert!(go_build_invocation(command).is_none(), "{command}");
             assert!(go_build_output(command).is_none(), "{command}");
             assert_eq!(kind_of(command), None, "{command}");
         }
-        assert!(go_build_output(&format!("go build -o {} .", "x".repeat(65_536))).is_none());
-        assert!(go_build_output("go build -o 'app\nnext' .").is_none());
+    }
+
+    #[test]
+    fn go_build_implicit_discovery_does_not_broaden_flag_or_shell_semantics() {
+        for command in [
+            "go build -n .",
+            "go build -n=false .",
+            "go build -work .",
+            "go build -buildmode=c-shared .",
+            "go build -buildmode=c-archive .",
+            "go build -buildmode=plugin .",
+            "go build -buildmode=archive .",
+            "go build -buildmode=shared .",
+            "go build -compiler gccgo .",
+            "go build -toolexec wrapper .",
+            "go build -overlay overlay.json .",
+            "go build -mod=mod .",
+            "go build -modfile other.mod .",
+            "go build -ldflags '-cpuprofile=cpu.out' .",
+            "go build -gcflags '-cpuprofile=cpu.out' .",
+            "go build -asmflags '-debug' .",
+            "go build -tags",
+            "go build -tags= .",
+            "go build . -tags e2e",
+            "go build main.go -race",
+            "go build -- .",
+            "go build $PACKAGE",
+            "go build *.go",
+            "go build ./cmd/{first,second}",
+            "go build ./cmd/app; touch marker",
+            "go build ./cmd/app > output.log",
+            "go build 'main\nnext.go'",
+            "go build -o 'app\nnext' .",
+        ] {
+            assert!(go_build_invocation(command).is_none(), "{command}");
+        }
+        assert!(go_build_invocation(&format!("go build -o {} .", "x".repeat(65_536))).is_none());
+        assert!(go_build_invocation(&format!("go build {}", "main.go ".repeat(4095))).is_none());
     }
 
     #[test]

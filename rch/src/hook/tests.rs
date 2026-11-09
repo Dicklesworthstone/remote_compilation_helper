@@ -18418,7 +18418,14 @@ fn rust_and_zig_jobs_require_toolchains_without_reinterpreting_opaque_jobs() {
         ("rustc main.rs", RequiredRuntime::Rust),
         ("bash ./build.sh", RequiredRuntime::None),
         ("python3 build.py", RequiredRuntime::None),
-        ("go build ./...", RequiredRuntime::None),
+        (
+            "go build ./...",
+            if cfg!(unix) {
+                RequiredRuntime::Go
+            } else {
+                RequiredRuntime::None
+            },
+        ),
         ("echo preparing && cargo build", RequiredRuntime::None),
     ] {
         assert_eq!(required_runtime_for_job(command), expected, "{command}");

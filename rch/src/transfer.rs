@@ -295,7 +295,7 @@ use rch_common::{
 use rch_common::{SshClient, SshOptions};
 use shell_escape::escape;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -1983,8 +1983,10 @@ const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str =
 /// (e.g. a `.cargo/config.toml` `target-dir` of `/root/cass-ft-target`, or a
 /// `TMPDIR` on a volatile host mount) the remote build writes outside the managed
 /// `/data/tmp` zone the disk reapers watch, or fails outright. Forcing them into
-/// `<remote_path>/.rch-*` makes placement deterministic and reclaimable, and —
-/// because env precedence beats a `.cargo/config.toml` `target-dir` — covers
+/// `<remote_path>/.rch-*` makes placement deterministic and reclaimable. Direct
+/// Go builds use the explicitly granted external target for their runtime
+/// paths so package discovery and embedding see only source inputs. Because
+/// env precedence beats a `.cargo/config.toml` `target-dir`, this also covers
 /// wrapper/unclassified builds that never went through target-dir rewriting.
 const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
     "CARGO_TARGET_DIR",
@@ -1992,6 +1994,7 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
     "GOCACHE",
     "GOMODCACHE",
     "GOPATH",
+    "GOTMPDIR",
 ];
 /// Remote loop-break. A command we are *already* executing on a worker must
 /// compile there — it must never re-enter the offload path and try to hand the
@@ -4878,11 +4881,23 @@ impl TransferPipeline {
     /// Returns `Some((value, ensure_dir))` for a managed key, or `None` for any
     /// other key. This is the single source of truth for managed placement,
     /// shared by [`Self::rewrite_remote_env_value`] (rewrites a forwarded value)
-    /// and [`Self::build_remote_env_plan`] (injects the key unconditionally). All
-    /// managed paths sit under `<remote_path>/.rch-*` so they land in the
-    /// managed `/data/tmp` build zone and are reclaimable.
+    /// and [`Self::build_remote_env_plan`] (injects the key unconditionally).
+    /// Ordinary commands keep managed paths under `<remote_path>/.rch-*`.
+    /// Direct Go builds instead use their explicitly granted external target
+    /// for scratch and caches. Package discovery and go:embed must not see
+    /// directories created by the execution wrapper in the source tree.
     fn managed_remote_env_value(&self, key: &str, remote_path: &str) -> Option<(String, String)> {
-        let go_base = format!("{remote_path}/.rch-go");
+        let runtime_root = if self.compilation_kind == Some(CompilationKind::GoBuild) {
+            // Admission supplies this external target and includes it in the
+            // source/target ownership grant. Do not invent an unowned sibling
+            // for direct callers that have no admitted target override.
+            self.remote_cargo_target_dir_override
+                .as_deref()
+                .unwrap_or(remote_path)
+        } else {
+            remote_path
+        };
+        let go_base = format!("{runtime_root}/.rch-go");
         match key {
             // Absolute or host-specific target directories are brittle on workers.
             // Force a remote-scoped target dir rooted in the synchronized project.
@@ -4891,9 +4906,18 @@ impl TransferPipeline {
                 Some((target_dir.clone(), target_dir))
             }
             // Temporary directories may point to host-only volatile mounts.
-            // Keep temp files project-scoped on the worker for stability.
+            // Use the granted runtime root, outside sources for direct Go.
             "TMPDIR" | "TMP" | "TEMP" => {
-                let temp_dir = format!("{remote_path}/.rch-tmp");
+                let temp_dir = format!("{runtime_root}/.rch-tmp");
+                Some((temp_dir.clone(), temp_dir))
+            }
+            // Go's own work directory takes precedence over TMPDIR. Only
+            // admitted direct Go builds acquire this additional managed key.
+            "GOTMPDIR"
+                if self.compilation_kind == Some(CompilationKind::GoBuild)
+                    && self.remote_cargo_target_dir_override.is_some() =>
+            {
+                let temp_dir = format!("{runtime_root}/.rch-tmp");
                 Some((temp_dir.clone(), temp_dir))
             }
             // Go build cache, module cache, and GOPATH — pin under the managed
@@ -4913,6 +4937,31 @@ impl TransferPipeline {
             }
             _ => None,
         }
+    }
+
+    /// Runtime assignments for the inner direct-Go execution guard. Apply
+    /// these after the caller's `env` wrappers so an inline cache assignment
+    /// or `env -i` cannot bypass the already granted and budgeted directories.
+    pub(crate) fn managed_go_runtime_environment(&self) -> Option<BTreeMap<String, String>> {
+        if self.compilation_kind != Some(CompilationKind::GoBuild) {
+            return None;
+        }
+        let target = self.remote_cargo_target_dir_override.as_deref()?;
+        [
+            "GOCACHE",
+            "GOMODCACHE",
+            "GOPATH",
+            "GOTMPDIR",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        ]
+        .into_iter()
+        .map(|key| {
+            self.managed_remote_env_value(key, target)
+                .map(|(value, _)| (key.to_owned(), value))
+        })
+        .collect()
     }
 
     fn rewrite_remote_env_value(
@@ -5051,7 +5100,7 @@ impl TransferPipeline {
                 if !ensure_dirs.iter().any(|existing| existing == &dir) {
                     ensure_dirs.push(dir.clone());
                 }
-                if matches!(key, "TMPDIR" | "TMP" | "TEMP")
+                if matches!(key, "GOTMPDIR" | "TMPDIR" | "TMP" | "TEMP")
                     && !restricted_dirs.iter().any(|existing| existing == &dir)
                 {
                     restricted_dirs.push(dir);
@@ -5083,7 +5132,7 @@ impl TransferPipeline {
             if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
                 ensure_dirs.push(ensure_dir.clone());
             }
-            if matches!(key, "TMPDIR" | "TMP" | "TEMP")
+            if matches!(key, "GOTMPDIR" | "TMPDIR" | "TMP" | "TEMP")
                 && !restricted_dirs
                     .iter()
                     .any(|existing| existing == &ensure_dir)
@@ -19948,6 +19997,289 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
         // Each managed dir must be mkdir'd before the build.
         assert!(command.contains("mkdir -p"));
         assert!(command.contains(&format!("{}/.rch-go/cache", root)));
+    }
+
+    #[test]
+    fn direct_go_runtime_uses_the_granted_target_for_forced_and_forwarded_paths() {
+        let _guard = test_guard!();
+        let source = "/source/project/nested";
+        let target = "/managed/go-target";
+        let pipeline = TransferPipeline::new(
+            PathBuf::from(source),
+            "go-project".into(),
+            "source-hash".into(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::GoBuild))
+        .with_remote_path_override(source)
+        .with_remote_cargo_target_dir_override(target)
+        .with_env_allowlist(
+            [
+                "CARGO_TARGET_DIR",
+                "GOCACHE",
+                "GOMODCACHE",
+                "GOPATH",
+                "GOTMPDIR",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        );
+        let inherited = ["GOCACHE", "GOMODCACHE", "GOTMPDIR", "TMP", "TEMP"]
+            .into_iter()
+            .map(|key| (key.to_owned(), "/caller/source/cache".to_owned()));
+        let plan = pipeline.build_remote_env_plan_with_environment(source, inherited);
+        let runtime = pipeline.managed_go_runtime_environment().unwrap();
+        assert_eq!(runtime.len(), 7);
+        for (key, path) in [
+            ("CARGO_TARGET_DIR", target.to_owned()),
+            ("GOCACHE", format!("{target}/.rch-go/cache")),
+            ("GOMODCACHE", format!("{target}/.rch-go/mod")),
+            ("GOPATH", format!("{target}/.rch-go/path")),
+            ("GOTMPDIR", format!("{target}/.rch-tmp")),
+            ("TMPDIR", format!("{target}/.rch-tmp")),
+            ("TMP", format!("{target}/.rch-tmp")),
+            ("TEMP", format!("{target}/.rch-tmp")),
+        ] {
+            assert!(plan.env_prefix.applied.iter().any(|applied| applied == key));
+            assert!(
+                plan.env_prefix
+                    .prefix
+                    .contains(&managed_assignment(key, &path))
+            );
+            assert!(plan.ensure_dirs.contains(&path));
+            if key != "CARGO_TARGET_DIR" {
+                assert_eq!(runtime.get(key), Some(&path));
+            }
+        }
+        assert_eq!(plan.ensure_dirs.len(), 5);
+        assert_eq!(plan.restricted_dirs, [format!("{target}/.rch-tmp")]);
+        assert!(
+            plan.ensure_dirs
+                .iter()
+                .all(|path| Path::new(path).starts_with(target))
+        );
+        assert!(!plan.env_prefix.prefix.contains(source));
+        assert!(!plan.env_prefix.prefix.contains("/caller/source/cache"));
+        let forced = pipeline.build_remote_env_plan_with_environment(source, std::iter::empty());
+        assert!(
+            forced
+                .env_prefix
+                .applied
+                .iter()
+                .any(|key| key == "GOTMPDIR")
+        );
+        assert!(forced.env_prefix.prefix.contains(&managed_assignment(
+            "GOTMPDIR",
+            &format!("{target}/.rch-tmp")
+        )));
+        assert_eq!(forced.ensure_dirs.len(), 5);
+        assert_eq!(forced.restricted_dirs, [format!("{target}/.rch-tmp")]);
+    }
+
+    #[test]
+    fn direct_go_runtime_does_not_relocate_ungranted_or_other_commands() {
+        let _guard = test_guard!();
+        let source = "/source/project";
+        for (kind, target) in [
+            (None, Some("/managed/target")),
+            (Some(CompilationKind::CargoBuild), Some("/managed/target")),
+            (Some(CompilationKind::GoTest), Some("/managed/target")),
+            (Some(CompilationKind::GoBuild), None),
+        ] {
+            let mut pipeline = TransferPipeline::new(
+                PathBuf::from(source),
+                "project".into(),
+                "source-hash".into(),
+                TransferConfig::default(),
+            )
+            .with_compilation_kind(kind);
+            if let Some(target) = target {
+                pipeline = pipeline.with_remote_cargo_target_dir_override(target);
+            }
+            assert!(pipeline.managed_go_runtime_environment().is_none());
+            assert!(
+                pipeline
+                    .managed_remote_env_value("GOTMPDIR", source)
+                    .is_none()
+            );
+            for (key, suffix) in [
+                ("GOCACHE", ".rch-go/cache"),
+                ("GOMODCACHE", ".rch-go/mod"),
+                ("GOPATH", ".rch-go/path"),
+                ("TMPDIR", ".rch-tmp"),
+                ("TMP", ".rch-tmp"),
+                ("TEMP", ".rch-tmp"),
+            ] {
+                let path = format!("{source}/{suffix}");
+                assert_eq!(
+                    pipeline.managed_remote_env_value(key, source),
+                    Some((path.clone(), path)),
+                    "{kind:?}/{key}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_go_guards_execute_with_real_remote_environment_outside_sources() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let target = retained.join("granted target");
+        let home = retained.join("caller home");
+        std::fs::create_dir(&home).unwrap();
+        let go_root = Command::new("go")
+            .args(["env", "GOROOT"])
+            .env("GOENV", "off")
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "")
+            .current_dir(&retained)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("the real Go toolchain is required for managed runtime regression");
+        assert!(go_root.status.success(), "{go_root:?}");
+        let go = PathBuf::from(String::from_utf8(go_root.stdout).unwrap().trim()).join("bin/go");
+
+        for (case, (nested, explicit)) in
+            [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let source = retained.join(format!("source {case}"));
+            let cwd = if nested {
+                source.join("cmd/app")
+            } else {
+                source.clone()
+            };
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::write(
+                source.join("go.mod"),
+                b"module fixture.invalid/runtime\n\ngo 1.20\n",
+            )
+            .unwrap();
+            std::fs::write(
+                cwd.join("main.go"),
+                br#"package main
+import ("embed"; "fmt")
+//go:embed all:*
+var inputs embed.FS
+func main() {
+    entries, err := inputs.ReadDir(".")
+    if err != nil { panic(err) }
+    for _, entry := range entries {
+        name := entry.Name()
+        if len(name) >= 5 && name[:5] == ".rch-" { panic("runtime state entered source inputs") }
+    }
+    fmt.Println("managed-go-runtime-ok")
+}
+"#,
+            )
+            .unwrap();
+            let mut args = vec![
+                "env".to_owned(),
+                format!("HOME={}", home.display()),
+                "GOENV=off".to_owned(),
+                "GOTOOLCHAIN=local".to_owned(),
+                "GOWORK=off".to_owned(),
+                "GOFLAGS=".to_owned(),
+                "GOBIN=".to_owned(),
+                "GO111MODULE=on".to_owned(),
+                "GOOS=".to_owned(),
+                "GOARCH=".to_owned(),
+                "CGO_ENABLED=0".to_owned(),
+                "GOMAXPROCS=1".to_owned(),
+                "GOPROXY=off".to_owned(),
+                "GOSUMDB=off".to_owned(),
+                go.to_str().unwrap().to_owned(),
+                "build".to_owned(),
+                "-p=1".to_owned(),
+            ];
+            let caller_runtime = retained.join(format!("caller-runtime-{case}"));
+            for (key, suffix) in [
+                ("GOCACHE", "build-cache"),
+                ("GOMODCACHE", "module-cache"),
+                ("GOPATH", "go-path"),
+                ("GOTMPDIR", "go-work"),
+                ("TMPDIR", "tmpdir"),
+                ("TMP", "tmp"),
+                ("TEMP", "temp"),
+            ] {
+                args.insert(
+                    1,
+                    format!("{key}={}", caller_runtime.join(suffix).display()),
+                );
+            }
+            if nested {
+                args.insert(1, "-i".to_owned());
+            }
+            let output_name = if explicit {
+                args.extend(["-o".to_owned(), "bin/named".to_owned()]);
+                "bin/named"
+            } else if nested {
+                "app"
+            } else {
+                "runtime"
+            };
+            args.push(".".to_owned());
+            let command = shell_words::join(args);
+            let pipeline = TransferPipeline::new(
+                cwd.clone(),
+                "go-runtime-fixture".into(),
+                format!("case-{case}"),
+                TransferConfig::default(),
+            )
+            .with_compilation_kind(Some(CompilationKind::GoBuild))
+            .with_remote_path_override(cwd.to_str().unwrap())
+            .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+            .with_disk_source_root(source.to_str().unwrap().to_owned())
+            .with_env_allowlist(Vec::new())
+            .with_env_overrides(HashMap::new())
+            .with_compilation_config(rch_common::CompilationConfig {
+                external_timeout_enabled: false,
+                remote_build_jobs: RemoteBuildJobs::Off,
+                ..Default::default()
+            });
+            let runtime = pipeline.managed_go_runtime_environment().unwrap();
+            let guarded =
+                crate::hook::guarded_go_build_for_test(&command, &cwd, &source, Some(&runtime))
+                    .await
+                    .unwrap();
+            let script = retained.join(format!("remote-command-{case}.sh"));
+            std::fs::write(&script, pipeline.build_remote_command(&guarded, None)).unwrap();
+            let mut process = Command::new("sh");
+            process.arg(&script).stdin(Stdio::null()).kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(120), process.output())
+                .await
+                .expect("managed Go build exceeded its deadline")
+                .expect("run actual remote command wrapper");
+            assert!(output.status.success(), "case {case}: {output:?}");
+            assert!(cwd.join(output_name).is_file(), "case {case}");
+            let output = Command::new(cwd.join(output_name)).output().await.unwrap();
+            assert!(output.status.success(), "case {case}: {output:?}");
+            assert_eq!(output.stdout, b"managed-go-runtime-ok\n");
+            for root in [&source, &cwd] {
+                for name in [".rch-go", ".rch-tmp", ".rch-target"] {
+                    assert!(
+                        !root.join(name).exists(),
+                        "case {case}: {}",
+                        root.join(name).display()
+                    );
+                }
+            }
+            for relative in [".rch-go/cache", ".rch-go/mod", ".rch-go/path", ".rch-tmp"] {
+                assert!(target.join(relative).is_dir(), "case {case}: {relative}");
+            }
+            assert!(
+                !caller_runtime.exists(),
+                "case {case}: inline environment escaped the grant"
+            );
+        }
     }
 
     #[test]

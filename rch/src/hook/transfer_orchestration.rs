@@ -692,6 +692,39 @@ fn stable_pooled_target_dir(remote_base: &str, project_id: &str, pooled_dir_name
     )
 }
 
+/// Go's caches and private compilation output must live outside every source
+/// root. The existing target authority owns this runtime directory through
+/// execution and recovery; lane and worker identity keep concurrent mirrors
+/// separate, while ordinary repeated builds can reuse Go's content-keyed cache.
+fn go_runtime_target_dir(
+    remote_base: &str,
+    project_id: &str,
+    source: &Path,
+    worker: &str,
+    lane: u32,
+    isolated_invocation: Option<&str>,
+) -> String {
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"rch.go.runtime.v1\0");
+    identity.update(source.as_os_str().as_encoded_bytes());
+    identity.update(b"\0");
+    identity.update(worker.as_bytes());
+    identity.update(b"\0");
+    identity.update(&lane.to_le_bytes());
+    if let Some(invocation) = isolated_invocation {
+        identity.update(b"\0isolated\0");
+        identity.update(invocation.as_bytes());
+    }
+    stable_pooled_target_dir(
+        remote_base,
+        project_id,
+        &format!(
+            ".rch-target-go-pool-{}",
+            &identity.finalize().to_hex()[..32]
+        ),
+    )
+}
+
 async fn send_telemetry(
     socket_path: &str,
     source: TelemetrySource,
@@ -1140,6 +1173,7 @@ async fn execute_remote_compilation_inner(
             super::artifact_patterns::direct_compiler::validate_go_build_output(
                 command,
                 &normalized_invocation_root,
+                &normalized_project_root,
             )
             .await?,
         )
@@ -1726,7 +1760,46 @@ async fn execute_remote_compilation_inner(
         clean_overlay.is_some() || owned_source_content_pair,
         &transfer_config.remote_base,
     );
-    let pooled_target_dir_override = if reuse_disabled {
+    let pooled_target_dir_override = if go_build_environment.is_some() {
+        let base = pooled_store_base_for(
+            false,
+            pooled_target_store_base,
+            true,
+            &transfer_config.remote_base,
+        )
+        .context("Go output delivery requires an external managed runtime base")?;
+        let target = go_runtime_target_dir(
+            base,
+            &project_id,
+            &normalized_project_root,
+            worker_config.id.as_str(),
+            project_lane,
+            reuse_disabled.then_some(recovery_identity.as_str()),
+        );
+        let target_path = Path::new(&target);
+        anyhow::ensure!(
+            target_path.is_absolute()
+                && target_path.components().all(|part| matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                ))
+                && !target.chars().any(char::is_control),
+            "Go runtime target must be a normalized absolute worker path"
+        );
+        for source in sync_plan
+            .iter()
+            .map(|entry| entry.remote_root.as_str())
+            .chain(overlay_remote_root.as_deref())
+            .chain(retained_source_root.as_deref())
+        {
+            let source = Path::new(source);
+            anyhow::ensure!(
+                !target_path.starts_with(source) && !source.starts_with(target_path),
+                "Go runtime target overlaps a selected source or retirement root"
+            );
+        }
+        Some(target)
+    } else if reuse_disabled {
         None
     } else {
         pooled_store_base
@@ -2503,6 +2576,12 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if let Some(environment) = go_build_environment.as_ref() {
+        recovery_session
+            .as_mut()
+            .context("Go executable delivery has no admitted recovery session")?
+            .require_go_outputs(environment.output_contract())?;
+    }
     if kind == Some(CompilationKind::Rustc)
         && let Some(session) = recovery_session.as_mut()
         && let Some(discovery) =
@@ -2772,10 +2851,14 @@ async fn execute_remote_compilation_inner(
     // original contract already persisted in the recovery recipe above.
     let command = stamped_command.as_deref().unwrap_or(command);
     let guarded_go_command = if let Some(environment) = go_build_environment.as_ref() {
+        let runtime = pipeline
+            .managed_go_runtime_environment()
+            .context("Go execution lost its granted runtime environment")?;
         Some(
             super::artifact_patterns::direct_compiler::go_build_execution_command(
                 command,
                 environment,
+                Some(&runtime),
             )
             .context("Go build lost its validated file output contract")?,
         )
@@ -5369,6 +5452,40 @@ sys.exit(99)
         assert_eq!(
             stable_pooled_target_dir("/data/tmp/rch/", project_id, pooled_name),
             pool_a
+        );
+    }
+
+    #[test]
+    fn go_runtime_targets_reuse_only_the_same_source_worker_and_lane() {
+        use super::go_runtime_target_dir;
+
+        let root = Path::new("/data/projects/service");
+        let base = "/data/tmp/rch";
+        let shared = go_runtime_target_dir(base, "service", root, "worker-a", 0, None);
+        assert_eq!(
+            shared,
+            go_runtime_target_dir("/data/tmp/rch/", "service", root, "worker-a", 0, None)
+        );
+        assert!(shared.starts_with("/data/tmp/rch/service/.rch-target-go-pool-"));
+        assert!(!Path::new(&shared).starts_with(root));
+        for other in [
+            go_runtime_target_dir(base, "service", root, "worker-b", 0, None),
+            go_runtime_target_dir(base, "service", root, "worker-a", 1, None),
+            go_runtime_target_dir(
+                base,
+                "service",
+                Path::new("/data/projects/another/service"),
+                "worker-a",
+                0,
+                None,
+            ),
+            go_runtime_target_dir(base, "service", root, "worker-a", 0, Some("attempt-a")),
+        ] {
+            assert_ne!(shared, other);
+        }
+        assert_ne!(
+            go_runtime_target_dir(base, "service", root, "worker-a", 0, Some("attempt-a")),
+            go_runtime_target_dir(base, "service", root, "worker-a", 0, Some("attempt-b"))
         );
     }
 
