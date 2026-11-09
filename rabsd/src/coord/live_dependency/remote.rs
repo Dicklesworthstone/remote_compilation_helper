@@ -963,6 +963,7 @@ impl RemoteValidation {
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
                 | DependencySourceKind::WorkspaceNativeGeneratedRlib
+                | DependencySourceKind::WorkspaceNativeGeneratedMetadata
         ) {
             request
                 .canonical_paths
@@ -987,7 +988,8 @@ impl RemoteValidation {
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
-                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib
+                | DependencySourceKind::WorkspaceNativeGeneratedMetadata => {
                     remote_closed_workspace_library_shape(&request.plan, &directories, &toolchain)
                 }
                 _ => remote_dependency_shape(&request.plan, &directories, &toolchain),
@@ -1063,6 +1065,7 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
         DependencySourceKind::WorkspaceGeneratedDagRlib
             | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
+            | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
     ) {
         let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
             .ok_or("generated workspace DAG lost its committed-input policy")?;
@@ -1100,6 +1103,7 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
             | DependencySourceKind::WorkspaceNativeGeneratedRlib
+            | DependencySourceKind::WorkspaceNativeGeneratedMetadata
     ) {
         return validate_closed_workspace_library_plan(plan)
             .map(|class| match class {
@@ -1107,7 +1111,8 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
                 | ClosedWorkspaceLibraryClass::GeneratedRlib
                 | ClosedWorkspaceLibraryClass::NativeGeneratedRlib => DependencyExecutionMode::Rlib,
                 ClosedWorkspaceLibraryClass::Metadata
-                | ClosedWorkspaceLibraryClass::GeneratedMetadata => {
+                | ClosedWorkspaceLibraryClass::GeneratedMetadata
+                | ClosedWorkspaceLibraryClass::NativeGeneratedMetadata => {
                     DependencyExecutionMode::ClosedMetadata
                 }
             })
@@ -1158,7 +1163,8 @@ fn verify_execution_policy(
             | DependencySourceKind::WorkspaceClosedMetadata
             | DependencySourceKind::WorkspaceGeneratedRlib
             | DependencySourceKind::WorkspaceGeneratedMetadata
-            | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
+            | DependencySourceKind::WorkspaceNativeGeneratedRlib
+            | DependencySourceKind::WorkspaceNativeGeneratedMetadata => {
                 let class = validate_closed_workspace_library_plan(plan)
                     .map_err(|error| error.to_string())?;
                 if closed_workspace_library_descriptor_class(&key.descriptor) != Some(class) {
@@ -1312,6 +1318,7 @@ impl RemoteDependencies {
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
                 | DependencySourceKind::WorkspaceNativeGeneratedRlib
+                | DependencySourceKind::WorkspaceNativeGeneratedMetadata
         ) {
             canonical
                 .ok_or("closed workspace library requires its retained Cargo graph")?
@@ -1348,7 +1355,8 @@ impl RemoteDependencies {
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
-                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib
+                | DependencySourceKind::WorkspaceNativeGeneratedMetadata => {
                     remote_closed_workspace_library_shape(plan, directories, &visible_root)
                 }
                 _ => remote_dependency_shape(plan, directories, &visible_root),
@@ -1399,7 +1407,8 @@ impl RemoteDependencies {
                 | DependencySourceKind::WorkspaceClosedMetadata
                 | DependencySourceKind::WorkspaceGeneratedRlib
                 | DependencySourceKind::WorkspaceGeneratedMetadata
-                | DependencySourceKind::WorkspaceNativeGeneratedRlib => {
+                | DependencySourceKind::WorkspaceNativeGeneratedRlib
+                | DependencySourceKind::WorkspaceNativeGeneratedMetadata => {
                     remote_closed_workspace_library_key
                 }
                 _ => remote_dependency_key,
@@ -5406,6 +5415,8 @@ mod execution_resource_tests {
             (true, true, false),
             (true, false, true),
             (true, true, true),
+            (false, false, true),
+            (false, true, true),
         ] {
             let root = "/__rabs/out/cargo/debug/build/workspace_app-123/out";
             let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
@@ -5657,11 +5668,12 @@ mod execution_resource_tests {
                 match (archive, dag, native) {
                     (true, false, true) => 30,
                     (true, true, true) => 31,
+                    (false, false, true) => 32,
+                    (false, true, true) => 33,
                     (true, false, false) => 26,
                     (false, false, false) => 27,
                     (true, true, false) => 28,
                     (false, true, false) => 29,
-                    (false, _, true) => unreachable!("native inputs require an archive"),
                 }
             );
             verify_execution_policy(plan, &key, mode, policy).unwrap();
@@ -5675,7 +5687,9 @@ mod execution_resource_tests {
                     CommittedDependencyPolicy::WorkspaceDagRlib,
                     CommittedDependencyPolicy::WorkspaceDagMetadata,
                     CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+                    CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
                     CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                    CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
                 ] {
                     if Some(other) != policy {
                         assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());

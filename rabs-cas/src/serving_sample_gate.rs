@@ -78,6 +78,9 @@ pub enum ActionClassRisk {
     /// Generated workspace archives with closed own-OUT_DIR static native
     /// inputs. Only this class's independent samples qualify its serving.
     NativeGeneratedWorkspaceRlib,
+    /// Closed metadata with own-OUT_DIR static native inputs. Archive and pure
+    /// generated metadata evidence cannot enroll this independent class.
+    NativeGeneratedWorkspaceMetadata,
     /// Complete-workspace archives whose entire retained Rust candidate set
     /// comes from exact committed workspace producers. Separate class evidence
     /// and transitive producer safety are required; dependency SPRT stays closed.
@@ -115,6 +118,9 @@ pub enum ActionClassRisk {
     /// Native-generated archives with committed Rust ancestry, independently
     /// sampled from native leaves and generated Rust-only DAGs.
     NativeGeneratedWorkspaceDagRlib,
+    /// Native-generated closed metadata with committed Rust ancestry, requiring
+    /// independent samples from native leaves and all archive DAG classes.
+    NativeGeneratedWorkspaceDagMetadata,
     /// Exact selected binary/example or harness metadata checks with a proven
     /// empty candidate inventory. Terminal outputs never authorize consumers.
     WorkspaceTerminalLeafMetadata,

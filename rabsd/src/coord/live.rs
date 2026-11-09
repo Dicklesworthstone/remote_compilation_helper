@@ -482,6 +482,8 @@ const LIVE_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-closed-metadata-v2"
 const LIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-generated-rlib-v1";
 const LIVE_GENERATED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-generated-metadata-v1";
 const LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-native-generated-rlib-v1";
+const LIVE_NATIVE_GENERATED_WORKSPACE_METADATA_CLASS: &str =
+    "rustc-workspace-native-generated-metadata-v1";
 const LIVE_COMMITTED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-rlib-v2";
 const LIVE_COMMITTED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-metadata-v2";
 const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v2";
@@ -495,6 +497,8 @@ const LIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-generated-dag-metadata-v1";
 const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str =
     "rustc-workspace-native-generated-dag-rlib-v1";
+const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
+    "rustc-workspace-native-generated-dag-metadata-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
@@ -551,6 +555,9 @@ fn record_descriptor_class(
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS
             }
+            CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
+                LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
             }
@@ -568,6 +575,9 @@ fn record_descriptor_class(
             }
             ClosedWorkspaceLibraryClass::NativeGeneratedRlib => {
                 LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS
+            }
+            ClosedWorkspaceLibraryClass::NativeGeneratedMetadata => {
+                LIVE_NATIVE_GENERATED_WORKSPACE_METADATA_CLASS
             }
         }
     } else if uses_committed_dependency_namespace(descriptor)
@@ -621,6 +631,9 @@ fn recorded_action_risk(
             [SqlValue::Text(class)] if class == LIVE_NATIVE_GENERATED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::NativeGeneratedWorkspaceRlib)
             }
+            [SqlValue::Text(class)] if class == LIVE_NATIVE_GENERATED_WORKSPACE_METADATA_CLASS => {
+                Ok(ActionClassRisk::NativeGeneratedWorkspaceMetadata)
+            }
             [SqlValue::Text(class)] if class == LIVE_COMMITTED_WORKSPACE_RLIB_CLASS => {
                 Ok(ActionClassRisk::CommittedWorkspaceRlib)
             }
@@ -653,6 +666,11 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => {
                 Ok(ActionClassRisk::NativeGeneratedWorkspaceDagRlib)
+            }
+            [SqlValue::Text(class)]
+                if class == LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS =>
+            {
+                Ok(ActionClassRisk::NativeGeneratedWorkspaceDagMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -5646,6 +5664,7 @@ mod tests {
                             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+                                | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
                         )
                     )
             );
@@ -5740,7 +5759,8 @@ mod tests {
                 Some(
                     CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
-                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
                 ) => plan_generated_workspace_dag_library(&execution),
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -6012,6 +6032,10 @@ mod tests {
                 ActionClassRisk::NativeGeneratedWorkspaceRlib,
             ),
             (
+                descriptor_with_generated("--emit=dep-info,metadata", None, true, true),
+                ActionClassRisk::NativeGeneratedWorkspaceMetadata,
+            ),
+            (
                 descriptor_with_generated(
                     "--emit=dep-info,metadata,link",
                     Some(CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib),
@@ -6019,6 +6043,15 @@ mod tests {
                     true,
                 ),
                 ActionClassRisk::NativeGeneratedWorkspaceDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::NativeGeneratedWorkspaceDagMetadata,
             ),
             (
                 descriptor(

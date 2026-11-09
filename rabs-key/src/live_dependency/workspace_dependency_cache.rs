@@ -18,7 +18,7 @@ mod generated;
 pub use generated::plan_generated_workspace_dag_library;
 pub(super) use generated::{
     GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
-    NATIVE_GENERATED_DAG_RLIB_ISOLATION_PROFILE,
+    NATIVE_GENERATED_DAG_METADATA_ISOLATION_PROFILE, NATIVE_GENERATED_DAG_RLIB_ISOLATION_PROFILE,
 };
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
@@ -241,6 +241,9 @@ pub enum CommittedDependencyPolicy {
     /// Workspace archive with complete own-OUT_DIR static native inputs and
     /// exact committed Rust producer ancestry, independently qualified, epoch 31.
     NativeGeneratedWorkspaceDagRlib,
+    /// Closed metadata with complete own-OUT_DIR static native inputs and
+    /// exact committed Rust producer ancestry, independently qualified, epoch 33.
+    NativeGeneratedWorkspaceDagMetadata,
 }
 
 impl CommittedDependencyPolicy {
@@ -263,6 +266,9 @@ impl CommittedDependencyPolicy {
             }
             DependencySourceKind::WorkspaceNativeGeneratedDagRlib => {
                 Some(Self::NativeGeneratedWorkspaceDagRlib)
+            }
+            DependencySourceKind::WorkspaceNativeGeneratedDagMetadata => {
+                Some(Self::NativeGeneratedWorkspaceDagMetadata)
             }
             // The source kind requires a retained policy capability. Only that
             // capability may select the separately qualified empty-input class.
@@ -290,7 +296,8 @@ impl CommittedDependencyPolicy {
             | Self::WorkspaceDagMetadata
             | Self::WorkspaceTerminalLeafMetadata
             | Self::WorkspaceTerminalMetadata
-            | Self::GeneratedWorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
+            | Self::GeneratedWorkspaceDagMetadata
+            | Self::NativeGeneratedWorkspaceDagMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
@@ -303,7 +310,8 @@ impl CommittedDependencyPolicy {
         match self {
             Self::GeneratedWorkspaceDagRlib
             | Self::GeneratedWorkspaceDagMetadata
-            | Self::NativeGeneratedWorkspaceDagRlib => generated::validate_plan(plan, self),
+            | Self::NativeGeneratedWorkspaceDagRlib
+            | Self::NativeGeneratedWorkspaceDagMetadata => generated::validate_plan(plan, self),
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
             Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
@@ -431,6 +439,9 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => Some(&generated::RLIB),
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => Some(&generated::METADATA),
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => Some(&generated::NATIVE_RLIB),
+        CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
+            Some(&generated::NATIVE_METADATA)
+        }
         _ => None,
     }
 }
@@ -787,7 +798,8 @@ pub fn remote_committed_dependency_shape(
     match policy {
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
         | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
-        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
+        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
             generated::shape(plan, policy, directories, dependencies, toolchain_root)
         }
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -1024,6 +1036,7 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+        CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -1045,14 +1058,14 @@ pub fn committed_dependency_descriptor_policy(
 /// invalid or predates the current workspace policy. Coordinators use this
 /// after exact classification so retired V1 evidence cannot fall through to
 /// generic immutable-dependency authority after an epoch or class alteration.
-/// Closed workspace leaf epochs 16/17 and generated leaf epochs 26/27 have no
+/// Closed workspace leaf epochs 16/17 and generated leaf epochs 26/27/30/32 have no
 /// producer capability and are handled by their separate exact recognizer.
 #[must_use]
 pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> bool {
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
         || (28..=29).contains(&descriptor.key_epoch)
-        || descriptor.key_epoch == 31
+        || matches!(descriptor.key_epoch, 31 | 33)
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1071,6 +1084,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
                 "rabs.canonical-workspace-terminal-metadata.",
                 "rabs.canonical-workspace-generated-dag-rlib.",
                 "rabs.canonical-workspace-native-generated-dag-rlib.",
+                "rabs.canonical-workspace-native-generated-dag-metadata.",
                 "rabs.canonical-workspace-generated-dag-metadata.",
             ]
             .into_iter()
@@ -1231,6 +1245,7 @@ pub fn remote_committed_dependency_key(
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
             | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
     ) {
         return generated::key(
             plan,

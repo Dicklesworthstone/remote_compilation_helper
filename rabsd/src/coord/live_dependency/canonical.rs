@@ -2049,7 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_graphs_qualify_generated_leaves_but_keep_native_searches_fresh() {
+    fn executor_graphs_qualify_native_generated_leaves_but_keep_search_only_inputs_fresh() {
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
         use rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library;
         use rabs_key::live_dependency::{DependencySourceKind, remote_workspace_execution_shape};
@@ -2091,11 +2091,15 @@ mod tests {
             paths.require_workspace_execution(&execution).unwrap();
             remote_workspace_execution_shape(&execution, &[], "/__rabs/toolchain").unwrap();
             assert!(paths.require_local_capture().is_err());
-            if native == 0 {
+            if native != 1 {
                 let generated = plan_closed_workspace_library(&execution).unwrap();
                 assert_eq!(
                     generated.source_kind,
-                    DependencySourceKind::WorkspaceGeneratedMetadata
+                    if native == 2 {
+                        DependencySourceKind::WorkspaceNativeGeneratedMetadata
+                    } else {
+                        DependencySourceKind::WorkspaceGeneratedMetadata
+                    }
                 );
                 paths.require_workspace_closed_library(&generated).unwrap();
                 let mut unselected = generated.clone();
@@ -2792,7 +2796,7 @@ mod tests {
             }
         }
 
-        fn workspace(mut self, archive: bool, dag: bool) -> Self {
+        fn workspace(mut self, archive: bool, dag: bool, native: bool) -> Self {
             use rabs_key::live_dependency::plan_canonical_workspace_execution;
             use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
             use rabs_key::live_dependency::workspace_dependency_cache::plan_generated_workspace_dag_library;
@@ -2833,6 +2837,18 @@ mod tests {
                     "--extern=upstream={}/libupstream.rmeta",
                     self.plan.out_dir
                 ));
+            }
+            if native {
+                let generated = self.plan.generated_root.as_ref().unwrap();
+                std::fs::write(
+                    self.paths
+                        .physical(Path::new(generated))
+                        .unwrap()
+                        .join("libgenerated.a"),
+                    crate::test_util::closed_rlib_fixture(b"retained native input"),
+                )
+                .unwrap();
+                argv.extend([format!("-Lnative={generated}"), "-lstatic=generated".into()]);
             }
             let mut env = self.plan.execution_env.clone();
             for (name, value) in &mut env {
@@ -2902,7 +2918,16 @@ mod tests {
         use crate::edge::live_facts::LiveFacts;
         use rabs_key::live_dependency::DependencySourceKind;
 
-        for (archive, dag) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (archive, dag, native) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
             for mutation in [
                 "generated-bytes",
                 "same-byte-file",
@@ -2913,15 +2938,26 @@ mod tests {
                 "same-byte-record",
                 "root-output",
                 "output-alias",
+                "native-bytes",
+                "native-same-byte-file",
             ] {
-                let fixture = GeneratedFixture::new(true, archive).workspace(archive, dag);
+                if mutation.starts_with("native-") && !native {
+                    continue;
+                }
+                let fixture = GeneratedFixture::new(true, archive).workspace(archive, dag, native);
                 assert_eq!(
                     fixture.plan.source_kind,
-                    match (archive, dag) {
-                        (true, false) => DependencySourceKind::WorkspaceGeneratedRlib,
-                        (false, false) => DependencySourceKind::WorkspaceGeneratedMetadata,
-                        (true, true) => DependencySourceKind::WorkspaceGeneratedDagRlib,
-                        (false, true) => DependencySourceKind::WorkspaceGeneratedDagMetadata,
+                    match (archive, dag, native) {
+                        (true, false, false) => DependencySourceKind::WorkspaceGeneratedRlib,
+                        (false, false, false) => DependencySourceKind::WorkspaceGeneratedMetadata,
+                        (true, true, false) => DependencySourceKind::WorkspaceGeneratedDagRlib,
+                        (false, true, false) => DependencySourceKind::WorkspaceGeneratedDagMetadata,
+                        (true, false, true) => DependencySourceKind::WorkspaceNativeGeneratedRlib,
+                        (false, false, true) =>
+                            DependencySourceKind::WorkspaceNativeGeneratedMetadata,
+                        (true, true, true) => DependencySourceKind::WorkspaceNativeGeneratedDagRlib,
+                        (false, true, true) =>
+                            DependencySourceKind::WorkspaceNativeGeneratedDagMetadata,
                     }
                 );
                 if dag {
@@ -2954,7 +2990,7 @@ mod tests {
                 captured
                     .verify_generated_disjoint(&fixture.physical)
                     .unwrap();
-                assert_eq!(captured.generated_files.len(), 1);
+                assert_eq!(captured.generated_files.len(), if native { 2 } else { 1 });
                 assert_eq!(
                     captured.build_script_output.as_deref(),
                     Some(b"cargo::rustc-env=BUILD_LABEL=pinned\n".as_slice())
@@ -2985,6 +3021,19 @@ mod tests {
                         )
                         .unwrap();
                         std::fs::rename(replacement, generated.join("value.rs"))
+                    }
+                    "native-bytes" => std::fs::write(
+                        generated.join("libgenerated.a"),
+                        crate::test_util::closed_rlib_fixture(b"changed native input"),
+                    ),
+                    "native-same-byte-file" => {
+                        let replacement = fixture._owner.path().join("replacement.a");
+                        std::fs::write(
+                            &replacement,
+                            std::fs::read(generated.join("libgenerated.a")).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::rename(replacement, generated.join("libgenerated.a"))
                     }
                     "added-member" => {
                         std::fs::write(generated.join("new.rs"), b"new generated input")
@@ -3017,7 +3066,7 @@ mod tests {
                     captured
                         .verify_unchanged(Path::new(&fixture.physical.source_root))
                         .is_err(),
-                    "archive={archive}, dag={dag}, {mutation}: original generated proof refreshed itself"
+                    "archive={archive}, dag={dag}, native={native}, {mutation}: original generated proof refreshed itself"
                 );
                 if mutation == "output-alias" {
                     assert!(
@@ -3036,7 +3085,7 @@ mod tests {
     #[test]
     fn generated_workspace_dags_keep_selected_units_native_exclusions_and_local_refusal() {
         for archive in [false, true] {
-            let fixture = GeneratedFixture::new(true, archive).workspace(archive, true);
+            let fixture = GeneratedFixture::new(true, archive).workspace(archive, true, false);
             let policy =
                 CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind).unwrap();
             fixture
