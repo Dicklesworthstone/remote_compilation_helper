@@ -4829,6 +4829,160 @@ sys.exit(99)
         }
 
         #[tokio::test]
+        async fn yarn_pnp_exact_outputs_join_source_without_excluding_yarn_inputs() {
+            const PNP_COMMAND: &str = "tsc --noEmit --incremental false --composite false";
+            let (local, _) = build_source_stamp_fixture_repo();
+            for (relative, bytes) in [
+                ("vittles/package.json", "{\"name\":\"pnp-proof-fixture\"}\n"),
+                ("vittles/yarn.lock", "selected frozen lock\n"),
+                ("vittles/.pnp.cjs", "selected zero-install loader\n"),
+                ("vittles/.yarn/cache/selected.zip", "selected archive\n"),
+                ("vittles/.yarn/releases/yarn.cjs", "selected Yarn release\n"),
+                ("vittles/.yarn/plugins/plugin.cjs", "selected plugin\n"),
+                ("vittles/.yarn/patches/tool.patch", "selected patch\n"),
+            ] {
+                let path = local.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            build_source_stamp_git(&local, &["add", "-f", "."]);
+            build_source_stamp_git_commit(&local, "selected PnP proof fixture");
+            let spec = prepare_clean_overlay_spec(
+                &local.join("vittles"),
+                Some("HEAD".into()),
+                true,
+                vec![],
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let remote = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let (entry, pipeline) = clean_overlay_receipt_pipeline(&spec, &remote);
+            let pipeline = pipeline.with_compilation_kind(Some(CompilationKind::Tsc));
+            let root = prepare_clean_overlay_source_content_root(0, &entry, &pipeline, &spec)
+                .await
+                .unwrap();
+            let archive =
+                TransferPipeline::create_selected_git_archive(&local, spec.base_commit(), &[], &[])
+                    .await
+                    .unwrap();
+            tar::Archive::new(archive.reopen().unwrap())
+                .unpack(&remote)
+                .unwrap();
+            let mut roots = vec![root];
+            let request = prepare_dependency_request(
+                &roots,
+                remote.join("vittles").to_str().unwrap(),
+                Some(CompilationKind::Tsc),
+                BUILD_ID,
+                "prepared-pnp-attempt",
+                &"a".repeat(64),
+                PNP_COMMAND,
+            )
+            .unwrap()
+            .unwrap();
+            let selected = roots[0].manifest.clone();
+            let selected_directories = roots[0].directories.clone();
+            let mut inventory = PreparedDependencyInventory::default();
+            for (relative, bytes) in [
+                ("vittles/.pnp.data.json", "{}\n"),
+                ("vittles/.pnp.loader.mjs", "export {};\n"),
+                ("vittles/.yarn/cache/prepared.zip", "prepared archive\n"),
+                ("vittles/.yarn/install-state.gz", "prepared install state\n"),
+                (
+                    "vittles/.yarn/unplugged/tool/index.js",
+                    "module.exports=1;\n",
+                ),
+            ] {
+                let path = remote.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+                inventory.files.push(PreparedDependencyFile {
+                    path: relative.into(),
+                    kind: PreparedDependencyFileKind::Regular,
+                    sha256: sha256_hex(bytes.as_bytes()),
+                    byte_count: bytes.len() as u64,
+                    executable: false,
+                    symlink_target: None,
+                });
+            }
+            inventory.directories = vec![
+                "vittles/.yarn/unplugged".into(),
+                "vittles/.yarn/unplugged/tool".into(),
+            ];
+            let metadata = std::fs::metadata(remote.join("vittles")).unwrap();
+            let state = PreparedDependencyState {
+                version: PREPARED_DEPENDENCY_VERSION,
+                project: remote.join("vittles").to_str().unwrap().into(),
+                root_device: metadata.dev(),
+                root_inode: metadata.ino(),
+                input_fingerprint: "b".repeat(64),
+                package_manager: "yarn".into(),
+                frozen: true,
+                inventory_digest: inventory.digest().unwrap(),
+                inventory,
+            };
+            state.validate_for(&request).unwrap();
+            let evidence = PreparedDependencyAttestation {
+                version: PREPARED_DEPENDENCY_VERSION,
+                request_digest: request.digest().unwrap(),
+                state_digest: state.digest().unwrap(),
+                state,
+                disposition: PreparedDependencyDisposition::Fresh,
+            };
+            attach_prepared_attestation(&mut roots, &request, &evidence)
+                .await
+                .unwrap();
+            let fixture = Fixture {
+                roots,
+                remote,
+                request,
+                state: evidence.state.clone(),
+            };
+            assert_eq!(fixture.roots[0].manifest, selected);
+            assert_eq!(fixture.roots[0].directories, selected_directories);
+            let expected = prepared_dependencies::namespace_inventory(&fixture.roots[0]).unwrap();
+            assert_eq!(worker_names(&fixture).await, expected);
+            let outputs = prepared_dependencies::verification_manifest(&fixture.roots[0])
+                .unwrap()
+                .unwrap();
+            assert!(verify_bytes(&outputs).status.success());
+            assert!(verify_bytes(&selected).status.success());
+            let receipt = source_content_receipt_for_verified_roots(
+                &WorkerConfig::default(),
+                BUILD_ID,
+                PNP_COMMAND,
+                0,
+                &fixture.roots,
+            )
+            .unwrap();
+            assert_eq!(receipt.roots, vec![selected.clone()]);
+            assert_eq!(receipt.prepared_dependencies, vec![evidence]);
+
+            // An admitted subtree is not an rsync ignore: every generated
+            // cache entry must still appear in the exact attested inventory.
+            std::fs::write(
+                fixture.remote.join("vittles/.yarn/cache/unregistered.zip"),
+                b"unregistered output\n",
+            )
+            .unwrap();
+            assert_ne!(worker_names(&fixture).await, expected);
+            std::fs::write(
+                fixture.remote.join("vittles/.yarn/cache/selected.zip"),
+                b"changed zero-install source\n",
+            )
+            .unwrap();
+            assert!(!verify_bytes(&selected).status.success());
+            std::fs::write(
+                fixture.remote.join("vittles/.pnp.loader.mjs"),
+                b"changed prepared loader\n",
+            )
+            .unwrap();
+            assert!(!verify_bytes(&outputs).status.success());
+        }
+
+        #[tokio::test]
         async fn preparation_attachment_refuses_other_attempts_roots_and_selected_changes() {
             let mut fixture = fixture().await;
             for kind in [

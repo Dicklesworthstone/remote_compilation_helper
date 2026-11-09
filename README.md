@@ -48,6 +48,7 @@ RCH currently recognizes and can offload:
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
+| TypeScript | `tsc --noEmit`, `npx tsc --noEmit` |
 | Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
@@ -96,6 +97,46 @@ RCH explicitly does **not** intercept local-mutating or interactive patterns (ex
 - Nix interactive/mutating: bare `nix develop` / `nix shell`, `nix run`, `nix repl`,
   `nix profile`, `nix flake update`, `nix store gc`, `nix-env`, `nix-shell`
 - Watch/background/piped/redirected commands where deterministic offload is unsafe
+
+### Yarn Berry / Plug'n'Play preparation
+
+Linux workers can prepare Yarn Berry projects using the standard project-local
+PnP layout. Set `enableGlobalCache: false` in `.yarnrc.yml`, keep the default
+cache, unplugged, virtual and install-state paths, and declare TypeScript as a
+dependency of the workspace that runs the check. The worker's Yarn version
+must match an authored `packageManager: "yarn@VERSION"` declaration.
+Berry configuration probes require Linux descendant supervision, including
+when Berry uses the `node-modules` linker; Yarn Classic keeps its existing
+preparation path.
+
+```bash
+rch exec -- tsc --noEmit --incremental false --composite false
+```
+
+This PnP launch accepts literal bare `tsc` arguments with explicit non-emitting,
+non-incremental, non-composite settings. Disabling both incremental and
+composite output prevents inherited `tsconfig.json` settings from writing
+build-info files, including when the compiler exits with an error. It uses
+Yarn's dependency binary resolver, so a
+package script or global `tsc` cannot replace the prepared compiler. Shell
+wrappers, `npx`, Bun, watch/build modes, and emitting overrides are outside this
+PnP launch contract.
+
+Qualified workspace checks run from the workspace root or a selected member's
+package directory. Member-local Yarn configuration and environment-file
+overrides that would change resolution from the prepared root are refused.
+Live `portal:` / `link:` dependencies and `pnpIgnorePatterns` are also outside
+this initial contract: dependency resolution must stay within the prepared
+package graph.
+
+Preparation runs an immutable install. Source-qualified clean-overlay runs
+bind workspace preparation to the selected workspace root, record exact
+generated loaders, local cache/unplugged files and installation state, and
+rehash them before skipping a later install. Ordinary preparation reruns
+Yarn's cached immutable install. Committed zero-install loaders and cache files
+remain source; `.yarn/releases`, plugins and patches are never admitted as
+generated dependency outputs. Global or custom PnP output paths require a
+separate ownership contract and are refused.
 
 ---
 

@@ -162,6 +162,11 @@ enum Commands {
         /// Directory for install logs (default: <project>/.rch_prepare_logs/).
         #[arg(long)]
         log_dir: Option<String>,
+
+        /// Emit a bounded execution-layout selector on success; report JSON
+        /// goes to stderr. Used by the owned dependency execution wrapper.
+        #[arg(long)]
+        execution_layout: bool,
     },
 
     /// Inspect, install or verify exact dependency ownership for a source proof.
@@ -416,6 +421,7 @@ async fn run_worker(cli: Cli) -> Result<()> {
             project,
             runtime,
             log_dir,
+            execution_layout,
         } => {
             use std::path::PathBuf;
             let project_path = PathBuf::from(&project);
@@ -423,7 +429,12 @@ async fn run_worker(cli: Cli) -> Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| project_path.join(".rch_prepare_logs"));
             let report = prepare::prepare(&project_path, runtime.into(), &log_dir_path).await?;
-            println!("{}", serde_json::to_string(&report)?);
+            let serialized = serde_json::to_string(&report)?;
+            if execution_layout {
+                eprintln!("{serialized}");
+            } else {
+                println!("{serialized}");
+            }
             // Exit code mapping (callers and e2e tests rely on these):
             //   0 - Skipped (cache hit / no-op for non-Node) or Installed (success)
             //   1 - Failed (install ran but exited non-zero)
@@ -432,7 +443,20 @@ async fn run_worker(cli: Cli) -> Result<()> {
             // wrapper can branch on a network-stall remediation (timeout)
             // vs. a real install error (failed).
             match report.action {
-                prepare::PrepareAction::Skipped | prepare::PrepareAction::Installed => Ok(()),
+                prepare::PrepareAction::Skipped | prepare::PrepareAction::Installed => {
+                    if execution_layout {
+                        println!(
+                            "{}",
+                            match report.dependency_layout {
+                                prepare::DependencyLayout::NodeModules => {
+                                    "RCH_PREPARED_NODE_MODULES"
+                                }
+                                prepare::DependencyLayout::YarnPnp => "RCH_PREPARED_YARN_PNP",
+                            }
+                        );
+                    }
+                    Ok(())
+                }
                 prepare::PrepareAction::Failed => std::process::exit(1),
                 prepare::PrepareAction::Timeout => std::process::exit(2),
             }
@@ -456,7 +480,7 @@ async fn run_worker(cli: Cli) -> Result<()> {
                     .context("prepared verification requires --expected-request-digest")?;
                 let attestation_digest = expected_attestation_digest
                     .context("prepared verification requires --expected-attestation-digest")?;
-                prepare::proof_verify(
+                let layout = prepare::proof_verify(
                     project,
                     runtime,
                     &request_digest,
@@ -464,7 +488,17 @@ async fn run_worker(cli: Cli) -> Result<()> {
                     invocation_project.as_deref().map(std::path::Path::new),
                 )
                 .await?;
-                println!("RCH_PREPARED_DEPENDENCIES_VERIFIED");
+                println!(
+                    "{}",
+                    match layout {
+                        prepare::DependencyLayout::NodeModules => {
+                            "RCH_PREPARED_DEPENDENCIES_VERIFIED"
+                        }
+                        prepare::DependencyLayout::YarnPnp => {
+                            "RCH_PREPARED_DEPENDENCIES_VERIFIED_YARN_PNP"
+                        }
+                    }
+                );
                 return Ok(());
             }
             anyhow::ensure!(

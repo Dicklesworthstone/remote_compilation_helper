@@ -13,9 +13,11 @@ SCRIPT = (REPO / "rch/src/transfer/node_prepare.sh").read_text()
 WORKER = """#!/bin/sh
 set -eu
 [ "$1" = prepare ] && [ "$2" = --project ] && [ "$3" = . ] &&
-[ "$4" = --runtime ] && [ "$5" = "$RUNTIME" ] || exit 91
+[ "$4" = --runtime ] && [ "$5" = "$RUNTIME" ] &&
+[ "$6" = --execution-layout ] && [ "$#" = 6 ] || exit 91
 printf 'prepare:%s\n' "$5" >> "$ROOT/events"
 if IFS= read -r ignored; then exit 92; fi
+printf '%s\n' "$LAYOUT_TOKEN"
 exit "$PREPARE_STATUS"
 """
 
@@ -36,8 +38,17 @@ set -eu
 [ "${11}" = attestation-digest ] || exit 91
 printf 'verify:%s\n' "$7" >> "$ROOT/events"
 if IFS= read -r ignored; then exit 92; fi
-printf 'verified preparation metadata\n'
+printf 'verified preparation metadata\n' >&2
+printf '%s\n' "$PROOF_LAYOUT_TOKEN"
 exit "$PREPARE_STATUS"
+"""
+
+YARN = """#!/bin/sh
+set -eu
+[ "$1" = run ] && [ "$2" = --binaries-only ] && [ "$3" = tsc ] || exit 93
+shift 3
+printf 'yarn:%s\n' "$PWD" >> "$ROOT/events"
+exec compiler "$@"
 """
 
 def executable(path, body):
@@ -51,7 +62,7 @@ class Fixture:
         self.tools = self.root / "tools"
         self.project.mkdir()
         self.tools.mkdir()
-        for name in ("sh", "bash"):
+        for name in ("sh", "bash", "head", "od", "cat"):
             found = shutil.which(name)
             if found:
                 (self.tools / name).symlink_to(found)
@@ -69,15 +80,18 @@ class Fixture:
             "RUNTIME": runtime,
             "PREPARE_STATUS": "0",
             "COMPILER_STATUS": "0",
+            "LAYOUT_TOKEN": "RCH_PREPARED_NODE_MODULES",
+            "PROOF_LAYOUT_TOKEN": "RCH_PREPARED_DEPENDENCIES_VERIFIED",
         }
 
-    def run(self, args=None):
+    def run(self, args=None, input=None, cwd=None):
         args = args or ["compiler", "--noEmit", "quoted argument"]
         return subprocess.run(
             [self.shell, "-c", SCRIPT, "rch-prepare", self.runtime, *args],
-            cwd=self.project,
+            cwd=cwd or self.project,
             env=self.env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input is None else None,
+            input=input,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=5,
@@ -170,6 +184,119 @@ class Tests(unittest.TestCase):
             result = f.run()
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertEqual(f.events(), ["prepare:node", "compiler"])
+
+    def test_yarn_pnp_launcher_preserves_cwd_arguments_stdin_and_status(self):
+        for shell in ("sh", "bash"):
+            for proved in (False, True):
+                for relative in ("", "packages/member", "packages/member/src"):
+                    f = Fixture(shell)
+                    cwd = f.project / relative
+                    cwd.mkdir(parents=True, exist_ok=True)
+                    (cwd / "package.json").write_text("{}\n")
+                    executable(f.tools / "yarn", YARN)
+                    executable(f.tools / "compiler", """#!/bin/sh
+printf 'compiler\n' >> "$ROOT/events"
+printf '[%s]\n' "$@"
+cat
+exit 23
+""")
+                    f.env["LAYOUT_TOKEN"] = "RCH_PREPARED_YARN_PNP"
+                    f.env["PROOF_LAYOUT_TOKEN"] = "RCH_PREPARED_DEPENDENCIES_VERIFIED_YARN_PNP"
+                    compiler_args = ["--noEmit", "--incremental", "false", "--composite", "false", "--project",
+                                     "literal $value; config.json"]
+                    args = ["--pnp-tsc", str(len(compiler_args)), *compiler_args,
+                            "sh", "-c", "printf original-shell-was-run"]
+                    if proved:
+                        executable(f.tools / "rch-wkr", PROOF_WORKER)
+                        args = ["--source-proof", "request-digest", "attestation-digest", *args]
+                    data = b"binary\x00stdin\xff\n"
+                    result = f.run(args=args, input=data, cwd=cwd)
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    phase = "verify" if proved else "prepare"
+                    self.assertEqual(f.events(), [f"{phase}:node", f"yarn:{cwd}", "compiler"])
+                    expected = b"".join(f"[{argument}]\n".encode() for argument in compiler_args)
+                    self.assertEqual(result.stdout, expected + data)
+                    self.assertEqual(result.stderr, b"verified preparation metadata\n" if proved else b"")
+
+    def test_bun_does_not_execute_a_yarn_pnp_layout(self):
+        for shell in ("sh", "bash"):
+            for proved in (False, True):
+                f = Fixture(shell, "bun")
+                executable(f.tools / "yarn", YARN)
+                f.env["LAYOUT_TOKEN"] = "RCH_PREPARED_YARN_PNP"
+                f.env["PROOF_LAYOUT_TOKEN"] = "RCH_PREPARED_DEPENDENCIES_VERIFIED_YARN_PNP"
+                args = ["compiler"]
+                if proved:
+                    executable(f.tools / "rch-wkr", PROOF_WORKER)
+                    args = ["--source-proof", "request-digest", "attestation-digest", *args]
+                result = f.run(args=args)
+                self.assertEqual(result.returncode, 121, result.stderr)
+                self.assertEqual(f.events(), ["verify:bun" if proved else "prepare:bun"])
+                self.assertIn(b"requires the Node runtime", result.stderr)
+                self.assertEqual(result.stdout, b"")
+
+    def test_layout_requires_exact_bounded_success_response(self):
+        for shell in ("sh", "bash"):
+            for proved in (False, True):
+                token = (b"RCH_PREPARED_DEPENDENCIES_VERIFIED" if proved
+                         else b"RCH_PREPARED_NODE_MODULES")
+                for malformed in [
+                    b"", b"unknown\n", token, token + b"\n\n",
+                    token + b"\x00\n", b"\x00" + token + b"\n",
+                    token + b"\nextra\n", b"x" * 4096,
+                    token + b"\nRCH_PREPARE_STATUS:0" + b"x" * 4096,
+                ]:
+                    f = Fixture(shell)
+                    (f.root / "selector").write_bytes(malformed)
+                    executable(f.tools / "rch-wkr", """#!/bin/sh
+printf 'prepare\n' >> "$ROOT/events"
+cat "$ROOT/selector"
+""")
+                    args = ["compiler"]
+                    if proved:
+                        args = ["--source-proof", "request-digest", "attestation-digest", *args]
+                    result = f.run(args=args)
+                    self.assertEqual(result.returncode, 121, (malformed[:80], result.stderr))
+                    self.assertEqual(f.events(), ["prepare"])
+                    self.assertEqual(result.stdout, b"")
+
+    def test_pnp_file_presence_cannot_select_the_launcher(self):
+        for shell in ("sh", "bash"):
+            f = Fixture(shell)
+            (f.project / ".pnp.cjs").write_text("unverified loader\n")
+            executable(f.tools / "yarn", YARN)
+            result = f.run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(f.events(), ["prepare:node", "compiler"])
+
+    def test_pnp_without_literal_compiler_arguments_never_runs_original_shell(self):
+        for shell in ("sh", "bash"):
+            f = Fixture(shell)
+            f.env["LAYOUT_TOKEN"] = "RCH_PREPARED_YARN_PNP"
+            executable(f.tools / "yarn", YARN)
+            result = f.run(args=["sh", "-c", "compiler --noEmit || true"])
+            self.assertEqual(result.returncode, 121, result.stderr)
+            self.assertEqual(f.events(), ["prepare:node"])
+            self.assertIn(b"literal tsc --noEmit --incremental false --composite false", result.stderr)
+            self.assertEqual(result.stdout, b"")
+
+    def test_node_modules_keeps_original_payload_when_pnp_arguments_are_available(self):
+        for shell in ("sh", "bash"):
+            f = Fixture(shell)
+            result = f.run(args=["--pnp-tsc", "5", "--noEmit", "--incremental", "false", "--composite", "false",
+                                 "compiler", "original literal argument"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"original literal argument\n")
+            self.assertEqual(f.events(), ["prepare:node", "compiler"])
+
+    def test_pnp_argument_count_is_bounded_and_keeps_a_real_workload(self):
+        for shell in ("sh", "bash"):
+            for count in ("0", "01", "-1", "abc", "257", "1000000000000000000000", "5"):
+                f = Fixture(shell)
+                result = f.run(args=["--pnp-tsc", count, "--noEmit", "compiler"])
+                self.assertEqual(result.returncode, 121, (count, result.stderr))
+                self.assertEqual(f.events(), [])
+                self.assertEqual(result.stdout, b"")
 
     def test_manifest_free_workload_does_not_require_worker(self):
         for shell in ("sh", "bash"):

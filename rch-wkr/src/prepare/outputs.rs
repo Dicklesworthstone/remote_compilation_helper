@@ -4,8 +4,10 @@
 //! frozen installer transaction can introduce a new output inventory. Later
 //! attempts rehash that inventory before reuse; an unrecorded retained tree is
 //! never promoted to trusted state by scanning it. Selected source remains a
-//! separate exact obligation, including selected files below node_modules.
+//! separate exact obligation, including selected files below node_modules and
+//! checked-in Yarn Plug'n'Play loaders or cache archives.
 
+use crate::prepare::DependencyLayout;
 use anyhow::Result;
 use rch_common::prepared_dependencies::{
     PreparedDependencyAttestation, PreparedDependencyRequest, PreparedDependencyState,
@@ -51,7 +53,7 @@ pub async fn proof_verify(
     expected_request_digest: &str,
     expected_attestation_digest: &str,
     invocation_project: Option<&Path>,
-) -> Result<()> {
+) -> Result<DependencyLayout> {
     #[cfg(target_os = "linux")]
     {
         linux::verify(
@@ -92,7 +94,8 @@ mod linux {
         MAX_PREPARED_DEPENDENCY_BYTES, MAX_PREPARED_DEPENDENCY_DIRECTORIES,
         MAX_PREPARED_DEPENDENCY_FILES, MAX_PREPARED_DEPENDENCY_JSON_BYTES,
         PREPARED_DEPENDENCY_VERSION, PreparedDependencyDisposition, PreparedDependencyFile,
-        PreparedDependencyFileKind, PreparedDependencyInventory, admitted_dependency_roots,
+        PreparedDependencyFileKind, PreparedDependencyInventory, admitted_dependency_outputs,
+        admitted_dependency_roots,
     };
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use serde::{Deserialize, Serialize};
@@ -245,9 +248,17 @@ mod linux {
         }
 
         fn directory(&mut self, path: &str) -> Result<File> {
+            self.optional_directory(path)?
+                .with_context(|| format!("prepared directory does not exist: {path}"))
+        }
+
+        /// Missing generated ancestors are normal before the first install.
+        /// Resolve them component by component without following a symlink or
+        /// dropping the identity checks on the last existing parent.
+        fn optional_directory(&mut self, path: &str) -> Result<Option<File>> {
             let mut current = self.root.try_clone()?;
             if path.is_empty() {
-                return Ok(current);
+                return Ok(Some(current));
             }
             let mut prefix = String::new();
             ensure!(
@@ -259,7 +270,12 @@ mod linux {
                     !component.is_empty() && !matches!(component, "." | ".."),
                     "invalid prepared directory component"
                 );
-                let before = Identity::at(&current, component)?;
+                let before =
+                    match rustix::fs::statat(&current, component, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(info) => Identity::of(&info)?,
+                        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                        Err(error) => return Err(error).context("inspect dependency parent"),
+                    };
                 ensure!(
                     before.kind() == FileType::Directory,
                     "dependency parent is not a directory"
@@ -281,7 +297,7 @@ mod linux {
                 self.remember(&prefix, before)?;
                 current = child;
             }
-            Ok(current)
+            Ok(Some(current))
         }
 
         fn parent(&mut self, path: &str) -> Result<(File, String)> {
@@ -541,7 +557,8 @@ mod linux {
             .iter()
             .map(|file| (file.path.as_str(), file))
             .collect();
-        let selected_directories = request.directories.iter().map(String::as_str).collect();
+        let selected_directories: BTreeSet<_> =
+            request.directories.iter().map(String::as_str).collect();
         let mut roots = BTreeSet::new();
         for name in &inputs.fingerprint.sources {
             let relative = if preparation.is_empty() {
@@ -569,6 +586,17 @@ mod linux {
             roots.is_subset(&allowed),
             "dependency output roots exceed selected workspace namespace"
         );
+        let outputs = admitted_dependency_outputs(request)?;
+        // Common's package-manifest roots are only candidates. Keep the
+        // narrower captured workspace membership above, while adding the
+        // fixed Yarn trees separately from its exact files and parent dirs.
+        roots.extend(
+            outputs
+                .subtree_roots
+                .iter()
+                .filter(|root| !allowed.contains(*root))
+                .cloned(),
+        );
         let declarations = view.selected(request)?;
         let regular_paths = request
             .files
@@ -586,23 +614,64 @@ mod linux {
             files: Vec::new(),
             directories: Vec::new(),
         };
-        for root in roots {
-            let (parent, name) = view.parent(&root)?;
-            match rustix::fs::statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        for directory in outputs.structural_directories {
+            if view.optional_directory(&directory)?.is_some()
+                && !selected_directories.contains(directory.as_str())
+            {
+                ensure!(
+                    inventory.directories.len() < MAX_PREPARED_DEPENDENCY_DIRECTORIES,
+                    "prepared directory count exceeded"
+                );
+                inventory.directories.push(directory);
+            }
+        }
+        for root in &roots {
+            // A selected workspace may itself be below a generated tree.
+            // Enumerate that namespace once, so inventories remain unique.
+            if root
+                .match_indices('/')
+                .any(|(boundary, _)| roots.contains(&root[..boundary]))
+            {
+                continue;
+            }
+            let (parent_path, name) = root.rsplit_once('/').unwrap_or(("", root));
+            let Some(parent) = view.optional_directory(parent_path)? else {
+                continue;
+            };
+            match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(info) => {
                     ensure!(
                         Identity::of(&info)?.kind() == FileType::Directory,
-                        "node_modules is not a real directory: {root}"
+                        "dependency output root is not a real directory: {root}"
                     );
-                    view.walk(
-                        &root,
-                        &selected_files,
-                        &selected_directories,
-                        &mut inventory,
-                    )?;
+                    view.walk(root, &selected_files, &selected_directories, &mut inventory)?;
                 }
                 Err(error) if error == rustix::io::Errno::NOENT => {}
                 Err(error) => return Err(error).context("inspect dependency output root"),
+            }
+        }
+        for path in outputs.exact_files {
+            let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", &path));
+            let Some(parent) = view.optional_directory(parent_path)? else {
+                continue;
+            };
+            let identity = match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(info) => Identity::of(&info)?,
+                Err(error) if error == rustix::io::Errno::NOENT => continue,
+                Err(error) => return Err(error).context("inspect exact dependency output"),
+            };
+            ensure!(
+                identity.kind() == FileType::RegularFile,
+                "exact dependency output is not a real regular file: {path}"
+            );
+            if selected_files.contains_key(path.as_str()) {
+                view.remember(&path, identity)?;
+            } else {
+                ensure!(
+                    inventory.files.len() < MAX_PREPARED_DEPENDENCY_FILES,
+                    "prepared file count exceeded"
+                );
+                inventory.files.push(view.file(&path)?);
             }
         }
         inventory
@@ -871,10 +940,12 @@ mod linux {
     ) -> Result<Option<PreparedDependencyState>> {
         check_runtime(runtime)?;
         request.validate()?;
-        let transaction = PrepareTransaction::acquire(project).await?;
+        let mut transaction = PrepareTransaction::acquire(project).await?;
         let mut store = Store::open(&transaction)?;
         let completed = store.read()?;
-        let inputs = DependencyInputs::capture(&transaction.project)?;
+        let inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
+        inputs.dependency_layout.verify_runtime(runtime)?;
+        inputs.verify_invocation(&transaction.project, Path::new(&request.invocation_path()))?;
         let snapshot = scan(&transaction.project, request, &inputs, None)?;
         let state = completed.map(|completed| completed.attestation.state);
         verify_baseline(request, &snapshot, state.as_ref())?;
@@ -893,7 +964,9 @@ mod linux {
         let mut store = Store::open(&transaction)?;
         let previous = store.read()?;
         preflight_cache_files(&transaction.project)?;
-        let inputs = DependencyInputs::capture(&transaction.project)?;
+        let inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
+        inputs.dependency_layout.verify_runtime(runtime)?;
+        inputs.verify_invocation(&transaction.project, Path::new(&request.invocation_path()))?;
         let plan = InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
         ensure!(
             plan.is_frozen(),
@@ -918,11 +991,14 @@ mod linux {
                 && completed.attestation.state.package_manager == plan.manager_name()
         });
         transaction.record(RUNNING)?;
-        let report = installer::prepare_proven_node(
-            &transaction.project,
+        let log_dir = transaction.project.join(".rch_prepare_logs");
+        let report = installer::prepare_observed_node(
+            &mut transaction,
             runtime,
-            &transaction.project.join(".rch_prepare_logs"),
+            &log_dir,
+            &inputs,
             allow_cache_hit,
+            true,
         )
         .await?;
         ensure!(
@@ -937,14 +1013,14 @@ mod linux {
             report.action != PrepareAction::Skipped || allow_cache_hit,
             "unproven dependency cache cannot be adopted"
         );
-        let after_inputs = DependencyInputs::capture(&transaction.project)?;
+        let after_inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
         inputs.verify_after(&after_inputs, runtime, report.action)?;
         ensure!(
             report.fingerprint.as_ref() == Some(&after_inputs.fingerprint),
             "qualified preparation fingerprint changed"
         );
         preflight_cache_files(&transaction.project)?;
-        verified_fingerprint(&transaction.project, &report)?;
+        verified_fingerprint(&transaction.project, &report, &after_inputs)?;
         let after = scan(&transaction.project, request, &after_inputs, None)?;
         ensure!(
             before.source.same_inode(&after.source) && before.project.same_inode(&after.project),
@@ -990,9 +1066,9 @@ mod linux {
         expected_request_digest: &str,
         expected_attestation_digest: &str,
         invocation_project: Option<&Path>,
-    ) -> Result<()> {
+    ) -> Result<DependencyLayout> {
         check_runtime(runtime)?;
-        let transaction = PrepareTransaction::acquire(project).await?;
+        let mut transaction = PrepareTransaction::acquire(project).await?;
         let mut store = Store::open(&transaction)?;
         let completed = store
             .read()?
@@ -1008,7 +1084,12 @@ mod linux {
                 || completed.request.preparation_relative() == completed.request.project_relative,
             "workspace prepared verification requires --invocation-project"
         );
-        let inputs = DependencyInputs::capture(&transaction.project)?;
+        let inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
+        inputs.dependency_layout.verify_runtime(runtime)?;
+        inputs.verify_invocation(
+            &transaction.project,
+            Path::new(&completed.request.invocation_path()),
+        )?;
         let plan = InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
         ensure!(
             plan.is_frozen()
@@ -1028,6 +1109,242 @@ mod linux {
             Some(&completed.attestation.state),
         )?;
         transaction.verify_path()?;
-        Ok(())
+        Ok(inputs.dependency_layout)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fmt::Write as _;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        fn project(source: &Path, relative: &str) -> PathBuf {
+            let project = source.join(relative);
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("package.json"),
+                br#"{"name":"pnp-fixture","private":true}"#,
+            )
+            .unwrap();
+            std::fs::write(project.join("yarn.lock"), b"selected frozen resolution\n").unwrap();
+            project
+        }
+
+        fn request(source: &Path, project: &Path, names: &[&str]) -> PreparedDependencyRequest {
+            let mut directories = BTreeSet::new();
+            let mut files = Vec::new();
+            for name in names {
+                let full = project.join(name);
+                let relative = full.strip_prefix(source).unwrap();
+                let path = relative.to_str().unwrap().to_owned();
+                let contents = std::fs::read(&full).unwrap();
+                let mut sha256 = String::with_capacity(64);
+                for byte in Sha256::digest(&contents) {
+                    write!(sha256, "{byte:02x}").unwrap();
+                }
+                files.push(PreparedDependencyFile {
+                    path,
+                    kind: PreparedDependencyFileKind::Regular,
+                    sha256,
+                    byte_count: contents.len() as u64,
+                    executable: std::fs::metadata(&full).unwrap().permissions().mode() & 0o111 != 0,
+                    symlink_target: None,
+                });
+                let mut parent = relative.parent().unwrap();
+                while !parent.as_os_str().is_empty() {
+                    directories.insert(parent.to_str().unwrap().to_owned());
+                    parent = parent.parent().unwrap();
+                }
+            }
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            let request = PreparedDependencyRequest {
+                schema_version: PREPARED_DEPENDENCY_VERSION,
+                attempt_id: "pnp-scan-attempt".to_owned(),
+                source_owner: "12345678-1234-1234-1234-123456789abc".to_owned(),
+                build_id: "12345".to_owned(),
+                command_sha256: "a".repeat(64),
+                source_content_root: "b".repeat(64),
+                source_root: source.canonicalize().unwrap().to_str().unwrap().to_owned(),
+                project_relative: project
+                    .strip_prefix(source)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                preparation_relative: None,
+                files,
+                directories: directories.into_iter().collect(),
+            };
+            request.validate().unwrap();
+            request
+        }
+
+        fn state(
+            request: &PreparedDependencyRequest,
+            inputs: &DependencyInputs,
+            snapshot: &Snapshot,
+        ) -> PreparedDependencyState {
+            PreparedDependencyState {
+                version: PREPARED_DEPENDENCY_VERSION,
+                project: request.preparation_path(),
+                root_device: snapshot.project.device,
+                root_inode: snapshot.project.inode,
+                input_fingerprint: inputs.fingerprint.hash.clone(),
+                package_manager: "yarn".to_owned(),
+                frozen: true,
+                inventory: snapshot.inventory.clone(),
+                inventory_digest: snapshot.inventory.digest().unwrap(),
+            }
+        }
+
+        #[test]
+        fn pnp_inventory_tracks_exact_files_trees_and_missing_structural_parent() {
+            for relative in ["", "web"] {
+                let source = tempfile::tempdir().unwrap();
+                let project = project(source.path(), relative);
+                let request = request(source.path(), &project, &["package.json", "yarn.lock"]);
+                let inputs = DependencyInputs::capture(&project).unwrap();
+                let before = scan(&project, &request, &inputs, None).unwrap();
+                verify_baseline(&request, &before, None).unwrap();
+                assert!(!project.join(".yarn").exists());
+
+                std::fs::create_dir_all(project.join(".yarn/cache")).unwrap();
+                std::fs::create_dir_all(project.join(".yarn/unplugged/pkg/empty")).unwrap();
+                for name in [
+                    ".pnp.cjs",
+                    ".pnp.data.json",
+                    ".pnp.loader.mjs",
+                    ".yarn/install-state.gz",
+                    ".yarn/cache/pkg.zip",
+                    ".yarn/unplugged/pkg/index.js",
+                ] {
+                    std::fs::write(project.join(name), format!("completed {name}\n")).unwrap();
+                }
+                let after = scan(&project, &request, &inputs, None).unwrap();
+                assert_eq!(after.inventory.files.len(), 6);
+                let prefix = if relative.is_empty() { "" } else { "web/" };
+                assert_eq!(
+                    after.inventory.directories,
+                    [
+                        ".yarn",
+                        ".yarn/cache",
+                        ".yarn/unplugged",
+                        ".yarn/unplugged/pkg",
+                        ".yarn/unplugged/pkg/empty",
+                    ]
+                    .map(|path| format!("{prefix}{path}"))
+                );
+                assert!(verify_baseline(&request, &after, None).is_err());
+                let completed = state(&request, &inputs, &after);
+                verify_baseline(&request, &after, Some(&completed)).unwrap();
+                std::fs::write(project.join(".yarn/cache/pkg.zip"), b"changed cache\n").unwrap();
+                let tampered = scan(&project, &request, &inputs, None).unwrap();
+                assert!(verify_baseline(&request, &tampered, Some(&completed)).is_err());
+            }
+        }
+
+        #[test]
+        fn pnp_zero_install_sources_are_not_adopted_and_yarn_neighbors_are_not_outputs() {
+            let source = tempfile::tempdir().unwrap();
+            let project = project(source.path(), "");
+            std::fs::create_dir_all(project.join(".yarn/cache")).unwrap();
+            std::fs::create_dir_all(project.join(".yarn/releases")).unwrap();
+            for name in [
+                ".pnp.cjs",
+                ".yarn/cache/selected.zip",
+                ".yarn/releases/yarn.cjs",
+            ] {
+                std::fs::write(project.join(name), format!("selected {name}\n")).unwrap();
+            }
+            let request = request(
+                source.path(),
+                &project,
+                &[
+                    "package.json",
+                    "yarn.lock",
+                    ".pnp.cjs",
+                    ".yarn/cache/selected.zip",
+                    ".yarn/releases/yarn.cjs",
+                ],
+            );
+            let inputs = DependencyInputs::capture(&project).unwrap();
+            let selected_only = scan(&project, &request, &inputs, None).unwrap();
+            verify_baseline(&request, &selected_only, None).unwrap();
+            std::fs::write(project.join(".yarn/install-state.gz"), b"new state\n").unwrap();
+            std::fs::write(project.join(".yarn/unclaimed.txt"), b"unclaimed neighbor\n").unwrap();
+            let after = scan(&project, &request, &inputs, None).unwrap();
+            assert_eq!(after.inventory.files.len(), 1);
+            assert_eq!(after.inventory.files[0].path, ".yarn/install-state.gz");
+            assert!(after.inventory.directories.is_empty());
+            // The full source namespace barrier rejects this extra neighbor.
+            // The dependency proof must not give it generated-output authority.
+            let mut forged = after.inventory.clone();
+            let neighbor = View::new(&request)
+                .unwrap()
+                .file(".yarn/unclaimed.txt")
+                .unwrap();
+            forged.files.push(neighbor);
+            assert!(forged.validate_for(&request).is_err());
+            std::fs::write(project.join(".pnp.cjs"), b"changed selected loader\n").unwrap();
+            assert!(scan(&project, &request, &inputs, None).is_err());
+        }
+
+        #[test]
+        fn pnp_exact_outputs_and_generated_directories_reject_aliases() {
+            for name in [".pnp.cjs", ".yarn", ".yarn/cache", ".yarn/unplugged"] {
+                let source = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let project = project(source.path(), "");
+                let request = request(source.path(), &project, &["package.json", "yarn.lock"]);
+                let inputs = DependencyInputs::capture(&project).unwrap();
+                if name.starts_with(".yarn/") {
+                    std::fs::create_dir(project.join(".yarn")).unwrap();
+                }
+                symlink(outside.path(), project.join(name)).unwrap();
+                assert!(scan(&project, &request, &inputs, None).is_err(), "{name}");
+                assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+            }
+            let source = tempfile::tempdir().unwrap();
+            let project = project(source.path(), "");
+            let request = request(source.path(), &project, &["package.json", "yarn.lock"]);
+            let inputs = DependencyInputs::capture(&project).unwrap();
+            std::fs::create_dir(project.join(".pnp.cjs")).unwrap();
+            assert!(scan(&project, &request, &inputs, None).is_err());
+        }
+
+        #[test]
+        fn pnp_retained_inventory_rechecks_mode_presence_and_new_empty_directories() {
+            for mutation in ["mode", "missing", "empty-directory"] {
+                let source = tempfile::tempdir().unwrap();
+                let project = project(source.path(), "");
+                let request = request(source.path(), &project, &["package.json", "yarn.lock"]);
+                let inputs = DependencyInputs::capture(&project).unwrap();
+                std::fs::create_dir_all(project.join(".yarn/cache")).unwrap();
+                let cache_file = project.join(".yarn/cache/pkg.zip");
+                std::fs::write(&cache_file, b"retained cache bytes\n").unwrap();
+                let before = scan(&project, &request, &inputs, None).unwrap();
+                let completed = state(&request, &inputs, &before);
+                match mutation {
+                    "mode" => {
+                        std::fs::set_permissions(
+                            &cache_file,
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                        .unwrap();
+                    }
+                    "missing" => {
+                        std::fs::rename(&cache_file, project.join("unclaimed-cache.zip")).unwrap();
+                    }
+                    _ => {
+                        std::fs::create_dir(project.join(".yarn/cache/unregistered-empty")).unwrap()
+                    }
+                }
+                let after = scan(&project, &request, &inputs, None).unwrap();
+                assert!(
+                    verify_baseline(&request, &after, Some(&completed)).is_err(),
+                    "{mutation}"
+                );
+            }
+        }
     }
 }

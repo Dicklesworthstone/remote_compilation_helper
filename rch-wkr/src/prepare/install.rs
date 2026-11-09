@@ -27,7 +27,7 @@ const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 const INSTALLER_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
-const INSTALLER_RECEIPT_LIMIT: u64 = 256;
+pub(super) const INSTALLER_RECEIPT_LIMIT: u64 = 256;
 
 /// Only the dedicated supervisor writes this frame, after reaping the complete
 /// installer tree. Installer output goes to a separate log descriptor.
@@ -53,6 +53,17 @@ impl InstallerCompletion {
             _ => anyhow::bail!("invalid installer completion status"),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn completed_installer_succeeded(receipt: &[u8]) -> Result<bool> {
+    ensure!(
+        receipt.len() as u64 <= INSTALLER_RECEIPT_LIMIT,
+        "oversized installer completion receipt"
+    );
+    let completion: InstallerCompletion =
+        serde_json::from_slice(receipt).context("invalid installer completion receipt")?;
+    completion.succeeded()
 }
 
 /// Run only through the hidden worker command before a Tokio runtime exists.
@@ -131,9 +142,7 @@ async fn wait_for_installer(child: &mut tokio::process::Child) -> Result<bool> {
             read_receipt,
         )?;
         ensure!(status.success(), "installer supervisor exited {status}");
-        let completion: InstallerCompletion =
-            serde_json::from_slice(&receipt).context("invalid installer completion receipt")?;
-        completion.succeeded()
+        completed_installer_succeeded(&receipt)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -187,7 +196,7 @@ pub(super) fn fingerprint_hasher() -> Hasher {
     // such as NODE_ENV and npm_config_omit that were absent from their keys.
     // Invalidate their reuse authority while preserving the completed output
     // inventory as ownership evidence for one new frozen installation.
-    hasher.update(b"rch-dependency-install-v5\0");
+    hasher.update(b"rch-dependency-install-v6\0");
     hasher
 }
 
@@ -218,6 +227,25 @@ pub enum PrepareAction {
     Timeout,
 }
 
+/// Runtime environment required by a completed dependency installation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyLayout {
+    #[default]
+    NodeModules,
+    YarnPnp,
+}
+
+impl DependencyLayout {
+    pub(super) fn verify_runtime(self, runtime: RequiredRuntime) -> Result<()> {
+        ensure!(
+            self != Self::YarnPnp || runtime == RequiredRuntime::Node,
+            "Yarn PnP preparation requires the Node runtime"
+        );
+        Ok(())
+    }
+}
+
 /// Identifying fingerprint for a Node-flavored project's dependency manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DependencyFingerprint {
@@ -232,6 +260,7 @@ pub struct DependencyFingerprint {
 pub struct PrepareReport {
     pub runtime: RequiredRuntime,
     pub action: PrepareAction,
+    pub dependency_layout: DependencyLayout,
     /// Fingerprint after this run (None if runtime doesn't use fingerprints).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<DependencyFingerprint>,
@@ -374,12 +403,9 @@ fn detect_package_manager(project_root: &Path) -> PackageManager {
 /// preparation transaction. Cache decisions and publication must not hash a
 /// different input set. The encoding length-prefixes file names and contents.
 pub async fn compute_fingerprint(project_root: &Path) -> Result<DependencyFingerprint> {
-    let project = project_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        super::DependencyInputs::capture(&project).map(|inputs| inputs.fingerprint)
-    })
-    .await
-    .context("dependency input discovery task failed")?
+    super::DependencyInputs::capture_for_install(project_root)
+        .await
+        .map(|inputs| inputs.fingerprint)
 }
 
 const FINGERPRINT_FILE: &str = ".rch_dep_fingerprint.json";
@@ -577,7 +603,7 @@ pub async fn prepare(
     let started = Instant::now();
     match runtime {
         RequiredRuntime::Bun | RequiredRuntime::Node => {
-            prepare_node_like(project_root, runtime, log_dir, started, true).await
+            prepare_node_like(project_root, runtime, log_dir, started, true, None).await
         }
         // Nix fetches its own inputs into /nix/store at build time and needs no
         // node_modules-style prepare step, so it is skipped like Rust/None.
@@ -592,6 +618,7 @@ pub async fn prepare(
         | RequiredRuntime::Zig => Ok(PrepareReport {
             runtime,
             action: PrepareAction::Skipped,
+            dependency_layout: DependencyLayout::NodeModules,
             fingerprint: None,
             fingerprint_changed_from: None,
             install_log_path: None,
@@ -604,21 +631,34 @@ pub async fn prepare(
 
 /// Proof-aware callers must disable the fingerprint-only cache path until a
 /// prior completed exact output inventory has been independently revalidated.
-#[cfg(target_os = "linux")]
-pub(super) async fn prepare_proven_node(
-    project_root: &Path,
+pub(super) async fn prepare_observed_node(
+    transaction: &mut super::PrepareTransaction,
     runtime: RequiredRuntime,
     log_dir: &Path,
+    inputs: &super::DependencyInputs,
     allow_cache_hit: bool,
+    proven_outputs: bool,
 ) -> Result<PrepareReport> {
+    let project_root = transaction.project.clone();
     prepare_node_like(
-        project_root,
+        &project_root,
         runtime,
         log_dir,
         Instant::now(),
         allow_cache_hit,
+        Some(ObservedNode {
+            inputs,
+            transaction,
+            proven_outputs,
+        }),
     )
     .await
+}
+
+struct ObservedNode<'a> {
+    inputs: &'a super::DependencyInputs,
+    transaction: &'a mut super::PrepareTransaction,
+    proven_outputs: bool,
 }
 
 async fn prepare_node_like(
@@ -627,6 +667,7 @@ async fn prepare_node_like(
     log_dir: &Path,
     started: Instant,
     allow_cache_hit: bool,
+    mut observed: Option<ObservedNode<'_>>,
 ) -> Result<PrepareReport> {
     // Serialize concurrent prepare() calls for the same project. Without
     // this, two callers race on the fingerprint write + invoke `bun install`
@@ -636,27 +677,45 @@ async fn prepare_node_like(
     let lock = project_lock(project_root);
     let _guard = lock.lock().await;
 
-    let fingerprint = compute_fingerprint(project_root).await?;
+    let captured;
+    let inputs = if let Some(observed) = &observed {
+        observed.inputs
+    } else {
+        captured = super::DependencyInputs::capture_for_install(project_root).await?;
+        &captured
+    };
+    let proven_outputs = observed
+        .as_ref()
+        .is_some_and(|observed| observed.proven_outputs);
+    let dependency_layout = inputs.dependency_layout;
+    dependency_layout.verify_runtime(runtime)?;
+    let fingerprint = inputs.fingerprint.clone();
     let plan = InstallPlan::for_sources(&fingerprint.sources, runtime)?;
     let cached = read_cached_fingerprint(project_root).await;
 
     // Cache hit: skip install
     if allow_cache_hit
+        // A PnP loader's existence does not prove its ZIP dependencies or
+        // automatically enabled ESM loader remain intact. Only the qualified
+        // path's exact rehashed inventory may skip installation. Ordinary
+        // preparation still benefits from Yarn's immutable cached install.
+        && (dependency_layout != DependencyLayout::YarnPnp || proven_outputs)
         && let Some(prev) = &cached
         && plan.locked
         && prev.hash == fingerprint.hash
-        && project_root.join("node_modules").exists()
+        && inputs.outputs_ready(project_root)
     {
         info!(
             target: "rch::wkr::prepare",
             action = "cache_hit",
             hash = %fingerprint.hash,
             runtime = ?runtime,
-            "node_modules cached, skipping install"
+            "prepared dependencies cached, skipping install"
         );
         return Ok(PrepareReport {
             runtime,
             action: PrepareAction::Skipped,
+            dependency_layout,
             fingerprint: Some(fingerprint),
             fingerprint_changed_from: None,
             install_log_path: None,
@@ -669,7 +728,15 @@ async fn prepare_node_like(
     // Lockfile-free installs cannot reuse a stamp: neither the dependency
     // resolution nor the runtime-selected manager is pinned in that case.
     let pm = plan.manager;
-    let cmd = plan.command();
+    let cmd = if inputs.yarn.is_some() {
+        vec![
+            "yarn".to_owned(),
+            "install".to_owned(),
+            "--immutable".to_owned(),
+        ]
+    } else {
+        plan.command()
+    };
     tokio::fs::create_dir_all(log_dir).await.ok();
     let log_path = log_dir.join(format!(
         "prepare_{}.log",
@@ -748,6 +815,7 @@ async fn prepare_node_like(
             return Ok(PrepareReport {
                 runtime,
                 action: PrepareAction::Timeout,
+                dependency_layout,
                 fingerprint: Some(fingerprint),
                 fingerprint_changed_from: cached.map(|c| c.hash),
                 install_log_path: Some(log_path),
@@ -770,6 +838,7 @@ async fn prepare_node_like(
         return Ok(PrepareReport {
             runtime,
             action: PrepareAction::Failed,
+            dependency_layout,
             fingerprint: Some(fingerprint),
             fingerprint_changed_from: cached.map(|c| c.hash),
             install_log_path: Some(log_path),
@@ -780,6 +849,10 @@ async fn prepare_node_like(
     }
 
     let post_size = dir_size(&project_root.join("node_modules")).await;
+    ensure!(
+        dependency_layout != DependencyLayout::YarnPnp || inputs.outputs_ready(project_root),
+        "Yarn completed without the required PnP loader and installation state"
+    );
     // Recompute the fingerprint AFTER install so newly-created lockfiles
     // (e.g. `bun.lock` written by `bun install`, `package-lock.json`
     // written by `npm install`) are included in the cached state.
@@ -796,16 +869,20 @@ async fn prepare_node_like(
     //     the original silent-fallback bug — it permanently loses the
     //     newly-created lockfile from the cached state and forces
     //     re-install every call).
-    let post_install_fingerprint = persist_post_install_fingerprint(
-        project_root,
-        &fingerprint,
-        compute_fingerprint(project_root).await,
-    )
-    .await;
+    let recomputed = if let Some(observed) = &mut observed {
+        super::DependencyInputs::capture_in_transaction(observed.transaction)
+            .await
+            .map(|inputs| inputs.fingerprint)
+    } else {
+        compute_fingerprint(project_root).await
+    };
+    let post_install_fingerprint =
+        persist_post_install_fingerprint(project_root, &fingerprint, recomputed).await;
 
     Ok(PrepareReport {
         runtime,
         action: PrepareAction::Installed,
+        dependency_layout,
         fingerprint: Some(post_install_fingerprint),
         fingerprint_changed_from: cached.map(|c| c.hash),
         install_log_path: Some(log_path),
@@ -820,6 +897,30 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use tempfile::TempDir;
+
+    #[test]
+    fn yarn_pnp_layout_requires_node_before_installation() {
+        for runtime in [
+            RequiredRuntime::Node,
+            RequiredRuntime::Bun,
+            RequiredRuntime::Rust,
+            RequiredRuntime::None,
+            RequiredRuntime::Nix,
+            RequiredRuntime::Go,
+            RequiredRuntime::Zig,
+        ] {
+            assert!(
+                DependencyLayout::NodeModules
+                    .verify_runtime(runtime)
+                    .is_ok()
+            );
+            assert_eq!(
+                DependencyLayout::YarnPnp.verify_runtime(runtime).is_ok(),
+                runtime == RequiredRuntime::Node,
+                "{runtime:?}"
+            );
+        }
+    }
 
     fn plan(sources: &[&str], runtime: RequiredRuntime) -> InstallPlan {
         InstallPlan::for_sources(
@@ -1498,6 +1599,7 @@ mod tests {
         let report = PrepareReport {
             runtime: RequiredRuntime::Bun,
             action: PrepareAction::Skipped,
+            dependency_layout: DependencyLayout::NodeModules,
             fingerprint: Some(DependencyFingerprint {
                 hash: "abc".into(),
                 sources: vec!["package.json".into()],

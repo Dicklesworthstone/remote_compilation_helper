@@ -4,9 +4,10 @@
 //! In addition to environment values, bind explicitly selected npm user/global
 //! configuration files, the default home `.npmrc` candidate, and the project's
 //! `.npmrc`, including their referenced environment values. This does not
-//! discover npm's implicit global prefix, configuration-file redirects, other
-//! managers' global files, or replacement executables. Custom lifecycle scripts
-//! may read other inputs; this is not a hermetic sandbox.
+//! discover npm's implicit global prefix, configuration-file redirects, or
+//! replacement executables. Berry separately binds its home/ancestor config
+//! and effective auxiliary files through `capture_yarn`. Custom lifecycle
+//! scripts may read other inputs; this is not a hermetic sandbox.
 
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeSet, VecDeque};
@@ -21,6 +22,8 @@ const MAX_CONFIGURATION_COMPONENTS: usize = 4096;
 const MAX_CONFIGURATION_SYMLINKS: usize = 40;
 const MAX_CONFIGURATION_REFERENCES: usize = 4096;
 const MAX_CONFIGURATION_FILES: usize = 32;
+const MAX_YARN_CONFIGURATION_ROOTS: usize = 128;
+const MAX_YARN_CONFIGURATION_FILES: usize = 4096 + MAX_YARN_CONFIGURATION_ROOTS;
 
 fn relevant(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
@@ -79,6 +82,65 @@ fn fingerprint(values: impl IntoIterator<Item = (OsString, OsString)>) -> Result
 pub(super) struct CapturedEnvironment {
     pub(super) digest: blake3::Hash,
     configurations: Vec<Configuration>,
+}
+
+impl CapturedEnvironment {
+    pub(super) fn configuration_paths(&self) -> impl Iterator<Item = &Path> {
+        self.configurations
+            .iter()
+            .map(|entry| entry.requested.as_path())
+    }
+
+    /// A fresh local PnP install may create the previously absent `.yarn`
+    /// structural parent. Its authored input roots must remain absent, and
+    /// every preexisting path observation must still match exactly. This is
+    /// only for the post-install comparison, never an in-query coherence test.
+    pub(super) fn same_after_yarn_parent_created(&self, after: &Self, project: &Path) -> bool {
+        if self.digest != after.digest || self.configurations.len() != after.configurations.len() {
+            return false;
+        }
+        let parent = project.join(".yarn");
+        self.configurations
+            .iter()
+            .zip(&after.configurations)
+            .all(|(before, after)| {
+                if before == after {
+                    return true;
+                }
+                if before.requested != after.requested
+                    || before.contents.is_some()
+                    || after.contents.is_some()
+                    || before.resolution.file.is_some()
+                    || after.resolution.file.is_some()
+                    || before.requested.parent() != Some(parent.as_path())
+                    || !matches!(
+                        before.requested.file_name().and_then(OsStr::to_str),
+                        Some("patches" | "plugins" | "releases")
+                    )
+                {
+                    return false;
+                }
+                let Some((PathEntry::Missing(missing_before), preserved_before)) =
+                    before.resolution.entries.split_last()
+                else {
+                    return false;
+                };
+                let Some((PathEntry::Missing(missing_after), prefix_after)) =
+                    after.resolution.entries.split_last()
+                else {
+                    return false;
+                };
+                let Some((PathEntry::Directory(created, _), preserved_after)) =
+                    prefix_after.split_last()
+                else {
+                    return false;
+                };
+                missing_before == &parent
+                    && created == &parent
+                    && missing_after == &before.requested
+                    && preserved_before == preserved_after
+            })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -339,6 +401,29 @@ fn collect_references(text: &str, references: &mut BTreeSet<String>) -> Result<(
     Ok(())
 }
 
+fn collect_yarn_references(text: &str, references: &mut BTreeSet<String>) -> Result<()> {
+    for segment in text.split("${").skip(1) {
+        let Some((body, _)) = segment.split_once('}') else {
+            continue;
+        };
+        // Yarn supports both an unset fallback and an unset-or-empty fallback.
+        // Bind the variable, not the literal fallback suffix. Conservatively
+        // include commented references; they can only cause an extra miss.
+        let name = body
+            .split_once(":-")
+            .or_else(|| body.split_once('-'))
+            .map_or(body, |(name, _)| name);
+        if !name.is_empty() && !name.contains(['$', '{', ':']) {
+            ensure!(
+                references.len() < MAX_CONFIGURATION_REFERENCES || references.contains(name),
+                "Yarn configuration exceeds environment reference limit"
+            );
+            references.insert(name.to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn bind_configuration_references(
     digest: &mut blake3::Hasher,
     bytes: &[u8],
@@ -351,6 +436,7 @@ fn bind_configuration_references(
     let text = String::from_utf8_lossy(bytes);
     let mut references = BTreeSet::new();
     collect_references(&text, &mut references)?;
+    collect_yarn_references(&text, &mut references)?;
     for line in text.split(['\r', '\n']) {
         for part in line.splitn(2, '=') {
             let field = trim_npm_text(part);
@@ -628,6 +714,93 @@ fn capture_with(project: &Path, values: Vec<(OsString, OsString)>) -> Result<Cap
     })
 }
 
+/// Bind Berry's home/ancestor configuration plus the effective files reported
+/// by Yarn itself. This is separate from npm capture: a Node project without
+/// a Yarn lock must not acquire unrelated Yarn configuration obligations.
+pub(super) fn capture_yarn(project: &Path, additional: &[PathBuf]) -> Result<CapturedEnvironment> {
+    capture_yarn_with(project, additional, std::env::vars_os().collect())
+}
+
+fn capture_yarn_with(
+    project: &Path,
+    additional: &[PathBuf],
+    values: Vec<(OsString, OsString)>,
+) -> Result<CapturedEnvironment> {
+    let mut names = BTreeSet::from([".yarnrc.yml".to_owned()]);
+    for (key, value) in &values {
+        if key
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b"YARN_RC_FILENAME")
+        {
+            let name = value
+                .to_str()
+                .context("Yarn configuration filename is not UTF-8")?;
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 255
+                    && !matches!(name, "." | "..")
+                    && !name.contains(['/', '\\'])
+                    && !name.chars().any(char::is_control),
+                "Yarn configuration filename must be a literal filename"
+            );
+            names.insert(name.to_owned());
+        }
+    }
+    let absolute = absolute_path(project, Path::new("."))?;
+    let mut paths = BTreeSet::new();
+    for ancestor in absolute.ancestors() {
+        for name in &names {
+            paths.insert(ancestor.join(name));
+        }
+        ensure!(
+            paths.len() <= MAX_YARN_CONFIGURATION_ROOTS,
+            "Yarn configuration exceeds file limit"
+        );
+    }
+    let home = environment_value(&values, "HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir);
+    if let Some(home) = home {
+        // Berry always reads the default home filename, even with RC_FILENAME.
+        paths.insert(absolute_path(project, &home.join(".yarnrc.yml"))?);
+    }
+    paths.extend(additional.iter().cloned());
+    ensure!(
+        paths.len() <= MAX_YARN_CONFIGURATION_FILES,
+        "Yarn configuration exceeds file limit"
+    );
+    capture_paths(paths, &values)
+}
+
+fn capture_paths(
+    paths: BTreeSet<PathBuf>,
+    values: &[(OsString, OsString)],
+) -> Result<CapturedEnvironment> {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"rch-yarn-configuration-v1\0");
+    let mut budget = MAX_CONFIGURATION_BYTES;
+    let mut configurations = Vec::new();
+    for path in paths {
+        configurations.push(capture_configuration(
+            path,
+            values,
+            &mut budget,
+            &mut digest,
+        )?);
+    }
+    for configuration in &configurations {
+        ensure!(
+            resolve_configuration(&configuration.requested)? == configuration.resolution,
+            "Yarn configuration changed during capture"
+        );
+    }
+    Ok(CapturedEnvironment {
+        digest: digest.finalize(),
+        configurations,
+    })
+}
+
 pub(super) fn capture(project: &Path) -> Result<CapturedEnvironment> {
     capture_with(project, std::env::vars_os().collect())
 }
@@ -635,6 +808,120 @@ pub(super) fn capture(project: &Path) -> Result<CapturedEnvironment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yarn_home_ancestor_override_and_environment_inputs_change_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("parent/project");
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let mut values = vec![(OsString::from("HOME"), home.as_os_str().to_owned())];
+        let capture = |values: &Vec<(OsString, OsString)>| {
+            capture_yarn_with(&project, &[], values.clone()).unwrap()
+        };
+        let absent = capture(&values);
+        std::fs::write(home.join(".yarnrc.yml"), b"enableScripts: false\n").unwrap();
+        let homed = capture(&values);
+        assert_ne!(absent.digest, homed.digest);
+        std::fs::write(
+            directory.path().join("parent/.yarnrc.yml"),
+            b"npmRegistryServer: '${CUSTOM_REGISTRY:-https://registry.yarnpkg.com}'\n",
+        )
+        .unwrap();
+        let parent = capture(&values);
+        assert_ne!(homed.digest, parent.digest);
+        values.push((
+            OsString::from("CUSTOM_REGISTRY"),
+            OsString::from("https://registry.example"),
+        ));
+        assert_ne!(parent.digest, capture(&values).digest);
+        values.push((
+            OsString::from("YARN_RC_FILENAME"),
+            OsString::from("custom.yml"),
+        ));
+        let custom_absent = capture(&values);
+        std::fs::write(project.join("custom.yml"), b"nodeLinker: pnp\n").unwrap();
+        assert_ne!(custom_absent.digest, capture(&values).digest);
+        // A cache/log write changes directory timestamps, not config authority.
+        let expected = capture(&values);
+        std::fs::write(home.join("unrelated-log"), b"new log").unwrap();
+        assert_eq!(expected, capture(&values));
+    }
+
+    #[test]
+    fn yarn_extra_files_bind_absence_and_content() {
+        let fixture = ConfigFixture::new();
+        let extra = fixture.project.join(".env.yarn");
+        let capture = || {
+            capture_yarn_with(
+                &fixture.project,
+                std::slice::from_ref(&extra),
+                fixture.values.clone(),
+            )
+            .unwrap()
+        };
+        let absent = capture();
+        std::fs::write(&extra, b"MODE=development\n").unwrap();
+        let initial = capture();
+        assert_ne!(absent.digest, initial.digest);
+        std::fs::write(&extra, b"MODE=production\n").unwrap();
+        assert_ne!(initial.digest, capture().digest);
+    }
+
+    #[test]
+    fn yarn_install_may_create_only_the_missing_structural_parent() {
+        let fixture = ConfigFixture::new();
+        let extra = fixture.project.join(".yarn/plugins");
+        let capture = || {
+            capture_yarn_with(
+                &fixture.project,
+                std::slice::from_ref(&extra),
+                fixture.values.clone(),
+            )
+            .unwrap()
+        };
+        let before = capture();
+        std::fs::create_dir(fixture.project.join(".yarn")).unwrap();
+        let after = capture();
+        assert_ne!(before, after);
+        assert!(before.same_after_yarn_parent_created(&after, &fixture.project));
+        assert!(!after.same_after_yarn_parent_created(&before, &fixture.project));
+
+        // Once the directory exists, a later replacement is still refused.
+        std::fs::rename(
+            fixture.project.join(".yarn"),
+            fixture.project.join("saved-yarn"),
+        )
+        .unwrap();
+        std::fs::create_dir(fixture.project.join(".yarn")).unwrap();
+        assert!(!after.same_after_yarn_parent_created(&capture(), &fixture.project));
+
+        std::fs::write(&extra, b"new authored input").unwrap();
+        assert!(!before.same_after_yarn_parent_created(&capture(), &fixture.project));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn yarn_created_parent_cannot_be_a_symlink_or_an_unrelated_input_parent() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ConfigFixture::new();
+        let target = fixture.project.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let capture = |extra: PathBuf| {
+            capture_yarn_with(&fixture.project, &[extra], fixture.values.clone()).unwrap()
+        };
+        let extra = fixture.project.join(".yarn/releases");
+        let before = capture(extra.clone());
+        symlink(&target, fixture.project.join(".yarn")).unwrap();
+        assert!(!before.same_after_yarn_parent_created(&capture(extra), &fixture.project));
+
+        let extra = fixture.project.join("new-config/settings.yml");
+        let before = capture(extra.clone());
+        std::fs::create_dir(fixture.project.join("new-config")).unwrap();
+        assert!(!before.same_after_yarn_parent_created(&capture(extra), &fixture.project));
+    }
 
     struct ConfigFixture {
         _directory: tempfile::TempDir,

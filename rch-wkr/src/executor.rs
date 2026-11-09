@@ -1,5 +1,6 @@
 //! Command execution on worker.
 
+mod prepared;
 mod relay;
 
 use anyhow::{Context, Result};
@@ -435,6 +436,7 @@ pub async fn execute_with_disk_budget(
 
     // br-4998x: pre-execution hook for Bun/Node projects.
     let runtime = detect_runtime_from_command(command);
+    let mut dependency_layout = crate::prepare::DependencyLayout::NodeModules;
     if disk_budget.is_none() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
         let project_root = Path::new(workdir);
         let log_dir = project_root.join(".rch_prepare_logs");
@@ -478,6 +480,7 @@ pub async fn execute_with_disk_budget(
                     }
                     .into());
                 }
+                dependency_layout = report.dependency_layout;
             }
             Err(e) => {
                 // Fail-open: if prepare itself errored (no manifest, IO error)
@@ -551,24 +554,9 @@ pub async fn execute_with_disk_budget(
         let plan =
             serde_json::json!({"probe": probe_paths, "output": output_paths, "receipt": receipt});
         let guarded_command = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
-            let worker = std::env::current_exe()?;
-            let worker = quote_shell_argument(
-                worker
-                    .to_str()
-                    .context("worker executable path is not UTF-8")?,
-            );
-            let project = quote_shell_argument(root.to_str().context("project path is not UTF-8")?);
-            let runtime = if runtime == RequiredRuntime::Bun {
-                "bun"
-            } else {
-                "node"
-            };
-            format!(
-                "{worker} prepare --project {project} --runtime {runtime} >/dev/null || exit {EXIT_PREPARE_FAILED}; sh -c {}",
-                quote_shell_argument(command)
-            )
+            prepared::disk_guard_command(&root, runtime, command)?
         } else {
-            command.to_owned()
+            prepared::workload_command(crate::prepare::DependencyLayout::NodeModules, command)?
         };
         let mut guarded = managed_command("python3");
         guarded
@@ -584,7 +572,8 @@ pub async fn execute_with_disk_budget(
             .arg(&target)
             .arg(plan.to_string())
             .arg("standalone")
-            .args(["sh", "-c", &guarded_command])
+            .arg(guarded_command.as_std().get_program())
+            .args(guarded_command.as_std().get_args())
             .env("CARGO_TARGET_DIR", &target)
             .env("TMPDIR", &temporary)
             .env("TMP", &temporary)
@@ -592,9 +581,7 @@ pub async fn execute_with_disk_budget(
         disk_receipt = Some((receipt, marker, budget));
         guarded
     } else {
-        let mut shell = managed_command("sh");
-        shell.args(["-c", command]);
-        shell
+        prepared::workload_command(dependency_layout, command)?
     };
     cmd.current_dir(workdir)
         .stdout(Stdio::piped())
@@ -607,10 +594,14 @@ pub async fn execute_with_disk_budget(
     // install, a project pinned to an older TypeScript would be typechecked by a
     // newer compiler and could report errors the user never sees locally.
     // Resolving the project's own binary keeps remote results identical to local.
-    // `prepare()` (above) has already installed node_modules by this point.
-    if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+    // The disk selector adds this path only after preparing a NodeModules
+    // layout. PnP must keep the original PATH that selected its Yarn manager.
+    if disk_budget.is_none()
+        && dependency_layout == crate::prepare::DependencyLayout::NodeModules
+        && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
+    {
         let local_bin = Path::new(workdir).join("node_modules").join(".bin");
-        if local_bin.is_dir() || disk_budget.is_some() {
+        if local_bin.is_dir() {
             let existing = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{existing}", local_bin.display()));
         }

@@ -11,9 +11,10 @@ mod environment;
 mod install;
 mod outputs;
 mod workspace_inputs;
+mod yarn;
 
+pub use install::{DependencyLayout, PrepareAction, PrepareReport};
 use install::{INPUT_NAMES, InstallPlan};
-pub use install::{PrepareAction, PrepareReport};
 #[cfg(target_os = "linux")]
 pub(crate) use install::{exec_installer, run_installer_supervisor};
 pub use outputs::{proof_inspect, proof_install, proof_verify};
@@ -76,11 +77,71 @@ struct DependencyInputs {
     members: Vec<Option<InputObservation>>,
     environment: environment::CapturedEnvironment,
     fingerprint: install::DependencyFingerprint,
+    dependency_layout: DependencyLayout,
+    yarn: Option<yarn::Observation>,
     #[cfg(unix)]
     root: (u64, u64),
 }
 
 impl DependencyInputs {
+    async fn capture_for_install(project: &Path) -> Result<Self> {
+        // Standalone fingerprint callers have no outer transaction. Pure
+        // captures never execute a manager or acquire its journal; Berry's
+        // executable configuration requires the same durable owner as install.
+        let project = project.to_owned();
+        let captured_project = project.clone();
+        let inputs = tokio::task::spawn_blocking(move || Self::capture(&captured_project))
+            .await
+            .context("capture dependency inputs")??;
+        if !yarn::requires_query(&project, &inputs.fingerprint.sources)? {
+            return Ok(inputs);
+        }
+        let mut transaction = PrepareTransaction::acquire(&project).await?;
+        Self::capture_in_transaction(&mut transaction).await
+    }
+
+    async fn capture_in_transaction(transaction: &mut PrepareTransaction) -> Result<Self> {
+        let project = transaction.project.clone();
+        let captured_project = project.clone();
+        let mut inputs = tokio::task::spawn_blocking(move || Self::capture(&captured_project))
+            .await
+            .context("capture dependency inputs")??;
+        let yarn = yarn::capture(&project, &inputs.fingerprint.sources, transaction).await?;
+        if let Some(observation) = &yarn {
+            let mut digest = install::fingerprint_hasher();
+            digest.update(inputs.fingerprint.hash.as_bytes());
+            digest.update(observation.digest.as_bytes());
+            inputs.fingerprint.hash = digest.finalize().to_hex().to_string();
+            inputs.dependency_layout = observation.layout;
+            let captured_project = project.clone();
+            let after = tokio::task::spawn_blocking(move || Self::capture(&captured_project))
+                .await
+                .context("revalidate dependency inputs")??;
+            ensure!(
+                inputs.names == after.names
+                    && inputs.members == after.members
+                    && inputs.environment == after.environment,
+                "dependency inputs changed during package-manager configuration query"
+            );
+        }
+        inputs.yarn = yarn;
+        Ok(inputs)
+    }
+
+    fn outputs_ready(&self, project: &Path) -> bool {
+        self.yarn.as_ref().map_or_else(
+            || project.join("node_modules").is_dir(),
+            |yarn| yarn.outputs_ready(project),
+        )
+    }
+
+    fn verify_invocation(&self, preparation: &Path, invocation: &Path) -> Result<()> {
+        if let Some(yarn) = &self.yarn {
+            yarn.verify_invocation(preparation, invocation)?;
+        }
+        Ok(())
+    }
+
     fn capture(project: &Path) -> Result<Self> {
         let root = std::fs::symlink_metadata(project)?;
         ensure!(
@@ -179,6 +240,8 @@ impl DependencyInputs {
             members,
             environment,
             fingerprint,
+            dependency_layout: DependencyLayout::NodeModules,
+            yarn: None,
             #[cfg(unix)]
             root,
         })
@@ -219,6 +282,15 @@ impl DependencyInputs {
             self.environment == after.environment,
             "package-manager environment changed during preparation"
         );
+        let same_yarn = match (&self.yarn, &after.yarn) {
+            (None, None) => true,
+            (Some(before), Some(after)) => before.unchanged_after_install(after),
+            _ => false,
+        };
+        ensure!(
+            same_yarn && self.dependency_layout == after.dependency_layout,
+            "Yarn configuration or auxiliary inputs changed during preparation"
+        );
         Ok(())
     }
 }
@@ -244,6 +316,10 @@ struct PrepareTransaction {
     file: File,
     path: PathBuf,
     project: PathBuf,
+    #[cfg(target_os = "linux")]
+    running: bool,
+    #[cfg(target_os = "linux")]
+    query_pending: bool,
 }
 
 impl PrepareTransaction {
@@ -298,6 +374,10 @@ impl PrepareTransaction {
             file,
             path,
             project,
+            #[cfg(target_os = "linux")]
+            running: false,
+            #[cfg(target_os = "linux")]
+            query_pending: false,
         };
         transaction.verify_path()?;
         let started = Instant::now();
@@ -360,6 +440,11 @@ impl PrepareTransaction {
     }
 
     fn record(&mut self, state: &[u8]) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        ensure!(
+            state != IDLE || !self.query_pending,
+            "Yarn configuration descendant completion remains unconfirmed"
+        );
         self.verify_path()?;
         // Intentionally synchronous: dropping an async fs future must not
         // leave a detached journal write running after the kernel lock drops.
@@ -369,7 +454,40 @@ impl PrepareTransaction {
         self.file.sync_all()?;
         #[cfg(unix)]
         File::open(self.path.parent().context("journal has no parent")?)?.sync_all()?;
-        self.verify_path()
+        self.verify_path()?;
+        #[cfg(target_os = "linux")]
+        {
+            self.running = state == RUNNING;
+        }
+        Ok(())
+    }
+
+    /// A configuration probe may execute plugins and spawn detached writers.
+    /// Persist its uncertainty before spawn, and do not clear an outer install
+    /// fence when a post-install probe completes.
+    #[cfg(target_os = "linux")]
+    fn begin_query(&mut self) -> Result<bool> {
+        ensure!(
+            !self.query_pending,
+            "Yarn configuration descendant completion remains unconfirmed"
+        );
+        let already_running = self.running;
+        self.record(RUNNING)?;
+        self.query_pending = true;
+        Ok(already_running)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_query(&mut self, already_running: bool) -> Result<()> {
+        ensure!(
+            self.query_pending,
+            "Yarn configuration query was not started"
+        );
+        // The caller has validated the supervisor's complete descendant
+        // receipt. All following operations are synchronous, so cancellation
+        // cannot interleave a retirement with another writer.
+        self.query_pending = false;
+        self.record(if already_running { RUNNING } else { IDLE })
     }
 }
 
@@ -381,6 +499,7 @@ fn failure(runtime: RequiredRuntime, started: Instant, error: &anyhow::Error) ->
     PrepareReport {
         runtime,
         action: PrepareAction::Failed,
+        dependency_layout: DependencyLayout::NodeModules,
         fingerprint: None,
         fingerprint_changed_from: None,
         install_log_path: None,
@@ -390,19 +509,34 @@ fn failure(runtime: RequiredRuntime, started: Instant, error: &anyhow::Error) ->
     }
 }
 
-fn verified_fingerprint(project: &Path, report: &PrepareReport) -> Result<()> {
-    match std::fs::symlink_metadata(project.join("node_modules")) {
-        Ok(meta) => ensure!(
-            meta.file_type().is_dir(),
-            "node_modules is not a real directory"
-        ),
-        // An empty dependency set (or a non-node_modules package-manager
-        // layout) can install successfully without creating this directory.
-        // The installer will not reuse that case as a node_modules cache hit.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && report.action == PrepareAction::Installed => {}
-        Err(error) => return Err(error).context("inspect prepared node_modules"),
+fn verified_fingerprint(
+    project: &Path,
+    report: &PrepareReport,
+    inputs: &DependencyInputs,
+) -> Result<()> {
+    ensure!(
+        report.dependency_layout == inputs.dependency_layout,
+        "prepared dependency layout changed"
+    );
+    if inputs.dependency_layout == DependencyLayout::YarnPnp {
+        ensure!(
+            inputs.outputs_ready(project),
+            "prepared Yarn PnP outputs are incomplete"
+        );
+    } else {
+        match std::fs::symlink_metadata(project.join("node_modules")) {
+            Ok(meta) => ensure!(
+                meta.file_type().is_dir(),
+                "node_modules is not a real directory"
+            ),
+            // An empty dependency set (or a non-node_modules package-manager
+            // layout) can install successfully without creating this directory.
+            // The installer will not reuse that case as a node_modules cache hit.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && report.action == PrepareAction::Installed => {}
+            Err(error) => return Err(error).context("inspect prepared node_modules"),
+        }
     }
     let expected = report
         .fingerprint
@@ -443,24 +577,34 @@ pub async fn prepare(
     let result = async {
         let mut transaction = PrepareTransaction::acquire(project_root).await?;
         preflight_cache_files(&transaction.project)?;
-        let inputs = DependencyInputs::capture(&transaction.project)?;
-        // A conflicting lock inventory has not started an installation. Refuse
-        // before RUNNING so correcting that input does not require recovery.
+        let inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
+        // These deterministic refusals have not started an installation.
+        // Reject before RUNNING so correcting the request needs no recovery.
         InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
+        inputs.dependency_layout.verify_runtime(runtime)?;
         transaction.record(RUNNING)?;
-        let mut report = install::prepare(&transaction.project, runtime, log_dir).await?;
+        let mut report = install::prepare_observed_node(
+            &mut transaction,
+            runtime,
+            log_dir,
+            &inputs,
+            true,
+            false,
+        )
+        .await?;
         match report.action {
             PrepareAction::Installed | PrepareAction::Skipped => {
-                let verified = (|| {
-                    let after = DependencyInputs::capture(&transaction.project)?;
+                let verified = async {
+                    let after = DependencyInputs::capture_in_transaction(&mut transaction).await?;
                     inputs.verify_after(&after, runtime, report.action)?;
                     ensure!(
                         report.fingerprint.as_ref() == Some(&after.fingerprint),
                         "published dependency fingerprint differs from observed inputs"
                     );
                     preflight_cache_files(&transaction.project)?;
-                    verified_fingerprint(&transaction.project, &report)
-                })();
+                    verified_fingerprint(&transaction.project, &report, &after)
+                }
+                .await;
                 if let Err(error) = verified {
                     tracing::warn!(
                         target: "rch::wkr::prepare", error = %format!("{error:#}"),
@@ -729,6 +873,50 @@ mod tests {
             PrepareTransaction::acquire_in(fixture.path(), &directory, Duration::ZERO).await;
         assert!(result.is_err());
         assert_eq!(std::fs::read(path).unwrap(), RUNNING);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn completed_queries_restore_only_their_own_journal_fence() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("transactions");
+        let mut transaction =
+            PrepareTransaction::acquire_in(fixture.path(), &directory, Duration::ZERO)
+                .await
+                .unwrap();
+        let was_running = transaction.begin_query().unwrap();
+        assert!(!was_running);
+        assert_eq!(std::fs::read(&transaction.path).unwrap(), RUNNING);
+        transaction.finish_query(was_running).unwrap();
+        assert_eq!(std::fs::read(&transaction.path).unwrap(), IDLE);
+        transaction.record(RUNNING).unwrap();
+        let was_running = transaction.begin_query().unwrap();
+        assert!(was_running);
+        transaction.finish_query(was_running).unwrap();
+        assert_eq!(std::fs::read(&transaction.path).unwrap(), RUNNING);
+        transaction.record(IDLE).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unconfirmed_query_blocks_more_probes_and_idle_publication() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("transactions");
+        let mut transaction =
+            PrepareTransaction::acquire_in(fixture.path(), &directory, Duration::ZERO)
+                .await
+                .unwrap();
+        transaction.begin_query().unwrap();
+        assert!(transaction.begin_query().is_err());
+        assert!(transaction.record(IDLE).is_err());
+        let path = transaction.path.clone();
+        drop(transaction);
+        assert_eq!(std::fs::read(path).unwrap(), RUNNING);
+        assert!(
+            PrepareTransaction::acquire_in(fixture.path(), &directory, Duration::ZERO)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

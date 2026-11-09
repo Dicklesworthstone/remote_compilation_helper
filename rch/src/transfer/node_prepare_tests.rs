@@ -164,10 +164,11 @@ fn check_generated_wrapper(
     write_tool(
         &tools.join("rch-wkr"),
         "#!/bin/sh\nset -eu\n\
-         [ \"$*\" = \"prepare --project . --runtime $EXPECTED_RUNTIME\" ] || exit 91\n\
+         [ \"$*\" = \"prepare --project . --runtime $EXPECTED_RUNTIME --execution-layout\" ] || exit 91\n\
          printf 'prepared\\n' >> events\n\
          if IFS= read -r ignored; then exit 92; fi\n\
-         printf 'preparation metadata\\n'\n\
+         printf 'preparation metadata\\n' >&2\n\
+         printf 'RCH_PREPARED_NODE_MODULES\\n'\n\
          exit \"$PREPARATION_STATUS\"\n",
     );
     write_tool(&tools.join(program), "#!/bin/sh\nexit 96\n");
@@ -243,6 +244,7 @@ fn rust_generated_workspace_wrapper_preserves_member_context_and_hoisted_tools()
                  [ \"$PWD\" = \"$EXPECTED_MEMBER\" ] || exit 95\n\
                  if IFS= read -r ignored; then exit 96; fi\n\
                  printf 'verified\\n' >> \"$EVENTS\"\n\
+                 printf 'RCH_PREPARED_DEPENDENCIES_VERIFIED\\n'\n\
                  exit \"$PREPARATION_STATUS\"\n",
             );
             write_tool(&tools.join("compiler"), "#!/bin/sh\nexit 97\n");

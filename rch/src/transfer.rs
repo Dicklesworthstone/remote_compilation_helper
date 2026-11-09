@@ -6487,6 +6487,17 @@ mkdir -p {} && rm -f {} && {launch}",
         let Some(runtime) = self.dependency_runtime() else {
             return command;
         };
+        let pnp_tsc = rch_common::patterns::tsc_invocation(&command)
+            .filter(|_| self.compilation_kind == Some(CompilationKind::Tsc))
+            .map(|arguments| {
+                let quoted = arguments
+                    .iter()
+                    .map(|argument| escape(Cow::Borrowed(argument.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(" --pnp-tsc {} {quoted}", arguments.len())
+            })
+            .unwrap_or_default();
         let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
         let command = escape(Cow::from(command.as_str()));
         let proof = self
@@ -6509,7 +6520,7 @@ mkdir -p {} && rm -f {} && {launch}",
                 )
             })
             .unwrap_or_default();
-        format!("sh -c {script} rch-prepare {runtime}{proof} sh -c {command}")
+        format!("sh -c {script} rch-prepare {runtime}{proof}{pnp_tsc} sh -c {command}")
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
