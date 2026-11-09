@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 from pathlib import Path
-import re
 import shlex
 import signal
 import socket
@@ -23,6 +23,11 @@ import sys
 import tempfile
 import time
 import unittest
+
+# Explicit file loading also works under -I and never writes source bytecode.
+_protocol_support = runpy.run_path(str(Path(__file__).with_name("remote_process_platform.py")))
+assemble_protocol = _protocol_support["assemble_protocol"]
+replace_protocol_source = _protocol_support["replace_protocol_source"]
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
@@ -52,28 +57,10 @@ rch_policy_select_file() {
 '''
 
 
-def assemble_protocol() -> str:
-    rust = (SOURCE / "remote_scoped_launch.rs").read_text()
-    expression = rust.split("= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((SOURCE / json.loads(include[1])).read_text()
-                     if include else json.loads(item))
-    expanded = "".join(parts)
-    compiled = os.environ.get("RCH_TEST_PROTOCOL_SCRIPT")
-    if compiled and Path(compiled).read_text() != expanded:
-        raise AssertionError("compiled protocol differs from its exact source expansion")
-    return expanded
-
-
 def protocol() -> str:
     expanded = assemble_protocol()
     core = (SOURCE / "remote_process.sh").read_text()
-    if expanded.count(core) != 1:
-        raise AssertionError("expected one identity implementation shared by parent and child")
-    return expanded.replace(core, core + SELECT)
+    return replace_protocol_source(expanded, core, core + SELECT)
 
 
 def process(pid: int):

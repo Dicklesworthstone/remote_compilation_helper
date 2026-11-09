@@ -27,19 +27,46 @@ CORE = (ROOT / "rch-common/src/remote_process.sh").read_text()
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 
 
+def quote_protocol_source(source):
+    """The byte-preserving POSIX double-quote escaping in compile_protocol()."""
+    return source.translate(str.maketrans({
+        "\\": "\\\\", '"': '\\"', "$": "\\$", "`": "\\`", "!": "${rch_literal_bang}",
+    }))
+
+
+def replace_protocol_source(protocol, before, after):
+    """Inject one explicit test adapter before the shared source is evaluated."""
+    encoded = quote_protocol_source(before)
+    if protocol.count(encoded) != 1:
+        raise AssertionError("expected exactly one quoted production source fragment")
+    return protocol.replace(encoded, quote_protocol_source(after), 1)
+
+
 def assemble_protocol():
-    # The legacy watchdog tail was removed from transfer.rs. Use the same
-    # literal sources as the Rust launcher instead of extracting dead code.
+    # Expand the same literal inputs and escaping as the public Rust constant.
+    # Native integration tests compare these bytes with the compiled constant;
+    # standalone runs exercise shell behavior, not Rust constant evaluation.
     source = ROOT / "rch-common/src"
-    expression = (source / "remote_scoped_launch.rs").read_text().split(
-        "= concat!(\n", 1)[1].split("\n);", 1)[0]
-    parts = []
-    for line in expression.splitlines():
-        item = line.strip().removesuffix(",")
-        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
-        parts.append((source / json.loads(include[1])).read_text()
-                     if include else json.loads(item))
-    return "".join(parts)
+    rust = (source / "remote_scoped_launch.rs").read_text()
+
+    def literal(name):
+        expression = rust.split(f"const {name}: &str = concat!(\n", 1)[1].split("\n);", 1)[0]
+        parts = []
+        for line in expression.splitlines():
+            item = line.strip().removesuffix(",")
+            include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
+            parts.append((source / json.loads(include[1])).read_text()
+                         if include else json.loads(item))
+        return "".join(parts)
+
+    prefix = re.search(r'^const BOOTSTRAP_PREFIX: &str = (".*");$', rust, re.MULTILINE)
+    if prefix is None:
+        raise AssertionError("bootstrap prefix is no longer a literal Rust string")
+    protocol = json.loads(prefix[1]) + quote_protocol_source(literal("LAUNCH_SOURCE")) + literal("BOOTSTRAP_SUFFIX")
+    compiled = os.environ.get("RCH_TEST_PROTOCOL_SCRIPT")
+    if compiled and Path(compiled).read_text() != protocol:
+        raise AssertionError("source expansion differs from the compiled protocol")
+    return protocol
 
 
 PROTOCOL = assemble_protocol()
@@ -84,7 +111,7 @@ class PlatformIdentity(unittest.TestCase):
     def launch(self, seconds=0, payload=None):
         if payload is None:
             payload = "trap '' TERM; echo ready > " + shlex.quote(str(self.ready)) + "; exec sleep 60"
-        source = PROTOCOL.replace(CORE, CORE + "\nrch_policy_select_file() { rch_policy_file=; }\n")
+        source = replace_protocol_source(PROTOCOL, CORE, CORE + "\nrch_policy_select_file() { rch_policy_file=; }\n")
         child = subprocess.Popen(
             [SHELL, "-c", "exec 3>&2\n" + source, "rch-build",
              str(self.receipt), str(seconds), "RCH_PLATFORM_DEADLINE", "115",
@@ -539,7 +566,7 @@ done
         self.assertEqual(observe.returncode, 0, observe.stderr)
         self.assertEqual(observe.stdout.splitlines(), ["1"] * 20)
         record, executions = root / "record", root / "executions"
-        source = PROTOCOL.replace(CORE, CORE + "\nrch_policy_select_file() { rch_policy_file=; }\n")
+        source = replace_protocol_source(PROTOCOL, CORE, CORE + "\nrch_policy_select_file() { rch_policy_file=; }\n")
         payload = f"printf 'executed\\n' >> {shlex.quote(str(executions))}; exit 7"
         executed = subprocess.run([SHELL, "-c", source, "rch-build", str(record), "5",
                                    "RCH_STRESS_DEADLINE", "115", SHELL, "-c", payload],

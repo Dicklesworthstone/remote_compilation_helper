@@ -722,22 +722,37 @@ install_binary_file() {
     fi
 }
 
-# A021 split-profile installer: resolve NAME built under PROFILE, falling back
-# to the legacy single-profile target/release layout. Required binaries abort
-# the install when missing; optional ones are skipped with a note. RABS uses
-# install_rabs_toolset instead so its launcher and binaries cannot be mixed.
-install_split_binary() {
-    local name="$1" profile="$2" required="$3"
-    local candidate src=""
-    for candidate in "$TARGET_DIR/$profile/$name" "$TARGET_DIR/release/$name"; do
-        if [[ -f "$candidate" ]]; then
-            src="$candidate"
-            break
+# Validate the complete source-built selection before activating RABS or
+# replacing any core binary. These paths must match the profiles we just built:
+# a retained target/release binary is not an output of either Cargo invocation.
+validate_split_binaries() {
+    local binary profile source_path
+    local binaries=("$WORKER_BIN")
+    if [[ "$MODE" != "worker" ]]; then
+        binaries=("$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN")
+    fi
+    for binary in "${binaries[@]}"; do
+        profile=daemon-release
+        if [[ "$binary" == "$HOOK_BIN" ]]; then
+            profile=wrapper-release
+        fi
+        source_path="$TARGET_DIR/$profile/$binary"
+        if ! validate_binary_source "$source_path"; then
+            error "Source build validation failed for $binary; installation refused before replacing binaries"
+            return 1
         fi
     done
-    if [[ -z "$src" ]]; then
+}
+
+# A021 split-profile installer: resolve NAME only from the requested PROFILE.
+# RABS uses install_rabs_toolset so its launcher and binaries cannot be mixed.
+install_split_binary() {
+    local name="$1" profile="$2" required="$3"
+    local src="$TARGET_DIR/$profile/$name"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
         if [[ "$required" == "required" ]]; then
-            die "Binary not found: $name (looked in $TARGET_DIR/$profile/ and $TARGET_DIR/release/)"
+            error "Binary not found: $name (expected $TARGET_DIR/$profile/$name)"
+            return 1
         fi
         info "Optional binary $name not present; skipping"
         return 0
@@ -820,14 +835,48 @@ install_rabs_toolset() {
     success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr and rabs-cargo-root"
 }
 
+# Bind native source builds and installation to the same output layout. Cargo
+# can otherwise honor build.target-dir/build.target from environment or config
+# while an older executable remains at the installer's guessed profile path.
+configure_source_build_layout() {
+    local project_dir="$1" compiler_version line host_fields=0
+    SOURCE_BUILD_HOST=""
+    if ! compiler_version=$(rustc -vV); then
+        error "Cannot determine native Rust host; source build refused before replacing binaries"
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" == host:* ]]; then
+            host_fields=$((host_fields + 1))
+            SOURCE_BUILD_HOST="${line#host: }"
+        fi
+    done <<< "$compiler_version"
+    if [[ "$host_fields" != 1 ||
+          ! "$SOURCE_BUILD_HOST" =~ ^[A-Za-z0-9_]+(-[A-Za-z0-9_]+){2,}$ ]]; then
+        error "Invalid native Rust host reported by rustc -vV; source build refused before replacing binaries"
+        return 1
+    fi
+
+    SOURCE_BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$project_dir/target}"
+    if [[ "$SOURCE_BUILD_TARGET_DIR" != /* ]]; then
+        SOURCE_BUILD_TARGET_DIR="$project_dir/$SOURCE_BUILD_TARGET_DIR"
+    fi
+    # --target places final artifacts beneath the triple, even for the host.
+    # Keep the base separate so repeated source setup never nests the triple.
+    TARGET_DIR="${SOURCE_BUILD_TARGET_DIR%/}/$SOURCE_BUILD_HOST"
+}
+
 build_rabs_toolset() {
     [[ "${WITH_RABS:-false}" == "true" ]] || return 0
     local project_dir="$1"
     info "Building the requested RABS toolset..."
-    if ! cargo build --locked --profile wrapper-release -p rabs-wrap; then
+    if ! cargo build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap \
+        --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS wrapper build failed; installation stopped"
     fi
-    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; then
+    if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr \
+        --bin rabsd --bin rabs-wkr --bin rabs-cargo-root \
+        --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS daemon/worker build failed; installation stopped"
     fi
     install_rabs_toolset "$project_dir/scripts/install-rabs" --from-build "$TARGET_DIR"
@@ -847,7 +896,7 @@ build_from_source() {
     fi
 
     project_dir=$(cd "$project_dir" && pwd) || return 1
-    cd "$project_dir"
+    cd "$project_dir" || return 1
     if [[ "${VERSION_EXPLICIT:-false}" == "true" ]]; then
         local requested_tag
         requested_tag=$(installer_release_tag "$VERSION") || return 1
@@ -858,23 +907,36 @@ build_from_source() {
     # footprint first), daemon/worker under daemon-release (throughput,
     # symbols retained for crashpacks). RABS is built only when requested and
     # its complete generation must install successfully before reporting success.
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        TARGET_DIR="${CARGO_TARGET_DIR%/}"
-    else
-        TARGET_DIR="$project_dir/target"
-    fi
+    configure_source_build_layout "$project_dir" || return 1
 
     if $USE_GUM; then
-        spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
-        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        if ! spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
+            error "RCH wrapper build failed; existing binaries were not replaced"
+            return 1
+        fi
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
+            error "RCH daemon/worker build failed; existing binaries were not replaced"
+            return 1
+        fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        cargo build --locked --profile wrapper-release -p rch
+        if ! cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
+            error "RCH wrapper build failed; existing binaries were not replaced"
+            return 1
+        fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
+            error "RCH daemon/worker build failed; existing binaries were not replaced"
+            return 1
+        fi
     fi
 
-    build_rabs_toolset "$project_dir"
+    validate_split_binaries || return 1
+    build_rabs_toolset "$project_dir" || return 1
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
@@ -1112,31 +1174,32 @@ clone_and_build_from_source() {
     verify_source_release "$TEMP_DIR/rch" "$source_tag" || return 1
 
     # A021 split profiles (see build_from_source for rationale).
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        TARGET_DIR="${CARGO_TARGET_DIR%/}"
-    else
-        TARGET_DIR="$TEMP_DIR/rch/target"
-    fi
+    configure_source_build_layout "$TEMP_DIR/rch" || return 1
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch; then
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
-        if ! cargo build --locked --profile wrapper-release -p rch; then
+        if ! cargo build --locked --profile wrapper-release -p rch --bin rch \
+            --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr \
+            --bin rchd --bin rch-wkr --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     fi
 
-    build_rabs_toolset "$TEMP_DIR/rch"
+    validate_split_binaries || return 1
+    build_rabs_toolset "$TEMP_DIR/rch" || return 1
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required || return 1

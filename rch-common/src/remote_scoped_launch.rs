@@ -3,27 +3,24 @@
 //! Other protocol users (cancellation, recovery, GC) only load functions.
 //!
 //! A scoped child needs the same identity/policy implementation as its parent.
-//! The quoted heredoc passes these exact sources as data, without installing a
-//! launcher on the worker or resolving a mutable script from a source checkout.
-//! Load that single literal copy for the supervisor and pass the same bytes to
-//! the child. Duplicating it inline exhausts Linux's per-argument limit after
-//! the surrounding execution/ownership/SSH layers quote the launch program.
+//! A quoted assignment passes these exact sources as data, without installing
+//! a launcher or requiring temporary-file space on a full worker. Load that
+//! single literal copy for the supervisor and pass the same bytes to the child.
+//! Duplicating it inline exhausts Linux's per-argument limit after the surrounding
+//! execution/ownership/SSH layers quote the launch program.
 
-/// The heredoc lives in a function body, not inside `$(...)`: bash 3.2 (macOS
-/// `/bin/sh`) scans a substitution's heredoc for the closing paren and fails on
-/// the first `pattern)` arm, which made every script that embeds this protocol
-/// a syntax error on macOS workers. Keep this `concat!` to string literals and
-/// `include_str!` lines only: `tests/remote_scoped_launch.py` re-assembles it.
-/// Only the compile-time literal is evaluated. Policy, environment, arguments
-/// and stdin never supply program text to the bootstrap.
-pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
-    "rch_scope_launch_source() { command cat <<'RCH_SCOPED_LAUNCH_SOURCE_104'\n",
+// Keep these inputs literal: the native Python suites reconstruct their exact
+// expansion and compare it with the compiled constant when Cargo supplies it.
+const LAUNCH_SOURCE: &str = concat!(
     include_str!("remote_process.sh"),
     "\n",
     include_str!("remote_scoped_launch.sh"),
-    "\nRCH_SCOPED_LAUNCH_SOURCE_104\n",
-    "}\n",
-    "rch_launch_source=$(rch_scope_launch_source) || exit 125\n",
+);
+const BOOTSTRAP_PREFIX: &str = "rch_literal_bang=\"!\"\nrch_launch_source=\"";
+const BANG_EXPANSION: &str = "${rch_literal_bang}";
+const BOOTSTRAP_SUFFIX: &str = concat!(
+    "\"\n",
+    "unset rch_literal_bang\n",
     "command eval \"$rch_launch_source\" || exit 125\n",
     "\nif [ \"$0\" = rch-build ]; then\n",
     "    rch_launch_platform=$(uname -s) || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
@@ -33,9 +30,81 @@ pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
     "fi\n",
 );
 
+const fn protocol_length() -> usize {
+    let source = LAUNCH_SOURCE.as_bytes();
+    let mut length = BOOTSTRAP_PREFIX.len() + source.len() + BOOTSTRAP_SUFFIX.len();
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] == b'!' {
+            length += BANG_EXPANSION.len() - 1;
+        } else if matches!(source[index], b'\\' | b'"' | b'$' | b'`') {
+            length += 1;
+        }
+        index += 1;
+    }
+    length
+}
+
+const PROTOCOL_LENGTH: usize = protocol_length();
+
+const fn compile_protocol() -> [u8; PROTOCOL_LENGTH] {
+    let source = LAUNCH_SOURCE.as_bytes();
+    let mut output = [0; PROTOCOL_LENGTH];
+    let mut written = 0;
+    let mut index = 0;
+    while index < BOOTSTRAP_PREFIX.len() {
+        output[written] = BOOTSTRAP_PREFIX.as_bytes()[index];
+        written += 1;
+        index += 1;
+    }
+    index = 0;
+    while index < source.len() {
+        let byte = source[index];
+        if byte == b'!' {
+            let mut bang_index = 0;
+            while bang_index < BANG_EXPANSION.len() {
+                output[written] = BANG_EXPANSION.as_bytes()[bang_index];
+                written += 1;
+                bang_index += 1;
+            }
+        } else {
+            if matches!(byte, b'\\' | b'"' | b'$' | b'`') {
+                output[written] = b'\\';
+                written += 1;
+            }
+            output[written] = byte;
+            written += 1;
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < BOOTSTRAP_SUFFIX.len() {
+        output[written] = BOOTSTRAP_SUFFIX.as_bytes()[index];
+        written += 1;
+        index += 1;
+    }
+    output
+}
+
+const PROTOCOL_BYTES: [u8; PROTOCOL_LENGTH] = compile_protocol();
+
+/// Bootstrap from literal bytes without a disk-backed heredoc. Bash can spill
+/// even a quoted heredoc to /tmp, regardless of an unavailable TMPDIR, so the
+/// old bootstrap prevented cancellation before its diskless census could run.
+/// Double quoting keeps nested transport below the existing argument budget;
+/// escaping every expansion character prevents any source from running early.
+/// A fixed internal variable supplies `!` bytes, whose shell-escape transport
+/// encoding would otherwise amplify beyond that budget after four layers.
+/// Only the compile-time literal is evaluated. Policy, environment, arguments
+/// and stdin never supply program text to the bootstrap.
+pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = match std::str::from_utf8(&PROTOCOL_BYTES) {
+    Ok(protocol) => protocol,
+    Err(_) => panic!("quoted worker protocol must remain UTF-8"),
+};
+
 #[cfg(test)]
 mod tests {
-    use super::REMOTE_PROCESS_IDENTITY_SCRIPT;
+    use super::{LAUNCH_SOURCE, REMOTE_PROCESS_IDENTITY_SCRIPT};
 
     /// Workers run this under their own `sh`: dash on Linux, bash 3.2 on
     /// macOS. A parse error here breaks every remote launch, cancellation,
@@ -59,16 +128,20 @@ mod tests {
         // Keep space for that tail, the payload, and enclosing launch wrappers.
         let quoted = shell_escape::escape(REMOTE_PROCESS_IDENTITY_SCRIPT.into());
         assert!(quoted.len() < 110_000);
-        for source in [
-            include_str!("remote_process.sh"),
-            include_str!("remote_scoped_launch.sh"),
-        ] {
-            assert!(
-                !source
-                    .lines()
-                    .any(|line| line == "RCH_SCOPED_LAUNCH_SOURCE_104")
-            );
-        }
+    }
+
+    #[test]
+    fn bootstrap_preserves_the_complete_literal_source() {
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("{REMOTE_PROCESS_IDENTITY_SCRIPT}\nprintf '%s' \"$rch_launch_source\""),
+            ])
+            .output()
+            .expect("read the quoted protocol source");
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, LAUNCH_SOURCE.as_bytes());
     }
 
     #[test]

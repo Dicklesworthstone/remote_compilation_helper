@@ -825,9 +825,18 @@ mod linux {
             .as_ref()
             .map(|completed| &completed.attestation.state);
         verify_baseline(request, &before, prior_state)?;
-        let allow_cache_hit = prior_state.is_some_and(|state| {
-            state.input_fingerprint == inputs.fingerprint.hash
-                && state.package_manager == plan.manager_name()
+        // Frozen resolution does not close lifecycle-script inputs: an
+        // installer can read any selected source file or directory. Reuse
+        // requires that exact namespace, not only the manifest/lock stamp.
+        // Keep attempt/build/owner identities out of this comparison so an
+        // unchanged selection can still receive a fresh retained attestation.
+        // The old inventory remains ownership evidence above even when these
+        // inputs change; only a completed installer may publish its successor.
+        let allow_cache_hit = previous.as_ref().is_some_and(|completed| {
+            completed.request.files == request.files
+                && completed.request.directories == request.directories
+                && completed.attestation.state.input_fingerprint == inputs.fingerprint.hash
+                && completed.attestation.state.package_manager == plan.manager_name()
         });
         transaction.record(RUNNING)?;
         let report = installer::prepare_proven_node(

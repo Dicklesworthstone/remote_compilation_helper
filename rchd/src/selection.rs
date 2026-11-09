@@ -2571,6 +2571,7 @@ impl WorkerSelector {
             // hard exclusion that must not reach even the fail-open lists. A
             // degraded candidate has to earn its place like any other.
             let mut undersized_but_free = false;
+            let mut waiting_for_slots = false;
             let total_slots = worker.effective_total_slots().await;
             let available_slots = worker.available_slots().await;
             // Preserve the disk-specific gate/audit reason when derating has
@@ -2626,12 +2627,11 @@ impl WorkerSelector {
                         continue;
                     }
                 } else {
-                    filtered_by_slots += 1;
-                    debug!(
-                        "Worker {} excluded: insufficient free slots (available={}, total={}, requested={})",
-                        worker_id, available_slots, total_slots, request.estimated_cores
-                    );
-                    continue;
+                    // A busy worker is worth waiting for only if it can run
+                    // this request once its slots free. Check the remaining
+                    // hard gates before letting it suppress a usable smaller
+                    // worker or make an explicitly pinned request queue.
+                    waiting_for_slots = true;
                 }
             }
 
@@ -2888,6 +2888,15 @@ impl WorkerSelector {
             if hard_preflight_block {
                 metrics::inc_reliability_error("selection", "preflight_blocked");
                 filtered_by_hard_preflight += 1;
+                continue;
+            }
+
+            if waiting_for_slots {
+                filtered_by_slots += 1;
+                debug!(
+                    "Worker {} excluded: insufficient free slots (available={}, total={}, requested={})",
+                    worker_id, available_slots, total_slots, request.estimated_cores
+                );
                 continue;
             }
 
@@ -10110,6 +10119,113 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+    }
+
+    #[tokio::test]
+    async fn busy_worker_with_hard_failure_does_not_strand_usable_capacity() {
+        let _guard = test_guard!();
+        for job_mode in [false, true] {
+            for blocker in ["topology", "critical", "reliability"] {
+                let pool = WorkerPool::new();
+                for (id, slots) in [("busy", 8), ("small", 2)] {
+                    let worker = make_worker(id, slots, 80.0);
+                    prepare_fixture_worker(
+                        &worker,
+                        Some("1.97.0-nightly"),
+                        PressureState::Healthy,
+                        "healthy",
+                    )
+                    .await;
+                    pool.add_worker_state(worker).await;
+                }
+                let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+                assert!(busy.reserve_slots(8).await);
+                let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
+                let mut request = SelectionRequest {
+                    source_topology: None,
+                    disk_observation_version: 0,
+                    job_mode,
+                    project: "busy-hard-failure".to_string(),
+                    command: Some("cargo build".to_string()),
+                    command_priority: CommandPriority::Normal,
+                    estimated_cores: 4,
+                    disk_headroom_gib: 0,
+                    preferred_workers: vec![],
+                    toolchain: None,
+                    required_runtime: RequiredRuntime::Rust,
+                    classification_duration_us: None,
+                    hook_pid: None,
+                    required_tools: Vec::new(),
+                };
+
+                // Waiting is useful while the full-size worker can run this
+                // build after its existing owner finishes.
+                assert_eq!(
+                    selector.select(&pool, &request).await.reason,
+                    SelectionReason::AllWorkersBusy
+                );
+                match blocker {
+                    "topology" => {
+                        let mut capabilities = busy.capabilities().await;
+                        capabilities.projects_root_ok = Some(false);
+                        busy.set_capabilities(capabilities).await;
+                    }
+                    "critical" => {
+                        // Another pressure signal can be critical even with
+                        // ample build-disk space and a nonzero slot ceiling.
+                        let mut pressure = busy.pressure_assessment().await;
+                        pressure.state = PressureState::Critical;
+                        pressure.memory_pressure = Some(95.0);
+                        busy.set_pressure_assessment(pressure).await;
+                    }
+                    "reliability" => {
+                        let mut reliability = ReliabilityAggregator::new(ReliabilityConfig {
+                            weights: process_only_weights(),
+                            quarantine_threshold: 0.05,
+                            ..ReliabilityConfig::default()
+                        });
+                        reliability.set_remediation(
+                            seeded_remediation_pipeline("busy", &[2001, 2002]).await,
+                        );
+                        selector.set_reliability(Arc::new(reliability));
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(busy.effective_total_slots().await, 8);
+
+                // Releasing CPU slots cannot repair these hard failures. The
+                // healthy smaller worker must remain usable in both previews
+                // and live hook/job selection, without changing ownership.
+                for result in [
+                    selector
+                        .preview_with_exclusions(&pool, &request, &HashSet::new())
+                        .await,
+                    selector.select(&pool, &request).await,
+                ] {
+                    let worker = result.worker.unwrap_or_else(|| {
+                        panic!(
+                            "job_mode={job_mode}, blocker={blocker}: {:?}",
+                            result.reason
+                        )
+                    });
+                    assert_eq!(worker.config.read().await.id.as_str(), "small");
+                    assert_eq!(worker.used_slots(), 0);
+                }
+                assert_eq!(busy.used_slots(), 8);
+
+                // An explicit pin cannot escape to the smaller worker, but
+                // must report the hard refusal instead of queueing for slots
+                // that would still leave the requested worker inadmissible.
+                request.preferred_workers = vec![WorkerId::new("busy")];
+                let result = selector.select(&pool, &request).await;
+                assert!(result.worker.is_none());
+                assert_ne!(
+                    result.reason,
+                    SelectionReason::AllWorkersBusy,
+                    "job_mode={job_mode}, blocker={blocker}"
+                );
+            }
+        }
     }
 
     // =========================================================================

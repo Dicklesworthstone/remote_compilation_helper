@@ -497,6 +497,58 @@ class PrepareTransactions(unittest.TestCase):
                 self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
                 self.assertEqual(self.invocations(state), ["npm", "1", "ci"] * 2)
 
+    def test_package_manager_configuration_changes_invalidate_the_cached_install(self):
+        cases = [(".yarnrc", "yarn.lock", "yarn"),
+                 (".yarnrc.yml", "yarn.lock", "yarn"),
+                 (".pnpmfile.cjs", "pnpm-lock.yaml", "pnpm"),
+                 (".pnpmfile.mjs", "pnpm-lock.yaml", "pnpm")]
+        for index, (name, lock, manager) in enumerate(cases):
+            with self.subTest(name=name):
+                project, state = self.project(f"manager-config-{index}", lock=lock)
+                options = dict(manager=manager, plan="frozen")
+                original = {path: (project / path).read_bytes()
+                            for path in ("package.json", lock)}
+                previous = self.report(self.start(project, state, **options), 0)
+                self.assertEqual(previous["action"], "Installed")
+                self.assertEqual(self.report(self.start(project, state, **options), 0)["action"], "Skipped")
+                for operation in ("add", "edit", "remove"):
+                    with self.subTest(operation=operation):
+                        path = project / name
+                        if operation == "remove":
+                            path.rename(state / "retained-configuration")
+                        else:
+                            path.write_text(operation + " configuration\n")
+                        self.assertEqual(original, {path: (project / path).read_bytes()
+                                                    for path in original})
+                        current = self.report(self.start(project, state, **options), 0)
+                        self.assertEqual(current["action"], "Installed")
+                        self.assertNotEqual(current["fingerprint"]["hash"], previous["fingerprint"]["hash"])
+                        self.assertEqual(current["fingerprint_changed_from"], previous["fingerprint"]["hash"])
+                        self.assertEqual(name in current["fingerprint"]["sources"], operation != "remove")
+                        self.assertEqual(self.report(self.start(project, state, **options), 0)["action"], "Skipped")
+                        previous = current
+                self.assertEqual(self.events(state), ["install"] * 4)
+                self.assertEqual(self.invocations(state), [manager, "2", "install", "--frozen-lockfile"] * 4)
+
+    def test_package_manager_configuration_added_during_install_keeps_the_fence(self):
+        cases = [(".yarnrc", "yarn.lock", "yarn"),
+                 (".yarnrc.yml", "yarn.lock", "yarn"),
+                 (".pnpmfile.cjs", "pnpm-lock.yaml", "pnpm"),
+                 (".pnpmfile.mjs", "pnpm-lock.yaml", "pnpm")]
+        for index, (name, lock, manager) in enumerate(cases):
+            with self.subTest(name=name):
+                project, state = self.project(f"manager-config-race-{index}", lock=lock)
+                options = dict(manager=manager, plan="frozen")
+                child = self.start(project, state, mode="blocked", **options)
+                eventually(lambda: (state / "started").exists(), "installer did not start")
+                (project / name).write_text("changed during installation\n")
+                (state / "release").write_text("release\n")
+                self.assertEqual(self.report(child, 1)["action"], "Failed")
+                self.assertEqual(self.report(self.start(project, state, **options), 1)["action"], "Failed")
+                self.assertEqual(self.events(state), ["install"], "uncertain inputs must not authorize reuse or another installer")
+                journal = [path for path in self.journals() if path.read_bytes() == RUNNING]
+                self.assertEqual(len(journal), index + 1)
+
     def test_conflicting_locks_are_refused_before_running_and_can_be_corrected(self):
         project, state = self.project("conflicting")
         extra = project / "bun.lock"
@@ -619,7 +671,8 @@ class PrepareTransactions(unittest.TestCase):
         self.assertEqual(self.events(state), ["install"])
 
     def test_changed_manifest_or_lock_cannot_be_certified_by_the_install(self):
-        for index, name in enumerate(("package.json", "package-lock.json", "npm-shrinkwrap.json", ".npmrc")):
+        for index, name in enumerate(("package.json", "package-lock.json", "npm-shrinkwrap.json", ".npmrc",
+                                     ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs")):
             with self.subTest(name=name):
                 project, state = self.project(f"changed-{index}")
                 if not (project / name).exists():
@@ -636,7 +689,8 @@ class PrepareTransactions(unittest.TestCase):
                 self.assertEqual(self.events(state), ["install"])
 
     def test_special_input_and_cache_files_fail_before_an_installer_starts(self):
-        for index, name in enumerate(("package.json", ".rch_dep_fingerprint.json", "npm-shrinkwrap.json", ".npmrc")):
+        for index, name in enumerate(("package.json", ".rch_dep_fingerprint.json", "npm-shrinkwrap.json", ".npmrc",
+                                     ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs")):
             with self.subTest(name=name):
                 project, state = self.project(f"special-{index}")
                 path = project / name

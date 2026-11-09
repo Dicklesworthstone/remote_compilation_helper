@@ -269,6 +269,94 @@ class PreparedOutputs(fixture.PrepareTransactions):
         self.assertNotEqual(second["state"]["input_fingerprint"], first["state"]["input_fingerprint"])
         self.assertEqual(self.events(state), ["install", "install"])
 
+    def test_selected_lifecycle_input_change_reinstalls_before_new_attestation(self):
+        project, state = self.project("lifecycle-input")
+        (project / "package.json").write_text(
+            '{"name":"fixture","scripts":{"postinstall":"sh prepare-dependency.sh"}}'
+        )
+        script = project / "prepare-dependency.sh"
+        script.write_text("printf 'first generation\\n' > node_modules/lifecycle-output\n")
+        # The manager is a deterministic fixture. Its lifecycle script, file
+        # writes, worker transaction and output attestation are real execution.
+        # No registry or package-manager implementation is being qualified.
+        (self.bin / "npm").write_text(fixture.NPM + "\nsh ./prepare-dependency.sh\n")
+        paths = ["package.json", "package-lock.json", "prepare-dependency.sh"]
+        request = self.request(project, paths)
+        first = self.accepted(self.proof(project, state, request))
+        output = project / "node_modules/lifecycle-output"
+        self.assertEqual(output.read_bytes(), b"first generation\n")
+        self.assertEqual(first["disposition"], "fresh")
+
+        # A new attempt with identical selected inputs still reuses the
+        # completed inventory without executing the installer twice.
+        unchanged = self.request(project, paths, attempt="unchanged-input-attempt")
+        retained = self.accepted(self.proof(project, state, unchanged))
+        self.assertEqual(retained["disposition"], "retained")
+        self.assertEqual(self.events(state), ["install"])
+
+        # The lockfile and manifests are unchanged. The old fingerprint alone
+        # cannot prove the lifecycle script will produce the same dependencies.
+        script.write_text("printf 'second generation\\n' > node_modules/lifecycle-output\n")
+        current = self.request(project, paths, attempt="changed-script-attempt")
+        current["source_content_root"] = "c" * 64
+        self.assertEqual(
+            self.accepted(self.proof(project, state, current, mode="inspect")),
+            retained["state"],
+            "old output ownership must remain usable for a fresh frozen install",
+        )
+        refreshed = self.accepted(self.proof(project, state, current))
+        self.assertEqual(refreshed["disposition"], "fresh")
+        self.assertEqual(output.read_bytes(), b"second generation\n")
+        self.assertEqual(self.events(state), ["install", "install"])
+        self.assertEqual(
+            refreshed["state"]["input_fingerprint"], first["state"]["input_fingerprint"],
+            "this regression must keep the old manifest/lock fingerprint unchanged",
+        )
+        self.assertNotEqual(
+            refreshed["state"]["inventory_digest"], first["state"]["inventory_digest"]
+        )
+        completed = json.loads(self.completed_records()[0].read_bytes())
+        self.assertEqual(completed["request"], current)
+        self.assertEqual(completed["attestation"], refreshed)
+        self.assertEqual(self.journals()[0].read_bytes(), fixture.IDLE)
+
+    def test_selected_directory_change_refreshes_lifecycle_outputs(self):
+        project, state = self.project("lifecycle-directory")
+        (project / "package.json").write_text(
+            '{"name":"fixture","scripts":{"postinstall":"sh prepare-dependency.sh"}}'
+        )
+        script = project / "prepare-dependency.sh"
+        script.write_text(
+            "if [ -d optional-input ]; then\n"
+            "    printf 'directory present\\n' > node_modules/lifecycle-output\n"
+            "else\n"
+            "    printf 'directory absent\\n' > node_modules/lifecycle-output\n"
+            "fi\n"
+        )
+        (self.bin / "npm").write_text(fixture.NPM + "\nsh ./prepare-dependency.sh\n")
+        paths = ["package.json", "package-lock.json", "prepare-dependency.sh"]
+        request = self.request(project, paths)
+        initial = self.accepted(self.proof(project, state, request))
+        output = project / "node_modules/lifecycle-output"
+        self.assertEqual(output.read_bytes(), b"directory absent\n")
+
+        (project / "optional-input").mkdir()
+        current = self.request(project, paths, attempt="changed-directory-attempt")
+        current["directories"] = ["optional-input"]
+        current["source_content_root"] = "d" * 64
+        self.assertEqual(request["files"], current["files"])
+        self.assertEqual(
+            self.accepted(self.proof(project, state, current, mode="inspect")),
+            initial["state"],
+        )
+        refreshed = self.accepted(self.proof(project, state, current))
+        self.assertEqual(refreshed["disposition"], "fresh")
+        self.assertEqual(output.read_bytes(), b"directory present\n")
+        self.assertEqual(self.events(state), ["install", "install"])
+        self.assertEqual(
+            refreshed["state"]["input_fingerprint"], initial["state"]["input_fingerprint"]
+        )
+
     def test_interrupted_install_cannot_publish_or_reuse_completed_state(self):
         project, state = self.project("interrupted")
         request = self.request(project)
