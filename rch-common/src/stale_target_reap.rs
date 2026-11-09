@@ -419,6 +419,9 @@ fn checked_source_recent_activity(
 /// claim remains after SIGKILL/OOM too; only completed child activity permits
 /// retirement, and an interrupted removal stays unavailable for inspection.
 /// Defines `__gc_source_begin` and `__gc_source_end` for the production registry.
+/// `__gc_source_inspect` is an advisory read-only check: it neither creates a
+/// registry nor repairs records or publishes a GC claim. Deletion still needs
+/// a successful begin and checked end around the entire mutation.
 /// A caller must check end after every successful begin, before leaving the
 /// candidate interval. Returning this fragment alone acquires no ownership.
 /// Begin returns 0 with ownership held, 1 for a verified ownership hold, 2 for
@@ -498,6 +501,7 @@ __gc_source_records_free() {
     for __gc_record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
         [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
         if ! rch_claim_record_valid "$__gc_record"; then
+            [ "${2-}" != read-only ] || return 2;
             rch_claim_quarantine_pending "$__gc_source_registry" "$__gc_record" || return 2;
             continue;
         fi;
@@ -542,6 +546,47 @@ __gc_source_records_free() {
             done < "$__gc_record";
         done;
     fi;
+};
+__gc_source_inspect() {
+    __gc_reservation="";
+    [ ! -L "$1" ] && [ -d "$1" ] || return 2;
+    [ ! -L "$__gc_source_registry" ] || return 2;
+    [ ! -L "$__gc_source_registry/metadata.lock" ] || return 2;
+    __gc_inspection_lock=0;
+    if [ -d "$__gc_source_registry" ]; then
+        [ -r "$__gc_source_registry" ] && [ -x "$__gc_source_registry" ] || return 2;
+        [ -f "$__gc_source_registry/metadata.lock" ] || return 2;
+        exec 8<"$__gc_source_registry/metadata.lock" || return 2;
+        if ! flock -s 8; then exec 8>&-; return 2; fi;
+        __gc_inspection_lock=1;
+    elif [ -e "$__gc_source_registry" ]; then
+        return 2;
+    else
+        # Distinguish an absent registry from an unsearchable parent. Preview
+        # may observe absence; apply must still acquire the real transaction.
+        __gc_parent=${__gc_source_registry%/*};
+        while [ ! -e "$__gc_parent" ] && [ ! -L "$__gc_parent" ]; do
+            [ "$__gc_parent" != / ] && [ -n "$__gc_parent" ] || return 2;
+            __gc_parent=${__gc_parent%/*};
+            [ -n "$__gc_parent" ] || __gc_parent=/;
+        done;
+        [ -d "$__gc_parent" ] && [ -x "$__gc_parent" ] || return 2;
+    fi;
+    __gc_inspection_status=0;
+    if __gc_source_records_free "$1" read-only; then
+        if rch_retained_source_gc_hold "$__gc_candidate"; then
+            __gc_inspection_status=3;
+        else
+            __gc_retention_status=$?;
+            [ "$__gc_retention_status" -eq 1 ] || __gc_inspection_status=2;
+        fi;
+    else
+        __gc_records_status=$?;
+        if [ "$__gc_records_status" -eq 3 ]; then __gc_inspection_status=1;
+        else __gc_inspection_status=2; fi;
+    fi;
+    if [ "$__gc_inspection_lock" -eq 1 ]; then exec 8>&-; fi;
+    return "$__gc_inspection_status";
 };
 __gc_source_end() {
     if [ -n "${__gc_reservation-}" ]; then
@@ -882,6 +927,14 @@ fn gate_snapshot_fragment() -> String {
 fn gate_snapshot_cleanup() -> &'static str {
     "if [ -n \"$__held\" ]; then rm -f \"$__held\"; fi; \
      if [ -n \"$__proc\" ]; then rm -f \"$__proc\"; fi; "
+}
+
+/// The same fail-closed descriptor/cwd and process-argument observations used
+/// by worker GC. Local staging cleanup takes these snapshots after acquiring
+/// its source claim, and must run the returned cleanup after the observation.
+/// The fragment defines `__gc_handles`, `__gc_procs`, and `__gc_gates_ok`.
+pub fn gc_liveness_guard_fragments() -> (String, &'static str) {
+    (gate_snapshot_fragment(), gate_snapshot_cleanup())
 }
 
 /// Gate prefix for a POOLED-dir reap loop body, given that pass's idle window.

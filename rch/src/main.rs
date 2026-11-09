@@ -1593,8 +1593,9 @@ enum CacheAction {
     ///
     /// Safe by default: a bare `rch cache clean` is a DRY RUN that only reports
     /// what would be removed. Pass `--execute` to actually delete. Trees
-    /// modified within `--older` are kept (an in-flight build keeps its tree
-    /// fresh), and every path is validated as a safe reap path before removal.
+    /// modified within `--older`, source/recovery custody, and live process
+    /// references are kept. Execution rechecks ownership and the observed
+    /// directory identities before removal.
     Clean {
         /// Only prune trees idle at least this long (e.g. `30m`, `24h`, `7d`).
         #[arg(long, value_name = "DURATION", default_value = "24h")]
@@ -4413,7 +4414,10 @@ async fn handle_cache_clean(
             cache_gc::enumerate_staging_trees(base, project.as_deref(), now).map_err(|e| {
                 anyhow::anyhow!("failed to enumerate staging trees under {base:?}: {e}")
             })?;
-        let plan = cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, base);
+        let plan = cache_gc::inspect_staging_gc_plan(
+            cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, base),
+            base,
+        );
         if execute {
             let o = cache_gc::execute_staging_gc(&plan, base);
             outcome.removed_count += o.removed_count;
@@ -4464,6 +4468,14 @@ async fn handle_cache_clean(
                 cache_gc::human_bytes(e.size_bytes),
                 e.age_secs
             );
+        }
+        for entry in combined.entries.iter().filter(|entry| {
+            !matches!(
+                entry.action,
+                cache_gc::GcAction::Prune | cache_gc::GcAction::KeepRecent
+            )
+        }) {
+            println!("  keep {} ({})", entry.path, entry.reason);
         }
         println!("  {} pass --execute to actually delete", style.muted("→"));
     }

@@ -182,9 +182,12 @@ pub(super) const INPUT_NAMES: &[&str] = &[
 
 pub(super) fn fingerprint_hasher() -> Hasher {
     let mut hasher = Hasher::new();
-    // Root-only stamps cannot prove the workspace manifests were unchanged.
-    // Retain locked-manager selection and invalidate pre-workspace stamps.
-    hasher.update(b"rch-dependency-install-v3\0");
+    // Prior stamps can describe outputs retained across changed selected
+    // lifecycle inputs, a skipped pnpm lifecycle, or changed install settings
+    // such as NODE_ENV and npm_config_omit that were absent from their keys.
+    // Invalidate their reuse authority while preserving the completed output
+    // inventory as ownership evidence for one new frozen installation.
+    hasher.update(b"rch-dependency-install-v5\0");
     hasher
 }
 
@@ -706,6 +709,16 @@ async fn prepare_node_like(
     installer
         .args(&cmd[1..])
         .stdout(log_file.try_clone().context("clone install log handle")?);
+    if pm == PackageManager::Pnpm {
+        // RCH has already decided an install is required. pnpm's separate
+        // manifest-only repeat shortcut can otherwise skip root/workspace
+        // lifecycle scripts after their selected source inputs changed.
+        // Keep frozen argv and script-trust policy intact. Remove the other
+        // accepted spelling so an inherited value cannot override this one.
+        installer
+            .env_remove("pnpm_config_optimistic_repeat_install")
+            .env("PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL", "false");
+    }
     let mut child = installer
         .current_dir(project_root)
         .stderr(log_file)
