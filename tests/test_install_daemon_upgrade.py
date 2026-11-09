@@ -450,6 +450,158 @@ download_binaries
         self.assertEqual((self.case / "rch-wkr").read_bytes(),
                          (self.bundle / "rch-wkr").read_bytes())
 
+    def test_failed_source_build_cannot_install_retained_outputs_in_checked_call(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        for profile in ("wrapper-release", "daemon-release"):
+            for gum in ("false", "true"):
+                with self.subTest(profile=profile, gum=gum):
+                    result = self.run_installer(
+                        REAL_INSTALL_HELPERS + r'''
+USE_GUM=$RCH_TEST_USE_GUM
+cargo() {
+    trace "cargo $*"
+    if [[ "$*" == *"--profile $RCH_TEST_FAIL_PROFILE "* ]]; then
+        printf 'injected compiler failure\n' >&2
+        return 17
+    fi
+}
+spin() { shift; "$@"; }
+build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }
+if build_from_source; then
+    trace UNEXPECTED-build-success
+else
+    trace source-build-refused
+fi
+''', RCH_TEST_FAIL_PROFILE=profile, RCH_TEST_USE_GUM=gum,
+                    )
+                    self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                    self.assertIn("injected compiler failure", result.stderr)
+                    self.assertIn("source-build-refused", self.events())
+                    self.assertNotIn("UNEXPECTED-build-success", self.events())
+                    self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+                    self.assert_installed_binaries_preserved(original)
+
+    def test_incomplete_source_toolset_preserves_every_installed_binary(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        for name, profile in (("rch", "wrapper-release"),
+                               ("rchd", "daemon-release"),
+                               ("rch-wkr", "daemon-release")):
+            with self.subTest(missing=name):
+                path = Path(self.env["CARGO_TARGET_DIR"]) / profile / name
+                retained = path.with_name(name + ".retained")
+                path.rename(retained)
+                try:
+                    result = self.run_installer(
+                        REAL_INSTALL_HELPERS + '\ncargo() { trace "cargo $*"; }\n'
+                        'build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }\n'
+                        'build_from_source\n'
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
+                    self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+                    self.assert_installed_binaries_preserved(original)
+                finally:
+                    retained.rename(path)
+
+    def test_source_upgrade_refuses_legacy_profile_fallback(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        target = Path(self.env["CARGO_TARGET_DIR"])
+        (target / "release").mkdir()
+        hook = target / "wrapper-release/rch"
+        hook.rename(target / "release/rch")
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\ncargo() { trace "cargo $*"; }\n'
+            'build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }\n'
+            'build_from_source\n'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wrapper-release", result.stderr)
+        self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+        self.assert_installed_binaries_preserved(original)
+
+    def test_unusable_source_hook_is_refused_before_any_activation(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        hook = Path(self.env["CARGO_TARGET_DIR"]) / "wrapper-release/rch"
+        for kind in ("empty", "not-executable", "symlink", "directory"):
+            with self.subTest(kind=kind):
+                hook.rename(hook.with_name("rch.before-" + kind))
+                if kind == "empty":
+                    hook.write_bytes(b"")
+                    hook.chmod(0o755)
+                elif kind == "not-executable":
+                    hook.write_bytes((self.bundle / "rch").read_bytes())
+                    hook.chmod(0o644)
+                elif kind == "symlink":
+                    hook.symlink_to(self.bundle / "rch")
+                else:
+                    hook.mkdir()
+                result = self.run_installer(
+                    REAL_INSTALL_HELPERS + '\ncargo() { trace "cargo $*"; }\n'
+                    'build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }\n'
+                    'build_from_source\n'
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("rch", result.stderr)
+                self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+                self.assert_installed_binaries_preserved(original)
+
+    def test_cloned_source_validates_core_toolset_before_rabs_activation(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        hook = Path(self.env["CARGO_TARGET_DIR"]) / "wrapper-release/rch"
+        hook.rename(hook.with_name("rch.retained"))
+        project = self.case / "source"
+        project.mkdir()
+        (project / "Cargo.toml").write_text("# installer source fixture\n")
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + r'''
+VERSION=2.1.35
+cargo() { trace "cargo $*"; }
+git() {
+    if [[ "$1" == clone ]]; then
+        cp -R "$RCH_TEST_SOURCE" "$TEMP_DIR/rch"
+    elif [[ "$1" == -C && "$3" == rev-parse ]]; then
+        printf 'fixture-release\n'
+    elif [[ "$1" != -C || "$3" != status ]]; then
+        return 97
+    fi
+}
+build_rabs_toolset() { trace UNEXPECTED-rabs-activation; }
+clone_and_build_from_source
+''', RCH_TEST_SOURCE=str(project),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wrapper-release", result.stderr)
+        self.assertNotIn("UNEXPECTED-rabs-activation", self.events())
+        self.assert_installed_binaries_preserved(original)
+
+    def test_source_worker_mode_validates_only_the_worker_selection(self):
+        self.prepare_upgrade()
+        self.prepare_split_build()
+        original = self.preserve_installed_binaries()
+        target = Path(self.env["CARGO_TARGET_DIR"])
+        for relative in ("wrapper-release/rch", "daemon-release/rchd"):
+            path = target / relative
+            path.rename(path.with_name(path.name + ".retained"))
+        result = self.run_installer(
+            REAL_INSTALL_HELPERS + '\nMODE=worker\n'
+            'cargo() { trace "cargo $*"; }\nbuild_from_source\n'
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual((self.case / "rch-wkr").read_bytes(),
+                         (self.bundle / "rch-wkr").read_bytes())
+        self.assert_installed_binaries_preserved(
+            {name: value for name, value in original.items() if name != "rch-wkr"})
+
     def test_download_upgrade_verifies_archive_and_drains_before_client_swap(self):
         self.prepare_upgrade()
         result = self.run_installer(

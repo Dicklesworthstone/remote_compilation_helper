@@ -722,22 +722,37 @@ install_binary_file() {
     fi
 }
 
-# A021 split-profile installer: resolve NAME built under PROFILE, falling back
-# to the legacy single-profile target/release layout. Required binaries abort
-# the install when missing; optional ones are skipped with a note. RABS uses
-# install_rabs_toolset instead so its launcher and binaries cannot be mixed.
-install_split_binary() {
-    local name="$1" profile="$2" required="$3"
-    local candidate src=""
-    for candidate in "$TARGET_DIR/$profile/$name" "$TARGET_DIR/release/$name"; do
-        if [[ -f "$candidate" ]]; then
-            src="$candidate"
-            break
+# Validate the complete source-built selection before activating RABS or
+# replacing any core binary. These paths must match the profiles we just built:
+# a retained target/release binary is not an output of either Cargo invocation.
+validate_split_binaries() {
+    local binary profile source_path
+    local binaries=("$WORKER_BIN")
+    if [[ "$MODE" != "worker" ]]; then
+        binaries=("$DAEMON_BIN" "$WORKER_BIN" "$HOOK_BIN")
+    fi
+    for binary in "${binaries[@]}"; do
+        profile=daemon-release
+        if [[ "$binary" == "$HOOK_BIN" ]]; then
+            profile=wrapper-release
+        fi
+        source_path="$TARGET_DIR/$profile/$binary"
+        if ! validate_binary_source "$source_path"; then
+            error "Source build validation failed for $binary; installation refused before replacing binaries"
+            return 1
         fi
     done
-    if [[ -z "$src" ]]; then
+}
+
+# A021 split-profile installer: resolve NAME only from the requested PROFILE.
+# RABS uses install_rabs_toolset so its launcher and binaries cannot be mixed.
+install_split_binary() {
+    local name="$1" profile="$2" required="$3"
+    local src="$TARGET_DIR/$profile/$name"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
         if [[ "$required" == "required" ]]; then
-            die "Binary not found: $name (looked in $TARGET_DIR/$profile/ and $TARGET_DIR/release/)"
+            error "Binary not found: $name (expected $TARGET_DIR/$profile/$name)"
+            return 1
         fi
         info "Optional binary $name not present; skipping"
         return 0
@@ -847,7 +862,7 @@ build_from_source() {
     fi
 
     project_dir=$(cd "$project_dir" && pwd) || return 1
-    cd "$project_dir"
+    cd "$project_dir" || return 1
     if [[ "${VERSION_EXPLICIT:-false}" == "true" ]]; then
         local requested_tag
         requested_tag=$(installer_release_tag "$VERSION") || return 1
@@ -865,16 +880,29 @@ build_from_source() {
     fi
 
     if $USE_GUM; then
-        spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
-        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        if ! spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch; then
+            error "RCH wrapper build failed; existing binaries were not replaced"
+            return 1
+        fi
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+            error "RCH daemon/worker build failed; existing binaries were not replaced"
+            return 1
+        fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        cargo build --locked --profile wrapper-release -p rch
+        if ! cargo build --locked --profile wrapper-release -p rch; then
+            error "RCH wrapper build failed; existing binaries were not replaced"
+            return 1
+        fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
+            error "RCH daemon/worker build failed; existing binaries were not replaced"
+            return 1
+        fi
     fi
 
-    build_rabs_toolset "$project_dir"
+    validate_split_binaries || return 1
+    build_rabs_toolset "$project_dir" || return 1
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
@@ -1136,7 +1164,8 @@ clone_and_build_from_source() {
         fi
     fi
 
-    build_rabs_toolset "$TEMP_DIR/rch"
+    validate_split_binaries || return 1
+    build_rabs_toolset "$TEMP_DIR/rch" || return 1
 
     if [[ "$MODE" == "worker" ]]; then
         install_split_binary "$WORKER_BIN" "daemon-release" required || return 1
