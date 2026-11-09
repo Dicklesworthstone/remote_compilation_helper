@@ -2889,7 +2889,9 @@ async fn handle_select_worker_mode(
         request: &SelectionRequest,
         local_wrapper_id: Option<String>,
         waiter: Option<&QueuedWaiterClaim>,
+        queue_candidates: &mut std::collections::HashSet<String>,
     ) -> Result<SelectionResponse> {
+        queue_candidates.clear();
         let source_topology = ctx.worker_selector.source_topology_for(request);
         source_topology.validate().map_err(anyhow::Error::msg)?;
         let execution_requirements = crate::admission::ExecutionRequirements::new(request);
@@ -2924,10 +2926,16 @@ async fn handle_select_worker_mode(
 
             loop {
                 // Use the configured worker selector.
-                let result = ctx
+                let (result, candidates) = ctx
                     .worker_selector
-                    .select_with_waiter(&ctx.pool, request, &excluded_worker_ids, waiter.is_some())
+                    .select_with_queue_candidates(
+                        &ctx.pool,
+                        request,
+                        &excluded_worker_ids,
+                        waiter.is_some(),
+                    )
                     .await;
+                *queue_candidates = candidates;
                 let selection_reason = result.reason;
                 let selection_diagnostics = result.diagnostics;
 
@@ -3183,6 +3191,7 @@ async fn handle_select_worker_mode(
         response
     }
 
+    let mut queue_candidates = std::collections::HashSet::new();
     let initial = if resumed.is_some() {
         SelectionResponse {
             worker: None,
@@ -3191,7 +3200,14 @@ async fn handle_select_worker_mode(
             diagnostics: None,
         }
     } else {
-        attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone(), None).await?
+        attempt_select_and_reserve(
+            ctx,
+            &request,
+            local_wrapper_id.clone(),
+            None,
+            &mut queue_candidates,
+        )
+        .await?
     };
     if initial.worker.is_some()
         || !wait_for_worker
@@ -3374,9 +3390,14 @@ async fn handle_select_worker_mode(
             ctx.history.owns_queued_waiter(&waiter),
             "queued waiter ownership lost"
         );
-        let response =
-            attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone(), Some(&waiter))
-                .await?;
+        let response = attempt_select_and_reserve(
+            ctx,
+            &request,
+            local_wrapper_id.clone(),
+            Some(&waiter),
+            &mut queue_candidates,
+        )
+        .await?;
         if response.worker.is_some() {
             let _ = ctx.history.remove_queued_build(queued.id);
             ctx.history.update_queue_estimates();
@@ -3409,16 +3430,11 @@ async fn handle_select_worker_mode(
             return Ok(response);
         }
 
-        if request.job_mode
-            && queued.slots_needed > 1
-            && queued.queued_at_mono.elapsed() >= QUEUE_HOLD_AFTER
-        {
+        if request.job_mode && queued.queued_at_mono.elapsed() >= QUEUE_HOLD_AFTER {
             let current = ctx.history.queue_hold_of(queued.id);
-            match response
-                .diagnostics
-                .as_ref()
-                .and_then(|diagnostics| queue_hold_candidate(diagnostics, current.as_deref()))
-            {
+            match response.diagnostics.as_ref().and_then(|diagnostics| {
+                queue_hold_candidate(diagnostics, &queue_candidates, current.as_deref())
+            }) {
                 Some(worker_id) => {
                     if ctx.history.claim_queue_hold(
                         queued.id,
@@ -3431,7 +3447,7 @@ async fn handle_select_worker_mode(
                             worker = %worker_id,
                             slots = queued.slots_needed,
                             waited_secs = queued.queued_at_mono.elapsed().as_secs(),
-                            "Queue hold: draining a worker for a starving multi-slot job"
+                            "Queue hold: draining worker resources for a starving job"
                         );
                     }
                 }
@@ -3462,7 +3478,7 @@ fn queue_wait_secs(job_mode: bool, client_secs: Option<u64>, daemon_secs: u64) -
         .filter(|secs| *secs > 0)
         .map_or(daemon_secs, |secs| secs.min(cap))
 }
-/// How long a multi-slot job waits before it may hold a worker (bd-decdd).
+/// How long a job waits before it may hold CPU or disk capacity (bd-decdd).
 const QUEUE_HOLD_AFTER: Duration = Duration::from_secs(120);
 
 struct QueueHoldRelease<'a> {
@@ -3476,21 +3492,25 @@ impl Drop for QueueHoldRelease<'_> {
     }
 }
 
-/// A worker that refused this request only for `slots.insufficient`: it
-/// passed every other gate and can hold the request once its slots free.
-/// Keeps the current hold while it still qualifies; otherwise prefers the
-/// worker closest to fitting.
+/// Hold only a worker that this selection round checked for suitability.
+/// Multi-slot jobs can drain CPU capacity; disk contention also qualifies
+/// single-slot jobs. Keep an existing hold across the required post-completion
+/// capacity probe, but never start a new hold from stale capacity alone.
 fn queue_hold_candidate(
     diagnostics: &rch_common::SelectionDiagnostics,
+    queue_candidates: &std::collections::HashSet<String>,
     current: Option<&str>,
 ) -> Option<String> {
     let candidates = diagnostics.workers.iter().filter(|worker| {
-        worker.total_slots >= diagnostics.estimated_cores
-            && worker
-                .reason_codes
-                .iter()
-                .map(String::as_str)
-                .eq(["slots.insufficient"])
+        queue_candidates.contains(worker.worker_id.as_str())
+            && worker.total_slots >= diagnostics.estimated_cores
+            && worker.reason_codes.len() == 1
+            && match worker.reason_codes[0].as_str() {
+                "slots.insufficient" => diagnostics.estimated_cores > 1,
+                "disk_headroom_reserved" => true,
+                "disk_headroom_awaiting_probe" => current == Some(worker.worker_id.as_str()),
+                _ => false,
+            }
     });
     let mut best: Option<&rch_common::WorkerSelectionDiagnostic> = None;
     for worker in candidates {
@@ -6452,6 +6472,141 @@ mod tests {
         })
         .await
         .expect("disk contention must enter the durable queue")
+    }
+
+    #[tokio::test]
+    async fn aged_single_slot_disk_waiter_drains_reservations_before_younger_jobs() {
+        let _guard = test_guard!();
+        let (tmp, mut ctx, mut request, owner_id) = disk_contention_fixture().await;
+        request.job_mode = true;
+        let worker = ctx.pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        let mut younger = request.clone();
+        younger.project = "younger-small-job".into();
+        younger.command = Some("true".into());
+        younger.disk_headroom_gib = 0;
+
+        // A cold 64 GiB request does not fit beside the current 64 GiB
+        // owner, but newer small jobs do. Repeated arrivals could previously
+        // consume every opening while this one-slot waiter never gained a hold.
+        for attempt in 0..3 {
+            let blocked = ctx
+                .worker_selector
+                .select_with_waiter(&ctx.pool, &request, &Default::default(), true)
+                .await;
+            assert_eq!(blocked.reason, SelectionReason::AllWorkersBusy);
+            let wrapper = format!("rchw-younger-before-hold-{attempt}");
+            let admitted = handle_select_worker_with_wrapper(
+                &ctx,
+                younger.clone(),
+                false,
+                None,
+                Some(wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(admitted.worker.is_some());
+            let mut release = disk_contention_release(admitted.build_id.unwrap());
+            release.local_wrapper_id = Some(wrapper);
+            handle_release_worker(&ctx, release).await.unwrap();
+            set_test_build_disk(&ctx.pool, "disk-worker", 100.0).await;
+        }
+
+        // Recover a genuinely aged durable row, avoiding a two-minute sleep
+        // or a production timeout override. The normal resume handler must
+        // acquire the disk hold despite this request needing only one slot.
+        let wrapper = format!("rchw-{}", Uuid::new_v4());
+        let wait_secs = Some(3600);
+        let (queued, _) = ctx
+            .history
+            .enqueue_selection_build(
+                request.project.clone(),
+                request.command.clone().unwrap(),
+                request.hook_pid.unwrap(),
+                1,
+                Some(wrapper.clone()),
+                QueueSelectionContract {
+                    digest: queue_selection_digest(&request, wait_secs).unwrap(),
+                    timeout_secs: wait_secs.unwrap(),
+                },
+            )
+            .unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let ownership = path.with_extension("ownership.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap();
+        snapshot["queued"][0]["queued_at"] =
+            serde_json::json!((Utc::now() - ChronoDuration::seconds(121)).to_rfc3339());
+        std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 100).unwrap());
+        let waiting_ctx = ctx.clone();
+        let waiter = tokio::spawn(async move {
+            handle_select_worker_mode(&waiting_ctx, request, true, wait_secs, Some(wrapper), true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while ctx.history.queue_hold_of(queued.id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an aged single-slot disk waiter must gain a resource hold");
+
+        let blocked = handle_select_worker_with_wrapper(
+            &ctx,
+            younger.clone(),
+            false,
+            None,
+            Some("rchw-younger-during-hold".into()),
+        )
+        .await
+        .unwrap();
+        assert!(blocked.worker.is_none());
+        assert_eq!(blocked.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("disk-worker"), 64);
+
+        handle_release_worker(&ctx, disk_contention_release(owner_id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "completion is not a fresh capacity sample"
+        );
+        assert_eq!(
+            ctx.history.queue_hold_of(queued.id).as_deref(),
+            Some("disk-worker"),
+            "the hold must survive the mandatory post-completion probe gap"
+        );
+        assert_eq!(worker.used_slots(), 0);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("disk-worker"), 0);
+
+        set_test_build_disk(&ctx.pool, "disk-worker", 100.0).await;
+        let admitted = tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.worker.unwrap().id.as_str(), "disk-worker");
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("disk-worker"), 64);
+        assert_eq!(ctx.history.queue_depth(), 0);
+        assert!(ctx.history.queue_hold_of(queued.id).is_none());
+
+        let next = handle_select_worker_with_wrapper(
+            &ctx,
+            younger,
+            false,
+            None,
+            Some("rchw-younger-after-hold".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            next.worker.is_some(),
+            "admission must release the temporary hold"
+        );
+        assert_eq!(worker.used_slots(), 2);
     }
 
     #[tokio::test]
@@ -9449,24 +9604,67 @@ mod tests {
                 hold_diagnostic("critical", 3, 8, &["pressure.critical"]),
             ],
         };
+        let checked = std::collections::HashSet::from(["busy-a".into(), "busy-b".into()]);
         // Closest to fitting first; an existing hold is kept while it qualifies.
         assert_eq!(
-            queue_hold_candidate(&diagnostics, None).as_deref(),
+            queue_hold_candidate(&diagnostics, &checked, None).as_deref(),
             Some("busy-b")
         );
         assert_eq!(
-            queue_hold_candidate(&diagnostics, Some("busy-a")).as_deref(),
+            queue_hold_candidate(&diagnostics, &checked, Some("busy-a")).as_deref(),
             Some("busy-a")
         );
         assert_eq!(
-            queue_hold_candidate(&diagnostics, Some("excluded")).as_deref(),
+            queue_hold_candidate(&diagnostics, &checked, Some("excluded")).as_deref(),
             Some("busy-b")
         );
         let mut none_fit = diagnostics.clone();
         none_fit
             .workers
             .retain(|w| !w.worker_id.as_str().starts_with("busy"));
-        assert_eq!(queue_hold_candidate(&none_fit, None), None);
+        assert_eq!(queue_hold_candidate(&none_fit, &checked, None), None);
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, &std::collections::HashSet::new(), None),
+            None,
+            "a diagnostic alone does not prove the later suitability gates passed"
+        );
+    }
+
+    #[test]
+    fn single_slot_disk_hold_keeps_only_its_current_post_completion_probe_wait() {
+        let mut diagnostics = rch_common::SelectionDiagnostics {
+            required_runtime: RequiredRuntime::default(),
+            estimated_cores: 1,
+            min_success_rate: 0.0,
+            fallback_min_success_rate: 0.0,
+            active_project_exclusion_count: 0,
+            workers: vec![hold_diagnostic("disk", 7, 8, &["disk_headroom_reserved"])],
+        };
+        let checked = std::collections::HashSet::from(["disk".into()]);
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, &checked, None).as_deref(),
+            Some("disk")
+        );
+        diagnostics.workers[0].reason_codes = vec!["disk_headroom_awaiting_probe".into()];
+        assert_eq!(queue_hold_candidate(&diagnostics, &checked, None), None);
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, &checked, Some("disk")).as_deref(),
+            Some("disk")
+        );
+        for refusal in [
+            "disk_headroom_unknown",
+            "disk_headroom_stale",
+            "disk_headroom_insufficient",
+            "pressure.critical",
+            "slots.insufficient",
+        ] {
+            diagnostics.workers[0].reason_codes = vec![refusal.into()];
+            assert_eq!(
+                queue_hold_candidate(&diagnostics, &checked, Some("disk")),
+                None,
+                "{refusal}"
+            );
+        }
     }
 
     #[tokio::test]

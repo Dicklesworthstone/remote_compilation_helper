@@ -613,6 +613,10 @@ pub struct WorkerSelector {
     /// Internal round state, never a caller-controlled selection field. An
     /// existing durable waiter may bridge a just-completed owner's probe gap.
     queued_disk_wait: bool,
+    /// Workers that passed this round's suitability gates and are waiting
+    /// only for resources. Never shared between selection requests: a queue
+    /// hold must not rely on a diagnostic that stopped at an earlier gate.
+    queue_candidates: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 /// Result of worker selection with reason.
@@ -662,6 +666,7 @@ impl WorkerSelector {
             ssh_pool: None,
             preview: false,
             queued_disk_wait: false,
+            queue_candidates: Arc::default(),
         }
     }
 
@@ -681,6 +686,7 @@ impl WorkerSelector {
             ssh_pool: None,
             preview: false,
             queued_disk_wait: false,
+            queue_candidates: Arc::default(),
         }
     }
 
@@ -947,25 +953,48 @@ impl WorkerSelector {
         excluded_worker_ids: &'a HashSet<String>,
         existing_waiter: bool,
     ) -> impl std::future::Future<Output = SelectionResult> + Send + 'a {
+        async move {
+            self.select_with_queue_candidates(pool, request, excluded_worker_ids, existing_waiter)
+                .await
+                .0
+        }
+    }
+
+    /// Return this request's fully checked wait candidates alongside selection.
+    /// They authorize only a temporary queue hold, never resource admission.
+    pub(crate) fn select_with_queue_candidates<'a>(
+        &'a self,
+        pool: &'a WorkerPool,
+        request: &'a SelectionRequest,
+        excluded_worker_ids: &'a HashSet<String>,
+        existing_waiter: bool,
+    ) -> impl std::future::Future<Output = (SelectionResult, HashSet<String>)> + Send + 'a {
         async fn select_round(
             selector: &WorkerSelector,
             pool: &WorkerPool,
             request: &SelectionRequest,
             excluded_worker_ids: &HashSet<String>,
             existing_waiter: bool,
-        ) -> SelectionResult {
+        ) -> (SelectionResult, HashSet<String>) {
             // Scoring, diagnostics, and audit must see this request's verdicts.
             // A shared cache lets concurrent requests erase one another's disk
             // decisions. Recovery hysteresis stays shared inside the forked gate.
             let mut round = selector.clone();
             round.queued_disk_wait = existing_waiter;
+            round.queue_candidates = Arc::default();
             round.admission_gate = selector
                 .admission_gate
                 .as_ref()
                 .map(|gate| Arc::new(gate.for_selection()));
-            round
+            let result = round
                 .select_in_round(pool, request, excluded_worker_ids)
-                .await
+                .await;
+            let candidates = round
+                .queue_candidates
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            (result, candidates)
         }
 
         select_round(self, pool, request, excluded_worker_ids, existing_waiter)
@@ -1011,6 +1040,7 @@ impl WorkerSelector {
     fn preview_round(&self) -> Self {
         let mut round = self.clone();
         round.preview = true;
+        round.queue_candidates = Arc::default();
         round.admission_gate = self
             .admission_gate
             .as_ref()
@@ -2362,6 +2392,12 @@ impl WorkerSelector {
         excluded_worker_ids: &HashSet<String>,
         allow_capability_refresh: bool,
     ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
+        // A capability refresh reruns eligibility; discard the earlier pass's
+        // evidence before considering changed topology, health or capacity.
+        self.queue_candidates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         // Clear per-round admission verdict cache (bd-vvmd.4.4).
         if let Some(ref gate) = self.admission_gate {
             gate.begin_round().await;
@@ -2892,6 +2928,14 @@ impl WorkerSelector {
             }
 
             if waiting_for_slots {
+                if passes_preflight
+                    && self.health_score(&worker).await >= self.config.min_success_rate
+                {
+                    self.queue_candidates
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(worker_id.as_str().to_owned());
+                }
                 filtered_by_slots += 1;
                 debug!(
                     "Worker {} excluded: insufficient free slots (available={}, total={}, requested={})",
@@ -2917,6 +2961,10 @@ impl WorkerSelector {
                     filtered_by_health += 1;
                 } else {
                     filtered_by_disk_contention += 1;
+                    self.queue_candidates
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(worker_id.as_str().to_owned());
                 }
                 continue;
             }
@@ -7882,13 +7930,19 @@ mod tests {
                 _ => unreachable!(),
             }
             let exclusions = HashSet::new();
+            let (waiting, queue_candidates) = selector
+                .select_with_queue_candidates(&pool, &request, &exclusions, true)
+                .await;
+            assert_eq!(
+                queue_candidates.contains("active-project"),
+                scenario == "reservation",
+                "only resource contention may justify a queue hold: {scenario}"
+            );
             for result in [
                 selector
                     .preview_with_exclusions(&pool, &request, &exclusions)
                     .await,
-                selector
-                    .select_with_waiter(&pool, &request, &exclusions, true)
-                    .await,
+                waiting,
             ] {
                 assert!(result.worker.is_none(), "{scenario}");
                 if scenario == "reservation" {
@@ -10160,10 +10214,11 @@ mod tests {
 
                 // Waiting is useful while the full-size worker can run this
                 // build after its existing owner finishes.
-                assert_eq!(
-                    selector.select(&pool, &request).await.reason,
-                    SelectionReason::AllWorkersBusy
-                );
+                let (waiting, queue_candidates) = selector
+                    .select_with_queue_candidates(&pool, &request, &HashSet::new(), true)
+                    .await;
+                assert_eq!(waiting.reason, SelectionReason::AllWorkersBusy);
+                assert!(queue_candidates.contains("busy"));
                 match blocker {
                     "topology" => {
                         let mut capabilities = busy.capabilities().await;
@@ -10196,11 +10251,18 @@ mod tests {
                 // Releasing CPU slots cannot repair these hard failures. The
                 // healthy smaller worker must remain usable in both previews
                 // and live hook/job selection, without changing ownership.
+                let (selected, queue_candidates) = selector
+                    .select_with_queue_candidates(&pool, &request, &HashSet::new(), true)
+                    .await;
+                assert!(
+                    !queue_candidates.contains("busy"),
+                    "a new round must discard its predecessor's hold evidence: {blocker}"
+                );
                 for result in [
                     selector
                         .preview_with_exclusions(&pool, &request, &HashSet::new())
                         .await,
-                    selector.select(&pool, &request).await,
+                    selected,
                 ] {
                     let worker = result.worker.unwrap_or_else(|| {
                         panic!(
