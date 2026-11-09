@@ -25,20 +25,29 @@ const MAX_PATTERN_BYTES: usize = 4096;
 /// non-string patterns, size/count limits and YAML merge keys. Merge keys must
 /// never hide a package list behind an ignored configuration field.
 pub fn package_patterns(bytes: &[u8]) -> Result<Vec<String>, String> {
-    if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err("pnpm-workspace.yaml exceeds document byte limit".to_owned());
-    }
-    let document: Option<Workspace> = serde_yaml_ng::from_slice(bytes)
-        .map_err(|error| format!("invalid pnpm-workspace.yaml: {error}"))?;
-    let mut patterns = document.map_or_else(Vec::new, |document| document.patterns);
+    let mut patterns = declared_package_patterns(bytes)?.unwrap_or_default();
     if !patterns.iter().any(|pattern| !pattern.starts_with('!')) {
         patterns.push("**".to_owned());
     }
     Ok(patterns)
 }
 
+/// Decode only the explicitly authored package list, without adding members.
+///
+/// Workspace-root authority must not reuse [`package_patterns`]' conservative
+/// cross-version fallback: an omitted or exclusion-only list does not prove
+/// that any particular descendant belongs to this workspace.
+pub fn declared_package_patterns(bytes: &[u8]) -> Result<Option<Vec<String>>, String> {
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err("pnpm-workspace.yaml exceeds document byte limit".to_owned());
+    }
+    let document: Option<Workspace> = serde_yaml_ng::from_slice(bytes)
+        .map_err(|error| format!("invalid pnpm-workspace.yaml: {error}"))?;
+    Ok(document.and_then(|document| document.patterns))
+}
+
 struct Workspace {
-    patterns: Vec<String>,
+    patterns: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for Workspace {
@@ -53,7 +62,7 @@ impl<'de> Deserialize<'de> for Workspace {
 
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
                 let mut seen_packages = false;
-                let mut patterns = Vec::new();
+                let mut patterns = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "packages" => {
@@ -63,7 +72,7 @@ impl<'de> Deserialize<'de> for Workspace {
                             seen_packages = true;
                             patterns = map
                                 .next_value::<Option<Patterns>>()?
-                                .map_or_else(Vec::new, |patterns| patterns.0);
+                                .map(|patterns| patterns.0);
                         }
                         "<<" => {
                             return Err(de::Error::custom(
@@ -171,6 +180,25 @@ mod tests {
         assert_eq!(
             package_patterns(b"packages: ['!fixtures/**']").unwrap(),
             ["!fixtures/**", "**"]
+        );
+    }
+
+    #[test]
+    fn explicit_membership_never_invents_the_conservative_fallback() {
+        for bytes in [b"".as_slice(), b"{}", b"packages: null", b"catalog: {}"] {
+            assert_eq!(declared_package_patterns(bytes).unwrap(), None);
+        }
+        assert_eq!(
+            declared_package_patterns(b"packages: []").unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            declared_package_patterns(b"packages: ['!fixtures/**']").unwrap(),
+            Some(vec!["!fixtures/**".to_owned()])
+        );
+        assert_eq!(
+            declared_package_patterns(b"packages: ['packages/*', '!packages/old']").unwrap(),
+            Some(vec!["packages/*".to_owned(), "!packages/old".to_owned()])
         );
     }
 
