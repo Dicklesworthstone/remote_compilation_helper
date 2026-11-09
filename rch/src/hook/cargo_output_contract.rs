@@ -358,6 +358,7 @@ impl CargoOutputCapture {
         );
         self.parse_receipt_with_roots(stdout, remote_output_roots)?;
         let mut selected = BTreeSet::new();
+        let mut executables = BTreeSet::new();
         let mut required_files = BTreeSet::new();
         for line in std::str::from_utf8(stdout)?.lines() {
             if line == PIGGYBACK_MARKER {
@@ -369,9 +370,19 @@ impl CargoOutputCapture {
             let Some(target) = self.caller_target(&value)? else {
                 continue;
             };
+            // One selector can match several workspace packages, and Cargo
+            // can build each target for more than one platform. The emitted
+            // executable distinguishes those records, not the selector name.
+            // Repeated or colliding executable paths remain ambiguous: one
+            // published file cannot independently satisfy both Cargo records.
+            selected.insert(target.clone());
+            let executable = value
+                .get("executable")
+                .and_then(serde_json::Value::as_str)
+                .context("selected Cargo record has no executable")?;
             anyhow::ensure!(
-                selected.insert(target.clone()),
-                "caller JSON has ambiguous duplicate selected targets"
+                executables.insert(relative_output_path(executable, remote_output_roots)?),
+                "caller JSON has duplicate or colliding selected executable paths"
             );
             let manifest = value
                 .get("manifest_path")
@@ -416,8 +427,8 @@ impl CargoOutputCapture {
             );
         }
         anyhow::ensure!(
-            selected.len() == self.selected.len(),
-            "caller JSON did not uniquely bind every selected executable target"
+            selected == self.selected,
+            "caller JSON did not bind every selected executable target"
         );
         Ok(required_files)
     }
@@ -462,7 +473,6 @@ impl CargoOutputCapture {
             "caller JSON cannot name an executable outside this invocation's published set"
         );
         let mut output = Vec::new();
-        let mut selected = BTreeSet::new();
         let mut files = BTreeSet::new();
         for line in std::str::from_utf8(stdout)?.split_inclusive('\n') {
             if line.trim_end_matches(['\r', '\n']) == PIGGYBACK_MARKER {
@@ -472,15 +482,11 @@ impl CargoOutputCapture {
                 output.extend_from_slice(line.as_bytes());
                 continue;
             };
-            let Some(target) = self.caller_target(&value)? else {
+            if self.caller_target(&value)?.is_none() {
                 output.extend_from_slice(line.as_bytes());
                 continue;
-            };
+            }
             let original = value.clone();
-            anyhow::ensure!(
-                selected.insert(target.clone()),
-                "caller JSON has ambiguous duplicate selected targets"
-            );
             let manifest = value
                 .get("manifest_path")
                 .and_then(serde_json::Value::as_str)
@@ -1061,6 +1067,247 @@ mod tests {
                     assert_eq!(record["rch"]["receipt"], binding);
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_cargo_workspace_json_delivers_same_named_tests_and_benches() {
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("producer");
+        let local = root.path().join("consumer");
+        for directory in [&source, &local] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("Cargo.toml"),
+                "[workspace]\nmembers = [\"alpha\", \"beta\"]\nresolver = \"3\"\n",
+            )
+            .unwrap();
+            for member in ["alpha", "beta"] {
+                let package = directory.join(member);
+                std::fs::create_dir_all(package.join("tests")).unwrap();
+                std::fs::create_dir_all(package.join("benches")).unwrap();
+                std::fs::write(
+                    package.join("Cargo.toml"),
+                    format!(
+                        "[package]\nname = \"rch_workspace_{member}_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+                         [[bench]]\nname = \"smoke\"\npath = \"benches/smoke.rs\"\nharness = false\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    package.join("tests/smoke.rs"),
+                    "#[test] fn not_executed() { panic!(\"no-run must not execute tests\"); }\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    package.join("benches/smoke.rs"),
+                    "fn main() { panic!(\"no-run must not execute benches\"); }\n",
+                )
+                .unwrap();
+            }
+        }
+        let source = source.canonicalize().unwrap();
+        let local = local.canonicalize().unwrap();
+        let remote_target = root.path().canonicalize().unwrap().join("producer-target");
+        let local_target = local.join("artifacts");
+        let binding = json!({"fixture":"actual-cargo-workspace-named-outputs"});
+        for (kind, selector) in [
+            (CompilationKind::CargoTest, "test"),
+            (CompilationKind::CargoBench, "bench"),
+        ] {
+            let command = format!(
+                "cargo {selector} --workspace --{selector} smoke --no-run --message-format=json --offline --jobs=1"
+            );
+            let capture = CargoOutputCapture::for_command(Some(kind), &command).unwrap();
+            // Recovery restores the same selector; it must also preserve all
+            // matching package outputs from this invocation's immutable receipt.
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
+            assert_eq!(capture.selected.len(), 1);
+            for warm in [false, true] {
+                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                let mut compile = Command::new(cargo);
+                compile
+                    .current_dir(&source)
+                    .args(command.split_ascii_whitespace().skip(1))
+                    .env("CARGO_HOME", root.path().join("cargo-home"))
+                    .env("CARGO_TARGET_DIR", &remote_target)
+                    .env_remove("RUSTC_WRAPPER")
+                    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                    .env_remove("RUSTFLAGS")
+                    .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                    .env_remove("CARGO_BUILD_TARGET")
+                    .env_remove("CARGO_BUILD_TARGET_DIR")
+                    .env_remove("CARGO_BUILD_BUILD_DIR")
+                    .env_remove("CARGO_MAKEFLAGS")
+                    .env_remove("MAKEFLAGS")
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true);
+                let result = tokio::time::timeout(Duration::from_secs(90), compile.output())
+                    .await
+                    .expect("owned Cargo workspace fixture timed out")
+                    .expect("Cargo is required for native workspace output coverage");
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let files = restored
+                    .validate_caller_metadata(&result.stdout, &[&remote_target], &[&source], &local)
+                    .unwrap();
+                let mut published = BTreeMap::new();
+                for relative in &files {
+                    let destination = local_target.join(relative);
+                    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    std::fs::copy(remote_target.join(relative), &destination).unwrap();
+                    let bytes = std::fs::read(destination).unwrap();
+                    published.insert(relative.clone(), blake3::hash(&bytes).to_hex().to_string());
+                }
+                let contract = restored
+                    .parse_receipt(&result.stdout, &remote_target)
+                    .unwrap();
+                assert_eq!(contract.required_files.len(), 2);
+                contract.verify_staged(&local_target).unwrap();
+                let paths = CargoCallerPaths {
+                    remote_output_roots: &[&remote_target],
+                    local_output_root: &local_target,
+                    remote_project_roots: &[&source],
+                    local_project_root: &local,
+                    published: &published,
+                    receipt_binding: &binding,
+                };
+                let output = restored.caller_json(&result.stdout, &paths).unwrap();
+                assert_eq!(output.files, files);
+                let records: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .filter(|record: &serde_json::Value| record.get("rch").is_some())
+                    .collect();
+                assert_eq!(records.len(), 2);
+                assert_ne!(records[0]["package_id"], records[1]["package_id"]);
+                assert_ne!(records[0]["manifest_path"], records[1]["manifest_path"]);
+                assert_ne!(records[0]["executable"], records[1]["executable"]);
+                for record in records {
+                    assert_eq!(record["target"]["name"], "smoke");
+                    assert_eq!(record["profile"]["test"], true);
+                    assert_eq!(record["fresh"], warm);
+                    let executable = Path::new(record["executable"].as_str().unwrap());
+                    assert!(executable.starts_with(&local_target));
+                    assert_eq!(
+                        blake3::hash(&std::fs::read(executable).unwrap())
+                            .to_hex()
+                            .as_str(),
+                        record["rch"]["executable_blake3"].as_str().unwrap()
+                    );
+                    assert_eq!(record["rch"]["receipt"], binding);
+                }
+                // Retaining one old local executable cannot stand in for a
+                // lost publication of the other package's same-named target.
+                let mut incomplete = published.clone();
+                incomplete.remove(contract.required_files.first().unwrap());
+                assert!(
+                    restored
+                        .caller_json(
+                            &result.stdout,
+                            &CargoCallerPaths {
+                                published: &incomplete,
+                                ..paths
+                            },
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_json_distinguishes_platform_outputs_but_refuses_executable_collisions() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("other")).unwrap();
+        for manifest in ["Cargo.toml", "other/Cargo.toml"] {
+            std::fs::write(root.path().join(manifest), "[workspace]\n").unwrap();
+        }
+        let local = root.path().canonicalize().unwrap();
+        let capture = capture(
+            "cargo build --bin app --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu --message-format=json",
+        );
+        let records: Vec<_> = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+            .into_iter()
+            .map(|platform| {
+                let executable = format!("/worker/target/{platform}/debug/app");
+                let mut record = artifact("bin", "app", &[&executable], Some(&executable), false);
+                record["manifest_path"] = json!("/worker/source/Cargo.toml");
+                record["profile"] = json!({"test":false});
+                record
+            })
+            .collect();
+        let data = receipt(&records);
+        let published: BTreeMap<_, _> = records
+            .iter()
+            .map(|record| {
+                (
+                    relative_output_path(
+                        record["executable"].as_str().unwrap(),
+                        &[Path::new("/worker/target")],
+                    )
+                    .unwrap(),
+                    "fixture-fingerprint".to_owned(),
+                )
+            })
+            .collect();
+        let target = local.join("target");
+        let binding = json!({"fixture":"multiple-platform-records"});
+        let paths = CargoCallerPaths {
+            remote_output_roots: &[Path::new("/worker/target"), Path::new("/alias/target")],
+            local_output_root: &target,
+            remote_project_roots: &[Path::new("/worker/source")],
+            local_project_root: &local,
+            published: &published,
+            receipt_binding: &binding,
+        };
+        let output = capture.caller_json(&data, &paths).unwrap();
+        assert_eq!(output.files, published.keys().cloned().collect());
+        let projected: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for (record, original) in projected.iter().zip(&records) {
+            let relative = Path::new(original["executable"].as_str().unwrap())
+                .strip_prefix("/worker/target")
+                .unwrap();
+            assert_eq!(record["executable"], json!(target.join(relative)));
+            assert_eq!(record["rch"]["worker_record"], *original);
+        }
+        for (manifest, executable) in [
+            (
+                "/worker/source/Cargo.toml",
+                records[0]["executable"].as_str().unwrap(),
+            ),
+            (
+                "/worker/source/other/Cargo.toml",
+                records[0]["executable"].as_str().unwrap(),
+            ),
+            (
+                "/worker/source/Cargo.toml",
+                "/alias/target/x86_64-unknown-linux-gnu/debug/app",
+            ),
+        ] {
+            let mut collision = records[1].clone();
+            collision["manifest_path"] = json!(manifest);
+            collision["executable"] = json!(executable);
+            collision["filenames"] = json!([executable]);
+            let error = capture
+                .caller_json(&receipt(&[records[0].clone(), collision]), &paths)
+                .err()
+                .expect("duplicate or colliding executable must not publish caller JSON");
+            assert!(error.to_string().contains("colliding selected executable"));
         }
     }
 
