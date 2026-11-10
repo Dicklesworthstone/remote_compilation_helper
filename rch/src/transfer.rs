@@ -3980,6 +3980,49 @@ impl TransferPipeline {
         Ok(output.stdout)
     }
 
+    /// Read the completed build's Ninja output graph while retaining the
+    /// original source grant. The absent-backend reply is explicit; a failed
+    /// or truncated graph query never broadens artifact publication.
+    pub(crate) async fn discover_build_system_outputs(
+        &self,
+        worker: &WorkerConfig,
+        query: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "build output discovery requires an owned POSIX source grant"
+        );
+        let budget = rch_common::timing::scale_duration(Duration::from_secs(30));
+        let deadline = TokioInstant::now() + budget;
+        let script = self.build_system_output_probe_script(query);
+        let script = self.source_activity_rpc_script(&script, budget);
+        let mut command = self.worker_ssh_command_with_activity_and_connect_timeout(
+            worker,
+            &["sh", "-s"],
+            false,
+            self.ssh_options.connect_timeout.min(budget),
+        );
+        let output = rch_common::ssh::capture_control_output(
+            &mut command,
+            Some(script.as_bytes()),
+            1024 * 1024,
+            64 * 1024,
+            deadline,
+        )
+        .await
+        .context("build output graph query failed")?;
+        if output.status.code() == Some(3) && output.stdout.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            output.status.success(),
+            "build output graph query failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(Some(output.stdout))
+    }
+
     fn compiler_output_probe_script(
         &self,
         query: &str,
@@ -3988,10 +4031,25 @@ impl TransferPipeline {
         let root = self.remote_path();
         let env = self.build_remote_env_plan(&root);
         let command = format!(
-            "exec 1>&3 3>&-; {}{}",
+            "{}{}",
             env.env_prefix.prefix,
             wrap_command_with_toolchain(query, toolchain)
         );
+        self.output_probe_script(&command)
+    }
+
+    fn build_system_output_probe_script(&self, query: &str) -> String {
+        let env = self.build_remote_env_plan(&self.remote_path());
+        // A graph probe contains compound shell syntax. Assignment prefixes
+        // apply to the executable shell, never directly to `if` or `{`.
+        let command =
+            shell_command_with_literal_script(&format!("{}sh -c", env.env_prefix.prefix), query);
+        self.output_probe_script(&command)
+    }
+
+    fn output_probe_script(&self, command: &str) -> String {
+        let root = self.remote_path();
+        let command = format!("exec 1>&3 3>&-; {command}");
         // The real compiler runs inside sh -lc after entering this same root.
         // Preserve its tool lookup and forwarded/inline environment here, too.
         // Login profiles may print banners; keep those on stderr and restore
@@ -19296,6 +19354,58 @@ Number of files transferred: 42
                 "{key} must be reported exactly once"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_graph_probe_runs_compound_queries_with_the_managed_environment() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worker's project");
+        std::fs::create_dir(&root).unwrap();
+        let value = "literal value '$HOME; $(touch forbidden)'";
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "project".into(),
+            "graph-probe".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_str().unwrap().to_owned())
+        .with_env_allowlist(vec!["RCH_GRAPH_PROBE_VALUE".into()])
+        .with_env_overrides(HashMap::from([(
+            "RCH_GRAPH_PROBE_VALUE".into(),
+            value.into(),
+        )]));
+        let query = r#"if [ "$RCH_CARGO_WRAPPER_BYPASS" = 1 ] && [ "$RCH_CARGO_WRAPPER_ORIGIN" = rch ]; then printf '%s\n' "$RCH_GRAPH_PROBE_VALUE"; pwd -P; else exit 97; fi"#;
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(pipeline.build_system_output_probe_script(query))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{value}\n{}\n", root.canonicalize().unwrap().display())
+        );
+        assert!(!root.join("forbidden").exists());
+        let absent = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(pipeline.build_system_output_probe_script(
+                "if test -f build.ninja; then exit 0; else exit 3; fi",
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            absent.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&absent.stderr)
+        );
+        assert!(absent.stdout.is_empty());
     }
 
     /// A caller that exports the bypass OFF locally must not be able to re-arm

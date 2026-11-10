@@ -38,6 +38,7 @@
 //! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
 //! module and stays private.
 
+pub(super) mod build_system;
 pub(super) mod cargo_bins;
 pub(super) mod clean_overlay;
 pub(super) mod direct_compiler;

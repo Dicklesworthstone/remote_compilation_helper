@@ -3335,6 +3335,18 @@ async fn execute_remote_compilation_inner(
     }
     if result.success()
         && let Some(session) = recovery_session.as_mut()
+        && let Err(error) = session
+            .collect_build_system_outputs(&pipeline, &worker_config)
+            .await
+    {
+        artifacts_failed = true;
+        eprintln!(
+            "[RCH] cannot establish completed build-system outputs: {error:#}; \
+             no artifacts published; use jobs recover for this attempt"
+        );
+    }
+    if result.success()
+        && let Some(session) = recovery_session.as_mut()
         && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)
     {
         let evidence = if reporter.cargo_json_stdout {
@@ -3433,7 +3445,7 @@ async fn execute_remote_compilation_inner(
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
         let mut artifact_patterns = match recovery_session
             .as_ref()
-            .filter(|session| session.has_native_output_contract())
+            .filter(|session| session.has_project_output_contract())
         {
             // The persisted contract determines whether native retrieval is
             // required, including explicit outputs underneath target/.
@@ -3601,7 +3613,7 @@ async fn execute_remote_compilation_inner(
             let remote_target_path = pipeline.remote_cargo_target_dir();
             let mut custom_patterns = if recovery_session
                 .as_ref()
-                .is_some_and(recovery::RecoverySession::has_native_output_contract)
+                .is_some_and(recovery::RecoverySession::has_project_output_contract)
             {
                 // Native compiler outputs belong to the project phase even
                 // when the caller forwards an unrelated CARGO_TARGET_DIR.

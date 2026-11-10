@@ -1,4 +1,5 @@
 //! Durable source ownership and identity-bound collection. Never replays a command.
+use super::super::artifact_patterns::build_system::{BuildSystemOutputDiscovery, merge_patterns};
 use super::super::artifact_patterns::direct_compiler::{
     NativeOutputContract, NativeOutputPlatform, native_output_contract,
 };
@@ -75,6 +76,10 @@ pub(crate) struct RecoveryRecipe {
     /// until its complete, same-attempt Cargo receipt supplies the output set.
     #[serde(default)]
     cargo_output_capture: Option<CargoOutputCapture>,
+    /// The completed graph extends the existing artifact policy with named
+    /// files, never recursive authority over an arbitrary build directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_system_output_capture: Option<BuildSystemOutputCapture>,
     /// A required source-qualified dependency phase must be accepted before
     /// execution. Recovery retains this binding but never reconstructs a
     /// source receipt from post-workload files or ordinary delivery success.
@@ -130,6 +135,14 @@ pub(crate) struct RecoveryRecipe {
     pair_released: bool,
     #[serde(default)]
     retired: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildSystemOutputCapture {
+    command: String,
+    resolved: bool,
+    graph_available: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -499,6 +512,11 @@ impl RecoveryRecipe {
 
     fn retain_failed_delivery_evidence(&self) -> bool {
         result_recovery::has_missing_results(self)
+            || (self.exit_code == Some(0)
+                && self
+                    .build_system_output_capture
+                    .as_ref()
+                    .is_some_and(|capture| !capture.resolved))
             || (self.exit_code == Some(0)
                 && self
                     .phases
@@ -1425,6 +1443,7 @@ impl RecoverySession {
             allow_foreign: false,
             package_archive: false,
             cargo_output_capture: None,
+            build_system_output_capture: None,
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -1615,6 +1634,14 @@ impl RecoverySession {
             allow_foreign: foreign_artifact_gate_disabled(),
             package_archive: sync_back_verified_zero_package_archives(Some(0), command),
             cargo_output_capture,
+            build_system_output_capture: (!WorkerPlatform::from_worker(worker).is_windows())
+                .then(|| BuildSystemOutputDiscovery::for_command(kind, command))
+                .flatten()
+                .map(|_| BuildSystemOutputCapture {
+                    command: command.to_owned(),
+                    resolved: false,
+                    graph_available: false,
+                }),
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -2300,6 +2327,110 @@ impl RecoverySession {
             .any(|phase| phase.native_outputs.is_some())
     }
 
+    pub(crate) fn has_project_output_contract(&self) -> bool {
+        self.has_native_output_contract()
+            || self
+                .recipe
+                .build_system_output_capture
+                .as_ref()
+                .is_some_and(|capture| capture.resolved && capture.graph_available)
+    }
+
+    /// Resolve after successful execution: Ninja may have regenerated its
+    /// manifest during the build. Detached recovery repeats only this read-only
+    /// query, never a build, and checkpoints the selection before publication.
+    pub(crate) async fn collect_build_system_outputs(
+        &mut self,
+        pipeline: &TransferPipeline,
+        worker: &WorkerConfig,
+    ) -> anyhow::Result<()> {
+        let Some(capture) = self.recipe.build_system_output_capture.as_ref() else {
+            return Ok(());
+        };
+        if capture.resolved || self.recipe.exit_code != Some(0) {
+            return Ok(());
+        }
+        let discovery = BuildSystemOutputDiscovery::for_command(self.recipe.kind, &capture.command)
+            .context("persisted build output discovery is invalid")?;
+        let remote = self
+            .recipe
+            .phases
+            .iter()
+            .find(|phase| phase.name == "project")
+            .context("build output discovery has no project phase")?
+            .remote
+            .clone();
+        let listing = pipeline
+            .clone()
+            .with_remote_path_override(remote)
+            .discover_build_system_outputs(worker, discovery.query())
+            .await?;
+        let patterns = listing
+            .as_deref()
+            .map(|listing| discovery.resolve(listing))
+            .transpose()?;
+        self.install_build_system_outputs(patterns)
+    }
+
+    fn install_build_system_outputs(
+        &mut self,
+        patterns: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.execution_started
+                && self.recipe.exit_code == Some(0)
+                && !self.recipe.sources_released
+                && !self.recipe.retired,
+            "build output graph requires a completed owned execution"
+        );
+        let mut next = self.recipe.clone();
+        let capture = next
+            .build_system_output_capture
+            .as_mut()
+            .context("build output graph was not requested before execution")?;
+        anyhow::ensure!(!capture.resolved, "build output graph is already bound");
+        anyhow::ensure!(
+            next.phases
+                .iter()
+                .filter(|phase| phase.result_dir.is_none())
+                .all(|phase| !phase.complete
+                    && phase.pending.is_none()
+                    && phase.published.is_empty()),
+            "build output graph cannot change after publication begins"
+        );
+        capture.resolved = true;
+        capture.graph_available = patterns.is_some();
+        if let Some(patterns) = patterns {
+            let phase = next
+                .phases
+                .iter_mut()
+                .find(|phase| phase.name == "project")
+                .context("build output graph has no project phase")?;
+            anyhow::ensure!(
+                phase.native_outputs.is_none()
+                    && phase.cargo_outputs.is_none()
+                    && !phase.custom_target,
+                "build output graph cannot replace another output contract"
+            );
+            // Ninja omits some compiler side effects and configure-time
+            // headers. Preserve the prior policy while adding only the
+            // graph's named files and excluding worker regeneration files.
+            phase.patterns = merge_patterns(&phase.patterns, &patterns);
+            phase.complete = phase.patterns.is_empty();
+            // The graph's paths are relative to the invocation/project root,
+            // including explicit target/ names. Cargo's ambient target setting
+            // must not move these files into another local directory.
+            // Staging paths use phase ordinals. Reports may already have
+            // staged bytes or a pending publication from an earlier failed
+            // graph query, so retire the unrelated target phase in place.
+            for phase in next.phases.iter_mut().filter(|phase| phase.custom_target) {
+                phase.patterns.clear();
+                phase.complete = true;
+            }
+        }
+        self.persist_next_recipe(next)
+    }
+
     /// Bind the one executable selected by Go's package/output preflight.
     /// An explicit -o is already in the recipe and must agree exactly; an
     /// implicit name may fill only its still-empty project publication phase.
@@ -2758,10 +2889,17 @@ impl RecoverySession {
                 "transfer.retrieval_staging_dir must be absolute"
             );
             if next.transfer.retrieval_staging_dir.as_ref() != Some(root) {
+                let graph_disables_target = next
+                    .build_system_output_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.resolved && capture.graph_available);
                 anyhow::ensure!(
                     !next.sources_released
                         && next.returned.is_none()
-                        && next.phases.iter().all(|phase| !phase.complete
+                        && next.phases.iter().all(|phase| (!phase.complete
+                            || (graph_disables_target
+                                && phase.custom_target
+                                && phase.patterns.is_empty()))
                             && phase.published.is_empty()
                             && phase.pending.is_none()),
                     "cannot change retrieval staging after publication began; retained staging and ownership are unchanged"
@@ -2838,6 +2976,15 @@ impl RecoverySession {
         mut observe: impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         publication_runtime::checkpoint()?;
+        anyhow::ensure!(
+            self.recipe.phases[index].result_dir.is_some()
+                || self
+                    .recipe
+                    .build_system_output_capture
+                    .as_ref()
+                    .is_none_or(|capture| capture.resolved),
+            "build outputs cannot publish before their final graph is discovered"
+        );
         // Validate the entire required set before the first journal/output
         // mutation. One executable or support library cannot satisfy another
         // selected Cargo target, and existing destination files are no proof.
@@ -2984,6 +3131,24 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            exit != 0
+                || self
+                    .recipe
+                    .build_system_output_capture
+                    .as_ref()
+                    .is_none_or(|capture| {
+                        capture.resolved
+                            && (!capture.graph_available
+                                || self
+                                    .recipe
+                                    .phases
+                                    .iter()
+                                    .filter(|phase| phase.name == "project")
+                                    .all(|phase| phase.complete))
+                    }),
+            "build-system execution cannot succeed before discovered outputs are published"
+        );
         anyhow::ensure!(
             exit != 0
                 || self
@@ -4106,6 +4271,42 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         );
     }
     result_recovery::validate_missing_results(&recipe)?;
+    if let Some(capture) = &recipe.build_system_output_capture {
+        let mut projects = recipe.phases.iter().filter(|phase| phase.name == "project");
+        let project = projects
+            .next()
+            .context("build output capture has no project phase")?;
+        anyhow::ensure!(
+            recipe.prepared
+                && projects.next().is_none()
+                && BuildSystemOutputDiscovery::for_command(recipe.kind, &capture.command).is_some()
+                && !WorkerPlatform::from_worker(&recipe.worker).is_windows()
+                && project.local == recipe.project_root
+                && !project.custom_target
+                && project.result_dir.is_none()
+                && project.native_outputs.is_none()
+                && project.cargo_outputs.is_none()
+                && (!capture.graph_available
+                    || (capture.resolved
+                        && recipe
+                            .phases
+                            .iter()
+                            .filter(|phase| phase.custom_target)
+                            .all(|phase| {
+                                phase.complete
+                                    && phase.patterns.is_empty()
+                                    && phase.pending.is_none()
+                                    && phase.published.is_empty()
+                            })))
+                && (capture.resolved
+                    || (!project.complete
+                        && project.pending.is_none()
+                        && project.published.is_empty()
+                        && recipe.returned != Some(0)))
+                && (!capture.resolved || (recipe.execution_started && recipe.exit_code == Some(0))),
+            "build output capture contradicts its admitted publication state"
+        );
+    }
     if recipe.kind == Some(CompilationKind::GoBuild) && recipe.execution_started {
         recipe.validate_go_output_contract()?;
     }
@@ -4835,6 +5036,13 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
     let base = base.with_source_authority_in(session.recipe.identity.clone(), namespace)?;
     session.completed(exit)?;
     let command_exit = exit;
+    // A failed graph probe must not withhold separately declared reports.
+    // Publish those phases below, then retain this retryable discovery error
+    // before retirement can release the source grant or completion receipt.
+    let build_output_error = session
+        .collect_build_system_outputs(&base, &worker)
+        .await
+        .err();
     session.collect_cargo_stderr(&base, &worker).await?;
     // A wrapper can disappear after Cargo finishes but before it records the
     // output set locally. Re-read the complete same-attempt receipt; never
@@ -4930,7 +5138,8 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
     for index in 0..session.recipe.phases.len() {
         let phase = session.recipe.phases[index].clone();
         if phase.complete
-            || ((command_exit != 0 || rejected_cargo_evidence) && phase.result_dir.is_none())
+            || ((command_exit != 0 || rejected_cargo_evidence || build_output_error.is_some())
+                && phase.result_dir.is_none())
         {
             continue;
         }
@@ -5065,6 +5274,9 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
             exit = EXIT_ARTIFACT_TRANSFER_FAILED;
             break;
         }
+    }
+    if let Some(error) = build_output_error {
+        return Err(error.context("build output discovery remains pending after result collection"));
     }
     // Publication is the durable terminal boundary. Retirement can be retried
     // independently and must never cause a second output write.
@@ -9184,6 +9396,313 @@ func TestValue(t *testing.T) {{
                 .to_string_lossy()
                 .starts_with(".rch-go-output.")
         }));
+    }
+
+    #[tokio::test]
+    async fn build_system_custom_directory_recovery_preserves_project_mapping() {
+        let _guard = test_guard!();
+        for (kind, command) in [
+            (CompilationKind::CmakeBuild, "cmake --build target/native"),
+            (CompilationKind::Ninja, "ninja -C target/native"),
+            (CompilationKind::Meson, "meson compile -C target/native"),
+        ] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let cargo_target = base.join("unrelated-cargo-target");
+            for directory in [&local, &remote, &cargo_target] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(local.join("source.c"), b"caller source\n").unwrap();
+            std::fs::write(cargo_target.join("sentinel"), b"unrelated Cargo outputs\n").unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "build-tree".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&cargo_target),
+                Some(kind),
+                command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            assert_eq!(session.recipe.phases.len(), 2);
+            assert_eq!(session.recipe.phases[0].name, "project");
+            assert_eq!(session.recipe.phases[0].remote, remote.to_str().unwrap());
+            assert!(session.returned(0).is_err());
+            session.starting_execution().unwrap();
+            session.completed(0).unwrap();
+            session = reload_publication(&session);
+            assert!(session.retain_failed_delivery_evidence());
+            assert!(session.returned(0).is_err());
+            session.staging_pipeline("project", &pipeline).unwrap();
+            let stage = session.stage(0);
+            std::fs::create_dir_all(stage.join("target/native")).unwrap();
+            std::fs::write(stage.join("target/native/app"), b"current build output\n").unwrap();
+            std::fs::create_dir_all(local.join("target/native")).unwrap();
+            std::fs::write(
+                local.join("target/native/source.c"),
+                b"caller in-tree source\n",
+            )
+            .unwrap();
+            std::fs::write(
+                stage.join("target/native/source.c"),
+                b"stale worker source\n",
+            )
+            .unwrap();
+            assert!(session.publish("project").await.is_err());
+            let discovery = BuildSystemOutputDiscovery::for_command(Some(kind), command).unwrap();
+            let patterns = discovery
+                .resolve(b"RCH_NINJA_OUTPUTS_V1\n/worker/project\n/worker/project\napp: cc\nsource.c: phony\nall: phony\n")
+                .unwrap();
+            session
+                .install_build_system_outputs(Some(patterns.clone()))
+                .unwrap();
+            assert!(
+                session
+                    .install_build_system_outputs(Some(patterns))
+                    .is_err()
+            );
+            session = reload_publication(&session);
+            assert_eq!(session.recipe.phases.len(), 2);
+            assert!(session.recipe.phases[1].complete);
+            assert!(session.recipe.phases[1].patterns.is_empty());
+            assert!(session.has_project_output_contract());
+            let patterns = session.cargo_artifact_patterns("project").unwrap();
+            assert!(
+                patterns
+                    .iter()
+                    .any(|pattern| pattern == "target/native/app")
+            );
+            assert!(patterns.iter().any(|pattern| pattern == "build/**"));
+            assert!(!patterns.iter().any(|pattern| pattern == "target/native/**"));
+            session.publish("project").await.unwrap();
+            session.returned(0).unwrap();
+            assert_eq!(
+                std::fs::read(local.join("target/native/app")).unwrap(),
+                b"current build output\n"
+            );
+            assert_eq!(
+                std::fs::read(local.join("source.c")).unwrap(),
+                b"caller source\n"
+            );
+            assert_eq!(
+                std::fs::read(local.join("target/native/source.c")).unwrap(),
+                b"caller in-tree source\n"
+            );
+            assert_eq!(
+                std::fs::read(cargo_target.join("sentinel")).unwrap(),
+                b"unrelated Cargo outputs\n"
+            );
+            assert!(!cargo_target.join("native/app").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn build_system_result_directories_publish_before_graph_discovery() {
+        let _guard = test_guard!();
+        for (exit, interrupted_report) in [(0, false), (0, true), (1, false)] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let local = writer.path.parent().unwrap().join("checkout");
+            let cargo_target = writer.path.parent().unwrap().join("cargo-target");
+            std::fs::create_dir(&local).unwrap();
+            std::fs::create_dir(&cargo_target).unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "build-tree".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            );
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&cargo_target),
+                Some(CompilationKind::Ninja),
+                "ninja -C generated",
+                &[PathBuf::from("reports")],
+                identity,
+            )
+            .unwrap();
+            session.starting_execution().unwrap();
+            session.completed(exit).unwrap();
+            session
+                .staging_pipeline("result:reports", &pipeline)
+                .unwrap();
+            let result_index = session
+                .recipe
+                .phases
+                .iter()
+                .position(|phase| phase.result_dir.is_some())
+                .unwrap();
+            let stage = session.stage(result_index);
+            assert_eq!(result_index, 2);
+            std::fs::create_dir_all(stage.join("reports")).unwrap();
+            std::fs::write(stage.join("reports/result.txt"), b"build diagnostics\n").unwrap();
+            if interrupted_report {
+                assert!(
+                    session
+                        .publish_with_observer("result:reports", |point, _| {
+                            if point == PublicationPoint::PendingDurable {
+                                anyhow::bail!("interrupted result publication");
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .is_err()
+                );
+                assert!(session.recipe.phases[result_index].pending.is_some());
+            } else {
+                session.publish("result:reports").await.unwrap();
+            }
+            let mut session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.phases[result_index].complete,
+                !interrupted_report
+            );
+            assert!(
+                !session
+                    .recipe
+                    .build_system_output_capture
+                    .as_ref()
+                    .unwrap()
+                    .resolved
+            );
+            if exit == 0 {
+                assert!(session.returned(0).is_err());
+                session
+                    .install_build_system_outputs(Some(Vec::new()))
+                    .unwrap();
+                let mut session = reload_publication(&session);
+                assert_eq!(session.stage(result_index), stage);
+                assert_eq!(session.recipe.phases[result_index].name, "result:reports");
+                session.staging_pipeline("project", &pipeline).unwrap();
+                session.publish("project").await.unwrap();
+                session.publish("result:reports").await.unwrap();
+                session.returned(0).unwrap();
+            } else {
+                assert!(session.install_build_system_outputs(None).is_err());
+                session.returned(exit).unwrap();
+            }
+            assert_eq!(
+                std::fs::read(local.join("reports/result.txt")).unwrap(),
+                b"build diagnostics\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_system_empty_graph_and_absent_backend_have_distinct_recovery_states() {
+        let _guard = test_guard!();
+        for exact_empty in [false, true] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let target = base.join("cargo-target");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "build-tree".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            );
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local,
+                Some(&target),
+                Some(CompilationKind::CmakeBuild),
+                "cmake --build generated",
+                &[],
+                identity,
+            )
+            .unwrap();
+            let original_patterns: Vec<_> = session
+                .recipe
+                .phases
+                .iter()
+                .map(|phase| phase.patterns.clone())
+                .collect();
+            assert!(session.install_build_system_outputs(None).is_err());
+            session.starting_execution().unwrap();
+            session.completed(0).unwrap();
+            assert!(session.returned(0).is_err());
+            session
+                .install_build_system_outputs(exact_empty.then(Vec::new))
+                .unwrap();
+            let mut session = reload_publication(&session);
+            if exact_empty {
+                assert_eq!(session.recipe.phases.len(), 2);
+                assert!(session.recipe.phases[1].complete);
+                assert!(session.recipe.phases[1].patterns.is_empty());
+                assert!(!session.recipe.phases[0].complete);
+                assert_eq!(session.recipe.phases[0].patterns, original_patterns[0]);
+                assert!(session.has_project_output_contract());
+                assert!(session.returned(0).is_err());
+                let relocated = TransferConfig {
+                    retrieval_staging_dir: Some(base.join("available-staging")),
+                    ..TransferConfig::default()
+                };
+                session.apply_retrieval_config(&relocated).unwrap();
+                session.staging_pipeline("project", &pipeline).unwrap();
+                let stage = session.stage(0);
+                std::fs::create_dir_all(stage.join("build")).unwrap();
+                std::fs::write(
+                    stage.join("build/generated-header.h"),
+                    b"generated header\n",
+                )
+                .unwrap();
+                session.publish("project").await.unwrap();
+                assert_eq!(
+                    std::fs::read(session.recipe.project_root.join("build/generated-header.h"))
+                        .unwrap(),
+                    b"generated header\n"
+                );
+                session.returned(0).unwrap();
+            } else {
+                assert!(!session.has_project_output_contract());
+                assert_eq!(
+                    session
+                        .recipe
+                        .phases
+                        .iter()
+                        .map(|phase| phase.patterns.clone())
+                        .collect::<Vec<_>>(),
+                    original_patterns
+                );
+                assert!(session.recipe.phases.iter().all(|phase| !phase.complete));
+            }
+        }
     }
 
     #[cfg(unix)]
