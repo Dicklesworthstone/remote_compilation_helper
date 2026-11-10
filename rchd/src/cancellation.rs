@@ -2346,8 +2346,9 @@ wait
         assert!(script.contains("rch_remote_cancel"));
         assert!(script.contains("RCH_REMOTE_PROCESS_V1"));
         // Group-kill must use `-PGID` (no `--`): dash's kill builtin mishandles
-        // `kill -TERM -- -PGID`, silently failing to signal the group.
-        assert!(script.contains("kill -\"$1\" -\"$rch_pgid\""));
+        // `kill -TERM -- -PGID`, silently failing to signal the group. The
+        // diskless bootstrap carries the protocol as an escaped literal.
+        assert!(script.contains("kill -\\\"\\$1\\\" -\\\"\\$rch_pgid\\\""));
         assert!(!script.contains("kill -TERM -- -"));
         assert!(script.contains("/tmp/rch/project/.rch-run/42.pgid"));
         assert!(!script.contains("RCH_BUILD_ID=42;"));

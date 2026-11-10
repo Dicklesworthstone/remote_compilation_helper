@@ -565,7 +565,8 @@ mod tests {
         // Claim-receipt housekeeping selects files independently of the
         // directory-only target discovery asserted above. It must not narrow
         // the source-activity predicate to files and miss directory writes.
-        assert!(cmd.contains("find \"$__gc_tdir\" -maxdepth 1 -type f -name '*.claim'"));
+        // GC retires only its own fc- receipts (62d085da).
+        assert!(cmd.contains("find \"$__gc_tdir\" -maxdepth 1 -type f -name 'fc-*.claim'"));
         // Never a bare `target` glob.
         assert!(!cmd.contains("/target "));
         // Metrics counters survive the loop: the `while read` is fed from a temp
