@@ -673,6 +673,63 @@ printf '%s\n' "$selected" > node_modules/member-source
         self.assertNotEqual(second["state"]["input_fingerprint"], first["state"]["input_fingerprint"])
         self.assertEqual(self.events(state), ["install", "install"])
 
+    def test_runtime_replacement_invalidates_attestation_and_refreshes_frozen_dependencies(self):
+        project, state = self.project("runtime-generation")
+        # These are controlled installer/runtime executables. Their generations,
+        # worker reuse decisions and frozen install invocations are real; this
+        # test does not claim to exercise a Node ABI or an actual registry.
+        (self.bin / "npm").write_text(fixture.NPM)
+        runtime = self.bin / "node"
+        runtime.write_text("#!/bin/sh\nexit 0\n")
+        runtime.chmod(0o700)
+        request = self.request(project)
+        initial = self.accepted(self.proof(project, state, request))
+        retained_request = self.request(project, attempt="same-runtime-generation")
+        retained = self.accepted(self.proof(project, state, retained_request))
+        self.assertEqual(retained["disposition"], "retained")
+        self.assertEqual(self.events(state), ["install"])
+        self.assert_verified(self.verify(project, state, retained))
+
+        metadata = runtime.stat()
+        runtime.rename(self.bin / "retained-node")
+        runtime.write_text("#!/bin/sh\nexit 0\n")
+        runtime.chmod(0o700)
+        os.utime(runtime, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        self.refused(self.verify(project, state, retained), "prepared execution inputs changed")
+        current = self.request(project, attempt="new-runtime-generation")
+        self.assertEqual(
+            self.accepted(self.proof(project, state, current, mode="inspect")),
+            initial["state"],
+            "old output ownership must survive toolchain invalidation",
+        )
+        refreshed = self.accepted(self.proof(project, state, current))
+        self.assertEqual(refreshed["disposition"], "fresh")
+        self.assertNotEqual(refreshed["state"]["input_fingerprint"], initial["state"]["input_fingerprint"])
+        self.assertEqual(refreshed["state"]["inventory_digest"], initial["state"]["inventory_digest"])
+        self.assertEqual(self.events(state), ["install", "install"])
+        self.assertEqual(self.invocations(state), ["npm", "1", "ci", "npm", "1", "ci"])
+        self.assert_verified(self.verify(project, state, refreshed))
+        warm = self.accepted(self.proof(project, state,
+                                      self.request(project, attempt="stable-new-runtime")))
+        self.assertEqual(warm["disposition"], "retained")
+        self.assertEqual(self.events(state), ["install", "install"])
+
+    def test_runtime_mutation_during_install_keeps_the_transaction_fenced(self):
+        project, state = self.project("runtime-during-install")
+        runtime = self.bin / "node"
+        runtime.write_text("#!/bin/sh\nexit 0\n")
+        runtime.chmod(0o700)
+        request = self.request(project)
+        child = self.proof(project, state, request, install_mode="blocked")
+        fixture.eventually(lambda: (state / "started").exists(), "installer did not start")
+        runtime.write_text("#!/bin/sh\nexit 1\n")
+        (state / "release").write_text("release\n")
+        self.refused(child, "package-manager environment changed")
+        self.assertFalse(self.completed_records())
+        self.assertEqual(self.journals()[0].read_bytes(), fixture.RUNNING)
+        self.refused(self.proof(project, state, request), "interrupted or invalid transaction")
+        self.assertEqual(self.events(state), ["install"])
+
     def test_selected_lifecycle_input_change_reinstalls_before_new_attestation(self):
         project, state = self.project("lifecycle-input")
         (project / "package.json").write_text(

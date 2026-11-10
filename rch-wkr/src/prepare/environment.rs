@@ -4,8 +4,13 @@
 //! In addition to environment values, bind explicitly selected npm user/global
 //! configuration files, the default home `.npmrc` candidate, and the project's
 //! `.npmrc`, including their referenced environment values. This does not
-//! discover npm's implicit global prefix, configuration-file redirects, or
-//! replacement executables. Berry separately binds its home/ancestor config
+//! discover npm's implicit global prefix or configuration-file redirects.
+//! Unix launcher generations (including PATH candidates and shebang
+//! interpreters) invalidate retained native dependencies after runtime or
+//! manager upgrades without repeatedly hashing large Node/Bun binaries.
+//! This is local generation identity, not a portable toolchain content digest
+//! or the dependency closure of arbitrary wrappers and runtime libraries.
+//! Berry separately binds its home/ancestor config
 //! and effective auxiliary files through `capture_yarn`. Custom lifecycle
 //! scripts may read other inputs; this is not a hermetic sandbox.
 
@@ -24,6 +29,12 @@ const MAX_CONFIGURATION_REFERENCES: usize = 4096;
 const MAX_CONFIGURATION_FILES: usize = 32;
 const MAX_YARN_CONFIGURATION_ROOTS: usize = 128;
 const MAX_YARN_CONFIGURATION_FILES: usize = 4096 + MAX_YARN_CONFIGURATION_ROOTS;
+#[cfg(unix)]
+const MAX_TOOLCHAIN_PATHS: usize = 1024;
+#[cfg(unix)]
+const MAX_TOOLCHAIN_SEARCH_DIRECTORIES: usize = 128;
+#[cfg(unix)]
+const MAX_SHEBANG_BYTES: u64 = 4096;
 
 fn relevant(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
@@ -308,6 +319,227 @@ fn resolve_configuration(path: &Path) -> Result<Resolution> {
 fn frame(digest: &mut blake3::Hasher, bytes: &[u8]) {
     digest.update(&(bytes.len() as u64).to_le_bytes());
     digest.update(bytes);
+}
+
+#[cfg(unix)]
+fn bind_file_generation(digest: &mut blake3::Hasher, identity: &FileIdentity) {
+    let (device, inode, changed, changed_nanos, mode) = identity.generation;
+    digest.update(&device.to_le_bytes());
+    digest.update(&inode.to_le_bytes());
+    digest.update(&changed.to_le_bytes());
+    digest.update(&changed_nanos.to_le_bytes());
+    digest.update(&mode.to_le_bytes());
+    digest.update(&identity.bytes.to_le_bytes());
+    let modified = match identity.modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            digest.update(&[0]);
+            duration
+        }
+        Err(error) => {
+            digest.update(&[1]);
+            error.duration()
+        }
+    };
+    digest.update(&modified.as_secs().to_le_bytes());
+    digest.update(&modified.subsec_nanos().to_le_bytes());
+}
+
+/// Include every executable candidate, not only the first mode-bit match:
+/// ACLs and effective credentials can make execvp skip an earlier candidate.
+/// Missing candidates remain an absence observation even if an installer
+/// creates an otherwise unrelated node_modules/.bin parent during its run.
+#[cfg(unix)]
+fn toolchain_candidates(
+    project: &Path,
+    values: &[(OsString, OsString)],
+    program: &str,
+) -> Result<Vec<PathBuf>> {
+    let project = if project.is_absolute() {
+        project.to_owned()
+    } else {
+        std::env::current_dir()?.join(project)
+    };
+    if program.contains('/') {
+        return Ok(vec![project.join(program)]);
+    }
+    // execvp uses the system search path when PATH is absent. Both supported
+    // Unix platforms include these directories; extra candidates only cause
+    // conservative misses, never reuse across a replaced executable.
+    let path = environment_value(values, "PATH").unwrap_or_else(|| OsStr::new("/bin:/usr/bin"));
+    let directories: Vec<_> = std::env::split_paths(path)
+        .take(MAX_TOOLCHAIN_SEARCH_DIRECTORIES + 1)
+        .collect();
+    ensure!(
+        directories.len() <= MAX_TOOLCHAIN_SEARCH_DIRECTORIES,
+        "dependency toolchain PATH exceeds directory limit"
+    );
+    Ok(directories
+        .into_iter()
+        .map(|directory| project.join(directory).join(program))
+        .collect())
+}
+
+#[cfg(unix)]
+fn launcher_interpreters(path: &Path, before: &FileIdentity) -> Result<Vec<String>> {
+    use rustix::fs::{Mode, OFlags};
+    let mut file = File::from(rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+        Mode::empty(),
+    )?);
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file() && FileIdentity::of(&opened)? == *before,
+        "dependency launcher changed before inspection"
+    );
+    let mut prefix = Vec::new();
+    (&mut file)
+        .take(MAX_SHEBANG_BYTES)
+        .read_to_end(&mut prefix)?;
+    ensure!(
+        FileIdentity::of(&file.metadata()?)? == *before,
+        "dependency launcher changed during inspection"
+    );
+    let Some(script) = prefix.strip_prefix(b"#!") else {
+        return Ok(Vec::new());
+    };
+    let line = script
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let text = std::str::from_utf8(line).context("dependency shebang is not UTF-8")?;
+    let mut words = text.split_ascii_whitespace();
+    let interpreter = words.next().context("empty dependency shebang")?;
+    // The kernel treats a shebang interpreter as a literal pathname relative
+    // to the workload cwd, even when it contains no slash. Only env's command
+    // below performs PATH lookup. Preserve that distinction in the resolver.
+    let mut interpreters = vec![if interpreter.contains('/') {
+        interpreter.to_owned()
+    } else {
+        format!("./{interpreter}")
+    }];
+    if Path::new(interpreter).file_name() == Some(OsStr::new("env")) {
+        let argument = words.next().context("env shebang has no interpreter")?;
+        let program = if matches!(argument, "-S" | "--split-string") {
+            words
+                .next()
+                .context("env shebang has no split interpreter")?
+        } else if let Some(program) = argument.strip_prefix("--split-string=") {
+            program
+        } else {
+            argument
+        };
+        // Common env and env -S launchers have a literal first command word.
+        // Do not guess at environment assignments, substitutions or quoting:
+        // their actual executable search context could differ from this one.
+        ensure!(
+            !program.is_empty()
+                && !program.starts_with('-')
+                && !program.contains(['=', '$', '\\', '\'', '"']),
+            "dependency env shebang requires a literal interpreter"
+        );
+        interpreters.push(program.to_owned());
+    }
+    Ok(interpreters)
+}
+
+#[cfg(unix)]
+fn capture_toolchain(
+    project: &Path,
+    values: &[(OsString, OsString)],
+) -> Result<std::collections::BTreeMap<PathBuf, Option<Resolution>>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut pending = BTreeSet::new();
+    for program in ["node", "bun", "npm", "pnpm", "yarn", "corepack"] {
+        pending.extend(toolchain_candidates(project, values, program)?);
+    }
+    let mut observations = std::collections::BTreeMap::new();
+    while let Some(path) = pending.pop_first() {
+        if observations.contains_key(&path) {
+            continue;
+        }
+        ensure!(
+            observations.len().saturating_add(pending.len()) < MAX_TOOLCHAIN_PATHS,
+            "dependency toolchain exceeds path limit"
+        );
+        let executable = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(error) => return Err(error).context("inspect dependency launcher"),
+        };
+        let resolution = if executable {
+            let resolution = resolve_configuration(&path)?;
+            let (resolved, identity) = resolution
+                .file
+                .as_ref()
+                .context("dependency launcher disappeared during inspection")?;
+            for interpreter in launcher_interpreters(resolved, identity)? {
+                for candidate in toolchain_candidates(project, values, &interpreter)? {
+                    if candidate != path && !observations.contains_key(&candidate) {
+                        pending.insert(candidate);
+                    }
+                }
+                ensure!(
+                    observations.len().saturating_add(pending.len()) < MAX_TOOLCHAIN_PATHS,
+                    "dependency toolchain exceeds path limit"
+                );
+            }
+            Some(resolution)
+        } else {
+            None
+        };
+        observations.insert(path, resolution);
+    }
+    Ok(observations)
+}
+
+#[cfg(unix)]
+fn bind_toolchain(
+    digest: &mut blake3::Hasher,
+    observations: &std::collections::BTreeMap<PathBuf, Option<Resolution>>,
+) {
+    digest.update(b"rch-dependency-toolchain-generation-v1\0");
+    digest.update(&(observations.len() as u64).to_le_bytes());
+    for (path, resolution) in observations {
+        frame(digest, path.as_os_str().as_encoded_bytes());
+        let Some(resolution) = resolution else {
+            digest.update(&[0]);
+            continue;
+        };
+        digest.update(&[1]);
+        digest.update(&(resolution.entries.len() as u64).to_le_bytes());
+        for entry in &resolution.entries {
+            match entry {
+                PathEntry::Directory(path, identity) => {
+                    digest.update(&[0]);
+                    frame(digest, path.as_os_str().as_encoded_bytes());
+                    digest.update(&identity.generation.0.to_le_bytes());
+                    digest.update(&identity.generation.1.to_le_bytes());
+                }
+                PathEntry::Symlink(path, identity, target) => {
+                    digest.update(&[1]);
+                    frame(digest, path.as_os_str().as_encoded_bytes());
+                    bind_file_generation(digest, identity);
+                    frame(digest, target.as_os_str().as_encoded_bytes());
+                }
+                PathEntry::Missing(path) => {
+                    digest.update(&[2]);
+                    frame(digest, path.as_os_str().as_encoded_bytes());
+                }
+            }
+        }
+        if let Some((path, identity)) = &resolution.file {
+            frame(digest, path.as_os_str().as_encoded_bytes());
+            bind_file_generation(digest, identity);
+        }
+    }
 }
 
 fn capture_configuration(
@@ -647,8 +879,12 @@ fn trim_npm_text(text: &str) -> &str {
 
 fn capture_with(project: &Path, values: Vec<(OsString, OsString)>) -> Result<CapturedEnvironment> {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"rch-dependency-install-environment-v2\0");
+    digest.update(b"rch-dependency-install-environment-v3\0");
     digest.update(fingerprint(values.iter().cloned())?.as_bytes());
+    #[cfg(unix)]
+    let toolchain = capture_toolchain(project, &values)?;
+    #[cfg(unix)]
+    bind_toolchain(&mut digest, &toolchain);
     let home = match environment_value(&values, "HOME") {
         Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
         // On Unix Node's os.homedir() preserves an explicitly empty HOME.
@@ -708,6 +944,11 @@ fn capture_with(project: &Path, values: Vec<(OsString, OsString)>) -> Result<Cap
             "npm configuration changed during environment capture"
         );
     }
+    #[cfg(unix)]
+    ensure!(
+        toolchain == capture_toolchain(project, &values)?,
+        "dependency toolchain changed during environment capture"
+    );
     Ok(CapturedEnvironment {
         digest: digest.finalize(),
         configurations,
@@ -955,6 +1196,160 @@ mod tests {
         fn capture(&self) -> Result<CapturedEnvironment> {
             capture_with(&self.project, self.values.clone())
         }
+    }
+
+    #[cfg(unix)]
+    fn launcher(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_and_manager_generations_invalidate_without_hashing_large_binaries() {
+        let mut fixture = ConfigFixture::new();
+        let bin = fixture.project.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        fixture.set("PATH", &bin);
+        let node = bin.join("node");
+        // A large sparse native-looking executable still costs only a bounded
+        // prefix read. No executable is launched to discover its identity.
+        launcher(&node, b"\x7fELFfixture");
+        File::options()
+            .write(true)
+            .open(&node)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        let initial = fixture.capture().unwrap();
+        assert_eq!(initial, fixture.capture().unwrap());
+
+        let before = std::fs::metadata(&node).unwrap().modified().unwrap();
+        std::fs::rename(&node, bin.join("retained-node")).unwrap();
+        launcher(&node, b"\x7fELFfixture");
+        let file = File::options().write(true).open(&node).unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(before))
+            .unwrap();
+        let replaced = fixture.capture().unwrap();
+        assert_ne!(
+            initial.digest, replaced.digest,
+            "same size and mtime, new inode"
+        );
+
+        let npm = bin.join("npm");
+        launcher(&npm, b"#!/bin/sh\nexit 0\n");
+        let installed = fixture.capture().unwrap();
+        let before = std::fs::metadata(&npm).unwrap().modified().unwrap();
+        std::fs::write(&npm, b"#!/bin/sh\nexit 1\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&npm)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before))
+            .unwrap();
+        assert_ne!(
+            installed.digest,
+            fixture.capture().unwrap().digest,
+            "same-size manager rewrite with restored mtime changes ctime"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_symlink_parent_and_literal_env_interpreter_generations_are_bound() {
+        use std::os::unix::fs::symlink;
+        let mut fixture = ConfigFixture::new();
+        let bin = fixture.project.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        fixture.set("PATH", &bin);
+        let first = bin.join("runtime-first");
+        let second = bin.join("runtime-second");
+        launcher(&first, b"\x7fELFsame runtime");
+        launcher(&second, b"\x7fELFsame runtime");
+        let interpreter = bin.join("private-node");
+        symlink(&first, &interpreter).unwrap();
+        launcher(
+            &bin.join("npm"),
+            b"#!/usr/bin/env -S private-node --no-warnings\n",
+        );
+        let initial = fixture.capture().unwrap();
+        std::fs::rename(&interpreter, bin.join("retained-interpreter-link")).unwrap();
+        symlink(&second, &interpreter).unwrap();
+        let retargeted = fixture.capture().unwrap();
+        assert_ne!(initial.digest, retargeted.digest);
+
+        // Rename the PATH directory and preserve the same executable inodes
+        // via links. A new parent generation still cannot certify an old run.
+        let retained = fixture.project.join("retained-tools");
+        std::fs::rename(&bin, &retained).unwrap();
+        symlink(&retained, &bin).unwrap();
+        assert_ne!(retargeted.digest, fixture.capture().unwrap().digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_tool_candidates_ignore_new_empty_parents_but_notice_shadowing() {
+        let mut fixture = ConfigFixture::new();
+        let bin = fixture.project.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        launcher(&bin.join("node"), b"\x7fELFruntime");
+        fixture.set("PATH", "node_modules/.bin:tools");
+        let initial = fixture.capture().unwrap();
+        let prepared = fixture.project.join("node_modules/.bin");
+        std::fs::create_dir_all(&prepared).unwrap();
+        std::fs::write(bin.join("unrelated-install-log"), b"log").unwrap();
+        assert_eq!(initial, fixture.capture().unwrap());
+        launcher(&prepared.join("node"), b"\x7fELFnew runtime");
+        assert_ne!(initial.digest, fixture.capture().unwrap().digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_kernel_interpreter_is_bound_to_workload_cwd_not_path() {
+        let mut fixture = ConfigFixture::new();
+        let bin = fixture.project.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        fixture.set("PATH", &bin);
+        launcher(&bin.join("npm"), b"#!private-node\n");
+        launcher(&bin.join("private-node"), b"\x7fELFunused PATH runtime");
+        let actual = fixture.project.join("private-node");
+        launcher(&actual, b"\x7fELFactual cwd runtime");
+        let before = fixture.capture().unwrap();
+        std::fs::write(
+            bin.join("private-node"),
+            b"\x7fELFreplaced unused PATH runtime",
+        )
+        .unwrap();
+        assert_eq!(before, fixture.capture().unwrap());
+        std::fs::write(&actual, b"\x7fELFreplaced cwd runtime").unwrap();
+        assert_ne!(before.digest, fixture.capture().unwrap().digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_bounds_and_ambiguous_env_launchers_refuse_without_execution() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("PATH", ":".repeat(MAX_TOOLCHAIN_SEARCH_DIRECTORIES));
+        assert!(
+            fixture
+                .capture()
+                .unwrap_err()
+                .to_string()
+                .contains("directory limit")
+        );
+        let bin = fixture.project.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        fixture.set("PATH", &bin);
+        launcher(&bin.join("npm"), b"#!/usr/bin/env -S PATH=/other node\n");
+        assert!(
+            fixture
+                .capture()
+                .unwrap_err()
+                .to_string()
+                .contains("literal interpreter")
+        );
     }
 
     fn digest(values: &[(&str, &str)]) -> blake3::Hash {

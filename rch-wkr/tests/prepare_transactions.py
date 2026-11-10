@@ -281,6 +281,25 @@ class PrepareTransactions(unittest.TestCase):
                 self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
                 self.assertEqual(dependency.read_text(), "descendant output\n" if code == 0 else "complete\n")
 
+    def test_manager_rewrite_with_unchanged_path_invalidates_prepared_dependencies(self):
+        project, state = self.project("manager-generation")
+        first = self.report(self.start(project, state), 0)
+        self.assertEqual(first["action"], "Installed")
+        self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
+        manager = self.bin / "npm"
+        metadata = manager.stat()
+        # A same-path installer update used to preserve PATH/config/manifest
+        # fingerprints. Restoring mtime also rules out an mtime-only fix.
+        manager.write_text(NPM + "\nprintf upgraded > node_modules/manager-generation\n")
+        os.utime(manager, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        refreshed = self.report(self.start(project, state), 0)
+        self.assertEqual(refreshed["action"], "Installed")
+        self.assertNotEqual(refreshed["fingerprint"]["hash"], first["fingerprint"]["hash"])
+        self.assertEqual(refreshed["fingerprint_changed_from"], first["fingerprint"]["hash"])
+        self.assertEqual((project / "node_modules/manager-generation").read_text(), "upgraded")
+        self.assertEqual(self.events(state), ["install", "install"])
+        self.assertEqual(self.report(self.start(project, state), 0)["action"], "Skipped")
+
     def test_supervisor_crash_cannot_certify_a_failed_install(self):
         project, state = self.project("supervisor-crash")
         child = self.start(project, state, mode="descendants")
