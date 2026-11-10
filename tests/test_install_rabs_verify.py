@@ -89,9 +89,10 @@ class InstallationVerificationTests(unittest.TestCase):
         self.marker = self.root / "tool-executed"
         native = shutil.which("true")
         self.assertIsNotNone(native)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             shutil.copyfile(native, self.bundle / name)
             (self.bundle / name).chmod(0o755)
+        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         self.launcher("first")
         client = self.root / "client"
         client.mkdir()

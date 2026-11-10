@@ -96,9 +96,10 @@ class TargetDeploymentTests(unittest.TestCase):
         for target, machine in [(X86, 62), (ARM, 183)]:
             bundle = self.root / target
             bundle.mkdir()
-            (bundle / "cargo-rabs").write_text(
-                "#!/usr/bin/env python3\nprint(" + repr(target) + ")\n")
-            for name in installer.TOOLS[1:]:
+            for name in installer.PYTHON_TOOLS:
+                (bundle / name).write_text(
+                    "#!/usr/bin/env python3\nprint(" + repr(target) + ")\n")
+            for name in installer.NATIVE_TOOLS:
                 fixture = bytearray(native)
                 fixture[18:20] = machine.to_bytes(2, "little")
                 (bundle / name).write_bytes(fixture)

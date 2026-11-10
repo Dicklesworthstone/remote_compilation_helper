@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -40,9 +41,10 @@ class InstallTests(unittest.TestCase):
         # A real native ELF fixture, not a claimed rabsd/rustc build.
         executable = shutil.which("true")
         self.assertIsNotNone(executable)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
+        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         self.launcher("first")
 
     def launcher(self, label):
@@ -88,6 +90,38 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.bin / old / "cargo-rabs").read_bytes(), old_launcher)
         self.assertEqual(links, {name: (self.bin / name).lstat().st_ino for name in installer.TOOLS})
         self.assertIn("second", subprocess.check_output([str(self.bin / "cargo-rabs")], text=True))
+
+    def test_installed_recovery_uses_its_generation_across_an_atomic_upgrade(self):
+        self.run_install()
+        original = self.bin / self.current()
+        driver = self.bin / "rabs-recover"
+        help_text = subprocess.check_output([str(driver), "--help"], text=True)
+        self.assertIn("--resume-to", help_text)
+        self.assertIn("--acknowledge", help_text)
+        # Load the actual installed driver, then switch the public links while
+        # this caller is still inspecting its result. Native execution remains
+        # an explicit ELF fixture; the generation resolution is production code.
+        recovery = runpy.run_path(str(driver))
+        self.launcher("second")
+        self.run_install()
+        self.assertNotEqual(original, self.bin / self.current())
+        self.assertEqual(recovery["daemon_path"](None, {}), str(original / "rabsd"))
+        current = runpy.run_path(str(driver))
+        self.assertEqual(current["daemon_path"](None, {}),
+                         str(self.bin / self.current() / "rabsd"))
+
+    def test_invalid_recovery_launcher_cannot_replace_an_active_toolset(self):
+        self.run_install()
+        original = self.current()
+        path = self.bundle / "rabs-recover"
+        for invalid in (b"#!/bin/sh\nexit 0\n", b"#!/usr/bin/env python3\nthis is (\n"):
+            with self.subTest(payload=invalid):
+                path.write_bytes(invalid)
+                with self.assertRaises((installer.InstallError, SyntaxError)):
+                    self.run_install()
+                self.assertEqual(self.current(), original)
+                self.assertTrue(all((self.bin / name).resolve().parent == self.bin / original
+                                    for name in installer.TOOLS))
 
     def test_missing_member_fails_before_creating_install_directory(self):
         (self.bundle / "rabs-wkr").rename(self.bundle / "not-rabs-wkr")
@@ -197,11 +231,12 @@ class InstallTests(unittest.TestCase):
     def test_split_profiles_are_explicit_and_missing_daemon_is_not_best_effort(self):
         scripts = self.root / "checkout" / "scripts"
         scripts.mkdir(parents=True)
-        shutil.copyfile(self.bundle / "cargo-rabs", scripts / "cargo-rabs")
-        (scripts / "cargo-rabs").chmod(0o755)
+        for name in installer.PYTHON_TOOLS:
+            shutil.copy2(self.bundle / name, scripts / name)
         build = self.root / "custom-target" / "x86_64-unknown-linux-gnu"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
-                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release")]:
+                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
+                              ("rabs-delivery-cas", "daemon-release")]:
             directory = build / profile
             directory.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.bundle / name, directory / name)
@@ -354,10 +389,10 @@ class MainInstallerTests(unittest.TestCase):
         self.home.mkdir()
         self.native = shutil.which("true")
         self.assertIsNotNone(self.native)
-        for name in ("rch", "rchd", "rch-wkr", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root"):
+        for name in ("rch", "rchd", "rch-wkr") + installer.NATIVE_TOOLS:
             shutil.copyfile(self.native, self.bundle / name)
             (self.bundle / name).chmod(0o755)
-        for name in ("install-rabs", "cargo-rabs"):
+        for name in ("install-rabs",) + installer.PYTHON_TOOLS:
             shutil.copyfile(SCRIPT.with_name(name), self.bundle / name)
             (self.bundle / name).chmod(0o755)
         for name in ("rustup", "rsync", "zstd"):
@@ -456,7 +491,7 @@ class MainInstallerTests(unittest.TestCase):
     def test_incomplete_requested_release_fails_and_keeps_the_previous_generation(self):
         self.assert_success(self.main("--with-rabs", "--offline", str(self.archive())))
         before = self.assert_complete_generation()
-        for missing in ("rabsd", "cargo-rabs", "install-rabs"):
+        for missing in ("rabsd", "cargo-rabs", "install-rabs", "rabs-recover", "rabs-delivery-cas"):
             with self.subTest(missing=missing):
                 result = self.main("--with-rabs", "--offline", str(self.archive(exclude={missing})))
                 self.assertNotEqual(result.returncode, 0)
@@ -513,7 +548,7 @@ esac
         (project / "Cargo.toml").write_text(
             '# remote_compilation_helper fixture\n[workspace]\n[workspace.package]\nversion = "2.9.0"\n')
         (project / "scripts").mkdir()
-        for name in ("install-rabs", "cargo-rabs"):
+        for name in ("install-rabs",) + installer.PYTHON_TOOLS:
             shutil.copyfile(self.bundle / name, project / "scripts" / name)
             (project / "scripts" / name).chmod(0o755)
         target_base = self.root / "custom target"
@@ -527,7 +562,7 @@ esac
             (target / "wrapper-release" / name).write_bytes(
                 (self.bundle / name).read_bytes() + stale_marker)
             (target / "wrapper-release" / name).chmod(0o755)
-        for name in ("rchd", "rch-wkr", "rabsd", "rabs-wkr", "rabs-cargo-root"):
+        for name in ("rchd", "rch-wkr", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas"):
             (target / "daemon-release" / name).write_bytes(
                 (self.bundle / name).read_bytes() + stale_marker)
             (target / "daemon-release" / name).chmod(0o755)
@@ -558,6 +593,7 @@ mkdir -p "$output"
 for package in $packages; do
     case "$package" in
         rabs-wkr) names='rabs-wkr rabs-cargo-root' ;;
+        rabsd) names='rabsd rabs-delivery-cas' ;;
         *) names=$package ;;
     esac
     for name in $names; do
@@ -587,7 +623,7 @@ done
             " --bin rchd --bin rch-wkr" + layout,
             "build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap" + layout,
             "build --locked --profile daemon-release -p rabsd -p rabs-wkr"
-            " --bin rabsd --bin rabs-wkr --bin rabs-cargo-root" + layout,
+            " --bin rabsd --bin rabs-wkr --bin rabs-cargo-root --bin rabs-delivery-cas" + layout,
         ])
 
     def test_release_source_fallback_clones_the_tag_and_installs_all_rabs_tools(self):
@@ -682,9 +718,10 @@ class PackageTests(unittest.TestCase):
         executable = shutil.which("true")
         self.assertIsNotNone(executable)
         # Real ELF fixtures test distribution, not source identity or RABS execution.
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
+        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         (self.bundle / "cargo-rabs").write_text(
             "#!/usr/bin/env python3\nprint('packaged launcher')\n", encoding="utf-8")
         (self.bundle / "cargo-rabs").chmod(0o755)
@@ -738,7 +775,7 @@ class PackageTests(unittest.TestCase):
     def test_cross_architecture_packaging_does_not_execute_supplied_binaries(self):
         target, machine = next((target, machine) for target, machine in installer.TARGET_MACHINES.items()
                                if target != self.target)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             data = bytearray((self.bundle / name).read_bytes())
             data[18:20] = machine.to_bytes(2, "little")
             (self.bundle / name).write_bytes(data)
@@ -751,7 +788,7 @@ class PackageTests(unittest.TestCase):
         build = self.root / "target"
         for profile in ("wrapper-release", "daemon-release"):
             (build / profile).mkdir(parents=True)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             profile = "wrapper-release" if name == "rabs-wrap" else "daemon-release"
             shutil.copy2(self.bundle / name, build / profile / name)
         code, stdout, error = self.main("--from-build", str(build), "--package", str(self.output),
@@ -759,8 +796,8 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(code, 0, error)
         self.assertEqual(json.loads(stdout)["kind"], "rabs-packaged")
         with tarfile.open(self.output, "r:gz") as archive:
-            self.assertEqual(archive.extractfile("cargo-rabs").read(),
-                             SCRIPT.with_name("cargo-rabs").read_bytes())
+            for name in installer.PYTHON_TOOLS:
+                self.assertEqual(archive.extractfile(name).read(), SCRIPT.with_name(name).read_bytes())
         self.assertFalse(self.bin.exists())
 
     def test_wrong_target_missing_or_mixed_tools_never_publish(self):
@@ -915,10 +952,10 @@ class PackageSourceTests(unittest.TestCase):
         (self.repo / "scripts").mkdir(parents=True)
         executable = shutil.which("true")
         self.assertIsNotNone(executable)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.snapshot / name)
             (self.snapshot / name).chmod(0o755)
-        for name in ("cargo-rabs", "install-rabs"):
+        for name in installer.PYTHON_TOOLS + ("install-rabs",):
             data = ("#!/usr/bin/env python3\nprint(" + repr(name + " fixture") + ")\n").encode()
             (self.snapshot / name).write_bytes(data)
             (self.snapshot / name).chmod(0o755)
@@ -931,7 +968,7 @@ class PackageSourceTests(unittest.TestCase):
         self.reports = {name: {"schema": 1, "kind": "rabs-build-info", "tool": name,
                                "version": "2.1.34", "compiled_source": self.source,
                                "build_identity": "rabs-2.1.34+" + self.source}
-                        for name in installer.TOOLS[1:]}
+                        for name in installer.NATIVE_TOOLS}
         self.raw_reports = {}
         self.seen = []
         self.run_probe = installer.package_probe_output
@@ -968,10 +1005,10 @@ class PackageSourceTests(unittest.TestCase):
             return installer.verify_package_source(self.snapshot, self.expected, self.entries,
                                                    self.source if source is None else source, self.repo)
 
-    def test_four_exact_snapshot_probes_and_git_blobs_bind_the_receipt(self):
+    def test_native_snapshot_probes_and_git_blobs_bind_the_receipt(self):
         self.assertEqual(self.verify(), {"commit": self.source, "version": "2.1.34",
                                          "build_identity": "rabs-2.1.34+" + self.source})
-        self.assertEqual(self.seen, list(installer.TOOLS[1:]))
+        self.assertEqual(self.seen, list(installer.NATIVE_TOOLS))
 
     def test_strict_package_cli_binds_captured_tools_and_refuses_mixed_source(self):
         # The producer ships its own installer. Pin those actual bytes in the
@@ -1052,8 +1089,8 @@ class PackageSourceTests(unittest.TestCase):
             self.verify(tree)
         self.assertEqual(self.seen, [])
 
-    def test_both_scripts_must_match_the_requested_git_blobs(self):
-        for name in ("cargo-rabs", "install-rabs"):
+    def test_all_scripts_must_match_the_requested_git_blobs(self):
+        for name in installer.PYTHON_TOOLS + ("install-rabs",):
             with self.subTest(name=name):
                 path = self.snapshot / name
                 original = path.read_bytes()

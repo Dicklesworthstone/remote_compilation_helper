@@ -33,6 +33,9 @@ from typing import Optional
 MAX_RECORD = 1024 * 1024 - 64
 SCHEMA = "rabs-live-remote-recovery-v1"
 CANONICAL_SCHEMA = "rabs-canonical-cargo-recovery-v1"
+# Resolve the installed generation once. An atomic toolset upgrade while this
+# process inspects retained metadata must not switch its eventual native peer.
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 
 
 class Refused(Exception):
@@ -419,7 +422,7 @@ def operation(intent, resume_to, acknowledge, no_prefix, prefix_from=None):
 
 def daemon_path(selected, env):
     candidates = ([selected] if selected else
-                  [env.get("CARGO_RABS_DAEMON"), str(Path(__file__).resolve().with_name("rabsd")),
+                  [env.get("CARGO_RABS_DAEMON"), str(SCRIPT_DIRECTORY / "rabsd"),
                    shutil.which("rabsd", path=env.get("PATH"))])
     # An explicit override must never silently select a different installed binary.
     if not selected and env.get("CARGO_RABS_DAEMON") is not None:

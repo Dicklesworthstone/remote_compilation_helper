@@ -781,23 +781,25 @@ try:
         paths = (api["source_files"](None, source_path) if source_kind == "--from-build"
                  else api["source_files"](source_path, None))
         machine = api["host_machine"]()
-        for name in ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root"):
+        for name in api["NATIVE_TOOLS"]:
             with paths[name].open("rb") as reader:
                 api["require_native_elf"](name, reader.read(64), machine)
     else:
         paths = {name: Path(source_path) / name
-                 for name in ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root")}
+                 for name in ("cargo-rabs", "rabs-recover", "rabs-wrap", "rabsd", "rabs-wkr",
+                              "rabs-cargo-root", "rabs-delivery-cas")}
     probe_tool = shutil.which("true")
     if probe_tool is None:
         raise RuntimeError("wrapper verification requires an external true executable")
-    for name, arguments in (("cargo-rabs", ["--help"]), ("rabsd", ["--version"]),
+    for name, arguments in (("cargo-rabs", ["--help"]), ("rabs-recover", ["--help"]),
+                            ("rabs-delivery-cas", ["--help"]), ("rabsd", ["--version"]),
                             ("rabs-wkr", ["--version"]), ("rabs-cargo-root", ["--version"]),
                             ("rabs-wrap", [probe_tool, "-vV"])):
         if not paths[name].is_file() or not os.access(paths[name], os.X_OK):
             raise RuntimeError(name + " is missing or not executable")
         try:
             result = subprocess.run([str(paths[name]), *arguments], timeout=10,
-                                    stdout=subprocess.DEVNULL if name == "cargo-rabs" else None)
+                                    stdout=subprocess.DEVNULL if "--help" in arguments else None)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeError(name + " cannot execute on this host: " + str(error)) from error
         if result.returncode:
@@ -827,12 +829,12 @@ install_rabs_toolset() {
     fi
     info "Installing the complete RABS toolset into $bin_dir..."
     # Use the supplied bundle/build's installer and its atomic generation
-    # switch. It verifies all four tools before activating any of them and
+    # switch. It verifies the complete toolset before activating any of it and
     # refuses to overwrite unmanaged files from an older loose installation.
     if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
         die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
     fi
-    success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr and rabs-cargo-root"
+    success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
 }
 
 # Bind native source builds and installation to the same output layout. Cargo
@@ -875,7 +877,7 @@ build_rabs_toolset() {
         die "Requested RABS wrapper build failed; installation stopped"
     fi
     if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr \
-        --bin rabsd --bin rabs-wkr --bin rabs-cargo-root \
+        --bin rabsd --bin rabs-wkr --bin rabs-cargo-root --bin rabs-delivery-cas \
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS daemon/worker build failed; installation stopped"
     fi

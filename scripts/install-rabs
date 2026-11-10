@@ -2,7 +2,7 @@
 """Install a complete, opt-in RABS toolset without changing Cargo or services.
 
 Accepts an extracted release bundle or Cargo's split-profile build directory.
-Generations are retained; one atomic symlink switch activates all five tools.
+Generations are retained; one atomic symlink switch activates the complete toolset.
 The supplied files must already be trusted: hashing detects copy corruption,
 not publisher authenticity. Verify the release signature/checksum first.
 
@@ -52,7 +52,9 @@ import time
 import zlib
 
 
-TOOLS = ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root")
+PYTHON_TOOLS = ("cargo-rabs", "rabs-recover")
+NATIVE_TOOLS = ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas")
+TOOLS = PYTHON_TOOLS + NATIVE_TOOLS
 VERSIONS = ".rabs-versions"
 CURRENT = ".rabs-current"
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
@@ -159,10 +161,12 @@ def source_files(bundle, build):
         root = Path(build).absolute()
         paths = {
             "cargo-rabs": Path(__file__).resolve().with_name("cargo-rabs"),
+            "rabs-recover": Path(__file__).resolve().with_name("rabs-recover"),
             "rabs-wrap": root / "wrapper-release" / "rabs-wrap",
             "rabsd": root / "daemon-release" / "rabsd",
             "rabs-wkr": root / "daemon-release" / "rabs-wkr",
             "rabs-cargo-root": root / "daemon-release" / "rabs-cargo-root",
+            "rabs-delivery-cas": root / "daemon-release" / "rabs-delivery-cas",
         }
     # Refuse incomplete sets before creating anything in the destination.
     for name, path in paths.items():
@@ -315,11 +319,11 @@ def copy_tool(name, source, destination, machine):
             remaining -= len(chunk)
         if reader.read(1) or copied.digest() != digest.digest():
             raise InstallError("staged executable failed digest verification: " + name)
-    if name == "cargo-rabs":
+    if name in PYTHON_TOOLS:
         # Reject truncated/invalid launchers, without executing supplied code.
         if count > 1024 * 1024 or not prefix.startswith(b"#!/usr/bin/env python3\n"):
-            raise InstallError("invalid cargo-rabs Python launcher")
-        ast.parse(destination.read_text(encoding="utf-8"), filename="cargo-rabs")
+            raise InstallError("invalid " + name + " Python launcher")
+        ast.parse(destination.read_text(encoding="utf-8"), filename=name)
     else:
         require_native_elf(name, prefix, machine)
     return {"sha256": digest.hexdigest(), "bytes": count}
@@ -411,7 +415,7 @@ def validate_toolset(manifest):
         raise InstallError("invalid complete RABS toolset manifest")
     total = 0
     for name, entry in manifest["files"].items():
-        limit = 1024 * 1024 if name == "cargo-rabs" else MAX_FILE_BYTES
+        limit = 1024 * 1024 if name in PYTHON_TOOLS else MAX_FILE_BYTES
         if (not isinstance(entry, dict) or set(entry) != {"bytes", "sha256"}
                 or type(entry["bytes"]) is not int or not 0 < entry["bytes"] <= limit
                 or not isinstance(entry["sha256"], str)
@@ -430,7 +434,7 @@ def toolset_digest(expected):
 
 def inspect_tool_bytes(name, reader, size):
     """Hash exactly one bounded tool without executing it or following links."""
-    limit = 1024 * 1024 if name == "cargo-rabs" else MAX_FILE_BYTES
+    limit = 1024 * 1024 if name in PYTHON_TOOLS else MAX_FILE_BYTES
     if type(size) is not int or not 0 < size <= limit:
         raise InstallError("invalid executable size: " + name)
     remaining = size
@@ -445,13 +449,13 @@ def inspect_tool_bytes(name, reader, size):
         digest.update(chunk)
         if len(prefix) < 64:
             prefix = (prefix + chunk)[:64]
-        if name == "cargo-rabs":
+        if name in PYTHON_TOOLS:
             launcher.extend(chunk)
     machine = None
-    if name == "cargo-rabs":
+    if name in PYTHON_TOOLS:
         if not prefix.startswith(b"#!/usr/bin/env python3\n"):
-            raise InstallError("invalid cargo-rabs Python launcher")
-        ast.parse(launcher.decode("utf-8"), filename="cargo-rabs")
+            raise InstallError("invalid " + name + " Python launcher")
+        ast.parse(launcher.decode("utf-8"), filename=name)
     else:
         machine = int.from_bytes(prefix[18:20], "little")
         if machine not in TARGET_MACHINES.values():
@@ -480,7 +484,7 @@ def inspect_tool_file(name, path, directory=None, installed=False, expected=None
 
 def expected_toolset(paths):
     if set(paths) != set(TOOLS):
-        raise InstallError("verification requires exactly the five RABS tools")
+        raise InstallError("verification requires the complete RABS toolset")
     observed = {name: signature(path.lstat()) for name, path in paths.items()}
     if sum(identity[2] for identity in observed.values()) > MAX_ARCHIVE_BYTES:
         raise InstallError("expected toolset exceeds its byte limit")
@@ -646,8 +650,8 @@ def verify_package_source(snapshot, expected, entries, required_source, source_r
 
     if expected_toolset(source_files(snapshot, None)) != expected:
         raise InstallError("package snapshot differs from captured toolset")
-    scripts = {"cargo-rabs": script_bytes("cargo-rabs", 1024 * 1024),
-               "install-rabs": script_bytes("install-rabs", MAX_INSTALLER_BYTES)}
+    scripts = {name: script_bytes(name, 1024 * 1024) for name in PYTHON_TOOLS}
+    scripts["install-rabs"] = script_bytes("install-rabs", MAX_INSTALLER_BYTES)
     unchanged()
     git = ["git", "--no-replace-objects", "-C", str(Path(source_repository).absolute())]
     deadline = time.monotonic() + 30
@@ -667,7 +671,7 @@ def verify_package_source(snapshot, expected, entries, required_source, source_r
     version = None
     identity = None
     fields = {"schema", "kind", "tool", "version", "build_identity", "compiled_source"}
-    for name in TOOLS[1:]:
+    for name in NATIVE_TOOLS:
         report = unique_json(probe([str(snapshot / name), "--rabs-build-info"], 64 * 1024))
         if (not isinstance(report, dict) or set(report) != fields
                 or type(report["schema"]) is not int or report["schema"] != 1
@@ -1095,7 +1099,7 @@ def prepare_deployment(paths, bin_dir, reserve_bytes):
         raise InstallError("deployment reserve must be at least 64 MiB")
     stage = Path(tempfile.mkdtemp(prefix="rabs-deploy-send-"))
     if set(paths) != set(TOOLS):
-        raise InstallError("deployment requires exactly the four RABS tools")
+        raise InstallError("deployment requires the complete RABS toolset")
     sources = {"install-rabs": Path(__file__).resolve(), **paths}
     observed_sources = {name: signature(path.lstat()) for name, path in sources.items()}
     estimated = sum(observed[2] for observed in observed_sources.values())
@@ -1410,7 +1414,7 @@ def validate_target_image(image, target):
             raise InstallError("sealed deployment image changed")
         offset = TRANSFER_HEADER_BYTES
         for entry in header["files"]:
-            if entry["name"] in TOOLS[1:]:
+            if entry["name"] in NATIVE_TOOLS:
                 reader.seek(offset)
                 require_native_elf(entry["name"], reader.read(min(64, entry["bytes"])),
                                    TARGET_MACHINES[target])

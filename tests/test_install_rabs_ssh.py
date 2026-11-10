@@ -73,9 +73,10 @@ class SSHDeploymentTests(unittest.TestCase):
         (self.ssh_bin / "ssh").chmod(0o755)
         executable = shutil.which("true")
         self.assertIsNotNone(executable)
-        for name in installer.TOOLS[1:]:
+        for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
+        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         self.launcher("first")
         self.env = {"PATH": str(self.ssh_bin) + os.pathsep + os.environ.get("PATH", ""),
                     "RABS_SSH_TEST_ROOT": str(self.root)}
@@ -349,11 +350,12 @@ class SSHDeploymentTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         copied_installer = scripts / "install-rabs"
         shutil.copyfile(SCRIPT, copied_installer)
-        shutil.copyfile(self.bundle / "cargo-rabs", scripts / "cargo-rabs")
-        (scripts / "cargo-rabs").chmod(0o755)
+        for name in installer.PYTHON_TOOLS:
+            shutil.copy2(self.bundle / name, scripts / name)
         target = checkout / "target" / "selected-platform"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
-                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release")]:
+                              ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
+                              ("rabs-delivery-cas", "daemon-release")]:
             directory = target / profile
             directory.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.bundle / name, directory / name)

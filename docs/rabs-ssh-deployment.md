@@ -1,7 +1,9 @@
 # Deploying the RABS toolset over SSH
 
 `install-rabs --ssh HOST` transfers and installs `cargo-rabs`, `rabs-wrap`,
-`rabsd`, `rabs-wkr`, and `rabs-cargo-root` together. Repeat `--ssh` for up to 32 distinct SSH
+`rabsd`, `rabs-wkr`, `rabs-cargo-root`, `rabs-recover`, and `rabs-delivery-cas`
+together. Recovery is available from the installed generation without a source
+checkout. Repeat `--ssh` for up to 32 distinct SSH
 host aliases. This is the S7 tool-distribution path: it does **not** turn the
 host-local dependency cache into fleet-wide canonical execution, start services,
 reconfigure Cargo, or qualify a release to serve cached compiler outputs.
@@ -18,15 +20,15 @@ python3 scripts/install-rabs \
   --target x86_64-unknown-linux-gnu
 ```
 
-The output contains exactly six flat regular files: the five RABS tools and
+The output contains exactly eight flat regular files: the seven RABS tools and
 `install-rabs`. It does not inherit generic archive additions or nested
 `scripts/` paths. An extracted complete toolset can instead be selected with
-`--from-bundle`. The explicit target must match all four native executables;
+`--from-bundle`. The explicit target must match all five native executables;
 packaging can run on another architecture because it never executes them.
 
 The producer captures stable input bytes, writes a gzip/USTAR archive with
 deterministic metadata (repeatable bytes under the same packaging runtime),
-reads it through the real installer, and checks all six members before
+reads it through the real installer, and checks all eight members before
 publishing a new pathname atomically. Existing output files and symlinks are
 refused. Its JSON receipt includes the archive SHA-256, byte count, tool
 identities, and retained private staging directory. Capacity checks allow for
@@ -49,7 +51,7 @@ python3 scripts/install-rabs \
   --source-repository "$PWD"
 ```
 
-This opt-in mode executes each of the four **captured, trusted native binaries**
+This opt-in mode executes each of the five **captured, trusted native binaries**
 with the exact standalone `--rabs-build-info` argument. Reports must identify
 the correct tool, agree on the package version, and contain the requested full
 commit in both the build identity and the primary compiled `RCH_BUILD_SOURCE`
@@ -57,7 +59,7 @@ field. Version-only, shortened, dirty, overlay, mixed, and malformed identities
 are refused; an invalid primary stamp cannot be hidden by a fallback identity
 variable. Each query has a deadline and a combined output bound.
 
-The launcher and bundled installer must also match the exact Git blobs from
+Both Python launchers and the bundled installer must also match the exact Git blobs from
 that commit; local Git replacement objects are disabled, and a tree or tag
 object cannot stand in for a commit. The captured files are checked again after
 the probes, and normal archive verification still runs before publication.
@@ -100,8 +102,11 @@ not restart or kill them. Existing daemon configuration is not changed.
 
 An extracted, trusted bundle works with `--from-bundle`. Locally built tools
 work with `--from-build /path/to/target/<target-triple>`, which selects
-`wrapper-release/rabs-wrap`, `daemon-release/{rabsd,rabs-wkr,rabs-cargo-root}`, and the
-checkout's `scripts/cargo-rabs`. No compiler runs on the deployment path.
+`wrapper-release/rabs-wrap`,
+`daemon-release/{rabsd,rabs-wkr,rabs-cargo-root,rabs-delivery-cas}`, and the
+checkout's `scripts/cargo-rabs` and `scripts/rabs-recover`. No compiler runs on
+the deployment path. Missing or malformed recovery tools refuse the complete
+installation before activation, preserving the previous generation.
 
 ## Transport and activation
 
@@ -111,7 +116,7 @@ process first. Agent forwarding and port forwarding are disabled; no project
 source, Cargo environment, or credentials are included in the transfer.
 
 The dispatcher captures one private transfer image containing the installer
-and all five tools, checking source file identities before and after capture.
+and all seven tools, checking source file identities before and after capture.
 Every worker receives those same bytes. The receiver verifies the complete
 inventory, exact sizes, SHA-256 digests, and stream termination before calling
 the existing installer. All tools become current via one atomic generation
@@ -167,7 +172,7 @@ asks the worker to inspect its current managed generation. It sends only the
 current inspector and expected file identities, without retransmitting tools.
 The receiver opens the existing installation lock for shared read access,
 checks all public links and the active generation manifest, and hashes all
-five actual executable files. It also checks native ELF identity, launcher
+seven actual executable files. It also checks native ELF identity, launcher
 syntax, ownership and permissions, and rechecks file/link identities after
 reading. A manifest alone cannot establish success. No installed executable
 is run, no destination or lock is created, and no generation is activated,

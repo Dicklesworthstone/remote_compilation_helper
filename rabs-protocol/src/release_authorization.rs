@@ -278,7 +278,10 @@ where
     I: IntoIterator<Item = A>,
     A: AsRef<std::ffi::OsStr>,
 {
-    if !matches!(tool, "rabs-wrap" | "rabsd" | "rabs-wkr" | "rabs-cargo-root") {
+    if !matches!(
+        tool,
+        "rabs-wrap" | "rabsd" | "rabs-wkr" | "rabs-cargo-root" | "rabs-delivery-cas"
+    ) {
         return None;
     }
     let mut args = args.into_iter();
@@ -665,6 +668,12 @@ mod tests {
     #[test]
     fn build_info_requires_one_exact_standalone_argument() {
         assert!(build_info_for_args("rabs-wrap", ["--rabs-build-info"]).is_some());
+        let recovery = build_info_for_args("rabs-delivery-cas", ["--rabs-build-info"])
+            .expect("installed recovery operator must participate in source verification");
+        assert!(recovery.contains("\"tool\":\"rabs-delivery-cas\""));
+        assert!(
+            build_info_for_args("rabs-delivery-cas", ["--rabs-build-info", "archive"]).is_none()
+        );
         for args in [
             vec![],
             vec!["--version"],

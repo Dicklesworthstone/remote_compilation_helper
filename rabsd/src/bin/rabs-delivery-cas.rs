@@ -107,6 +107,13 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
     }
 }
 fn main() {
+    if let Some(info) = rabs_protocol::release_authorization::build_info_for_args(
+        "rabs-delivery-cas",
+        std::env::args_os().skip(1),
+    ) {
+        println!("{info}");
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args
         .first()

@@ -3,8 +3,12 @@
 `scripts/rabs-recover` connects the live remote lane's retained `recovery.json`
 and `request.json` to the **existing native TLS result-recovery operator**. It
 never sends a new compiler execution. Linux, Python 3.9+, procfs and Linux
-sealed memory-file support are required. Use this repository script with an
-updated `rabsd`; it is not yet added to the release installer payload.
+sealed memory-file support are required. The complete `install-rabs` toolset
+installs this command as `rabs-recover` alongside its matching `rabsd` and the
+`rabs-delivery-cas` archive/restore operator. The main installer includes them
+when `--with-rabs` is selected. Existing installations need a complete updated
+bundle; supplying only a new launcher is refused before generation activation.
+The repository script remains usable directly with an updated `rabsd`.
 
 ## Inspect first
 
@@ -13,7 +17,7 @@ execution error. Paths below are examples, not a directory to create manually.
 
 ```bash
 recovery=/absolute/rabs-state/dependency-workers/result-EXAMPLE
-python3 scripts/rabs-recover "$recovery"
+rabs-recover "$recovery"
 ```
 
 Without an operation flag, this reads only bounded private intent metadata. It
@@ -36,14 +40,17 @@ its lock or ledger. The worker must reconnect outward to the recorded listener.
 Supply the same coordinator TLS credentials used by the original deployment.
 The driver checks that their paths are absolute; `rabsd` validates the credentials
 and performs authentication. Select a matching binary with `--rabsd` or
-`CARGO_RABS_DAEMON`. Otherwise a sibling binary or `rabsd` on PATH is used.
+`CARGO_RABS_DAEMON`. Otherwise a sibling binary from the recovery command's
+installed generation or `rabsd` on PATH is used. An already running recovery
+command keeps that generation even if a later installation switches the public
+tool links.
 
 ```bash
 export RABS_COORD_TLS_CA=/absolute/credentials/ca.pem
 export RABS_COORD_TLS_CERT=/absolute/credentials/coordinator.pem
 export RABS_COORD_TLS_KEY=/absolute/credentials/coordinator.key
 
-python3 scripts/rabs-recover "$recovery" \
+rabs-recover "$recovery" \
   --rabsd /absolute/bin/rabsd \
   --resume-to /absolute/recovered/dependency-17
 ```
@@ -60,7 +67,7 @@ If that recovery is interrupted too, keep its new partial directory and select
 it explicitly on the next result-only attempt:
 
 ```bash
-python3 scripts/rabs-recover "$recovery" \
+rabs-recover "$recovery" \
   --prefix-from /absolute/recovered/dependency-17 \
   --resume-to /absolute/recovered/dependency-17-next
 ```
@@ -76,7 +83,7 @@ corrupt bytes, or lost connection is a refusal, never a compiler retry.
 When complete `delivery.json` exists but acknowledgment was unconfirmed, use:
 
 ```bash
-python3 scripts/rabs-recover "$recovery" \
+rabs-recover "$recovery" \
   --acknowledge "$recovery/delivery"
 ```
 
