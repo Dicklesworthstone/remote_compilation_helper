@@ -272,7 +272,8 @@ class RealYarnPnp(unittest.TestCase):
         project, paths = self.project("typescript", typescript=True)
         source_bytes = {path: ((project / path).read_bytes(), (project / path).stat().st_mode)
                         for path in paths}
-        for number, invocation in enumerate((project, project / "packages/app")):
+        for number, invocation in enumerate((project, project / "packages/app",
+                                             project / "packages/app/src")):
             request = self.request(invocation, paths, source=project,
                                    preparation=project if invocation != project else None,
                                    attempt=f"pnp-{number}")
@@ -316,9 +317,8 @@ class RealYarnPnp(unittest.TestCase):
         self.assertEqual(rejected.stdout, oracle.stdout)
         self.assertFalse(self.global_tsc.exists())
         self.assertFalse(self.script_tsc.exists())
-        # An arbitrary subdirectory without its own selected package.json is
-        # not a qualified worker invocation. Independently check Yarn's cwd
-        # semantics here; do not manufacture a source-proof request for it.
+        # The qualified subdirectory run above preserves the same cwd and
+        # relative config behavior as Yarn's ordinary direct execution.
         nested = project / "packages/app/src"
         nested_result = self.invoke(
             ["yarn", "run", "--binaries-only", "tsc", "--noEmit", "--incremental", "false",

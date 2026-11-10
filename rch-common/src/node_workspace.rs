@@ -79,6 +79,32 @@ pub fn declaration_paths(invocation: &str) -> Result<BTreeSet<String>, String> {
     Ok(paths)
 }
 
+/// Find the nearest package named by the selected source on this ancestry.
+/// Callers that also select symlinks must pass those names too, then require
+/// the returned manifest to be regular before reading or installing it. A
+/// linked or otherwise unsupported nearer package must not be skipped in
+/// favor of an enclosing package. The selected root is the final boundary.
+pub fn selected_package_root(
+    invocation: &str,
+    is_selected: impl Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
+    relative_path(invocation, true)?;
+    let internal = invocation
+        .split('/')
+        .any(|part| matches!(part, "node_modules" | ".git"));
+    let mut directory = Some(invocation);
+    while let Some(root) = directory {
+        if is_selected(&join(root, "package.json")) {
+            return Ok(Some(root.to_owned()));
+        }
+        if internal {
+            return Ok(None);
+        }
+        directory = parent(root);
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Manager {
     Bun,
@@ -410,8 +436,9 @@ fn declares_member(manager: Manager, patterns: Vec<String>, member: &str) -> Res
 
 /// Resolve within the selected root, preserving a nearer independent project.
 ///
-/// An invocation's own frozen lockfile wins. Otherwise the nearest selected
-/// ancestor with a lockfile must explicitly declare this member; an excluded,
+/// The nearest selected package owns commands in its subdirectories. Its own
+/// frozen lockfile wins. Otherwise the nearest selected ancestor with a
+/// lockfile must explicitly declare that package as a member; an excluded,
 /// independent, or implicit workspace is a boundary, not permission to search
 /// further upward. Unsupported declarations fail before an installer starts.
 pub fn resolve_preparation_root(
@@ -444,12 +471,14 @@ pub fn resolve_preparation_root(
             .map(|bytes| Some(bytes.as_slice()))
             .ok_or_else(|| format!("selected workspace declaration bytes are missing: {path}"))
     };
+    let package = selected_package_root(invocation, |path| selected_regular.contains(path))?
+        .ok_or("invocation has no selected regular package.json on its ancestry")?;
     let invocation_manifest = manifest(
-        document(&join(invocation, "package.json"))?
-            .ok_or("invocation has no selected regular package.json")?,
+        document(&join(&package, "package.json"))?
+            .ok_or("invocation package has no selected regular package.json")?,
     )?;
-    if locked_manager(invocation, selected_regular)?.is_some() {
-        return Ok(invocation.to_owned());
+    if locked_manager(&package, selected_regular)?.is_some() {
+        return Ok(package);
     }
     // Existing invocation-local preparation is not expanded through package
     // manager internals, even if a selected source happens to live there.
@@ -457,15 +486,15 @@ pub fn resolve_preparation_root(
         .split('/')
         .any(|part| matches!(part, "node_modules" | ".git"))
     {
-        return Ok(invocation.to_owned());
+        return Ok(package);
     }
-    let mut ancestor = parent(invocation);
+    let mut ancestor = parent(&package);
     while let Some(root) = ancestor {
         if let Some(manager) = locked_manager(root, selected_regular)? {
             let Some(bytes) = document(&join(root, "package.json"))? else {
-                return Ok(invocation.to_owned());
+                return Ok(package);
             };
-            let package = manifest(bytes)?;
+            let ancestor_manifest = manifest(bytes)?;
             let patterns = if manager == Manager::Pnpm {
                 match document(&join(root, pnpm_workspace::FILE_NAME))? {
                     Some(bytes) => {
@@ -474,14 +503,14 @@ pub fn resolve_preparation_root(
                     None => Vec::new(),
                 }
             } else {
-                package
+                ancestor_manifest
                     .workspaces
                     .map_or_else(Vec::new, |workspaces| workspaces.0)
             };
             let member = if root.is_empty() {
-                invocation
+                package.as_str()
             } else {
-                invocation
+                package
                     .strip_prefix(root)
                     .and_then(|path| path.strip_prefix('/'))
                     .ok_or("workspace ancestor is not a literal parent")?
@@ -495,11 +524,11 @@ pub fn resolve_preparation_root(
             {
                 return Ok(root.to_owned());
             }
-            return Ok(invocation.to_owned());
+            return Ok(package);
         }
         ancestor = parent(root);
     }
-    Ok(invocation.to_owned())
+    Ok(package)
 }
 
 #[cfg(test)]
@@ -538,6 +567,68 @@ mod tests {
         for invalid in ["/app", "../app", "a//b", "a/./b", "a/../b", "a\\b"] {
             assert!(declaration_paths(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn subdirectory_commands_resolve_the_nearest_package_before_workspace_membership() {
+        let root = r#"{"name":"root","workspaces":["packages/*"]}"#;
+        let member = r#"{"name":"member"}"#;
+        let entries = [
+            ("package.json", root),
+            ("bun.lock", "locked root"),
+            ("packages/app/package.json", member),
+            ("packages/app/src/index.ts", "selected source"),
+        ];
+        assert_eq!(resolve("packages/app/src", &entries).unwrap(), "");
+        assert_eq!(resolve("src/deep", &entries).unwrap(), "");
+
+        let mut independent = entries.to_vec();
+        independent.push(("packages/app/bun.lock", "member lock"));
+        assert_eq!(
+            resolve("packages/app/src", &independent).unwrap(),
+            "packages/app"
+        );
+        let mut nested = entries.to_vec();
+        nested.push(("packages/app/src/package.json", r#"{"name":"independent"}"#));
+        assert_eq!(
+            resolve("packages/app/src/deep", &nested).unwrap(),
+            "packages/app/src",
+            "a nearer package is not the enclosing workspace member"
+        );
+        let mut excluded = entries;
+        excluded[0].1 = r#"{"workspaces":["other/*"]}"#;
+        assert_eq!(
+            resolve("packages/app/src", &excluded).unwrap(),
+            "packages/app"
+        );
+    }
+
+    #[test]
+    fn subdirectory_package_resolution_preserves_source_and_internal_boundaries() {
+        assert!(resolve("src", &[("other/package.json", "{}")]).is_err());
+        assert!(
+            resolve(
+                "src/deep",
+                &[("package.json", "{}"), ("src/package.json", "invalid JSON")]
+            )
+            .is_err(),
+            "a malformed nearer package must not be skipped"
+        );
+        for path in [
+            "node_modules/tool/src",
+            ".git/work",
+            "src/node_modules/tool",
+        ] {
+            assert!(resolve(path, &[("package.json", "{}")]).is_err(), "{path}");
+        }
+        let selected = BTreeSet::from(["package.json".to_owned(), "src/package.json".to_owned()]);
+        assert_eq!(
+            selected_package_root("src/deep", |path| selected.contains(path))
+                .unwrap()
+                .as_deref(),
+            Some("src"),
+            "the caller must validate the nearest selected name, even if it is a link"
+        );
     }
 
     #[test]

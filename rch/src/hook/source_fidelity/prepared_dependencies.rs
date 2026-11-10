@@ -101,7 +101,8 @@ fn selected_preparation_root(
 }
 
 /// Only classified Node/Bun clean-overlay executions acquire this obligation.
-/// A standalone Bun script with no selected package manifest needs no installer.
+/// The nearest selected package owns a subdirectory invocation. A standalone
+/// Bun script with no selected package on its ancestry needs no installer.
 pub(in crate::hook) fn prepare_dependency_request(
     prepared: &[PreparedSourceContentRoot],
     remote_cwd: &str,
@@ -155,19 +156,29 @@ pub(in crate::hook) fn prepare_dependency_request(
                 .invocation_directory,
         "prepared dependency execution directory differs from the selected invocation"
     );
-    let package_manifest = if project_relative.is_empty() {
+    let selected = selected_inventory(root)?;
+    let Some(package) =
+        rch_common::node_workspace::selected_package_root(&project_relative, |path| {
+            selected
+                .files
+                .binary_search_by(|file| file.path.as_str().cmp(path))
+                .is_ok()
+        })
+        .map_err(anyhow::Error::msg)?
+    else {
+        return Ok(None);
+    };
+    let package_manifest = if package.is_empty() {
         "package.json".to_owned()
     } else {
-        format!("{project_relative}/package.json")
+        format!("{package}/package.json")
     };
-    let selected = selected_inventory(root)?;
-    if !selected
-        .files
-        .iter()
-        .any(|file| file.path == package_manifest)
-    {
-        return Ok(None);
-    }
+    anyhow::ensure!(
+        selected.files.iter().any(|file| {
+            file.path == package_manifest && file.kind == PreparedDependencyFileKind::Regular
+        }),
+        "nearest invocation package is not selected regular source"
+    );
     let mut request = PreparedDependencyRequest {
         schema_version: PREPARED_DEPENDENCY_VERSION,
         attempt_id: attempt_id.to_owned(),

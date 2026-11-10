@@ -172,12 +172,42 @@ if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ]; 
         PATH="$rch_prepare_bin${PATH:+:$PATH}"
         export PATH
     }
-    # Prepend the shared root first, then the member. Member-local tools win,
-    # and hoisted tools remain available after the workload changes directory.
+    rch_prepare_add_ancestor_bins() {
+        if [ "$2" -gt 128 ]; then
+            printf 'rch: prepared tool ancestry exceeds its bound; the command was not run\n' >&2
+            exit 121
+        fi
+        if [ "$1" != "$rch_prepare_root" ]; then
+            case "$rch_prepare_root:$1" in
+                /:/*) ;;
+                *) case "$1" in
+                       "$rch_prepare_root"/*) ;;
+                       *) printf 'rch: invocation is outside its prepared root; the command was not run\n' >&2
+                          exit 121 ;;
+                   esac ;;
+            esac
+            case "${1%/*}" in
+                '') rch_prepare_add_ancestor_bins / "$(($2 + 1))" ;;
+                *) rch_prepare_add_ancestor_bins "${1%/*}" "$(($2 + 1))" ;;
+            esac
+        fi
+        rch_prepare_add_bin "$1"
+    }
+    # The proof binds both the unchanged invocation cwd and the preparation
+    # root. Include the package between them when the command starts in src/
+    # or tests/. Prepend outer bins first so nearer tools win, without looking
+    # above the verified root or changing the workload's directory.
     if [ "$rch_prepare_workspace" = 1 ]; then
-        rch_prepare_add_bin "$rch_prepare_project"
+        rch_prepare_root=$(CDPATH= cd "$rch_prepare_project" && pwd -P && printf x) || exit 121
+        rch_prepare_root=${rch_prepare_root%?}
+        rch_prepare_root=${rch_prepare_root%?}
+        rch_prepare_cwd=$(pwd -P && printf x) || exit 121
+        rch_prepare_cwd=${rch_prepare_cwd%?}
+        rch_prepare_cwd=${rch_prepare_cwd%?}
+        rch_prepare_add_ancestor_bins "$rch_prepare_cwd" 0
+    else
+        rch_prepare_add_bin .
     fi
-    rch_prepare_add_bin .
 fi
 while [ "$rch_prepare_tsc_arguments" -gt 0 ]; do
     shift

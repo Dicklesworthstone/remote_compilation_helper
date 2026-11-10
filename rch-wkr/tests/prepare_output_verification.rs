@@ -184,7 +184,12 @@ fn workspace_verification_requires_the_accepted_member_cwd_and_reuses_one_root_i
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     let project = root.join("project");
-    for name in ["project/packages/a", "project/packages/b", "home", "bin"] {
+    for name in [
+        "project/packages/a/src",
+        "project/packages/b/tests",
+        "home",
+        "bin",
+    ] {
         fs::create_dir_all(root.join(name)).unwrap();
     }
     let manifest = br#"{"name":"root","private":true,"workspaces":["packages/*"]}"#;
@@ -195,6 +200,12 @@ fn workspace_verification_requires_the_accepted_member_cwd_and_reuses_one_root_i
     fs::write(project.join("package-lock.json"), lock).unwrap();
     fs::write(project.join("packages/a/package.json"), member_a_manifest).unwrap();
     fs::write(project.join("packages/b/package.json"), member_b_manifest).unwrap();
+    fs::write(project.join("packages/a/src/index.ts"), b"export {};\n").unwrap();
+    fs::write(
+        project.join("packages/b/tests/member.test.ts"),
+        b"export {};\n",
+    )
+    .unwrap();
     let manager = root.join("bin/npm");
     fs::write(
         &manager,
@@ -222,12 +233,16 @@ printf 'install\n' >> "$RCH_TEST_INSTALL_COUNT"
             selected("package-lock.json", lock),
             selected("package.json", manifest),
             selected("packages/a/package.json", member_a_manifest),
+            selected("packages/a/src/index.ts", b"export {};\n"),
             selected("packages/b/package.json", member_b_manifest),
+            selected("packages/b/tests/member.test.ts", b"export {};\n"),
         ],
         directories: vec![
             "packages".to_owned(),
             "packages/a".to_owned(),
+            "packages/a/src".to_owned(),
             "packages/b".to_owned(),
+            "packages/b/tests".to_owned(),
         ],
     };
     let member_a = project.join("packages/a");
@@ -271,4 +286,29 @@ printf 'install\n' >> "$RCH_TEST_INSTALL_COUNT"
     assert!(project.join("node_modules/dependency.js").is_file());
     assert!(!member_a.join("node_modules").exists());
     assert!(!member_b.join("node_modules").exists());
+
+    for relative in ["packages/a/src", "packages/b/tests"] {
+        request.attempt_id = relative.replace('/', "-");
+        request.project_relative = relative.to_owned();
+        let nested = project.join(relative);
+        let proof = install(root, &project, &request);
+        assert_eq!(proof.disposition, PreparedDependencyDisposition::Retained);
+        assert_eq!(proof.state, first.state);
+        let verified = verify_from(root, &project, &request, &proof, Some(&nested));
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        for wrong in [&project, &member_a, &member_b] {
+            let refused = verify_from(root, &project, &request, &proof, Some(wrong));
+            assert!(!refused.status.success(), "{relative}: {}", wrong.display());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("invocation directory"));
+        }
+        assert!(!nested.join("node_modules").exists());
+    }
+    assert_eq!(
+        fs::read(root.join("installer-count")).unwrap(),
+        b"install\n"
+    );
 }

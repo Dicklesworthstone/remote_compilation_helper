@@ -4565,10 +4565,26 @@ sys.exit(99)
             working_manifest: &str,
             select_overlay: bool,
         ) -> (PreparedSourceContentRoot, PreparedDependencyRequest) {
+            workspace_selection_at(
+                base_manifest,
+                working_manifest,
+                select_overlay,
+                "packages/app",
+            )
+            .await
+        }
+
+        async fn workspace_selection_at(
+            base_manifest: &str,
+            working_manifest: &str,
+            select_overlay: bool,
+            invocation: &str,
+        ) -> (PreparedSourceContentRoot, PreparedDependencyRequest) {
             let (local, _) = build_source_stamp_fixture_repo();
-            std::fs::create_dir_all(local.join("packages/app")).unwrap();
+            std::fs::create_dir_all(local.join("packages/app/src")).unwrap();
             std::fs::write(local.join("package.json"), base_manifest).unwrap();
             std::fs::write(local.join("bun.lock"), "selected frozen lock\n").unwrap();
+            std::fs::write(local.join("packages/app/src/index.ts"), "export {};\n").unwrap();
             std::fs::write(
                 local.join("packages/app/package.json"),
                 r#"{"name":"workspace-app"}"#,
@@ -4578,7 +4594,7 @@ sys.exit(99)
             build_source_stamp_git_commit(&local, "workspace authority selection");
             std::fs::write(local.join("package.json"), working_manifest).unwrap();
             let spec = prepare_clean_overlay_spec(
-                &local.join("packages/app"),
+                &local.join(invocation),
                 Some("HEAD".to_owned()),
                 true,
                 if select_overlay {
@@ -4608,7 +4624,7 @@ sys.exit(99)
             );
             let request = prepare_dependency_request(
                 std::slice::from_ref(&root),
-                remote.join("packages/app").to_str().unwrap(),
+                remote.join(invocation).to_str().unwrap(),
                 Some(CompilationKind::BunTest),
                 BUILD_ID,
                 "workspace-node-attempt",
@@ -4633,6 +4649,35 @@ sys.exit(99)
             let (_, request) = workspace_selection(excluded, declared, false).await;
             assert_eq!(request.project_relative, "packages/app");
             assert!(request.preparation_relative.is_none());
+            assert!(request.preparation_path().ends_with("/packages/app"));
+        }
+
+        #[tokio::test]
+        async fn subdirectory_preparation_preserves_cwd_and_selected_workspace_authority() {
+            let declared = r#"{"workspaces":["packages/*"]}"#;
+            let excluded = r#"{"workspaces":["other/*"]}"#;
+            let (root, request) =
+                workspace_selection_at(declared, excluded, false, "packages/app/src").await;
+            assert_eq!(request.project_relative, "packages/app/src");
+            assert_eq!(request.preparation_relative.as_deref(), Some(""));
+            assert!(request.invocation_path().ends_with("/packages/app/src"));
+            assert!(
+                request
+                    .files
+                    .iter()
+                    .any(|file| file.path == "packages/app/src/index.ts"),
+                "the actual command directory remains part of the exact selected source"
+            );
+            request.validate().unwrap();
+            verify_local_source_content_manifest(&root).await.unwrap();
+
+            let (_, request) =
+                workspace_selection_at(excluded, declared, false, "packages/app/src").await;
+            assert_eq!(request.project_relative, "packages/app/src");
+            assert_eq!(
+                request.preparation_relative.as_deref(),
+                Some("packages/app")
+            );
             assert!(request.preparation_path().ends_with("/packages/app"));
         }
 

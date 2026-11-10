@@ -95,7 +95,8 @@ pub struct PreparedDependencyRequest {
     pub source_root: String,
     /// Invocation directory. Empty denotes the source root; `.` is not canonical.
     pub project_relative: String,
-    /// A declared workspace ancestor that owns installation and its transaction.
+    /// The selected package or declared workspace ancestor that owns installation
+    /// and its transaction, while the command keeps its original invocation cwd.
     /// Absent when preparation belongs to the invocation directory itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation_relative: Option<String>,
@@ -399,14 +400,28 @@ fn validate_request_shape(request: &PreparedDependencyRequest) -> Result<()> {
             "preparation project is not a selected directory",
         )?;
     }
-    let manifest = join_relative(&request.project_relative, "package.json");
+    let package = crate::node_workspace::selected_package_root(&request.project_relative, |path| {
+        request
+            .files
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+            .is_ok()
+    })
+    .map_err(PreparedDependencyError)?
+    .ok_or_else(|| {
+        PreparedDependencyError("invocation has no selected package on its ancestry".to_owned())
+    })?;
+    let manifest = join_relative(&package, "package.json");
     require(
         request
             .files
             .binary_search_by(|file| file.path.cmp(&manifest))
             .ok()
             .is_some_and(|index| request.files[index].kind == PreparedDependencyFileKind::Regular),
-        "preparation project has no selected regular package.json",
+        "nearest invocation package has no selected regular package.json",
+    )?;
+    require(
+        package == request.project_relative || request.preparation_relative.is_some(),
+        "subdirectory invocation requires its selected preparation root",
     )?;
     if let Some(preparation) = request.preparation_relative.as_deref() {
         require(
@@ -1584,6 +1599,36 @@ mod tests {
         let mut member_owned = state();
         member_owned.project = "/tmp/source/vittles/packages/app".to_owned();
         assert!(member_owned.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn subdirectory_requests_bind_cwd_without_admitting_more_runtime_outputs() {
+        let original = request();
+        let mut nested = original.clone();
+        nested.project_relative = "vittles/src".to_owned();
+        nested.preparation_relative = Some("vittles".to_owned());
+        nested.validate().unwrap();
+        state().validate_for(&nested).unwrap();
+        assert_eq!(nested.invocation_path(), "/tmp/source/vittles/src");
+        assert_eq!(nested.preparation_path(), original.preparation_path());
+        assert_eq!(
+            admitted_dependency_roots(&nested).unwrap(),
+            admitted_dependency_roots(&original).unwrap()
+        );
+        assert_ne!(nested.digest().unwrap(), original.digest().unwrap());
+        assert!(attestation().validate_for(&nested).is_err());
+
+        let mut missing_binding = nested.clone();
+        missing_binding.preparation_relative = None;
+        assert!(missing_binding.validate().is_err());
+        let mut linked_nearer_package = nested;
+        linked_nearer_package
+            .files
+            .push(link("vittles/src/package.json", "../package.json"));
+        linked_nearer_package
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        assert!(linked_nearer_package.validate().is_err());
     }
 
     #[test]

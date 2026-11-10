@@ -43,6 +43,20 @@ printf '%s\n' "$PROOF_LAYOUT_TOKEN"
 exit "$PREPARE_STATUS"
 """
 
+ANCESTOR_PROOF_WORKER = """#!/bin/sh
+set -eu
+[ "$#" = 13 ] && [ "$1" = prepare-proof ] && [ "$2" = --mode ] &&
+[ "$3" = verify ] && [ "$4" = --project ] && [ "$5" = "$PREPARATION_ROOT" ] &&
+[ "$6" = --runtime ] && [ "$7" = "$RUNTIME" ] &&
+[ "$8" = --expected-request-digest ] && [ "$9" = request-digest ] &&
+[ "${10}" = --expected-attestation-digest ] && [ "${11}" = attestation-digest ] &&
+[ "${12}" = --invocation-project ] && [ "${13}" = . ] &&
+[ "$PWD" = "$INVOCATION_DIR" ] || exit 91
+printf 'verify:%s\n' "$7" >> "$ROOT/events"
+printf '%s\n' "$PROOF_LAYOUT_TOKEN"
+exit "$PREPARE_STATUS"
+"""
+
 YARN = """#!/bin/sh
 set -eu
 [ "$1" = run ] && [ "$2" = --binaries-only ] && [ "$3" = tsc ] || exit 93
@@ -103,6 +117,49 @@ class Fixture:
         return path.read_text().splitlines() if path.exists() else []
 
 class Tests(unittest.TestCase):
+    def test_subdirectory_uses_nearest_prepared_tools_without_changing_cwd(self):
+        for shell in ("sh", "bash"):
+            for runtime in ("node", "bun"):
+                for member_tool in (False, True):
+                    f = Fixture(shell, runtime)
+                    member = f.project / "packages/member"
+                    invocation = member / "src/deep"
+                    invocation.mkdir(parents=True)
+                    (member / "package.json").write_text('{"name":"member"}\n')
+                    for package, label in [(f.project, "root"), (member, "member")]:
+                        if label == "member" and not member_tool:
+                            continue
+                        bin_dir = package / "node_modules/.bin"
+                        bin_dir.mkdir(parents=True)
+                        executable(bin_dir / "compiler", "#!/bin/sh\n"
+                                   f"printf '{label}\\n' >> \"$ROOT/events\"\n"
+                                   "printf '[%s]\\n' \"$PWD\" \"$@\"\ncat\nexit 23\n")
+                    executable(f.tools / "rch-wkr", ANCESTOR_PROOF_WORKER)
+                    f.env.update(PREPARATION_ROOT=str(f.project), INVOCATION_DIR=str(invocation))
+                    args = ["--source-proof", "request-digest", "attestation-digest",
+                            "--preparation-root", str(f.project), "compiler", "literal $value; argument"]
+                    data = b"binary\x00stdin\xff\n"
+                    result = f.run(args=args, input=data, cwd=invocation)
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    self.assertEqual(f.events(), [f"verify:{runtime}", "member" if member_tool else "root"])
+                    self.assertEqual(result.stdout,
+                                     f"[{invocation}]\n[literal $value; argument]\n".encode() + data)
+
+    def test_subdirectory_search_stops_at_the_verified_preparation_root(self):
+        for shell in ("sh", "bash"):
+            f = Fixture(shell)
+            invocation = f.project / "src"
+            invocation.mkdir()
+            outside = f.root / "node_modules/.bin"
+            outside.mkdir(parents=True)
+            executable(outside / "outside-only", COMPILER)
+            executable(f.tools / "rch-wkr", ANCESTOR_PROOF_WORKER)
+            f.env.update(PREPARATION_ROOT=str(f.project), INVOCATION_DIR=str(invocation))
+            result = f.run(args=["--source-proof", "request-digest", "attestation-digest",
+                                 "--preparation-root", str(f.project), "outside-only"], cwd=invocation)
+            self.assertEqual(result.returncode, 127, result.stderr)
+            self.assertEqual(f.events(), ["verify:node"])
+
     def test_accepted_proof_verifies_without_installing_again(self):
         for shell in ("sh", "bash"):
             for runtime in ("node", "bun"):
