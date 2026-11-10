@@ -979,9 +979,13 @@ fn daemon_command_is_cancellation(command: &str) -> bool {
         // outlive it and remain inspectable through active history/events.
         return true;
     }
+    // A forget may ask the worker once, within the same cleanup window.
     let build = path
         .strip_prefix("/builds/")
-        .and_then(|rest| rest.strip_suffix("/cancel"))
+        .and_then(|rest| {
+            rest.strip_suffix("/cancel")
+                .or_else(|| rest.strip_suffix("/forget"))
+        })
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
     // Unlike the build endpoints, the daemon's queued-job route accepts only
     // the bare path. A query suffix must not receive a cancellation allowance.

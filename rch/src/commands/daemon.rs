@@ -742,6 +742,9 @@ pub struct StopOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DaemonWorkload {
     active_build_ids: Vec<u64>,
+    /// Reported, never waited on: their wrappers exited long ago and their
+    /// durable ownership survives the restart.
+    orphaned_build_ids: Vec<u64>,
     queued_build_ids: Vec<u64>,
     client_lease_ids: Vec<String>,
     client_lease_scan_error: Option<String>,
@@ -751,10 +754,22 @@ impl DaemonWorkload {
     fn from_admission(response: RestartAdmissionResponse) -> Self {
         Self {
             active_build_ids: response.active_build_ids,
+            orphaned_build_ids: response.orphaned_build_ids,
             queued_build_ids: response.queued_build_ids,
             client_lease_ids: response.client_lease_ids,
             client_lease_scan_error: response.client_lease_scan_error,
         }
+    }
+
+    /// One line naming the orphaned builds a stop will not wait for.
+    fn orphan_notice(&self) -> Option<String> {
+        (!self.orphaned_build_ids.is_empty()).then(|| {
+            format!(
+                "not waiting for orphaned builds {:?} (wrapper gone; ownership survives the \
+                 restart; retire with `rch jobs forget <build-id>`)",
+                self.orphaned_build_ids
+            )
+        })
     }
 
     /// True when stopping now interrupts nothing. A lease-scan failure counts
@@ -1455,6 +1470,11 @@ async fn stop_owned(
     let workload = lease
         .acquire(if restarting { "restart" } else { "stop" })
         .await?;
+    if let Some(notice) = workload.orphan_notice()
+        && !ctx.is_json()
+    {
+        println!("{} {notice}", StatusIndicator::Warning.display(style));
+    }
 
     let mut decision = decide_stop_action(&workload, &opts);
     if decision == StopDecision::Drain {
@@ -2228,10 +2248,51 @@ mod tests {
     fn busy_workload() -> DaemonWorkload {
         DaemonWorkload {
             active_build_ids: vec![41, 42],
+            orphaned_build_ids: Vec::new(),
             queued_build_ids: vec![43],
             client_lease_ids: Vec::new(),
             client_lease_scan_error: None,
         }
+    }
+
+    /// Phantom builds (wrapper long gone) are reported, never drained: three
+    /// of them on one dispatcher made every `restart --drain` time out.
+    #[test]
+    fn orphaned_builds_are_reported_but_do_not_block_a_stop() {
+        let _guard = test_guard!();
+        let admission: RestartAdmissionResponse = serde_json::from_value(serde_json::json!({
+            "success": true, "status": "maintenance_active", "message": null,
+            "daemon_incarnation": "a12ca740-4c39-4486-9872-1490f0b6c263",
+            "admission_closed": true, "maintenance_closed": true,
+            "ownership_failed": false, "ownership_error": null,
+            "shutdown_committed": false, "maintenance_owner": null, "last_recovery": null,
+            "restart_permitted": true, "active_build_ids": [],
+            "orphaned_build_ids": [30085930664591411_u64, 30071436022382747_u64],
+            "queued_build_ids": [], "client_lease_ids": [], "client_lease_scan_error": null,
+        }))
+        .unwrap();
+        let workload = DaemonWorkload::from_admission(admission);
+        assert!(workload.is_idle());
+        assert_eq!(
+            decide_stop_action(
+                &workload,
+                &StopOptions {
+                    drain: true,
+                    ..Default::default()
+                }
+            ),
+            StopDecision::Proceed
+        );
+        let notice = workload.orphan_notice().unwrap();
+        assert!(notice.contains("30085930664591411"), "{notice}");
+        assert!(notice.contains("rch jobs forget"), "{notice}");
+        assert!(DaemonWorkload::default().orphan_notice().is_none());
+
+        // An older daemon omits the field; nothing is invented.
+        let mut old = serde_json::to_value(RestartAdmissionResponse::default()).unwrap();
+        old.as_object_mut().unwrap().remove("orphaned_build_ids");
+        let old: RestartAdmissionResponse = serde_json::from_value(old).unwrap();
+        assert!(old.orphaned_build_ids.is_empty());
     }
 
     /// Issue #54: `-y` alone must never interrupt in-flight builds.

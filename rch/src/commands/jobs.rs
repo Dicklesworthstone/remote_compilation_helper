@@ -23,6 +23,14 @@ pub enum JobsAction {
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
+    /// Retire a phantom build whose wrapper is gone and whose worker cannot
+    /// confirm a cancellation. Refused for a live wrapper; without a worker
+    /// answer the build must have been silent for 24h. Releases its slots
+    /// and keeps a terminal record (exit 130, reason phantom_build_forgotten)
+    Forget {
+        /// Daemon build id, as listed by `rch --json queue`
+        build_id: u64,
+    },
     /// Reconcile completion and retrieve outstanding outputs; never replay
     Recover {
         wrapper_id: String,
@@ -298,8 +306,16 @@ fn cancellation_unconfirmed_error(
         "After the original wrapper stops, run `rch jobs recover {}` to reconcile the same job without replay",
         lease.identity.local_wrapper_id
     );
+    let forget = lease.identity.remote_build_id.map(|id| {
+        format!(
+            "If the wrapper is gone and the worker can never answer, `rch jobs forget {id}` retires the build (after 24h of silence without a worker answer)"
+        )
+    });
     let mut api = rch_common::ApiError::from_code(rch_common::ErrorCode::CancelCleanupFailed)
-        .with_details(format!("{error:#}\n{recovery}"));
+        .with_details(match &forget {
+            Some(forget) => format!("{error:#}\n{recovery}\n{forget}"),
+            None => format!("{error:#}\n{recovery}"),
+        });
     api.message = "Cancellation outcome is unconfirmed".to_string();
     api.remediation = vec![
         format!(
@@ -309,6 +325,7 @@ fn cancellation_unconfirmed_error(
         recovery,
         "Keep its journal and reservations until terminal acknowledgement".to_string(),
     ];
+    api.remediation.extend(forget);
     anyhow::Error::new(api)
 }
 
@@ -620,6 +637,45 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
     }))
 }
 
+/// The daemon decides; this only reports. Exit 1 unless the build was forgotten.
+#[cfg(unix)]
+async fn forget_build(build_id: u64, ctx: &OutputContext) -> Result<()> {
+    let response = super::send_daemon_command(&format!("POST /builds/{build_id}/forget\n")).await?;
+    let payload = parse_forget_response(&response)?;
+    emit(ctx, &payload)?;
+    if payload["status"] != "forgotten" {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[RCH] build {build_id} was not forgotten: {}",
+            payload["message"].as_str().unwrap_or("no reason given")
+        );
+        // The structured reply was already emitted; avoid a second envelope.
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parse_forget_response(response: &str) -> Result<Value> {
+    let (header, body) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .context("daemon response has no body")?;
+    let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+        "daemon refused the forget request (an older daemon has no forget endpoint; \
+         update and restart it); nothing was forgotten"
+    );
+    let payload: Value = serde_json::from_str(body.trim()).context("invalid forget reply")?;
+    anyhow::ensure!(
+        payload["status"].is_string(),
+        "forget reply has no status; nothing is known to be forgotten"
+    );
+    Ok(payload)
+}
+
 #[cfg(unix)]
 async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> {
     use crate::hook::DurableLeaseWriter;
@@ -641,6 +697,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         return Ok(());
     };
     let (wrapper_id, recover, cancel, timeout, cargo_json, local_only) = match action {
+        JobsAction::Forget { build_id } => return forget_build(build_id, ctx).await,
         JobsAction::Attach {
             wrapper_id,
             timeout_secs,

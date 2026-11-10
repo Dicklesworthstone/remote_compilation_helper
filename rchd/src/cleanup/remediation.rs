@@ -314,6 +314,24 @@ impl Remediations {
                         false,
                     )
                     .await;
+                if matches!(response.status.as_str(), "deferred" | "failed") {
+                    // A worker that is disabled or never answers must not
+                    // hold an orphan forever. The forget never dials it and
+                    // refuses unless the wrapper exited and the build has
+                    // been silent past the automatic limit (72h).
+                    let forgotten = owner
+                        .context
+                        .cancellation
+                        .forget_build(
+                            &owner.context,
+                            current.id,
+                            crate::cancellation::ForgetOrigin::Automatic,
+                        )
+                        .await;
+                    if forgotten.status == "forgotten" {
+                        return Some(forgotten.status);
+                    }
+                }
                 Some(response.status)
             };
             if self.push(stamp, wait) {

@@ -185,6 +185,10 @@ enum ApiRequest {
     CancelAllBuilds {
         force: bool,
     },
+    /// Retire an orphaned build no cancellation can confirm (`rch jobs forget`).
+    ForgetBuild {
+        build_id: u64,
+    },
     BuildRecovery {
         build_id: u64,
         local_wrapper_id: String,
@@ -1265,6 +1269,18 @@ async fn handle_connection_with_metrics(
             let response = handle_cancel_all_builds(&ctx, force).await;
             (serde_json::to_string(&response)?, "application/json")
         }
+        Ok(ApiRequest::ForgetBuild { build_id }) => {
+            metrics::inc_requests("forget-build");
+            let response = ctx
+                .cancellation
+                .forget_build(
+                    &ctx,
+                    build_id,
+                    crate::cancellation::ForgetOrigin::Operator,
+                )
+                .await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
         Ok(ApiRequest::WorkerDrain { worker_id }) => {
             metrics::inc_requests("worker-drain");
             let response = handle_worker_drain(&ctx, &worker_id).await;
@@ -1593,6 +1609,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         if let Some(rest) = path_only.strip_prefix("/builds/") {
             let rest = rest.trim_matches('/');
             let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() == 2 && parts[1] == "forget" {
+                let build_id = parts[0]
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("Invalid build id: {}", parts[0]))?;
+                return Ok(ApiRequest::ForgetBuild { build_id });
+            }
             if parts.len() == 2 && parts[1] == "cancel" {
                 let build_id = parts[0]
                     .parse::<u64>()
@@ -3680,12 +3702,17 @@ async fn admission_response(
     // successful acquisition after recovery has invalidated its fence.
     admission.recover(Instant::now(), maintenance_wall_ms());
     let mut response = admission.snapshot(Instant::now(), ctx.history.ownership_failure_reason());
-    response.active_build_ids = ctx
+    // A build whose wrapper exited here long ago has nobody to interrupt,
+    // and its durable ownership survives the restart. Waiting on it made
+    // every drain (and the nightly update's restart) wait forever.
+    let now = Instant::now();
+    let (orphaned, active): (Vec<_>, Vec<_>) = ctx
         .history
         .active_builds()
         .into_iter()
-        .map(|build| build.id)
-        .collect();
+        .partition(|build| crate::cancellation::is_orphaned_build(build, now));
+    response.active_build_ids = active.into_iter().map(|build| build.id).collect();
+    response.orphaned_build_ids = orphaned.into_iter().map(|build| build.id).collect();
     response.queued_build_ids = ctx
         .history
         .queued_builds()
@@ -3857,7 +3884,7 @@ async fn handle_shutdown(
     response
 }
 
-async fn restart_admission_snapshot(
+pub(crate) async fn restart_admission_snapshot(
     ctx: &DaemonContext,
     include_leases: bool,
 ) -> RestartAdmissionResponse {
@@ -4561,7 +4588,8 @@ fn ownership_mismatch_message(build_id: u64, owner: Option<Option<&str>>) -> Str
             "build ownership mismatch: build {build_id} is owned by wrapper {wrapper}. \
              Cancel it with `rch jobs cancel {wrapper}`. If that wrapper and its lease are \
              gone, the stuck detector releases the build on its own once it has been silent \
-             for 15 min (never started remote work) or 6h (started)"
+             for 15 min (never started remote work) or 6h (started); if its worker cannot \
+             answer, `rch jobs forget {build_id}` retires it"
         ),
         Some(None) => format!(
             "build ownership mismatch: build {build_id} has no wrapper identity; cancel it \

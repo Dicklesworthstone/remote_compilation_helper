@@ -5,6 +5,10 @@
 //! cancellation debt for reliability integration.
 
 mod batch;
+mod forget;
+
+pub use forget::ForgetOrigin;
+pub(crate) use forget::is_orphaned_build;
 
 use crate::DaemonContext;
 use crate::api::{CancelAllBuildsResponse, CancelBuildResponse, CancelledBuildInfo};
@@ -123,6 +127,11 @@ pub struct CancellationRecord {
     /// An authenticated remote receipt, independent of local wrapper cleanup.
     /// A local failure after this proof must not quarantine a healthy worker.
     pub remote_kill_confirmed: bool,
+    /// The worker answered that it holds no process record for the build.
+    /// Not proof of death for a recent build, but an answering worker is
+    /// observable: it must not enter a process-observation bypass.
+    #[serde(skip)]
+    pub remote_record_absent: bool,
     pub cleanup_ok: bool,
     /// Slots originally held by the build (captured at cancel time).
     pub slots: u32,
@@ -490,6 +499,7 @@ impl CancellationOrchestrator {
                 escalation_count: 0,
                 remote_kill_attempted: false,
                 remote_kill_confirmed: false,
+            remote_record_absent: false,
                 cleanup_ok: true,
                 slots: build.slots,
                 slots_released: 0,
@@ -1066,6 +1076,7 @@ impl CancellationOrchestrator {
         }
         record.remote_kill_attempted = true;
         record.remote_kill_confirmed = false;
+        record.remote_record_absent = false;
 
         // The answer is known without asking: see `remote_answer_can_confirm`.
         // A build fenced by a lease that still owns worker source is
@@ -1316,9 +1327,13 @@ impl CancellationOrchestrator {
         ctx: &DaemonContext,
         record: &CancellationRecord,
     ) {
+        // A worker that answered "no such record" observed its process
+        // table correctly; only the daemon lacks proof the build is old
+        // enough. One such answer bypassed a healthy worker for ~50 min.
         if record.state != CancellationState::Failed
             || !record.remote_kill_attempted
             || record.remote_kill_confirmed
+            || record.remote_record_absent
             || !remote_answer_can_confirm(record)
         {
             return;
@@ -1600,11 +1615,13 @@ fn confirm_remote_cancellation_before(
     if TokioInstant::now() >= deadline {
         return false;
     }
-    let success = remote_kill_confirmed(output, record.build_id)
-        || (record.abandoned_unlaunched && remote_record_absent(output, record.build_id));
+    let absent = remote_record_absent(output, record.build_id);
+    let success =
+        remote_kill_confirmed(output, record.build_id) || (record.abandoned_unlaunched && absent);
     if TokioInstant::now() >= deadline {
         return false;
     }
+    record.remote_record_absent = absent;
     record.remote_kill_confirmed = success;
     success
 }
@@ -2046,6 +2063,7 @@ wait
             escalation_count,
             remote_kill_attempted,
             remote_kill_confirmed: false,
+            remote_record_absent: false,
             cleanup_ok: true,
             slots: 1,
             slots_released: 1,
@@ -3243,6 +3261,9 @@ wait
             "retarget",
             "aba",
             "windows",
+            // The worker answered RCH_REMOTE_RECORD_ABSENT_V1 for a build too
+            // recent for that answer to prove death: retained, not bypassed.
+            "record_absent",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let pool = WorkerPool::new();
@@ -3305,6 +3326,21 @@ wait
             record.slots = owner.slots;
             record.slots_released = 0;
             record.remote_kill_confirmed = case == "confirmed_remote_local_failed";
+            if case == "record_absent" {
+                use std::os::unix::process::ExitStatusExt;
+                let absent = std::process::Output {
+                    status: std::process::ExitStatus::from_raw(42 << 8),
+                    stdout: format!("RCH_REMOTE_RECORD_ABSENT_V1:{}\n", owner.id).into_bytes(),
+                    stderr: Vec::new(),
+                };
+                let deadline = TokioInstant::now() + Duration::from_secs(5);
+                assert!(!confirm_remote_cancellation_before(
+                    &mut record,
+                    &absent,
+                    deadline
+                ));
+                assert!(record.remote_record_absent);
+            }
             record.remote_kill_attempted = case != "not_attempted";
             if case == "missing_record" {
                 record.remote_pgid_file = None;
@@ -3388,6 +3424,7 @@ wait
             escalation_count: 0,
             remote_kill_attempted: false,
             remote_kill_confirmed: false,
+            remote_record_absent: false,
             cleanup_ok: true,
             slots: 1,
             slots_released: 0,
@@ -3424,6 +3461,7 @@ wait
             escalation_count: 0,
             remote_kill_attempted: false,
             remote_kill_confirmed: false,
+            remote_record_absent: false,
             cleanup_ok: true,
             slots: 0,
             slots_released: 0,

@@ -58,6 +58,11 @@ pub struct RestartAdmissionResponse {
     pub last_recovery: Option<MaintenanceRecovery>,
     pub restart_permitted: bool,
     pub active_build_ids: Vec<u64>,
+    /// Active builds whose wrapper exited on the dispatcher long ago. They do
+    /// not block a restart: nothing waits for them, and their durable
+    /// ownership survives it. Absent from older daemons.
+    #[serde(default)]
+    pub orphaned_build_ids: Vec<u64>,
     pub queued_build_ids: Vec<u64>,
     pub client_lease_ids: Vec<String>,
     /// Any failure to inspect durable leases prevents proof of quiescence.
