@@ -950,18 +950,16 @@ impl WorkerSelector {
 
     /// Only the API's already-claimed durable queue can enable completion-probe
     /// waiting. Admission still repeats every authoritative budget check.
-    pub(crate) fn select_with_waiter<'a>(
-        &'a self,
-        pool: &'a WorkerPool,
-        request: &'a SelectionRequest,
-        excluded_worker_ids: &'a HashSet<String>,
+    pub(crate) async fn select_with_waiter(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
         existing_waiter: bool,
-    ) -> impl std::future::Future<Output = SelectionResult> + Send + 'a {
-        async move {
-            self.select_with_queue_candidates(pool, request, excluded_worker_ids, existing_waiter)
-                .await
-                .0
-        }
+    ) -> SelectionResult {
+        self.select_with_queue_candidates(pool, request, excluded_worker_ids, existing_waiter)
+            .await
+            .0
     }
 
     /// Return this request's fully checked wait candidates alongside selection.

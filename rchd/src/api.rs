@@ -6553,7 +6553,8 @@ mod tests {
         // or a production timeout override. The normal resume handler must
         // acquire the disk hold despite this request needing only one slot.
         let wrapper = format!("rchw-{}", Uuid::new_v4());
-        let wait_secs = Some(3600);
+        let timeout_secs = 3600;
+        let wait_secs = Some(timeout_secs);
         let (queued, _) = ctx
             .history
             .enqueue_selection_build(
@@ -6564,7 +6565,7 @@ mod tests {
                 Some(wrapper.clone()),
                 QueueSelectionContract {
                     digest: queue_selection_digest(&request, wait_secs).unwrap(),
-                    timeout_secs: wait_secs.unwrap(),
+                    timeout_secs,
                 },
             )
             .unwrap();
