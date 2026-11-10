@@ -20,7 +20,7 @@ use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
     CompilationKind, cargo_xwin_compilation_kind, classify_command, classify_command_detailed,
-    normalize_command, split_shell_commands, split_wrapper_word, unquote_literal_option_word,
+    normalize_command, split_shell_commands, split_wrapper_word,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -182,8 +182,359 @@ fn is_rust_kind(kind: CompilationKind) -> bool {
     )
 }
 
-/// Derive required capabilities from a command string + its classified kind.
-fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> RequiredCapabilities {
+struct DerivedCapabilities {
+    required: RequiredCapabilities,
+    // Native compiler targets can constrain the host without requiring a
+    // rustup standard library. Keep this evidence out of needs_targets.
+    host_targets: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdmissionArgument {
+    Literal(String),
+    // The literal prefix before a quoted parameter expansion. This still
+    // occupies exactly one argv slot, but its complete value is unknown.
+    Opaque(String),
+    // The remaining shell text can add an unknown number of arguments. It
+    // cannot establish option arity, but a preceding compiler -- still applies.
+    Unbounded,
+}
+
+impl AdmissionArgument {
+    fn literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Opaque(_) | Self::Unbounded => None,
+        }
+    }
+}
+
+/// Consume only simple, single-word parameter expansions inside double quotes.
+/// `$@`, substitutions and parameter operators need a full shell grammar and
+/// cannot establish a bounded argv slot here.
+fn quoted_parameter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<()> {
+    let first = chars.next()?;
+    if first == '{' {
+        let first = chars.next()?;
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return None;
+        }
+        while chars
+            .peek()
+            .is_some_and(|ch| *ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            chars.next();
+        }
+        return (chars.next()? == '}').then_some(());
+    }
+    if first == '_' || first.is_ascii_alphabetic() {
+        while chars
+            .peek()
+            .is_some_and(|ch| *ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            chars.next();
+        }
+        return Some(());
+    }
+    matches!(first, '0'..='9' | '?' | '$' | '!' | '#' | '*' | '-').then_some(())
+}
+
+/// Read argv without executing expansions or treating quoted option operands as
+/// additional arguments. A quoted variable can hide an operand without hiding
+/// other literal options; unquoted expansion can manufacture argv and is opaque.
+fn admission_arguments(command: &str) -> Option<Vec<AdmissionArgument>> {
+    if command.len() > 65_536 {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut opaque_prefix = None;
+    let mut started = false;
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '\0' | '\r' | '\n') {
+            return None;
+        }
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => word.push(ch),
+            (None, '\'' | '"') => {
+                started = true;
+                quote = Some(ch);
+            }
+            (None, '$') | (None | Some('"'), '`') => {
+                words.push(AdmissionArgument::Unbounded);
+                return Some(words);
+            }
+            (Some('"'), '$') => {
+                if quoted_parameter(&mut chars).is_none() {
+                    words.push(AdmissionArgument::Unbounded);
+                    return Some(words);
+                }
+                if opaque_prefix.is_none() {
+                    opaque_prefix = Some(word.clone());
+                }
+            }
+            (None, '\\') => {
+                let escaped = chars.next()?;
+                if matches!(escaped, '\0' | '\r' | '\n') {
+                    return None;
+                }
+                started = true;
+                word.push(escaped);
+            }
+            (Some('"'), '\\') => {
+                let escaped = chars.next()?;
+                if matches!(escaped, '\0' | '\r' | '\n') {
+                    return None;
+                }
+                if !matches!(escaped, '$' | '`' | '"' | '\\') {
+                    word.push('\\');
+                }
+                word.push(escaped);
+            }
+            (None, ' ' | '\t') => {
+                if started {
+                    let value = std::mem::take(&mut word);
+                    words.push(match opaque_prefix.take() {
+                        Some(prefix) => AdmissionArgument::Opaque(prefix),
+                        None => AdmissionArgument::Literal(value),
+                    });
+                    started = false;
+                }
+            }
+            (None, ';' | '&' | '|' | '<' | '>') => break,
+            (None, '#') if !started => break,
+            (None, '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}' | '~') => {
+                words.push(AdmissionArgument::Unbounded);
+                return Some(words);
+            }
+            _ => {
+                started = true;
+                word.push(ch);
+            }
+        }
+        if words.len() > 4096 {
+            return None;
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(match opaque_prefix {
+            Some(prefix) => AdmissionArgument::Opaque(prefix),
+            None => AdmissionArgument::Literal(word),
+        });
+    }
+    (!words.is_empty() && words.len() <= 4096).then_some(words)
+}
+
+fn target_value_is_literal(value: &str) -> bool {
+    // A custom Rust target JSON file is not an installed rustup target, and a
+    // filename containing "-apple-" does not establish its target platform.
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.ends_with(".json")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn option_takes_value(option: &str, program: &str) -> bool {
+    if matches!(program, "clang" | "clang++") {
+        matches!(
+            option,
+            "-o" | "--output"
+                | "-x"
+                | "-I"
+                | "-D"
+                | "-U"
+                | "-L"
+                | "-l"
+                | "-B"
+                | "-isystem"
+                | "-iquote"
+                | "-idirafter"
+                | "-include"
+                | "-include-pch"
+                | "-imacros"
+                | "-isysroot"
+                | "--sysroot"
+                | "-arch"
+                | "-std"
+                | "-MF"
+                | "-MJ"
+                | "-MT"
+                | "-MQ"
+                | "-Xclang"
+                | "-Xlinker"
+                | "-Xassembler"
+                | "-Xpreprocessor"
+                | "-mllvm"
+                | "--gcc-toolchain"
+        ) || option.starts_with("-Xarch_")
+    } else if program == "rustc" {
+        matches!(
+            option,
+            "-o" | "--out-dir"
+                | "--crate-name"
+                | "--crate-type"
+                | "--edition"
+                | "--extern"
+                | "--cfg"
+                | "--check-cfg"
+                | "--sysroot"
+                | "--emit"
+                | "--print"
+                | "--error-format"
+                | "--json"
+                | "--color"
+                | "--cap-lints"
+                | "--diagnostic-width"
+                | "--remap-path-prefix"
+                | "--remap-path-scope"
+                | "-C"
+                | "--codegen"
+                | "-Z"
+                | "-L"
+                | "-l"
+                | "-A"
+                | "--allow"
+                | "-W"
+                | "--warn"
+                | "--force-warn"
+                | "-D"
+                | "--deny"
+                | "-F"
+                | "--forbid"
+        )
+    } else {
+        matches!(
+            option,
+            "--color"
+                | "--config"
+                | "-Z"
+                | "-C"
+                | "--manifest-path"
+                | "--target-dir"
+                | "--build-dir"
+                | "--message-format"
+                | "--profile"
+                | "-p"
+                | "--package"
+                | "--exclude"
+                | "-F"
+                | "--features"
+                | "--bin"
+                | "--example"
+                | "--test"
+                | "--bench"
+                | "-j"
+                | "--jobs"
+                | "--out-dir"
+                | "--artifact-dir"
+                | "--crate-type"
+                | "--filter-expr"
+                | "-E"
+                | "--filterset"
+                | "-P"
+                | "--partition"
+                | "--status-level"
+                | "--final-status-level"
+                | "--failure-output"
+                | "--success-output"
+                | "--archive-file"
+                | "--workspace-remap"
+                | "--test-threads"
+        )
+    }
+}
+
+fn opaque_argument_is_value(prefix: &str, program: &str) -> bool {
+    // A fixed non-option prefix cannot become --target. Known --flag=value
+    // spellings retain their arity even when the attached value expands empty.
+    if !prefix.is_empty() && !prefix.starts_with(['-', '+']) {
+        return true;
+    }
+    if prefix
+        .split_once('=')
+        .is_some_and(|(flag, _)| option_takes_value(flag, program))
+    {
+        return true;
+    }
+    let short: &[&str] = if matches!(program, "clang" | "clang++") {
+        &[
+            "-o", "-x", "-I", "-D", "-U", "-L", "-l", "-B", "-MF", "-MJ", "-MT", "-MQ",
+        ]
+    } else if program == "rustc" {
+        &["-C", "-Z", "-L", "-l", "-A", "-W", "-D", "-F"]
+    } else {
+        &["-j", "-p", "-F", "-Z", "-C"]
+    };
+    // Require a fixed, nonempty operand: -D"$NAME" could expand to bare -D
+    // and consume the next token, but -DNAME="$VALUE" cannot change its arity.
+    short.iter().any(|flag| {
+        prefix
+            .strip_prefix(flag)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn compiler_target_options(words: &[AdmissionArgument]) -> Vec<String> {
+    let Some(program) = words[0].literal().and_then(|word| word.rsplit('/').next()) else {
+        return Vec::new();
+    };
+    let native = matches!(program, "clang" | "clang++");
+    let mut targets = Vec::new();
+    let mut args = words[1..].iter();
+    while let Some(word) = args.next() {
+        let argument = match word {
+            AdmissionArgument::Literal(value) => value.as_str(),
+            AdmissionArgument::Opaque(prefix) if opaque_argument_is_value(prefix, program) => {
+                continue;
+            }
+            AdmissionArgument::Opaque(_) | AdmissionArgument::Unbounded => return Vec::new(),
+        };
+        if argument == "--" {
+            break;
+        }
+        let target = if argument == "--target" || native && argument == "-target" {
+            match args.next() {
+                Some(AdmissionArgument::Literal(value)) => Some(value.as_str()),
+                Some(AdmissionArgument::Opaque(_) | AdmissionArgument::Unbounded) => {
+                    return Vec::new();
+                }
+                None => None,
+            }
+        } else {
+            argument
+                .strip_prefix("--target=")
+                .or_else(|| native.then(|| argument.strip_prefix("-target=")).flatten())
+        };
+        if let Some(target) = target {
+            // Clang's final driver target wins. Cargo can build several
+            // explicitly selected targets and requires all of their stds.
+            if native {
+                targets.clear();
+            }
+            if target_value_is_literal(target) {
+                targets.push(target.to_owned());
+            }
+        } else if option_takes_value(argument, program)
+            && matches!(args.next(), Some(AdmissionArgument::Unbounded))
+        {
+            return Vec::new();
+        }
+    }
+    targets
+}
+
+/// Derive language capabilities and separate host-target evidence from the
+/// invoked compiler's own options. CMake build targets, TypeScript targets,
+/// and test-program arguments are never Rust standard-library requirements.
+fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> DerivedCapabilities {
     let mut req = RequiredCapabilities::default();
     if let Some(kind) = kind {
         req.needs_cargo = is_rust_kind(kind);
@@ -202,49 +553,50 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
         // exactly as for a plain `cargo build --target ...`.
         req.needs_zig = matches!(kind, CompilationKind::CargoZigbuild);
     }
-    // The xwin matcher validates the entire normalized suffix before admitting
-    // quoted option words. Scan that same suffix so an env/wrapper payload cannot
-    // introduce a target and a quoted --target= option cannot lose its requirement.
-    let xwin = cargo_xwin_compilation_kind(command).is_some();
-    let normalized = xwin.then(|| normalize_command(command));
-    let token_command = normalized.as_deref().unwrap_or(command);
-    // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
-    let tokens: Vec<&str> = token_command
-        .split_whitespace()
-        .map(|token| {
-            if xwin {
-                unquote_literal_option_word(token)
-            } else {
-                token
-            }
-        })
-        .collect();
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i];
-        if let Some(triple) = tok.strip_prefix("--target=") {
-            if !triple.is_empty() {
-                req.needs_targets.push(triple.to_string());
-            }
-        } else if tok == "--target" {
-            if let Some(triple) = tokens.get(i + 1) {
-                req.needs_targets.push((*triple).to_string());
-                i += 1;
-            }
-        } else if let Some(toolchain) = tok.strip_prefix('+') {
-            // A cargo toolchain override token, e.g. `cargo +nightly-2025-11-01 build`.
-            if !toolchain.is_empty() {
-                req.needs_toolchains.push(toolchain.to_string());
-            }
+    let normalized = normalize_command(command);
+    let words = admission_arguments(&normalized).filter(|words| {
+        let Some(program) = words[0].literal().and_then(|word| word.rsplit('/').next()) else {
+            return false;
+        };
+        req.needs_cargo && matches!(program, "cargo" | "rustc" | "cargo-xwin" | "cargo-zigbuild")
+            || matches!(
+                kind,
+                Some(CompilationKind::Clang | CompilationKind::Clangpp)
+            ) && matches!(program, "clang" | "clang++")
+    });
+    let targets = words
+        .as_deref()
+        .map(compiler_target_options)
+        .unwrap_or_default();
+    if req.needs_cargo {
+        req.needs_targets = targets.clone();
+        let selector = words.as_ref().and_then(|words| {
+            let program = words[0].literal()?.rsplit('/').next()?;
+            matches!(program, "cargo" | "rustc")
+                .then(|| words.get(1)?.literal()?.strip_prefix('+'))
+                .flatten()
+        });
+        let toolchain = selector
+            .map(str::to_owned)
+            .or_else(|| crate::rustup_toolchain_from_command(command).ok().flatten());
+        if let Some(toolchain) = toolchain.filter(|name| {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && !name.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        }) {
+            req.needs_toolchains.push(toolchain);
         }
-        i += 1;
     }
     req.needs_targets.sort();
     req.needs_targets.dedup();
     req.needs_toolchains.sort();
     req.needs_toolchains.dedup();
-    req.needs_os = os_from_target_triples(&host_bound_targets(command, &req.needs_targets));
-    req
+    let host_targets = host_bound_targets(command, &targets);
+    req.needs_os = os_from_target_triples(&host_targets);
+    DerivedCapabilities {
+        required: req,
+        host_targets,
+    }
 }
 
 /// Explicit cross-build tools supply their linker on the build host. Darwin
@@ -276,8 +628,7 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
     for part in split_shell_commands(command) {
         let detail = classify_command_detailed(part);
         if detail.classification.is_compilation {
-            let required = derive_capabilities(part, detail.classification.kind);
-            triples.extend(host_bound_targets(part, &required.needs_targets));
+            triples.extend(derive_capabilities(part, detail.classification.kind).host_targets);
         }
     }
     os_from_command_and_targets(command, &triples)
@@ -376,8 +727,9 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             {
                 family = Some(family_token(kind).to_string());
             }
-            let part_req = derive_capabilities(part, c.kind);
-            host_targets.extend(host_bound_targets(part, &part_req.needs_targets));
+            let derived = derive_capabilities(part, c.kind);
+            host_targets.extend(derived.host_targets);
+            let part_req = derived.required;
             required.needs_cargo |= part_req.needs_cargo;
             required.needs_zig |= part_req.needs_zig;
             required.needs_bun |= part_req.needs_bun;
@@ -939,6 +1291,339 @@ mod tests {
     fn explicit_toolchain_override_is_captured() {
         let p = preflight("cargo +nightly-2025-11-01 build", false);
         assert_eq!(p.required.needs_toolchains, vec!["nightly-2025-11-01"]);
+    }
+
+    #[test]
+    fn non_rust_targets_never_require_rustup_or_select_a_host_os() {
+        for command in [
+            "cmake --build obj/debug --target app",
+            "cmake --build obj/debug --target aarch64-apple-darwin",
+            "cmake --build obj/debug --target x86_64-pc-windows-msvc",
+            "cmake --build obj/debug --target +nightly",
+            "env RUSTUP_TOOLCHAIN=nightly cmake --build obj --target app",
+            "ninja -C obj +nightly",
+            "make +nightly",
+            "gcc -c main.c -o main.o -D 'TEXT= --target aarch64-apple-darwin +nightly'",
+            "tsc --noEmit --target ES2022",
+            "bun test -- --target x86_64-pc-windows-msvc +nightly",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(!result.required.needs_cargo, "{command}");
+            assert!(result.required.needs_targets.is_empty(), "{command}");
+            assert!(result.required.needs_toolchains.is_empty(), "{command}");
+            assert!(result.required.needs_tools.is_empty(), "{command}");
+            assert_eq!(result.required.needs_os, None, "{command}");
+            assert_eq!(required_os_for_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn rust_requirements_follow_literal_compiler_options_and_wrappers() {
+        for (command, toolchain, targets, host) in [
+            (
+                "env NOTE='--target x86_64-pc-windows-msvc +decoy' cargo +nightly build --target 'wasm32-unknown-unknown'",
+                Some("nightly"),
+                vec!["wasm32-unknown-unknown"],
+                None,
+            ),
+            (
+                "timeout 30 cargo +nightly build '--target=aarch64-apple-darwin'",
+                Some("nightly"),
+                vec!["aarch64-apple-darwin"],
+                Some("darwin"),
+            ),
+            (
+                "time -f '--target x86_64-pc-windows-msvc +decoy' cargo build --target='wasm32-unknown-unknown'",
+                None,
+                vec!["wasm32-unknown-unknown"],
+                None,
+            ),
+            (
+                "RUSTUP_TOOLCHAIN=nightly-2026-01-01 cargo build --target x86_64-pc-windows-msvc",
+                Some("nightly-2026-01-01"),
+                vec!["x86_64-pc-windows-msvc"],
+                Some("windows"),
+            ),
+            (
+                "env RUSTUP_TOOLCHAIN=nightly cargo +stable build --target wasm32-unknown-unknown",
+                Some("stable"),
+                vec!["wasm32-unknown-unknown"],
+                None,
+            ),
+            (
+                "rustc +nightly main.rs --cfg 'feature=\"--target x86_64-pc-windows-msvc\"' --target wasm32-unknown-unknown",
+                Some("nightly"),
+                vec!["wasm32-unknown-unknown"],
+                None,
+            ),
+            (
+                "cargo build --target wasm32-unknown-unknown --target aarch64-apple-darwin",
+                None,
+                vec!["aarch64-apple-darwin", "wasm32-unknown-unknown"],
+                Some("darwin"),
+            ),
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(result.required.needs_cargo, "{command}");
+            assert_eq!(result.required.needs_targets, targets, "{command}");
+            assert_eq!(
+                result.required.needs_toolchains,
+                toolchain.into_iter().collect::<Vec<_>>(),
+                "{command}"
+            );
+            assert_eq!(result.required.needs_os.as_deref(), host, "{command}");
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                host,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_argument_payloads_and_separators_do_not_become_requirements() {
+        for command in [
+            "cargo test +test_name -- --target x86_64-pc-windows-msvc +nightly",
+            "cargo clippy -- -W '--target=aarch64-apple-darwin'",
+            "cargo build --config '--target=x86_64-pc-windows-msvc'",
+            "cargo test --test +nightly",
+            "cargo build --target ./targets/x86_64-apple-custom.json",
+            "cargo build --target x86_64-apple-custom.json",
+            "rustc main.rs -- --target=x86_64-pc-windows-msvc",
+            "rustc main.rs --cfg '--target=x86_64-pc-windows-msvc'",
+            "rustc main.rs --crate-name +nightly",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(result.required.needs_cargo, "{command}");
+            assert!(result.required.needs_targets.is_empty(), "{command}");
+            assert!(result.required.needs_toolchains.is_empty(), "{command}");
+            assert_eq!(result.required.needs_os, None, "{command}");
+            assert_eq!(required_os_for_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn clang_targets_constrain_hosts_without_requiring_rust_std() {
+        for (command, host) in [
+            (
+                "clang --target=x86_64-pc-windows-msvc -c main.c -o main.o",
+                Some("windows"),
+            ),
+            (
+                "clang++ -target aarch64-apple-darwin -c main.cpp -o main.o",
+                Some("darwin"),
+            ),
+            (
+                "env NOTE='--target=x86_64-pc-windows-msvc' clang -target 'aarch64-apple-darwin' -c main.c",
+                Some("darwin"),
+            ),
+            (
+                "clang --target=aarch64-apple-darwin --target=x86_64-unknown-linux-gnu -c main.c",
+                None,
+            ),
+            (
+                "clang --target=x86_64-pc-windows-msvc -target aarch64-apple-darwin -c main.c",
+                Some("darwin"),
+            ),
+            ("clang -c main.c -D '--target=x86_64-pc-windows-msvc'", None),
+            (
+                "clang -c main.c -Xclang --target=aarch64-apple-darwin",
+                None,
+            ),
+            ("clang -c main.c -- --target=x86_64-pc-windows-msvc", None),
+            (
+                "clang -c main.c -o main.o -D 'TEXT= --target x86_64-pc-windows-msvc +nightly'",
+                None,
+            ),
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(!result.required.needs_cargo, "{command}");
+            assert!(result.required.needs_targets.is_empty(), "{command}");
+            assert!(result.required.needs_toolchains.is_empty(), "{command}");
+            assert_eq!(result.required.needs_os.as_deref(), host, "{command}");
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                host,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_host_requirements_ignore_non_compiler_target_names() {
+        for (command, host) in [
+            (
+                "cmake --build obj --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+                Some("darwin"),
+            ),
+            (
+                "clang -c main.c --target=x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+                None,
+            ),
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert_eq!(result.required.needs_targets, vec!["aarch64-apple-darwin"]);
+            assert_eq!(result.required.needs_os.as_deref(), host, "{command}");
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                host,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_arguments_do_not_evaluate_opaque_shell_words() {
+        for command in [
+            "cargo build --target=$TARGET",
+            "cargo build --target `target-name`",
+            "cargo build --features \"$@\"",
+            "cargo build --features \"${FEATURES:-default}\"",
+        ] {
+            let arguments = admission_arguments(command).expect("literal prefix remains available");
+            assert_eq!(
+                arguments.last(),
+                Some(&AdmissionArgument::Unbounded),
+                "{command}"
+            );
+            assert!(compiler_target_options(&arguments).is_empty(), "{command}");
+        }
+        assert!(admission_arguments("cargo build --target 'unterminated").is_none());
+        for command in [
+            "cargo build '--target=wasm32-unknown-unknown' > output.log",
+            "cargo build --target=\"wasm32-unknown-unknown\"",
+        ] {
+            assert_eq!(
+                admission_arguments(command),
+                Some(
+                    ["cargo", "build", "--target=wasm32-unknown-unknown"]
+                        .into_iter()
+                        .map(|word| AdmissionArgument::Literal(word.to_owned()))
+                        .collect()
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_unrelated_operands_preserve_explicit_compiler_targets() {
+        for command in [
+            "cargo build --target aarch64-apple-darwin --features=\"$FEATURES\"",
+            "cargo build --features=\"${FEATURES}\" --target aarch64-apple-darwin",
+            "cargo build --target aarch64-apple-darwin --features \"$FEATURES\"",
+            "rustc main.rs --cfg \"$CFG\" --target aarch64-apple-darwin",
+            "clang --target=aarch64-apple-darwin -DNAME=\"$NAME\" -c main.c",
+            "clang -DNAME=\"${NAME}\" -c main.c --target=aarch64-apple-darwin",
+            "clang --target=aarch64-apple-darwin -D \"$NAME\" -c main.c",
+            "clang --sysroot \"$SDK\" --target=aarch64-apple-darwin -c main.c",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert_eq!(
+                result.required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            if result.required.needs_cargo {
+                assert_eq!(
+                    result.required.needs_targets,
+                    vec!["aarch64-apple-darwin"],
+                    "{command}"
+                );
+            } else {
+                assert!(result.required.needs_targets.is_empty(), "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_arguments_cannot_manufacture_compiler_target_evidence() {
+        for command in [
+            "cargo build --target \"${TARGET}\"",
+            "cargo build \"--target=$TARGET\"",
+            "cargo build --target aarch64-apple-darwin \"$EXTRA\"",
+            "cargo build --features=$FEATURES --target aarch64-apple-darwin",
+            "clang --target=aarch64-apple-darwin \"$EXTRA\" -c main.c",
+            "clang -D\"$NAME\" --target=aarch64-apple-darwin -c main.c",
+        ] {
+            let result = preflight(command, true);
+            assert_eq!(result.required.needs_os, None, "{command}");
+            assert_eq!(required_os_for_command(command), None, "{command}");
+            assert!(result.required.needs_targets.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn compiler_terminators_keep_program_expansion_out_of_requirements() {
+        for command in [
+            "cargo test --target aarch64-apple-darwin -- --filter=$FILTER",
+            "cargo test --target aarch64-apple-darwin -- \"$@\"",
+            "rustc main.rs --target aarch64-apple-darwin -- $INPUTS",
+            "clang --target=aarch64-apple-darwin -c main.c -- $INPUTS",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert_eq!(
+                result.required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            if result.required.needs_cargo {
+                assert_eq!(
+                    result.required.needs_targets,
+                    vec!["aarch64-apple-darwin"],
+                    "{command}"
+                );
+            } else {
+                assert!(result.required.needs_targets.is_empty(), "{command}");
+            }
+        }
+        for command in [
+            "cargo test $ARGS --target aarch64-apple-darwin --",
+            "cargo test --target aarch64-apple-darwin $ARGS --",
+            "cargo test --target aarch64-apple-darwin --features $FEATURES --",
+            "clang $ARGS --target=aarch64-apple-darwin -c main.c --",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.required.needs_targets.is_empty(), "{command}");
+            assert_eq!(result.required.needs_os, None, "{command}");
+            assert_eq!(required_os_for_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn immediate_toolchain_selectors_survive_opaque_argument_tails() {
+        for command in [
+            "cargo +nightly test --features=$FEATURES",
+            "timeout 30 cargo +nightly test --features=$FEATURES",
+            "rustc +nightly main.rs --cfg=$CFG",
+            "timeout 30 rustc +nightly main.rs --cfg=$CFG",
+            "cargo +nightly test -- --filter=$FILTER",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert_eq!(
+                result.required.needs_toolchains,
+                vec!["nightly"],
+                "{command}"
+            );
+        }
     }
 
     #[test]
