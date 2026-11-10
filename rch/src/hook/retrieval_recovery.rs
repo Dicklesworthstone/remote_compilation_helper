@@ -1518,7 +1518,7 @@ impl RecoverySession {
         // Implicit Go executable names are resolved before execution. Retain
         // the project destination now, even though no glob can yet authorize
         // a file. The execution gate requires the exact discovered contract.
-        let pending_go_output = kind == Some(CompilationKind::GoBuild);
+        let pending_go_output = delivery_kind == Some(CompilationKind::GoBuild);
         let native_project_outputs = native_outputs.is_some() || pending_go_output;
         if !project_patterns.is_empty() || pending_go_output {
             phases.push(RecoveryPhase {
@@ -8567,6 +8567,375 @@ mod tests {
                 b"unrelated Cargo target"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn write_go_test_output_fixture(root: &Path, external_tests: bool) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            b"module fixture.invalid/test-output\n\ngo 1.20\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("value.go"),
+            b"package fixture\nfunc Value() int { return 37 }\n",
+        )
+        .unwrap();
+        let (package, import, value) = if external_tests {
+            (
+                "fixture_test",
+                "fixture \"fixture.invalid/test-output\"",
+                "fixture.Value()",
+            )
+        } else {
+            ("fixture", "", "Value()")
+        };
+        std::fs::write(
+            root.join("value_test.go"),
+            format!(
+                r#"package {package}
+import ("os"; "testing"; {import})
+func TestMain(m *testing.M) {{
+    marker := os.Getenv("RCH_GO_TEST_EXECUTION_MARKER")
+    if marker == "" {{ os.Exit(91) }}
+    if err := os.WriteFile(marker, []byte("explicit-test-execution\n"), 0600); err != nil {{ os.Exit(92) }}
+    os.Exit(m.Run())
+}}
+func TestValue(t *testing.T) {{
+    if {value} != 37 {{ t.Fatal("incorrect compiled test input") }}
+    t.Log("go-test-output-ok")
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_compile_only_test_binary_survives_recovery_without_running_tests() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        for (relative, external_tests, inline_output) in [
+            ("fixture.test", false, false),
+            ("products/test [dev]*?", true, true),
+        ] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let missing = base.join("missing-worker");
+            let unrelated_target = base.join("unrelated-cargo-target");
+            for root in [&local, &remote] {
+                write_go_test_output_fixture(root, external_tests);
+            }
+            for root in [&local, &remote, &missing, &unrelated_target] {
+                std::fs::create_dir_all(root.join("products")).unwrap();
+            }
+            std::fs::write(local.join(relative), b"old local test executable").unwrap();
+            std::fs::write(remote.join(relative), b"old worker test executable").unwrap();
+            std::fs::write(local.join("foreign.o"), b"other job's object").unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"unrelated Cargo target").unwrap();
+            let remote_marker = remote.join("tests-ran");
+            let marker_assignment =
+                format!("RCH_GO_TEST_EXECUTION_MARKER={}", remote_marker.display());
+            let inline = format!("-o={relative}");
+            let mut argv = vec!["test", "-p=1", "-c", "."];
+            if inline_output {
+                argv.push(&inline);
+            } else {
+                argv.extend(["-o", relative]);
+            }
+            let command = go_fixture_command("go", &argv, &[&marker_assignment]);
+            assert_eq!(
+                rch_common::classify_command(&command).kind,
+                Some(CompilationKind::GoTest)
+            );
+            let before = go_fixture_tree(&local);
+            let environment = validate_go_build_output(&command, &local, &local)
+                .await
+                .unwrap();
+            assert_eq!(
+                go_fixture_tree(&local),
+                before,
+                "test discovery changed source"
+            );
+            assert!(!remote_marker.exists());
+            let contract = environment.output_contract();
+            assert_eq!(
+                contract.required_files,
+                std::collections::BTreeSet::from([PathBuf::from(relative)])
+            );
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "go-test-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::GoTest),
+                &command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            assert!(session.has_native_output_contract());
+            session.require_go_outputs(contract.clone()).unwrap();
+            assert_eq!(session.recipe.phases.len(), 1);
+            assert_eq!(session.recipe.phases[0].name, "project");
+            assert!(session.returned(0).is_err());
+            session.starting_execution().unwrap();
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(&remote);
+            let output = run_go_fixture(&mut compiler).await;
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert!(
+                !remote_marker.exists(),
+                "compile-only command executed the tests"
+            );
+            contract.verify_staged(&remote).unwrap();
+            session.completed(0).unwrap();
+            let mut session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.phases[0].native_outputs.as_ref(),
+                Some(&contract)
+            );
+            for root in [&remote, &missing] {
+                std::fs::write(root.join("foreign.o"), b"unrelated remote object").unwrap();
+                std::fs::write(root.join("source.go"), b"unselected remote source").unwrap();
+                std::fs::write(root.join("products/test d-decoy"), b"wildcard decoy").unwrap();
+            }
+            for complete in [false, true] {
+                let stage = session.stage(0);
+                let staged = session.staging_pipeline("project", &pipeline).unwrap();
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync = staged.local_artifact_retrieval_for_test(
+                    &worker,
+                    if complete { &remote } else { &missing },
+                    &patterns,
+                );
+                let output = run_go_fixture(&mut rsync).await;
+                assert!(output.status.success(), "{output:?}");
+                for unselected in ["foreign.o", "source.go", "products/test d-decoy"] {
+                    assert!(!stage.join(unselected).exists(), "retrieved {unselected}");
+                }
+                let journal = std::fs::read(&writer.path).unwrap();
+                if !complete {
+                    assert!(session.publish("project").await.is_err());
+                    assert!(session.returned(0).is_err());
+                    assert!(session.retain_failed_delivery_evidence());
+                    assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+                    assert_eq!(go_fixture_tree(&local), before);
+                    session = reload_publication(&session);
+                    assert!(!session.recipe.phases[0].complete);
+                    assert!(session.recipe.phases[0].published.is_empty());
+                } else {
+                    session.publish("project").await.unwrap();
+                    session.returned(0).unwrap();
+                    session = reload_publication(&session);
+                    assert!(session.recipe.phases[0].complete);
+                    session.publish("project").await.unwrap();
+                    assert_eq!(
+                        std::fs::read(local.join(relative)).unwrap(),
+                        std::fs::read(remote.join(relative)).unwrap()
+                    );
+                }
+            }
+            assert!(!remote_marker.exists(), "delivery or recovery ran tests");
+            let mut after = go_fixture_tree(&local);
+            after.insert(PathBuf::from(relative), before[Path::new(relative)].clone());
+            assert_eq!(after, before, "publication changed unselected caller files");
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"unrelated Cargo target"
+            );
+            // The delivered file is a real test executable. It starts only
+            // when the caller explicitly invokes it after durable recovery.
+            let local_marker = local.join("explicit-tests-ran");
+            let mut executable = Command::new(local.join(relative));
+            executable
+                .args(["-test.v", "-test.run=^TestValue$"])
+                .env("RCH_GO_TEST_EXECUTION_MARKER", &local_marker)
+                .current_dir(&local);
+            let output = run_go_fixture(&mut executable).await;
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("go-test-output-ok"));
+            assert_eq!(
+                std::fs::read(local_marker).unwrap(),
+                b"explicit-test-execution\n"
+            );
+            assert!(!remote_marker.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_compile_only_test_guards_reject_absent_or_changed_test_packages() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::process::Command;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        write_go_test_output_fixture(root, false);
+        std::fs::write(root.join("fixture.test"), b"prior test executable").unwrap();
+        for name in ["no-tests", "other"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("value.go"),
+                b"package fixture\nfunc Value() int { return 37 }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("other/value_test.go"),
+            b"package fixture\nimport \"testing\"\nfunc TestOther(t *testing.T) {}\n",
+        )
+        .unwrap();
+        let mut goroot = Command::new("sh");
+        goroot
+            .args(["-c", &go_fixture_command("go", &["env", "GOROOT"], &[])])
+            .current_dir(root);
+        let output = run_go_fixture(&mut goroot).await;
+        assert!(output.status.success(), "{output:?}");
+        let real_go =
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("bin/go");
+        let real_go = shell_escape::escape(real_go.to_string_lossy());
+        let shim = root.join("bin/go");
+        std::fs::create_dir(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in env|list) exec {real_go} \"$@\";; test) printf started > workload-invoked; exec {real_go} \"$@\";; esac\nexit 114\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = go_fixture_command(
+            shim.to_str().unwrap(),
+            &["test", "-p=1", "-c", "-o", "fixture.test", "."],
+            &[],
+        );
+        let before = go_fixture_tree(root);
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        assert_eq!(go_fixture_tree(root), before);
+        for packages in [
+            vec!["./no-tests"],
+            vec![".", "./other"],
+            vec!["./..."],
+            vec!["./missing/..."],
+        ] {
+            let mut args = vec!["test", "-p=1", "-c", "-o", "fixture.test"];
+            args.extend(packages);
+            let refused = go_fixture_command(shim.to_str().unwrap(), &args, &[]);
+            assert!(
+                validate_go_build_output(&refused, root, root)
+                    .await
+                    .is_err(),
+                "{refused}"
+            );
+            assert_eq!(go_fixture_tree(root), before, "refusal changed {refused}");
+        }
+        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+        let module = std::fs::read(root.join("go.mod")).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            b"module fixture.invalid/changed-test-selection\n\ngo 1.20\n",
+        )
+        .unwrap();
+        let changed = go_fixture_tree(root);
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("test package selection differs"));
+        assert_eq!(go_fixture_tree(root), changed);
+        std::fs::write(root.join("go.mod"), module).unwrap();
+
+        // A matching package identity without any selected test file must
+        // refuse before test compilation, including after an upload race.
+        std::fs::write(
+            root.join("value_test.go"),
+            b"//go:build rch_unselected_test\n\npackage fixture\nimport \"testing\"\nfunc TestHidden(t *testing.T) {}\n",
+        )
+        .unwrap();
+        let changed = go_fixture_tree(root);
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert_eq!(go_fixture_tree(root), changed);
+        assert!(!root.join("workload-invoked").exists());
+        assert_eq!(
+            std::fs::read(root.join("fixture.test")).unwrap(),
+            b"prior test executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_compile_only_test_compile_failure_preserves_previous_executable() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        write_go_test_output_fixture(root, false);
+        std::fs::write(root.join("fixture.test"), b"prior test executable").unwrap();
+        // go list -find loads test metadata but does not typecheck this body.
+        // The real compiler must fail, leaving the prior caller output intact.
+        std::fs::write(
+            root.join("value_test.go"),
+            b"package fixture\nimport \"testing\"\nfunc TestBroken(t *testing.T) { UndefinedFixtureSymbol() }\n",
+        )
+        .unwrap();
+        let command = go_fixture_command(
+            "go",
+            &["test", "-p=1", "-c", "-o", "fixture.test", "."],
+            &[],
+        );
+        let before = go_fixture_tree(root);
+        let environment = validate_go_build_output(&command, root, root)
+            .await
+            .unwrap();
+        assert_eq!(go_fixture_tree(root), before);
+        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("UndefinedFixtureSymbol"));
+        assert_eq!(go_fixture_tree(root), before);
     }
 
     #[cfg(unix)]

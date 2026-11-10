@@ -117,6 +117,10 @@ pub(crate) fn native_output_contract(
             c_family_outputs(command, &["clang++"], true, posix_defaults)
         }
         rch_common::CompilationKind::GoBuild if posix_defaults => go_output_contract(command),
+        rch_common::CompilationKind::GoTest if posix_defaults => {
+            rch_common::patterns::go_test_invocation(command)?;
+            go_output_contract(command)
+        }
         rch_common::CompilationKind::Rustc if posix_defaults => {
             let selection = rustc_output_selection(command)?;
             if selection.explicit_target {
@@ -147,6 +151,10 @@ pub(super) fn patterns(
             c_family_patterns(command, &["clang++"], true)
         }
         (Some(rch_common::CompilationKind::GoBuild), Some(command)) => {
+            go_output_contract(command)?.patterns().ok()
+        }
+        (Some(rch_common::CompilationKind::GoTest), Some(command)) => {
+            rch_common::patterns::go_test_invocation(command)?;
             go_output_contract(command)?.patterns().ok()
         }
         _ => None,

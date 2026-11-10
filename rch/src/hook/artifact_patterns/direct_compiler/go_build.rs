@@ -1,4 +1,4 @@
-//! Exact Go executable selection and fresh-file execution.
+//! Exact Go executable/test-binary selection and fresh-file execution.
 //!
 //! `go list` exposes the install Target built by the same DefaultExecName
 //! method that `go build` uses for its implicit output. Only its basename is
@@ -9,7 +9,7 @@
 
 use super::{NativeOutputContract, compiler_arguments, literal_words};
 use anyhow::{Context, Result, ensure};
-use rch_common::patterns::GoBuildInvocation;
+use rch_common::patterns::GoBuildOutput;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -17,6 +17,21 @@ const MAX_PROBE_BYTES: usize = 65_536;
 const MAX_SOURCE_ANCESTORS: usize = 128;
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PACKAGE_FORMAT: &str = "{{.Name}}{{\"\\n\"}}{{.ImportPath}}{{\"\\n\"}}{{.Target}}";
+const TEST_PACKAGE_FORMAT: &str =
+    "{{.ImportPath}}{{\"\\n\"}}{{len .TestGoFiles}}{{\"\\n\"}}{{len .XTestGoFiles}}";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GoCompileMode {
+    Build,
+    Test,
+}
+
+pub(super) struct GoCompileInvocation {
+    mode: GoCompileMode,
+    pub(super) output: Option<GoBuildOutput>,
+    build_flags: Vec<String>,
+    packages: Vec<String>,
+}
 
 /// Asking Go for CGO settings probes the C compiler and writes support flags
 /// into GOCACHE, even with CGO_ENABLED=0. Disabling that cache makes `go env`
@@ -185,13 +200,59 @@ impl PackageWitness {
     }
 }
 
+/// `go test -c` succeeds without producing a binary for a package with no
+/// tests. Admit exactly one package that really has test inputs, then require
+/// the worker to observe the same selection before creating an output stage.
+#[derive(Clone, Debug)]
+struct TestPackageWitness {
+    record: String,
+}
+
+impl TestPackageWitness {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let record = std::str::from_utf8(bytes).context("non-UTF-8 Go test package discovery")?;
+        let fields: Vec<_> = record
+            .strip_suffix('\n')
+            .context("unterminated Go test package discovery")?
+            .split('\n')
+            .collect();
+        ensure!(
+            fields.len() == 3 && !fields[0].is_empty() && !fields[0].chars().any(char::is_control),
+            "Go test output requires exactly one complete package selection"
+        );
+        let mut test_files = 0_u64;
+        for field in &fields[1..] {
+            let count = field.parse::<u32>().context("invalid Go test file count")?;
+            ensure!(
+                count.to_string() == *field,
+                "non-canonical Go test file count"
+            );
+            test_files += u64::from(count);
+        }
+        ensure!(test_files > 0, "Go package has no test binary to deliver");
+        Ok(Self {
+            record: record.to_owned(),
+        })
+    }
+
+    fn worker_check(&self) -> String {
+        let expected = shell_escape::escape(self.record.as_str().into());
+        format!(
+            "if [ \"$rch_go_package\" != {expected} ]; then \
+             printf '%s\\n' 'RCH: worker Go test package selection differs from the dispatcher' >&2; exit 113; fi; "
+        )
+    }
+}
+
 /// The caller's effective compiler settings and exact promised file. Recovery
 /// persists only the output contract; it never reruns discovery or compilation.
 #[derive(Clone, Debug)]
 pub(in crate::hook) struct GoBuildEnvironment {
+    mode: GoCompileMode,
     settings: String,
     output: NativeOutputContract,
     implicit: Option<PackageWitness>,
+    test_package: Option<TestPackageWitness>,
     source_ancestors: usize,
 }
 
@@ -201,10 +262,25 @@ impl GoBuildEnvironment {
     }
 }
 
-pub(super) fn invocation(command: &str) -> Option<GoBuildInvocation> {
+pub(super) fn invocation(command: &str) -> Option<GoCompileInvocation> {
     let args = compiler_arguments(command, &["go"])?;
     let plain = shell_words::join(std::iter::once("go").chain(args.iter().map(String::as_str)));
-    rch_common::patterns::go_build_invocation(&plain)
+    if let Some(invocation) = rch_common::patterns::go_build_invocation(&plain) {
+        Some(GoCompileInvocation {
+            mode: GoCompileMode::Build,
+            output: invocation.output,
+            build_flags: invocation.build_flags,
+            packages: invocation.packages,
+        })
+    } else {
+        let invocation = rch_common::patterns::go_test_invocation(&plain)?;
+        Some(GoCompileInvocation {
+            mode: GoCompileMode::Test,
+            output: Some(invocation.output),
+            build_flags: invocation.build_flags,
+            packages: invocation.packages,
+        })
+    }
 }
 
 fn shell_command(command: &str, script: String, args: &[String]) -> Option<String> {
@@ -325,12 +401,12 @@ fn package_query_preflight(source_ancestors: usize) -> String {
     format!(
         "rch_go_capture \"$rch_go\" env GOWORK || exit 113; \
          case \"$rch_go_capture_output\" in {empty}|{off}) ;; *) \
-           printf '%s\\n' 'RCH: implicit Go output discovery does not support workspace mode' >&2; exit 113;; esac; \
+           printf '%s\\n' 'RCH: Go output discovery does not support workspace mode' >&2; exit 113;; esac; \
          {caches}"
     )
 }
 
-fn package_query(invocation: &GoBuildInvocation) -> String {
+fn package_query(invocation: &GoCompileInvocation) -> String {
     let mut args = vec!["list".to_owned()];
     args.extend_from_slice(&invocation.build_flags);
     // These are query-only options. Preserve all package-selection flags,
@@ -340,7 +416,11 @@ fn package_query(invocation: &GoBuildInvocation) -> String {
         "-find".to_owned(),
         "-buildvcs=false".to_owned(),
         "-f".to_owned(),
-        PACKAGE_FORMAT.to_owned(),
+        match invocation.mode {
+            GoCompileMode::Build => PACKAGE_FORMAT,
+            GoCompileMode::Test => TEST_PACKAGE_FORMAT,
+        }
+        .to_owned(),
     ]);
     args.extend_from_slice(&invocation.packages);
     let query = shell_words::join(args);
@@ -502,14 +582,15 @@ pub(in crate::hook) async fn validate_go_build_output(
 ) -> Result<GoBuildEnvironment> {
     let invocation = invocation(command).context("Go build has no supported output contract")?;
     let runtime = LocalProbeRuntime::create(source_root)?;
-    let source_ancestors = if invocation.output.is_none() {
+    let needs_package_query = invocation.output.is_none() || invocation.mode == GoCompileMode::Test;
+    let source_ancestors = if needs_package_query {
         source_ancestor_depth(project_root, source_root)?
     } else {
         0
     };
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     let query = shell_words::join(GO_BUILD_ENVIRONMENT);
-    let initial_paths = if invocation.output.is_none() {
+    let initial_paths = if needs_package_query {
         // Toolchain startup may download into GOMODCACHE before executing
         // `go env`. Inspect its placement with GOTOOLCHAIN=local first; the
         // subsequent settings probe still selects the caller's real toolchain.
@@ -546,17 +627,10 @@ pub(in crate::hook) async fn validate_go_build_output(
         values["GOFLAGS"].is_empty() && values["GOOS"] == goos && values["GOARCH"] == goarch,
         "Go output delivery requires empty GOFLAGS and the dispatcher native GOOS/GOARCH"
     );
-    let (output, implicit, source_ancestors) = if let Some(output) = &invocation.output {
-        (
-            NativeOutputContract::from_paths([output.path.clone()])
-                .context("invalid explicit Go file output")?,
-            None,
-            0,
-        )
-    } else {
+    let package_record = if needs_package_query {
         ensure!(
             readonly_package_discovery_supported(&values["GOVERSION"]),
-            "implicit Go output discovery requires a release Go toolchain version 1.18 or newer"
+            "Go output discovery requires a release Go toolchain version 1.18 or newer"
         );
         let script = format!(
             "{}{}{}{}{}printf '%s' \"$rch_go_package\"",
@@ -568,16 +642,42 @@ pub(in crate::hook) async fn validate_go_build_output(
         );
         let query_command = shell_command(command, script, &[])
             .context("Go package query exceeds its command bound")?;
-        let witness = PackageWitness::parse(&probe(&query_command, project_root, deadline).await?)?;
+        Some(probe(&query_command, project_root, deadline).await?)
+    } else {
+        None
+    };
+    let test_package = if invocation.mode == GoCompileMode::Test {
+        Some(TestPackageWitness::parse(
+            package_record
+                .as_deref()
+                .context("Go test compilation requires package discovery")?,
+        )?)
+    } else {
+        None
+    };
+    let (output, implicit) = if let Some(output) = &invocation.output {
+        (
+            NativeOutputContract::from_paths([output.path.clone()])
+                .context("invalid explicit Go file output")?,
+            None,
+        )
+    } else {
+        let witness = PackageWitness::parse(
+            package_record
+                .as_deref()
+                .context("implicit Go output requires package discovery")?,
+        )?;
         let output = NativeOutputContract::from_paths([witness.output.clone()])
             .context("invalid implicit Go file output")?;
-        (output, Some(witness), source_ancestors)
+        (output, Some(witness))
     };
     validate_destination(project_root, &output)?;
     let environment = GoBuildEnvironment {
+        mode: invocation.mode,
         settings,
         output,
         implicit,
+        test_package,
         source_ancestors,
     };
     ensure!(
@@ -635,6 +735,12 @@ pub(in crate::hook) fn go_build_execution_command(
     managed_runtime: Option<&BTreeMap<String, String>>,
 ) -> Option<String> {
     let invocation = invocation(command)?;
+    if invocation.mode != environment.mode
+        || (invocation.mode == GoCompileMode::Test) != environment.test_package.is_some()
+        || (invocation.mode == GoCompileMode::Test && environment.implicit.is_some())
+    {
+        return None;
+    }
     match (&invocation.output, &environment.implicit) {
         (Some(selection), None)
             if NativeOutputContract::from_paths([selection.path.clone()])?
@@ -664,7 +770,7 @@ pub(in crate::hook) fn go_build_execution_command(
          printf '%s\\n' 'RCH: Go output must name a regular file, not a directory or symlink' >&2; return 113; fi; "
     ));
     let mut preflight = capture_function();
-    if environment.implicit.is_some() {
+    if environment.implicit.is_some() || environment.test_package.is_some() {
         // Cheap path admission precedes costly CGO environment probes. A
         // source-local module cache is refused without warming any cache.
         preflight.push_str(&package_query_preflight(environment.source_ancestors));
@@ -677,8 +783,16 @@ pub(in crate::hook) fn go_build_execution_command(
         // ancestor go.work between discovery and compilation cannot silently
         // change selection or cause a supposedly readonly query to write sums.
         "GOWORK=off "
+    } else if let Some(witness) = &environment.test_package {
+        preflight.push_str(&package_query(&invocation));
+        preflight.push_str(&witness.worker_check());
+        "GOWORK=off "
     } else {
         ""
+    };
+    let subcommand = match invocation.mode {
+        GoCompileMode::Build => "build",
+        GoCompileMode::Test => "test -c",
     };
     let parent = shell_escape::escape(format!("./{}", output.parent()?.to_str()?).into());
     // These values come from the pipeline's exact granted runtime placement.
@@ -700,7 +814,7 @@ pub(in crate::hook) fn go_build_execution_command(
          rch_go_build_root=$(cd \"$rch_go_build\" && pwd -P) || exit 113; \
          case \"$rch_go_build_root/\" in \"${{rch_go_root%/}}/\"*) \
            printf '%s\\n' 'RCH: Go build temporary directory must be outside the source root' >&2; exit 113;; esac; \
-         {build_environment}\"$rch_go\" build -o \"$rch_go_build/output\" \"$@\"; \
+         {build_environment}\"$rch_go\" {subcommand} -o \"$rch_go_build/output\" \"$@\"; \
          rch_go_status=$?; \
          if [ \"$rch_go_status\" -ne 0 ]; then exit \"$rch_go_status\"; fi; \
          if [ -L \"$rch_go_build/output\" ] || [ ! -f \"$rch_go_build/output\" ]; then \
@@ -722,6 +836,58 @@ pub(in crate::hook) fn go_build_execution_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_package_witness_requires_one_package_with_actual_test_inputs() {
+        for record in [
+            "example.invalid/library\n1\n0\n",
+            "example.invalid/library\n0\n2\n",
+            "command-line-arguments\n1\n1\n",
+        ] {
+            let witness = TestPackageWitness::parse(record.as_bytes()).unwrap();
+            assert_eq!(witness.record, record);
+        }
+        for record in [
+            "example.invalid/library\n0\n0\n",
+            "\n1\n0\n",
+            "example.invalid/lib\rary\n1\n0\n",
+            "example.invalid/library\n1\n0",
+            "example.invalid/library\n01\n0\n",
+            "example.invalid/library\n-1\n0\n",
+            "example.invalid/library\n4294967296\n0\n",
+            "example.invalid/library\n1\n0\n\n",
+            "example.invalid/library\n1\n0\nexample.invalid/other\n1\n0\n",
+        ] {
+            assert!(
+                TestPackageWitness::parse(record.as_bytes()).is_err(),
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_test_witness_refuses_changed_or_incomplete_package_selection() {
+        let witness = TestPackageWitness::parse(b"example.invalid/library\n1\n1\n").unwrap();
+        for (record, admitted) in [
+            ("example.invalid/library\n1\n1\n", true),
+            ("example.invalid/library\n1\n1", false),
+            ("example.invalid/library\n0\n0\n", false),
+            ("example.invalid/library\n2\n0\n", false),
+            ("example.invalid/other\n1\n1\n", false),
+            ("example.invalid/library\n1\n1\nextra\n", false),
+        ] {
+            let record = shell_escape::escape(record.into());
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("rch_go_package={record}; {}", witness.worker_check()),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), admitted, "{record}: {output:?}");
+        }
+    }
 
     #[test]
     fn package_witness_requires_one_complete_main_record() {

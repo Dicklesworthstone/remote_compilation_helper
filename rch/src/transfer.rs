@@ -3165,6 +3165,9 @@ pub struct TransferPipeline {
     /// Used to apply appropriate timeouts and wrappers (e.g., external timeout
     /// for bun test to protect against known CPU hang issues).
     compilation_kind: Option<CompilationKind>,
+    /// An admitted `go test -c -o` has the external runtime/output contract
+    /// of a Go build while retaining its test execution kind and time budget.
+    go_test_output: bool,
     /// Compilation configuration for timeouts and other settings.
     ///
     /// Provides configurable external timeout values per command type and
@@ -3342,6 +3345,7 @@ impl TransferPipeline {
             layer0_env: Vec::new(),
             env_overrides: None,
             compilation_kind: None,
+            go_test_output: false,
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
             remote_path_override: None,
@@ -4377,6 +4381,18 @@ impl TransferPipeline {
         self
     }
 
+    /// Select external scratch only after compile-only Go output preflight.
+    /// Ordinary streaming tests keep their existing runtime placement.
+    pub(crate) fn with_go_test_output(mut self, enabled: bool) -> Self {
+        self.go_test_output = enabled;
+        self
+    }
+
+    fn uses_external_go_runtime(&self) -> bool {
+        self.compilation_kind == Some(CompilationKind::GoBuild)
+            || (self.go_test_output && self.compilation_kind == Some(CompilationKind::GoTest))
+    }
+
     /// Set the compilation configuration for timeout settings.
     ///
     /// This allows customizing external timeout durations for different command
@@ -4887,7 +4903,7 @@ impl TransferPipeline {
     /// for scratch and caches. Package discovery and go:embed must not see
     /// directories created by the execution wrapper in the source tree.
     fn managed_remote_env_value(&self, key: &str, remote_path: &str) -> Option<(String, String)> {
-        let runtime_root = if self.compilation_kind == Some(CompilationKind::GoBuild) {
+        let runtime_root = if self.uses_external_go_runtime() {
             // Admission supplies this external target and includes it in the
             // source/target ownership grant. Do not invent an unowned sibling
             // for direct callers that have no admitted target override.
@@ -4914,7 +4930,7 @@ impl TransferPipeline {
             // Go's own work directory takes precedence over TMPDIR. Only
             // admitted direct Go builds acquire this additional managed key.
             "GOTMPDIR"
-                if self.compilation_kind == Some(CompilationKind::GoBuild)
+                if self.uses_external_go_runtime()
                     && self.remote_cargo_target_dir_override.is_some() =>
             {
                 let temp_dir = format!("{runtime_root}/.rch-tmp");
@@ -4943,7 +4959,7 @@ impl TransferPipeline {
     /// these after the caller's `env` wrappers so an inline cache assignment
     /// or `env -i` cannot bypass the already granted and budgeted directories.
     pub(crate) fn managed_go_runtime_environment(&self) -> Option<BTreeMap<String, String>> {
-        if self.compilation_kind != Some(CompilationKind::GoBuild) {
+        if !self.uses_external_go_runtime() {
             return None;
         }
         let target = self.remote_cargo_target_dir_override.as_deref()?;
@@ -20133,6 +20149,53 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
                 );
             }
         }
+    }
+
+    #[test]
+    fn compile_only_go_tests_use_granted_external_runtime_without_changing_test_policy() {
+        let source = "/source/test-package";
+        let target = "/managed/test-output";
+        let pipeline = TransferPipeline::new(
+            PathBuf::from(source),
+            "test-package".into(),
+            "source-hash".into(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::GoTest))
+        .with_go_test_output(true)
+        .with_remote_path_override(source)
+        .with_remote_cargo_target_dir_override(target);
+        let runtime = pipeline.managed_go_runtime_environment().unwrap();
+        assert_eq!(pipeline.compilation_kind, Some(CompilationKind::GoTest));
+        assert_eq!(runtime.len(), 7);
+        let plan = pipeline.build_remote_env_plan_with_environment(source, std::iter::empty());
+        for (key, value) in runtime {
+            assert!(Path::new(&value).starts_with(target), "{key}: {value}");
+            assert!(plan.ensure_dirs.contains(&value), "{key}: {value}");
+            assert!(
+                plan.env_prefix
+                    .prefix
+                    .contains(&managed_assignment(&key, &value))
+            );
+        }
+        assert!(
+            plan.ensure_dirs
+                .iter()
+                .all(|path| !Path::new(path).starts_with(source))
+        );
+        assert!(
+            pipeline
+                .clone()
+                .with_go_test_output(false)
+                .managed_go_runtime_environment()
+                .is_none()
+        );
+        assert!(
+            pipeline
+                .with_compilation_kind(Some(CompilationKind::GoVet))
+                .managed_go_runtime_environment()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

@@ -49,7 +49,7 @@ RCH currently recognizes and can offload:
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
 | TypeScript | `tsc --noEmit`, `npx tsc --noEmit` |
-| Go | `go build -o <file>`, ordinary `go test`, `go vet` |
+| Go | `go build`, `go build -o <file>`, ordinary `go test`, `go test -c -o <file>`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -83,12 +83,22 @@ local binary, and durable recovery resumes collection without rerunning Go.
 Directory outputs, symlinks or symlinked output parents, cross compilation,
 native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
 create extra files are outside this output contract. Implicit forms such as
-`go build`, `go build .`, and `go build ./...` stay local because their output
-names depend on which packages they select. Go test options that write binaries,
-profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
-`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
-local. Strict remote mode refuses
-unsupported forms instead of executing them locally.
+`go build`, `go build .`, and `go build ./...` use Go's own package query to
+prove that exactly one main package is selected and bind its executable name
+before execution.
+
+Compile-only tests also return an exact binary: for example,
+`go test -c -o bin/package.test ./package`. Both endpoints verify that the same
+single package has test sources; packages without tests and selections spanning
+multiple packages stay local. Compilation never runs the test binary. The binary
+uses the same fresh-file publication and collection-only recovery as `go build`,
+and its caches and temporary files stay outside the selected source tree.
+Package discovery for implicit builds and compile-only tests requires Go 1.18
+or newer with workspace mode disabled. Test profiling, fuzz corpora, implicit
+test-binary names, and output-producing test execution (`-coverprofile`,
+`-cpuprofile`, `-trace`, `-fuzz`, `-o` without `-c`, and related `-test.*` forms)
+stay local. Strict remote mode refuses unsupported forms instead of executing
+them locally.
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 

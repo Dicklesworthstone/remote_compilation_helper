@@ -1162,7 +1162,9 @@ async fn execute_remote_compilation_inner(
         );
     }
 
-    let go_build_environment = if kind == Some(CompilationKind::GoBuild) {
+    let go_test_output = kind == Some(CompilationKind::GoTest)
+        && rch_common::patterns::go_test_invocation(command).is_some();
+    let go_build_environment = if kind == Some(CompilationKind::GoBuild) || go_test_output {
         anyhow::ensure!(
             !worker_is_windows
                 && durable_lease.is_some()
@@ -2067,6 +2069,7 @@ async fn execute_remote_compilation_inner(
         .with_command_timeout(command_timeout)
         .with_compilation_config(compilation_config.clone())
         .with_compilation_kind(kind)
+        .with_go_test_output(go_test_output)
         .with_remote_path_override(entry.remote_root.clone())
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
         .with_build_id(build_id)

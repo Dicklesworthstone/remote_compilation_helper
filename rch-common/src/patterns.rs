@@ -2411,12 +2411,13 @@ fn go_linker_flags_have_one_output(value: &str) -> bool {
     present
 }
 
-/// The one project-relative file promised by a supported `go build -o`.
+/// The one project-relative file promised by a supported Go output command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoBuildOutput {
     /// Literal path, relative to the invocation directory.
     pub path: String,
-    /// Index of the -o option in the normalized argv, including `go build`.
+    /// Index of the -o option in the normalized argv, including `go build`
+    /// or `go test`.
     /// The executor uses this to replace only the actual output option, never
     /// an opaque argument value that happens to resemble a flag.
     pub option_index: usize,
@@ -2439,6 +2440,100 @@ pub struct GoBuildInvocation {
     /// Literal package selectors or named `.go` source files, in argument order.
     /// An empty list means the current package, as it does for `go build`.
     pub packages: Vec<String>,
+}
+
+/// Literal arguments of a Go test compilation with one explicit executable.
+///
+/// This represents `go test -c -o FILE`, never an invocation that runs tests.
+/// The executor must still prove that the selected package has test sources,
+/// since Go can succeed without creating a binary for a package with no tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoTestInvocation {
+    /// Exactly one explicit project-relative executable, not an output directory.
+    pub output: GoBuildOutput,
+    /// Build flags accepted by both `go test` and the package-discovery query.
+    /// Test compilation controls (`-c`, `-o`) are omitted; opaque values remain.
+    pub build_flags: Vec<String>,
+    /// One contiguous list of literal packages or named `.go` source files.
+    /// An empty list selects the invocation directory.
+    pub packages: Vec<String>,
+}
+
+fn go_output_path(path: &str) -> bool {
+    !path.is_empty()
+        && path != "-"
+        && !path.ends_with('/')
+        && !path.ends_with("/.")
+        && !path.chars().any(char::is_control)
+        && std::path::Path::new(path).components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+        && std::path::Path::new(path)
+            .components()
+            .any(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+/// Consume only known build options that preserve a single-file contract.
+/// Sharing this grammar keeps build and compile-only test discovery aligned.
+fn go_build_flag<'a>(
+    flag: &str,
+    inline: Option<&'a str>,
+    args: &mut impl Iterator<Item = (usize, &'a str)>,
+) -> Option<()> {
+    match flag {
+        "-buildmode" => {
+            if !matches!(
+                inline.or_else(|| args.next().map(|(_, value)| value))?,
+                "default" | "exe" | "pie"
+            ) {
+                return None;
+            }
+        }
+        "-compiler" => {
+            if inline.or_else(|| args.next().map(|(_, value)| value))? != "gc" {
+                return None;
+            }
+        }
+        "-p" | "-tags" | "-covermode" | "-coverpkg" => {
+            if inline
+                .or_else(|| args.next().map(|(_, value)| value))?
+                .is_empty()
+            {
+                return None;
+            }
+        }
+        "-ldflags" => {
+            if !go_linker_flags_have_one_output(
+                inline.or_else(|| args.next().map(|(_, value)| value))?,
+            ) {
+                return None;
+            }
+        }
+        "-mod" => {
+            if !matches!(
+                inline.or_else(|| args.next().map(|(_, value)| value))?,
+                "readonly" | "vendor"
+            ) {
+                return None;
+            }
+        }
+        "-buildvcs" => {
+            if inline.is_some_and(|value| !matches!(value, "auto" | "true" | "false")) {
+                return None;
+            }
+        }
+        "-a" | "-race" | "-msan" | "-asan" | "-v" | "-x" | "-trimpath" | "-modcacherw"
+        | "-cover" => {
+            if inline.is_some_and(|value| !matches!(value, "true" | "false")) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 /// Parse the literal arguments of a supported Go build.
@@ -2472,82 +2567,20 @@ pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg, None), |(flag, value)| (flag, Some(value)));
-        match flag {
-            "-o" => {
-                let path = inline.or_else(|| args.next().map(|(_, value)| value))?;
-                if output
-                    .replace(GoBuildOutput {
-                        path: path.to_owned(),
-                        option_index,
-                    })
-                    .is_some()
-                    || path.is_empty()
-                    || path == "-"
-                    || path.ends_with('/')
-                    || path.chars().any(char::is_control)
-                    || !std::path::Path::new(path).components().all(|part| {
-                        matches!(
-                            part,
-                            std::path::Component::Normal(_) | std::path::Component::CurDir
-                        )
-                    })
-                    || !std::path::Path::new(path)
-                        .components()
-                        .any(|part| matches!(part, std::path::Component::Normal(_)))
-                {
-                    return None;
-                }
+        if flag == "-o" {
+            let path = inline.or_else(|| args.next().map(|(_, value)| value))?;
+            if output
+                .replace(GoBuildOutput {
+                    path: path.to_owned(),
+                    option_index,
+                })
+                .is_some()
+                || !go_output_path(path)
+            {
+                return None;
             }
-            "-buildmode" => {
-                if !matches!(
-                    inline.or_else(|| args.next().map(|(_, value)| value))?,
-                    "default" | "exe" | "pie"
-                ) {
-                    return None;
-                }
-            }
-            "-compiler" => {
-                if inline.or_else(|| args.next().map(|(_, value)| value))? != "gc" {
-                    return None;
-                }
-            }
-            "-p" | "-tags" | "-covermode" | "-coverpkg" => {
-                if inline
-                    .or_else(|| args.next().map(|(_, value)| value))?
-                    .is_empty()
-                {
-                    return None;
-                }
-            }
-            "-ldflags" => {
-                if !go_linker_flags_have_one_output(
-                    inline.or_else(|| args.next().map(|(_, value)| value))?,
-                ) {
-                    return None;
-                }
-            }
-            "-mod" => {
-                if !matches!(
-                    inline.or_else(|| args.next().map(|(_, value)| value))?,
-                    "readonly" | "vendor"
-                ) {
-                    return None;
-                }
-            }
-            "-buildvcs" => {
-                if inline.is_some_and(|value| !matches!(value, "auto" | "true" | "false")) {
-                    return None;
-                }
-            }
-            "-a" | "-race" | "-msan" | "-asan" | "-v" | "-x" | "-trimpath" | "-modcacherw"
-            | "-cover" => {
-                if inline.is_some_and(|value| !matches!(value, "true" | "false")) {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-        if flag != "-o" {
+        } else {
+            go_build_flag(flag, inline, &mut args)?;
             let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
             build_flags.extend(
                 words[option_index..next_index]
@@ -2563,6 +2596,75 @@ pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
     })
 }
 
+/// Parse compile-only Go tests with an exact output file.
+///
+/// Go accepts known options before and after one contiguous package list.
+/// Unknown options and trailing positional test arguments change that grammar,
+/// so they remain local. No test execution, profiles, fuzz corpus, wrapper,
+/// response file, or native-library output can acquire a one-file contract.
+#[must_use]
+pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
+    let normalized = normalize_command(command);
+    let words = literal_flag_words(&normalized)?;
+    let mut args = words.iter().copied().enumerate().peekable();
+    if args.next()?.1 != "go" || args.next()?.1 != "test" {
+        return None;
+    }
+    let mut compile_only = false;
+    let mut output = None;
+    let mut build_flags = Vec::new();
+    let mut packages = Vec::new();
+    let mut packages_finished = false;
+    while let Some((option_index, arg)) = args.next() {
+        if !arg.starts_with('-') {
+            if packages_finished {
+                return None;
+            }
+            packages.push(arg.to_owned());
+            continue;
+        }
+        packages_finished |= !packages.is_empty();
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        match flag {
+            "-c" => {
+                if compile_only || inline.is_some_and(|value| value != "true") {
+                    return None;
+                }
+                compile_only = true;
+            }
+            "-o" => {
+                let path = inline.or_else(|| args.next().map(|(_, value)| value))?;
+                if output
+                    .replace(GoBuildOutput {
+                        path: path.to_owned(),
+                        option_index,
+                    })
+                    .is_some()
+                    || !go_output_path(path)
+                {
+                    return None;
+                }
+            }
+            _ => {
+                go_build_flag(flag, inline, &mut args)?;
+                let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
+                build_flags.extend(
+                    words[option_index..next_index]
+                        .iter()
+                        .map(|arg| (*arg).to_owned()),
+                );
+            }
+        }
+    }
+    compile_only.then_some(GoTestInvocation {
+        output: output?,
+        build_flags,
+        packages,
+    })
+}
+
 /// Plan the explicit file output of a supported Go build. An implicit build
 /// has no static output contract, even when its arguments permit discovery.
 #[must_use]
@@ -2571,9 +2673,9 @@ pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
 }
 
 /// Classify Go builds eligible for explicit or compiler-discovered output
-/// delivery, and streaming test/vet commands. File-producing test modes remain
-/// local until they have an equivalent contract; arbitrary subcommands are
-/// never offloaded here.
+/// delivery, compile-only tests with an exact output, and streaming test/vet
+/// commands. Other file-producing test modes remain local until they have an
+/// equivalent contract; arbitrary subcommands are never offloaded here.
 fn classify_go(cmd: &str) -> Classification {
     let mut tokens = cmd.split_whitespace();
     // Skip the leading "go".
@@ -2602,6 +2704,19 @@ fn classify_go(cmd: &str) -> Classification {
             Classification::compilation(CompilationKind::GoBuild, 0.95, "go build command")
         }
         "test" => {
+            if go_test_invocation(cmd).is_some() {
+                return if cfg!(unix) {
+                    Classification::compilation(
+                        CompilationKind::GoTest,
+                        0.95,
+                        "go test compilation with explicit executable output",
+                    )
+                } else {
+                    Classification::not_compilation(
+                        "Go output delivery requires a Unix dispatcher and worker",
+                    )
+                };
+            }
             // These flags accept both separated and = values. Profiling flags
             // may also be passed directly to the test binary as -test.*.
             if args.iter().any(|arg| {
@@ -8496,6 +8611,190 @@ mod tests_go_and_typescript {
         assert_eq!(invocation.output.unwrap().option_index, 2);
     }
 
+    #[test]
+    fn go_compile_only_tests_have_one_explicit_output() {
+        for (command, path, option_index) in [
+            ("go test -c -o app.test", "app.test", 3),
+            ("go test -c=true -o=bin/app.test ./pkg", "bin/app.test", 3),
+            ("go test '-c=true' '-o=app test' ./pkg", "app test", 3),
+            ("go test ./pkg -c -o app.test", "app.test", 4),
+            ("go test -o app.test ./pkg -c=true", "app.test", 2),
+            (
+                "go test -c -trimpath -p=2 -o './products/test [dev]*?' .",
+                "./products/test [dev]*?",
+                5,
+            ),
+            (
+                "env GOFLAGS= go test -c -ldflags '-s -w' -o app.test .",
+                "app.test",
+                5,
+            ),
+            ("go test -c -o app.test main.go main_test.go", "app.test", 3),
+        ] {
+            let invocation = go_test_invocation(command).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!(invocation.output.path, path, "{command}");
+            assert_eq!(invocation.output.option_index, option_index, "{command}");
+            assert_eq!(
+                kind_of(command),
+                cfg!(unix).then_some(CompilationKind::GoTest),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_discovery_preserves_build_flags_and_contiguous_packages() {
+        let invocation = go_test_invocation(
+            "go test -tags 'debug e2e' -c ./pkg/first ./pkg/second -trimpath -o bin/tests -p=2 -ldflags '-s -X main.version=v2'",
+        )
+        .unwrap();
+        assert_eq!(invocation.output.path, "bin/tests");
+        assert_eq!(invocation.output.option_index, 8);
+        assert_eq!(
+            invocation.build_flags,
+            [
+                "-tags",
+                "debug e2e",
+                "-trimpath",
+                "-p=2",
+                "-ldflags",
+                "-s -X main.version=v2",
+            ]
+        );
+        assert_eq!(invocation.packages, ["./pkg/first", "./pkg/second"]);
+
+        let invocation = go_test_invocation(
+            "go test -c -buildmode=pie -compiler gc -race=false -mod readonly -cover -coverpkg ./pkg -covermode atomic -o=test.bin",
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.build_flags,
+            [
+                "-buildmode=pie",
+                "-compiler",
+                "gc",
+                "-race=false",
+                "-mod",
+                "readonly",
+                "-cover",
+                "-coverpkg",
+                "./pkg",
+                "-covermode",
+                "atomic",
+            ]
+        );
+        assert!(invocation.packages.is_empty());
+
+        // A positional word after flags following the package list is a test
+        // argument, not another package; discovery cannot silently change it.
+        assert!(go_test_invocation("go test -c -o app.test ./one -race ./two").is_none());
+    }
+
+    #[test]
+    fn go_test_flag_values_cannot_authorize_compile_only_output() {
+        for command in [
+            "go test -tags -c -o app.test ./pkg",
+            "go test -tags -o -c app.test ./pkg",
+            "go test -ldflags '-X main.version=-c' -o app.test ./pkg",
+            "go test -run -c -o app.test ./pkg",
+            "go test -c -run -o app.test ./pkg",
+            "go test -c -o app.test -args -c",
+            "go test -c -o app.test -- -c",
+        ] {
+            assert!(go_test_invocation(command).is_none(), "{command}");
+            assert_eq!(kind_of(command), None, "{command}");
+        }
+        let invocation = go_test_invocation("go test -tags -o -c -o app.test ./pkg").unwrap();
+        assert_eq!(invocation.output.option_index, 5);
+        assert_eq!(invocation.output.path, "app.test");
+        assert_eq!(invocation.build_flags, ["-tags", "-o"]);
+        assert_eq!(invocation.packages, ["./pkg"]);
+    }
+
+    #[test]
+    fn go_compile_only_tests_decline_other_output_or_execution_contracts() {
+        for command in [
+            "go test -c",
+            "go test -o app.test",
+            "go test -c=false -o app.test",
+            "go test -c=true -c=false -o app.test",
+            "go test -c -c -o app.test",
+            "go test -c=1 -o app.test",
+            "go test -c -o",
+            "go test -c -o=",
+            "go test -c -o ''",
+            "go test -c -o /tmp/app.test",
+            "go test -c -o ../app.test",
+            "go test -c -o bin/../app.test",
+            "go test -c -o .",
+            "go test -c -o bin/",
+            "go test -c -o bin/.",
+            "go test -c -o -",
+            "go test -c -o one -o two",
+            "go test -c -n -o app.test",
+            "go test -c -work -o app.test",
+            "go test -c -buildmode=c-archive -o app.test",
+            "go test -c -buildmode=c-shared -o app.test",
+            "go test -c -buildmode=plugin -o app.test",
+            "go test -c -compiler gccgo -o app.test",
+            "go test -c -toolexec wrapper -o app.test",
+            "go test -c -overlay overlay.json -o app.test",
+            "go test -c -modfile other.mod -o app.test",
+            "go test -c -mod=mod -o app.test",
+            "go test -c -gcflags '-cpuprofile=compiler.out' -o app.test",
+            "go test -c -asmflags '-debug' -o app.test",
+            "go test -c -ldflags '-tmpdir=products' -o app.test",
+            "go test -c -tags -o app.test",
+            "go test -c -tags= -o app.test",
+            "go test -c -o $OUTPUT ./pkg",
+            "go test -c -o app* ./pkg",
+            "go test -c -o app.test *.go",
+            "go test -c -o app.test ./pkg/{first,second}",
+            "go test -c -o 'app\nnext' ./pkg",
+            "go test -c -o app.test 'unterminated",
+        ] {
+            assert!(go_test_invocation(command).is_none(), "{command}");
+            assert_eq!(kind_of(command), None, "{command}");
+        }
+        for flag in [
+            "-exec=sudo",
+            "-coverprofile=coverage.out",
+            "-cpuprofile=cpu.out",
+            "-memprofile=mem.out",
+            "-blockprofile=block.out",
+            "-mutexprofile=mutex.out",
+            "-trace=trace.out",
+            "-outputdir=profiles",
+            "-fuzz=FuzzParser",
+            "-test.fuzzcachedir=corpus",
+            "-test.gocoverdir=coverage",
+            "-test.testlogfile=test.log",
+            "-artifacts",
+            "-args",
+            "-run=TestParser",
+            "-unknown",
+        ] {
+            let command = format!("go test -c -o app.test ./pkg {flag}");
+            assert!(go_test_invocation(&command).is_none(), "{command}");
+            assert_eq!(kind_of(&command), None, "{command}");
+        }
+        for command in [
+            "go test -c -o app.test ./pkg; touch marker",
+            "go test -c -o app.test ./pkg > output.log",
+            "go test -c -o app.test ./pkg && echo complete",
+        ] {
+            assert!(go_test_invocation(command).is_none(), "{command}");
+        }
+        assert!(go_test_invocation(&format!("go test -c -o {}", "x".repeat(65_536))).is_none());
+        assert!(
+            go_test_invocation(&format!(
+                "go test -c -o app.test {}",
+                "main.go ".repeat(4093)
+            ))
+            .is_none()
+        );
+    }
+
     // --- Go: forms that MUST stay local (would otherwise lose artifacts) ---
 
     #[test]
@@ -8506,6 +8805,7 @@ mod tests_go_and_typescript {
             "go build -o ../app .",
             "go build -o . .",
             "go build -o bin/ .",
+            "go build -o bin/. .",
             "go build -o - .",
             "go build -o one -o two .",
             "go build -n -o app .",
