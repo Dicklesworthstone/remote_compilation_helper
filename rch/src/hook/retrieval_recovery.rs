@@ -5484,7 +5484,9 @@ mod tests {
         .with_build_id(Some(41))
         .with_remote_path_override(remote_source)
         .with_remote_cargo_target_dir_override(remote_target);
-        let pipeline = clean_overlay_execution_pipeline(source, &spec);
+        let remote_invocation_root = spec.remote_invocation_root(remote_source);
+        let pipeline =
+            invocation_execution_pipeline(source, &spec.invocation_root(), &remote_invocation_root);
         let remote_cwd = format!("{remote_source}/crates/app/src");
         assert_eq!(pipeline.remote_path(), remote_cwd);
         assert_eq!(pipeline.remote_cargo_target_dir(), remote_target);

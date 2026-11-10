@@ -949,19 +949,20 @@ pub(super) async fn execute_remote_compilation(
     .await
 }
 
-/// Source upload and ownership retain the whole selected Git root. Only after
+/// Source upload and ownership retain the whole selected source root. Only after
 /// upload may execution and artifact retrieval adopt the caller's directory.
 /// Preserve the already granted target path and full-root disk supervision.
-fn clean_overlay_execution_pipeline(
+fn invocation_execution_pipeline(
     pipeline: TransferPipeline,
-    spec: &CleanOverlaySpec,
+    invocation_root: &Path,
+    remote_invocation_root: &str,
 ) -> TransferPipeline {
     let source_root = pipeline.remote_path();
     let target_root = pipeline.remote_cargo_target_dir();
     pipeline
-        .with_local_root(spec.invocation_root())
-        .with_retrieval_reference_root(spec.invocation_root())
-        .with_remote_path_override(spec.remote_invocation_root(&source_root))
+        .with_local_root(invocation_root.to_owned())
+        .with_retrieval_reference_root(invocation_root.to_owned())
+        .with_remote_path_override(remote_invocation_root)
         .with_remote_cargo_target_dir_override(target_root)
         .with_disk_source_root(source_root)
 }
@@ -1123,8 +1124,8 @@ async fn execute_remote_compilation_inner(
         None
     };
 
-    // Source authority covers the whole selected Git root. The invocation cwd
-    // remains the command/artifact basis even when it is below that root.
+    // Source authority covers the selected Git root or declared frozen Node
+    // workspace. The invocation cwd remains the command/artifact basis.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
     let normalized_project = normalize_project_path_with_policy(&project_root, topology_policy)
@@ -1152,7 +1153,7 @@ async fn execute_remote_compilation_inner(
         );
         spec.repository_root.clone()
     } else {
-        normalized_invocation_root.clone()
+        super::node_workspace::source_root(&normalized_invocation_root, kind, topology_policy)?
     };
 
     // Windows workers have no Unix canonical/alias projects topology and cargo
@@ -1449,6 +1450,17 @@ async fn execute_remote_compilation_inner(
         } else {
             project_hash
         };
+    let transfer_config =
+        if clean_overlay.is_none() && normalized_project_root != normalized_invocation_root {
+            super::node_workspace::preserve_invocation_excludes(
+                transfer_config,
+                &normalized_project_root,
+                &normalized_invocation_root,
+                &project_hash,
+            )?
+        } else {
+            transfer_config
+        };
     let mut sync_plan = if clean_overlay.is_some() {
         // Explicit committed roots are the whole authority. The ordinary
         // planner reads ambient ancestor manifests and must not widen this set.
@@ -1643,10 +1655,14 @@ async fn execute_remote_compilation_inner(
         .context("sync plan has no primary source root")?
         .remote_root
         .clone();
-    let remote_invocation_root = clean_overlay.map_or_else(
-        || primary_remote_source_root.clone(),
-        |spec| spec.remote_invocation_root(&primary_remote_source_root),
-    );
+    let remote_invocation_root = match clean_overlay {
+        Some(spec) => spec.remote_invocation_root(&primary_remote_source_root),
+        None => super::node_workspace::remote_invocation_root(
+            &primary_remote_source_root,
+            &normalized_project_root,
+            &normalized_invocation_root,
+        )?,
+    };
 
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
@@ -2506,11 +2522,16 @@ async fn execute_remote_compilation_inner(
             normalized_project_root.display()
         )
     })?;
-    let pipeline = if let Some(spec) = clean_overlay {
-        clean_overlay_execution_pipeline(pipeline, spec)
-    } else {
-        pipeline
-    };
+    let pipeline =
+        if clean_overlay.is_some() || normalized_project_root != normalized_invocation_root {
+            invocation_execution_pipeline(
+                pipeline,
+                &normalized_invocation_root,
+                &remote_invocation_root,
+            )
+        } else {
+            pipeline
+        };
     let pipeline = pipeline.with_cargo_disk_cache(command, &worker_config.id);
     let owned_command = if owned_source_content_pair {
         Some(validate_owned_source_content_closure(
@@ -4252,6 +4273,97 @@ async fn execute_remote_compilation_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_node_workspace_plan_owns_full_root_and_rebases_execution_and_retrieval() {
+        use super::*;
+
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let root = storage.join("workspace");
+        let member = root.join("packages/app");
+        let invocation = member.join("src");
+        std::fs::create_dir_all(&invocation).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            br#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package-lock.json"), "frozen").unwrap();
+        std::fs::write(member.join("package.json"), br#"{"name":"app"}"#).unwrap();
+        std::fs::write(invocation.join(".rchignore"), "member-private/\n").unwrap();
+        let topology = PathTopologyPolicy::new(storage.clone(), storage.join("alias"));
+        let kind = Some(CompilationKind::Tsc);
+        let selected =
+            super::super::node_workspace::source_root(&invocation, kind, &topology).unwrap();
+        let runtime = build_dependency_runtime_plan(
+            &selected,
+            kind,
+            &HookReporter::new(OutputVisibility::None),
+            &topology,
+        );
+        assert_eq!(runtime.sync_roots, vec![root.clone()]);
+        let mut plan =
+            build_sync_closure_plan(&runtime.sync_roots, &selected, "workspace-hash", &topology);
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].is_primary);
+        assert_eq!(plan[0].mode, SyncClosureMode::Full);
+        assert_eq!(plan[0].local_root, root);
+        plan[0].remote_root = "/worker/granted/source".into();
+        let owned = source_namespace::build_source_roots(
+            &plan,
+            None,
+            None,
+            None,
+            Some("/worker/granted/target"),
+        );
+        assert_eq!(owned, ["/worker/granted/source", "/worker/granted/target"]);
+        let remote_cwd = super::super::node_workspace::remote_invocation_root(
+            &plan[0].remote_root,
+            &selected,
+            &invocation,
+        )
+        .unwrap();
+        let pipeline = TransferPipeline::new(
+            selected,
+            "workspace".into(),
+            "workspace-hash".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(&plan[0].remote_root)
+        .with_remote_cargo_target_dir_override("/worker/granted/target")
+        .with_build_id(Some(42));
+        let execution = invocation_execution_pipeline(pipeline, &invocation, &remote_cwd);
+        assert_eq!(
+            execution.remote_path(),
+            "/worker/granted/source/packages/app/src"
+        );
+        assert_eq!(
+            execution.remote_cargo_target_dir(),
+            "/worker/granted/target"
+        );
+        assert_eq!(
+            execution.remote_pgid_file_path(),
+            Some(TransferPipeline::remote_pgid_file_path_for_root(
+                &remote_cwd,
+                42
+            ))
+        );
+        let retrieval = execution.local_artifact_retrieval_for_test(
+            &WorkerConfig::default(),
+            &root,
+            &["reports/**".into()],
+        );
+        let args = retrieval
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args.last().unwrap().trim_end_matches('/'),
+            invocation.to_str().unwrap()
+        );
+        assert!(args.iter().any(|arg| arg == "member-private/"));
+    }
+
     /// bd-dxsx5: an E327 rejection must not leave the source pair waiting for a
     /// recovery that can only repeat the rejection. A transient transfer failure
     /// (the planted negative) must still hold it, or a live transfer could lose
