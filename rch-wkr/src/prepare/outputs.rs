@@ -972,6 +972,7 @@ mod linux {
             plan.is_frozen(),
             "source-qualified dependency preparation requires a selected frozen lockfile"
         );
+        plan.verify_root(&transaction.project, &inputs)?;
         let before = scan(&transaction.project, request, &inputs, None)?;
         let prior_state = previous
             .as_ref()
@@ -1015,6 +1016,7 @@ mod linux {
         );
         let after_inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
         inputs.verify_after(&after_inputs, runtime, report.action)?;
+        plan.verify_root(&transaction.project, &after_inputs)?;
         ensure!(
             report.fingerprint.as_ref() == Some(&after_inputs.fingerprint),
             "qualified preparation fingerprint changed"

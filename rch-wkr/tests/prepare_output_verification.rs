@@ -119,7 +119,7 @@ fn verify_uses_stored_request_without_stdin_and_rejects_old_attempts_or_changed_
     fs::write(project.join("package.json"), manifest).unwrap();
     fs::write(project.join("package-lock.json"), lock).unwrap();
     let manager = root.join("bin/npm");
-    fs::write(&manager, b"#!/bin/sh\nset -eu\n[ \"$#\" = 1 ] && [ \"$1\" = ci ]\nmkdir -p node_modules\nprintf 'verified output\\n' > node_modules/dependency.js\nprintf 'install\\n' >> \"$RCH_TEST_INSTALL_COUNT\"\n").unwrap();
+    fs::write(&manager, b"#!/bin/sh\nset -eu\n[ \"$#\" = 3 ] && [ \"$1\" = --prefix ] && [ \"$2\" = \"$PWD\" ] && [ \"$3\" = ci ]\nmkdir -p node_modules\nprintf 'verified output\\n' > node_modules/dependency.js\nprintf 'install\\n' >> \"$RCH_TEST_INSTALL_COUNT\"\n").unwrap();
     fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
     let mut request = PreparedDependencyRequest {
         schema_version: 1,
@@ -211,7 +211,7 @@ fn workspace_verification_requires_the_accepted_member_cwd_and_reuses_one_root_i
         &manager,
         br#"#!/bin/sh
 set -eu
-[ "$#" = 1 ] && [ "$1" = ci ]
+[ "$#" = 3 ] && [ "$1" = --prefix ] && [ "$2" = "$PWD" ] && [ "$3" = ci ]
 mkdir -p node_modules
 printf 'root-owned output\n' > node_modules/dependency.js
 printf 'install\n' >> "$RCH_TEST_INSTALL_COUNT"

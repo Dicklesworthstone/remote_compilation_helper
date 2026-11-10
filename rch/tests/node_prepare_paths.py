@@ -35,7 +35,16 @@ import json, os, sys
 from pathlib import Path
 Path(os.environ['RCH_TEST_PREPARE_LOG']).write_text(json.dumps({
     'args': sys.argv[1:], 'cwd': os.getcwd(), 'stdin': sys.stdin.buffer.read().hex()}))
-print('fixture preparation diagnostic', flush=True)
+print('fixture preparation diagnostic', file=sys.stderr, flush=True)
+if 'RCH_TEST_PREPARE_RESPONSE_HEX' in os.environ:
+    sys.stdout.buffer.write(bytes.fromhex(os.environ['RCH_TEST_PREPARE_RESPONSE_HEX']))
+elif sys.argv[1] == 'prepare-proof':
+    print('RCH_PREPARED_DEPENDENCIES_VERIFIED', flush=True)
+else:
+    marker = 'RCH_PREPARED_NODE_MODULES'
+    if '--workspace-root' in sys.argv:
+        marker += ':' + os.environ.get('RCH_TEST_PREPARE_ROOT_PARENTS', '0')
+    print(marker, flush=True)
 sys.exit(int(os.environ['RCH_TEST_PREPARE_EXIT']))
 """)
         self.compiler(self.tools, "global")
@@ -61,7 +70,7 @@ sys.exit(7)
         (self.project / "package.json").write_text('{"name":"fixture","version":"1.0.0"}\n')
 
     def invoke(self, *, destination=None, arguments=(), data=b"", runtime="node", prefix="",
-               proof_root=None):
+               proof_root=None, boundary=None):
         if destination is None:
             command = ["tsc", *arguments]
         else:
@@ -69,7 +78,8 @@ sys.exit(7)
                        "workload", str(destination), *arguments]
         proof = ([] if proof_root is None else
                  ["--source-proof", "a" * 64, "b" * 64, "--preparation-root", str(proof_root)])
-        return subprocess.run([SHELL, "-c", prefix + self.script, "rch-prepare", runtime, *proof, *command],
+        scope = [] if boundary is None else ["--preparation-boundary", str(boundary)]
+        return subprocess.run([SHELL, "-c", prefix + self.script, "rch-prepare", runtime, *scope, *proof, *command],
                               cwd=self.project, env=self.env, input=data,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
 
@@ -90,7 +100,8 @@ sys.exit(7)
                 result = self.invoke(destination=nested, runtime=runtime)
                 self.assert_tool(result, "prepared", cwd=nested)
                 prepared = json.loads((self.root / "preparation.json").read_text())
-                self.assertEqual(prepared, {'args': ['prepare', '--project', '.', '--runtime', runtime],
+                self.assertEqual(prepared, {'args': ['prepare', '--project', '.', '--runtime', runtime,
+                                                    '--execution-layout', '--workspace-root'],
                                            'cwd': str(self.project), 'stdin': ''})
                 self.assertIn(b"fixture preparation diagnostic", result.stderr)
 
@@ -139,6 +150,50 @@ sys.exit(7)
         # Absolute entries continue selecting the same prepared member tools.
         self.assert_tool(self.invoke(destination=workspace, proof_root=workspace),
                          "member", cwd=workspace)
+
+    def test_normal_workspace_preparation_serves_hoisted_tools_without_changing_cwd(self):
+        workspace = self.workspace_member()
+        self.env['RCH_TEST_PREPARE_ROOT_PARENTS'] = '2'
+        self.compiler(workspace / "node_modules/.bin", "workspace")
+        data = bytes(range(256)) + b"tail\x00\xff"
+        arguments = ("--project", "member config 'literal' $.json")
+        self.assert_tool(self.invoke(arguments=arguments, data=data), "workspace",
+                         args=arguments, data=data)
+        prepared = json.loads((self.root / "preparation.json").read_text())
+        self.assertEqual(prepared['cwd'], str(self.project))
+        self.assertEqual(prepared['stdin'], '')
+        self.assertEqual(prepared['args'], ['prepare', '--project', '.', '--runtime', 'node',
+                                           '--execution-layout', '--workspace-root'])
+        self.compiler(self.project / "node_modules/.bin", "member")
+        self.assert_tool(self.invoke(destination=workspace), "member", cwd=workspace)
+
+    def test_malformed_workspace_selectors_never_authorize_execution(self):
+        self.package()
+        self.compiler(self.project / "node_modules/.bin", "prepared")
+        for response in [b'RCH_PREPARED_NODE_MODULES:65\n', b'RCH_PREPARED_NODE_MODULES:-1\n',
+                         b'RCH_PREPARED_NODE_MODULES:00\n', b'RCH_PREPARED_NODE_MODULES:0\n\n',
+                         b'RCH_PREPARED_NODE_MODULES:0\x00\n',
+                         b'RCH_PREPARED_NODE_MODULES:0\nRCH_PREPARE_STATUS:0',
+                         b'RCH_PREPARED_NODE_MODULES:0\n' + b'x' * 300]:
+            with self.subTest(response=response):
+                self.env['RCH_TEST_PREPARE_RESPONSE_HEX'] = response.hex()
+                result = self.invoke()
+                self.assertEqual(result.returncode, 121, result.stderr)
+                self.assertEqual(result.stdout, b'')
+                self.assertFalse((self.root / 'executed').exists())
+
+    def test_bounded_normal_subdirectory_uses_intermediate_member_tools(self):
+        workspace = self.workspace_member()
+        self.compiler(workspace / "node_modules/.bin", "workspace")
+        self.compiler(self.project / "node_modules/.bin", "member")
+        self.project = self.project / "src"
+        self.project.mkdir()
+        self.env['RCH_TEST_PREPARE_ROOT_PARENTS'] = '3'
+        data = b'member cwd input\x00\xff'
+        self.assert_tool(self.invoke(boundary=workspace, data=data), "member", data=data)
+        prepared = json.loads((self.root / "preparation.json").read_text())
+        self.assertEqual(prepared['cwd'], str(self.project))
+        self.assertEqual(prepared['args'][-2:], ['--preparation-boundary', str(workspace)])
 
     def test_failed_workspace_proof_never_runs_a_hoisted_tool(self):
         workspace = self.workspace_member()
@@ -222,7 +277,7 @@ sys.exit(7)
         result = self.invoke()
         self.assertEqual(result.returncode, 121, result.stderr)
         self.assertEqual(result.stdout, b"")
-        self.assertIn(b"preparation failed (exit 31)", result.stderr)
+        self.assertIn(b"preparation failed or returned an unknown layout", result.stderr)
         self.assertFalse((self.root / "executed").exists())
 
     def test_without_package_manifest_original_path_is_preserved(self):

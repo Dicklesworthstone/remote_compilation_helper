@@ -330,7 +330,7 @@ class PreparedOutputs(fixture.PrepareTransactions):
         request["directories"].sort()
         # The fixture manager recreates its symlink, so use a manager that
         # preserves selected source while producing a different new output.
-        (self.bin / "npm").write_text("#!/bin/sh\nset -eu\n[ \"$#\" = 1 ] && [ \"$1\" = ci ]\nprintf 'install\\n' >> \"$RCH_PREPARE_TEST_STATE/events\"\nprintf 'new output\\n' > node_modules/new-output\n")
+        (self.bin / "npm").write_text("#!/bin/sh\nset -eu\n[ \"$#\" = 3 ] && [ \"$1\" = --prefix ] && [ \"$2\" = \"$PWD\" ] && [ \"$3\" = ci ]\nprintf 'install\\n' >> \"$RCH_PREPARE_TEST_STATE/events\"\nprintf 'new output\\n' > node_modules/new-output\n")
         accepted = self.accepted(self.proof(project, state, request))
         self.assertEqual(accepted["disposition"], "fresh")
         self.assertEqual([entry["path"] for entry in accepted["state"]["inventory"]["files"]], ["node_modules/new-output"])
@@ -654,7 +654,7 @@ printf '%s\n' "$selected" > node_modules/member-source
         self.assertEqual(second["state"], first["state"])
         self.assert_verified(self.verify(project, state, second, invocation=".", cwd=provider,
                                          extra_env=environment))
-        self.assertEqual((state / "real-npm-argv").read_text(), "ci\n")
+        self.assertEqual((state / "real-npm-argv").read_text(), f"--prefix {project} ci\n")
         self.assertEqual((project / "package-lock.json").read_bytes(), lock)
         self.assertEqual(len(self.journals()), 1)
         self.assertEqual(len(self.completed_records()), 1)

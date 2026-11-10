@@ -60,6 +60,14 @@ def load_suite(worker, previous_worker, npm, node):
             }
             (self.bin / "npm").write_text(
                 '#!/bin/sh\nset -eu\n'
+                # Keep the historical-worker comparison's plan log comparable,
+                # while checking and preserving the new exact-root argv.
+                'if [ "${1-}" = --prefix ]; then\n'
+                '  [ "$#" -ge 3 ] && [ "$2" = "$PWD" ] || exit 97\n'
+                '  root=$2; shift 2\n'
+                '  printf "%s\\n" "$#" "$@" >> "$RCH_PREPARE_TEST_STATE/real-npm-argv"\n'
+                f'  exec {shlex.quote(str(node))} {shlex.quote(str(npm))} --prefix "$root" "$@"\n'
+                'fi\n'
                 'printf "%s\\n" "$#" "$@" >> "$RCH_PREPARE_TEST_STATE/real-npm-argv"\n'
                 f'exec {shlex.quote(str(node))} {shlex.quote(str(npm))} "$@"\n'
             )

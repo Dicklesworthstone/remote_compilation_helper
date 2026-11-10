@@ -35,6 +35,10 @@ const LOCK_WAIT: Duration = Duration::from_secs(300);
 const FINGERPRINT_FILE: &str = ".rch_dep_fingerprint.json";
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
+pub(super) fn preparation_root(invocation: &Path) -> Result<PathBuf> {
+    rch_common::node_workspace_fs::resolve_preparation_root(invocation, None)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InputIdentity {
     len: u64,
@@ -562,6 +566,14 @@ fn verified_fingerprint(
     Ok(())
 }
 
+/// A preparation report bound to the root whose dependencies were prepared.
+pub struct PreparedInvocation {
+    pub report: PrepareReport,
+    /// The installation root is usable only with a successful report.
+    pub project: PathBuf,
+    pub root_parents: usize,
+}
+
 /// Prepare dependencies once across cooperating worker processes. An inability
 /// to coordinate or verify preparation is a Failed report, not an Err that
 /// the executor's legacy best-effort branch could turn into command execution.
@@ -569,19 +581,65 @@ pub async fn prepare(
     project_root: &Path,
     runtime: RequiredRuntime,
     log_dir: &Path,
-) -> Result<PrepareReport> {
+    expected_root: Option<&Path>,
+    preparation_boundary: Option<&Path>,
+) -> Result<PreparedInvocation> {
     if !matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
-        return install::prepare(project_root, runtime, log_dir).await;
+        return Ok(PreparedInvocation {
+            report: install::prepare(project_root, runtime, log_dir).await?,
+            project: project_root.to_owned(),
+            root_parents: 0,
+        });
     }
     let started = Instant::now();
     let result = async {
-        let mut transaction = PrepareTransaction::acquire(project_root).await?;
+        let invocation = std::fs::canonicalize(project_root)?;
+        let project = preparation_root(&invocation)?;
+        if let Some(expected) = expected_root {
+            ensure!(
+                project.as_path() == expected,
+                "workspace preparation root changed after disk admission"
+            );
+        }
+        let boundary = preparation_boundary
+            .map(std::fs::canonicalize)
+            .transpose()?;
+        if let Some(boundary) = &boundary {
+            ensure!(
+                project.starts_with(boundary),
+                "workspace preparation root is outside the admitted source boundary"
+            );
+        }
+        let root_parents = invocation.strip_prefix(&project)?.components().count();
+        ensure!(
+            root_parents <= rch_common::node_workspace_fs::MAX_ROOT_PARENTS,
+            "workspace preparation root exceeds selector depth limit"
+        );
+        let verify_root = || -> Result<()> {
+            ensure!(
+                std::fs::canonicalize(project_root)? == invocation
+                    && preparation_root(&invocation)? == project,
+                "workspace preparation ownership changed during installation"
+            );
+            if let (Some(path), Some(boundary)) = (preparation_boundary, boundary.as_ref()) {
+                ensure!(
+                    std::fs::canonicalize(path)? == *boundary,
+                    "workspace preparation source boundary changed during installation"
+                );
+            }
+            Ok(())
+        };
+        let mut transaction = PrepareTransaction::acquire(&project).await?;
+        verify_root()?;
         preflight_cache_files(&transaction.project)?;
         let inputs = DependencyInputs::capture_in_transaction(&mut transaction).await?;
         // These deterministic refusals have not started an installation.
         // Reject before RUNNING so correcting the request needs no recovery.
-        InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
+        let plan = InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
+        plan.verify_root(&transaction.project, &inputs)?;
         inputs.dependency_layout.verify_runtime(runtime)?;
+        inputs.verify_invocation(&transaction.project, &invocation)?;
+        verify_root()?;
         transaction.record(RUNNING)?;
         let mut report = install::prepare_observed_node(
             &mut transaction,
@@ -595,6 +653,7 @@ pub async fn prepare(
         match report.action {
             PrepareAction::Installed | PrepareAction::Skipped => {
                 let verified = async {
+                    verify_root()?;
                     let after = DependencyInputs::capture_in_transaction(&mut transaction).await?;
                     inputs.verify_after(&after, runtime, report.action)?;
                     ensure!(
@@ -602,7 +661,10 @@ pub async fn prepare(
                         "published dependency fingerprint differs from observed inputs"
                     );
                     preflight_cache_files(&transaction.project)?;
-                    verified_fingerprint(&transaction.project, &report, &after)
+                    verified_fingerprint(&transaction.project, &report, &after)?;
+                    after.verify_invocation(&transaction.project, &invocation)?;
+                    plan.verify_root(&transaction.project, &after)?;
+                    verify_root()
                 }
                 .await;
                 if let Err(error) = verified {
@@ -612,7 +674,11 @@ pub async fn prepare(
                         "prepared dependencies are unconfirmed"
                     );
                     report.action = PrepareAction::Failed;
-                    return Ok(report);
+                    return Ok(PreparedInvocation {
+                        report,
+                        project,
+                        root_parents,
+                    });
                 }
                 transaction.record(IDLE)?;
             }
@@ -639,12 +705,20 @@ pub async fn prepare(
             }
         }
         report.took_ms = started.elapsed().as_millis() as u64;
-        Ok::<_, anyhow::Error>(report)
+        Ok::<_, anyhow::Error>(PreparedInvocation {
+            report,
+            project,
+            root_parents,
+        })
     }
     .await;
     Ok(match result {
-        Ok(report) => report,
-        Err(error) => failure(runtime, started, &error),
+        Ok(prepared) => prepared,
+        Err(error) => PreparedInvocation {
+            report: failure(runtime, started, &error),
+            project: project_root.to_owned(),
+            root_parents: 0,
+        },
     })
 }
 
@@ -941,10 +1015,12 @@ mod tests {
             &fixture.path().join("missing"),
             RequiredRuntime::Node,
             fixture.path(),
+            None,
+            None,
         )
         .await
         .unwrap();
-        assert_eq!(report.action, PrepareAction::Failed);
-        assert!(report.fingerprint.is_none());
+        assert_eq!(report.report.action, PrepareAction::Failed);
+        assert!(report.report.fingerprint.is_none());
     }
 }

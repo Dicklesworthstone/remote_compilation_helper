@@ -437,11 +437,13 @@ pub async fn execute_with_disk_budget(
     // br-4998x: pre-execution hook for Bun/Node projects.
     let runtime = detect_runtime_from_command(command);
     let mut dependency_layout = crate::prepare::DependencyLayout::NodeModules;
+    let mut preparation_project = None;
     if disk_budget.is_none() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
         let project_root = Path::new(workdir);
         let log_dir = project_root.join(".rch_prepare_logs");
-        match crate::prepare::prepare(project_root, runtime, &log_dir).await {
-            Ok(report) => {
+        match crate::prepare::prepare(project_root, runtime, &log_dir, None, None).await {
+            Ok(prepared) => {
+                let report = prepared.report;
                 info!(
                     target: "rch::wkr::executor",
                     runtime = ?report.runtime,
@@ -481,6 +483,7 @@ pub async fn execute_with_disk_budget(
                     .into());
                 }
                 dependency_layout = report.dependency_layout;
+                preparation_project = Some(prepared.project);
             }
             Err(e) => {
                 // Fail-open: if prepare itself errored (no manifest, IO error)
@@ -505,6 +508,16 @@ pub async fn execute_with_disk_budget(
             "conditional warm budgets require dispatcher-owned admission"
         );
         let root = std::fs::canonicalize(workdir)?;
+        let prepared_root = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+            crate::prepare::preparation_root(&root).map_err(|error| {
+                eprintln_best_effort(&format!(
+                    "rch-wkr: workspace dependency preparation refused: {error:#}; the command was not run"
+                ));
+                CommandFailed { exit_code: EXIT_PREPARE_FAILED }
+            })?
+        } else {
+            root.clone()
+        };
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| root.join("target"));
@@ -523,7 +536,10 @@ pub async fn execute_with_disk_budget(
             .as_nanos();
         let marker = format!("RCH_WORKER_{}_{nonce}_DISK_BUDGET:", std::process::id());
         let receipt = run.join(format!("disk-{}-{nonce}.receipt", std::process::id()));
-        let outputs = vec![root.clone(), target.clone(), temporary.clone()];
+        // A workspace member may install hoisted dependencies in its declared
+        // root. Admit that complete output scope before the installer starts;
+        // the child binds its resolution to this same root under the monitor.
+        let outputs = vec![prepared_root.clone(), target.clone(), temporary.clone()];
         let mut probes = outputs.clone();
         // Shared Cargo/toolchain downloads may land on a separate filesystem.
         // Probe that free space without charging another project's existing
@@ -554,7 +570,7 @@ pub async fn execute_with_disk_budget(
         let plan =
             serde_json::json!({"probe": probe_paths, "output": output_paths, "receipt": receipt});
         let guarded_command = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
-            prepared::disk_guard_command(&root, runtime, command)?
+            prepared::disk_guard_command(&root, &prepared_root, runtime, command)?
         } else {
             prepared::workload_command(crate::prepare::DependencyLayout::NodeModules, command)?
         };
@@ -600,11 +616,16 @@ pub async fn execute_with_disk_budget(
         && dependency_layout == crate::prepare::DependencyLayout::NodeModules
         && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
     {
-        let local_bin = Path::new(workdir).join("node_modules").join(".bin");
-        if local_bin.is_dir() {
-            let existing = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{existing}", local_bin.display()));
-        }
+        cmd.env(
+            "PATH",
+            prepared::node_modules_path(
+                Path::new(workdir),
+                preparation_project
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(workdir)),
+                std::env::var_os("PATH").as_deref(),
+            )?,
+        );
     }
 
     let mut child = match cmd.spawn() {

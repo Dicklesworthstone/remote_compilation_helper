@@ -196,7 +196,10 @@ pub(super) fn fingerprint_hasher() -> Hasher {
     // such as NODE_ENV and npm_config_omit that were absent from their keys.
     // Invalidate their reuse authority while preserving the completed output
     // inventory as ownership evidence for one new frozen installation.
-    hasher.update(b"rch-dependency-install-v6\0");
+    // v7 also invalidates a member stamp from npm's implicit ancestor-root
+    // installation: an explicit --prefix now binds all npm writes to the
+    // transaction's selected project, including independent nested locks.
+    hasher.update(b"rch-dependency-install-v7\0");
     hasher
 }
 
@@ -311,6 +314,27 @@ pub(super) struct InstallPlan {
 }
 
 impl InstallPlan {
+    pub(super) fn verify_root(
+        self,
+        project: &Path,
+        inputs: &super::DependencyInputs,
+    ) -> Result<()> {
+        use rch_common::node_workspace_fs::{AncestorWorkspaceManager, verify_install_root};
+        let manager = match self.manager {
+            PackageManager::Bun => Some(AncestorWorkspaceManager::Bun),
+            PackageManager::Yarn if inputs.yarn.is_none() => {
+                Some(AncestorWorkspaceManager::YarnClassic)
+            }
+            // npm has an explicit --prefix; independent pnpm has
+            // --ignore-workspace; Berry stops at the selected yarn.lock.
+            _ => None,
+        };
+        if let Some(manager) = manager {
+            verify_install_root(project, manager)?;
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn is_frozen(self) -> bool {
         self.locked
@@ -691,6 +715,7 @@ async fn prepare_node_like(
     dependency_layout.verify_runtime(runtime)?;
     let fingerprint = inputs.fingerprint.clone();
     let plan = InstallPlan::for_sources(&fingerprint.sources, runtime)?;
+    plan.verify_root(project_root, inputs)?;
     let cached = read_cached_fingerprint(project_root).await;
 
     // Cache hit: skip install
@@ -728,7 +753,7 @@ async fn prepare_node_like(
     // Lockfile-free installs cannot reuse a stamp: neither the dependency
     // resolution nor the runtime-selected manager is pinned in that case.
     let pm = plan.manager;
-    let cmd = if inputs.yarn.is_some() {
+    let mut cmd = if inputs.yarn.is_some() {
         vec![
             "yarn".to_owned(),
             "install".to_owned(),
@@ -737,6 +762,27 @@ async fn prepare_node_like(
     } else {
         plan.command()
     };
+    if pm == PackageManager::Npm {
+        // npm otherwise promotes a declared member to its ancestor workspace
+        // even when this selected project has its own package-lock.json.
+        // Pin the actual install root; cwd alone does not bind npm's writes.
+        let root = project_root
+            .to_str()
+            .context("npm preparation root is not UTF-8")?;
+        cmd.splice(1..1, ["--prefix".to_owned(), root.to_owned()]);
+    }
+    if pm == PackageManager::Pnpm
+        && !inputs
+            .fingerprint
+            .sources
+            .iter()
+            .any(|name| name == "pnpm-workspace.yaml")
+    {
+        // A selected independent lock is not permission to install an ambient
+        // parent YAML workspace. --dir only changes cwd and does not prevent
+        // that ascent. Real workspace roots retain their normal workspace plan.
+        cmd.push("--ignore-workspace".to_owned());
+    }
     tokio::fs::create_dir_all(log_dir).await.ok();
     let log_path = log_dir.join(format!(
         "prepare_{}.log",
@@ -780,7 +826,7 @@ async fn prepare_node_like(
         // RCH has already decided an install is required. pnpm's separate
         // manifest-only repeat shortcut can otherwise skip root/workspace
         // lifecycle scripts after their selected source inputs changed.
-        // Keep frozen argv and script-trust policy intact. Remove the other
+        // Keep the frozen lockfile and script-trust policy intact. Remove the other
         // accepted spelling so an inherited value cannot override this one.
         installer
             .env_remove("pnpm_config_optimistic_repeat_install")

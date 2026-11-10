@@ -22,6 +22,7 @@ rch_prepare_project=.
 rch_prepare_workspace=0
 rch_prepare_layout=node_modules
 rch_prepare_tsc_arguments=0
+rch_prepare_boundary=
 # A success status alone does not describe how project tools are resolved.
 # Keep the worker's final newline and status in a bounded frame; command
 # substitution must not erase extra blank records or accept truncated output.
@@ -48,6 +49,19 @@ rch_prepare_select_layout() {
         *) return 1 ;;
     esac
 }
+if [ "${1-}" = --preparation-boundary ]; then
+    if [ "$#" -lt 3 ]; then
+        printf 'rch: incomplete preparation source boundary; the command was not run\n' >&2
+        exit 121
+    fi
+    rch_prepare_boundary=$2
+    case "$rch_prepare_boundary" in
+        /*|[a-zA-Z]:/*) ;;
+        *) printf 'rch: preparation source boundary is not absolute; the command was not run\n' >&2
+           exit 121 ;;
+    esac
+    shift 2
+fi
 if [ "${1-}" = --source-proof ]; then
     if [ "$#" -lt 4 ]; then
         printf 'rch: incomplete dependency proof binding; the command was not run\n' >&2
@@ -108,15 +122,38 @@ if [ "${1-}" = --pnp-tsc ]; then
         exit 121
     fi
 fi
-if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ]; then
+if [ "$rch_prepare_proved" = 1 ] || [ -e package.json ] || [ -L package.json ] ||
+   { [ -n "$rch_prepare_boundary" ] &&
+     { [ -e "$rch_prepare_boundary/package.json" ] || [ -L "$rch_prepare_boundary/package.json" ]; }; }; then
     if [ "$rch_prepare_proved" = 1 ]; then
         :
     else
-        rch_prepare_capture rch-wkr prepare --project . --runtime "$rch_prepare_runtime" --execution-layout
-        if ! rch_prepare_select_layout RCH_PREPARED_NODE_MODULES RCH_PREPARED_YARN_PNP; then
+        rch_prepare_install() {
+            if [ -n "$rch_prepare_boundary" ]; then
+                set -- --preparation-boundary "$rch_prepare_boundary"
+            fi
+            rch-wkr prepare --project . --runtime "$rch_prepare_runtime" --execution-layout --workspace-root "$@"
+        }
+        rch_prepare_capture rch_prepare_install
+        # Accept only one of the finite, byte-exact layout/distance frames.
+        # The worker never supplies a pathname for this shell to interpret.
+        # Keep this limit in sync with the worker's MAX_ROOT_PARENTS.
+        rch_prepare_parents=0
+        while [ "$rch_prepare_parents" -le 64 ]; do
+            if rch_prepare_select_layout "RCH_PREPARED_NODE_MODULES:$rch_prepare_parents" "RCH_PREPARED_YARN_PNP:$rch_prepare_parents"; then
+                break
+            fi
+            rch_prepare_parents=$((rch_prepare_parents + 1))
+        done
+        if [ "$rch_prepare_parents" -gt 64 ]; then
             printf 'rch: remote dependency preparation failed or returned an unknown layout; the command was not run\n' >&2
             exit 121
         fi
+        while [ "$rch_prepare_parents" -gt 0 ]; do
+            rch_prepare_project="$rch_prepare_project/.."
+            rch_prepare_workspace=1
+            rch_prepare_parents=$((rch_prepare_parents - 1))
+        done
     fi
     if [ "$rch_prepare_layout" = yarn_pnp ]; then
         if [ "$rch_prepare_runtime" != node ]; then

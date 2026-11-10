@@ -14,10 +14,10 @@ WORKER = """#!/bin/sh
 set -eu
 [ "$1" = prepare ] && [ "$2" = --project ] && [ "$3" = . ] &&
 [ "$4" = --runtime ] && [ "$5" = "$RUNTIME" ] &&
-[ "$6" = --execution-layout ] && [ "$#" = 6 ] || exit 91
+[ "$6" = --execution-layout ] && [ "$7" = --workspace-root ] && [ "$#" = 7 ] || exit 91
 printf 'prepare:%s\n' "$5" >> "$ROOT/events"
 if IFS= read -r ignored; then exit 92; fi
-printf '%s\n' "$LAYOUT_TOKEN"
+printf '%s:0\n' "$LAYOUT_TOKEN"
 exit "$PREPARE_STATUS"
 """
 
@@ -296,7 +296,7 @@ exit 23
         for shell in ("sh", "bash"):
             for proved in (False, True):
                 token = (b"RCH_PREPARED_DEPENDENCIES_VERIFIED" if proved
-                         else b"RCH_PREPARED_NODE_MODULES")
+                         else b"RCH_PREPARED_NODE_MODULES:0")
                 for malformed in [
                     b"", b"unknown\n", token, token + b"\n\n",
                     token + b"\x00\n", b"\x00" + token + b"\n",

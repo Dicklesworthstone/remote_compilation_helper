@@ -6,12 +6,52 @@
 
 use super::{CommandFailed, EXIT_PREPARE_FAILED, eprintln_best_effort, managed_command};
 use crate::prepare::DependencyLayout;
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use rch_common::types::RequiredRuntime;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use tokio::process::Command;
 
 const DISK_PREPARE_SELECTOR: &str = include_str!("prepared.sh");
+
+/// Member-local tools precede hoisted tools. Resolve both before launching a
+/// shell which may change cwd; join_paths rejects an unrepresentable separator
+/// instead of silently searching an unrelated directory.
+pub(super) fn node_modules_path(
+    invocation: &Path,
+    preparation: &Path,
+    existing: Option<&OsStr>,
+) -> Result<OsString> {
+    let invocation = invocation.canonicalize()?;
+    let preparation = preparation.canonicalize()?;
+    ensure!(
+        invocation.starts_with(&preparation),
+        "invocation is outside its prepared root"
+    );
+    let mut paths = Vec::new();
+    for (distance, root) in invocation.ancestors().enumerate() {
+        ensure!(
+            distance <= rch_common::node_workspace_fs::MAX_ROOT_PARENTS,
+            "prepared tool ancestry exceeds its bound"
+        );
+        let bin = root.join("node_modules/.bin");
+        if bin.is_dir() {
+            let absolute = bin
+                .canonicalize()
+                .context("resolve prepared tool directory")?;
+            if !paths.contains(&absolute) {
+                paths.push(absolute);
+            }
+        }
+        if root == preparation {
+            break;
+        }
+    }
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(existing));
+    }
+    std::env::join_paths(paths).context("prepared tool directory contains a PATH separator")
+}
 
 fn yarn_arguments(command: &str) -> Option<Vec<String>> {
     let compiler = rch_common::patterns::tsc_invocation(command)?;
@@ -48,6 +88,7 @@ pub(super) fn workload_command(layout: DependencyLayout, command: &str) -> Resul
 
 pub(super) fn disk_guard_command(
     project: &Path,
+    preparation: &Path,
     runtime: RequiredRuntime,
     command: &str,
 ) -> Result<Command> {
@@ -61,6 +102,7 @@ pub(super) fn disk_guard_command(
         .args(["-c", DISK_PREPARE_SELECTOR, "rch-worker-prepare"])
         .arg(std::env::current_exe()?)
         .arg(project)
+        .arg(preparation)
         .arg(runtime)
         .arg(command);
     if let Some(arguments) = yarn_arguments(command) {
@@ -156,7 +198,7 @@ mod tests {
         for (path, source) in [
             (
                 worker.clone(),
-                "#!/bin/sh\nprintf '%s\\n' RCH_PREPARED_YARN_PNP\n",
+                "#!/bin/sh\nprintf '%s\\n' RCH_PREPARED_YARN_PNP:0\n",
             ),
             (
                 bin.join("yarn"),
@@ -177,6 +219,7 @@ mod tests {
         let mut child = std::process::Command::new("sh")
             .args(["-c", DISK_PREPARE_SELECTOR, "rch-worker-prepare"])
             .arg(&worker)
+            .arg(&project)
             .arg(&project)
             .arg("node")
             .arg(original)

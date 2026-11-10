@@ -167,6 +167,20 @@ enum Commands {
         /// goes to stderr. Used by the owned dependency execution wrapper.
         #[arg(long)]
         execution_layout: bool,
+
+        /// Include the prepared workspace root's bounded parent distance in
+        /// the execution selector, while preserving the invocation directory.
+        #[arg(long, requires = "execution_layout")]
+        workspace_root: bool,
+
+        /// Refuse if resolution differs from the root admitted by the disk
+        /// monitor. This path must be absolute and already canonical.
+        #[arg(long)]
+        expected_preparation_root: Option<String>,
+
+        /// Limit ordinary workspace ascent to the synchronized source scope.
+        #[arg(long)]
+        preparation_boundary: Option<String>,
     },
 
     /// Inspect, install or verify exact dependency ownership for a source proof.
@@ -422,13 +436,26 @@ async fn run_worker(cli: Cli) -> Result<()> {
             runtime,
             log_dir,
             execution_layout,
+            workspace_root,
+            expected_preparation_root,
+            preparation_boundary,
         } => {
             use std::path::PathBuf;
             let project_path = PathBuf::from(&project);
             let log_dir_path = log_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(|| project_path.join(".rch_prepare_logs"));
-            let report = prepare::prepare(&project_path, runtime.into(), &log_dir_path).await?;
+            let prepared = prepare::prepare(
+                &project_path,
+                runtime.into(),
+                &log_dir_path,
+                expected_preparation_root
+                    .as_deref()
+                    .map(std::path::Path::new),
+                preparation_boundary.as_deref().map(std::path::Path::new),
+            )
+            .await?;
+            let report = prepared.report;
             let serialized = serde_json::to_string(&report)?;
             if execution_layout {
                 eprintln!("{serialized}");
@@ -445,15 +472,15 @@ async fn run_worker(cli: Cli) -> Result<()> {
             match report.action {
                 prepare::PrepareAction::Skipped | prepare::PrepareAction::Installed => {
                     if execution_layout {
-                        println!(
-                            "{}",
-                            match report.dependency_layout {
-                                prepare::DependencyLayout::NodeModules => {
-                                    "RCH_PREPARED_NODE_MODULES"
-                                }
-                                prepare::DependencyLayout::YarnPnp => "RCH_PREPARED_YARN_PNP",
-                            }
-                        );
+                        let marker = match report.dependency_layout {
+                            prepare::DependencyLayout::NodeModules => "RCH_PREPARED_NODE_MODULES",
+                            prepare::DependencyLayout::YarnPnp => "RCH_PREPARED_YARN_PNP",
+                        };
+                        if workspace_root {
+                            println!("{marker}:{}", prepared.root_parents);
+                        } else {
+                            println!("{marker}");
+                        }
                     }
                     Ok(())
                 }

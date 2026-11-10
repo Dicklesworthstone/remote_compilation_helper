@@ -30,12 +30,27 @@ NPM = r'''#!/bin/sh
 set -eu
 manager=${0##*/}
 if [ "${1-}" = test ]; then
+    if [ "${RCH_PREPARE_TEST_EXEC_TSC-}" = 1 ]; then
+        exec tsc --noEmit
+    fi
     if [ "${RCH_PREPARE_TEST_CARGO_LIFECYCLE-}" = 1 ]; then
         [ -f "$RCH_PREPARE_TEST_STATE/finished" ] || exit 95
         printf 'job\n' >> "$RCH_PREPARE_TEST_STATE/events"
     fi
     printf ran > "$RCH_PREPARE_TEST_STATE/user-command"
     exit 0
+fi
+# The worker pins npm's actual install root; validate that binding before
+# recording the frozen/bootstrap plan shared by these transaction scenarios.
+if [ "$manager" = npm ]; then
+    [ "$#" -ge 3 ] && [ "$1" = --prefix ] && [ "$2" = "$PWD" ] || exit 97
+    printf '%s' "$2" > "$RCH_PREPARE_TEST_STATE/npm-preparation-root"
+    shift 2
+fi
+if [ "$manager" = pnpm ] && [ ! -e pnpm-workspace.yaml ]; then
+    [ "$#" = 3 ] && [ "$3" = --ignore-workspace ] || exit 98
+    printf '%s' "$PWD" > "$RCH_PREPARE_TEST_STATE/pnpm-preparation-root"
+    set -- "$1" "$2"
 fi
 printf '%s\n' "$manager" "$#" "$@" >> "$RCH_PREPARE_TEST_STATE/argv"
 printf '%s\n' "${PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL-unset}" \
@@ -144,7 +159,7 @@ class PrepareTransactions(unittest.TestCase):
         self.children = []
         self.states = []
         # Never fall through to a machine's real manager, registry or user config.
-        for name in ("sh", "mkdir", "sleep"):
+        for name in ("sh", "mkdir", "sleep", "head", "od"):
             executable = shutil.which(name)
             self.assertIsNotNone(executable, name)
             (self.bin / name).symlink_to(executable)
@@ -186,10 +201,12 @@ class PrepareTransactions(unittest.TestCase):
 
     def start(self, project, state, mode="immediate", execute=False,
               runtime="node", manager="npm", plan="ci", new_lock="",
-              guarded=True, command=None, extra_env=None):
+              guarded=True, command=None, extra_env=None, prepare_options=()):
         user_command = command if command is not None else ("bun test" if runtime == "bun" else "tsc --noEmit")
         args = (["execute", "--workdir", str(project), "--command", user_command]
                 if execute else ["prepare", "--project", str(project), "--runtime", runtime])
+        if not execute:
+            args.extend(prepare_options)
         if execute and guarded:
             # Fixture installers produce KiB, so test their actual transaction
             # outcomes with an explicit small budget independent of host GiB.
@@ -641,8 +658,8 @@ class PrepareTransactions(unittest.TestCase):
         extra.write_text("different package manager\n")
         self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
         self.assertEqual(self.invocations(state), [])
-        journal, = self.journals()
-        self.assertEqual(journal.read_bytes(), b"", "no installer acquired a RUNNING transaction")
+        self.assertTrue(all(path.read_bytes() == b"" for path in self.journals()),
+                        "no installer acquired a RUNNING transaction")
         extra.rename(project / "bun.lock.retained")
         self.assertEqual(self.report(self.start(project, state), 0)["action"], "Installed")
         self.assertEqual(self.invocations(state), ["npm", "1", "ci"])

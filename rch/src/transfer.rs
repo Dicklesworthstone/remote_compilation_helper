@@ -2400,7 +2400,7 @@ fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> 
             .unwrap_or(false)
 }
 
-fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
+pub(crate) fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
     if !has_rsync_glob_meta(name) {
         return Cow::Borrowed(name);
     }
@@ -6593,7 +6593,16 @@ mkdir -p {} && rm -f {} && {launch}",
                     proof.request_digest, proof.attestation_digest
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // Ordinary preparation may find an ambient parent workspace.
+                // Its install must remain inside the source scope already
+                // synchronized, owned and covered by the disk monitor.
+                let boundary = self
+                    .disk_source_root
+                    .clone()
+                    .unwrap_or_else(|| self.remote_path());
+                format!(" --preparation-boundary {}", escape(Cow::Owned(boundary)))
+            });
         format!("sh -c {script} rch-prepare {runtime}{proof}{pnp_tsc} sh -c {command}")
     }
 
