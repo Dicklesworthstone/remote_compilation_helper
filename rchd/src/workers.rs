@@ -11,6 +11,7 @@ use crate::disk_pressure::{
 use crate::health::probe_worker_capabilities_until;
 use rch_common::bypass_record::AdminDisableStore;
 use rch_common::timing::scale_duration;
+use rch_common::types::CircuitSelectionPermit;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, RequiredRuntime, WorkerCapabilities,
     WorkerConfig, WorkerId, WorkerStatus,
@@ -1834,10 +1835,27 @@ impl WorkerState {
         endpoint: &WorkerEndpointSnapshot,
         requirements: &ExecutionRequirements<'_>,
     ) -> Option<WorkerSlotAdmission> {
+        self.reserve_slots_for_selection(count, endpoint, requirements, None)
+            .await
+    }
+
+    /// Revalidate the selection's circuit permit with endpoint and capacity
+    /// evidence before accounting. Without a permit only a closed circuit may
+    /// admit work. The caller commits the permit once durable ownership exists.
+    pub(crate) async fn reserve_slots_for_selection(
+        &self,
+        count: u32,
+        endpoint: &WorkerEndpointSnapshot,
+        requirements: &ExecutionRequirements<'_>,
+        permit: Option<&CircuitSelectionPermit>,
+    ) -> Option<WorkerSlotAdmission> {
         if count == 0 {
             return None;
         }
         let config = self.config.read().await;
+        // Recovery publishes circuit before lifecycle. Retain the circuit
+        // guard through accounting without reversing that lock order.
+        let circuit = self.circuit.read().await;
         // Match publish_capabilities' capability-before-pressure order and
         // retain this guard through the CAS. Every execution requirement must
         // still hold when a refresh publishes after selection. The optional
@@ -1861,6 +1879,9 @@ impl WorkerState {
             && endpoint.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
             && same_endpoint(&config, &endpoint.config);
         if !endpoint_current
+            || !permit.map_or(circuit.state() == CircuitState::Closed, |permit| {
+                circuit.allows_selection(permit)
+            })
             || !lifecycle.is_schedulable()
             || pressure.state == PressureState::Critical
             || !requirements.capabilities_satisfied(&capabilities)
@@ -2141,6 +2162,15 @@ impl WorkerState {
     /// Start a probe request.
     pub async fn start_probe(&self, config: &CircuitBreakerConfig) -> bool {
         self.circuit.write().await.start_probe(config)
+    }
+
+    /// Claim a selection's circuit admission atomically, with cancellation
+    /// returning an unused half-open probe without another async operation.
+    pub(crate) async fn reserve_circuit_selection(
+        &self,
+        config: &CircuitBreakerConfig,
+    ) -> Option<CircuitSelectionPermit> {
+        self.circuit.write().await.reserve_selection(config)
     }
 
     /// Open the circuit.
@@ -4255,6 +4285,133 @@ mod tests {
         assert_eq!(worker.used_slots(), 3);
         assert!(worker.reserve_slots(5).await);
         assert_eq!(worker.used_slots(), 8);
+    }
+
+    #[tokio::test]
+    async fn failed_slot_reservation_returns_selection_probe_and_preserves_other_owners() {
+        let worker = WorkerState::new(recovered_worker_config("probe-capacity", 8));
+        assert!(worker.reserve_slots(7).await);
+        let endpoint = worker.endpoint_snapshot().await;
+        let request = execution_request(RequiredRuntime::None);
+        let requirements = ExecutionRequirements::new(&request);
+        let circuit = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+        worker.half_open_circuit().await;
+        let permit = worker.reserve_circuit_selection(&circuit).await.unwrap();
+        assert!(
+            worker
+                .reserve_slots_for_selection(2, &endpoint, &requirements, Some(&permit))
+                .await
+                .is_none()
+        );
+        drop(permit);
+        assert_eq!(worker.used_slots(), 7);
+        assert!(worker.can_probe(&circuit).await);
+
+        let permit = worker.reserve_circuit_selection(&circuit).await.unwrap();
+        assert!(
+            worker
+                .reserve_slots_for_selection(1, &endpoint, &requirements, Some(&permit))
+                .await
+                .is_some()
+        );
+        permit.commit();
+        assert_eq!(worker.used_slots(), 8);
+        assert!(!worker.can_probe(&circuit).await);
+        worker.record_success().await;
+        worker.release_slots(1).await;
+        assert_eq!(worker.used_slots(), 7);
+        assert!(worker.can_probe(&circuit).await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_slot_reservation_returns_selection_probe_without_spending_slots() {
+        let worker = WorkerState::new(recovered_worker_config("probe-cancel", 8));
+        assert!(worker.reserve_slots(3).await);
+        let endpoint = worker.endpoint_snapshot().await;
+        let request = execution_request(RequiredRuntime::None);
+        let requirements = ExecutionRequirements::new(&request);
+        let circuit = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+        worker.half_open_circuit().await;
+        let lifecycle = worker.lifecycle.write().await;
+        {
+            let pending = async {
+                let permit = worker.reserve_circuit_selection(&circuit).await.unwrap();
+                worker
+                    .reserve_slots_for_selection(2, &endpoint, &requirements, Some(&permit))
+                    .await
+            };
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(!worker.can_probe(&circuit).await);
+        }
+        assert!(worker.can_probe(&circuit).await);
+        assert_eq!(worker.used_slots(), 3);
+        drop(lifecycle);
+    }
+
+    #[tokio::test]
+    async fn slot_reservation_rejects_circuit_changes_after_selection() {
+        let worker = WorkerState::new(recovered_worker_config("probe-generation", 8));
+        let endpoint = worker.endpoint_snapshot().await;
+        let request = execution_request(RequiredRuntime::None);
+        let requirements = ExecutionRequirements::new(&request);
+        let circuit = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+        let closed = worker.reserve_circuit_selection(&circuit).await.unwrap();
+        worker.open_circuit().await;
+        assert!(
+            worker
+                .reserve_slots_for_selection(1, &endpoint, &requirements, Some(&closed))
+                .await
+                .is_none()
+        );
+        worker.half_open_circuit().await;
+        assert!(
+            worker
+                .reserve_slots_for_selection(1, &endpoint, &requirements, Some(&closed))
+                .await
+                .is_none()
+        );
+        let old = worker.reserve_circuit_selection(&circuit).await.unwrap();
+        worker.open_circuit().await;
+        worker.half_open_circuit().await;
+        let current = worker.reserve_circuit_selection(&circuit).await.unwrap();
+        assert!(
+            worker
+                .reserve_slots_for_selection(1, &endpoint, &requirements, Some(&old))
+                .await
+                .is_none()
+        );
+        drop(old);
+        assert_eq!(worker.used_slots(), 0);
+        assert!(!worker.can_probe(&circuit).await);
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &endpoint, &requirements)
+                .await
+                .is_none(),
+            "a caller without a permit cannot bypass the recovery probe budget"
+        );
+        assert!(
+            worker
+                .reserve_slots_for_selection(1, &endpoint, &requirements, Some(&current))
+                .await
+                .is_some()
+        );
+        current.commit();
+        assert_eq!(worker.used_slots(), 1);
     }
 
     #[tokio::test]

@@ -2962,6 +2962,9 @@ async fn handle_select_worker_mode(
                         diagnostics: selection_diagnostics,
                     });
                 };
+                let circuit_permit = result.circuit_permit.ok_or_else(|| {
+                    anyhow::anyhow!("selected worker has no circuit admission permit")
+                })?;
 
                 let selected_endpoint = worker.endpoint_snapshot().await;
                 let selected_worker_id = selected_endpoint.config.id.clone();
@@ -3002,10 +3005,11 @@ async fn handle_select_worker_mode(
                     }
                 };
                 if let Some(slot_admission) = worker
-                    .reserve_slots_for_endpoint(
+                    .reserve_slots_for_selection(
                         reserve_slots,
                         &selected_endpoint,
                         &execution_requirements,
+                        Some(&circuit_permit),
                     )
                     .await
                 {
@@ -3066,6 +3070,7 @@ async fn handle_select_worker_mode(
                     let state = match admission {
                         Ok(Some(state)) => state,
                         Ok(None) => {
+                            drop(circuit_permit);
                             worker.release_slots(reserve_slots).await;
                             if local_wrapper_id
                                 .as_deref()
@@ -3093,9 +3098,16 @@ async fn handle_select_worker_mode(
                             continue;
                         }
                         Err(error) => {
+                            // Durable publication may have reached storage.
+                            // Capacity stays fenced for restart recovery; hand
+                            // its probe to normal circuit outcome accounting.
+                            circuit_permit.commit();
                             return Err(error.into());
                         }
                     };
+                    // No await separates slot accounting, durable ownership,
+                    // and transferring the circuit probe to this operation.
+                    circuit_permit.commit();
                     let build_id = Some(state.id);
                     if !cfg!(test) {
                         metrics::inc_active_builds("remote");
@@ -9730,6 +9742,80 @@ mod tests {
             admitted.worker.as_ref().map(|w| w.id.as_str()),
             Some("held")
         );
+    }
+
+    #[tokio::test]
+    async fn half_open_api_preview_and_queue_hold_preserve_probe_until_durable_admission() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("recovering", 3)).await;
+        set_test_build_disk(&pool, "recovering", 100.0).await;
+        let worker = pool.get(&WorkerId::new("recovering")).await.unwrap();
+        let mut ctx = make_test_context(pool);
+        Arc::make_mut(&mut ctx.worker_selector)
+            .circuit_config
+            .half_open_max_probes = 1;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(100).with_persistence(path.clone()),
+        );
+        worker.half_open_circuit().await;
+        let ApiRequest::SelectWorker { request, .. } =
+            parse_request("GET /select-worker?project=probe-owner&cores=1").unwrap()
+        else {
+            panic!("selection expected");
+        };
+
+        for _ in 0..2 {
+            let preview = handle_select_worker_dry_run(&ctx, &request).await;
+            assert_eq!(preview.worker.unwrap().id.as_str(), "recovering");
+            assert!(preview.build_id.is_none());
+            assert!(worker.can_probe(&ctx.worker_selector.circuit_config).await);
+        }
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_builds().is_empty());
+
+        let (queued, _claim) = ctx
+            .history
+            .enqueue_selection_build(
+                "older-project".into(),
+                "bash job.sh".into(),
+                std::process::id(),
+                3,
+                None,
+                QueueSelectionContract {
+                    digest: [7; 32],
+                    timeout_secs: 3600,
+                },
+            )
+            .unwrap();
+        assert!(ctx.history.claim_queue_hold(
+            queued.id,
+            queued.queued_at_mono,
+            "recovering".into()
+        ));
+        let blocked = handle_select_worker(&ctx, request.clone(), false, None)
+            .await
+            .unwrap();
+        assert!(blocked.worker.is_none());
+        assert_eq!(blocked.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_builds().is_empty());
+        assert!(worker.can_probe(&ctx.worker_selector.circuit_config).await);
+
+        ctx.history.release_queue_hold(queued.id);
+        let admitted = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(admitted.worker.unwrap().id.as_str(), "recovering");
+        assert_eq!(worker.used_slots(), 1);
+        assert!(!worker.can_probe(&ctx.worker_selector.circuit_config).await);
+        let restored = BuildHistory::load_from_file(&path, 100).unwrap();
+        let active = restored.active_build(admitted.build_id.unwrap()).unwrap();
+        assert_eq!(active.worker_id, "recovering");
+        assert_eq!(active.slots, 1);
     }
 
     #[tokio::test]

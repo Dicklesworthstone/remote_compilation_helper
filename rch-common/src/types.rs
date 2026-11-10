@@ -5,6 +5,8 @@ use rand::RngExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Unique identifier for a worker in the fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -2592,6 +2594,42 @@ impl CircuitBreakerConfig {
     }
 }
 
+const PROBE_PENDING: u8 = 0;
+const PROBE_COMMITTED: u8 = 1;
+const PROBE_ABANDONED: u8 = 2;
+
+/// Circuit admission held between worker selection and durable build ownership.
+///
+/// Dropping an uncommitted permit returns its half-open probe immediately, even
+/// when the selecting future is cancelled. Committing hands that probe to the
+/// existing circuit policy: a recorded circuit outcome or transition settles it.
+#[derive(Debug)]
+pub struct CircuitSelectionPermit {
+    probe: Option<Arc<AtomicU8>>,
+}
+
+impl CircuitSelectionPermit {
+    /// Transfer the admitted operation's probe to circuit outcome accounting.
+    pub fn commit(self) {
+        if let Some(probe) = &self.probe {
+            probe.store(PROBE_COMMITTED, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for CircuitSelectionPermit {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.probe {
+            let _ = probe.compare_exchange(
+                PROBE_PENDING,
+                PROBE_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Circuit breaker statistics for tracking state transitions.
 ///
 /// Maintains a rolling window of successes and failures to determine
@@ -2614,6 +2652,10 @@ pub struct CircuitStats {
     last_state_change: u64,
     /// Current active probes in half-open state.
     active_probes: u32,
+    /// Selection probes, including cancellable reservations not yet handed to
+    /// an operation. Identity is scoped to this circuit incarnation; transitions
+    /// clear the list so an old permit cannot release or admit a new probe.
+    selection_probes: Vec<Arc<AtomicU8>>,
     /// Consecutive command-class failures (telemetry poll exhaustion, probe
     /// sessions that connected but never completed). Reset only by a
     /// command-class success or a circuit close — NOT by a liveness success,
@@ -2642,6 +2684,7 @@ impl CircuitStats {
             opened_at: None,
             last_state_change: Self::now_millis(),
             active_probes: 0,
+            selection_probes: Vec::new(),
             consecutive_command_failures: 0,
             reopen_streak: 0,
             recent_results: Vec::with_capacity(CIRCUIT_HISTORY_SIZE),
@@ -2713,9 +2756,7 @@ impl CircuitStats {
 
         if self.state == CircuitState::HalfOpen {
             self.consecutive_successes += 1;
-            if self.active_probes > 0 {
-                self.active_probes -= 1;
-            }
+            self.finish_probe();
         }
     }
 
@@ -2730,9 +2771,7 @@ impl CircuitStats {
 
         if self.state == CircuitState::HalfOpen {
             self.consecutive_successes = 0;
-            if self.active_probes > 0 {
-                self.active_probes -= 1;
-            }
+            self.finish_probe();
         }
     }
 
@@ -2804,7 +2843,63 @@ impl CircuitStats {
             return false;
         }
 
-        self.active_probes < config.half_open_max_probes
+        let reserved = self
+            .selection_probes
+            .iter()
+            .filter(|probe| probe.load(Ordering::Acquire) != PROBE_ABANDONED)
+            .count();
+        u64::from(self.active_probes).saturating_add(reserved as u64)
+            < u64::from(config.half_open_max_probes)
+    }
+
+    /// Atomically recheck the circuit and reserve a selection's probe budget.
+    pub fn reserve_selection(
+        &mut self,
+        config: &CircuitBreakerConfig,
+    ) -> Option<CircuitSelectionPermit> {
+        match self.state {
+            CircuitState::Open => None,
+            CircuitState::Closed => Some(CircuitSelectionPermit { probe: None }),
+            CircuitState::HalfOpen => {
+                self.selection_probes
+                    .retain(|probe| probe.load(Ordering::Acquire) != PROBE_ABANDONED);
+                if !self.can_probe(config) {
+                    return None;
+                }
+                let probe = Arc::new(AtomicU8::new(PROBE_PENDING));
+                self.selection_probes.push(Arc::clone(&probe));
+                Some(CircuitSelectionPermit { probe: Some(probe) })
+            }
+        }
+    }
+
+    /// Revalidate a selection at the slot-accounting boundary. A circuit that
+    /// reopened, entered a different half-open generation, or lost its permit
+    /// must not admit work from an earlier eligibility snapshot.
+    pub fn allows_selection(&self, permit: &CircuitSelectionPermit) -> bool {
+        match self.state {
+            CircuitState::Closed => true,
+            CircuitState::Open => false,
+            CircuitState::HalfOpen => permit.probe.as_ref().is_some_and(|probe| {
+                probe.load(Ordering::Acquire) == PROBE_PENDING
+                    && self
+                        .selection_probes
+                        .iter()
+                        .any(|current| Arc::ptr_eq(current, probe))
+            }),
+        }
+    }
+
+    fn finish_probe(&mut self) {
+        if self.active_probes > 0 {
+            self.active_probes -= 1;
+        } else if let Some(index) = self
+            .selection_probes
+            .iter()
+            .position(|probe| probe.load(Ordering::Acquire) == PROBE_COMMITTED)
+        {
+            self.selection_probes.swap_remove(index);
+        }
     }
 
     /// Start a probe request in half-open state.
@@ -2826,6 +2921,7 @@ impl CircuitStats {
             self.last_state_change = Self::now_millis();
             self.consecutive_successes = 0;
             self.active_probes = 0;
+            self.selection_probes.clear();
             // Every open without an intervening close lengthens the next
             // cooldown (see `CircuitBreakerConfig::cooldown_ms_for_streak`).
             self.reopen_streak = self.reopen_streak.saturating_add(1);
@@ -2839,6 +2935,7 @@ impl CircuitStats {
             self.last_state_change = Self::now_millis();
             self.consecutive_successes = 0;
             self.active_probes = 0;
+            self.selection_probes.clear();
         }
     }
 
@@ -2851,6 +2948,7 @@ impl CircuitStats {
             self.consecutive_failures = 0;
             self.consecutive_successes = 0;
             self.active_probes = 0;
+            self.selection_probes.clear();
             self.consecutive_command_failures = 0;
             self.reopen_streak = 0;
             // Reset the window on close, INCLUDING the recent-results history

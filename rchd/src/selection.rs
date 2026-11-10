@@ -29,6 +29,7 @@ use rand::RngExt;
 #[cfg(test)]
 use rch_common::WorkerCapabilities;
 use rch_common::timing::{MAX_CONTROL_TIMEOUT, scale_duration};
+use rch_common::types::CircuitSelectionPermit;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
     SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
@@ -627,6 +628,9 @@ pub struct SelectionResult {
     pub reason: SelectionReason,
     /// Optional per-worker selector diagnostics for failed selections.
     pub diagnostics: Option<SelectionDiagnostics>,
+    /// Held until the API publishes durable build ownership. An abandoned
+    /// selection releases its half-open probe; previews never hold one.
+    pub(crate) circuit_permit: Option<CircuitSelectionPermit>,
 }
 
 fn cache_use_for_request(request: &SelectionRequest) -> CacheUse {
@@ -1087,11 +1091,12 @@ impl WorkerSelector {
                 worker: None,
                 reason,
                 diagnostics: Some(diagnostics),
+                circuit_permit: None,
             };
         }
 
         // Get eligible workers
-        let eligible = match self
+        let mut eligible = match self
             .get_eligible_workers(pool, request, excluded_worker_ids)
             .await
         {
@@ -1108,6 +1113,7 @@ impl WorkerSelector {
                     worker: None,
                     reason,
                     diagnostics: Some(diagnostics),
+                    circuit_permit: None,
                 };
             }
         };
@@ -1121,30 +1127,37 @@ impl WorkerSelector {
                 && let Some(fallback_worker_id) =
                     self.try_fallback(pool, request, excluded_worker_ids).await
             {
-                // Record fallback selection in audit log
-                self.record_audit_entry(
-                    request,
-                    Vec::new(),
-                    Some(fallback_worker_id.clone()),
-                    &SelectionReason::AffinityFallback,
-                    select_start.elapsed(),
-                )
-                .await;
                 let worker_id = WorkerId::new(&fallback_worker_id);
                 if let Some(worker) = pool.get(&worker_id).await {
-                    debug!(
-                        "Using affinity fallback worker {} for project {}",
-                        fallback_worker_id, request.project
-                    );
-                    record_selection_metrics(
-                        &SelectionReason::AffinityFallback,
-                        select_start.elapsed(),
-                    );
-                    return SelectionResult {
-                        worker: Some(worker),
-                        reason: SelectionReason::AffinityFallback,
-                        diagnostics: None,
+                    let circuit_permit = if self.preview {
+                        None
+                    } else {
+                        worker.reserve_circuit_selection(&self.circuit_config).await
                     };
+                    if self.preview || circuit_permit.is_some() {
+                        self.record_audit_entry(
+                            request,
+                            Vec::new(),
+                            Some(fallback_worker_id.clone()),
+                            &SelectionReason::AffinityFallback,
+                            select_start.elapsed(),
+                        )
+                        .await;
+                        debug!(
+                            "Using affinity fallback worker {} for project {}",
+                            fallback_worker_id, request.project
+                        );
+                        record_selection_metrics(
+                            &SelectionReason::AffinityFallback,
+                            select_start.elapsed(),
+                        );
+                        return SelectionResult {
+                            worker: Some(worker),
+                            reason: SelectionReason::AffinityFallback,
+                            diagnostics: None,
+                            circuit_permit,
+                        };
+                    }
                 }
             }
 
@@ -1165,6 +1178,7 @@ impl WorkerSelector {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
                 diagnostics: Some(diagnostics),
+                circuit_permit: None,
             };
         }
 
@@ -1172,7 +1186,7 @@ impl WorkerSelector {
         let pinned_selection = self
             .try_pinned_worker(&eligible, request, excluded_worker_ids)
             .await;
-        if let Some((worker, circuit_state)) = pinned_selection {
+        if let Some((worker, _)) = pinned_selection {
             let worker_id = worker.config.read().await.id.as_str().to_string();
             debug!(
                 "Using affinity-pinned worker {} for project {}",
@@ -1183,152 +1197,166 @@ impl WorkerSelector {
                     worker: Some(worker),
                     reason: SelectionReason::AffinityPinned,
                     diagnostics: None,
+                    circuit_permit: None,
                 };
             }
 
-            // Record the selection for fairness tracking
-            let mut history = self.selection_history.write().await;
-            history.record_selection(&worker_id);
+            if let Some(circuit_permit) =
+                worker.reserve_circuit_selection(&self.circuit_config).await
+            {
+                self.selection_history
+                    .write()
+                    .await
+                    .record_selection(&worker_id);
 
-            // Record in audit log
-            let breakdowns = self
-                .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
+                let breakdowns = self
+                    .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
+                    .await;
+                self.record_audit_entry(
+                    request,
+                    breakdowns,
+                    Some(worker_id.clone()),
+                    &SelectionReason::AffinityPinned,
+                    select_start.elapsed(),
+                )
                 .await;
-            self.record_audit_entry(
-                request,
-                breakdowns,
-                Some(worker_id.clone()),
-                &SelectionReason::AffinityPinned,
-                select_start.elapsed(),
-            )
-            .await;
-            record_selection_metrics(&SelectionReason::AffinityPinned, select_start.elapsed());
+                record_selection_metrics(&SelectionReason::AffinityPinned, select_start.elapsed());
 
-            // If selecting a half-open worker, start the probe
-            if circuit_state == CircuitState::HalfOpen {
-                worker.start_probe(&self.circuit_config).await;
+                return SelectionResult {
+                    worker: Some(worker),
+                    reason: SelectionReason::AffinityPinned,
+                    diagnostics: None,
+                    circuit_permit: Some(circuit_permit),
+                };
             }
-
-            return SelectionResult {
-                worker: Some(worker),
-                reason: SelectionReason::AffinityPinned,
-                diagnostics: None,
-            };
+            // Another request spent the probe after eligibility was observed.
+            // Keep independent workers eligible instead of refusing the request.
+            eligible.retain(|(candidate, _)| !Arc::ptr_eq(candidate, &worker));
         }
 
         // Apply the configured selection strategy (with per-command priority hint).
-        let selected = match self.config.strategy {
-            SelectionStrategy::Priority => {
-                self.select_by_priority(&eligible, request, cache_use).await
-            }
-            SelectionStrategy::Fastest => {
-                if matches!(request.command_priority, CommandPriority::Low) {
-                    self.select_fair_fastest(&eligible).await
+        while !eligible.is_empty() {
+            let selected = match self.config.strategy {
+                SelectionStrategy::Priority => {
+                    self.select_by_priority(&eligible, request, cache_use).await
+                }
+                SelectionStrategy::Fastest => {
+                    if matches!(request.command_priority, CommandPriority::Low) {
+                        self.select_fair_fastest(&eligible).await
+                    } else {
+                        self.select_by_fastest(&eligible).await
+                    }
+                }
+                SelectionStrategy::Balanced => {
+                    self.select_balanced(&eligible, request, cache_use).await
+                }
+                SelectionStrategy::CacheAffinity => match request.command_priority {
+                    CommandPriority::High => self.select_by_fastest(&eligible).await,
+                    CommandPriority::Normal | CommandPriority::Low => {
+                        self.select_cache_affinity(&eligible, request, cache_use)
+                            .await
+                    }
+                },
+                SelectionStrategy::FairFastest => {
+                    if matches!(request.command_priority, CommandPriority::High) {
+                        self.select_by_fastest(&eligible).await
+                    } else {
+                        self.select_fair_fastest(&eligible).await
+                    }
+                }
+            };
+
+            if let Some((worker, circuit_state)) = selected {
+                let worker_id = worker.config.read().await.id.as_str().to_string();
+
+                if debug_routing_enabled() {
+                    let scores = self.debug_scores(&eligible, request, cache_use).await;
+                    let circuit_label = format!("{:?}", circuit_state);
+                    log_routing_decision(
+                        self.config.strategy,
+                        &worker_id,
+                        Some(circuit_label.as_str()),
+                        &scores,
+                        eligible.len(),
+                    );
+                }
+
+                // Record in audit log (bd-37hc)
+                if self.preview {
+                    return SelectionResult {
+                        worker: Some(worker),
+                        reason: SelectionReason::Success,
+                        diagnostics: None,
+                        circuit_permit: None,
+                    };
+                }
+                let Some(circuit_permit) =
+                    worker.reserve_circuit_selection(&self.circuit_config).await
+                else {
+                    eligible.retain(|(candidate, _)| !Arc::ptr_eq(candidate, &worker));
+                    continue;
+                };
+                let breakdowns = self
+                    .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
+                    .await;
+                self.record_audit_entry(
+                    request,
+                    breakdowns,
+                    Some(worker_id.clone()),
+                    &SelectionReason::Success,
+                    select_start.elapsed(),
+                )
+                .await;
+
+                if circuit_state == CircuitState::HalfOpen {
+                    debug!(
+                        "Worker {} selected (half-open probe), strategy={:?}",
+                        worker_id, self.config.strategy
+                    );
                 } else {
-                    self.select_by_fastest(&eligible).await
+                    debug!(
+                        "Worker {} selected, strategy={:?}",
+                        worker_id, self.config.strategy
+                    );
                 }
-            }
-            SelectionStrategy::Balanced => {
-                self.select_balanced(&eligible, request, cache_use).await
-            }
-            SelectionStrategy::CacheAffinity => match request.command_priority {
-                CommandPriority::High => self.select_by_fastest(&eligible).await,
-                CommandPriority::Normal | CommandPriority::Low => {
-                    self.select_cache_affinity(&eligible, request, cache_use)
-                        .await
-                }
-            },
-            SelectionStrategy::FairFastest => {
-                if matches!(request.command_priority, CommandPriority::High) {
-                    self.select_by_fastest(&eligible).await
-                } else {
-                    self.select_fair_fastest(&eligible).await
-                }
-            }
-        };
 
-        if let Some((worker, circuit_state)) = selected {
-            let worker_id = worker.config.read().await.id.as_str().to_string();
+                // Record the selection for fairness tracking
+                let mut history = self.selection_history.write().await;
+                history.record_selection(&worker_id);
+                record_selection_metrics(&SelectionReason::Success, select_start.elapsed());
 
-            if debug_routing_enabled() {
-                let scores = self.debug_scores(&eligible, request, cache_use).await;
-                let circuit_label = format!("{:?}", circuit_state);
-                log_routing_decision(
-                    self.config.strategy,
-                    &worker_id,
-                    Some(circuit_label.as_str()),
-                    &scores,
-                    eligible.len(),
-                );
-            }
-
-            // Record in audit log (bd-37hc)
-            if self.preview {
                 return SelectionResult {
                     worker: Some(worker),
                     reason: SelectionReason::Success,
                     diagnostics: None,
+                    circuit_permit: Some(circuit_permit),
                 };
-            }
-            let breakdowns = self
-                .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
-                .await;
-            self.record_audit_entry(
-                request,
-                breakdowns,
-                Some(worker_id.clone()),
-                &SelectionReason::Success,
-                select_start.elapsed(),
-            )
-            .await;
-
-            // If selecting a half-open worker, start the probe
-            if circuit_state == CircuitState::HalfOpen {
-                worker.start_probe(&self.circuit_config).await;
-                debug!(
-                    "Worker {} selected (half-open probe), strategy={:?}",
-                    worker_id, self.config.strategy
-                );
             } else {
-                debug!(
-                    "Worker {} selected, strategy={:?}",
-                    worker_id, self.config.strategy
-                );
+                break;
             }
-
-            // Record the selection for fairness tracking
-            let mut history = self.selection_history.write().await;
-            history.record_selection(&worker_id);
-            record_selection_metrics(&SelectionReason::Success, select_start.elapsed());
-
-            SelectionResult {
-                worker: Some(worker),
-                reason: SelectionReason::Success,
-                diagnostics: None,
-            }
-        } else {
-            let diagnostics = self
-                .build_selection_diagnostics(pool, request, excluded_worker_ids)
-                .await;
-            // Record failed selection in audit log (bd-37hc)
-            let breakdowns = self
-                .build_score_breakdowns(&eligible, request, cache_use, None)
-                .await;
-            self.record_audit_entry(
-                request,
-                breakdowns,
-                None,
-                &SelectionReason::AllWorkersBusy,
-                select_start.elapsed(),
-            )
+        }
+        let diagnostics = self
+            .build_selection_diagnostics(pool, request, excluded_worker_ids)
             .await;
-            record_selection_metrics(&SelectionReason::AllWorkersBusy, select_start.elapsed());
+        // Record failed selection in audit log (bd-37hc)
+        let breakdowns = self
+            .build_score_breakdowns(&eligible, request, cache_use, None)
+            .await;
+        self.record_audit_entry(
+            request,
+            breakdowns,
+            None,
+            &SelectionReason::AllWorkersBusy,
+            select_start.elapsed(),
+        )
+        .await;
+        record_selection_metrics(&SelectionReason::AllWorkersBusy, select_start.elapsed());
 
-            SelectionResult {
-                worker: None,
-                reason: SelectionReason::AllWorkersBusy,
-                diagnostics: Some(diagnostics),
-            }
+        SelectionResult {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            diagnostics: Some(diagnostics),
+            circuit_permit: None,
         }
     }
 
@@ -1592,11 +1620,13 @@ impl WorkerSelector {
             return None;
         }
 
-        // Check circuit state (don't use if open)
-        if let Some(circuit_state) = worker.circuit_state().await
-            && circuit_state == CircuitState::Open
-        {
-            return None;
+        // Last-success affinity cannot bypass the half-open probe budget.
+        match worker.circuit_state().await {
+            Some(CircuitState::Open) => return None,
+            Some(CircuitState::HalfOpen) if !worker.can_probe(&self.circuit_config).await => {
+                return None;
+            }
+            _ => {}
         }
 
         let success_rate = self.health_score(&worker).await;
@@ -3819,9 +3849,13 @@ pub async fn select_worker(
     weights: &SelectionWeights,
 ) -> Option<Arc<WorkerState>> {
     let config = CircuitBreakerConfig::default();
-    select_worker_with_config(pool, request, weights, &config)
-        .await
-        .worker
+    let result = select_worker_with_config(pool, request, weights, &config).await;
+    // This legacy API has no reservation handoff: returning the worker starts
+    // its operation. Modern callers retain the permit through durable admission.
+    if let Some(permit) = result.circuit_permit {
+        permit.commit();
+    }
+    result.worker
 }
 
 /// The host OS a request's command demands of a worker, if any.
@@ -3876,6 +3910,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::NoWorkersConfigured,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -3905,6 +3940,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::AllCircuitsOpen,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -3913,6 +3949,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::AllWorkersUnreachable,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -3920,6 +3957,7 @@ pub async fn select_worker_with_config(
             worker: None,
             reason: SelectionReason::AllWorkersUnreachable,
             diagnostics: None,
+            circuit_permit: None,
         };
     }
 
@@ -4048,6 +4086,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::NoMatchingWorkers,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4060,6 +4099,7 @@ pub async fn select_worker_with_config(
                     request.required_runtime
                 )),
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4068,6 +4108,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::AllCircuitsOpen,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4078,6 +4119,7 @@ pub async fn select_worker_with_config(
                     "insufficient_total_slots={filtered_by_capacity}"
                 )),
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4088,6 +4130,7 @@ pub async fn select_worker_with_config(
                     "missing_toolchain_component={filtered_by_component}"
                 )),
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4096,6 +4139,7 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
                 diagnostics: None,
+                circuit_permit: None,
             };
         }
 
@@ -4103,6 +4147,7 @@ pub async fn select_worker_with_config(
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
             diagnostics: None,
+            circuit_permit: None,
         };
     }
 
@@ -4130,37 +4175,34 @@ pub async fn select_worker_with_config(
     // Select worker with highest score
     scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
 
-    // Defensive check: scored should never be empty since candidates was non-empty
-    // and every candidate was pushed to scored. But handle gracefully just in case.
-    let Some((selected_worker, circuit_state, score)) = scored.into_iter().next() else {
-        warn!("Bug: scored list empty despite non-empty candidates - this should not happen");
-        return SelectionResult {
-            worker: None,
-            reason: SelectionReason::AllWorkersBusy,
-            diagnostics: None,
+    // Eligibility is a snapshot. Reserve the probe atomically and keep trying
+    // independent candidates when another request claimed the preferred one.
+    for (selected_worker, circuit_state, score) in scored {
+        let Some(circuit_permit) = selected_worker
+            .reserve_circuit_selection(circuit_config)
+            .await
+        else {
+            continue;
         };
-    };
-
-    // If selecting a half-open worker, start the probe
-    if circuit_state == CircuitState::HalfOpen {
-        selected_worker.start_probe(circuit_config).await;
         debug!(
-            "Worker {} selected (half-open probe started), score={:.3}",
+            "Worker {} selected, circuit={:?}, score={:.3}",
             selected_worker.config.read().await.id,
+            circuit_state,
             score
         );
-    } else {
-        debug!(
-            "Worker {} selected, score={:.3}",
-            selected_worker.config.read().await.id,
-            score
-        );
+        return SelectionResult {
+            worker: Some(selected_worker),
+            reason: SelectionReason::Success,
+            diagnostics: None,
+            circuit_permit: Some(circuit_permit),
+        };
     }
 
     SelectionResult {
-        worker: Some(selected_worker),
-        reason: SelectionReason::Success,
+        worker: None,
+        reason: SelectionReason::AllWorkersBusy,
         diagnostics: None,
+        circuit_permit: None,
     }
 }
 
@@ -5491,6 +5533,194 @@ mod tests {
             worker.can_probe(&circuit).await,
             "a pinned preview consumed the probe slot"
         );
+    }
+
+    async fn probe_selection_fixture(
+        pinned: bool,
+        alternative: bool,
+    ) -> (
+        WorkerPool,
+        WorkerSelector,
+        Arc<WorkerState>,
+        SelectionRequest,
+    ) {
+        let pool = WorkerPool::new();
+        let mut config = make_worker("recovering", 8, 90.0)
+            .config
+            .read()
+            .await
+            .clone();
+        config.priority = 200;
+        pool.add_worker(config).await;
+        if alternative {
+            let mut config = make_worker("alternative", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone();
+            config.priority = 100;
+            pool.add_worker(config).await;
+        }
+        let worker = pool.get(&WorkerId::new("recovering")).await.unwrap();
+        worker.open_circuit().await;
+        worker.half_open_circuit().await;
+        let mut config = SelectionConfig {
+            strategy: SelectionStrategy::Priority,
+            ..Default::default()
+        };
+        config.affinity.enabled = pinned;
+        config.affinity.enable_last_success_fallback = true;
+        config.affinity.pin_minutes = 60;
+        let selector = WorkerSelector::with_config(
+            config,
+            CircuitBreakerConfig {
+                half_open_max_probes: 1,
+                ..Default::default()
+            },
+        );
+        selector.record_success("recovering", "probe-race").await;
+        let request = SelectionRequest {
+            source_topology: None,
+            disk_observation_version: 0,
+            job_mode: false,
+            project: "probe-race".into(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        (pool, selector, worker, request)
+    }
+
+    #[tokio::test]
+    async fn concurrent_selection_claims_one_probe_and_keeps_independent_workers() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        for pinned in [false, true] {
+            for alternative in [false, true] {
+                let (pool, selector, worker, request) =
+                    probe_selection_fixture(pinned, alternative).await;
+                // Both calls finish eligibility before either can choose and
+                // claim a worker. This deterministically exercises the stale
+                // can_probe snapshot, without sleeps or scheduling assumptions.
+                let cache = selector.cache_tracker.write().await;
+                let first = selector.select(&pool, &request);
+                let second = selector.select(&pool, &request);
+                tokio::pin!(first, second);
+                tokio::task::unconstrained(poll_fn(|cx| {
+                    assert!(first.as_mut().poll(cx).is_pending());
+                    assert!(second.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                }))
+                .await;
+                assert!(worker.can_probe(&selector.circuit_config).await);
+                drop(cache);
+                let first = first.await;
+                let second = second.await;
+                assert_eq!(
+                    first
+                        .worker
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .read()
+                        .await
+                        .id
+                        .as_str(),
+                    "recovering"
+                );
+                assert_eq!(
+                    first.reason,
+                    if pinned {
+                        SelectionReason::AffinityPinned
+                    } else {
+                        SelectionReason::Success
+                    }
+                );
+                if alternative {
+                    assert_eq!(
+                        second
+                            .worker
+                            .as_ref()
+                            .unwrap()
+                            .config
+                            .read()
+                            .await
+                            .id
+                            .as_str(),
+                        "alternative"
+                    );
+                } else {
+                    assert!(second.worker.is_none());
+                    assert_eq!(second.reason, SelectionReason::AllWorkersBusy);
+                }
+                assert!(!worker.can_probe(&selector.circuit_config).await);
+                drop(first);
+                drop(second);
+                assert!(worker.can_probe(&selector.circuit_config).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_selection_returns_probe_without_async_cleanup() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let (pool, selector, worker, request) = probe_selection_fixture(false, false).await;
+        let audit = selector.audit_log.write().await;
+        {
+            let selecting = selector.select(&pool, &request);
+            tokio::pin!(selecting);
+            tokio::task::unconstrained(poll_fn(|cx| {
+                assert!(selecting.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            }))
+            .await;
+            assert!(!worker.can_probe(&selector.circuit_config).await);
+        }
+        // Still hold the audit lock: cleanup must not depend on a spawned task
+        // making progress or on another lock acquisition.
+        assert!(worker.can_probe(&selector.circuit_config).await);
+        assert_eq!(worker.used_slots(), 0);
+        drop(audit);
+        assert!(selector.select(&pool, &request).await.worker.is_some());
+    }
+
+    #[tokio::test]
+    async fn affinity_fallback_respects_half_open_probe_budget() {
+        let (pool, selector, worker, request) = probe_selection_fixture(false, false).await;
+        let excluded = HashSet::new();
+        assert!(worker.start_probe(&selector.circuit_config).await);
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &excluded)
+                .await
+                .is_none()
+        );
+        assert!(
+            selector
+                .preview_round()
+                .try_fallback(&pool, &request, &excluded)
+                .await
+                .is_none()
+        );
+        worker.record_success().await;
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &excluded)
+                .await
+                .as_deref(),
+            Some("recovering")
+        );
+        assert!(worker.can_probe(&selector.circuit_config).await);
     }
 
     #[tokio::test]
