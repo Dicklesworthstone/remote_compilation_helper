@@ -88,6 +88,36 @@ class SourceRegistryHealthTests(unittest.TestCase):
             self.assertTrue(path.is_dir())
             self.assertEqual(path.stat().st_mode & 0o777, 0o700)
 
+    def test_missing_temp_root_is_created_like_mkdir_p(self) -> None:
+        # Git for Windows has no /var/tmp: the authority's parent may not exist.
+        temp_root = self.root / "missing" / "var-tmp"
+        registry = temp_root / "rch-source-authority-locks" / "claims-v1"
+        self.assert_healthy(self.run_probe(registry=registry))
+        self.assertEqual(temp_root.stat().st_mode & 0o7777, 0o1777)
+        self.assertEqual((self.root / "missing").stat().st_mode & 0o777, 0o755)
+        for path in (registry.parent, registry, registry / "released"):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        self.assert_healthy(self.run_probe(registry=registry))
+
+    def test_existing_temp_root_permissions_are_not_repaired(self) -> None:
+        temp_root = self.root / "private-tmp"
+        temp_root.mkdir(mode=0o700)
+        self.assert_healthy(
+            self.run_probe(registry=temp_root / "authority" / "claims-v1"))
+        self.assertEqual(temp_root.stat().st_mode & 0o7777, 0o700)
+
+    def test_dangling_temp_root_symlink_is_not_created_through(self) -> None:
+        temp_root = self.root / "var-tmp"
+        temp_root.symlink_to(self.root / "absent", target_is_directory=True)
+        self.assert_refused(
+            self.run_probe(registry=temp_root / "authority" / "claims-v1"), b"mkdir")
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_temp_root_creation_failure_is_not_a_healthy_echo(self) -> None:
+        registry = self.root / "missing" / "authority" / "claims-v1"
+        self.assert_refused(self.run_probe("mkdir() { return 1; }", registry=registry),
+                            b"missing: mkdir")
+
     def test_existing_records_and_inodes_are_untouched(self) -> None:
         records = self.seed_registry()
         self.assert_healthy(self.run_probe())
@@ -255,12 +285,17 @@ class SourceRegistryHealthTests(unittest.TestCase):
         self.registry.parent.mkdir(mode=0o500)
         self.assert_refused(self.run_probe(user=65534), b"mkdir")
 
-    def test_low_headroom_reports_degraded_with_free_bytes_and_inodes(self) -> None:
+    def test_low_headroom_reports_exact_pressure_protocol(self) -> None:
+        # ae3b71e0 replaced the DEGRADED warning with the PRESSURE protocol
+        # that rchd's registry_health::pressure_evidence parses: exit 75,
+        # no sentinel, exactly one `<marker> <registry>: <reason>` line.
         result = self.run_probe("RCH_REGISTRY_MIN_FREE_KB=999999999999")
         self.assertEqual(result.returncode, 75, result.stderr)
-        self.assertIn(b"RCH_SOURCE_REGISTRY_DEGRADED", result.stderr)
-        self.assertIn(b"free_bytes=", result.stderr)
-        self.assertIn(b"free_inodes=", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr,
+            b"RCH_SOURCE_REGISTRY_PRESSURE " + bytes(self.registry)
+            + b": insufficient-headroom\n")
         self.assertFalse(list(self.root.rglob(".health-probe.*")))
 
 

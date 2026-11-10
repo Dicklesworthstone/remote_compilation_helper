@@ -885,6 +885,26 @@ class RecoveryReserveTests(unittest.TestCase):
                 finally:
                     reserve.close()
 
+    def test_missing_temp_root_is_created_but_an_existing_one_is_not_repaired(self):
+        # Git for Windows ships no /var/tmp: the authority's parent may not exist.
+        temp_root = self.root / "missing" / "var-tmp"
+        registry = temp_root / "authority" / "claims"
+        reserve = PRODUCTION.Reserve(str(registry), create=True, capacity=CAPACITY,
+                                     headroom=HEADROOM)
+        self.reserves.append(reserve)
+        self.assertEqual(temp_root.stat().st_mode & 0o7777, 0o1777)
+        self.assertTrue((registry / PRODUCTION.PRIVATE / "scratch").is_dir())
+        with self.assertRaises(FileNotFoundError):
+            PRODUCTION.Reserve(str(self.root / "absent" / "authority" / "claims"),
+                               capacity=CAPACITY, headroom=HEADROOM)
+        self.assertFalse((self.root / "absent").exists())
+        private_root = self.root / "private-tmp"
+        private_root.mkdir(mode=0o700)
+        existing = PRODUCTION.Reserve(str(private_root / "authority" / "claims"), create=True,
+                                      capacity=CAPACITY, headroom=HEADROOM)
+        self.reserves.append(existing)
+        self.assertEqual(private_root.stat().st_mode & 0o7777, 0o700)
+
     def test_private_directory_identity_and_noncanonical_registry_are_refused(self):
         reserve = self.reserve()
         scratch = Path(reserve.scratch)

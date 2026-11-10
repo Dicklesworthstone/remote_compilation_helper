@@ -13,6 +13,18 @@ rch_source_registry_health() (
         exit 74
     }
 
+    # Git for Windows ships no /var/tmp, so a plain mkdir of the authority
+    # failed every probe on such a worker until a human created the temp root.
+    # Create only a MISSING shared temp root above the authority (mkdir -p).
+    # An existing ancestor, or a dangling symlink in its place, is never
+    # repaired or followed; the managed directories below keep their checks.
+    ancestor=${authority%/*}
+    if [ -n "$ancestor" ] && [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; then
+        (umask 022 && mkdir -p -m 1777 -- "$ancestor") 2>/dev/null || {
+            [ -d "$ancestor" ] || refuse_registry_health "$ancestor" mkdir
+        }
+    fi
+
     # Do not follow an authority/record-directory symlink, repair its permissions,
     # or silently choose another filesystem. /tmp itself may be a platform alias.
     # Concurrent first probes/builds may create the same directory; revalidate it

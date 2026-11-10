@@ -64,6 +64,16 @@ class Reserve:
         ancestor, authority_name = os.path.split(authority)
         if not ancestor or not authority_name or not registry_name:
             raise Unsafe("shallow registry")
+        if create and not os.path.lexists(ancestor):
+            # A worker can lack the shared temp root itself (Git for Windows
+            # ships no /var/tmp). Create only that MISSING root, like
+            # `mkdir -p`; an existing ancestor or symlink is never repaired.
+            try:
+                os.makedirs(ancestor, 0o755)
+            except FileExistsError:
+                pass
+            else:
+                os.chmod(ancestor, 0o1777)
         # /tmp and /var can be platform aliases. Only ancestors above the
         # worker-owned authority are resolved; managed leaves never follow links.
         self.original_ancestor = ancestor
