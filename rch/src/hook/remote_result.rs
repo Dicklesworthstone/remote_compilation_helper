@@ -346,22 +346,23 @@ pub(super) const fn is_cpu_capability_signal(signal: i32) -> bool {
 /// Sniff cargo's diagnostic line instead. Both markers must appear on the
 /// SAME line so incidental strings in test output cannot spoof a quarantine,
 /// and a zero exit never classifies.
+///
+/// Only SIGILL is a CPU-capability fault, exactly as for the exit-code arm
+/// ([`is_cpu_capability_signal`]). SIGBUS means a bad memory access: almost
+/// always a truncated mmap, a full tmpfs or an I/O error, sometimes a bug in
+/// the project under test. Counting it here quarantined ts1 (which has AVX2)
+/// on 2026-11-08, when a frankensqlite `fsqlite-vfs` lib test died with
+/// SIGBUS and the hook recorded a fixed "build-script SIGILL" reason.
 pub(super) fn wrapped_cpu_capability_signal(exit_code: i32, output: &str) -> Option<i32> {
     if exit_code == 0 {
         return None;
     }
-    for line in output.lines() {
-        if !line.contains("didn't exit successfully") {
-            continue;
-        }
-        if line.contains("(signal: 4, SIGILL") {
-            return Some(4);
-        }
-        if line.contains("(signal: 7, SIGBUS") {
-            return Some(7);
-        }
-    }
-    None
+    output
+        .lines()
+        .any(|line| {
+            line.contains("didn't exit successfully") && line.contains("(signal: 4, SIGILL")
+        })
+        .then_some(4)
 }
 
 /// Whether a completed non-zero remote result blames the WORKER rather than
@@ -471,10 +472,27 @@ mod wrapped_signal_tests {
         );
     }
 
+    /// The 2026-11-08 ts1 incident: a lib test died with SIGBUS on a worker
+    /// with AVX2. That is not a CPU-capability fault and must not quarantine.
     #[test]
-    fn detects_cargo_wrapped_sigbus() {
-        let line = "process didn't exit successfully: `rustc …` (signal: 7, SIGBUS: access to undefined memory)";
-        assert_eq!(wrapped_cpu_capability_signal(101, line), Some(7));
+    fn cargo_wrapped_sigbus_is_not_a_cpu_capability_fault() {
+        let test_binary = "process didn't exit successfully: `/data/projects/frankensqlite/.rch-target-ts1-pool-1f2e/debug/deps/fsqlite_vfs-0c1d2e3f4a5b6c7d` (signal: 7, SIGBUS: access to undefined memory)";
+        assert_eq!(wrapped_cpu_capability_signal(101, test_binary), None);
+        let build_script = "  process didn't exit successfully: `/data/projects/p/target/debug/build/p-1a2b/build-script-build` (signal: 7, SIGBUS: access to undefined memory)";
+        assert_eq!(wrapped_cpu_capability_signal(101, build_script), None);
+        assert!(
+            !super::remote_failure_is_worker_fault(test_binary, 101),
+            "SIGBUS alone is not a CPU-capability worker fault"
+        );
+    }
+
+    #[test]
+    fn sigill_still_classifies_when_a_sigbus_line_precedes_it() {
+        let output = format!(
+            "process didn't exit successfully: `t` (signal: 7, SIGBUS: access to undefined memory)\n{CARGO_SIGILL_LINE}"
+        );
+        assert_eq!(wrapped_cpu_capability_signal(101, &output), Some(4));
+        assert!(super::remote_failure_is_worker_fault(&output, 101));
     }
 
     #[test]
