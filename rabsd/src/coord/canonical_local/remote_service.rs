@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wire::{
-    Chunk, Manifest, Message, Output, ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint,
-    digest, invalid, require,
+    ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, Chunk, Manifest, Message, Output,
+    ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint, digest, invalid, require,
 };
 
 const SERVICE_VERSION: &str = "canonical-compile-remote-service-v1";
@@ -778,7 +778,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             stderr_bytes: stderr_offset,
             target: target
                 .as_ref()
-                .map(|target| Manifest::from_native(target.manifest())),
+                .map(|target| ArtifactDeclaration::from_native(target.manifest())),
         },
         stopped,
         delivery_deadline,
@@ -967,6 +967,20 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
             ),
             "client did not accept the declared target",
         )?;
+        send_artifact_manifest(wire, target.manifest(), stopped, deadline).await?;
+        let manifest_sha256 = encode_hex(&target.manifest().digest());
+        let Message::ReceiveArtifacts {
+            manifest_sha256: accepted,
+        } = wire.receive_until(stopped, deadline).await?
+        else {
+            return Err(invalid(
+                "client did not validate the complete artifact manifest",
+            ));
+        };
+        require(
+            accepted == manifest_sha256,
+            "client accepted a different artifact manifest",
+        )?;
         let mut window = Window::default();
         for file in target.manifest().files() {
             let mut offset = 0;
@@ -994,7 +1008,6 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         send_window(wire, &mut window, stopped, deadline).await?;
         wire.send(&Message::ArtifactEnd {}, stopped, deadline)
             .await?;
-        let manifest_sha256 = encode_hex(&target.manifest().digest());
         let Message::Received {
             manifest_sha256: received,
         } = wire.receive_until(stopped, deadline).await?
@@ -1041,6 +1054,32 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         deadline,
     )
     .await
+}
+
+async fn send_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    manifest: &rabs_sandbox::source_transfer::ArtifactManifest,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut window = Window::default();
+    for (index, files) in manifest.files().chunks(ARTIFACT_PAGE_FILES).enumerate() {
+        checkpoint(stopped, deadline)?;
+        wire.send(
+            &Message::ArtifactManifestPage {
+                page: ArtifactPage::from_native(index * ARTIFACT_PAGE_FILES, files)?,
+            },
+            stopped,
+            deadline,
+        )
+        .await?;
+        if window.record()? {
+            send_window(wire, &mut window, stopped, deadline).await?;
+        }
+    }
+    send_window(wire, &mut window, stopped, deadline).await?;
+    wire.send(&Message::ArtifactManifestEnd {}, stopped, deadline)
+        .await
 }
 
 #[cfg(test)]
@@ -1267,12 +1306,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_input_decisions_require_v3_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v3", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v4_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v4", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
-            ("canonical-compile-remote-v3", "build-two"),
+            ("canonical-compile-remote-v3", "build-one"),
+            ("canonical-compile-remote-v4", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1282,6 +1322,92 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    #[test]
+    fn artifact_manifest_sender_honors_bounded_windows_and_exact_page_order() {
+        let manifest = rabs_sandbox::source_transfer::ArtifactManifest::new(
+            (0..ARTIFACT_PAGE_FILES * 6 + 1)
+                .map(|index| SourceFile {
+                    path: format!("target/{index:04}"),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        for wrong_ack in [false, true] {
+            let mut input = record(&Message::Window {
+                count: if wrong_ack { 3 } else { 4 },
+            });
+            input.extend(record(&Message::Window { count: 7 }));
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            let mut transport = Wire::new(peer);
+            let result = ready(send_artifact_manifest(
+                &mut transport,
+                &manifest,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(15),
+            ));
+            let sent = messages(&output);
+            if wrong_ack {
+                assert!(result.is_err());
+                assert_eq!(sent.len(), 5);
+                assert_eq!(sent.last().unwrap()["kind"], "window-end");
+                continue;
+            }
+            result.unwrap();
+            let mut received =
+                wire::ArtifactPages::new(ArtifactDeclaration::from_native(&manifest)).unwrap();
+            let mut window_counts = Vec::new();
+            for message in sent {
+                match serde_json::from_value::<Message>(message).unwrap() {
+                    Message::ArtifactManifestPage { page } => received.push(page).unwrap(),
+                    Message::WindowEnd { count } => window_counts.push(count),
+                    Message::ArtifactManifestEnd {} => {}
+                    _ => panic!("sender emitted a message from another phase"),
+                }
+            }
+            assert_eq!(window_counts, [4, 7]);
+            assert_eq!(received.finish().unwrap(), manifest);
+        }
+    }
+
+    #[test]
+    fn artifact_manifest_sender_observes_cancellation_while_awaiting_window_ack() {
+        let manifest = rabs_sandbox::source_transfer::ArtifactManifest::new(
+            (0..ARTIFACT_PAGE_FILES * 5)
+                .map(|index| SourceFile {
+                    path: format!("target/{index:04}"),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&stopped);
+        let mut peer = AdmissionPeer::new(record(&Message::Window { count: 4 }));
+        peer.before_read = Some(Box::new(move || cancel.store(true, Ordering::Release)));
+        let output = Arc::clone(&peer.output);
+        let mut transport = Wire::new(peer);
+        let result = ready(send_artifact_manifest(
+            &mut transport,
+            &manifest,
+            &stopped,
+            Instant::now() + Duration::from_secs(15),
+        ));
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        let sent = messages(&output);
+        assert_eq!(sent.len(), 5);
+        assert_eq!(sent.last().unwrap()["kind"], "window-end");
+        assert!(
+            sent.iter()
+                .all(|message| message["kind"] != "artifact-manifest-end")
+        );
     }
 
     fn received_sdk() -> Arc<ReceivedToolchain> {

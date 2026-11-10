@@ -674,18 +674,44 @@ impl<const ARTIFACT: bool> FileReceiver<ARTIFACT> {
         let parent = fs::canonicalize(parent)?;
         let parent_directory = open_root(&parent)?;
         check_root(&parent, &parent_directory)?;
+        Self::create_cancellable_in(&parent.join(name), &parent_directory, manifest, stopped)
+    }
+
+    /// Create beneath the caller's already-retained parent generation.
+    /// Neither cancellation callbacks nor a replaced public path can select a
+    /// different parent between the caller's ownership check and this creation.
+    pub fn create_cancellable_in(
+        root: &Path,
+        parent_directory: &File,
+        manifest: FileManifest<ARTIFACT>,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        checkpoint(stopped)?;
+        if !root.is_absolute() || root.file_name().is_none() {
+            return Err(invalid(
+                "source staging root must be an absolute new directory",
+            ));
+        }
+        let name = root.file_name().ok_or_else(|| invalid("source root"))?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| invalid("source staging root has no parent"))?;
+        private_directory(parent)?;
+        check_root(parent, parent_directory)?;
+        let parent = fs::canonicalize(parent)?;
+        check_root(&parent, parent_directory)?;
         let root = parent.join(name);
         checkpoint(stopped)?;
-        check_root(&parent, &parent_directory)?;
+        check_root(&parent, parent_directory)?;
         #[cfg(unix)]
         let root_directory = {
-            check_staging_directory(&parent_directory, &parent_directory)?;
-            rustix::fs::mkdirat(&parent_directory, name, rustix::fs::Mode::RWXU)?;
-            open_staging_member(&parent_directory, name, true, false)?
+            check_staging_directory(parent_directory, parent_directory)?;
+            rustix::fs::mkdirat(parent_directory, name, rustix::fs::Mode::RWXU)?;
+            open_staging_member(parent_directory, name, true, false)?
         };
         #[cfg(not(unix))]
         let root_directory = open_root(&root)?;
-        check_root(&parent, &parent_directory)?;
+        check_root(&parent, parent_directory)?;
         check_root(&root, &root_directory)?;
         let mut files = BTreeMap::new();
         for expected in manifest.files() {
@@ -1481,6 +1507,41 @@ mod tests {
             assert!(replaced.get());
             assert!(result.is_err());
             assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_parent_creation_refuses_an_ordinary_directory_substituted_by_a_callback() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+        for replace_at in [1, 2] {
+            let owner = private();
+            let parent = owner.path().join("parent");
+            let replacement = owner.path().join("replacement");
+            for path in [&parent, &replacement] {
+                fs::create_dir(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let held = File::open(&parent).unwrap();
+            let original = owner.path().join("retained-parent");
+            let calls = Cell::new(0);
+            let result = ArtifactReceiver::create_cancellable_in(
+                &parent.join("artifacts"),
+                &held,
+                ArtifactManifest::new(vec![entry("object", b"x")]).unwrap(),
+                &|| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == replace_at {
+                        fs::rename(&parent, &original).unwrap();
+                        fs::rename(&replacement, &parent).unwrap();
+                    }
+                    false
+                },
+            );
+            assert!(calls.get() >= replace_at);
+            assert!(result.is_err());
+            assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&original).unwrap().count(), 0);
         }
     }
 

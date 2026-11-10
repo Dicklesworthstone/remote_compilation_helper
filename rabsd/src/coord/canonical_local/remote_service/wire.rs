@@ -9,8 +9,11 @@ use super::super::remote_operation::RemoteOperationSettings;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
+use rabs_sandbox::artifact_tree::{
+    MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
+};
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest,
+    ArtifactManifest, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest,
 };
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
@@ -26,7 +29,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v3";
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v4";
+/// A maximum-length path still leaves this declaration far below one ATP
+/// record. Neither a large target nor its complete manifest becomes one frame.
+pub(super) const ARTIFACT_PAGE_FILES: usize = 64;
 pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
@@ -100,6 +106,30 @@ pub(super) struct ManifestFile {
     executable: bool,
 }
 
+impl ManifestFile {
+    fn from_native(file: &SourceFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            bytes: file.len,
+            sha256: encode_hex(&file.sha256),
+            executable: file.executable,
+        }
+    }
+
+    fn native(&self) -> io::Result<SourceFile> {
+        require(
+            self.path.len() <= 1024,
+            "remote manifest path exceeds its bound",
+        )?;
+        Ok(SourceFile {
+            path: self.path.clone(),
+            len: self.bytes,
+            sha256: digest(&self.sha256)?,
+            executable: self.executable,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Manifest {
@@ -113,12 +143,7 @@ impl Manifest {
             files: manifest
                 .files()
                 .iter()
-                .map(|file| ManifestFile {
-                    path: file.path.clone(),
-                    bytes: file.len,
-                    sha256: encode_hex(&file.sha256),
-                    executable: file.executable,
-                })
+                .map(ManifestFile::from_native)
                 .collect(),
             manifest_sha256: encode_hex(&manifest.digest()),
         }
@@ -128,19 +153,151 @@ impl Manifest {
         let files = self
             .files
             .iter()
-            .map(|file| {
-                Ok(SourceFile {
-                    path: file.path.clone(),
-                    len: file.bytes,
-                    sha256: digest(&file.sha256)?,
-                    executable: file.executable,
-                })
-            })
+            .map(ManifestFile::native)
             .collect::<io::Result<Vec<_>>>()?;
         let manifest = SourceManifest::new(files)?;
         require(
             manifest.digest() == digest(&self.manifest_sha256)?,
             "remote manifest digest differs from its complete file declaration",
+        )?;
+        Ok(manifest)
+    }
+}
+
+/// V4 negotiates an output-specific, finite storage profile independently of
+/// source upload. The declaration is small even for a many-file Cargo target;
+/// no output paths are created until all bounded pages match this identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArtifactDeclaration {
+    pub(super) manifest_sha256: String,
+    files: u32,
+    bytes: u64,
+    metadata_bytes: u64,
+}
+
+impl ArtifactDeclaration {
+    pub(super) fn from_native(manifest: &ArtifactManifest) -> Self {
+        Self {
+            manifest_sha256: encode_hex(&manifest.digest()),
+            files: manifest.files().len() as u32,
+            bytes: manifest.total_bytes(),
+            metadata_bytes: manifest.metadata_bytes(),
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        require(
+            self.files != 0
+                && u64::from(self.files) <= MAX_ARTIFACT_FILES as u64
+                && self.bytes <= MAX_ARTIFACT_BYTES
+                && self.metadata_bytes != 0
+                && self.metadata_bytes <= MAX_ARTIFACT_MANIFEST_BYTES as u64,
+            "remote artifact declaration exceeds the negotiated output profile",
+        )?;
+        digest(&self.manifest_sha256)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArtifactPage {
+    first: u32,
+    files: Vec<ManifestFile>,
+}
+
+impl ArtifactPage {
+    pub(super) fn from_native(first: usize, files: &[SourceFile]) -> io::Result<Self> {
+        require(
+            !files.is_empty()
+                && files.len() <= ARTIFACT_PAGE_FILES
+                && first < MAX_ARTIFACT_FILES
+                && first + files.len() <= MAX_ARTIFACT_FILES,
+            "remote artifact manifest page exceeds its bound",
+        )?;
+        Ok(Self {
+            first: first as u32,
+            files: files.iter().map(ManifestFile::from_native).collect(),
+        })
+    }
+}
+
+/// Bounded metadata only. Every chunk of file data goes directly to the
+/// anchored receiver after this complete declaration has been validated.
+pub(super) struct ArtifactPages {
+    declaration: ArtifactDeclaration,
+    files: Vec<SourceFile>,
+    bytes: u64,
+    entry_bytes: u64,
+}
+
+impl ArtifactPages {
+    pub(super) fn new(declaration: ArtifactDeclaration) -> io::Result<Self> {
+        declaration.validate()?;
+        Ok(Self {
+            declaration,
+            files: Vec::new(),
+            bytes: 0,
+            entry_bytes: 0,
+        })
+    }
+
+    pub(super) fn push(&mut self, page: ArtifactPage) -> io::Result<()> {
+        require(
+            page.first as usize == self.files.len()
+                && !page.files.is_empty()
+                && page.files.len() <= ARTIFACT_PAGE_FILES
+                && self.files.len() + page.files.len() <= self.declaration.files as usize,
+            "remote artifact pages overlap, skip members or exceed their declared count",
+        )?;
+        let files = page
+            .files
+            .iter()
+            .map(ManifestFile::native)
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut prior = self.files.last().map(|file| file.path.as_str());
+        let mut bytes = self.bytes;
+        let mut entry_bytes = self.entry_bytes;
+        for file in &files {
+            require(
+                prior.is_none_or(|prior| prior < file.path.as_str()),
+                "remote artifact pages must preserve canonical path order",
+            )?;
+            prior = Some(&file.path);
+            bytes = bytes
+                .checked_add(file.len)
+                .filter(|bytes| *bytes <= self.declaration.bytes)
+                .ok_or_else(|| invalid("remote artifact pages exceed their declared bytes"))?;
+            // Canonical entries contain a u64 path length, the path, a u64
+            // file length, one mode byte and a SHA-256 digest. This early bound
+            // includes every allocated name; finish also checks domain/header
+            // overhead against the exact canonical manifest size.
+            entry_bytes = entry_bytes
+                .checked_add(file.path.len() as u64 + 8 + 8 + 1 + 32)
+                .filter(|bytes| *bytes <= self.declaration.metadata_bytes)
+                .ok_or_else(|| invalid("remote artifact pages exceed their metadata budget"))?;
+        }
+        // Validate each page before retaining it; global namespace collisions
+        // and exact whole-manifest identity are checked again at finish.
+        ArtifactManifest::new(files.clone())?;
+        self.files.extend(files);
+        self.bytes = bytes;
+        self.entry_bytes = entry_bytes;
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> io::Result<ArtifactManifest> {
+        require(
+            self.files.len() == self.declaration.files as usize
+                && self.bytes == self.declaration.bytes,
+            "remote artifact manifest ended before its complete declaration",
+        )?;
+        let manifest = ArtifactManifest::new(self.files)?;
+        require(
+            manifest.digest() == digest(&self.declaration.manifest_sha256)?
+                && manifest.metadata_bytes() == self.declaration.metadata_bytes,
+            "remote artifact manifest differs from its declared identity",
         )?;
         Ok(manifest)
     }
@@ -386,9 +543,16 @@ pub(super) enum Message {
         exit_code: i32,
         stdout_bytes: u64,
         stderr_bytes: u64,
-        target: Option<Manifest>,
+        target: Option<ArtifactDeclaration>,
     },
     ReceiveTarget {},
+    ArtifactManifestPage {
+        page: ArtifactPage,
+    },
+    ArtifactManifestEnd {},
+    ReceiveArtifacts {
+        manifest_sha256: String,
+    },
     ArtifactChunk {
         chunk: Chunk,
     },
@@ -1110,6 +1274,10 @@ mod tests {
             (Message::Accepted {}, r#"{"kind":"accepted"}"#),
             (Message::Poll {}, r#"{"kind":"poll"}"#),
             (Message::ReceiveTarget {}, r#"{"kind":"receive-target"}"#),
+            (
+                Message::ArtifactManifestEnd {},
+                r#"{"kind":"artifact-manifest-end"}"#,
+            ),
             (Message::ArtifactEnd {}, r#"{"kind":"artifact-end"}"#),
             (Message::Close {}, r#"{"kind":"close"}"#),
             (Message::Cancel {}, r#"{"kind":"cancel"}"#),
@@ -1260,6 +1428,149 @@ mod tests {
         assert!(window.acknowledge(WINDOW).is_err());
         assert!(!window.record().unwrap());
         window.acknowledge(WINDOW + 1).unwrap();
+    }
+
+    fn artifact_file(path: &str, bytes: &[u8]) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        }
+    }
+
+    #[test]
+    fn artifact_pages_admit_large_targets_without_enlarging_source_or_record_limits() {
+        let native = ArtifactManifest::new(
+            (0..MAX_ARTIFACT_FILES)
+                .map(|index| SourceFile {
+                    path: format!("debug/deps/{index:05}-{}", "x".repeat(192)),
+                    len: if index == 0 {
+                        rabs_sandbox::source_transfer::MAX_SOURCE_BYTES + 1
+                    } else {
+                        0
+                    },
+                    sha256: Sha256::digest([]).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        // This checks declaration transport, not the large file's payload.
+        assert!(SourceManifest::new(native.files().to_vec()).is_err());
+        let declaration = ArtifactDeclaration::from_native(&native);
+        assert!(serde_json::to_vec(&declaration).unwrap().len() < 256);
+        let mut received = ArtifactPages::new(declaration).unwrap();
+        let mut encoded_bytes = 0;
+        for (index, files) in native.files().chunks(ARTIFACT_PAGE_FILES).enumerate() {
+            let page = ArtifactPage::from_native(index * ARTIFACT_PAGE_FILES, files).unwrap();
+            let bytes = serde_json::to_vec(&Message::ArtifactManifestPage { page }).unwrap();
+            assert!(bytes.len() < MAX_JSON_RECORD);
+            encoded_bytes += bytes.len();
+            let Message::ArtifactManifestPage { page } = serde_json::from_slice(&bytes).unwrap()
+            else {
+                panic!("expected an artifact declaration page");
+            };
+            received.push(page).unwrap();
+        }
+        assert!(encoded_bytes > MAX_JSON_RECORD);
+        assert_eq!(received.finish().unwrap(), native);
+    }
+
+    #[test]
+    fn artifact_declarations_refuse_excessive_resources_before_accepting_pages() {
+        let native = ArtifactManifest::new(vec![artifact_file("data", b"x")]).unwrap();
+        let valid = ArtifactDeclaration::from_native(&native);
+        for case in 0..7 {
+            let mut declaration = valid.clone();
+            match case {
+                0 => declaration.files = 0,
+                1 => declaration.files = (MAX_ARTIFACT_FILES + 1) as u32,
+                2 => declaration.bytes = MAX_ARTIFACT_BYTES + 1,
+                3 => declaration.metadata_bytes = 0,
+                4 => declaration.metadata_bytes = MAX_ARTIFACT_MANIFEST_BYTES as u64 + 1,
+                5 => declaration.manifest_sha256 = "ab".repeat(31),
+                _ => declaration.manifest_sha256 = "AB".repeat(32),
+            }
+            assert!(ArtifactPages::new(declaration).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn artifact_pages_refuse_gaps_repeats_reordering_and_budget_overruns() {
+        let native = ArtifactManifest::new(vec![
+            artifact_file("a", b"a"),
+            artifact_file("b", b"b"),
+            artifact_file("c", b"c"),
+        ])
+        .unwrap();
+        for case in 0..9 {
+            let mut pages = ArtifactPages::new(ArtifactDeclaration::from_native(&native)).unwrap();
+            pages
+                .push(ArtifactPage::from_native(0, &native.files()[..1]).unwrap())
+                .unwrap();
+            let mut page = ArtifactPage::from_native(1, &native.files()[1..]).unwrap();
+            match case {
+                0 => page.first = 0,
+                1 => page.first = 2,
+                2 => page.files.clear(),
+                3 => page.files = vec![page.files[0].clone(); ARTIFACT_PAGE_FILES + 1],
+                4 => page.files.reverse(),
+                5 => page.files[0].path = "a".into(),
+                6 => page.files[0].bytes = MAX_ARTIFACT_BYTES,
+                7 => page.files[0].path = "z".repeat(1025),
+                _ => page.files[0].sha256 = "AB".repeat(32),
+            }
+            assert!(pages.push(page).is_err(), "{case}");
+        }
+        let mut declaration = ArtifactDeclaration::from_native(&native);
+        declaration.metadata_bytes = 1;
+        let mut pages = ArtifactPages::new(declaration).unwrap();
+        assert!(
+            pages
+                .push(ArtifactPage::from_native(0, native.files()).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_pages_require_exact_domain_complete_counts_and_global_namespace() {
+        let native =
+            ArtifactManifest::new(vec![artifact_file("a", b"a"), artifact_file("b", b"b")])
+                .unwrap();
+        let source = SourceManifest::new(native.files().to_vec()).unwrap();
+        assert_ne!(source.digest(), native.digest());
+        for case in 0..4 {
+            let mut declaration = ArtifactDeclaration::from_native(&native);
+            match case {
+                0 => declaration.manifest_sha256 = encode_hex(&source.digest()),
+                1 => declaration.metadata_bytes += 1,
+                2 => declaration.bytes += 1,
+                _ => {}
+            }
+            let mut pages = ArtifactPages::new(declaration).unwrap();
+            let files = if case == 3 {
+                &native.files()[..1]
+            } else {
+                native.files()
+            };
+            pages
+                .push(ArtifactPage::from_native(0, files).unwrap())
+                .unwrap();
+            assert!(pages.finish().is_err(), "{case}");
+        }
+        let mut pages = ArtifactPages::new(ArtifactDeclaration::from_native(&native)).unwrap();
+        let first = artifact_file("A", b"a");
+        let second = artifact_file("a", b"b");
+        pages
+            .push(ArtifactPage::from_native(0, &[first]).unwrap())
+            .unwrap();
+        pages
+            .push(ArtifactPage::from_native(1, &[second]).unwrap())
+            .unwrap();
+        // Each page alone is valid and the paths are strictly sorted. Only
+        // whole-manifest validation can detect this cross-page alias.
+        assert!(pages.finish().is_err());
     }
 
     #[test]

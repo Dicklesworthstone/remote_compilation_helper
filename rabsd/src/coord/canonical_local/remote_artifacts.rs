@@ -7,14 +7,14 @@
 //! directories, timestamps, hard-link topology and Cargo freshness are not part
 //! of this first protocol. Unsupported or oversized trees refuse in full.
 
-use rabs_sandbox::artifact_tree::{TreeInventory, validate_tree_names};
+use rabs_sandbox::artifact_tree::{MAX_ARTIFACT_BYTES, TreeInventory, validate_artifact_names};
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SourceFile, SourceManifest, SourceReceiver,
+    ArtifactManifest, ArtifactReceiver, MAX_SOURCE_CHUNK, SourceFile, create_staging_file,
 };
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 fn invalid(message: &str) -> io::Error {
@@ -44,10 +44,10 @@ fn mode(executable: bool) -> u32 {
     if executable { 0o555 } else { 0o444 }
 }
 
-fn validate_manifest(manifest: &SourceManifest) -> io::Result<()> {
-    // SourceManifest enforces the shared 512 MiB/4096-file byte contract.
-    // Artifact names additionally reject case-folded component collisions.
-    validate_tree_names(manifest.files().iter().map(|file| file.path.as_str()))?;
+fn validate_manifest(manifest: &ArtifactManifest) -> io::Result<()> {
+    // The independently negotiated artifact profile bounds both data and
+    // metadata. Source upload limits never authorize or restrict this tree.
+    validate_artifact_names(manifest.files().iter().map(|file| file.path.as_str()))?;
     Ok(())
 }
 
@@ -89,12 +89,103 @@ impl Parent {
     }
 }
 
+/// The canonical operation owner retains this parent until final delivery and
+/// cleans the capture together with its original target. This narrower owner
+/// never removes a path on drop: a replaced name is not deletion authority.
+/// Standalone callers likewise retain ownership of the parent lifecycle.
+#[derive(Debug)]
+struct CaptureOwner {
+    parent: Parent,
+    directory: Parent,
+}
+
+impl CaptureOwner {
+    fn create(parent: &Parent) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        parent.verify()?;
+        let created = tempfile::Builder::new()
+            .prefix("rabs-target-capture-")
+            .disable_cleanup(true)
+            .make_in(&parent.path, |path| {
+                parent.verify()?;
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| invalid("capture owner name is absent"))?;
+                mkdirat(&parent.directory, name, Mode::RWXU)?;
+                let directory = File::from(openat(
+                    &parent.directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+                parent.verify()?;
+                Ok(directory)
+            })?;
+        let (directory, path) = created.keep().map_err(|error| error.error)?;
+        let owner = Self {
+            parent: Parent {
+                path: parent.path.clone(),
+                directory: parent.directory.try_clone()?,
+            },
+            directory: Parent { path, directory },
+        };
+        owner.verify()?;
+        Ok(owner)
+    }
+
+    fn path(&self) -> &Path {
+        &self.directory.path
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        use rustix::fs::{Mode, OFlags, openat};
+        self.parent.verify()?;
+        let name = self
+            .path()
+            .file_name()
+            .ok_or_else(|| invalid("capture owner name is absent"))?;
+        let named = File::from(openat(
+            &self.parent.directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let named = named.metadata()?;
+        let retained = self.directory.directory.metadata()?;
+        require(
+            named.dev() == retained.dev() && named.ino() == retained.ino(),
+            "capture owner name was replaced",
+        )?;
+        self.directory.verify()?;
+        self.parent.verify()
+    }
+}
+
+fn verify_capture_root(owner: &CaptureOwner, directory: &File) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, openat};
+    owner.verify()?;
+    let named = File::from(openat(
+        &owner.directory.directory,
+        "files",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let current = named.metadata()?;
+    let retained = directory.metadata()?;
+    require(
+        current.dev() == retained.dev()
+            && current.ino() == retained.ino()
+            && current.mode() & 0o077 == 0,
+        "captured target root was replaced or is no longer private",
+    )
+}
+
 /// Rehash the exact retained namespace, including empty files, and sync only
 /// those anchored descriptors. The inventory comparison brackets all reads;
 /// a valid digest alone cannot bless replaced files, extra entries or links.
 fn verify_tree(
     tree: &TreeInventory,
-    manifest: &SourceManifest,
+    manifest: &ArtifactManifest,
     stopped: &impl Fn() -> bool,
     sync: bool,
 ) -> io::Result<()> {
@@ -153,9 +244,9 @@ fn verify_tree(
 /// Its parent remains under the operation owner's custody through delivery.
 #[derive(Debug)]
 pub(super) struct CapturedTarget {
-    owner: tempfile::TempDir,
+    owner: CaptureOwner,
     tree: TreeInventory,
-    manifest: SourceManifest,
+    manifest: ArtifactManifest,
 }
 
 impl CapturedTarget {
@@ -169,31 +260,28 @@ impl CapturedTarget {
                 .parent()
                 .ok_or_else(|| invalid("remote target has no parent"))?,
         )?;
-        let original = TreeInventory::scan_complete(target, MAX_SOURCE_BYTES, stopped)?;
-        validate_tree_names(original.names())?;
-        let owner = tempfile::Builder::new()
-            .prefix("rabs-target-capture-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(&parent.path)?;
+        let original = TreeInventory::scan_complete_artifacts(target, MAX_ARTIFACT_BYTES, stopped)?;
+        validate_artifact_names(original.names())?;
+        let owner = CaptureOwner::create(&parent)?;
+        let captured_parent = &owner.directory;
         let root = owner.path().join("files");
-        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        mkdirat(&captured_parent.directory, "files", Mode::RWXU)?;
+        let root_directory = File::from(openat(
+            &captured_parent.directory,
+            "files",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        verify_capture_root(&owner, &root_directory)?;
         let mut files = Vec::new();
         let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
         for name in original.names() {
             checkpoint(stopped)?;
+            verify_capture_root(&owner, &root_directory)?;
             let mut input = original.open_file(name)?;
             let metadata = input.metadata()?;
-            let destination = root.join(name);
-            fs::DirBuilder::new().mode(0o700).recursive(true).create(
-                destination
-                    .parent()
-                    .ok_or_else(|| invalid("target member"))?,
-            )?;
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&destination)?;
+            let mut output = create_staging_file(&root_directory, name, stopped)?;
             let executable = metadata.mode() & 0o111 != 0;
             let mut remaining = metadata.len();
             let mut hash = Sha256::new();
@@ -212,6 +300,7 @@ impl CapturedTarget {
             original.verify_file(name, &input)?;
             output.set_permissions(fs::Permissions::from_mode(mode(executable)))?;
             output.sync_all()?;
+            verify_capture_root(&owner, &root_directory)?;
             files.push(SourceFile {
                 path: name.to_owned(),
                 len: metadata.len(),
@@ -221,14 +310,22 @@ impl CapturedTarget {
         }
         original.verify(stopped)?;
         parent.verify()?;
-        let manifest = SourceManifest::new(files)?;
+        verify_capture_root(&owner, &root_directory)?;
+        let manifest = ArtifactManifest::new(files)?;
         validate_manifest(&manifest)?;
-        let tree = TreeInventory::scan_complete(&root, MAX_SOURCE_BYTES, stopped)?;
+        let tree = TreeInventory::scan_complete_artifacts(&root, MAX_ARTIFACT_BYTES, stopped)?;
+        let scanned = tree.open_directory("")?.metadata()?;
+        let retained = root_directory.metadata()?;
+        require(
+            scanned.dev() == retained.dev() && scanned.ino() == retained.ino(),
+            "captured target inventory names a different root",
+        )?;
         verify_tree(&tree, &manifest, stopped, true)?;
-        File::open(owner.path())?.sync_all()?;
+        captured_parent.directory.sync_all()?;
         parent.directory.sync_all()?;
         original.verify(stopped)?;
         parent.verify()?;
+        verify_capture_root(&owner, &root_directory)?;
         checkpoint(stopped)?;
         Ok(Self {
             owner,
@@ -237,7 +334,7 @@ impl CapturedTarget {
         })
     }
 
-    pub(super) fn manifest(&self) -> &SourceManifest {
+    pub(super) fn manifest(&self) -> &ArtifactManifest {
         &self.manifest
     }
 
@@ -277,7 +374,7 @@ impl CapturedTarget {
 
     /// Mandatory after the last byte is sent and before terminal success.
     pub(super) fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
-        super::private_directory(self.owner.path())?;
+        self.owner.verify()?;
         verify_tree(&self.tree, &self.manifest, stopped, false)
     }
 }
@@ -287,26 +384,42 @@ impl CapturedTarget {
 pub(super) struct ReceivedTarget {
     parent: Parent,
     staging: PathBuf,
-    receiver: SourceReceiver,
+    receiver: ArtifactReceiver,
     sealed: Option<TreeInventory>,
     poisoned: bool,
 }
 
 impl ReceivedTarget {
-    pub(super) fn new(private_parent: &Path, manifest: SourceManifest) -> io::Result<Self> {
+    #[cfg(test)]
+    pub(super) fn new(private_parent: &Path, manifest: ArtifactManifest) -> io::Result<Self> {
+        Self::new_cancellable(private_parent, manifest, &|| false)
+    }
+
+    pub(super) fn new_cancellable(
+        private_parent: &Path,
+        manifest: ArtifactManifest,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        checkpoint(stopped)?;
         validate_manifest(&manifest)?;
         let parent = Parent::open(private_parent)?;
-        // make_in chooses a fresh bounded random name; SourceReceiver creates
+        // make_in chooses a fresh bounded random name; ArtifactReceiver creates
         // that directory exclusively. Keep it immediately, including on later
         // failure. Publication needs a sibling of the eventual destination.
         let staged = tempfile::Builder::new()
             .prefix(".rabs-target-staging-")
             .disable_cleanup(true)
             .make_in(&parent.path, |path| {
-                SourceReceiver::create(path, manifest.clone())
+                ArtifactReceiver::create_cancellable_in(
+                    path,
+                    &parent.directory,
+                    manifest.clone(),
+                    stopped,
+                )
             })?;
         let (receiver, staging) = staged.keep().map_err(|error| error.error)?;
         parent.verify()?;
+        checkpoint(stopped)?;
         Ok(Self {
             parent,
             staging,
@@ -337,12 +450,13 @@ impl ReceivedTarget {
             checkpoint(stopped)?;
             self.parent.verify()?;
             if let Some(tree) = &self.sealed {
-                // SourceReceiver's already-sealed path is intentionally cheap;
+                // ArtifactReceiver's already-sealed path is intentionally cheap;
                 // an artifact delivery must still recheck every retained byte.
                 return verify_tree(tree, self.receiver.manifest(), stopped, true);
             }
             self.receiver.seal_cancellable(stopped)?;
-            let tree = TreeInventory::scan_complete(&self.staging, MAX_SOURCE_BYTES, stopped)?;
+            let tree =
+                TreeInventory::scan_complete_artifacts(&self.staging, MAX_ARTIFACT_BYTES, stopped)?;
             verify_tree(&tree, self.receiver.manifest(), stopped, true)?;
             self.parent.directory.sync_all()?;
             self.parent.verify()?;
@@ -442,7 +556,7 @@ impl ReceivedTarget {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{DirBuilderExt, symlink};
 
     fn private() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -533,6 +647,164 @@ mod tests {
     }
 
     #[test]
+    fn complete_target_above_source_file_limit_roundtrips_without_dropping_members() {
+        let server = private();
+        let original = target(server.path());
+        for index in 0..=rabs_sandbox::source_transfer::MAX_SOURCE_FILES {
+            fs::write(original.join(format!("member-{index:05}")), []).unwrap();
+        }
+        let captured = CapturedTarget::capture(&original, &|| false).unwrap();
+        assert_eq!(captured.manifest().files().len(), 4097);
+        let client = private();
+        let mut received = receive(client.path(), &captured);
+        received.seal(&|| false).unwrap();
+        let destination = client.path().join("completed");
+        received.publish(&destination, &|| false).unwrap();
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 4097);
+        assert_eq!(fs::read_dir(original).unwrap().count(), 4097);
+    }
+
+    #[test]
+    #[ignore = "streams and rehashes more than 512 MiB; needs 2 GiB of disk-backed scratch"]
+    fn artifact_larger_than_source_byte_limit_streams_with_bounded_buffers() {
+        let server = private();
+        let original = target(server.path());
+        let length = rabs_sandbox::source_transfer::MAX_SOURCE_BYTES + MAX_SOURCE_CHUNK as u64 + 17;
+        let mut input = File::create(original.join("large.rlib")).unwrap();
+        input.set_len(length).unwrap();
+        for offset in [0, length / 2, length - 4] {
+            input.seek(SeekFrom::Start(offset)).unwrap();
+            input.write_all(b"RABS").unwrap();
+        }
+        input.sync_all().unwrap();
+        drop(input);
+        let captured = CapturedTarget::capture(&original, &|| false).unwrap();
+        assert_eq!(captured.manifest().total_bytes(), length);
+        let client = private();
+        let mut received = receive(client.path(), &captured);
+        received.seal(&|| false).unwrap();
+        let destination = client.path().join("completed");
+        received.publish(&destination, &|| false).unwrap();
+        let mut output = File::open(destination.join("large.rlib")).unwrap();
+        assert_eq!(output.metadata().unwrap().len(), length);
+        for offset in [0, length / 2, length - 4] {
+            output.seek(SeekFrom::Start(offset)).unwrap();
+            let mut marker = [0; 4];
+            output.read_exact(&mut marker).unwrap();
+            assert_eq!(&marker, b"RABS");
+        }
+        let mut forbidden = [0_u8; 1];
+        assert_eq!(output.read(&mut forbidden).unwrap(), 0);
+    }
+
+    #[test]
+    fn receiver_creation_observes_cancellation_between_manifest_members() {
+        let parent = private();
+        let manifest = ArtifactManifest::new(
+            (0..1024)
+                .map(|index| file(&format!("member-{index:04}"), b"", false))
+                .collect(),
+        )
+        .unwrap();
+        let observed = Cell::new(false);
+        let result = ReceivedTarget::new_cancellable(parent.path(), manifest, &|| {
+            let created = fs::read_dir(parent.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| fs::read_dir(entry.path()).is_ok_and(|entries| entries.count() != 0));
+            observed.set(observed.get() || created);
+            created
+        });
+        assert!(
+            observed.get(),
+            "cancellation was never checked after the first member"
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        let staging = fs::read_dir(parent.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let created = fs::read_dir(staging).unwrap().count();
+        assert!((1..1024).contains(&created));
+        assert!(!parent.path().join("completed").exists());
+    }
+
+    #[test]
+    fn receiver_creation_never_adopts_a_replaced_parent_after_its_callback() {
+        let container = private();
+        let parent = container.path().join("parent");
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let retained = container.path().join("retained-parent");
+        let checkpoints = Cell::new(0);
+        let replaced = Cell::new(false);
+        let manifest = ArtifactManifest::new(vec![file("empty", b"", false)]).unwrap();
+        let result = ReceivedTarget::new_cancellable(&parent, manifest, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            // The first checkpoint precedes the outer retained Parent. The
+            // next belongs to the inner receiver, after that custody exists.
+            if checkpoints.get() == 2 {
+                fs::rename(&parent, &retained).unwrap();
+                fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+                replaced.set(true);
+            }
+            false
+        });
+        assert!(replaced.get());
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&retained).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn capture_owner_creation_never_follows_a_replaced_parent_after_inventory() {
+        let container = private();
+        let parent = container.path().join("parent");
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let original = target(&parent);
+        fs::write(original.join("data"), b"retained input").unwrap();
+        let outside = container.path().join("outside");
+        fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
+        let retained = container.path().join("retained-parent");
+        // Count the real scanner's checkpoints instead of depending on a
+        // particular read_dir order or an implementation-specific count. Its
+        // last checkpoint occurs after the completed inventory verification.
+        let scan_checkpoints = Cell::new(0);
+        TreeInventory::scan_complete_artifacts(&original, MAX_ARTIFACT_BYTES, &|| {
+            scan_checkpoints.set(scan_checkpoints.get() + 1);
+            false
+        })
+        .unwrap();
+        let checkpoints = Cell::new(0);
+        let replaced = Cell::new(false);
+        let outside_was_modified = Cell::new(false);
+        let result = CapturedTarget::capture(&original, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            outside_was_modified
+                .set(outside_was_modified.get() || fs::read_dir(&outside).unwrap().count() != 0);
+            if checkpoints.get() == scan_checkpoints.get() + 1 {
+                fs::rename(&parent, &retained).unwrap();
+                symlink(&outside, &parent).unwrap();
+                replaced.set(true);
+            }
+            false
+        });
+        assert!(
+            replaced.get(),
+            "inventory did not reach its final checkpoint"
+        );
+        assert!(result.is_err());
+        assert!(!outside_was_modified.get());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&retained).unwrap().count(), 1);
+        assert_eq!(
+            fs::read(retained.join("target/data")).unwrap(),
+            b"retained input"
+        );
+    }
+
+    #[test]
     fn capture_refuses_links_special_files_and_oversized_trees_without_a_partial_offer() {
         for kind in [
             "symlink",
@@ -561,14 +833,14 @@ mod tests {
                     .unwrap();
                 }
                 "too-many" => {
-                    for index in 0..rabs_sandbox::source_transfer::MAX_SOURCE_FILES {
+                    for index in 0..rabs_sandbox::artifact_tree::MAX_ARTIFACT_FILES {
                         fs::write(original.join(format!("file-{index}")), []).unwrap();
                     }
                 }
                 "too-large" => {
                     File::create(original.join("large"))
                         .unwrap()
-                        .set_len(MAX_SOURCE_BYTES + 1)
+                        .set_len(MAX_ARTIFACT_BYTES + 1)
                         .unwrap();
                 }
                 _ => unreachable!(),
@@ -613,6 +885,49 @@ mod tests {
     }
 
     #[test]
+    fn capture_does_not_follow_a_replaced_staging_parent_into_an_outside_tree() {
+        let parent = private();
+        let original = target(parent.path());
+        fs::create_dir(original.join("nested")).unwrap();
+        fs::write(original.join("nested/a"), vec![7; MAX_SOURCE_CHUNK + 19]).unwrap();
+        fs::write(original.join("nested/b"), b"second member").unwrap();
+        let outside = parent.path().join("outside");
+        fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"untouched").unwrap();
+        let replaced = Cell::new(false);
+        let result = CapturedTarget::capture(&original, &|| {
+            if !replaced.get() {
+                for entry in fs::read_dir(parent.path()).unwrap().flatten() {
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("rabs-target-capture-")
+                    {
+                        continue;
+                    }
+                    let nested = entry.path().join("files/nested");
+                    if nested.join("a").exists() {
+                        fs::rename(&nested, parent.path().join("retained-original-nested"))
+                            .unwrap();
+                        symlink(&outside, &nested).unwrap();
+                        replaced.set(true);
+                        break;
+                    }
+                }
+            }
+            false
+        });
+        assert!(replaced.get(), "the capture never reached its first member");
+        assert!(result.is_err());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"untouched");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+        assert_eq!(
+            fs::read(original.join("nested/b")).unwrap(),
+            b"second member"
+        );
+    }
+
+    #[test]
     fn captured_snapshot_rejects_changed_bytes_modes_and_membership() {
         for mutation in ["bytes", "mode", "extra", "replacement"] {
             let parent = private();
@@ -648,27 +963,26 @@ mod tests {
     }
 
     #[test]
-    fn source_manifest_cannot_bypass_artifact_path_collision_rules() {
+    fn artifact_manifest_refuses_path_collisions_before_creating_any_receiver() {
         for names in [["Dir/a", "dir/b"], ["FILE", "file"], ["A", "a/child"]] {
             let parent = private();
-            let manifest = SourceManifest::new(
+            let manifest = ArtifactManifest::new(
                 names
                     .into_iter()
                     .map(|name| file(name, b"", false))
                     .collect(),
-            )
-            .unwrap();
-            assert!(ReceivedTarget::new(parent.path(), manifest).is_err());
+            );
+            assert!(manifest.is_err());
             assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
         }
-        assert!(SourceManifest::new(vec![file("../outside", b"", false)]).is_err());
+        assert!(ArtifactManifest::new(vec![file("../outside", b"", false)]).is_err());
     }
 
     #[test]
     fn malformed_ranges_do_not_write_and_exact_retries_preserve_sealing() {
         let parent = private();
         let bytes = b"complete bytes";
-        let manifest = SourceManifest::new(vec![file("data", bytes, false)]).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
         let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
         let hash = Sha256::digest(&bytes[..4]).into();
         assert!(
@@ -708,7 +1022,7 @@ mod tests {
     fn seal_rehashes_received_bytes_and_failure_cannot_be_repaired_into_success() {
         let parent = private();
         let bytes = b"complete bytes";
-        let manifest = SourceManifest::new(vec![file("data", bytes, false)]).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
         let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
         received
             .write_chunk("data", 0, bytes, Sha256::digest(bytes).into())
@@ -728,7 +1042,7 @@ mod tests {
             let outer = private();
             let parent = target(outer.path());
             let bytes = b"complete bytes";
-            let manifest = SourceManifest::new(vec![file("data", bytes, false)]).unwrap();
+            let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
             let mut received = ReceivedTarget::new(&parent, manifest).unwrap();
             received
                 .write_chunk("data", 0, bytes, Sha256::digest(bytes).into())
@@ -774,7 +1088,7 @@ mod tests {
     fn publication_never_replaces_an_existing_directory_or_crosses_parents() {
         for existing in [true, false] {
             let parent = private();
-            let manifest = SourceManifest::new(vec![file("empty", b"", false)]).unwrap();
+            let manifest = ArtifactManifest::new(vec![file("empty", b"", false)]).unwrap();
             let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
             received.seal(&|| false).unwrap();
             let destination = parent.path().join("completed");
@@ -796,7 +1110,7 @@ mod tests {
         }
         let parent = private();
         let other = private();
-        let manifest = SourceManifest::new(vec![file("empty", b"", false)]).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("empty", b"", false)]).unwrap();
         let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
         received.seal(&|| false).unwrap();
         let destination = other.path().join("completed");
@@ -808,7 +1122,7 @@ mod tests {
     fn final_checkpoint_namespace_swaps_cannot_publish_an_unverified_replacement() {
         let prepare = |parent: &Path| {
             let bytes = b"verified bytes";
-            let manifest = SourceManifest::new(vec![file("data", bytes, false)]).unwrap();
+            let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
             let mut received = ReceivedTarget::new(parent, manifest).unwrap();
             received
                 .write_chunk("data", 0, bytes, Sha256::digest(bytes).into())
@@ -867,7 +1181,7 @@ mod tests {
         for stage in ["incomplete", "cancelled", "unsealed", "publish-cancelled"] {
             let parent = private();
             let bytes = b"complete bytes";
-            let manifest = SourceManifest::new(vec![file("data", bytes, false)]).unwrap();
+            let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
             let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
             if stage != "incomplete" {
                 received

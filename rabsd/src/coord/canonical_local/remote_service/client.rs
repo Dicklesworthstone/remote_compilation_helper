@@ -3,9 +3,9 @@
 use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
-    ADMISSION_BUDGET, ADMISSION_POLL, CargoHome, Chunk, Entry, Manifest, Message, Output,
-    SourcePlan, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
-    controlled_future, decode_hex, digest, invalid, require,
+    ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, CargoHome, Chunk, Entry,
+    Manifest, Message, Output, SourcePlan, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION,
+    Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -23,7 +23,9 @@ use rabs_asupersync::worker_transport::{
 };
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceCheckpointError, SourceManifest};
+use rabs_sandbox::source_transfer::{
+    ArtifactManifest, MAX_SOURCE_CHUNK, SourceCheckpointError, SourceManifest,
+};
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_INPUT_BUDGET, ToolchainEntryKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -578,22 +580,30 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
-    manifest: Manifest,
+    declaration: ArtifactDeclaration,
     destination: &Path,
     stopped: &AtomicBool,
     deadline: Instant,
 ) -> io::Result<()> {
     require_absent(destination)?;
-    let native = manifest.native()?;
+    let native = receive_artifact_manifest(wire, declaration, stopped, deadline).await?;
     let manifest_sha256 = encode_hex(&native.digest());
-    let mut target = ReceivedTarget::new(
+    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
+    let mut target = ReceivedTarget::new_cancellable(
         destination
             .parent()
             .ok_or_else(|| invalid("target parent missing"))?,
         native,
+        &cancelled,
     )?;
-    wire.send(&Message::ReceiveTarget {}, stopped, deadline)
-        .await?;
+    wire.send(
+        &Message::ReceiveArtifacts {
+            manifest_sha256: manifest_sha256.clone(),
+        },
+        stopped,
+        deadline,
+    )
+    .await?;
     let mut window = Window::default();
     loop {
         match wire.receive_until(stopped, deadline).await? {
@@ -621,7 +631,6 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
     target.seal(&cancelled)?;
     checkpoint(stopped, deadline)?;
     wire.send(
@@ -649,6 +658,46 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     // uncertain command result. Never remove it or reexecute automatically.
     wire.send(&Message::Published { manifest_sha256 }, stopped, deadline)
         .await
+}
+
+async fn receive_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    declaration: ArtifactDeclaration,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<ArtifactManifest> {
+    // Validate the aggregate budget before accepting any page, allocating the
+    // receiver or creating an output path. Pages never renew the deadline.
+    let mut pages = ArtifactPages::new(declaration)?;
+    wire.send(&Message::ReceiveTarget {}, stopped, deadline)
+        .await?;
+    let mut window = Window::default();
+    loop {
+        match wire.receive(stopped, deadline).await? {
+            Message::ArtifactManifestPage { page } => {
+                window.record()?;
+                pages.push(page)?;
+            }
+            Message::WindowEnd { count } => {
+                window.acknowledge(count)?;
+                wire.send(&Message::Window { count }, stopped, deadline)
+                    .await?;
+            }
+            Message::ArtifactManifestEnd {} => {
+                require(
+                    !window.pending(),
+                    "remote artifact manifest ended before its last window acknowledgment",
+                )?;
+                checkpoint(stopped, deadline)?;
+                return pages.finish();
+            }
+            _ => {
+                return Err(invalid(
+                    "unexpected message during remote artifact manifest transfer",
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -784,6 +833,221 @@ mod tests {
             .filter(|record| !record.is_empty())
             .map(|record| serde_json::from_slice(record).unwrap())
             .collect()
+    }
+
+    fn artifact_manifest_messages(manifest: &ArtifactManifest) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut window = Window::default();
+        for (index, files) in manifest
+            .files()
+            .chunks(wire::ARTIFACT_PAGE_FILES)
+            .enumerate()
+        {
+            messages.push(Message::ArtifactManifestPage {
+                page: wire::ArtifactPage::from_native(index * wire::ARTIFACT_PAGE_FILES, files)
+                    .unwrap(),
+            });
+            if window.record().unwrap() {
+                let count = window.count();
+                messages.push(Message::WindowEnd { count });
+                window.acknowledge(count).unwrap();
+            }
+        }
+        if window.pending() {
+            messages.push(Message::WindowEnd {
+                count: window.count(),
+            });
+        }
+        messages.push(Message::ArtifactManifestEnd {});
+        messages
+    }
+
+    fn artifact_fixture() -> (ArtifactManifest, Vec<u8>) {
+        let bytes = vec![0x91; MAX_SOURCE_CHUNK + 17];
+        let mut files = vec![SourceFile {
+            path: "program".into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            executable: true,
+        }];
+        files.extend((0..wire::ARTIFACT_PAGE_FILES * 5).map(|index| SourceFile {
+            path: format!("empty/{index:04}"),
+            len: 0,
+            sha256: Sha256::digest([]).into(),
+            executable: false,
+        }));
+        (ArtifactManifest::new(files).unwrap(), bytes)
+    }
+
+    #[test]
+    fn artifact_pages_and_payload_publish_only_after_exact_commit() {
+        let directory = private();
+        let destination = directory.path().join("completed");
+        let (manifest, bytes) = artifact_fixture();
+        let mut messages = artifact_manifest_messages(&manifest);
+        for (index, bytes) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            messages.push(Message::ArtifactChunk {
+                chunk: Chunk::new("program", (index * MAX_SOURCE_CHUNK) as u64, bytes).unwrap(),
+            });
+        }
+        messages.push(Message::WindowEnd { count: 2 });
+        messages.push(Message::ArtifactEnd {});
+        messages.push(Message::Commit {
+            manifest_sha256: encode_hex(&manifest.digest()),
+        });
+        let mut stream = AdmissionStream::new(&messages, false);
+        stream.quantum = 211;
+        let output = Arc::clone(&stream.output);
+        let mut wire = Wire::new(stream);
+        native(receive_target(
+            &mut wire,
+            ArtifactDeclaration::from_native(&manifest),
+            &destination,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(15),
+        ))
+        .unwrap();
+        assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(destination.join("empty")).unwrap().count(),
+            320
+        );
+        assert_eq!(
+            fs::metadata(destination.join("program")).unwrap().mode() & 0o777,
+            0o555
+        );
+        let sent = admission_messages(&output);
+        assert_eq!(
+            sent.iter()
+                .map(|message| message["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "receive-target",
+                "window",
+                "window",
+                "receive-artifacts",
+                "window",
+                "received",
+                "published"
+            ]
+        );
+        assert_eq!(sent[1]["count"], 4);
+        assert_eq!(sent[2]["count"], 6);
+        assert_eq!(sent[4]["count"], 2);
+        for index in [3, 5, 6] {
+            assert_eq!(
+                sent[index]["manifest_sha256"],
+                encode_hex(&manifest.digest())
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_manifest_phase_refuses_early_payload_truncation_and_unacknowledged_pages() {
+        let (manifest, _) = artifact_fixture();
+        for case in [
+            "payload-first",
+            "truncated",
+            "missing-window",
+            "wrong-window",
+            "repeated-page",
+        ] {
+            let directory = private();
+            let destination = directory.path().join("completed");
+            let first = || Message::ArtifactManifestPage {
+                page: wire::ArtifactPage::from_native(
+                    0,
+                    &manifest.files()[..wire::ARTIFACT_PAGE_FILES],
+                )
+                .unwrap(),
+            };
+            let messages = match case {
+                "payload-first" => vec![Message::ArtifactChunk {
+                    chunk: Chunk::new("program", 0, b"unrequested").unwrap(),
+                }],
+                "truncated" => vec![
+                    first(),
+                    Message::WindowEnd { count: 1 },
+                    Message::ArtifactManifestEnd {},
+                ],
+                "missing-window" => vec![first(), Message::ArtifactManifestEnd {}],
+                "wrong-window" => vec![first(), Message::WindowEnd { count: 2 }],
+                _ => vec![first(), first()],
+            };
+            let stream = AdmissionStream::new(&messages, false);
+            let output = Arc::clone(&stream.output);
+            let mut wire = Wire::new(stream);
+            let result = native(receive_target(
+                &mut wire,
+                ArtifactDeclaration::from_native(&manifest),
+                &destination,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(15),
+            ));
+            assert!(result.is_err(), "{case}");
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0, "{case}");
+            assert!(
+                admission_messages(&output).iter().all(|message| {
+                    !matches!(
+                        message["kind"].as_str(),
+                        Some("receive-artifacts" | "received" | "published")
+                    )
+                }),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_manifest_cannot_restart_after_payload_admission_or_authorize_wrong_commit() {
+        let (manifest, bytes) = artifact_fixture();
+        for case in ["second-manifest", "source-domain-commit"] {
+            let directory = private();
+            let destination = directory.path().join("completed");
+            let mut messages = artifact_manifest_messages(&manifest);
+            if case == "second-manifest" {
+                messages.push(Message::ArtifactManifestEnd {});
+            } else {
+                for (index, bytes) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                    messages.push(Message::ArtifactChunk {
+                        chunk: Chunk::new("program", (index * MAX_SOURCE_CHUNK) as u64, bytes)
+                            .unwrap(),
+                    });
+                }
+                messages.push(Message::WindowEnd { count: 2 });
+                messages.push(Message::ArtifactEnd {});
+                let source = SourceManifest::new(manifest.files().to_vec()).unwrap();
+                messages.push(Message::Commit {
+                    manifest_sha256: encode_hex(&source.digest()),
+                });
+            }
+            let mut stream = AdmissionStream::new(&messages, false);
+            stream.quantum = 211;
+            let output = Arc::clone(&stream.output);
+            let mut wire = Wire::new(stream);
+            assert!(
+                native(receive_target(
+                    &mut wire,
+                    ArtifactDeclaration::from_native(&manifest),
+                    &destination,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(15),
+                ))
+                .is_err(),
+                "{case}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                1,
+                "failed transfers retain their unexposed private staging evidence"
+            );
+            assert!(
+                admission_messages(&output)
+                    .iter()
+                    .all(|message| message["kind"] != "published")
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
