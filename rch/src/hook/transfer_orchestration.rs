@@ -5611,6 +5611,7 @@ sys.exit(99)
     #[test]
     fn go_runtime_targets_reuse_only_the_same_source_worker_and_lane() {
         use super::go_runtime_target_dir;
+        use std::path::Path;
 
         let root = Path::new("/data/projects/service");
         let base = "/data/tmp/rch";
