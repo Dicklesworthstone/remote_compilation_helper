@@ -3939,10 +3939,10 @@ impl TransferPipeline {
         Ok(Some(status))
     }
 
-    /// Resolve implicit rustc artifact names under the already-held source
+    /// Resolve native compiler output facts under the already-held source
     /// grant. This is a bounded read-only compiler query, not a second build:
     /// it never consumes the build's one-shot execution/completion identity.
-    pub(crate) async fn discover_rustc_output_names(
+    pub(crate) async fn discover_compiler_outputs(
         &self,
         worker: &WorkerConfig,
         query: &str,
@@ -3950,7 +3950,7 @@ impl TransferPipeline {
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
             !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
-            "rustc output discovery requires an owned POSIX source grant"
+            "compiler output discovery requires an owned POSIX source grant"
         );
         let budget = rch_common::timing::scale_duration(Duration::from_secs(30));
         let deadline = TokioInstant::now() + budget;
@@ -3970,10 +3970,10 @@ impl TransferPipeline {
             deadline,
         )
         .await
-        .context("rustc output-name query failed")?;
+        .context("compiler output query failed")?;
         anyhow::ensure!(
             output.status.success(),
-            "rustc output-name query failed (exit {:?}): {}",
+            "compiler output query failed (exit {:?}): {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );

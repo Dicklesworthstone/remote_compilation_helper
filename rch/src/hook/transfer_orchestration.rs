@@ -2593,9 +2593,23 @@ async fn execute_remote_compilation_inner(
             )
     {
         let names = pipeline
-            .discover_rustc_output_names(&worker_config, discovery.query(), toolchain)
+            .discover_compiler_outputs(&worker_config, discovery.query(), toolchain)
             .await?;
-        session.require_rustc_outputs(discovery.resolve(&names)?)?;
+        session.require_native_outputs(discovery.resolve(&names)?)?;
+    }
+    if let Some(session) = recovery_session.as_mut()
+        && let Some(discovery) =
+            super::artifact_patterns::direct_compiler::NativeOutputDiscovery::for_command(
+                kind,
+                policy_command,
+            )
+    {
+        let target = pipeline
+            .discover_compiler_outputs(&worker_config, discovery.query(), toolchain)
+            .await?;
+        if let Some(contract) = discovery.resolve(&target)? {
+            session.require_native_outputs(contract)?;
+        }
     }
     if reporter.cargo_json_stdout {
         recovery_session

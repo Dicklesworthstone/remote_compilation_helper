@@ -95,26 +95,37 @@ impl NativeOutputContract {
     }
 }
 
+/// Worker facts needed for native output naming. A POSIX transport alone does
+/// not distinguish ELF debug outputs from Darwin's post-link dSYM bundles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeOutputPlatform {
+    /// Artifact-pattern selection before a worker has been chosen.
+    Unspecified,
+    /// POSIX defaults, without an identified native debug-output convention.
+    Posix,
+    /// The selected compiler reported a Linux default target; overrides refuse.
+    Linux,
+}
+
 /// Implicit filenames are a property of the selected worker's compiler, not
 /// the dispatcher. Callers enable defaults only on a POSIX worker; explicit
 /// target/architecture options still decline implicit filename inference.
 pub(crate) fn native_output_contract(
     kind: Option<rch_common::CompilationKind>,
     command: &str,
-    posix_defaults: bool,
+    platform: NativeOutputPlatform,
 ) -> Option<NativeOutputContract> {
+    let posix_defaults = platform != NativeOutputPlatform::Unspecified;
     match kind? {
         rch_common::CompilationKind::Gcc => {
-            c_family_outputs(command, &["gcc", "cc"], false, posix_defaults)
+            c_family_outputs(command, &["gcc", "cc"], false, platform)
         }
         rch_common::CompilationKind::Gpp => {
-            c_family_outputs(command, &["g++", "c++"], false, posix_defaults)
+            c_family_outputs(command, &["g++", "c++"], false, platform)
         }
-        rch_common::CompilationKind::Clang => {
-            c_family_outputs(command, &["clang"], true, posix_defaults)
-        }
+        rch_common::CompilationKind::Clang => c_family_outputs(command, &["clang"], true, platform),
         rch_common::CompilationKind::Clangpp => {
-            c_family_outputs(command, &["clang++"], true, posix_defaults)
+            c_family_outputs(command, &["clang++"], true, platform)
         }
         rch_common::CompilationKind::GoBuild if posix_defaults => go_output_contract(command),
         rch_common::CompilationKind::GoTest if posix_defaults => {
@@ -158,6 +169,106 @@ pub(super) fn patterns(
             go_output_contract(command)?.patterns().ok()
         }
         _ => None,
+    }
+}
+
+/// Debug linking and split DWARF need the selected compiler's target, not the
+/// dispatcher's OS or the worker's optional scheduling tags. Resolve that one
+/// fact through a read-only driver query, then persist the same exact output
+/// contract used by ordinary retrieval and collection-only recovery.
+pub(in crate::hook) struct NativeOutputDiscovery {
+    contract: NativeOutputContract,
+    query: String,
+}
+
+impl NativeOutputDiscovery {
+    pub(in crate::hook) fn for_command(
+        kind: Option<rch_common::CompilationKind>,
+        command: &str,
+    ) -> Option<Self> {
+        let compilers: &[&str] = match kind? {
+            rch_common::CompilationKind::Gcc => &["gcc", "cc"],
+            rch_common::CompilationKind::Gpp => &["g++", "c++"],
+            rch_common::CompilationKind::Clang => &["clang"],
+            rch_common::CompilationKind::Clangpp => &["clang++"],
+            _ => return None,
+        };
+        if native_output_contract(kind, command, NativeOutputPlatform::Posix).is_some() {
+            return None;
+        }
+        let contract = native_output_contract(kind, command, NativeOutputPlatform::Linux)?;
+        let args = compiler_arguments(command, compilers)?;
+        let mut words = literal_words(command)?;
+        let compiler = words.len().checked_sub(args.len() + 1)?;
+        words.truncate(compiler + 1);
+        // No source, emission or destination argument reaches the query.
+        // Preserve the literal wrapper and environment selecting the driver.
+        words.push("-dumpmachine".into());
+        Some(Self {
+            contract,
+            query: super::super::join_exec_command(&words),
+        })
+    }
+
+    pub(in crate::hook) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(in crate::hook) fn resolve(
+        &self,
+        stdout: &[u8],
+    ) -> anyhow::Result<Option<NativeOutputContract>> {
+        anyhow::ensure!(
+            stdout.len() <= 256 && stdout.ends_with(b"\n"),
+            "incomplete or oversized native compiler target response"
+        );
+        let target = std::str::from_utf8(&stdout[..stdout.len() - 1])?;
+        anyhow::ensure!(
+            !target.is_empty()
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                && target.split('-').all(|component| !component.is_empty())
+                && target.split('-').count() >= 3,
+            "invalid native compiler target response"
+        );
+        // Other targets retain their existing output selection. In particular,
+        // a Darwin target may create a dSYM directory and a Windows target may
+        // create import libraries; neither is an ELF-only output contract.
+        // Linux must name the OS, not merely the vendor: Clang accepts targets
+        // such as x86_64-linux-darwin and produces Mach-O for them. Admit the
+        // ordinary vendor-qualified form and GCC's vendorless Linux/ABI form;
+        // unknown ABI/object-format suffixes retain the previous selection.
+        let linux_abi = |abi: &str| {
+            matches!(
+                abi,
+                "gnu"
+                    | "gnueabi"
+                    | "gnueabihf"
+                    | "gnuabi64"
+                    | "gnuabin32"
+                    | "gnux32"
+                    | "gnuspe"
+                    | "musl"
+                    | "musleabi"
+                    | "musleabihf"
+                    | "muslabi64"
+                    | "muslabin32"
+                    | "muslx32"
+                    | "uclibc"
+                    | "uclibceabi"
+                    | "uclibceabihf"
+                    | "android"
+                    | "androideabi"
+            )
+        };
+        let components: Vec<_> = target.split('-').collect();
+        let linux = match components.as_slice() {
+            [_, "linux", abi] | [_, _, "linux", abi] => linux_abi(abi),
+            [_, _, "linux"] => true,
+            _ => false,
+        };
+        Ok(linux.then(|| self.contract.clone()))
     }
 }
 
@@ -213,7 +324,7 @@ fn literal_words(command: &str) -> Option<Vec<String>> {
 /// Skip only wrappers whose argv and working directory are unchanged. Do not
 /// search arbitrary option values for a compiler name. env -C/-S, shells and
 /// unknown wrapper options require a different execution/root contract.
-fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> {
+pub(super) fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> {
     let words = literal_words(command)?;
     let assignment = |word: &str| {
         word.split_once('=')
@@ -321,7 +432,7 @@ fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> 
 /// A literal filename, not a caller-controlled rsync filter. Bracket quoting
 /// also forces rsync's wildcard parser for literal backslashes. Protect a
 /// leading '-' from the pipeline's special '- ' exclusion-rule convention.
-fn literal_file_pattern(path: &str) -> Option<String> {
+pub(super) fn literal_file_pattern(path: &str) -> Option<String> {
     if path.is_empty() || path.ends_with('/') || path.chars().any(char::is_control) {
         return None;
     }
@@ -439,6 +550,7 @@ struct RustcOutputSelection {
     output: Option<String>,
     output_dir: Option<String>,
     emissions: BTreeMap<String, Option<String>>,
+    explicit_crate_name: Option<String>,
     extra_filename: String,
     explicit_target: bool,
     query_arguments: Vec<String>,
@@ -480,17 +592,37 @@ pub(in crate::hook) struct RustcOutputDiscovery {
 impl RustcOutputDiscovery {
     pub(in crate::hook) fn for_command(command: &str) -> Option<Self> {
         let selection = rustc_output_selection(command)?;
-        if selection.explicit_paths().is_some()
-            || selection.output.is_some()
-            || selection.explicit_target
-        {
-            // Keep rustc's -o/multiple-unnamed-emissions adaptation outside
-            // this subset. --print=file-names does not describe that mapping.
+        if selection.explicit_paths().is_some() || selection.explicit_target {
             // Cross targets can add import libraries and other linker sidecars
             // absent from that query; a POSIX worker is not a POSIX target.
             return None;
         }
-        if let Some(directory) = &selection.output_dir
+        if let Some(output) = &selection.output {
+            // Two unnamed emissions make rustc adapt -o rather than use it
+            // literally. Keep the compiler's own linked-filename decision,
+            // and derive only its documented non-link extension mapping.
+            if output == "-"
+                || selection
+                    .emissions
+                    .values()
+                    .filter(|path| path.is_none())
+                    .count()
+                    < 2
+            {
+                return None;
+            }
+            literal_file_pattern(output)?;
+            // Unlike object/dep-info output, metadata uses a crate-name
+            // attribute when present, otherwise the adapted -o stem. The
+            // crate-name query does not reveal whether that attribute was
+            // present. Only an explicit --crate-name removes the ambiguity;
+            // a KIND=PATH metadata destination needs no such inference.
+            if selection.emissions.get("metadata") == Some(&None)
+                && selection.explicit_crate_name.is_none()
+            {
+                return None;
+            }
+        } else if let Some(directory) = &selection.output_dir
             && (directory.is_empty()
                 || directory.chars().any(char::is_control)
                 || !Path::new(directory)
@@ -508,14 +640,16 @@ impl RustcOutputDiscovery {
         // Insert before ordinary args, including a possible `--` separator.
         let options =
             compiler + 1 + usize::from(args.first().is_some_and(|arg| arg.starts_with('+')));
-        words.splice(
-            options..options,
-            [
-                "--print=file-names".into(),
-                "--print=crate-name".into(),
-                "--emit=link".into(),
-            ],
-        );
+        let mut query_options = vec!["--print=file-names".into(), "--print=crate-name".into()];
+        if let Some(output) = &selection.output {
+            // Preserve -o adaptation without the caller's dep-info request:
+            // --print may still write dep-info, whereas these two emissions
+            // stop before codegen and never create output files/directories.
+            query_options.extend(["--emit=link,metadata".into(), "-o".into(), output.clone()]);
+        } else {
+            query_options.push("--emit=link".into());
+        }
+        words.splice(options..options, query_options);
         Some(Self {
             selection,
             query: super::super::join_exec_command(&words),
@@ -549,9 +683,19 @@ impl RustcOutputDiscovery {
         );
         let crate_name = names.pop().unwrap();
         // Query output is a filename, not a directory path. rustc's print
-        // mode deliberately omits --out-dir, so apply that literal option
-        // exactly once. Explicit KIND=PATH emissions ignore --out-dir.
-        let directory = Path::new(self.selection.output_dir.as_deref().unwrap_or("."));
+        // mode omits placement. Adapted -o uses its own parent and ignores
+        // --out-dir; otherwise apply --out-dir once. KIND=PATH ignores both.
+        let adapted_output = self.selection.output.as_deref().map(Path::new);
+        let directory = adapted_output
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new(self.selection.output_dir.as_deref().unwrap_or(".")));
+        let ordinary_stem = match adapted_output {
+            Some(output) => output
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context("rustc adapted output has no valid filename stem")?,
+            None => crate_name,
+        };
         let mut paths = Vec::new();
         for (kind, path) in &self.selection.emissions {
             if let Some(path) = path {
@@ -563,20 +707,29 @@ impl RustcOutputDiscovery {
                     paths.push(directory.join(name).to_string_lossy().into_owned());
                 }
             } else {
-                let (prefix, suffix) = match kind.as_str() {
-                    "asm" => ("", "s"),
-                    "dep-info" => ("", "d"),
-                    "llvm-bc" => ("", "bc"),
-                    "llvm-ir" => ("", "ll"),
-                    "metadata" => ("lib", "rmeta"),
-                    "mir" => ("", "mir"),
-                    "obj" => ("", "o"),
+                let suffix = match kind.as_str() {
+                    "asm" => "s",
+                    "dep-info" => "d",
+                    "llvm-bc" => "bc",
+                    "llvm-ir" => "ll",
+                    "metadata" => "rmeta",
+                    "mir" => "mir",
+                    "obj" => "o",
                     _ => anyhow::bail!("unsupported rustc emission {kind}"),
                 };
-                let name = format!(
-                    "{prefix}{crate_name}{}.{suffix}",
-                    self.selection.extra_filename
-                );
+                let name = if kind == "metadata" {
+                    PathBuf::from(format!(
+                        "lib{crate_name}{}.rmeta",
+                        self.selection.extra_filename
+                    ))
+                } else {
+                    // OutputFilenames::with_directory_and_extension uses
+                    // set_extension, including dots inside -o or its extra
+                    // suffix; appending another suffix would select stale
+                    // files for names such as -o app.stage.bin.
+                    PathBuf::from(format!("{ordinary_stem}{}", self.selection.extra_filename))
+                        .with_extension(suffix)
+                };
                 paths.push(directory.join(name).to_string_lossy().into_owned());
             }
         }
@@ -587,7 +740,8 @@ impl RustcOutputDiscovery {
 
 /// Resolve named primary rustc emissions. KIND=PATH outranks -o; rustc adapts
 /// -o into inferred filenames only when MORE THAN ONE emission is unnamed.
-/// Refuse that inference rather than copying a stale file at the original -o.
+/// Those adapted names are resolved by RustcOutputDiscovery, never by copying
+/// a stale file at the original -o.
 /// No crate/source/target naming guesses or recursive --out-dir includes occur.
 /// `Some([])` is an explicitly stdout-only invocation, not an unknown layout.
 pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
@@ -612,6 +766,7 @@ fn rustc_output_selection(command: &str) -> Option<RustcOutputSelection> {
     }
     let mut output: Option<String> = None;
     let mut output_dir: Option<String> = None;
+    let mut explicit_crate_name: Option<String> = None;
     let mut extra_filename = String::new();
     let mut explicit_target = false;
     let mut emits = BTreeMap::new();
@@ -650,6 +805,17 @@ fn rustc_output_selection(command: &str) -> Option<RustcOutputSelection> {
             }
         } else if let Some(value) = arg.strip_prefix("--out-dir=") {
             if output_dir.replace(value.to_owned()).is_some() {
+                return None;
+            }
+        } else if arg == "--crate-name" {
+            if explicit_crate_name
+                .replace(iter.next()?.to_owned())
+                .is_some()
+            {
+                return None;
+            }
+        } else if let Some(value) = arg.strip_prefix("--crate-name=") {
+            if explicit_crate_name.replace(value.to_owned()).is_some() {
                 return None;
             }
         } else if arg == "--target" {
@@ -705,6 +871,7 @@ fn rustc_output_selection(command: &str) -> Option<RustcOutputSelection> {
         output,
         output_dir,
         emissions: emits,
+        explicit_crate_name,
         extra_filename,
         explicit_target,
         query_arguments,
@@ -769,7 +936,6 @@ fn c_plain_option(option: &str) -> bool {
             | "-fdata-sections"
             | "-m32"
             | "-m64"
-            | "-g0"
             | "-O"
             | "-O0"
             | "-O1"
@@ -798,13 +964,36 @@ fn c_plain_option(option: &str) -> bool {
         .any(|prefix| option.starts_with(*prefix))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeDebugLevel {
+    Off,
+    Lines,
+    Full,
+}
+
+/// These options change embedded debug information, not output filenames.
+/// Keep an exact grammar: -gmodules, split DWARF, compiler dumps, and other
+/// side-effecting options must never become ordinary flags by prefix matching.
+fn c_debug_level(option: &str, clang: bool) -> Option<NativeDebugLevel> {
+    match option {
+        "-g0" | "-ggdb0" => Some(NativeDebugLevel::Off),
+        "-g1" | "-ggdb1" => Some(NativeDebugLevel::Lines),
+        "-g" | "-g2" | "-g3" | "-ggdb" | "-ggdb2" | "-ggdb3" | "-gdwarf" | "-gdwarf-2"
+        | "-gdwarf-3" | "-gdwarf-4" | "-gdwarf-5" => Some(NativeDebugLevel::Full),
+        "--debug" if !clang => Some(NativeDebugLevel::Full),
+        "-gline-tables-only" | "-gline-directives-only" if clang => Some(NativeDebugLevel::Lines),
+        _ => None,
+    }
+}
+
 /// Native driver outputs with an explicit -o and their dependency sidecars.
 /// Without -MF, -MD/-MMD derives the depfile from -o for one ordinary C/C++
 /// source. Multi-input or language-overridden inference, preprocessing-only
-/// modes, raw subtool options, debug sidecars and response files retain the
-/// previous policy; they are not an exact selection.
+/// modes, raw subtool options and response files retain the previous policy.
+/// Split DWARF is supported for native Linux object compilation, including its
+/// required .dwo sidecar; linking/split-assembly and target overrides decline.
 fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<Vec<String>> {
-    c_family_outputs(command, compilers, clang, false)?
+    c_family_outputs(command, compilers, clang, NativeOutputPlatform::Unspecified)?
         .patterns()
         .ok()
 }
@@ -813,8 +1002,9 @@ fn c_family_outputs(
     command: &str,
     compilers: &[&str],
     clang: bool,
-    posix_defaults: bool,
+    platform: NativeOutputPlatform,
 ) -> Option<NativeOutputContract> {
+    let posix_defaults = platform != NativeOutputPlatform::Unspecified;
     let args = compiler_arguments(command, compilers)?;
     if args.iter().any(|arg| arg.starts_with('@')) {
         return None;
@@ -830,6 +1020,9 @@ fn c_family_outputs(
     let mut compile_only = false;
     let mut assembly_only = false;
     let mut llvm_emission = false;
+    let mut debug_level = NativeDebugLevel::Off;
+    let mut debug_option_seen = false;
+    let mut split_dwarf = false;
     while let Some(arg) = iter.next() {
         if arg == "--" {
             for input in iter {
@@ -878,6 +1071,13 @@ fn c_family_outputs(
             assembly_only = true;
         } else if arg == "-emit-llvm" {
             llvm_emission = true;
+        } else if let Some(level) = c_debug_level(arg, clang) {
+            debug_level = level;
+            debug_option_seen = true;
+        } else if arg == "-gsplit-dwarf" || clang && arg == "-gsplit-dwarf=split" {
+            split_dwarf = true;
+        } else if arg == "-gno-split-dwarf" {
+            split_dwarf = false;
         } else if c_value_option(arg) {
             language_override |= arg == "-x";
             target_override |= matches!(arg.as_str(), "-target" | "--target" | "-arch");
@@ -907,6 +1107,41 @@ fn c_family_outputs(
         }
     }
     let inputs = sources.len();
+    if debug_level != NativeDebugLevel::Off
+        && (target_override
+            || !compile_only && !assembly_only && platform != NativeOutputPlatform::Linux)
+    {
+        // A Darwin link can produce a dSYM directory. A declared Linux host
+        // does not authorize guessing the outputs of a cross-target driver.
+        return None;
+    }
+    let ordinary_source = |source: &str| {
+        Path::new(source)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext,
+                    "c" | "C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++" | "m" | "M" | "mm"
+                )
+            })
+    };
+    if split_dwarf
+        && (platform != NativeOutputPlatform::Linux
+            || !compile_only
+            || assembly_only
+            || llvm_emission
+            || language_override
+            || target_override
+            || inputs == 0
+            || !sources.iter().all(|source| ordinary_source(source))
+            // Clang's level-zero/location-only modes can suppress fission, unlike
+            // GCC (which still creates a .dwo). Admit only an explicit full
+            // debug level until that distinct output grammar is modeled.
+            || clang && (!debug_option_seen || debug_level != NativeDebugLevel::Full))
+    {
+        return None;
+    }
     if output.is_none() {
         if !posix_defaults
             || inputs == 0
@@ -920,17 +1155,6 @@ fn c_family_outputs(
         {
             return None;
         }
-        let ordinary_source = |source: &str| {
-            Path::new(source)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    matches!(
-                        ext,
-                        "c" | "C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++" | "m" | "M" | "mm"
-                    )
-                })
-        };
         if compile_only || assembly_only {
             let extension = if compile_only { "o" } else { "s" };
             let mut outputs = BTreeSet::new();
@@ -943,6 +1167,9 @@ fn c_family_outputs(
                 let output = format!("{stem}.{extension}");
                 if !outputs.insert(output) {
                     return None;
+                }
+                if split_dwarf {
+                    outputs.insert(format!("{stem}.dwo"));
                 }
             }
             return NativeOutputContract::from_paths(outputs);
@@ -965,6 +1192,25 @@ fn c_family_outputs(
         return None;
     }
     let mut paths = BTreeSet::from([output.clone()]);
+    if split_dwarf {
+        if inputs != 1 {
+            return None;
+        }
+        // GCC auxiliary outputs preserve a leading dot in an extensionless
+        // basename ('.hidden' -> '.hidden.dwo'), unlike its depfile spelling.
+        // LLVM's dotfile handling is different; keep that uncommon spelling
+        // outside the Clang subset until independently qualified.
+        let name = Path::new(&output).file_name()?.to_str()?;
+        if clang && name.starts_with('.') && !name[1..].contains('.') {
+            return None;
+        }
+        paths.insert(
+            Path::new(&output)
+                .with_extension("dwo")
+                .to_str()?
+                .to_owned(),
+        );
+    }
     if dependencies && depfile.is_none() {
         if inputs != 1 || language_override {
             return None;
@@ -1018,7 +1264,8 @@ mod tests {
             ),
             ("go build -o=target/app .", "target/app", "target/app"),
         ] {
-            let contract = native_output_contract(kind, command, true).unwrap();
+            let contract =
+                native_output_contract(kind, command, NativeOutputPlatform::Posix).unwrap();
             assert_eq!(
                 contract.required_files,
                 BTreeSet::from([PathBuf::from(path)])
@@ -1037,7 +1284,9 @@ mod tests {
                 super::super::get_custom_target_artifact_patterns(kind, Some(command)).is_empty()
             );
             assert!(super::super::kind_produces_transferable_artifacts(kind));
-            assert!(native_output_contract(kind, command, false).is_none());
+            assert!(
+                native_output_contract(kind, command, NativeOutputPlatform::Unspecified).is_none()
+            );
         }
         for command in [
             "go build .",
@@ -1048,7 +1297,7 @@ mod tests {
             "sh -c 'go build -o app .'",
         ] {
             assert!(
-                native_output_contract(kind, command, true).is_none(),
+                native_output_contract(kind, command, NativeOutputPlatform::Posix).is_none(),
                 "{command}"
             );
             if command != "go build ." {
@@ -1073,10 +1322,13 @@ mod tests {
                 ("-c 'src/odd[1]*?.c'", vec!["odd[[]1[]][*][?].o"]),
             ] {
                 let command = format!("{driver} {args}");
-                let contract = native_output_contract(Some(kind), &command, true).unwrap();
+                let contract =
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Posix)
+                        .unwrap();
                 assert_eq!(contract.patterns().unwrap(), expected, "{command}");
                 assert!(
-                    native_output_contract(Some(kind), &command, false).is_none(),
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Unspecified)
+                        .is_none(),
                     "implicit filenames must not be inferred for another worker platform"
                 );
             }
@@ -1108,9 +1360,393 @@ mod tests {
             ] {
                 let command = format!("{driver} {args}");
                 assert!(
-                    native_output_contract(Some(kind), &command, true).is_none(),
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Posix)
+                        .is_none(),
                     "{command}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn native_debug_outputs_use_the_selected_worker_and_exact_flag_grammar() {
+        use rch_common::CompilationKind;
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            for debug in [
+                "-g",
+                "-g1",
+                "-g2",
+                "-g3",
+                "-ggdb",
+                "-ggdb3",
+                "-gdwarf-4",
+                "-gdwarf-5",
+            ] {
+                let command =
+                    format!("{driver} -c {debug} -O2 main.c -o 'objects/item[dev].o' -MMD");
+                let contract =
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Posix)
+                        .unwrap();
+                assert_eq!(
+                    contract.required_files,
+                    BTreeSet::from([
+                        PathBuf::from("objects/item[dev].d"),
+                        PathBuf::from("objects/item[dev].o")
+                    ]),
+                    "{command}"
+                );
+                assert_eq!(
+                    contract.patterns().unwrap(),
+                    vec!["objects/item[[]dev[]].d", "objects/item[[]dev[]].o"]
+                );
+                assert_eq!(
+                    patterns(Some(kind), Some(&command)).unwrap(),
+                    contract.patterns().unwrap()
+                );
+
+                let command = format!("{driver} {debug} -O2 main.c -o application");
+                assert_eq!(
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux)
+                        .unwrap()
+                        .required_files,
+                    BTreeSet::from([PathBuf::from("application")]),
+                    "{command}"
+                );
+                for platform in [
+                    NativeOutputPlatform::Unspecified,
+                    NativeOutputPlatform::Posix,
+                ] {
+                    assert!(
+                        native_output_contract(Some(kind), &command, platform).is_none(),
+                        "a POSIX transport does not establish Linux debug linking: {command}"
+                    );
+                }
+            }
+            for args in [
+                "-g --target=x86_64-pc-windows-gnu -c main.c -o output.o",
+                "-g -arch arm64 -c main.c -o output.o",
+                "-g -m32 -c main.c -o output.o",
+                "-gmodules -c main.c -o output.o",
+                "-gen-reproducer=always -c main.c -o output.o",
+                "-g -save-temps -c main.c -o output.o",
+                "-g -Xclang -split-dwarf-output -Xclang foreign.dwo -c main.c -o output.o",
+            ] {
+                let command = format!("{driver} {args}");
+                assert!(
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux)
+                        .is_none(),
+                    "{command}"
+                );
+            }
+            // Retain the already supported explicit no-debug spelling.
+            assert!(
+                native_output_contract(
+                    Some(kind),
+                    &format!("{driver} -g0 main.c -o application"),
+                    NativeOutputPlatform::Unspecified
+                )
+                .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn native_split_dwarf_contract_requires_every_object_sidecar() {
+        use rch_common::CompilationKind;
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            let command = format!(
+                "{driver} -g -gsplit-dwarf -c main.c -o 'objects/item[dev].o' -MMD -MF reports/input.d"
+            );
+            let contract =
+                native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux).unwrap();
+            assert_eq!(
+                contract.required_files,
+                BTreeSet::from([
+                    PathBuf::from("objects/item[dev].o"),
+                    PathBuf::from("objects/item[dev].dwo"),
+                    PathBuf::from("reports/input.d"),
+                ])
+            );
+            for platform in [
+                NativeOutputPlatform::Unspecified,
+                NativeOutputPlatform::Posix,
+            ] {
+                assert!(native_output_contract(Some(kind), &command, platform).is_none());
+            }
+            let command = format!("{driver} -g -gsplit-dwarf -c main.c lib/helper.cpp");
+            assert_eq!(
+                native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux)
+                    .unwrap()
+                    .required_files,
+                BTreeSet::from(["main.o", "main.dwo", "helper.o", "helper.dwo"].map(PathBuf::from))
+            );
+            for args in [
+                "-g -gsplit-dwarf main.c -o app",
+                "-g -gsplit-dwarf -S main.c -o output.s",
+                "-g -gsplit-dwarf -c main.c -o output.o --target=x86_64-pc-windows-gnu",
+                "-g -gsplit-dwarf -emit-llvm -c main.c -o output.bc",
+                "-g -gsplit-dwarf -x c -c main.c -o output.o",
+                "-g -gsplit-dwarf -c main.c -o output.o -dumpbase renamed",
+                "-g -gsplit-dwarf -c main.c -o output.o -dumpdir outside/",
+                "-g -gsplit-dwarf -c first/same.c second/same.c",
+                "-g -gsplit-dwarf -c assembly.S -o output.o",
+            ] {
+                let command = format!("{driver} {args}");
+                assert!(
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux)
+                        .is_none(),
+                    "{command}"
+                );
+            }
+            let command =
+                format!("{driver} -g -gsplit-dwarf -gno-split-dwarf -c main.c -o output.o");
+            assert_eq!(
+                native_output_contract(Some(kind), &command, NativeOutputPlatform::Linux)
+                    .unwrap()
+                    .patterns()
+                    .unwrap(),
+                vec!["output.o"]
+            );
+        }
+        for command in [
+            "gcc -gsplit-dwarf -c main.c -o output.o",
+            "gcc -g0 -gsplit-dwarf -c main.c -o output.o",
+            "gcc -gsplit-dwarf -g0 -c main.c -o output.o",
+        ] {
+            assert_eq!(
+                native_output_contract(
+                    Some(CompilationKind::Gcc),
+                    command,
+                    NativeOutputPlatform::Linux
+                )
+                .unwrap()
+                .patterns()
+                .unwrap(),
+                vec!["output.dwo", "output.o"]
+            );
+        }
+        assert_eq!(
+            native_output_contract(
+                Some(CompilationKind::Gcc),
+                "gcc -g -gsplit-dwarf -c main.c -o products/.hidden -MMD",
+                NativeOutputPlatform::Linux
+            )
+            .unwrap()
+            .patterns()
+            .unwrap(),
+            vec!["products/.d", "products/.hidden", "products/.hidden.dwo"]
+        );
+        for args in [
+            "-gsplit-dwarf",
+            "-g -gsplit-dwarf -g0",
+            "-gdwarf-5 -g0 -gsplit-dwarf",
+            "-gline-tables-only -gsplit-dwarf",
+            "-g -gsplit-dwarf=unknown",
+        ] {
+            let command = format!("clang {args} -c main.c -o output.o");
+            assert!(
+                native_output_contract(
+                    Some(CompilationKind::Clang),
+                    &command,
+                    NativeOutputPlatform::Linux
+                )
+                .is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_debug_discovery_queries_only_the_selected_driver_target() {
+        use rch_common::CompilationKind;
+        for (command, expected) in [
+            ("gcc -g main.c -o application", vec!["gcc", "-dumpmachine"]),
+            (
+                "env -- CCACHE_DISABLE=1 sccache gcc-14 -g -gsplit-dwarf -c main.c -o output.o",
+                vec![
+                    "env",
+                    "--",
+                    "CCACHE_DISABLE=1",
+                    "sccache",
+                    "gcc-14",
+                    "-dumpmachine",
+                ],
+            ),
+        ] {
+            let discovery =
+                NativeOutputDiscovery::for_command(Some(CompilationKind::Gcc), command).unwrap();
+            assert_eq!(shell_words::split(discovery.query()).unwrap(), expected);
+            for target in [
+                b"x86_64-linux-gnu\n".as_slice(),
+                b"aarch64-unknown-linux-gnu\n",
+                b"arm-linux-gnueabihf\n",
+                b"aarch64-linux-musl\n",
+                b"x86_64-unknown-linux\n",
+            ] {
+                assert!(discovery.resolve(target).unwrap().is_some());
+            }
+            for target in [
+                b"x86_64-apple-darwin24\n".as_slice(),
+                b"x86_64-w64-mingw32\n",
+                b"x86_64-unknown-linuxish\n",
+                b"x86_64-linux-darwin\n",
+                b"x86_64-linux-windows-gnu\n",
+                b"x86_64-unknown-linux-coff\n",
+                b"x86_64-unknown-linux-gnu-coff\n",
+            ] {
+                assert!(discovery.resolve(target).unwrap().is_none());
+            }
+            for target in [
+                b"".as_slice(),
+                b"x86_64-linux-gnu",
+                b"x86_64-linux-gnu\n\n",
+                b"banner\nx86_64-linux-gnu\n",
+                b"x86_64--linux\n",
+                b"x86_64-linux-gnu\0\n",
+            ] {
+                assert!(discovery.resolve(target).is_err(), "{target:?}");
+            }
+        }
+        for command in [
+            "gcc -g -c main.c -o output.o", // Output is platform independent.
+            "gcc -g0 main.c -o application",
+            "gcc -g main.c -o application --target=x86_64-linux-gnu",
+            "gcc -g -gsplit-dwarf main.c -o application", // Link-sidecar grammar differs.
+            "gcc @response",
+            "sh -c 'gcc -g main.c -o application'",
+        ] {
+            assert!(
+                NativeOutputDiscovery::for_command(Some(CompilationKind::Gcc), command).is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_native_debug_outputs_match_the_complete_compiler_inventory() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        async fn run(command: &mut Command) -> std::process::Output {
+            let output = rch_common::ssh::capture_control_output(
+                command,
+                None,
+                64 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .expect("owned native debug fixture failed or exceeded its deadline");
+            assert!(output.status.success(), "{output:?}");
+            output
+        }
+        fn files(root: &Path, directory: &Path, found: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files(root, &path, found);
+                } else if !matches!(
+                    path.strip_prefix(root).unwrap().to_str(),
+                    Some("main.c" | "src/helper.c")
+                ) {
+                    found.insert(path.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+
+        let owner = tempfile::tempdir().unwrap();
+        for (kind, driver) in [
+            (rch_common::CompilationKind::Gcc, "gcc"),
+            (rch_common::CompilationKind::Clang, "clang"),
+        ] {
+            // GCC is the required reference; qualify Clang independently when
+            // installed, never substitute GCC for a missing second compiler.
+            if driver == "clang" {
+                let mut version = Command::new(driver);
+                version.arg("--version");
+                match rch_common::ssh::capture_control_output(
+                    &mut version,
+                    None,
+                    64 * 1024,
+                    64 * 1024,
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                )
+                .await
+                {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        eprintln!(
+                            "Clang debug-output qualification skipped: clang is not installed"
+                        );
+                        continue;
+                    }
+                    Err(error) => panic!("Clang version probe failed: {error}"),
+                    Ok(output) => assert!(output.status.success(), "{output:?}"),
+                }
+            }
+            for (index, arguments) in [
+                "-g -O2 main.c -o application",
+                "-ggdb3 -c main.c -o 'objects/item[dev].o' -MMD -MF reports/input.d",
+                "-gdwarf-5 -g1 -S main.c -o objects/item.s",
+                "-g -gsplit-dwarf -c main.c -o objects/item.o -MMD",
+                "-g -gsplit-dwarf -c main.c src/helper.c",
+                "-g -gsplit-dwarf -gno-split-dwarf -c main.c -o objects/item.o",
+                "-g0 -gdwarf-5 -gsplit-dwarf -c main.c -o objects/item.o",
+                "-g1 -gdwarf-5 -gsplit-dwarf -c main.c -o objects/item.o",
+                "-g1 -ggdb -gsplit-dwarf -c main.c -o objects/item.o",
+            ]
+            .into_iter()
+            .chain((driver == "clang").then_some(
+                "-gline-tables-only -gdwarf-5 -gsplit-dwarf -c main.c -o objects/item.o",
+            ))
+            .enumerate()
+            {
+                let root = owner.path().join(format!("{driver}-{index}"));
+                for directory in ["objects", "reports", "src"] {
+                    std::fs::create_dir_all(root.join(directory)).unwrap();
+                }
+                std::fs::write(root.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+                std::fs::write(
+                    root.join("src/helper.c"),
+                    b"int helper(void) { return 37; }\n",
+                )
+                .unwrap();
+                let command = format!("{driver} {arguments}");
+                let contract = if let Some(discovery) =
+                    NativeOutputDiscovery::for_command(Some(kind), &command)
+                {
+                    let mut query = Command::new("sh");
+                    query.args(["-c", discovery.query()]).current_dir(&root);
+                    let target = run(&mut query).await;
+                    let mut before = BTreeSet::new();
+                    files(&root, &root, &mut before);
+                    assert!(before.is_empty(), "target query created outputs");
+                    discovery
+                        .resolve(&target.stdout)
+                        .unwrap()
+                        .expect("native Linux fixture requires a Linux compiler")
+                } else {
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Posix)
+                        .unwrap()
+                };
+                assert!(contract.verify_staged(&root).is_err());
+                let mut compiler = Command::new("sh");
+                compiler.args(["-c", &command]).current_dir(&root);
+                run(&mut compiler).await;
+                let mut emitted = BTreeSet::new();
+                files(&root, &root, &mut emitted);
+                assert_eq!(contract.required_files, emitted, "{command}");
+                contract.verify_staged(&root).unwrap();
             }
         }
     }
@@ -1119,7 +1755,7 @@ mod tests {
     fn native_explicit_contract_keeps_raw_paths_and_all_sidecars() {
         use rch_common::CompilationKind;
         let contract = native_output_contract(Some(CompilationKind::Clang),
-            "clang -c main.c -o './products/item[1]*?.o' -MMD -MF reports/input.d -MJ reports/compile.json", false).unwrap();
+            "clang -c main.c -o './products/item[1]*?.o' -MMD -MF reports/input.d -MJ reports/compile.json", NativeOutputPlatform::Unspecified).unwrap();
         assert_eq!(
             contract.required_files,
             BTreeSet::from([
@@ -1198,7 +1834,7 @@ mod tests {
     fn rustc_named_contract_requires_every_selected_native_output() {
         let kind = Some(rch_common::CompilationKind::Rustc);
         let command = "rustc main.rs --emit=link=products/app,dep-info=products/inputs.d";
-        let contract = native_output_contract(kind, command, true).unwrap();
+        let contract = native_output_contract(kind, command, NativeOutputPlatform::Posix).unwrap();
         assert_eq!(
             contract.required_files,
             BTreeSet::from([
@@ -1206,9 +1842,9 @@ mod tests {
                 PathBuf::from("products/inputs.d"),
             ])
         );
-        assert!(native_output_contract(kind, command, false).is_none());
+        assert!(native_output_contract(kind, command, NativeOutputPlatform::Unspecified).is_none());
         let cross = "rustc main.rs --crate-type=cdylib --target=x86_64-pc-windows-gnu -o out.dll";
-        assert!(native_output_contract(kind, cross, true).is_none());
+        assert!(native_output_contract(kind, cross, NativeOutputPlatform::Posix).is_none());
         assert_eq!(rustc_patterns(cross).unwrap(), vec!["out.dll"]);
     }
 
@@ -1220,6 +1856,9 @@ mod tests {
             "env RUST_BACKTRACE=1 rustup run nightly rustc main.rs --emit=link,dep-info",
             "sccache rustc --crate-type rlib -- ./main.rs",
             "rustc main.rs --emit=metadata --codegen extra-filename=-unique",
+            "rustc main.rs --emit=link,dep-info -o dist/app",
+            "rustc +nightly --emit=obj,dep-info -o 'products with spaces/app.o' -- ./main.rs",
+            "rustc --crate-name selected main.rs --emit=link,metadata,dep-info -o dist/app",
         ] {
             let discovery = RustcOutputDiscovery::for_command(command).unwrap();
             let query = shell_words::split(discovery.query()).unwrap();
@@ -1252,6 +1891,9 @@ mod tests {
             "rustc main.rs -o app",       // Already has an explicit contract.
             "rustc main.rs --emit=asm=-", // Only stdout.
             "rustc main.rs --emit=link,metadata -o adapted",
+            "rustc main.rs --emit=obj,dep-info -o -",
+            "rustc main.rs --emit=obj,dep-info -o ../outside",
+            "rustc main.rs --emit=obj,dep-info -o /outside",
             "rustc main.rs --out-dir ../outside",
             "rustc main.rs --out-dir /outside",
             "rustc main.rs --target=x86_64-pc-windows-gnu",
@@ -1286,6 +1928,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rustc_adapted_output_query_preserves_names_without_emitting_dep_info() {
+        let discovery = RustcOutputDiscovery::for_command(
+            "rustc main.rs --cfg '--emit=dep-info' --emit=link,dep-info,obj -o 'products/app.stage.bin' --out-dir ignored",
+        )
+        .unwrap();
+        assert_eq!(
+            shell_words::split(discovery.query()).unwrap(),
+            [
+                "rustc",
+                "--print=file-names",
+                "--print=crate-name",
+                "--emit=link,metadata",
+                "-o",
+                "products/app.stage.bin",
+                "main.rs",
+                "--cfg",
+                "--emit=dep-info",
+            ]
+        );
+        let contract = discovery
+            .resolve(b"compiler_selected_link\ncrate_identity\n")
+            .unwrap();
+        assert_eq!(
+            contract.required_files,
+            BTreeSet::from([
+                PathBuf::from("products/compiler_selected_link"),
+                PathBuf::from("products/app.d"),
+                PathBuf::from("products/app.o"),
+            ])
+        );
+        assert!(
+            rustc_patterns("rustc main.rs --emit=link,dep-info,obj -o products/app.stage.bin")
+                .is_none(),
+            "the preflight must bind the compiler-resolved contract"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn real_rustc_discovery_matches_exact_default_and_emitted_files() {
@@ -1314,6 +1994,15 @@ mod tests {
             "rustc main.rs --emit=link,dep-info=explicit.d --out-dir dist",
             "rustc main.rs --emit=asm=-,metadata --out-dir dist",
             "rustc --crate-name overridden main.rs --emit=obj,dep-info -Cextra-filename=-v3",
+            "rustc main.rs --emit=link,dep-info -o dist/app",
+            "rustc main.rs --emit=asm,obj,dep-info,llvm-bc,llvm-ir,mir -o dist/result.stage.bin -Cextra-filename=-v1.2",
+            "rustc main.rs --crate-type=rlib,cdylib --emit=link,dep-info -o dist/multitype.ext",
+            "rustc main.rs --emit=link,dep-info,metadata=explicit.rmeta -o 'products with spaces/app' --out-dir ignored",
+            "rustc --crate-name overridden main.rs --emit=link,metadata,dep-info -o dist/alternate",
+            "rustc --crate-name=attribute_name main.rs --emit=metadata,dep-info -o dist/alternate",
+            "rustc main.rs --emit=link=explicit,dep-info,obj -o dist/chosen",
+            "rustc main.rs --emit=asm=-,obj,dep-info -o dist/stdout",
+            "rustc main.rs --emit=asm,obj,dep-info,metadata -Cextra-filename=-v1.2",
         ];
         for (index, command) in cases.into_iter().enumerate() {
             let root = owner.path().join(index.to_string());
@@ -1352,9 +2041,9 @@ mod tests {
                 source
             );
             assert!(contract.verify_staged(&root).is_err());
-            if let Some(directory) = &discovery.selection.output_dir {
-                // rustc can write dep-info before creating --out-dir itself.
-                std::fs::create_dir_all(root.join(directory)).unwrap();
+            for output in &contract.required_files {
+                // rustc can write dep-info before creating its output parent.
+                std::fs::create_dir_all(root.join(output).parent().unwrap()).unwrap();
             }
             let mut compiler = Command::new("sh");
             compiler.args(["-c", command]).current_dir(&root);
@@ -1411,9 +2100,12 @@ mod tests {
             // that selected file. The static contract must follow the actual
             // invocation, not substitute the query's incompatible naming rule.
             assert!(RustcOutputDiscovery::for_command(command).is_none());
-            let contract =
-                native_output_contract(Some(rch_common::CompilationKind::Rustc), command, true)
-                    .unwrap();
+            let contract = native_output_contract(
+                Some(rch_common::CompilationKind::Rustc),
+                command,
+                NativeOutputPlatform::Posix,
+            )
+            .unwrap();
             assert_eq!(
                 contract.required_files,
                 BTreeSet::from([PathBuf::from("products/selected")])

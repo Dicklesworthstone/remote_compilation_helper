@@ -1,6 +1,6 @@
 //! Durable source ownership and identity-bound collection. Never replays a command.
 use super::super::artifact_patterns::direct_compiler::{
-    NativeOutputContract, native_output_contract,
+    NativeOutputContract, NativeOutputPlatform, native_output_contract,
 };
 use super::super::cargo_output_contract::{
     CargoCallerPaths, CargoOutputCapture, CargoOutputContract,
@@ -1509,7 +1509,7 @@ impl RecoverySession {
         );
         let mut phases = Vec::new();
         let native_outputs = (!WorkerPlatform::from_worker(worker).is_windows())
-            .then(|| native_output_contract(kind, command, true))
+            .then(|| native_output_contract(kind, command, NativeOutputPlatform::Posix))
             .flatten();
         let project_patterns = match &native_outputs {
             Some(contract) => contract.patterns()?,
@@ -2352,23 +2352,33 @@ impl RecoverySession {
         self.persist_next_recipe(next)
     }
 
-    /// Install the compiler-resolved implicit Rust outputs before execution.
-    /// Replacing the old Cargo-shaped globs is essential: they can neither
-    /// discover a root-level rustc binary nor prove that it was delivered.
-    pub(crate) fn require_rustc_outputs(
+    /// Install compiler-resolved Rust/C/C++ outputs before execution. Replacing
+    /// broad fallback globs makes every native output and sidecar mandatory,
+    /// even if Cargo target settings are present in the caller's environment.
+    pub(crate) fn require_native_outputs(
         &mut self,
         contract: NativeOutputContract,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.recipe.kind == Some(CompilationKind::Rustc)
-                && self.recipe.prepared
+            matches!(
+                self.recipe.kind,
+                Some(
+                    CompilationKind::Rustc
+                        | CompilationKind::Gcc
+                        | CompilationKind::Gpp
+                        | CompilationKind::Clang
+                        | CompilationKind::Clangpp
+                )
+            ) && self.recipe.prepared
                 && !self.recipe.execution_started
                 && !self.recipe.preparation_cancelled
                 && self.recipe.exit_code.is_none()
                 && !self.recipe.sources_released
                 && !self.recipe.retired
-                && !self.recipe.phases.iter().any(|phase| phase.custom_target),
-            "rustc output discovery requires an unconsumed project-output session"
+                && self.recipe.phases.iter().all(|phase| !phase.complete
+                    && phase.pending.is_none()
+                    && phase.published.is_empty()),
+            "native output discovery requires an unconsumed project-output session"
         );
         let patterns = contract.patterns()?;
         let mut next = self.recipe.clone();
@@ -2376,17 +2386,22 @@ impl RecoverySession {
             .phases
             .iter_mut()
             .find(|phase| phase.name == "project")
-            .context("rustc output discovery has no project publication phase")?;
+            .context("native output discovery has no project publication phase")?;
         anyhow::ensure!(
             phase.native_outputs.is_none()
                 && phase.cargo_outputs.is_none()
                 && !phase.complete
                 && phase.pending.is_none()
                 && phase.published.is_empty(),
-            "rustc output discovery cannot replace a previously bound output contract"
+            "native output discovery cannot replace a previously bound output contract"
         );
         phase.patterns = patterns;
         phase.native_outputs = Some(contract);
+        // Keep the legacy target fallback until the selected compiler has
+        // actually established its native naming convention. A non-Linux
+        // target may decline discovery without losing a prepared phase; a
+        // resolved native contract instead owns only project-relative files.
+        next.phases.retain(|phase| !phase.custom_target);
         self.persist_next_recipe(next)
     }
 
@@ -8108,6 +8123,8 @@ mod tests {
             "rustc main.rs",
             "rustc main.rs --crate-type=rlib --emit=link,metadata,dep-info --out-dir dist",
             "rustc main.rs -o dist/explicit",
+            "rustc main.rs --emit=link,dep-info -o dist/adapted.bin",
+            "rustc main.rs --crate-type=rlib,cdylib --emit=link,dep-info -o dist/libraries.bin",
         ] {
             let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
@@ -8152,8 +8169,8 @@ mod tests {
                 let output = run(&mut query).await;
                 assert!(output.status.success(), "{command}: {output:?}");
                 let contract = discovery.resolve(&output.stdout).unwrap();
-                session.require_rustc_outputs(contract.clone()).unwrap();
-                assert!(session.require_rustc_outputs(contract).is_err());
+                session.require_native_outputs(contract.clone()).unwrap();
+                assert!(session.require_native_outputs(contract).is_err());
             }
             assert!(session.has_native_output_contract());
             assert_eq!(session.recipe.phases.len(), 1);
@@ -9172,6 +9189,7 @@ func TestValue(t *testing.T) {{
     #[cfg(unix)]
     #[tokio::test]
     async fn real_native_outputs_are_complete_before_publication_and_survive_recovery() {
+        use super::super::artifact_patterns::direct_compiler::NativeOutputDiscovery;
         use tokio::process::Command;
         async fn run(command: &mut Command) -> std::process::Output {
             command.stdin(Stdio::null()).kill_on_drop(true);
@@ -9184,7 +9202,7 @@ func TestValue(t *testing.T) {{
         }
 
         let _guard = test_guard!();
-        for (argv, expected, missing_index) in [
+        let ordinary = [
             (vec!["main.c", "lib/helper.c"], vec!["a.out"], 0),
             (
                 vec!["-c", "main.c", "lib/helper.c"],
@@ -9222,7 +9240,44 @@ func TestValue(t *testing.T) {{
                 vec!["target/app.d", "target/app[dev]*?"],
                 0,
             ),
-        ] {
+        ];
+        // The debug-link/split-DWARF extension is qualified against native
+        // Linux driver targets. Keep all original POSIX cases on other hosts.
+        let linux_debug = [
+            (
+                vec!["-g", "main.c", "lib/helper.c", "-o", "application"],
+                vec!["application"],
+                0,
+            ),
+            (
+                vec!["-c", "-ggdb3", "main.c", "-o", "products/main.o", "-MMD"],
+                vec!["products/main.d", "products/main.o"],
+                1,
+            ),
+            (
+                vec![
+                    "-c",
+                    "-g",
+                    "-gsplit-dwarf",
+                    "main.c",
+                    "-o",
+                    "products/main.o",
+                    "-MMD",
+                ],
+                vec!["products/main.d", "products/main.dwo", "products/main.o"],
+                1,
+            ),
+            (
+                vec!["-c", "-g", "-gsplit-dwarf", "main.c", "lib/helper.c"],
+                vec!["helper.dwo", "helper.o", "main.dwo", "main.o"],
+                0,
+            ),
+        ];
+        for (argv, expected, missing_index) in ordinary.into_iter().chain(
+            linux_debug
+                .into_iter()
+                .filter(|_| cfg!(target_os = "linux")),
+        ) {
             let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
@@ -9273,6 +9328,37 @@ func TestValue(t *testing.T) {{
                 identity,
             )
             .unwrap();
+            if let Some(discovery) =
+                NativeOutputDiscovery::for_command(Some(CompilationKind::Gcc), &command)
+            {
+                // Declining a non-Linux target must preserve both prepared
+                // fallback phases, including a forwarded Cargo target. Only
+                // a positively resolved contract may remove that phase.
+                assert!(!session.has_native_output_contract());
+                assert!(
+                    discovery
+                        .resolve(b"x86_64-apple-darwin24\n")
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    !session
+                        .cargo_artifact_patterns("target")
+                        .unwrap()
+                        .is_empty()
+                );
+                let mut query = Command::new("sh");
+                query.args(["-c", discovery.query()]).current_dir(&remote);
+                let observed = run(&mut query).await;
+                session
+                    .require_native_outputs(
+                        discovery
+                            .resolve(&observed.stdout)
+                            .unwrap()
+                            .expect("Linux debug fixture requires a Linux compiler"),
+                    )
+                    .unwrap();
+            }
             assert!(session.has_native_output_contract());
             assert_eq!(
                 session.recipe.phases.len(),
