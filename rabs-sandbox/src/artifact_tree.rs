@@ -28,6 +28,17 @@ pub const MAX_PRIVATE_TREE_ENTRIES: usize = 131_072;
 pub const MAX_PRIVATE_TREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Leave room for result/retention metadata in a bounded transport record.
 pub const MAX_TREE_MANIFEST_BYTES: usize = 512 * 1024;
+/// Regular files in the independently negotiated, paged artifact contract.
+/// The original `tree-files-v1` and source-upload limits remain unchanged.
+pub const MAX_ARTIFACT_FILES: usize = 16_384;
+/// Directories and files in a paged artifact tree, including empty directories.
+pub const MAX_ARTIFACT_ENTRIES: usize = 65_536;
+/// Complete artifact bytes for one operation. Payloads stream in fixed chunks;
+/// this is a storage bound, never permission to allocate a target-sized buffer.
+pub const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Canonical declaration bytes across all artifact manifest pages. This bounds
+/// metadata independently of payload size and each transport record's limit.
+pub const MAX_ARTIFACT_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -52,7 +63,26 @@ fn valid_path(path: &str) -> bool {
 pub fn validate_tree_names<'a>(
     paths: impl IntoIterator<Item = &'a str>,
 ) -> io::Result<BTreeSet<String>> {
-    validate_names(paths, MAX_TREE_FILES)
+    validate_names(paths, MAX_TREE_FILES, None)
+}
+
+/// Validate the larger, explicitly negotiated artifact namespace. A source
+/// upload or a legacy `tree-files-v1` offer must still use its own validator.
+/// Bound both implicit parent directories and the complete canonical manifest
+/// before the sender copies output bytes or the receiver creates any paths.
+pub fn validate_artifact_names<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> io::Result<BTreeSet<String>> {
+    let names = validate_names(paths, MAX_ARTIFACT_FILES, Some(MAX_ARTIFACT_ENTRIES))?;
+    let mut metadata_bytes = b"rabs.artifact-files.v1\0".len() + 8;
+    for name in &names {
+        // path-length frame, path, file length, executable bit, SHA-256.
+        metadata_bytes = metadata_bytes
+            .checked_add(8 + name.len() + 8 + 1 + 32)
+            .filter(|bytes| *bytes <= MAX_ARTIFACT_MANIFEST_BYTES)
+            .ok_or_else(|| invalid("artifact manifest metadata limit exceeded"))?;
+    }
+    Ok(names)
 }
 
 /// Validate a complete private compiler-state namespace without granting an
@@ -60,12 +90,13 @@ pub fn validate_tree_names<'a>(
 pub fn validate_private_tree_names<'a>(
     paths: impl IntoIterator<Item = &'a str>,
 ) -> io::Result<BTreeSet<String>> {
-    validate_names(paths, MAX_PRIVATE_TREE_FILES)
+    validate_names(paths, MAX_PRIVATE_TREE_FILES, None)
 }
 
 fn validate_names<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     max_files: usize,
+    max_entries: Option<usize>,
 ) -> io::Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
     let mut namespace: BTreeMap<String, (String, bool)> = BTreeMap::new();
@@ -89,6 +120,9 @@ fn validate_names<'a>(
                 }
                 Some(_) => {}
                 None => {
+                    if max_entries.is_some_and(|limit| namespace.len() >= limit) {
+                        return Err(invalid("artifact manifest directory entry limit exceeded"));
+                    }
                     namespace.insert(folded, (prefix.to_owned(), is_file));
                 }
             }
@@ -106,8 +140,9 @@ pub use linux::TreeInventory;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        MAX_PRIVATE_TREE_BYTES, MAX_PRIVATE_TREE_ENTRIES, MAX_PRIVATE_TREE_FILES, MAX_TREE_ENTRIES,
-        MAX_TREE_FILES, invalid, valid_path, validate_names, validate_private_tree_names,
+        MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_FILES, MAX_PRIVATE_TREE_BYTES,
+        MAX_PRIVATE_TREE_ENTRIES, MAX_PRIVATE_TREE_FILES, MAX_TREE_ENTRIES, MAX_TREE_FILES,
+        invalid, valid_path, validate_artifact_names, validate_names, validate_private_tree_names,
         validate_tree_names,
     };
     use rustix::fs::{CWD, Dir, Mode, OFlags, ResolveFlags, openat2};
@@ -180,6 +215,14 @@ mod linux {
                 files: MAX_PRIVATE_TREE_FILES,
                 entries: MAX_PRIVATE_TREE_ENTRIES,
                 bytes: bytes.min(MAX_PRIVATE_TREE_BYTES),
+            }
+        }
+
+        fn paged_artifacts(bytes: u64) -> Self {
+            Self {
+                files: MAX_ARTIFACT_FILES,
+                entries: MAX_ARTIFACT_ENTRIES,
+                bytes: bytes.min(MAX_ARTIFACT_BYTES),
             }
         }
     }
@@ -256,6 +299,29 @@ mod linux {
             Self::scan_with_required(root, &BTreeSet::new(), Limits::private(max_bytes), stopped)
         }
 
+        /// Inventory a complete quiescent target for the paged artifact
+        /// contract. Its larger storage and metadata budgets are independent
+        /// of source uploads, legacy artifact offers, and private target reuse.
+        /// Every inode, hard link, mount, path and mutation check is identical
+        /// to the ordinary inventory; no oversized or unsupported subset is
+        /// silently omitted. Successful compilation must be proved by the
+        /// operation owner before this byte inventory can become a result.
+        pub fn scan_complete_artifacts(
+            root: &Path,
+            max_bytes: u64,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
+            let tree = Self::scan_with_required(
+                root,
+                &BTreeSet::new(),
+                Limits::paged_artifacts(max_bytes),
+                stopped,
+            )?;
+            validate_artifact_names(tree.names())?;
+            checkpoint(stopped)?;
+            Ok(tree)
+        }
+
         fn scan_with_required(
             root: &Path,
             required: &BTreeSet<String>,
@@ -282,7 +348,11 @@ mod linux {
                 entries: 0,
             };
             tree.visit(&directory, "", limits, stopped)?;
-            let names = validate_names(tree.files.keys().map(String::as_str), limits.files)?;
+            let names = validate_names(
+                tree.files.keys().map(String::as_str),
+                limits.files,
+                Some(limits.entries),
+            )?;
             if !required.is_subset(&names) {
                 return Err(invalid(
                     "compiler did not produce every required tree artifact",
@@ -510,6 +580,59 @@ mod tests {
     }
 
     #[test]
+    fn paged_artifact_names_have_independent_file_and_metadata_budgets() {
+        let mut names: Vec<_> = (0..MAX_ARTIFACT_FILES)
+            .map(|index| format!("debug/deps/f{index}"))
+            .collect();
+        assert!(validate_tree_names(names.iter().map(String::as_str)).is_err());
+        assert_eq!(
+            validate_artifact_names(names.iter().map(String::as_str))
+                .unwrap()
+                .len(),
+            MAX_ARTIFACT_FILES
+        );
+        names.push("overflow".into());
+        assert!(validate_artifact_names(names.iter().map(String::as_str)).is_err());
+
+        // All individual paths and the file count fit, but their aggregate
+        // declarations must not turn paging into an unbounded metadata buffer.
+        let component = "a".repeat(150);
+        let large: Vec<_> = (0..MAX_ARTIFACT_FILES)
+            .map(|index| format!("{component}/{component}/{component}/{component}/f{index}"))
+            .collect();
+        assert!(
+            validate_artifact_names(large.iter().map(String::as_str))
+                .unwrap_err()
+                .to_string()
+                .contains("metadata limit")
+        );
+        for paths in [
+            vec!["../escape"],
+            vec!["A/x", "a/y"],
+            vec!["file", "file/child"],
+        ] {
+            assert!(validate_artifact_names(paths).is_err());
+        }
+    }
+
+    #[test]
+    fn paged_artifact_manifest_counts_implicit_directories_before_creation() {
+        let mut names: Vec<_> = (0..MAX_ARTIFACT_FILES - 1)
+            .map(|index| format!("p{index}/a/b/file"))
+            .collect();
+        // Four entries per path, exactly filling the independent entry budget.
+        names.push("last/a/b/file".into());
+        assert!(validate_artifact_names(names.iter().map(String::as_str)).is_ok());
+        *names.last_mut().unwrap() = "last/a/b/c/file".into();
+        assert!(
+            validate_artifact_names(names.iter().map(String::as_str))
+                .unwrap_err()
+                .to_string()
+                .contains("directory entry limit")
+        );
+    }
+
+    #[test]
     fn private_names_do_not_enlarge_the_transport_namespace() {
         let names: Vec<_> = (0..MAX_PRIVATE_TREE_FILES)
             .map(|index| format!("incremental/f{index}"))
@@ -635,6 +758,68 @@ mod tests {
         .unwrap();
         assert!(inventory.verify(&|| false).is_err());
         assert!(TreeInventory::scan_private(root.path(), &required, bytes, &|| false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paged_artifact_inventory_handles_large_targets_and_preserves_custody_checks() {
+        use crate::source_transfer::MAX_SOURCE_BYTES;
+        let root = private();
+        std::fs::create_dir(root.path().join("deps")).unwrap();
+        for index in 0..MAX_TREE_FILES {
+            std::fs::write(root.path().join(format!("deps/f{index}")), []).unwrap();
+        }
+        // The inventory does not read payloads. A sparse file exercises the
+        // real filesystem byte boundary without allocating a large test copy.
+        let binary = std::fs::File::create(root.path().join("app")).unwrap();
+        let bytes = MAX_SOURCE_BYTES + 1;
+        binary.set_len(bytes).unwrap();
+        assert!(TreeInventory::scan_complete(root.path(), MAX_SOURCE_BYTES, &|| false).is_err());
+        let inventory =
+            TreeInventory::scan_complete_artifacts(root.path(), bytes, &|| false).unwrap();
+        assert_eq!(inventory.names().count(), MAX_TREE_FILES + 1);
+        assert_eq!(inventory.total_bytes(), bytes);
+        assert!(TreeInventory::scan_complete_artifacts(root.path(), bytes - 1, &|| false).is_err());
+        assert!(TreeInventory::scan_complete_artifacts(root.path(), bytes, &|| true).is_err());
+
+        let outside = private();
+        std::fs::hard_link(root.path().join("app"), outside.path().join("alias")).unwrap();
+        assert!(inventory.verify(&|| false).is_err());
+        assert!(TreeInventory::scan_complete_artifacts(root.path(), bytes, &|| false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paged_artifact_inventory_never_overrides_its_cap_or_skips_special_files() {
+        use std::os::unix::fs::symlink;
+        let large = private();
+        std::fs::File::create(large.path().join("app"))
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert!(TreeInventory::scan_complete_artifacts(large.path(), u64::MAX, &|| false).is_err());
+
+        let special = private();
+        std::fs::write(special.path().join("app"), b"output").unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            special.path().join("fifo"),
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        assert!(TreeInventory::scan_complete_artifacts(special.path(), 100, &|| false).is_err());
+        let links = private();
+        std::fs::write(links.path().join("app"), b"output").unwrap();
+        symlink(special.path(), links.path().join("state")).unwrap();
+        assert!(TreeInventory::scan_complete_artifacts(links.path(), 100, &|| false).is_err());
+
+        let changed = private();
+        std::fs::write(changed.path().join("app"), b"first").unwrap();
+        let inventory =
+            TreeInventory::scan_complete_artifacts(changed.path(), 100, &|| false).unwrap();
+        std::fs::rename(changed.path().join("app"), changed.path().join("prior")).unwrap();
+        std::fs::write(changed.path().join("app"), b"first").unwrap();
+        assert!(inventory.verify(&|| false).is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -12,6 +12,9 @@
 
 mod projection;
 
+pub use crate::artifact_tree::{
+    MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
+};
 pub use projection::{SourceProjectionLease, SourceProjectionPool};
 
 use sha2::{Digest, Sha256};
@@ -57,24 +60,51 @@ pub struct SourceFile {
     pub executable: bool,
 }
 
-/// A validated exact file set with one canonical identity implementation shared
-/// by senders and receivers. Caller-supplied ordering never changes its digest.
+/// A validated source projection with the source-only byte and file limits.
+pub type SourceManifest = FileManifest<false>;
+
+/// A validated complete artifact tree, with its own bounded transport contract.
+/// This type cannot be supplied to a [`SourceReceiver`]. Output capacity never
+/// enlarges the input-upload contract or changes an existing source identity.
+pub type ArtifactManifest = FileManifest<true>;
+
+/// The shared exact file-set implementation. The const parameter is a protocol
+/// type boundary, not a caller-selected numeric limit. Source and artifact
+/// senders/receivers share validation and hashing, with distinct digest domains.
+/// Caller-supplied ordering never changes the selected protocol's digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceManifest {
+pub struct FileManifest<const ARTIFACT: bool> {
     files: Vec<SourceFile>,
     digest: [u8; 32],
     total: u64,
+    metadata: u64,
 }
 
-impl SourceManifest {
+impl<const ARTIFACT: bool> FileManifest<ARTIFACT> {
     pub fn new(mut files: Vec<SourceFile>) -> io::Result<Self> {
-        if files.is_empty() || files.len() > MAX_SOURCE_FILES {
-            return Err(invalid("source file count outside its bound"));
+        let max_files = if ARTIFACT {
+            MAX_ARTIFACT_FILES
+        } else {
+            MAX_SOURCE_FILES
+        };
+        let max_bytes = if ARTIFACT {
+            MAX_ARTIFACT_BYTES
+        } else {
+            MAX_SOURCE_BYTES
+        };
+        let domain: &[u8] = if ARTIFACT {
+            b"rabs.artifact-files.v1\0"
+        } else {
+            b"rabs.source-files.v1\0"
+        };
+        if files.is_empty() || files.len() > max_files {
+            return Err(invalid("transfer file count outside its bound"));
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut names = BTreeSet::new();
         let mut directories = BTreeSet::new();
         let mut total = 0_u64;
+        let mut metadata = domain.len() as u64 + 8;
         for file in &files {
             if file.path.len() > 1024
                 || file.path.contains(['\\', ':'])
@@ -91,10 +121,21 @@ impl SourceManifest {
             for (offset, _) in file.path.match_indices('/') {
                 directories.insert(&file.path[..offset]);
             }
+            if ARTIFACT && names.len().saturating_add(directories.len()) > MAX_ARTIFACT_ENTRIES {
+                return Err(invalid(
+                    "artifact directory and file count exceeds its bound",
+                ));
+            }
+            metadata = metadata
+                .checked_add(8 + file.path.len() as u64 + 8 + 1 + 32)
+                .ok_or_else(|| invalid("transfer manifest byte count overflow"))?;
+            if ARTIFACT && metadata > MAX_ARTIFACT_MANIFEST_BYTES as u64 {
+                return Err(invalid("artifact manifest byte budget exceeded"));
+            }
             total = total
                 .checked_add(file.len)
-                .filter(|size| *size <= MAX_SOURCE_BYTES)
-                .ok_or_else(|| invalid("source byte budget exceeded"))?;
+                .filter(|size| *size <= max_bytes)
+                .ok_or_else(|| invalid("transfer byte budget exceeded"))?;
             if file.len == 0 && file.sha256 != <[u8; 32]>::from(Sha256::digest([])) {
                 return Err(invalid("empty source file has a nonempty digest"));
             }
@@ -102,8 +143,16 @@ impl SourceManifest {
         if names.iter().any(|name| directories.contains(name)) {
             return Err(invalid("source file is also an input directory"));
         }
+        if ARTIFACT {
+            // Output trees are portable to the receiving filesystem. Reject
+            // component-level case aliases before any receiver creates paths;
+            // source projections retain their existing path contract.
+            crate::artifact_tree::validate_artifact_names(
+                files.iter().map(|file| file.path.as_str()),
+            )?;
+        }
         let mut hash = Sha256::new();
-        hash.update(b"rabs.source-files.v1\0");
+        hash.update(domain);
         hash.update((files.len() as u64).to_be_bytes());
         for file in &files {
             hash.update((file.path.len() as u64).to_be_bytes());
@@ -116,6 +165,7 @@ impl SourceManifest {
             files,
             digest: hash.finalize().into(),
             total,
+            metadata,
         })
     }
 
@@ -133,6 +183,13 @@ impl SourceManifest {
     pub const fn total_bytes(&self) -> u64 {
         self.total
     }
+
+    /// Canonical manifest bytes, including the domain and fixed-width framing.
+    /// This bounds declaration memory independently of the streamed file bytes.
+    #[must_use]
+    pub const fn metadata_bytes(&self) -> u64 {
+        self.metadata
+    }
 }
 
 struct PendingFile {
@@ -141,15 +198,21 @@ struct PendingFile {
     hash: Sha256,
 }
 
+/// An input receiver whose constructor accepts only source-bounded manifests.
+pub type SourceReceiver = FileReceiver<false>;
+
+/// An output receiver whose constructor requires the distinct artifact contract.
+pub type ArtifactReceiver = FileReceiver<true>;
+
 /// One private staging operation. A malformed range leaves it unchanged; an
 /// uncertain filesystem write or complete-file digest mismatch poisons it.
 /// Retrying an already-written exact range is idempotent and does not rehash it.
-pub struct SourceReceiver {
+pub struct FileReceiver<const ARTIFACT: bool> {
     root: PathBuf,
     // Keep the created directory alive and bind all Linux member opens to it.
     // A replacement at the public path must never become the execution root.
     root_directory: File,
-    manifest: SourceManifest,
+    manifest: FileManifest<ARTIFACT>,
     files: BTreeMap<String, PendingFile>,
     poisoned: bool,
     sealed: bool,
@@ -271,6 +334,141 @@ fn open_root(path: &Path) -> io::Result<File> {
         }
         File::open(path)
     }
+}
+
+/// Create one exclusive regular file under a retained private directory.
+/// Every parent is traversed through directory descriptors; substituted
+/// symlinks and mount crossings cannot redirect creation outside this root.
+/// Callers must separately retain and check the root's public-name identity.
+/// Cancellation leaves any new directories or empty file in owned staging.
+pub fn create_staging_file(
+    root: &File,
+    relative: &str,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, mkdirat};
+        checkpoint(stopped)?;
+        if relative.is_empty()
+            || relative.len() > 1024
+            || relative.contains(['\\', ':'])
+            || relative.chars().any(char::is_control)
+            || relative.split('/').count() > 32
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err(invalid("unsafe staging file path"));
+        }
+        check_staging_directory(root, root)?;
+        let mut directory = root.try_clone()?;
+        let mut parent = String::new();
+        let mut parts = relative.split('/').peekable();
+        while let Some(part) = parts.next() {
+            checkpoint(stopped)?;
+            verify_staging_parent(root, &parent, &directory)?;
+            if parts.peek().is_none() {
+                let file = open_staging_member(&directory, OsStr::new(part), false, true)?;
+                checkpoint(stopped)?;
+                verify_staging_parent(root, &parent, &directory)?;
+                let named = open_staging_member(&directory, OsStr::new(part), false, false)?;
+                if !same_identity(&file.metadata()?, &named.metadata()?) {
+                    return Err(invalid("staging file was replaced during creation"));
+                }
+                return Ok(file);
+            }
+            match mkdirat(&directory, part, Mode::RWXU) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(error) => return Err(error.into()),
+            }
+            let child = open_staging_member(&directory, OsStr::new(part), true, false)?;
+            check_staging_directory(root, &child)?;
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
+            directory = child;
+        }
+        Err(invalid("staging file path has no filename"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, relative, stopped);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "staging requires Unix",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn check_staging_directory(root: &File, directory: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.dev() != root.metadata()?.dev()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(invalid(
+            "staging directory is not private, owned and on the retained filesystem",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_staging_member(
+    directory: &File,
+    name: &OsStr,
+    is_directory: bool,
+    create: bool,
+) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::CLOEXEC
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | if is_directory {
+            OFlags::RDONLY | OFlags::DIRECTORY
+        } else if create {
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL
+        } else {
+            OFlags::RDONLY
+        };
+    let mode = if create {
+        Mode::RUSR | Mode::WUSR
+    } else {
+        Mode::empty()
+    };
+    #[cfg(target_os = "linux")]
+    let opened = rustix::fs::openat2(
+        directory,
+        name,
+        flags,
+        mode,
+        rustix::fs::ResolveFlags::BENEATH
+            | rustix::fs::ResolveFlags::NO_SYMLINKS
+            | rustix::fs::ResolveFlags::NO_MAGICLINKS
+            | rustix::fs::ResolveFlags::NO_XDEV,
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    let opened = rustix::fs::openat(directory, name, flags, mode)?;
+    Ok(File::from(opened))
+}
+
+#[cfg(unix)]
+fn verify_staging_parent(root: &File, relative: &str, expected: &File) -> io::Result<()> {
+    let mut current = root.try_clone()?;
+    for part in relative.split('/').filter(|part| !part.is_empty()) {
+        current = open_staging_member(&current, OsStr::new(part), true, false)?;
+        check_staging_directory(root, &current)?;
+    }
+    if !same_identity(&current.metadata()?, &expected.metadata()?) {
+        return Err(invalid("staging parent was replaced during creation"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -443,11 +641,23 @@ fn verify_file(
     Ok(())
 }
 
-impl SourceReceiver {
+impl<const ARTIFACT: bool> FileReceiver<ARTIFACT> {
     /// `root` is selected by the worker under a held private directory, not by
     /// a remote frame. Existing roots refuse even if empty. Partial failures
     /// remain under the caller's owner and never return an execution capability.
-    pub fn create(root: &Path, manifest: SourceManifest) -> io::Result<Self> {
+    pub fn create(root: &Path, manifest: FileManifest<ARTIFACT>) -> io::Result<Self> {
+        Self::create_cancellable(root, manifest, &|| false)
+    }
+
+    /// Create bounded staging with cancellation between namespace operations.
+    /// An interrupted creation retains its partial, unsealed directory under
+    /// the caller's existing owner; it cannot be reused as a completed tree.
+    pub fn create_cancellable(
+        root: &Path,
+        manifest: FileManifest<ARTIFACT>,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        checkpoint(stopped)?;
         if !root.is_absolute() || root.file_name().is_none() {
             return Err(invalid(
                 "source staging root must be an absolute new directory",
@@ -460,39 +670,33 @@ impl SourceReceiver {
         // Freeze the caller-selected ancestry before using peer-selected relative
         // names. The private owner excludes other principals, not hostile code
         // running with the worker's own credentials.
-        let root =
-            fs::canonicalize(parent)?.join(root.file_name().ok_or_else(|| invalid("source root"))?);
-        let mut builder = fs::DirBuilder::new();
+        let name = root.file_name().ok_or_else(|| invalid("source root"))?;
+        let parent = fs::canonicalize(parent)?;
+        let parent_directory = open_root(&parent)?;
+        check_root(&parent, &parent_directory)?;
+        let root = parent.join(name);
+        checkpoint(stopped)?;
+        check_root(&parent, &parent_directory)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&root)?;
+        let root_directory = {
+            check_staging_directory(&parent_directory, &parent_directory)?;
+            rustix::fs::mkdirat(&parent_directory, name, rustix::fs::Mode::RWXU)?;
+            open_staging_member(&parent_directory, name, true, false)?
+        };
+        #[cfg(not(unix))]
         let root_directory = open_root(&root)?;
+        check_root(&parent, &parent_directory)?;
         check_root(&root, &root_directory)?;
         let mut files = BTreeMap::new();
         for expected in manifest.files() {
-            let path = root.join(&expected.path);
-            let parent = path
-                .parent()
-                .ok_or_else(|| invalid("source file has no parent"))?;
-            let mut directories = fs::DirBuilder::new();
-            directories.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                directories.mode(0o700);
-            }
-            directories.create(parent)?;
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            drop(options.open(&path)?);
+            checkpoint(stopped)?;
+            check_root(&root, &root_directory)?;
+            drop(create_staging_file(
+                &root_directory,
+                &expected.path,
+                stopped,
+            )?);
+            check_root(&root, &root_directory)?;
             files.insert(
                 expected.path.clone(),
                 PendingFile {
@@ -502,6 +706,8 @@ impl SourceReceiver {
                 },
             );
         }
+        checkpoint(stopped)?;
+        check_root(&root, &root_directory)?;
         Ok(Self {
             root,
             root_directory,
@@ -513,7 +719,7 @@ impl SourceReceiver {
     }
 
     #[must_use]
-    pub fn manifest(&self) -> &SourceManifest {
+    pub fn manifest(&self) -> &FileManifest<ARTIFACT> {
         &self.manifest
     }
 
@@ -1050,6 +1256,261 @@ mod tests {
             }])
             .is_err()
         );
+    }
+
+    #[test]
+    fn artifact_capacity_and_identity_cannot_widen_source_uploads() {
+        let file = entry("src/lib.rs", b"source\0\xff");
+        let source = SourceManifest::new(vec![file.clone()]).unwrap();
+        // Fixed source-files-v1 wire identity, predating artifact transport.
+        assert_eq!(
+            source.digest(),
+            [
+                0xd8, 0x76, 0xd4, 0x33, 0x59, 0x79, 0x40, 0x9a, 0x8a, 0x84, 0x8b, 0xcd, 0xbb, 0x54,
+                0x8c, 0xb2, 0x40, 0xed, 0xa0, 0x83, 0x00, 0x0b, 0x62, 0x16, 0xc2, 0xd5, 0xf4, 0x9b,
+                0x51, 0xc7, 0x0b, 0xf7,
+            ]
+        );
+        let artifact = ArtifactManifest::new(vec![file.clone()]).unwrap();
+        assert_ne!(source.digest(), artifact.digest());
+        assert_eq!(source.files(), artifact.files());
+        assert_eq!(
+            artifact.metadata_bytes(),
+            (b"rabs.artifact-files.v1\0".len() + 8 + 8 + file.path.len() + 8 + 1 + 32) as u64
+        );
+
+        let many = (0..=MAX_SOURCE_FILES)
+            .map(|index| entry(&format!("deps/{index:05}.rmeta"), b""))
+            .collect::<Vec<_>>();
+        assert!(SourceManifest::new(many.clone()).is_err());
+        assert_eq!(
+            ArtifactManifest::new(many).unwrap().files().len(),
+            MAX_SOURCE_FILES + 1
+        );
+        let large = SourceFile {
+            len: MAX_SOURCE_BYTES + 1,
+            ..file
+        };
+        assert!(SourceManifest::new(vec![large.clone()]).is_err());
+        assert_eq!(
+            ArtifactManifest::new(vec![large]).unwrap().total_bytes(),
+            MAX_SOURCE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn artifact_manifests_bound_payload_metadata_and_implicit_directories() {
+        let mut many = (0..MAX_ARTIFACT_FILES)
+            .map(|index| entry(&format!("{index:05}"), b""))
+            .collect::<Vec<_>>();
+        ArtifactManifest::new(many.clone()).unwrap();
+        many.push(entry("overflow", b""));
+        assert!(ArtifactManifest::new(many).is_err());
+
+        let maximum = SourceFile {
+            len: MAX_ARTIFACT_BYTES,
+            ..entry("complete-target", b"x")
+        };
+        ArtifactManifest::new(vec![maximum.clone()]).unwrap();
+        for len in [MAX_ARTIFACT_BYTES + 1, u64::MAX] {
+            assert!(
+                ArtifactManifest::new(vec![SourceFile {
+                    len,
+                    ..maximum.clone()
+                }])
+                .is_err()
+            );
+        }
+        assert!(ArtifactManifest::new(vec![maximum, entry("extra", b"x")]).is_err());
+
+        // 2048 disjoint 32-component paths consume exactly 65536 entries,
+        // well below the file-count and encoded-metadata budgets.
+        let mut deep = (0..MAX_ARTIFACT_ENTRIES / 32)
+            .map(|index| entry(&format!("{index:05}/{}file", "d/".repeat(30)), b""))
+            .collect::<Vec<_>>();
+        ArtifactManifest::new(deep.clone()).unwrap();
+        deep.push(entry("extra", b""));
+        assert!(ArtifactManifest::new(deep.clone()).is_err());
+        SourceManifest::new(deep).unwrap();
+
+        let prefix = format!(
+            "{}/{}/{}/{}",
+            "a".repeat(250),
+            "b".repeat(250),
+            "c".repeat(250),
+            "d".repeat(242)
+        );
+        let per_file = 8 + prefix.len() + 5 + 8 + 1 + 32;
+        let header = b"rabs.artifact-files.v1\0".len() + 8;
+        let count = (MAX_ARTIFACT_MANIFEST_BYTES - header) / per_file;
+        assert!(count < MAX_ARTIFACT_FILES);
+        let mut large_names = (0..count)
+            .map(|index| entry(&format!("{prefix}{index:05}"), b""))
+            .collect::<Vec<_>>();
+        let accepted = ArtifactManifest::new(large_names.clone()).unwrap();
+        assert!(accepted.metadata_bytes() <= MAX_ARTIFACT_MANIFEST_BYTES as u64);
+        large_names.push(entry(&format!("{prefix}{count:05}"), b""));
+        assert!(ArtifactManifest::new(large_names).is_err());
+
+        for paths in [["Deps/a.o", "deps/b.o"], ["out", "OUT/a.o"], ["a", "a/b"]] {
+            assert!(
+                ArtifactManifest::new(paths.into_iter().map(|path| entry(path, b"x")).collect())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_receiver_seals_more_than_the_source_file_limit() {
+        let owner = private();
+        let entries = (0..=MAX_SOURCE_FILES)
+            .map(|index| entry(&format!("deps/{index:05}.o"), b"x"))
+            .collect::<Vec<_>>();
+        let manifest = ArtifactManifest::new(entries).unwrap();
+        let mut receiver =
+            ArtifactReceiver::create(&owner.path().join("artifacts"), manifest.clone()).unwrap();
+        for file in manifest.files() {
+            assert_eq!(
+                receiver
+                    .write_chunk(&file.path, 0, b"x", file.sha256)
+                    .unwrap(),
+                1
+            );
+        }
+        let sealed = receiver.seal_cancellable(|| false).unwrap().to_path_buf();
+        assert_eq!(
+            fs::read_dir(sealed.join("deps")).unwrap().count(),
+            MAX_SOURCE_FILES + 1
+        );
+        assert_eq!(fs::read(sealed.join("deps/04096.o")).unwrap(), b"x");
+        assert_eq!(receiver.manifest(), &manifest);
+        assert_eq!(receiver.sealed_root(), Some(sealed.as_path()));
+    }
+
+    #[test]
+    fn artifact_receiver_preserves_chunk_poison_and_cancellation_boundaries() {
+        use std::cell::Cell;
+        for corrupt in [false, true] {
+            let owner = private();
+            let bytes = vec![0x51; MAX_SOURCE_CHUNK * 3 + 7];
+            let manifest = ArtifactManifest::new(vec![entry("binary", &bytes)]).unwrap();
+            let root = owner.path().join("artifacts");
+            let mut receiver = ArtifactReceiver::create(&root, manifest).unwrap();
+            assert!(receiver.write_chunk("binary", 0, b"bad", [0; 32]).is_err());
+            assert!(!receiver.poisoned, "malformed chunks cannot alter staging");
+            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                receiver
+                    .write_chunk(
+                        "binary",
+                        (index * MAX_SOURCE_CHUNK) as u64,
+                        chunk,
+                        Sha256::digest(chunk).into(),
+                    )
+                    .unwrap();
+            }
+            if corrupt {
+                fs::write(root.join("binary"), vec![0x52; bytes.len()]).unwrap();
+            }
+            let checks = Cell::new(0);
+            assert!(
+                receiver
+                    .seal_cancellable(|| {
+                        checks.set(checks.get() + 1);
+                        !corrupt && checks.get() == 9
+                    })
+                    .is_err()
+            );
+            assert!(receiver.poisoned);
+            assert!(receiver.sealed_root().is_none());
+            assert!(receiver.seal().is_err());
+        }
+    }
+
+    #[test]
+    fn artifact_receiver_creation_stops_before_all_declared_files_are_created() {
+        let owner = private();
+        let root = owner.path().join("artifacts");
+        let manifest = ArtifactManifest::new(
+            (0..=MAX_SOURCE_FILES)
+                .map(|index| entry(&format!("deps/{index:05}.o"), b""))
+                .collect(),
+        )
+        .unwrap();
+        assert!(ArtifactReceiver::create_cancellable(&root, manifest.clone(), &|| true).is_err());
+        assert!(!root.exists());
+        let error = ArtifactReceiver::create_cancellable(&root, manifest, &|| {
+            root.join("deps/00003.o").exists()
+        })
+        .err()
+        .expect("creation must observe cancellation between files");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_dir(root.join("deps")).unwrap().count(), 4);
+        assert!(!root.join("deps/00004.o").exists());
+    }
+
+    #[test]
+    fn cancellable_creation_never_follows_replaced_root_or_ancestry() {
+        use std::cell::Cell;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for replace_parent in [false, true] {
+            let owner = private();
+            let parent = owner.path().join("parent");
+            let outside = owner.path().join("outside");
+            for path in [&parent, &outside] {
+                fs::create_dir(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let root = parent.join("artifacts");
+            let calls = Cell::new(0);
+            let replaced = Cell::new(false);
+            let manifest = ArtifactManifest::new(vec![entry("nested/object", b"x")]).unwrap();
+            let result = ArtifactReceiver::create_cancellable(&root, manifest, &|| {
+                calls.set(calls.get() + 1);
+                let ready = if replace_parent {
+                    calls.get() == 2
+                } else {
+                    root.exists()
+                };
+                if ready && !replaced.replace(true) {
+                    let victim = if replace_parent { &parent } else { &root };
+                    fs::rename(victim, owner.path().join("original")).unwrap();
+                    symlink(&outside, victim).unwrap();
+                }
+                false
+            });
+            assert!(replaced.get());
+            assert!(result.is_err());
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn staging_file_creation_is_anchored_across_parent_replacement() {
+        use std::cell::Cell;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let owner = private();
+        let root = owner.path().join("artifacts");
+        let outside = owner.path().join("outside");
+        for path in [&root, &outside] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let held = File::open(&root).unwrap();
+        let replaced = Cell::new(false);
+        let result = create_staging_file(&held, "nested/deep/object", &|| {
+            if root.join("nested").exists() && !replaced.replace(true) {
+                fs::rename(root.join("nested"), root.join("retained")).unwrap();
+                symlink(&outside, root.join("nested")).unwrap();
+            }
+            false
+        });
+        assert!(replaced.get());
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root.join("retained")).unwrap().count(), 0);
+        for path in ["../escape", "/absolute", "bad//path"] {
+            assert!(create_staging_file(&held, path, &|| false).is_err());
+        }
     }
 
     fn private() -> tempfile::TempDir {
