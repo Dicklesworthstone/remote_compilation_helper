@@ -578,7 +578,10 @@ mod tests {
         assert!(cmd.contains(&rch_common::gc_roots::remote_cargo_home_base_prelude()));
         assert!(cmd.contains("__tmpbase=\"${RCH_CH_BASE}\""));
         assert!(!cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
-        assert!(cmd.contains("mktemp -p \"$__tmpbase\""));
+        // Temporary lists come from the shared GC helper (62d085da), which
+        // uses the recovery scratch when set and otherwise this tmp base.
+        assert!(cmd.contains("__tmpf=$(rch_gc_mktemp)"));
+        assert!(cmd.contains("mktemp -p \"${__tmpbase:-${TMPDIR:-/tmp}}\""));
         assert!(!cmd.contains("mktemp -p \"${TMPDIR:-/data/tmp}\""));
         // 6dj11: the legacy /data/tmp/rch_target_* trees (the css
         // incident class) are swept too — -maxdepth 1, name-anchored.
