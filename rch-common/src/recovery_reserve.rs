@@ -1,8 +1,9 @@
-//! Physically allocated worker-local emergency storage for GC ownership records.
+//! Physically allocated worker-local emergency storage for recovery metadata.
 //!
 //! The helper runs from memory, so a full worker does not need to install a
-//! script before recovering. Only known, finite admission/GC transactions use
-//! the inherited lease. Build processes and source release waiters never do.
+//! script before recovering. Only known, finite admission/GC/cancellation
+//! transactions use the inherited lease. Build processes and source release
+//! waiters never do.
 
 use std::io::Write as _;
 use std::sync::LazyLock;
@@ -93,6 +94,18 @@ pub fn readiness_command(registry: &str) -> String {
 #[must_use]
 pub fn admission_command(registry: &str, payload: &str) -> String {
     command("admit", registry, payload, "")
+}
+
+/// Let a finite cancellation metadata operation use this namespace's existing
+/// reserve. Wrap the entire operation BEFORE its activity and metadata locks;
+/// never wrap an inner transaction, a build, or a source release waiter.
+///
+/// This does not create a reserve, reconcile a GC claim, or grant cancellation
+/// authority. A namespace without a reserve retains its ordinary protocol.
+/// Existing but malformed reserve state refuses without running the operation.
+#[must_use]
+pub fn recovery_command(registry: &str, payload: &str) -> String {
+    command("recover", registry, payload, "")
 }
 
 /// Wrap a known GC transaction and its existing exact-claim reconciliation.

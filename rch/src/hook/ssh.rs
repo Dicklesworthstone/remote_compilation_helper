@@ -1500,11 +1500,22 @@ fn source_intent_command(
     // callable after the build fills the worker, so stream the literal roots
     // through a builtin instead. Registry matching/hashed publication still
     // rejects incomplete input; no closure enters an external exec argument.
-    Ok(format!(
+    let command = format!(
         "{}printf '%s' {roots} | {invocation}\n",
         source_registry_recovery_setup(registry),
         roots = shell_escape::escape(roots.into()),
-    ))
+    );
+    if matches!(operation, "cancel" | "finish-cancel") {
+        // Hold emergency storage before setup, activity and metadata locks.
+        // Hard-linking the immutable closure avoids data allocation, but a
+        // full filesystem can still need bytes for directories and barriers.
+        // The finite RPC guardian owns every process inheriting this lease.
+        Ok(rch_common::recovery_reserve::recovery_command(
+            registry, &command,
+        ))
+    } else {
+        Ok(command)
+    }
 }
 
 /// Bound the worker process tree as well as the local SSH client. A client
@@ -1711,7 +1722,7 @@ fn source_cancellation_settlement_command(
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
         SOURCE_CLAIM_REGISTRY,
     );
-    Ok(format!(
+    let command = format!(
         "printf '%s' {roots} | exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected}\n",
         roots = quote(&roots),
         coordinator = quote(include_str!("source_cancel_settlement.py")),
@@ -1722,7 +1733,24 @@ fn source_cancellation_settlement_command(
         transaction = quote(&transaction),
         operation = quote(operation),
         expected = quote(expected_namespace),
-    ))
+    );
+    if operation == "settle-cancel" {
+        let selected = match expected_namespace {
+            "current" => registry,
+            "legacy" => legacy_registry,
+            _ => anyhow::bail!("invalid terminal cancellation namespace"),
+        };
+        // The coordinator takes both namespaces' activity/metadata locks.
+        // Borrow storage outside it, in the same order as cancel/finish-cancel.
+        // Only the recorded namespace can supply storage; a legacy /tmp
+        // registry must not borrow a reserve from another filesystem.
+        Ok(rch_common::recovery_reserve::recovery_command(
+            selected, &command,
+        ))
+    } else {
+        // Discovery remains read-only and cannot spend emergency storage.
+        Ok(command)
+    }
 }
 
 /// Discover exact legacy evidence without admitting activity or publishing

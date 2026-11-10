@@ -1,8 +1,9 @@
-"""Worker-local GC emergency bytes; invoked in memory by recovery_reserve.rs.
+"""Worker-local recovery bytes; invoked in memory by recovery_reserve.rs.
 
 This is a byte reserve, not an inode reserve or a quota guarantee. It protects
-only the current source registry and the GC scratch directory on that same
-filesystem. Cancellation and legacy registries retain their existing protocol.
+the owning source registry and the GC scratch directory on that same filesystem.
+Finite cancellation metadata transactions may borrow an existing reserve; they
+retain all of their own authority checks and never settle a GC claim.
 """
 
 import errno
@@ -447,7 +448,18 @@ def main(arguments):
     if len(arguments) < 2:
         raise Unsafe("missing reserve operation")
     operation, registry = arguments[:2]
-    reserve = Reserve(registry, create=operation in ("ready", "admit", "gc"))
+    try:
+        reserve = Reserve(registry, create=operation in ("ready", "admit", "gc"))
+    except FileNotFoundError:
+        # Recovery of an older/unprovisioned namespace must keep working by
+        # its ordinary protocol. Only an entirely absent reserve permits that
+        # path; a partial existing reserve is damaged evidence, not absence.
+        # Never create a reserve after the disk is full, or borrow another
+        # registry's reserve (the legacy namespace may be on another device).
+        if operation != "recover" or os.path.lexists(os.path.join(registry, PRIVATE)):
+            raise
+        os.execvp("sh", ["sh", "-c", unpack(arguments[2])])
+        return
     try:
         if operation in ("bind", "settle"):
             callback(reserve, operation, arguments[2])
@@ -456,6 +468,25 @@ def main(arguments):
         reserve.initialize()
         ready = (reserve.full() and reserve.state["provisioned"] and reserve.state["epoch"] is None
                  and reserve.free_bytes() >= reserve.headroom)
+        if operation == "recover":
+            # The caller wraps the ENTIRE finite metadata operation, before
+            # its activity/metadata locks. Never acquire this lease from an
+            # inner transaction already holding either lock, or let a build
+            # or its release waiter inherit it. Nonblocking acquisition and
+            # the outer owned-process deadline bound contention.
+            if ready:
+                reserve.inherit("shared")
+            else:
+                reserve.lock(True)
+                reserve.load()
+                # spend() changes only our allocation and, when necessary,
+                # establishes an epoch. Preserve even an unretired GC claim:
+                # source cancellation neither proves its retirement nor owns
+                # its reconciler. Its ordinary recovery remains mandatory.
+                reserve.spend()
+                reserve.inherit("exclusive")
+            reserve.validate()
+            os.execvp("sh", ["sh", "-c", unpack(arguments[2])])
         if operation in ("ready", "admit"):
             if not ready:
                 reserve.lock(True)

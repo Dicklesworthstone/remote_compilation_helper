@@ -34,6 +34,7 @@ PRODUCTION = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PRODUCTION)
 GC_SOURCE = (HELPER.parent / "stale_target_reap.rs").read_text()
 RESERVE_SOURCE = (HELPER.parent / "recovery_reserve.rs").read_text()
+HOOK_SOURCE = HELPER.parents[2] / "rch/src/hook"
 CAPACITY = 2 * 1024 * 1024
 HEADROOM = 1024 * 1024
 RESERVE_ENV = (
@@ -50,6 +51,11 @@ def raw_constant(source, name):
 
 
 GC_SHELL_HELPERS = raw_constant(RESERVE_SOURCE, "GC_SHELL_HELPERS")
+SOURCE_TRANSACTION = (
+    raw_constant(GC_SOURCE, "SOURCE_CLAIM_RECORD_HELPERS") + "\n"
+    + (HOOK_SOURCE / "source_claim_registry.sh").read_text()
+)
+SOURCE_SETTLEMENT = (HOOK_SOURCE / "source_cancel_settlement.py").read_text()
 GC_GUARD = (
     "__gc_source_registry=__RCH_TEST_REGISTRY__; " + GC_SHELL_HELPERS + "\n"
     + raw_constant(GC_SOURCE, "SOURCE_CLAIM_RECORD_HELPERS") + "\n"
@@ -135,13 +141,23 @@ def retire_claim(path):
     return destination
 
 
-def call_cli(operation, registry, payload=None, reconciler=None, environment=None):
+def call_cli(operation, registry, payload=None, reconciler=None, environment=None, input_data=None):
     command = [sys.executable, "-I", "-S", str(HELPER), operation, str(registry)]
     for argument in (payload, reconciler):
         if argument is not None:
             command.append(base64.b64encode(zlib.compress(argument.encode())).decode())
-    return subprocess.run(command, env=environment, stdout=subprocess.PIPE,
+    return subprocess.run(command, env=environment, input=input_data, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=15, check=False)
+
+
+def source_transaction(registry, token, roots, operation):
+    """Use the production transaction under its actual activity/metadata locks."""
+    digest = hashlib.sha256(roots).hexdigest()
+    return " ".join(shlex.quote(str(argument)) for argument in (
+        "flock", "-x", "--", registry / (token + ".activity.lock"),
+        "flock", "-x", "--", registry / "metadata.lock", "sh", "-c",
+        SOURCE_TRANSACTION, "rch-source-registry", registry, token, digest, operation,
+    ))
 
 
 CALLBACK = r"""
@@ -354,6 +370,115 @@ test -s "$RCH_GC_SCRATCH/control"
                           "recovery_stdout": recovered.stdout.decode(), "refilled": True,
                           "truncation_before_epoch_recovered": True,
                           "production_gc_receipt": receipts[0].name}))
+
+
+def cancellation_enospc_child(root):
+    """Recover actual source cancellation, without deleting any source or GC target."""
+    mount_private_tmpfs(root, "192m")
+    registry = registry_at(root)
+    for name in ("cancelled", "quarantine"):
+        (registry / name).mkdir(mode=0o700)
+    source = root / "owned-source"
+    source.mkdir(mode=0o700)
+    selected = source / "selected.rs"
+    selected.write_bytes(b"source must remain unchanged\n")
+    roots = (str(source) + "\n").encode()
+    digest = hashlib.sha256(roots).hexdigest()
+    owned_token, unowned_token = "cafe01", "cafe02"
+    for token in (owned_token, unowned_token):
+        (registry / (token + ".activity.lock")).touch(mode=0o600)
+    active = registry / (owned_token + "." + digest + ".claim")
+    active.write_bytes(roots)
+    active.chmod(0o600)
+    original_inode = active.stat().st_ino
+    ready = call_cli("ready", registry)
+    assert ready.returncode == 0, ready.stderr
+    reserve_path = registry / PRODUCTION.PRIVATE / PRODUCTION.FILE
+    reserve_inode = reserve_path.stat().st_ino
+    unowned_cancel = source_transaction(registry, unowned_token, roots, "cancel")
+    owned_cancel = source_transaction(registry, owned_token, roots, "cancel")
+    with (root / "filler").open("xb", buffering=0) as filler:
+        info = os.statvfs(root)
+        os.posix_fallocate(filler.fileno(), 0, info.f_bavail * info.f_frsize)
+        require_real_enospc(root)
+        # This is the pre-wrapper production transaction, on the same actual
+        # full filesystem. An unowned cancellation must durably fence a delayed
+        # admission; a missing receipt must never be reported as successful.
+        before = subprocess.run(
+            ["sh", "-c", unowned_cancel], input=roots, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10, check=False,
+        )
+        assert before.returncode == 73, (before.returncode, before.stdout, before.stderr)
+        assert before.stdout == b""
+        assert b"RCH_SOURCE_CLAIM_WRITE_FAILED" in before.stderr
+        assert not (registry / "cancelled" / (unowned_token + "." + digest + ".claim")).exists()
+        failed_writes = {path.name: path.read_bytes() for path in registry.glob(".record-write.*")}
+        assert failed_writes, "full-filesystem refusal must retain its failed-write evidence"
+
+        recovered = call_cli("recover", registry, unowned_cancel, input_data=roots)
+        assert recovered.returncode == 0, (recovered.returncode, recovered.stdout, recovered.stderr)
+        assert recovered.stdout == b"unowned"
+        assert reserve_path.stat().st_ino == reserve_inode
+        assert reserve_path.stat().st_size == PRODUCTION.HEADER
+        assert {path.name: path.read_bytes() for path in registry.glob(".record-write.*")} == failed_writes
+        unowned_fence = registry / (unowned_token + "." + digest + ".cancelling")
+        unowned_receipt = registry / "cancelled" / (unowned_token + "." + digest + ".claim")
+        assert unowned_fence.read_bytes() == unowned_receipt.read_bytes() == roots
+        assert unowned_fence.stat().st_ino == unowned_receipt.stat().st_ino
+
+        cancelled = call_cli("recover", registry, owned_cancel, input_data=roots)
+        assert cancelled.returncode == 0, (cancelled.stdout, cancelled.stderr)
+        assert cancelled.stdout == b"owned"
+        fence = registry / (owned_token + "." + digest + ".cancelling")
+        receipt = registry / "cancelled" / (owned_token + "." + digest + ".claim")
+        assert active.read_bytes() == fence.read_bytes() == roots
+        assert active.stat().st_ino == fence.stat().st_ino == original_inode
+        assert not receipt.exists(), "cancellation must retain the active blocker until retirement"
+
+        # Emergency space is not authority: changed roots still refuse and
+        # preserve every existing claim/fence byte and its original inode.
+        wrong_roots = (str(root / "other-source") + "\n").encode()
+        refused = call_cli(
+            "recover", registry, source_transaction(registry, owned_token, wrong_roots, "cancel"),
+            input_data=wrong_roots,
+        )
+        assert refused.returncode == 73, (refused.stdout, refused.stderr)
+        assert refused.stdout == b""
+        assert active.read_bytes() == fence.read_bytes() == roots
+        assert active.stat().st_ino == fence.stat().st_ino == original_inode
+        assert not receipt.exists()
+
+        # Run the actual terminal coordinator with its cross-registry locks,
+        # inode checks and exact shell transaction. A lost reply is retried
+        # without recreating a grant or discarding its cancellation fence.
+        settlement = " ".join(shlex.quote(str(argument)) for argument in (
+            sys.executable, "-I", "-S", "-c", SOURCE_SETTLEMENT, registry,
+            root / "absent-legacy", owned_token, digest, SOURCE_TRANSACTION,
+            "settle-cancel", "current",
+        ))
+        for _ in range(2):
+            settled = call_cli("recover", registry, settlement, input_data=roots)
+            assert settled.returncode == 0, (settled.stdout, settled.stderr)
+            assert settled.stdout == b"RCH_SOURCE_CANCELLATION_SETTLED\n"
+            assert not active.exists()
+            assert receipt.read_bytes() == fence.read_bytes() == roots
+            assert receipt.stat().st_ino == fence.stat().st_ino == original_inode
+        assert selected.read_bytes() == b"source must remain unchanged\n"
+        assert list(source.iterdir()) == [selected]
+        assert not list((registry / "released").iterdir())
+        blocked = call_cli("admit", registry, "printf MUST-NOT-ADMIT")
+        assert blocked.returncode == 75, (blocked.stdout, blocked.stderr)
+        assert blocked.stdout == b""
+        filler.truncate(0)
+        os.fsync(filler.fileno())
+        admitted = call_cli("admit", registry, "printf admitted")
+        assert admitted.returncode == 0, admitted.stderr
+        assert admitted.stdout == b"admitted"
+        assert reserve_path.stat().st_blocks * 512 >= PRODUCTION.CAPACITY
+        print(json.dumps({"real_enospc": True, "unwrapped_exit": before.returncode,
+                          "unowned_reply": recovered.stdout.decode(),
+                          "owned_reply": cancelled.stdout.decode(), "settled_retries": 2,
+                          "source_unchanged": True, "refilled": True}))
 
 
 def assert_bound_child(registry, name):
@@ -864,6 +989,122 @@ class RecoveryReserveTests(unittest.TestCase):
         self.assertTrue(second.full())
         self.assertIsNone(second.state["epoch"])
 
+    def test_recovery_without_a_reserve_preserves_stdin_and_creates_no_reserve(self):
+        before = sorted(path.relative_to(self.root) for path in self.root.rglob("*"))
+        content = b"literal roots\nwith binary bytes\x00\xff\n" * 1024
+        recovered = call_cli("recover", self.registry, "cat", input_data=content)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.stdout, content)
+        self.assertEqual(recovered.stderr, b"")
+        self.assertEqual(sorted(path.relative_to(self.root) for path in self.root.rglob("*")), before)
+        self.assertFalse((self.registry / PRODUCTION.PRIVATE).exists())
+
+    def test_recovery_refuses_partial_corrupt_and_symlinked_reserves_without_running_payload(self):
+        for kind in ("partial", "corrupt", "symlink"):
+            with self.subTest(kind=kind):
+                root = fixture_root("rch-recovery-damaged-")
+                registry = registry_at(root)
+                private = registry / PRODUCTION.PRIVATE
+                if kind == "symlink":
+                    foreign = root / "foreign"
+                    foreign.mkdir(mode=0o700)
+                    marker = foreign / "untouched"
+                    marker.write_bytes(b"do not adopt foreign recovery evidence\n")
+                    private.symlink_to(foreign, target_is_directory=True)
+                else:
+                    private.mkdir(mode=0o700)
+                    (private / "scratch").mkdir(mode=0o700)
+                    if kind == "corrupt":
+                        damaged = private / PRODUCTION.FILE
+                        damaged.write_bytes(b"invalid reserve header".ljust(PRODUCTION.HEADER, b"\0"))
+                        damaged.chmod(0o600)
+                snapshot = {path.relative_to(root): path.read_bytes()
+                            for path in root.rglob("*") if path.is_file()}
+                recovered = call_cli("recover", registry, "printf UNAUTHORIZED-PAYLOAD")
+                self.assertEqual(recovered.returncode, 74, (recovered.stdout, recovered.stderr))
+                self.assertEqual(recovered.stdout, b"")
+                self.assertIn(b"RCH_RECOVERY_RESERVE_UNSAFE", recovered.stderr)
+                self.assertEqual({path.relative_to(root): path.read_bytes()
+                                  for path in root.rglob("*") if path.is_file()}, snapshot)
+                if kind == "symlink":
+                    self.assertTrue(private.is_symlink())
+                    self.assertEqual(list(foreign.iterdir()), [marker])
+                elif kind == "partial":
+                    self.assertFalse((private / PRODUCTION.FILE).exists())
+
+    def test_healthy_recovery_shares_reserve_but_an_exclusive_owner_blocks_payload(self):
+        ready = call_cli("ready", self.registry)
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        reserve = PRODUCTION.Reserve(str(self.registry))
+        self.reserves.append(reserve)
+        reserve.lock(False)
+        reserve.load()
+        before = (os.fstat(reserve.fd).st_ino, os.fstat(reserve.fd).st_size,
+                  os.pread(reserve.fd, PRODUCTION.HEADER, 0))
+        shared = call_cli(
+            "recover", self.registry,
+            'test "$RCH_RECOVERY_RESERVE_MODE" = shared && '
+            'test -z "$RCH_RECOVERY_RESERVE_EPOCH" && cat', input_data=b"exact input\n",
+        )
+        self.assertEqual(shared.returncode, 0, shared.stderr)
+        self.assertEqual(shared.stdout, b"exact input\n")
+        self.assertEqual((os.fstat(reserve.fd).st_ino, os.fstat(reserve.fd).st_size,
+                          os.pread(reserve.fd, PRODUCTION.HEADER, 0)), before)
+        reserve.lock(True)
+        blocked = call_cli("recover", self.registry, "printf MUST-NOT-RUN")
+        self.assertEqual(blocked.returncode, 74, (blocked.stdout, blocked.stderr))
+        self.assertEqual(blocked.stdout, b"")
+        self.assertIn(b"recovery lease busy", blocked.stderr)
+        self.assertEqual((os.fstat(reserve.fd).st_ino, os.fstat(reserve.fd).st_size,
+                          os.pread(reserve.fd, PRODUCTION.HEADER, 0)), before)
+
+    def test_recovery_neither_reconciles_a_gc_claim_nor_refills_its_epoch(self):
+        ready = call_cli("ready", self.registry)
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        reserve = PRODUCTION.Reserve(str(self.registry))
+        self.reserves.append(reserve)
+        reserve.lock(True)
+        reserve.load()
+        reserve.spend()
+        claim = create_claim(self.registry, self.root / "gc-still-owned")
+        reserve.write(reserve.state["epoch"], reserve.claim(claim.name))
+        reserve.load()
+        header = os.pread(reserve.fd, PRODUCTION.HEADER, 0)
+        state = json.loads(json.dumps(reserve.state))
+        fcntl.flock(reserve.fd, fcntl.LOCK_UN)
+        # A visible retirement receipt is also insufficient for this new
+        # operation to clear GC ownership: only GC's own reconciler may do so.
+        for retired in (False, True):
+            with self.subTest(retired=retired):
+                if retired:
+                    receipt = retire_claim(claim)
+                    self.assertEqual(receipt.stat().st_ino, state["claim"]["file"][1])
+                recovered = call_cli(
+                    "recover", self.registry,
+                    'test "$RCH_RECOVERY_RESERVE_MODE" = exclusive && printf recovered',
+                    "printf MUST-NOT-RECONCILE; exit 99",
+                )
+                self.assertEqual(recovered.returncode, 0, (recovered.stdout, recovered.stderr))
+                self.assertEqual(recovered.stdout, b"recovered")
+                self.assertEqual(reserve.load(), state)
+                self.assertEqual(os.pread(reserve.fd, PRODUCTION.HEADER, 0), header)
+                self.assertEqual(os.fstat(reserve.fd).st_size, PRODUCTION.HEADER)
+
+    def test_recovery_never_provisions_an_unfunded_reserve(self):
+        reserve = PRODUCTION.Reserve(str(self.registry), create=True)
+        self.reserves.append(reserve)
+        reserve.lock(True)
+        reserve.initialize()
+        header = os.pread(reserve.fd, PRODUCTION.HEADER, 0)
+        fcntl.flock(reserve.fd, fcntl.LOCK_UN)
+        recovered = call_cli("recover", self.registry, "printf MUST-NOT-RUN")
+        self.assertEqual(recovered.returncode, 75, (recovered.stdout, recovered.stderr))
+        self.assertEqual(recovered.stdout, b"")
+        self.assertIn(b"insufficient-headroom", recovered.stderr)
+        self.assertEqual(os.fstat(reserve.fd).st_size, PRODUCTION.HEADER)
+        self.assertEqual(os.pread(reserve.fd, PRODUCTION.HEADER, 0), header)
+        self.assertFalse(reserve.load()["provisioned"])
+
     def test_gc_prunes_only_its_own_released_receipts(self):
         candidate = self.root / "candidate"
         candidate.mkdir(mode=0o700)
@@ -979,6 +1220,15 @@ class RecoveryReserveTests(unittest.TestCase):
         self.assertTrue(evidence["truncation_before_epoch_recovered"])
         self.assertTrue(evidence["production_gc_receipt"].startswith("fc-"))
 
+    def test_real_enospc_cancellation_preserves_source_fences_and_refill_gates(self):
+        evidence = self.namespace_fixture("cancellation-enospc-child")
+        self.assertEqual(evidence["unwrapped_exit"], 73)
+        self.assertEqual(evidence["unowned_reply"], "unowned")
+        self.assertEqual(evidence["owned_reply"], "owned")
+        self.assertEqual(evidence["settled_retries"], 2)
+        self.assertTrue(evidence["source_unchanged"])
+        self.assertTrue(evidence["refilled"])
+
     @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open")
                          and hasattr(signal, "pidfd_send_signal"), "safe Linux pidfd cleanup required")
     def test_real_gc_claim_outlives_killed_supervisor_and_recovers_only_after_quiescence(self):
@@ -993,6 +1243,8 @@ if __name__ == "__main__":
         enospc_child(Path(sys.argv[2]))
     elif len(sys.argv) == 3 and sys.argv[1] == "--cli-enospc-child":
         cli_enospc_child(Path(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "--cancellation-enospc-child":
+        cancellation_enospc_child(Path(sys.argv[2]))
     elif len(sys.argv) == 3 and sys.argv[1] == "--interrupted-gc-child":
         interrupted_gc_child(Path(sys.argv[2]))
     elif len(sys.argv) == 4 and sys.argv[1] == "--surviving-deletion":
