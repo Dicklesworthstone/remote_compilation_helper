@@ -4,8 +4,9 @@ use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, CargoHome, Chunk, Entry,
-    Manifest, Message, Output, SourcePlan, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION,
-    Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid, require,
+    IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan,
+    Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
+    controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -13,6 +14,7 @@ use super::{
 };
 use crate::coord::source_delivery::control::PreparationControl;
 use crate::coord::source_delivery::{PreparedLocalBundle, prepare_local_bundle_controlled};
+use crate::coord::worker_delivery::MAX_LOCAL_CANONICAL_REQUEST_BYTES;
 use crate::edge::live_facts::read_stable;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::runtime::RuntimeBuilder;
@@ -207,8 +209,10 @@ pub fn run_client_profile(
         &PreparationControl::new(&cancelled, None),
     )?;
     checkpoint(stopped, capture_deadline)?;
-    let (_, request_bytes) =
-        read_stable(&bundle_path.join("request.json"), MAX_JSON_RECORD as u64)?;
+    let (_, request_bytes) = read_stable(
+        &bundle_path.join("request.json"),
+        MAX_LOCAL_CANONICAL_REQUEST_BYTES as u64,
+    )?;
     let request: Value = serde_json::from_slice(&request_bytes)?;
     let cargo_home: Option<CargoHome> = request
         .get("cargo_home")
@@ -225,12 +229,12 @@ pub fn run_client_profile(
         build_identity,
         require_release: release_mode == ReleaseAuthorizationMode::Required,
         settings: Box::new(config.settings.clone()),
-        source_manifest: Manifest::from_native(bundle.source.manifest()),
+        source_manifest: SourceDeclaration::from_native(bundle.source.manifest()),
         toolchain_identity: Toolchain::from_native(toolchain.identity()),
         cargo_home,
     };
-    // Refuse a manifest that cannot fit this protocol before connecting. An
-    // oversized source declaration never becomes a partial remote operation.
+    // The Hello remains one bounded record. Source paths follow in separately
+    // bounded pages; their complete identity must precede admission/payloads.
     require(
         serde_json::to_vec(&hello)?.len() <= MAX_JSON_RECORD,
         "captured source declaration exceeds the remote ATP record bound",
@@ -243,8 +247,16 @@ pub fn run_client_profile(
             .await
             .map_err(io::Error::other)?;
         let mut wire = Wire::new(peer.stream);
+        let declaration_deadline = Instant::now() + IO_BUDGET;
+        wire.send(&hello, stopped, declaration_deadline).await?;
+        send_source_manifest(
+            &mut wire,
+            bundle.source.manifest(),
+            stopped,
+            declaration_deadline,
+        )
+        .await?;
         let admission_deadline = Instant::now() + ADMISSION_BUDGET;
-        wire.send(&hello, stopped, admission_deadline).await?;
         let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
             &mut wire,
             bundle.source.manifest(),
@@ -279,6 +291,33 @@ pub fn run_client_profile(
         );
         receive_operation(&mut wire, &config, stopped).await
     })
+}
+
+/// The entire declaration uses one deadline and the same bounded window as
+/// byte transfer. A refused/partial declaration cannot start input upload.
+async fn send_source_manifest<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    manifest: &SourceManifest,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut window = Window::default();
+    for (index, files) in manifest.files().chunks(SOURCE_PAGE_FILES).enumerate() {
+        checkpoint(stopped, deadline)?;
+        upload_message(
+            wire,
+            &mut window,
+            Message::SourceManifestPage {
+                page: SourcePage::from_native(index * SOURCE_PAGE_FILES, files)?,
+            },
+            stopped,
+            deadline,
+        )
+        .await?;
+    }
+    flush_window(wire, &mut window, stopped, deadline).await?;
+    wire.send(&Message::SourceManifestEnd {}, stopped, deadline)
+        .await
 }
 
 /// Remain on the authenticated connection while the coordinator owns our queue
@@ -833,6 +872,146 @@ mod tests {
             .filter(|record| !record.is_empty())
             .map(|record| serde_json::from_slice(record).unwrap())
             .collect()
+    }
+
+    fn long_source_manifest(count: usize) -> SourceManifest {
+        SourceManifest::new(
+            (0..count)
+                .map(|index| SourceFile {
+                    path: format!(
+                        "workspace/{index:04}/{}/{}/source.rs",
+                        "a".repeat(240),
+                        "b".repeat(240)
+                    ),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: index % 2 == 0,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_manifest_sender_preserves_windows_and_refuses_wrong_phase_or_ack() {
+        let manifest = long_source_manifest(SOURCE_PAGE_FILES * 6 + 1);
+        for case in 0..4 {
+            let first = match case {
+                0 => Message::Window { count: 4 },
+                1 => Message::Window { count: 3 },
+                2 => Message::Cancel {},
+                _ => Message::Ready {
+                    toolchain: ToolchainDisposition::Reuse,
+                    source: SourcePlan::all(&manifest).unwrap(),
+                },
+            };
+            let mut peer = AdmissionStream::new(&[first, Message::Window { count: 7 }], false);
+            peer.quantum = 211;
+            let output = Arc::clone(&peer.output);
+            let result = native(send_source_manifest(
+                &mut Wire::new(peer),
+                &manifest,
+                &AtomicBool::new(false),
+                Instant::now() + IO_BUDGET,
+            ));
+            let sent = admission_messages(&output);
+            if case != 0 {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if case == 2 {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::InvalidData
+                    }
+                );
+                assert_eq!(sent.len(), 5);
+                assert_eq!(sent.last().unwrap()["kind"], "window-end");
+                continue;
+            }
+            result.unwrap();
+            let mut pages =
+                wire::SourcePages::new(SourceDeclaration::from_native(&manifest)).unwrap();
+            let mut counts = Vec::new();
+            for message in &sent {
+                assert!(serde_json::to_vec(message).unwrap().len() < MAX_JSON_RECORD);
+                match serde_json::from_value::<Message>(message.clone()).unwrap() {
+                    Message::SourceManifestPage { page } => pages.push(page).unwrap(),
+                    Message::WindowEnd { count } => counts.push(count),
+                    Message::SourceManifestEnd {} => {}
+                    _ => panic!("source sender crossed into another operation phase"),
+                }
+            }
+            assert_eq!(counts, [4, 7]);
+            assert_eq!(sent.last().unwrap()["kind"], "source-manifest-end");
+            assert_eq!(pages.finish().unwrap(), manifest);
+        }
+    }
+
+    #[test]
+    fn native_atp_pages_deliver_large_source_identity_before_input_readiness() {
+        // Real loopback ATP framing and production source sender/receiver,
+        // not TLS, Cargo execution or cross-host qualification.
+        let manifest = long_source_manifest(rabs_sandbox::source_transfer::MAX_SOURCE_FILES);
+        assert!(
+            serde_json::to_vec(&wire::Manifest::from_native(&manifest))
+                .unwrap()
+                .len()
+                > MAX_JSON_RECORD
+        );
+        let declaration = SourceDeclaration::from_native(&manifest);
+        let received = std::thread::scope(|scope| {
+            let (addresses, address) = mpsc::sync_channel(1);
+            let server = scope.spawn(move || {
+                native(async {
+                    let listener = TcpListener::bind("127.0.0.1:0").await?;
+                    addresses.send(listener.local_addr()?.to_string()).unwrap();
+                    let (stream, _) = listener.accept().await?;
+                    let mut wire = Wire::new(JsonAtpStream::new(stream));
+                    let stopped = AtomicBool::new(false);
+                    let deadline = Instant::now() + IO_BUDGET;
+                    let received = super::super::receive_source_manifest(
+                        &mut wire,
+                        declaration,
+                        &stopped,
+                        deadline,
+                    )
+                    .await?;
+                    wire.send(
+                        &Message::Ready {
+                            toolchain: ToolchainDisposition::Reuse,
+                            source: SourcePlan::all(&received)?,
+                        },
+                        &stopped,
+                        deadline,
+                    )
+                    .await?;
+                    Ok::<_, io::Error>(received)
+                })
+            });
+            let address = address.recv_timeout(Duration::from_secs(10)).unwrap();
+            let sent = native(async {
+                let stream = TcpStream::connect(address).await?;
+                let mut wire = Wire::new(JsonAtpStream::new(stream));
+                let stopped = AtomicBool::new(false);
+                let deadline = Instant::now() + IO_BUDGET;
+                send_source_manifest(&mut wire, &manifest, &stopped, deadline).await?;
+                let Message::Ready {
+                    source,
+                    toolchain: ToolchainDisposition::Reuse,
+                } = wire.receive(&stopped, deadline).await?
+                else {
+                    return Err(invalid(
+                        "receiver did not validate the complete source declaration",
+                    ));
+                };
+                source.validate(&manifest)
+            });
+            let received = server.join().unwrap();
+            sent.unwrap();
+            received.unwrap()
+        });
+        assert_eq!(received, manifest);
     }
 
     fn artifact_manifest_messages(manifest: &ArtifactManifest) -> Vec<Message> {

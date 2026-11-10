@@ -67,11 +67,23 @@ impl PreparationToolchain {
         self.image().root()
     }
 
-    fn attach(self, upload: SourceUpload, request: &Value) -> io::Result<SourceUpload> {
-        match self {
-            Self::Captured(image) => upload.with_shared_toolchain(image, request),
-            Self::Retained(owner) => upload.with_retained_toolchain(owner, request),
-        }
+    fn attach(
+        self,
+        mut upload: SourceUpload,
+        request: &Value,
+        context: PreparationContext,
+    ) -> io::Result<SourceUpload> {
+        require(
+            upload.toolchain.is_none(),
+            "toolchain upload already attached",
+        )?;
+        upload.validate_source_request_with_context(request, context)?;
+        upload.toolchain = Some(match self {
+            Self::Captured(image) => toolchain::ToolchainUpload::from_shared(image, request)?,
+            Self::Retained(owner) => toolchain::ToolchainUpload::from_retained(owner, request)?,
+        });
+        upload.validate_request_with_context(request, context)?;
+        Ok(upload)
     }
 }
 
@@ -435,18 +447,24 @@ fn prepare_source_bundle_inner(
         );
     }
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
-    // One validator for prepared and hand-authored execution requests. This
-    // preserves argv, output declarations, timeouts, and unknown extensions.
-    validate_request(&request)?;
+    // Canonical Cargo runs locally at the coordinator and receives its source
+    // declaration in pages. Worker-bound requests retain their one-frame cap.
+    // Both paths use the same execution-field and source-identity validators.
+    match context {
+        PreparationContext::RemoteRequest => validate_request(&request)?,
+        PreparationContext::CanonicalLocal => {
+            super::worker_delivery::validate_local_canonical_request(&request)?;
+        }
+    }
     let prepared_toolchain_root = toolchain.as_ref().map(|owner| owner.root().to_path_buf());
     let captured_toolchain = match &toolchain {
         Some(PreparationToolchain::Captured(image)) => Some(Arc::clone(image)),
         _ => None,
     };
     if let Some(toolchain) = toolchain {
-        upload = toolchain.attach(upload, &request)?;
+        upload = toolchain.attach(upload, &request, context)?;
     }
-    upload.validate_request(&request)?;
+    upload.validate_request_with_context(&request, context)?;
     if allocation_intent {
         request["request_id"] = json!("allocate");
     }
@@ -1093,7 +1111,15 @@ impl SourceUpload {
     }
 
     pub fn validate_request(&self, request: &Value) -> io::Result<()> {
-        self.validate_source_request(request)?;
+        self.validate_request_with_context(request, PreparationContext::RemoteRequest)
+    }
+
+    fn validate_request_with_context(
+        &self,
+        request: &Value,
+        context: PreparationContext,
+    ) -> io::Result<()> {
+        self.validate_source_request_with_context(request, context)?;
         require(
             super::worker_delivery::toolchain_transfer(request)? == self.toolchain.is_some(),
             "toolchain transfer requires explicitly retained toolchain bytes",
@@ -1105,6 +1131,14 @@ impl SourceUpload {
     }
 
     fn validate_source_request(&self, request: &Value) -> io::Result<()> {
+        self.validate_source_request_with_context(request, PreparationContext::RemoteRequest)
+    }
+
+    fn validate_source_request_with_context(
+        &self,
+        request: &Value,
+        context: PreparationContext,
+    ) -> io::Result<()> {
         require(
             request["kind"] == "canonical-exec" && request["request_id"].as_u64().is_some(),
             "source upload requires an original execution request",
@@ -1199,11 +1233,14 @@ impl SourceUpload {
                 _ => return Err(invalid("native source context is missing")),
             }
         }
-        let begin = self.begin_frame(request);
-        require(
-            serde_json::to_vec(&begin)?.len() <= MAX_JSON_RECORD,
-            "source manifest exceeds the transport record bound",
-        )
+        if context == PreparationContext::RemoteRequest {
+            let begin = self.begin_frame(request);
+            require(
+                serde_json::to_vec(&begin)?.len() <= MAX_JSON_RECORD,
+                "source manifest exceeds the transport record bound",
+            )?;
+        }
+        Ok(())
     }
 
     /// Extend the ordinary grant without changing its output/retention policy.
@@ -1523,6 +1560,88 @@ mod tests {
         let request = json!({"kind":"canonical-exec", "request_id":7, "program":"fixture",
             "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()});
         (upload, request, bytes)
+    }
+
+    #[test]
+    fn canonical_preparation_retains_large_source_custody_without_authorizing_worker_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let prefix = (0..7)
+            .map(|index| format!("d{index}{}", "x".repeat(98)))
+            .collect::<Vec<_>>()
+            .join("/");
+        fs::create_dir_all(source.join(&prefix)).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..1500 {
+            let path = format!("{prefix}/{index:04}.rs");
+            fs::write(source.join(&path), b"exact retained source\n").unwrap();
+            paths.push(path);
+        }
+        let image = Arc::new(
+            capture_sealed_source(&[("workspace".into(), source)], false, 2, 100_000).unwrap(),
+        );
+        let upload = SourceUpload::from_snapshot(image, "workspace", &paths).unwrap();
+        let sdk = root.path().join("sdk");
+        fs::create_dir(&sdk).unwrap();
+        fs::write(
+            sdk.join("compiler-fixture"),
+            b"retained SDK bytes; never executed",
+        )
+        .unwrap();
+        let prepared = Arc::new(
+            capture_toolchain_with_cloner(
+                &sdk,
+                &root.path().join("captured-sdk"),
+                None,
+                &ToolchainLimits::default(),
+                || false,
+                |_, _, _| false,
+            )
+            .unwrap(),
+        );
+        let request = json!({
+            "kind":"canonical-exec", "request_id":1,
+            "program":"/__rabs/toolchain/bin/cargo", "args":["check"],
+            "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace", "env":{}},
+            "source_manifest":upload.wire_manifest(),
+            "toolchain_transfer":TOOLCHAIN_TRANSFER_VERSION,
+            "toolchain_identity":super::super::worker_delivery::toolchain_identity_value(prepared.identity()),
+        });
+        assert!(serde_json::to_vec(&request).unwrap().len() > MAX_FRAME_BYTES);
+        super::super::worker_delivery::validate_local_canonical_request(&request).unwrap();
+        assert!(validate_request(&request).is_err());
+        assert!(upload.validate_source_request(&request).is_err());
+        let upload = PreparationToolchain::Captured(Arc::clone(&prepared))
+            .attach(upload, &request, PreparationContext::CanonicalLocal)
+            .unwrap();
+        upload
+            .validate_request_with_context(&request, PreparationContext::CanonicalLocal)
+            .unwrap();
+        assert!(upload.validate_request(&request).is_err());
+        prepared.verify(|| false).unwrap();
+        for path in &paths {
+            assert_eq!(upload.file_bytes(path).unwrap(), b"exact retained source\n");
+        }
+
+        for field in ["source_manifest", "toolchain_identity"] {
+            let mut changed = request.clone();
+            let digest_field = if field == "source_manifest" {
+                "manifest_sha256"
+            } else {
+                "sha256"
+            };
+            changed[field][digest_field] = json!("00".repeat(32));
+            assert!(
+                upload
+                    .validate_request_with_context(&changed, PreparationContext::CanonicalLocal)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut peer = ReceiverPeer::new();
+        assert!(upload.transmit(&mut peer, &request, false, false).is_err());
+        assert!(peer.sent.is_empty());
+        assert!(peer.receiver.is_none());
     }
 
     #[test]

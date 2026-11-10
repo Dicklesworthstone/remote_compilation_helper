@@ -176,7 +176,7 @@ impl RemoteOperationInputs {
                 .is_some_and(|fields| fields.keys().all(|field| allowed.contains(&field.as_str()))),
             "remote prepared request contains unsupported execution or host-path controls",
         )?;
-        worker_delivery::validate_request(&self.request)?;
+        worker_delivery::validate_local_canonical_request(&self.request)?;
         require(
             self.request["request_id"]
                 .as_u64()

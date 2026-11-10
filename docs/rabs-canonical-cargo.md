@@ -2736,7 +2736,14 @@ without materializing that destination. The destination field remains required
 for every profile, and an existing destination refuses instead of being merged
 or overwritten. Choose a fresh destination for each intentional new operation.
 
-Artifact delivery is limited to **512 MiB and 4096 regular files**. The complete
+Source input remains limited to **512 MiB and 4096 regular files**. Source and
+artifact manifests transfer in bounded pages, so a complete declaration may
+exceed one 1 MiB ATP record without enlarging individual records or file limits.
+The service verifies the complete source declaration before admitting input
+bytes or reserving compilation work.
+
+Artifact delivery is limited to **8 GiB and 16,384 regular files**, with at most
+8 MiB of canonical manifest metadata. The complete
 file set, lengths, executable identities and hashes are verified before atomic
 publication. Symlinks, special files, external hardlinks, ambiguous paths and
 oversized trees refuse delivery; the service never substitutes a successful
@@ -2753,10 +2760,11 @@ producer through the existing ownership path. Service shutdown stops admission
 and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
-Install matching client and coordinator binaries: source-file delta negotiation
-and SDK upload/reuse selection use wire version `canonical-compile-remote-v3`,
-while existing client and service JSON profile versions remain unchanged. Older wire versions refuse
-before upload or execution.
+Install matching client and coordinator binaries: paged source and artifact
+manifests, source-file delta negotiation and SDK upload/reuse selection use wire
+version `canonical-compile-remote-v5`, while existing client and service JSON
+profile versions remain unchanged. Older wire versions refuse before upload or
+execution.
 
 This remote protocol has no detached-job resume or automatic operation
 retry after admission. A transport failure after acceptance can leave execution

@@ -13,7 +13,8 @@ use rabs_sandbox::artifact_tree::{
     MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
 };
 use rabs_sandbox::source_transfer::{
-    ArtifactManifest, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile, SourceManifest,
+    ArtifactManifest, MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile,
+    SourceManifest,
 };
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
@@ -29,7 +30,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v4";
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v5";
+/// Source declarations retain their existing file/path/byte limits. Paging
+/// removes only the requirement that every source path fit in the Hello frame.
+pub(super) const SOURCE_PAGE_FILES: usize = 64;
 /// A maximum-length path still leaves this declaration far below one ATP
 /// record. Neither a large target nor its complete manifest becomes one frame.
 pub(super) const ARTIFACT_PAGE_FILES: usize = 64;
@@ -149,6 +153,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn native(&self) -> io::Result<SourceManifest> {
         let files = self
             .files
@@ -159,6 +164,141 @@ impl Manifest {
         require(
             manifest.digest() == digest(&self.manifest_sha256)?,
             "remote manifest digest differs from its complete file declaration",
+        )?;
+        Ok(manifest)
+    }
+}
+
+/// V5 binds the entire source tree before accepting any payload or reserving
+/// an operation. This identity uses the unchanged source manifest domain;
+/// the larger artifact profile cannot grant source-upload capacity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceDeclaration {
+    manifest_sha256: String,
+    files: u32,
+    bytes: u64,
+    metadata_bytes: u64,
+}
+
+impl SourceDeclaration {
+    pub(super) fn from_native(manifest: &SourceManifest) -> Self {
+        Self {
+            manifest_sha256: encode_hex(&manifest.digest()),
+            files: manifest.files().len() as u32,
+            bytes: manifest.total_bytes(),
+            metadata_bytes: manifest.metadata_bytes(),
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        require(
+            self.files != 0
+                && self.files as usize <= MAX_SOURCE_FILES
+                && self.bytes <= MAX_SOURCE_BYTES
+                && self.metadata_bytes != 0
+                // Canonical entries contain a bounded path plus two u64s,
+                // a mode byte and SHA-256. The fixed header fits in 128 bytes.
+                && self.metadata_bytes <= 128 + u64::from(self.files) * (1024 + 8 + 8 + 1 + 32),
+            "remote source declaration exceeds its existing source profile",
+        )?;
+        digest(&self.manifest_sha256)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourcePage {
+    first: u32,
+    files: Vec<ManifestFile>,
+}
+
+impl SourcePage {
+    pub(super) fn from_native(first: usize, files: &[SourceFile]) -> io::Result<Self> {
+        require(
+            !files.is_empty()
+                && files.len() <= SOURCE_PAGE_FILES
+                && first < MAX_SOURCE_FILES
+                && first + files.len() <= MAX_SOURCE_FILES,
+            "remote source manifest page exceeds its bound",
+        )?;
+        Ok(Self {
+            first: first as u32,
+            files: files.iter().map(ManifestFile::from_native).collect(),
+        })
+    }
+}
+
+/// Metadata custody only. No source path is created and no compilation can
+/// be admitted until finish verifies the complete declared namespace/digest.
+pub(super) struct SourcePages {
+    declaration: SourceDeclaration,
+    files: Vec<SourceFile>,
+    bytes: u64,
+    entry_bytes: u64,
+}
+
+impl SourcePages {
+    pub(super) fn new(declaration: SourceDeclaration) -> io::Result<Self> {
+        declaration.validate()?;
+        Ok(Self {
+            declaration,
+            files: Vec::new(),
+            bytes: 0,
+            entry_bytes: 0,
+        })
+    }
+
+    pub(super) fn push(&mut self, page: SourcePage) -> io::Result<()> {
+        require(
+            page.first as usize == self.files.len()
+                && !page.files.is_empty()
+                && page.files.len() <= SOURCE_PAGE_FILES
+                && self.files.len() + page.files.len() <= self.declaration.files as usize,
+            "remote source pages overlap, skip members or exceed their declared count",
+        )?;
+        let files = page
+            .files
+            .iter()
+            .map(ManifestFile::native)
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut prior = self.files.last().map(|file| file.path.as_str());
+        let mut bytes = self.bytes;
+        let mut entry_bytes = self.entry_bytes;
+        for file in &files {
+            require(
+                prior.is_none_or(|prior| prior < file.path.as_str()),
+                "remote source pages must preserve canonical path order",
+            )?;
+            prior = Some(&file.path);
+            bytes = bytes
+                .checked_add(file.len)
+                .filter(|bytes| *bytes <= self.declaration.bytes)
+                .ok_or_else(|| invalid("remote source pages exceed their declared bytes"))?;
+            entry_bytes = entry_bytes
+                .checked_add(file.path.len() as u64 + 8 + 8 + 1 + 32)
+                .filter(|bytes| *bytes <= self.declaration.metadata_bytes)
+                .ok_or_else(|| invalid("remote source pages exceed their metadata budget"))?;
+        }
+        SourceManifest::new(files.clone())?;
+        self.files.extend(files);
+        self.bytes = bytes;
+        self.entry_bytes = entry_bytes;
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> io::Result<SourceManifest> {
+        require(
+            self.files.len() == self.declaration.files as usize
+                && self.bytes == self.declaration.bytes,
+            "remote source manifest ended before its complete declaration",
+        )?;
+        let manifest = SourceManifest::new(self.files)?;
+        require(
+            manifest.digest() == digest(&self.declaration.manifest_sha256)?
+                && manifest.metadata_bytes() == self.declaration.metadata_bytes,
+            "remote source manifest differs from its declared identity",
         )?;
         Ok(manifest)
     }
@@ -508,10 +648,14 @@ pub(super) enum Message {
         build_identity: String,
         require_release: bool,
         settings: Box<RemoteOperationSettings>,
-        source_manifest: Manifest,
+        source_manifest: SourceDeclaration,
         toolchain_identity: Toolchain,
         cargo_home: Option<CargoHome>,
     },
+    SourceManifestPage {
+        page: SourcePage,
+    },
+    SourceManifestEnd {},
     Queued {},
     Ready {
         toolchain: ToolchainDisposition,
@@ -1437,6 +1581,141 @@ mod tests {
             sha256: Sha256::digest(bytes).into(),
             executable: false,
         }
+    }
+
+    #[test]
+    fn source_pages_transfer_a_large_complete_tree_under_original_frame_limits() {
+        let native = SourceManifest::new(
+            (0..MAX_SOURCE_FILES)
+                .map(|index| SourceFile {
+                    path: format!(
+                        "workspace/{index:04}/{}/{}/source.rs",
+                        "a".repeat(240),
+                        "b".repeat(240)
+                    ),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: index % 2 == 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&Manifest::from_native(&native))
+                .unwrap()
+                .len()
+                > MAX_JSON_RECORD
+        );
+        let declaration = SourceDeclaration::from_native(&native);
+        assert!(serde_json::to_vec(&declaration).unwrap().len() < 256);
+        let mut received = SourcePages::new(declaration).unwrap();
+        for (index, files) in native.files().chunks(SOURCE_PAGE_FILES).enumerate() {
+            let page = SourcePage::from_native(index * SOURCE_PAGE_FILES, files).unwrap();
+            let bytes = serde_json::to_vec(&Message::SourceManifestPage { page }).unwrap();
+            assert!(bytes.len() < MAX_JSON_RECORD);
+            let Message::SourceManifestPage { page } = serde_json::from_slice(&bytes).unwrap()
+            else {
+                panic!("expected a source declaration page");
+            };
+            received.push(page).unwrap();
+        }
+        assert_eq!(received.finish().unwrap(), native);
+    }
+
+    #[test]
+    fn source_declarations_keep_existing_resource_and_digest_limits() {
+        let valid = SourceDeclaration::from_native(&source_manifest());
+        for case in 0..7 {
+            let mut declaration = valid.clone();
+            match case {
+                0 => declaration.files = 0,
+                1 => declaration.files = (MAX_SOURCE_FILES + 1) as u32,
+                2 => declaration.bytes = MAX_SOURCE_BYTES + 1,
+                3 => declaration.metadata_bytes = 0,
+                4 => declaration.metadata_bytes = u64::MAX,
+                5 => declaration.manifest_sha256 = "ab".repeat(31),
+                _ => declaration.manifest_sha256 = "AB".repeat(32),
+            }
+            assert!(SourcePages::new(declaration).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn source_pages_refuse_reordering_unsafe_names_and_aggregate_overruns() {
+        let native = source_manifest();
+        for case in 0..10 {
+            let mut pages = SourcePages::new(SourceDeclaration::from_native(&native)).unwrap();
+            pages
+                .push(SourcePage::from_native(0, &native.files()[..1]).unwrap())
+                .unwrap();
+            let mut page = SourcePage::from_native(1, &native.files()[1..]).unwrap();
+            match case {
+                0 => page.first = 0,
+                1 => page.first = 2,
+                2 => page.files.clear(),
+                3 => page.files = vec![page.files[0].clone(); SOURCE_PAGE_FILES + 1],
+                4 => page.files.reverse(),
+                5 => page.files[0].path = native.files()[0].path.clone(),
+                6 => page.files[0].bytes = MAX_SOURCE_BYTES,
+                7 => page.files[0].path = "z".repeat(1025),
+                8 => page.files[0].sha256 = "AB".repeat(32),
+                _ => page.files[0].path = "src/../escape".into(),
+            }
+            assert!(pages.push(page).is_err(), "{case}");
+        }
+        let mut declaration = SourceDeclaration::from_native(&native);
+        declaration.metadata_bytes = 1;
+        let mut pages = SourcePages::new(declaration).unwrap();
+        assert!(
+            pages
+                .push(SourcePage::from_native(0, native.files()).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_pages_require_complete_source_identity_and_cross_page_namespace() {
+        let native = source_manifest();
+        let artifact = ArtifactManifest::new(native.files().to_vec()).unwrap();
+        assert_ne!(artifact.digest(), native.digest());
+        for case in 0..5 {
+            let mut declaration = SourceDeclaration::from_native(&native);
+            let mut files = native.files().to_vec();
+            match case {
+                0 => declaration.manifest_sha256 = encode_hex(&artifact.digest()),
+                1 => declaration.metadata_bytes += 1,
+                2 => declaration.bytes += 1,
+                3 => {
+                    files.pop();
+                }
+                _ => files[0].executable = !files[0].executable,
+            }
+            let mut pages = SourcePages::new(declaration).unwrap();
+            pages
+                .push(SourcePage::from_native(0, &files).unwrap())
+                .unwrap();
+            assert!(pages.finish().is_err(), "{case}");
+        }
+        let first = artifact_file("a", b"a");
+        let second = artifact_file("a/b", b"b");
+        let mut declaration = SourceDeclaration::from_native(
+            &SourceManifest::new(vec![first.clone(), artifact_file("b", b"b")]).unwrap(),
+        );
+        declaration.metadata_bytes += 2;
+        let mut pages = SourcePages::new(declaration).unwrap();
+        pages
+            .push(SourcePage::from_native(0, &[first]).unwrap())
+            .unwrap();
+        pages
+            .push(SourcePage::from_native(1, &[second]).unwrap())
+            .unwrap();
+        assert!(
+            pages
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("also an input directory")
+        );
     }
 
     #[test]

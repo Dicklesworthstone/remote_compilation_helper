@@ -51,6 +51,13 @@ pub const CHUNK_BYTES: usize = 65_536;
 pub const MAX_DELIVERY_BYTES: u64 = 1024 * 1024 * 1024;
 /// Maximum UTF-8 JSON frame before parsing or allocating its decoded payload.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Local canonical intent carries the complete source declaration, which the
+/// edge/coordinator protocol transfers in bounded pages. This is never a worker
+/// frame allowance: retain one frame for command fields and at most 4096 source
+/// rows, each with a 1024-byte path (at most doubled by JSON escaping) and fixed
+/// metadata. SourceManifest independently enforces the file/path/data limits.
+pub(crate) const MAX_LOCAL_CANONICAL_REQUEST_BYTES: usize =
+    MAX_FRAME_BYTES + rabs_sandbox::source_transfer::MAX_SOURCE_FILES * (2 * 1024 + 160);
 
 /// Local operator intent, never inferred from a peer response or a failed run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,6 +676,55 @@ fn command_context(request: &Value) -> io::Result<Option<CommandContext>> {
 /// Validate before listening, reserving disk, or sending execution. Unknown
 /// top-level extensions remain in the exact request sent and fingerprinted.
 pub fn validate_request(request: &Value) -> io::Result<()> {
+    validate_request_fields(request)?;
+    require(
+        serde_json::to_vec(request)?.len() <= MAX_FRAME_BYTES,
+        "request frame too large",
+    )
+}
+
+/// Validate private canonical-driver intent without treating its complete
+/// source manifest as one worker frame. Only this closed local shape may use
+/// the larger metadata budget; actual worker dispatch still calls
+/// [`validate_request`] and retains its original frame limit.
+pub(crate) fn validate_local_canonical_request(request: &Value) -> io::Result<()> {
+    let allowed = [
+        "kind",
+        "request_id",
+        "program",
+        "args",
+        "command_context",
+        "source_manifest",
+        "toolchain_transfer",
+        "toolchain_identity",
+        "cargo_home",
+    ];
+    let fields = request
+        .as_object()
+        .filter(|fields| fields.keys().all(|field| allowed.contains(&field.as_str())))
+        .ok_or_else(|| invalid("local canonical request contains unsupported fields"))?;
+    require(
+        serde_json::to_vec(request)?.len() <= MAX_LOCAL_CANONICAL_REQUEST_BYTES,
+        "local canonical request exceeds its source metadata bound",
+    )?;
+    let command: std::collections::BTreeMap<_, _> = fields
+        .iter()
+        .filter(|(name, _)| name.as_str() != "source_manifest")
+        .collect();
+    require(
+        serde_json::to_vec(&command)?.len() <= MAX_FRAME_BYTES,
+        "local canonical command exceeds its frame bound",
+    )?;
+    validate_request_fields(request)?;
+    require(
+        number(request, "request_id")? != 0
+            && toolchain_transfer(request)?
+            && request.get("command_context").is_some(),
+        "local canonical request requires explicit command and source/compiler custody",
+    )
+}
+
+fn validate_request_fields(request: &Value) -> io::Result<()> {
     require(
         request.get("kind").and_then(Value::as_str) == Some("canonical-exec"),
         "expected canonical-exec",
@@ -731,10 +787,7 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
     }
     command_context(request)?;
     declaration(request)?;
-    require(
-        serde_json::to_vec(request)?.len() <= MAX_FRAME_BYTES,
-        "request frame too large",
-    )
+    Ok(())
 }
 
 /// A transferred compiler is selected explicitly and never by a worker hint.
@@ -1480,6 +1533,97 @@ mod tests {
 
     use super::*;
     use std::collections::VecDeque;
+
+    fn local_canonical_request(files: usize) -> Value {
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+
+        let manifest = SourceManifest::new(
+            (0..files)
+                .map(|index| SourceFile {
+                    path: format!("{}/{index:04}.rs", "x".repeat(1000)),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        json!({
+            "kind":"canonical-exec", "request_id":1,
+            "program":"/__rabs/toolchain/bin/cargo", "args":["check", "--locked", "--offline"],
+            "command_context":{"version":COMMAND_CONTEXT_VERSION,
+                "cwd":"/__rabs/workspace", "env":{}},
+            "toolchain_transfer":rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION,
+            "toolchain_identity":toolchain_identity_value(&ToolchainIdentity {
+                sha256:[0xab; 32], files:1, bytes:123,
+            }),
+            "source_manifest":{
+                "manifest_sha256":rabs_protocol::raw_bytes::encode_hex(&manifest.digest()),
+                "files":manifest.files().iter().map(|file| json!({
+                    "path":file.path, "bytes":file.len,
+                    "sha256":rabs_protocol::raw_bytes::encode_hex(&file.sha256),
+                    "executable":file.executable,
+                })).collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    #[test]
+    fn local_canonical_manifest_capacity_never_expands_worker_frames() {
+        let request = local_canonical_request(rabs_sandbox::source_transfer::MAX_SOURCE_FILES);
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(encoded.len() > MAX_FRAME_BYTES);
+        assert!(encoded.len() <= MAX_LOCAL_CANONICAL_REQUEST_BYTES);
+        validate_local_canonical_request(&request).unwrap();
+        assert_eq!(
+            validate_request(&request).unwrap_err().to_string(),
+            "request frame too large"
+        );
+        assert_eq!(serde_json::to_vec(&request).unwrap(), encoded);
+
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("refused");
+        let mut peer = fixture(&destination);
+        let replies = peer.replies.len();
+        let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+        assert!(!failure.execution_may_have_run);
+        assert!(peer.sent.is_empty());
+        assert_eq!(peer.replies.len(), replies);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn local_canonical_metadata_capacity_keeps_source_and_command_guards() {
+        let original = local_canonical_request(1);
+        validate_local_canonical_request(&original).unwrap();
+        for case in 0..11 {
+            let mut request = original.clone();
+            match case {
+                0 => request["source_manifest"]["manifest_sha256"] = json!("00".repeat(32)),
+                1 => request["source_manifest"]["files"][0]["path"] = json!("../escape"),
+                2 => request["source_manifest"]["files"][0]["bytes"] = json!(u64::MAX),
+                3 => request["toolchain_backing"] = json!("/unapproved/compiler"),
+                4 => request["workspace_backing"] = json!("/unapproved/source"),
+                5 => request["extension"] = json!({"unrecognized":true}),
+                6 => request["args"] = json!(["x".repeat(MAX_FRAME_BYTES)]),
+                7 => request["request_id"] = json!(0),
+                8 => request["command_context"]["cwd"] = json!("/etc"),
+                9 => {
+                    request.as_object_mut().unwrap().remove("command_context");
+                }
+                _ => {
+                    request
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("toolchain_identity");
+                }
+            }
+            assert!(
+                validate_local_canonical_request(&request).is_err(),
+                "case {case}"
+            );
+        }
+    }
 
     #[test]
     fn encoded_worker_frame_charges_exact_escaped_bytes_and_one_delimiter() {

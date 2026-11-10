@@ -49,7 +49,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wire::{
     ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, Chunk, Manifest, Message, Output,
-    ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint, digest, invalid, require,
+    SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint,
+    digest, invalid, require,
 };
 
 const SERVICE_VERSION: &str = "canonical-compile-remote-service-v1";
@@ -473,7 +474,7 @@ fn prepared_request(
     if let Some(home) = cargo_home {
         request["cargo_home"] = serde_json::to_value(home)?;
     }
-    worker_delivery::validate_request(&request)?;
+    worker_delivery::validate_local_canonical_request(&request)?;
     source_manifest::request_manifest(&request)?;
     Ok(request)
 }
@@ -611,14 +612,15 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         settings.jobs <= runtime.jobs_per_root && runtime.healthy(),
         "remote service unavailable or requested jobs exceed its root grant",
     )?;
-    let manifest = source_manifest.native()?;
     let identity = toolchain_identity.native()?;
+    let manifest =
+        receive_source_manifest(wire, source_manifest, stopped, declaration_deadline).await?;
     // The synthesized request discards physical capture paths. Validate its
     // complete logical declaration before reserving work or creating any tree.
     let request = prepared_request(
         &settings,
         &config.input_root.join("toolchain"),
-        &source_manifest,
+        &Manifest::from_native(&manifest),
         &toolchain_identity,
         &cargo_home,
     )?;
@@ -825,6 +827,45 @@ async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
             matches!(wire.receive(stopped, deadline).await?, Message::Poll {}),
             "expected an admission status poll before input upload",
         )?;
+    }
+}
+
+/// Receive metadata only, before operation/SDK admission or any source tree
+/// creation. Missing/duplicate pages, malformed windows, early payloads and a
+/// mismatched complete identity refuse without starting a build.
+async fn receive_source_manifest<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    declaration: SourceDeclaration,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<rabs_sandbox::source_transfer::SourceManifest> {
+    let mut pages = SourcePages::new(declaration)?;
+    let mut window = Window::default();
+    loop {
+        match wire.receive(stopped, deadline).await? {
+            Message::SourceManifestPage { page } => {
+                window.record()?;
+                pages.push(page)?;
+            }
+            Message::WindowEnd { count } => {
+                window.acknowledge(count)?;
+                wire.send(&Message::Window { count }, stopped, deadline)
+                    .await?;
+            }
+            Message::SourceManifestEnd {} => {
+                require(
+                    !window.pending(),
+                    "remote source manifest ended before its last window acknowledgment",
+                )?;
+                checkpoint(stopped, deadline)?;
+                return pages.finish();
+            }
+            _ => {
+                return Err(invalid(
+                    "unexpected message during remote source manifest transfer",
+                ));
+            }
+        }
     }
 }
 
@@ -1306,13 +1347,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v4_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v4", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v5_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v5", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
             ("canonical-compile-remote-v3", "build-one"),
-            ("canonical-compile-remote-v4", "build-two"),
+            ("canonical-compile-remote-v4", "build-one"),
+            ("canonical-compile-remote-v5", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1321,6 +1363,149 @@ mod tests {
                     .kind(),
                 io::ErrorKind::InvalidData
             );
+        }
+    }
+
+    fn paged_source(count: usize) -> SourceManifest {
+        SourceManifest::new(
+            (0..count)
+                .map(|index| SourceFile {
+                    path: format!("workspace/src/{index:04}.rs"),
+                    len: 0,
+                    sha256: Sha256::digest([]).into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_manifest_receiver_finishes_complete_windows_before_next_phase() {
+        let manifest = paged_source(wire::SOURCE_PAGE_FILES * 6 + 1);
+        let mut input = Vec::new();
+        let mut window = Window::default();
+        for (index, files) in manifest.files().chunks(wire::SOURCE_PAGE_FILES).enumerate() {
+            input.extend(record(&Message::SourceManifestPage {
+                page: wire::SourcePage::from_native(index * wire::SOURCE_PAGE_FILES, files)
+                    .unwrap(),
+            }));
+            if window.record().unwrap() {
+                let count = window.count();
+                input.extend(record(&Message::WindowEnd { count }));
+                window.acknowledge(count).unwrap();
+            }
+        }
+        input.extend(record(&Message::WindowEnd { count: 7 }));
+        input.extend(record(&Message::SourceManifestEnd {}));
+        input.extend(record(&Message::InputsDone {}));
+        let peer = AdmissionPeer::new(input);
+        let output = Arc::clone(&peer.output);
+        let mut transport = Wire::new(peer);
+        let stopped = AtomicBool::new(false);
+        let deadline = Instant::now() + wire::IO_BUDGET;
+        let received = ready(receive_source_manifest(
+            &mut transport,
+            SourceDeclaration::from_native(&manifest),
+            &stopped,
+            deadline,
+        ))
+        .unwrap();
+        assert_eq!(received, manifest);
+        assert_eq!(
+            messages(&output),
+            [
+                json!({"kind":"window","count":4}),
+                json!({"kind":"window","count":7})
+            ]
+        );
+        assert!(matches!(
+            ready(transport.receive(&stopped, deadline)).unwrap(),
+            Message::InputsDone {}
+        ));
+    }
+
+    #[test]
+    fn source_manifest_receiver_refuses_partial_out_of_phase_and_unacknowledged_inputs() {
+        let manifest = paged_source(wire::SOURCE_PAGE_FILES * 5);
+        let page = |index: usize| Message::SourceManifestPage {
+            page: wire::SourcePage::from_native(
+                index * wire::SOURCE_PAGE_FILES,
+                &manifest.files()
+                    [index * wire::SOURCE_PAGE_FILES..(index + 1) * wire::SOURCE_PAGE_FILES],
+            )
+            .unwrap(),
+        };
+        for case in 0..8 {
+            let input = match case {
+                0 => vec![
+                    page(0),
+                    Message::WindowEnd { count: 1 },
+                    Message::SourceManifestEnd {},
+                ],
+                1 => vec![Message::SourceChunk {
+                    chunk: Chunk::new("not-admitted", 0, b"x").unwrap(),
+                }],
+                2 => vec![page(0), page(0)],
+                3 => (0..5).map(page).collect(),
+                4 => vec![page(0), Message::WindowEnd { count: 2 }],
+                5 => vec![page(0), Message::SourceManifestEnd {}],
+                6 => vec![Message::SourceManifestEnd {}],
+                _ => vec![page(0)],
+            };
+            let peer = AdmissionPeer::new(input.iter().flat_map(record).collect());
+            let output = Arc::clone(&peer.output);
+            let mut transport = Wire::new(peer);
+            let result = ready(receive_source_manifest(
+                &mut transport,
+                SourceDeclaration::from_native(&manifest),
+                &AtomicBool::new(false),
+                Instant::now() + wire::IO_BUDGET,
+            ));
+            assert!(result.is_err(), "{case}");
+            assert!(
+                messages(&output)
+                    .iter()
+                    .all(|reply| reply["kind"] == "window")
+            );
+        }
+    }
+
+    #[test]
+    fn source_manifest_receiver_observes_cancellation_and_fixed_deadline() {
+        let manifest = paged_source(1);
+        for cancel in [false, true] {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let mut peer = AdmissionPeer::new(record(&Message::SourceManifestPage {
+                page: wire::SourcePage::from_native(0, manifest.files()).unwrap(),
+            }));
+            if cancel {
+                let stop = Arc::clone(&stopped);
+                peer.before_read = Some(Box::new(move || stop.store(true, Ordering::Release)));
+            }
+            let output = Arc::clone(&peer.output);
+            let mut transport = Wire::new(peer);
+            let deadline = if cancel {
+                Instant::now() + wire::IO_BUDGET
+            } else {
+                Instant::now()
+            };
+            let error = ready(receive_source_manifest(
+                &mut transport,
+                SourceDeclaration::from_native(&manifest),
+                &stopped,
+                deadline,
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancel {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                }
+            );
+            assert!(messages(&output).is_empty());
         }
     }
 

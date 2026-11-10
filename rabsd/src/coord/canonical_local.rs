@@ -1280,9 +1280,10 @@ fn run_operation(
                 )?;
                 let (_, request_bytes) = read_stable(
                     &bundle.join("request.json"),
-                    super::worker_delivery::MAX_FRAME_BYTES as u64,
+                    super::worker_delivery::MAX_LOCAL_CANONICAL_REQUEST_BYTES as u64,
                 )?;
                 let request: Value = serde_json::from_slice(&request_bytes)?;
+                super::worker_delivery::validate_local_canonical_request(&request)?;
                 (prepared.source, prepared.toolchain, request, None, None)
             }
         };
