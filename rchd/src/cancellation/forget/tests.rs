@@ -23,7 +23,10 @@ fn forget_thresholds_follow_proof_and_origin() {
 
     // Without a worker answer the operator waits 24h, the detector 72h.
     let refusal = forget_decision(Operator, 23 * HOUR, Unconfirmed).unwrap_err();
-    assert!(refusal.contains("24h of silence (1h remaining)"), "{refusal}");
+    assert!(
+        refusal.contains("24h of silence (1h remaining)"),
+        "{refusal}"
+    );
     assert!(forget_decision(Operator, 24 * HOUR, Unconfirmed).is_ok());
     assert!(forget_decision(Operator, 24 * HOUR, NotAsked).is_ok());
     assert!(forget_decision(Automatic, 71 * HOUR, NotAsked).is_err());
@@ -94,7 +97,13 @@ async fn pool_with_reserved_slots(slots: u32) -> WorkerPool {
         ..Default::default()
     };
     pool.add_worker(config.clone()).await;
-    assert!(pool.get(&config.id).await.unwrap().reserve_slots(slots).await);
+    assert!(
+        pool.get(&config.id)
+            .await
+            .unwrap()
+            .reserve_slots(slots)
+            .await
+    );
     pool
 }
 
@@ -106,9 +115,15 @@ async fn persisted_phantom_skips_drains_and_is_forgotten_only_with_proof() {
     assert!(restored.recovered, "ownership came back from disk");
     let now = Instant::now();
     let silence = orphaned_silence(&restored, now).unwrap();
-    assert!(silence >= 19 * MINUTE && silence <= 21 * MINUTE, "{silence:?}");
+    assert!(
+        silence >= 19 * MINUTE && silence <= 21 * MINUTE,
+        "{silence:?}"
+    );
     assert!(is_orphaned_build(&restored, now));
-    assert!(!is_orphaned_build(&history.active_build(live).unwrap(), now));
+    assert!(!is_orphaned_build(
+        &history.active_build(live).unwrap(),
+        now
+    ));
 
     let pool = pool_with_reserved_slots(3).await;
     let ctx = make_test_context(pool.clone(), Arc::clone(&history));
@@ -140,7 +155,11 @@ async fn persisted_phantom_skips_drains_and_is_forgotten_only_with_proof() {
         .await;
     assert_eq!(refused.status, "refused");
     assert!(
-        refused.message.as_deref().unwrap().contains("running or unverified"),
+        refused
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("running or unverified"),
         "{refused:?}"
     );
     assert!(history.active_build(live).is_some());
@@ -168,8 +187,7 @@ async fn persisted_phantom_skips_drains_and_is_forgotten_only_with_proof() {
         .await;
     assert_eq!(again.status, "error");
     assert_eq!(worker.used_slots(), 1);
-    let reloaded =
-        BuildHistory::load_from_file(&root.path().join("history.jsonl"), 20).unwrap();
+    let reloaded = BuildHistory::load_from_file(&root.path().join("history.jsonl"), 20).unwrap();
     assert!(reloaded.active_build(phantom).is_none());
     assert!(reloaded.has_terminal_build(phantom));
     assert!(reloaded.active_build(live).is_some());

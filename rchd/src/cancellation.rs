@@ -499,7 +499,7 @@ impl CancellationOrchestrator {
                 escalation_count: 0,
                 remote_kill_attempted: false,
                 remote_kill_confirmed: false,
-            remote_record_absent: false,
+                remote_record_absent: false,
                 cleanup_ok: true,
                 slots: build.slots,
                 slots_released: 0,

@@ -1273,11 +1273,7 @@ async fn handle_connection_with_metrics(
             metrics::inc_requests("forget-build");
             let response = ctx
                 .cancellation
-                .forget_build(
-                    &ctx,
-                    build_id,
-                    crate::cancellation::ForgetOrigin::Operator,
-                )
+                .forget_build(&ctx, build_id, crate::cancellation::ForgetOrigin::Operator)
                 .await;
             (serde_json::to_string(&response)?, "application/json")
         }
