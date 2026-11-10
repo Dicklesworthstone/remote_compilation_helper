@@ -868,6 +868,38 @@ fn go_parallelism_for_command(command: &str, kind: CompilationKind) -> Option<u3
     jobs.or(inline_maxprocs)
 }
 
+/// Bound a native build's scheduler to the reservation committed by the daemon.
+/// Missing reservation evidence and opaque argv must fail before remote transfer;
+/// neither the requested estimate nor remaining worker capacity is a grant.
+pub(crate) fn bounded_native_build_command(
+    kind: Option<CompilationKind>,
+    command: &str,
+    reserved_slots: Option<u32>,
+) -> anyhow::Result<Option<String>> {
+    let Some(
+        kind @ (CompilationKind::Make
+        | CompilationKind::Ninja
+        | CompilationKind::CmakeBuild
+        | CompilationKind::Meson),
+    ) = kind
+    else {
+        return Ok(None);
+    };
+    let slots = reserved_slots.filter(|slots| *slots > 0).ok_or_else(|| {
+        anyhow::anyhow!(
+            "native build requires a positive committed slot reservation; update rchd and retry"
+        )
+    })?;
+    let jobs =
+        rch_common::native_build_jobs::native_build_jobs(kind, command).ok_or_else(|| {
+            anyhow::anyhow!("native build job controls cannot be safely bounded to the reservation")
+        })?;
+    let command = jobs
+        .bounded_command(slots)
+        .ok_or_else(|| anyhow::anyhow!("native build lost its validated scheduler job budget"))?;
+    Ok(Some(command))
+}
+
 pub(crate) fn estimate_cores_for_command(
     kind: Option<CompilationKind>,
     command: &str,
@@ -967,6 +999,14 @@ pub(crate) fn estimate_cores_for_command(
             };
             go_parallelism_for_command(command, kind).unwrap_or(default)
         }
+        Some(
+            kind @ (CompilationKind::Make
+            | CompilationKind::Ninja
+            | CompilationKind::CmakeBuild
+            | CompilationKind::Meson),
+        ) => rch_common::native_build_jobs::native_build_jobs(kind, command)
+            .and_then(|jobs| jobs.requested_jobs())
+            .unwrap_or(build_default),
         Some(_) => cargo_job_count_for_command(command)
             .unwrap_or(build_default)
             .max(1),
@@ -1120,6 +1160,107 @@ fn project_name_for_cwd(policy: &PathTopologyPolicy, warn_on_failure: bool) -> S
     let short_hash = &hash[..8];
 
     format!("{}-{}", name, short_hash)
+}
+
+#[cfg(test)]
+mod native_build_budget_tests {
+    use super::{CompilationKind, bounded_native_build_command, estimate_cores_for_command};
+
+    #[test]
+    fn native_estimates_follow_the_build_tool_instead_of_cargo_or_target_names() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 12,
+            ..Default::default()
+        };
+        for (kind, command, expected) in [
+            (CompilationKind::Make, "make", 1),
+            (CompilationKind::Make, "make -j3 all", 3),
+            (CompilationKind::Make, "make -j all", 12),
+            (CompilationKind::Ninja, "ninja -j0", 12),
+            (CompilationKind::Ninja, "CARGO_BUILD_JOBS=1 ninja -j5", 5),
+            (
+                CompilationKind::CmakeBuild,
+                "cmake --build out --parallel 6",
+                6,
+            ),
+            (
+                CompilationKind::CmakeBuild,
+                "cmake --build out --target=-j1",
+                12,
+            ),
+            (
+                CompilationKind::CmakeBuild,
+                "cmake --build out --parallel 8 -- -j2",
+                2,
+            ),
+            (CompilationKind::Meson, "meson compile -C out -j4", 4),
+            (
+                CompilationKind::Meson,
+                "CARGO_BUILD_JOBS=1 meson compile -C out",
+                12,
+            ),
+        ] {
+            assert_eq!(
+                estimate_cores_for_command(Some(kind), command, &config),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_execution_uses_the_committed_grant_and_keeps_smaller_requests() {
+        for (kind, command) in [
+            (CompilationKind::Make, "make -j32 all"),
+            (CompilationKind::Ninja, "ninja -j32 all"),
+            (
+                CompilationKind::CmakeBuild,
+                "cmake --build out --parallel 32",
+            ),
+            (CompilationKind::Meson, "meson compile -C out -j32"),
+        ] {
+            let bounded = bounded_native_build_command(Some(kind), command, Some(2))
+                .unwrap()
+                .unwrap();
+            let jobs = rch_common::native_build_jobs::native_build_jobs(kind, &bounded).unwrap();
+            assert_eq!(jobs.requested_jobs(), Some(2), "{bounded}");
+        }
+        let bounded =
+            bounded_native_build_command(Some(CompilationKind::Ninja), "ninja -j1 all", Some(8))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            rch_common::native_build_jobs::native_build_jobs(CompilationKind::Ninja, &bounded)
+                .unwrap()
+                .requested_jobs(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn native_execution_refuses_unknown_grants_and_opaque_job_controls() {
+        for slots in [None, Some(0)] {
+            assert!(
+                bounded_native_build_command(Some(CompilationKind::Ninja), "ninja", slots).is_err()
+            );
+        }
+        for command in [
+            "ninja -j$JOBS",
+            "ninja && ninja -j64",
+            "env -S 'ninja -j64'",
+        ] {
+            assert!(
+                bounded_native_build_command(Some(CompilationKind::Ninja), command, Some(2))
+                    .is_err(),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            bounded_native_build_command(Some(CompilationKind::CargoBuild), "cargo build", None)
+                .unwrap(),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

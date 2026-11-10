@@ -4189,6 +4189,7 @@ mod tests {
                 user: "builder".to_string(),
                 identity_file: "~/.ssh/id_rsa".to_string(),
                 slots_available: 6,
+                reserved_slots: Some(2),
                 speed_score: 90.0,
                 declared_os: None,
                 project_lane: 0,

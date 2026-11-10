@@ -275,6 +275,7 @@ async fn observe(
                     user: config.user.clone(),
                     identity_file: config.identity_file.clone(),
                     slots_available,
+                    reserved_slots: None,
                     speed_score,
                     declared_os: rch_common::declared_os(&config.tags),
                     project_lane,

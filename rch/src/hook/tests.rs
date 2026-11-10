@@ -4697,6 +4697,7 @@ fn test_selected_worker_to_config() {
         user: "ubuntu".to_string(),
         identity_file: "~/.ssh/id_rsa".to_string(),
         slots_available: 8,
+        reserved_slots: Some(2),
         speed_score: 75.5,
         declared_os: None,
         project_lane: 0,
@@ -5741,6 +5742,7 @@ async fn retry_selection_selected_response_stays_pending_until_new_admission() {
                 user: "test".into(),
                 identity_file: "/unused/key".into(),
                 slots_available: 4,
+                reserved_slots: Some(2),
                 speed_score: 90.0,
                 declared_os: None,
                 project_lane: 0,
@@ -6260,6 +6262,7 @@ async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_
                         user: "test".into(),
                         identity_file: "/unused/key".into(),
                         slots_available: 16,
+                        reserved_slots: Some(2),
                         speed_score: 90.0,
                         declared_os: None,
                         project_lane: 0,
@@ -6583,6 +6586,7 @@ async fn test_daemon_query_protocol() {
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
+                reserved_slots: Some(4),
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
@@ -6674,6 +6678,7 @@ async fn test_daemon_query_sends_preferred_workers() {
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
+                reserved_slots: Some(4),
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
@@ -6763,6 +6768,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     user: "mockuser".to_string(),
                     identity_file: "~/.ssh/mock_key".to_string(),
                     slots_available: 6,
+                    reserved_slots: Some(2),
                     speed_score: 90.0,
                     declared_os: None,
                     project_lane: 0,
@@ -6869,6 +6875,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     user: "mockuser".to_string(),
                     identity_file: "~/.ssh/mock_key".to_string(),
                     slots_available: 6,
+                    reserved_slots: Some(2),
                     speed_score: 90.0,
                     declared_os: None,
                     project_lane: 0,
@@ -6987,6 +6994,7 @@ async fn test_daemon_query_wait_parameters() {
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
+                reserved_slots: Some(4),
                 speed_score: 95.0,
                 declared_os: None,
                 project_lane: 0,
@@ -7071,6 +7079,7 @@ async fn test_daemon_query_url_encoding() {
                 user: "u".to_string(),
                 identity_file: "i".to_string(),
                 slots_available: 1,
+                reserved_slots: Some(1),
                 speed_score: 1.0,
                 declared_os: None,
                 project_lane: 0,
@@ -7199,6 +7208,7 @@ async fn test_process_hook_remote_success_mocked() {
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
@@ -7281,6 +7291,7 @@ async fn test_force_local_allows_even_when_remote_available() {
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
@@ -7351,6 +7362,7 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
@@ -7540,6 +7552,7 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 90.0,
             declared_os: None,
             project_lane: 0,
@@ -7593,6 +7606,7 @@ fn test_worker_config_from_selected_worker() {
         user: "deploy".to_string(),
         identity_file: "/keys/deploy.pem".to_string(),
         slots_available: 32,
+        reserved_slots: Some(4),
         speed_score: 88.8,
         declared_os: None,
         project_lane: 0,
@@ -8357,6 +8371,7 @@ async fn namespace_preflight_failure_retries_only_after_confirmed_release() {
                         user: "test".into(),
                         identity_file: "/unused/key".into(),
                         slots_available: 4,
+                        reserved_slots: Some(2),
                         speed_score: 90.0,
                         declared_os: None,
                         project_lane: 0,
@@ -9555,6 +9570,7 @@ fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
         user: "builder".into(),
         identity_file: "/test/key".into(),
         slots_available: 8,
+        reserved_slots: Some(4),
         speed_score: 50.0,
         declared_os: None,
         project_lane: 0,
@@ -13302,6 +13318,72 @@ edition = "2024"
 
 #[tokio::test]
 #[serial(mock_global)]
+async fn native_budget_refusal_precedes_transfer_and_does_not_blame_the_worker() {
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    let (_temp_dir, policy) = topology_tempdir();
+    let mut worker = SelectedWorker {
+        id: WorkerId::new("native-budget-worker"),
+        host: "not-contacted.invalid".to_string(),
+        user: "unused".to_string(),
+        identity_file: "unused".to_string(),
+        slots_available: 64,
+        reserved_slots: None,
+        speed_score: 90.0,
+        declared_os: None,
+        project_lane: 0,
+        disk_budget: None,
+    };
+    let reporter = HookReporter::new(OutputVisibility::None);
+    for (command, grant) in [
+        ("ninja -j32", None),
+        ("ninja -j32", Some(0)),
+        ("ninja -j$JOBS", Some(2)),
+    ] {
+        worker.reserved_slots = grant;
+        let result = Box::pin(execute_remote_compilation(
+            &worker,
+            command,
+            TransferConfig::default(),
+            Vec::new(),
+            true,
+            None,
+            &rch_common::CompilationConfig::default(),
+            None,
+            Some(CompilationKind::Ninja),
+            &reporter,
+            "/not-contacted.sock",
+            ColorMode::Auto,
+            None,
+            None,
+            None,
+            &policy,
+            None,
+            false,
+            &[],
+            &[],
+            rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+            None,
+        ))
+        .await;
+        let error = result
+            .as_ref()
+            .expect_err("native execution requires a proven job budget");
+        assert!(matches!(
+            error.downcast_ref::<TransferError>(),
+            Some(TransferError::TransferSkipped { reason })
+                if reason.contains("native build job budget")
+        ));
+        assert_eq!(
+            classify_remote_pipeline_failure(error),
+            RemotePipelineFailurePolicy::AllowLocalFallback
+        );
+        assert!(!remote_release_faults(&result, &worker.id).worker_fault);
+    }
+}
+
+#[tokio::test]
+#[serial(mock_global)]
 async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
     let _lock = test_lock().lock().await;
     let _guard = test_guard!();
@@ -13360,6 +13442,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         user: "unused".to_string(),
         identity_file: "unused".to_string(),
         slots_available: 1,
+        reserved_slots: Some(1),
         speed_score: 1.0,
         declared_os: Some("windows".to_string()),
         project_lane: 0,
@@ -13488,6 +13571,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
+        reserved_slots: Some(4),
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
@@ -13599,6 +13683,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
+        reserved_slots: Some(4),
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
@@ -13797,6 +13882,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
+        reserved_slots: Some(4),
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
@@ -13908,6 +13994,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
+        reserved_slots: Some(4),
         speed_score: 90.0,
         declared_os: None,
         project_lane: 0,
@@ -14239,6 +14326,7 @@ async fn test_cargo_test_remote_build_failure() {
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
@@ -14303,6 +14391,7 @@ async fn test_cargo_test_with_filter() {
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
@@ -14367,6 +14456,7 @@ async fn test_cargo_test_with_test_threads() {
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
@@ -14436,6 +14526,7 @@ async fn test_cargo_test_signal_killed() {
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
@@ -14505,6 +14596,7 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,
@@ -14568,6 +14660,7 @@ async fn test_cargo_test_toolchain_fallback() {
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
+            reserved_slots: Some(4),
             speed_score: 85.0,
             declared_os: None,
             project_lane: 0,

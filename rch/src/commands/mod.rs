@@ -1240,6 +1240,7 @@ mod tests {
             user: "rch".to_string(),
             identity_file: "~/.ssh/id_rsa".to_string(),
             slots_available: 4,
+            reserved_slots: None,
             speed_score: 1.5,
             declared_os: None,
             project_lane: 0,

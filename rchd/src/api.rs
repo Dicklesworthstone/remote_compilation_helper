@@ -2716,6 +2716,7 @@ async fn handle_select_worker_dry_run(
                 user: config.user.clone(),
                 identity_file: config.identity_file.clone(),
                 slots_available,
+                reserved_slots: None,
                 speed_score,
                 declared_os: rch_common::declared_os(&config.tags),
                 project_lane: 0,
@@ -3131,6 +3132,7 @@ async fn handle_select_worker_mode(
                             user,
                             identity_file,
                             slots_available,
+                            reserved_slots: Some(state.slots),
                             speed_score,
                             declared_os,
                             project_lane: state.project_lane,
@@ -7205,6 +7207,7 @@ mod tests {
         let selected = response.worker.expect("dry run should report a worker");
         assert_eq!(selected.id.as_str(), "dry-worker");
         assert_eq!(selected.slots_available, 8);
+        assert_eq!(selected.reserved_slots, None);
         assert!(response.build_id.is_none());
         assert_eq!(worker.used_slots(), 0);
         assert!(
@@ -14418,7 +14421,9 @@ mod tests {
         let response = handle_select_worker(&ctx, request, false, None)
             .await
             .unwrap();
-        assert_eq!(response.worker.unwrap().slots_available, 0);
+        let selected = response.worker.unwrap();
+        assert_eq!(selected.slots_available, 0);
+        assert_eq!(selected.reserved_slots, Some(3));
         assert_eq!(worker.used_slots(), 3);
         let build_id = response.build_id.unwrap();
         assert_eq!(ctx.history.active_build(build_id).unwrap().slots, 3);
@@ -14499,6 +14504,7 @@ mod tests {
             "degraded worker with free slots must be admitted: {}",
             response.reason
         );
+        assert_eq!(response.worker.unwrap().reserved_slots, Some(2));
         assert_eq!(worker.used_slots(), 3);
         let build_id = response.build_id.unwrap();
         assert_eq!(ctx.history.active_build(build_id).unwrap().slots, 2);

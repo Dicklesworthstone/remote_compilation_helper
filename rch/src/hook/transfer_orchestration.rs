@@ -1071,6 +1071,17 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    // Validate before source transfer. Native schedulers otherwise default to
+    // all worker CPUs (or accept unlimited -j), independently of admission.
+    // Keep the original command for output discovery and durable recovery;
+    // only the execution command below consumes this bounded form.
+    let bounded_native_command =
+        super::command_parsing::bounded_native_build_command(kind, command, worker.reserved_slots)
+            .map_err(|error| TransferError::TransferSkipped {
+                // This is a caller/daemon admission limitation. Trying another worker
+                // cannot resolve opaque argv or a missing reservation in the reply.
+                reason: format!("native build job budget: {error}"),
+            })?;
     let execution_disk_budget = admitted_execution_disk_budget(
         worker.disk_budget,
         command,
@@ -2883,6 +2894,7 @@ async fn execute_remote_compilation_inner(
         None
     };
     let command = guarded_go_command.as_deref().unwrap_or(command);
+    let command = bounded_native_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging

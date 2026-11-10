@@ -53,6 +53,7 @@ pub mod log_retention;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
+pub mod native_build_jobs;
 pub mod node_workspace;
 pub mod orphan_quarantine;
 pub mod path_topology;

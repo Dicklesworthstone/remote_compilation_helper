@@ -927,6 +927,11 @@ pub struct SelectedWorker {
     pub identity_file: String,
     /// Number of slots available on this worker after reservation.
     pub slots_available: u32,
+    /// Slots actually charged to this build's durable admission record.
+    /// This may be below the requested estimate on a capacity-degraded worker.
+    /// Previews and older daemon replies have no committed reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_slots: Option<u32>,
     /// Worker's speed score (0-100).
     pub speed_score: f64,
     /// Operator-declared host OS (e.g. `windows`), if any. Propagated so the
@@ -5527,6 +5532,7 @@ retry_max = 2
                 user: "user".to_string(),
                 identity_file: "~/.ssh/id_rsa".to_string(),
                 slots_available: 8,
+                reserved_slots: Some(2),
                 speed_score: 75.0,
                 declared_os: None,
                 project_lane: 0,
@@ -5623,6 +5629,7 @@ retry_max = 2
                 user: "ubuntu".to_string(),
                 identity_file: "/path/to/key".to_string(),
                 slots_available: 16,
+                reserved_slots: Some(3),
                 speed_score: 90.5,
                 declared_os: None,
                 project_lane: 0,
@@ -5641,11 +5648,32 @@ retry_max = 2
         assert_eq!(worker.id.as_str(), "worker-1");
         assert_eq!(worker.host, "192.168.1.100");
         assert_eq!(worker.slots_available, 16);
+        assert_eq!(worker.reserved_slots, Some(3));
         assert_eq!(
             worker.disk_budget,
             BuildDiskBudget::cold_for_command("cargo test --workspace")
         );
         assert_eq!(parsed.reason, SelectionReason::Success);
+    }
+
+    #[test]
+    fn selected_worker_without_reservation_does_not_infer_one_from_free_slots() {
+        let worker: SelectedWorker = serde_json::from_value(serde_json::json!({
+            "id": "preview-or-legacy",
+            "host": "worker.example",
+            "user": "builder",
+            "identity_file": "key",
+            "slots_available": 64,
+            "speed_score": 90.0
+        }))
+        .unwrap();
+        assert_eq!(worker.reserved_slots, None);
+        assert!(
+            serde_json::to_value(worker)
+                .unwrap()
+                .get("reserved_slots")
+                .is_none()
+        );
     }
 
     #[test]
