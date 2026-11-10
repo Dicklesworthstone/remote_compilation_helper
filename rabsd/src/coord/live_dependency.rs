@@ -208,6 +208,40 @@ impl LiveDependencyRequest {
             .verify_unchanged(Path::new(&physical.compiler))
     }
 
+    /// Bind rustc's binary dep-info to the retained keyed inventory. Neither a
+    /// wrapper-reported path nor an existing file can supply this authority.
+    /// Dependency placement is projected back only through this action's plan;
+    /// canonical namespaces additionally require their retained driver mapping.
+    fn contains_binary_input(&self, virtual_path: &str) -> bool {
+        if !self.plan.records_binary_dependencies() {
+            return false;
+        }
+        let logical = self
+            .plan
+            .placement_mappings()
+            .into_iter()
+            .find_map(|(real, virtual_root)| {
+                virtual_path
+                    .strip_prefix(&format!("{virtual_root}/"))
+                    .map(|relative| format!("{real}/{relative}"))
+            })
+            .unwrap_or_else(|| virtual_path.to_owned());
+        let physical = match &self.canonical_paths {
+            Some(paths) => match paths.physical(Path::new(&logical)) {
+                Ok(path) => path,
+                Err(_) => return false,
+            },
+            None => PathBuf::from(logical),
+        };
+        self.toolchain.contains_sysroot_file(&physical)
+            || self.dependencies.directories.iter().any(|directory| {
+                directory
+                    .artifacts
+                    .iter()
+                    .any(|artifact| Path::new(&artifact.path) == physical)
+            })
+    }
+
     fn io_plan(&self) -> Result<std::borrow::Cow<'_, DependencyActionPlan>, String> {
         match &self.canonical_paths {
             Some(paths) => paths.project_plan(&self.plan).map(std::borrow::Cow::Owned),
@@ -672,7 +706,7 @@ fn expected_outputs(plan: &DependencyActionPlan) -> ExpectedOutputs {
         mappings: plan
             .placement_mappings()
             .into_iter()
-            .filter(|(real, _)| real == &plan.out_dir)
+            .filter(|(real, _)| real == &plan.out_dir || plan.records_binary_dependencies())
             .map(|(real, canonical)| (canonical.into_bytes(), real.into_bytes()))
             .collect(),
     }
@@ -1577,7 +1611,7 @@ impl ExecutionAttempt {
                                 matches!(manifest.members.get(relative), Some(rabs_sandbox::snapshot_capture::MemberKind::Regular { .. }))
                             })
                         })
-                    })
+                    }) || self.request.contains_binary_input(virtual_path)
                 }) {
                     return Err(format!("closure: {violation}"));
                 }

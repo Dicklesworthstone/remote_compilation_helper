@@ -76,6 +76,9 @@
 //!   (plan §17.7's conservative default), bound to their crate names.
 //!   Every Rust artifact candidate in every dependency search directory is
 //!   also keyed, including transitive candidates and negative membership.
+//!   With `-Zbinary-dep-depinfo`, every reported binary path must additionally
+//!   identify an exact keyed dependency or retained sysroot file. This evidence
+//!   does not narrow the candidate inventory or admit procedural macros.
 //! - **Environment (`dependency-env-v3`, applied by the edge through
 //!   [`DependencyActionPlan::narrow_to_source_env_reads`]; unnarrowed plans
 //!   keep `dependency-env-v2`, hashing every non-control value):** preserve
@@ -621,6 +624,20 @@ pub struct DependencyActionPlan {
 }
 
 impl DependencyActionPlan {
+    /// Whether the compiler was explicitly asked to report binary inputs in
+    /// dep-info. The output adapter validates every occurrence; rustc applies
+    /// the last occurrence when the option is repeated.
+    #[must_use]
+    pub fn records_binary_dependencies(&self) -> bool {
+        self.invocation
+            .unstable
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "binary-dep-depinfo")
+            .and_then(|(_, value)| crate::binary_dep_info::flag_value(value.as_deref()))
+            == Some(true)
+    }
+
     /// Narrow to `dependency-env-v3`: keep ambient names keyed only when
     /// `names` (the [`source_env_reads`] of every captured source and
     /// generated file) spells them — by value when present, by absence
@@ -1498,6 +1515,15 @@ fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
     enc.seq(&virtual_invocation.excluded_presentation, |enc, flag| {
         enc.str(flag);
     });
+    if plan.records_binary_dependencies() && !plan.canonical_cargo {
+        // The shared invocation encoder deliberately omits compiler argv[0]
+        // and toolchain identity is content-based. Binary dep-info additionally
+        // exposes the implicit sysroot's absolute path, which this host adapter
+        // preserves. Bind that placement before another installation of the
+        // same compiler bytes could replay .d paths from the first one.
+        enc.str("binary-dep-info-host-toolchain-placement-v1")
+            .str(&plan.compiler);
+    }
     compute(DOMAIN_LIVE_INVOCATION, &enc.finish())
 }
 
@@ -2442,15 +2468,16 @@ pub fn render_out_dir(canonical: &[u8], out_dir: &str) -> Vec<u8> {
 }
 
 /// Canonicalize output placement in closure-checked dep-info. Only an absolute
-/// path token beneath the output directory is rewritten: a source path with a
-/// matching substring or sibling prefix is not output placement.
-/// Dependency directory strings remain outside this replay profile.
+/// path token beneath a declared placement directory is rewritten: a source
+/// path with a matching substring or sibling prefix is not output placement.
+/// Dependency paths are admitted only with explicitly selected binary dep-info
+/// and its exact keyed-input closure check. Environment comments stay verbatim.
 /// Prepared canonical Cargo plans retain every byte because their actual
 /// visible placement is already exact and included in the key.
 /// Compiler transcripts must use [`canonicalize_compiler_transcript`] instead.
 ///
 /// # Errors
-/// Canonical markers and observable dependency placement are refused for
+/// Canonical markers and unmodeled dependency placement are refused for
 /// ordinary host plans; prepared plans require the fixed canonical layout.
 pub fn canonicalize_placements(
     raw: &[u8],
@@ -2468,9 +2495,11 @@ pub fn canonicalize_placements(
         // nested real target path /__rabs/out/cargo as well as source literals.
         return Ok(raw.to_vec());
     }
-    for root in &plan.dependency_dirs {
-        if root != &plan.out_dir && contains(raw, root.as_bytes()) {
-            return Err("observable dependency directory placement cannot be replayed");
+    if !plan.records_binary_dependencies() {
+        for root in &plan.dependency_dirs {
+            if root != &plan.out_dir && contains(raw, root.as_bytes()) {
+                return Err("observable dependency directory placement cannot be replayed");
+            }
         }
     }
     if contains(raw, b"/__rabs") {
@@ -2478,6 +2507,13 @@ pub fn canonicalize_placements(
     }
     if !plain_path(&plan.out_dir) {
         return Err("out-dir is not a plain path");
+    }
+    if plan.records_binary_dependencies() {
+        let mappings = plan.placement_mappings();
+        if mappings.iter().any(|(root, _)| !plain_path(root)) {
+            return Err("dependency directory is not a plain path");
+        }
+        return Ok(rewrite_dep_info_placements(raw, &mappings));
     }
     let prefix = format!("{}/", plan.out_dir);
     let mut canonical = Vec::with_capacity(raw.len());
@@ -2496,11 +2532,59 @@ pub fn canonicalize_placements(
     Ok(canonical)
 }
 
+/// The input has already passed the bounded dep-info grammar and exact closure
+/// checks. Rewrite complete path-token prefixes only, never arbitrary bytes or
+/// tracked environment values. Escaped whitespace remains inside its token even
+/// though the live closure currently refuses escaped paths and continuations.
+/// Mappings are disjoint by the live plan's rules.
+fn rewrite_dep_info_placements(raw: &[u8], mappings: &[(String, String)]) -> Vec<u8> {
+    let mut rewritten = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"#") {
+            rewritten.extend_from_slice(line);
+            continue;
+        }
+        let mut at = 0;
+        let mut token_start = true;
+        while at < line.len() {
+            let mapping = token_start
+                .then(|| {
+                    mappings.iter().find(|(from, _)| {
+                        line[at..].starts_with(from.as_bytes())
+                            && line.get(at + from.len()) == Some(&b'/')
+                    })
+                })
+                .flatten();
+            if let Some((from, to)) = mapping {
+                rewritten.extend_from_slice(to.as_bytes());
+                at += from.len();
+                token_start = false;
+            } else if line[at] == b'\\' && at + 1 < line.len() {
+                rewritten.extend_from_slice(&line[at..at + 2]);
+                at += 2;
+                token_start = false;
+            } else {
+                rewritten.push(line[at]);
+                token_start = line[at].is_ascii_whitespace();
+                at += 1;
+            }
+        }
+    }
+    rewritten
+}
+
 /// Render the output placement admitted by [`canonicalize_placements`].
 #[must_use]
 pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
     if plan.canonical_cargo {
         canonical.to_vec()
+    } else if plan.records_binary_dependencies() {
+        let mappings = plan
+            .placement_mappings()
+            .into_iter()
+            .map(|(real, virtual_root)| (virtual_root, real))
+            .collect::<Vec<_>>();
+        rewrite_dep_info_placements(canonical, &mappings)
     } else {
         render_out_dir(canonical, &plan.out_dir)
     }
@@ -2832,12 +2916,14 @@ fn normalized_within(absolute: &str, root: &str) -> Option<String> {
 
 /// Post-execution closure enforcement from rustc's own dep-info: every
 /// rule target must be inside the out-dir, every source dependency inside
-/// the source root, and every tracked environment read (`# env-dep:`)
+/// the source root (or an explicitly reported, keyed binary input), and every
+/// tracked environment read (`# env-dep:`)
 /// must name a variable whose value or absence the key covers. Reads of
 /// unkeyed controls refuse publication even when absent. `is_input` answers
-/// whether a virtual input path
-/// is a member of the keyed input manifest: a read of a source or generated file
-/// the key does not cover is a violation too. Returns the first
+/// whether a virtual input path is a member of the keyed source/generated
+/// manifest or, with binary dep-info enabled, the exact dependency/sysroot
+/// inventory. A directory-prefix match alone is never sufficient evidence.
+/// A read of a file the key does not cover is a violation too. Returns the first
 /// violation, or `None` when the observed reads are inside the closure.
 #[must_use]
 pub fn dep_info_closure_violation(
@@ -2912,7 +2998,7 @@ pub fn dep_info_closure_violation(
                 };
                 if !is_input(&virtual_path) {
                     return Some(format!(
-                        "dep-info target is an unkeyed source file: {target}"
+                        "dep-info target is an unkeyed input file: {target}"
                     ));
                 }
             }
@@ -2933,12 +3019,10 @@ pub fn dep_info_closure_violation(
             // `src/../README.md`. The keyed source tree is symlink-free
             // (capture refuses links), so lexical normalization is exact.
             let Some(virtual_path) = observed_input_virtual_path(plan, &absolute) else {
-                return Some(format!(
-                    "read outside the source and generated trees: {dep}"
-                ));
+                return Some(format!("read outside the admitted input classes: {dep}"));
             };
             if !is_input(&virtual_path) {
-                return Some(format!("read of an unkeyed source file: {dep}"));
+                return Some(format!("read of an unkeyed input file: {dep}"));
             }
         }
     }
@@ -2958,13 +3042,40 @@ fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> O
     {
         return Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]));
     }
-    plan.native_roots
+    if let Some(path) = plan
+        .native_roots
         .iter()
         .enumerate()
         .find_map(|(index, root)| {
             let normalized = normalized_within(absolute, root)?;
             Some(plan.native_input_virtual_path(index, &normalized[root.len() + 1..]))
         })
+    {
+        return Some(path);
+    }
+    // Binary evidence never grants a new read capability. Only paths in the
+    // already keyed artifact/sysroot classes reach the caller's exact member
+    // lookup. No lexical traversal through an unobserved directory is allowed.
+    if !plan.records_binary_dependencies()
+        || !plain_path_in_profile(absolute, plan.canonical_cargo)
+        || !absolute.rsplit('/').next().is_some_and(|name| {
+            name.starts_with("lib") && (name.ends_with(".rmeta") || name.ends_with(".rlib"))
+        })
+    {
+        return None;
+    }
+    for root in &plan.dependency_dirs {
+        if absolute
+            .strip_prefix(&format!("{root}/"))
+            .is_some_and(safe_component)
+        {
+            return Some(plan.virtual_dependency_path(absolute));
+        }
+    }
+    let sysroot = plan.compiler.strip_suffix("/bin/rustc")?;
+    absolute
+        .starts_with(&format!("{sysroot}/lib/rustlib/"))
+        .then(|| absolute.to_owned())
 }
 
 #[cfg(test)]
@@ -5192,6 +5303,216 @@ mod tests {
                 |_| true
             ),
             None
+        );
+    }
+
+    #[test]
+    fn binary_dep_info_requires_exact_members_and_preserves_negative_candidates() {
+        let plan = plan_for(OUT_A, &["-Zbinary-dep-depinfo"], &[]).unwrap();
+        let binary = format!("{OUT_A}/libdep-0123456789abcdef.rmeta");
+        let sysroot = "/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-123.rlib";
+        let source = format!("{PACKAGE}/src/lib.rs");
+        let raw = format!(
+            "{OUT_A}/itoa.d: {source} {binary} {sysroot}\n\n\
+             {source}:\n{binary}:\n{sysroot}:\n"
+        );
+        let keyed = |path: &str| {
+            path == plan.input_virtual_path("src/lib.rs")
+                || path == plan.virtual_dependency_path(&binary)
+                || path == sysroot
+        };
+        assert!(plan.records_binary_dependencies());
+        assert_eq!(
+            dep_info_closure_violation(&plan, raw.as_bytes(), keyed),
+            None
+        );
+        for path in [
+            format!("{OUT_A}/libunobserved.rmeta"),
+            format!(
+                "{OUT_A}/libunobserved.rmeta/../{}",
+                "libdep-0123456789abcdef.rmeta"
+            ),
+            format!("{OUT_A}/libmacro.so"),
+            format!("{OUT_A}/nested/libdep-0123456789abcdef.rmeta"),
+            "/toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib/libmissing.rlib".into(),
+            "/toolchain/lib/rustlib/../libstd-123.rlib".into(),
+            "/other/libstd-123.rlib".into(),
+            "/etc/passwd".into(),
+        ] {
+            let mut invalid_rules = vec![format!("{OUT_A}/itoa.d: {path}\n")];
+            // A phony target inside the output directory is not itself a
+            // reported input read. Outside that directory it must identify
+            // an exact keyed input, just like dependencies in a real rule.
+            if normalized_within(&path, OUT_A).is_none() {
+                invalid_rules.push(format!("{path}:\n"));
+            }
+            for invalid in invalid_rules {
+                assert!(
+                    dep_info_closure_violation(&plan, invalid.as_bytes(), keyed).is_some(),
+                    "unproven binary input accepted: {invalid}"
+                );
+            }
+        }
+        for flags in [vec![], vec!["-Zbinary-dep-depinfo=no"]] {
+            let ordinary = plan_for(OUT_A, &flags, &[]).unwrap();
+            assert!(!ordinary.records_binary_dependencies());
+            assert!(dep_info_closure_violation(&ordinary, raw.as_bytes(), keyed).is_some());
+        }
+        assert!(
+            dep_info_closure_violation(&plan, b"# env-dep:CARGO_MAKEFLAGS=-j\n", |_| true)
+                .is_some()
+        );
+
+        let direct = externs(&plan, 20);
+        let mut inventory = directory_facts(&plan, &direct);
+        let keyed_action = |inventory: &[DependencyDirectoryFact]| {
+            super::live_dependency_key(
+                &plan,
+                &toolchain(),
+                &direct,
+                inventory,
+                None,
+                &inputs(&plan, 11),
+            )
+            .unwrap()
+            .action_key
+        };
+        let original = keyed_action(&inventory);
+        inventory[0].artifacts.push(ExternFact {
+            path: format!("{OUT_A}/libunobserved.rmeta"),
+            content_digest: digest(42),
+        });
+        let added = keyed_action(&inventory);
+        assert_ne!(
+            added, original,
+            "binary evidence cannot drop negative membership"
+        );
+        inventory[0].artifacts[1].content_digest = digest(43);
+        assert_ne!(
+            keyed_action(&inventory),
+            added,
+            "unread candidate bytes remain keyed"
+        );
+    }
+
+    #[test]
+    fn binary_dep_info_binds_untranslated_host_sysroot_location() {
+        let make_plan = |compiler: &str, flags: &[&str]| {
+            let mut args = argv(OUT_A, flags);
+            args[0] = compiler.to_owned();
+            let env = env(&[]);
+            plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &args,
+                    cwd: PACKAGE,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap()
+        };
+        // `key` supplies identical toolchain content facts. Ordinary metadata
+        // can still share them; binary dep-info retains each real sysroot path.
+        for flags in [vec![], vec!["-Zbinary-dep-depinfo=no"]] {
+            assert_eq!(
+                key(&make_plan("/toolchain-a/bin/rustc", &flags)),
+                key(&make_plan("/toolchain-b/bin/rustc", &flags)),
+            );
+        }
+        assert_ne!(
+            key(&make_plan(
+                "/toolchain-a/bin/rustc",
+                &["-Zbinary-dep-depinfo"]
+            )),
+            key(&make_plan(
+                "/toolchain-b/bin/rustc",
+                &["-Zbinary-dep-depinfo"]
+            )),
+            "binary evidence must never replay a different installation's sysroot paths"
+        );
+    }
+
+    #[test]
+    fn binary_dep_info_rewrites_only_input_tokens_for_each_subscriber() {
+        let make_plan = |base: &str| {
+            let mut args = argv(&format!("{base}/middle/out"), &["-Zbinary-dep-depinfo"]);
+            for arg in &mut args {
+                if arg.starts_with("dependency=") {
+                    *arg = format!("dependency={base}/leaf/out");
+                }
+                if arg.starts_with("dep=") {
+                    *arg = format!("dep={base}/leaf/out/libdep-0123456789abcdef.rmeta");
+                }
+            }
+            let env = env(&[]);
+            plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &args,
+                    cwd: PACKAGE,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap()
+        };
+        let a = make_plan("/work/a");
+        let b = make_plan("/work/b");
+        assert_eq!(key(&a), key(&b));
+        let raw = format!(
+            "{}/middle.d: {PACKAGE}/src/lib.rs {}/libdep-0123456789abcdef.rmeta\n\
+             {}/libdep-0123456789abcdef.rmeta:\n\
+             # env-dep:NOTE=literal /work/a/leaf/out/value\n",
+            a.out_dir, a.dependency_dirs[0], a.dependency_dirs[0]
+        );
+        let canonical = canonicalize_placements(raw.as_bytes(), &a).unwrap();
+        assert!(String::from_utf8_lossy(&canonical).contains("/__rabs/deps/000/libdep-"));
+        assert_eq!(render_placements(&canonical, &a), raw.as_bytes());
+        let expected = raw
+            .lines()
+            .map(|line| {
+                if line.starts_with('#') {
+                    line.to_owned()
+                } else {
+                    line.replace("/work/a", "/work/b")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(render_placements(&canonical, &b), expected.as_bytes());
+        let sibling = b"/work/a/leaf/outside/libsame.rmeta: /source/work/a/leaf/out/value\n";
+        assert_eq!(canonicalize_placements(sibling, &a).unwrap(), sibling);
+        for escaped_source in [
+            "src/odd\\ /work/a/leaf/out/lib.rs",
+            "src/odd\\\t/work/a/leaf/out/lib.rs",
+            "src/odd\\ /work/a/middle/out/lib.rs",
+            "src/odd\\\t/work/a/middle/out/lib.rs",
+        ] {
+            let escaped = format!("{}/middle.d: {escaped_source}\n", a.out_dir);
+            let canonical = canonicalize_placements(escaped.as_bytes(), &a).unwrap();
+            let expected = format!("{}/middle.d: {escaped_source}\n", b.out_dir);
+            assert_eq!(render_placements(&canonical, &b), expected.as_bytes());
+            assert!(
+                dep_info_closure_violation(&a, escaped.as_bytes(), |_| true).is_some(),
+                "the live closure must still refuse escaped source paths"
+            );
+        }
+        let continued = format!(
+            "{}/middle.d: \\\n {}/libdep-0123456789abcdef.rmeta\n\
+             # env-dep:NOTE=literal /work/a/leaf/out/value\\\n",
+            a.out_dir, a.dependency_dirs[0]
+        );
+        assert!(dep_info_closure_violation(&a, continued.as_bytes(), |_| true).is_some());
+        let canonical = canonicalize_placements(continued.as_bytes(), &a).unwrap();
+        assert_eq!(render_placements(&canonical, &a), continued.as_bytes());
+        assert!(
+            String::from_utf8_lossy(&canonical)
+                .ends_with("# env-dep:NOTE=literal /work/a/leaf/out/value\\\n")
+        );
+        let ordinary = plan_for(OUT_A, &[], &[]).unwrap();
+        assert_ne!(
+            key(&ordinary),
+            key(&plan_for(OUT_A, &["-Zbinary-dep-depinfo"], &[]).unwrap())
         );
     }
 

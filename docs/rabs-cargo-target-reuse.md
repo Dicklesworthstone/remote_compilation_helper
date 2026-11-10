@@ -32,6 +32,39 @@ Ordinary dep-info and codegen scratch files remain excluded from crate inputs.
 Live dependency key epoch 4 prevents older dynamic-omitting publications from
 regaining serving authority through their previous verification samples.
 
+## Binary dependency evidence
+
+Nightly Cargo's `-Zbinary-dep-depinfo` mode is supported by the live dependency
+lane. For example:
+
+```sh
+cargo +nightly rabs -Zbinary-dep-depinfo check
+```
+
+Cargo forwards this flag to rustc, whose `.d` file then includes the compiled
+dependencies and sysroot artifacts it consumed. RABS validates those paths
+against the exact dependency inventory and original toolchain observation used
+to build the action key. An unobserved file, path traversal, changed compiler
+input or unsupported dynamic artifact still prevents publication. The same
+checks apply when canonical worker execution supplies the result.
+
+For an ordinary host invocation, only complete dependency path tokens in this
+validated `.d` file are translated into the existing canonical placement roots.
+Cache installation derives the next subscriber's real dependency paths and
+checks their freshness; environment comments remain unchanged. The flag and its
+value remain part of the compiler invocation key. Host-mode binary dep-info
+also keys the exact compiler installation path because sysroot paths remain
+verbatim: even byte-identical toolchains installed in different directories do
+not share these entries. Canonical workers already use their fixed toolchain
+namespace. RABS does not add the flag to commands that did not request it, and
+does not require it for ordinary metadata serving.
+
+Binary read evidence does **not** reduce the keyed candidate set. Every admitted
+crate-locator candidate, its bytes and directory membership remain inputs,
+including candidates rustc did not load on a particular run. This mode does not
+enable procedural-macro, build-script-run or unsandboxed codegen caching, and
+does not solve shared-directory key fragmentation (`bd-jwes2`).
+
 ## Enable reuse through the launcher or daemon
 
 `cargo rabs check` enables the complete layout profile when it starts a new

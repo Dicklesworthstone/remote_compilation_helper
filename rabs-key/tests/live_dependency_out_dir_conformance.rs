@@ -283,6 +283,142 @@ fn library_bytes_ignore_the_out_dir_and_the_rest_canonicalizes_exactly() {
     );
 }
 
+/// Rustc itself supplies the binary read evidence. A source-only inventory must
+/// reject it; exact observed binary members authorize only .d path derivation,
+/// while the compiled metadata stays identical in both subscriber placements.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn binary_dep_info_real_rustc_members_and_placements_round_trip() {
+    use rabs_key::live_dependency::{
+        canonicalize_placements, dep_info_closure_violation, render_placements,
+    };
+
+    let temporary = tempfile::tempdir().unwrap();
+    let cargo_home = temporary.path().join("cargo");
+    let registry = cargo_home.join("registry/src/binary-index");
+    let leaf = registry.join("leaf-1.0.0");
+    let package = registry.join("middle-1.0.0");
+    for (root, source) in [
+        (&leaf, "pub const ANSWER: u32 = 42;\n"),
+        (&package, "pub const ANSWER: u32 = leaf::ANSWER;\n"),
+    ] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+    }
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(sysroot.status.success());
+    let sysroot = PathBuf::from(std::str::from_utf8(&sysroot.stdout).unwrap().trim());
+    let compiler = sysroot.join("bin/rustc");
+    let identity = Command::new(&compiler).arg("-vV").output().unwrap();
+    assert!(identity.status.success());
+    let identity = String::from_utf8(identity.stdout).unwrap();
+    let host = identity
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let sysroot_members = std::fs::read_dir(sysroot.join("lib/rustlib").join(host).join("lib"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().to_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut compiled = Vec::new();
+    for subscriber in ["first", "second"] {
+        let base = temporary.path().join(subscriber);
+        let dependencies = base.join("dependencies");
+        let out_dir = base.join("outputs");
+        std::fs::create_dir_all(&dependencies).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        compile(&leaf, "leaf", &dependencies, &[]);
+        let binary = dependencies.join("libleaf-leaf0123.rmeta");
+        let argv = vec![
+            compiler.to_str().unwrap().to_owned(),
+            package.join("src/lib.rs").to_str().unwrap().to_owned(),
+            "--crate-name=middle".into(),
+            "--crate-type=rlib".into(),
+            "--edition=2024".into(),
+            "--emit=metadata,dep-info".into(),
+            "--cap-lints=allow".into(),
+            "--error-format=json".into(),
+            "-Zbinary-dep-depinfo".into(),
+            "-Cmetadata=middle0123".into(),
+            "-Cextra-filename=-middle0123".into(),
+            format!("--out-dir={}", out_dir.display()),
+            format!("-Ldependency={}", dependencies.display()),
+            format!("--extern=leaf={}", binary.display()),
+        ];
+        let environment = vec![
+            ("CARGO_HOME".into(), cargo_home.to_str().unwrap().to_owned()),
+            (
+                "CARGO_MANIFEST_DIR".into(),
+                package.to_str().unwrap().to_owned(),
+            ),
+            ("CARGO_PKG_NAME".into(), "middle".into()),
+        ];
+        let plan = plan_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package.to_str().unwrap(),
+                env: &environment,
+            },
+            host,
+        )
+        .unwrap();
+        check_dependency_cache_read_closure(&plan.invocation).unwrap();
+        let result = Command::new(&compiler)
+            .args(&argv[1..])
+            .current_dir(&package)
+            .env_clear()
+            .envs(plan.execution_env.iter().cloned())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stdout.is_empty());
+        let dep_info = std::fs::read(out_dir.join("middle-middle0123.d")).unwrap();
+        let text = std::str::from_utf8(&dep_info).unwrap();
+        assert!(text.contains(binary.to_str().unwrap()), "{text}");
+        assert!(text.contains("/lib/rustlib/"), "{text}");
+        let source = plan.input_virtual_path("src/lib.rs");
+        let virtual_binary = "/__rabs/deps/000/libleaf-leaf0123.rmeta";
+        let covered =
+            |path: &str| path == source || path == virtual_binary || sysroot_members.contains(path);
+        assert_eq!(dep_info_closure_violation(&plan, &dep_info, covered), None);
+        assert!(
+            dep_info_closure_violation(&plan, &dep_info, |path| {
+                covered(path) && path != virtual_binary
+            })
+            .is_some()
+        );
+        assert!(
+            dep_info_closure_violation(&plan, &dep_info, |path| {
+                path == source || path == virtual_binary
+            })
+            .is_some()
+        );
+        let canonical = canonicalize_placements(&dep_info, &plan).unwrap();
+        assert_eq!(render_placements(&canonical, &plan), dep_info);
+        let metadata = std::fs::read(out_dir.join("libmiddle-middle0123.rmeta")).unwrap();
+        compiled.push((plan, dep_info, canonical, metadata));
+    }
+    let first = &compiled[0];
+    let second = &compiled[1];
+    assert_ne!(first.1, second.1, "rustc must report actual placement");
+    assert_eq!(first.2, second.2, "canonical binary evidence must agree");
+    assert_eq!(
+        first.3, second.3,
+        "metadata must ignore dependency placement"
+    );
+    assert_eq!(render_placements(&first.2, &second.0), second.1);
+}
+
 /// A real compiler counterexample to using dep-info as complete codegen read
 /// evidence. The assembler input lives outside every keyed source root, and a
 /// macro introduces the assembly so a textual source scan is not an answer.

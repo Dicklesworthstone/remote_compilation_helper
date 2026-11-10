@@ -17,6 +17,17 @@
 
 use crate::dep_info::{DepInfoError, DepInfoEvidence, parse_dep_info};
 
+/// rustc's accepted boolean spellings for `-Zbinary-dep-depinfo`. An omitted
+/// value enables the flag. Unknown spellings must remain output-adapter
+/// refusals, even if a later duplicate happens to contain a valid value.
+pub(crate) fn flag_value(value: Option<&str>) -> Option<bool> {
+    match value {
+        None | Some("y" | "yes" | "on" | "true") => Some(true),
+        Some("n" | "no" | "off" | "false") => Some(false),
+        Some(_) => None,
+    }
+}
+
 /// Whether the toolchain emitted binary dep-info for this action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryDepInfoSupport {

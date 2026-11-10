@@ -173,6 +173,7 @@ struct World {
     socket: PathBuf,
     rustc: PathBuf,
     source: PathBuf,
+    binary_dep_info: bool,
 }
 
 impl World {
@@ -192,6 +193,7 @@ impl World {
             socket: root.join("d.sock"),
             rustc: real_rustc(),
             source,
+            binary_dep_info: false,
         };
         std::fs::create_dir_all(world.root.join("home")).unwrap();
         std::fs::create_dir_all(world.cargo_home()).unwrap();
@@ -255,6 +257,9 @@ impl World {
 
     fn cargo_command(&self, worktree: &Path, wrapped: bool) -> Command {
         let mut cargo = Command::new(env!("CARGO"));
+        if self.binary_dep_info {
+            cargo.arg("-Zbinary-dep-depinfo");
+        }
         cargo
             .current_dir(worktree)
             .env_clear()
@@ -381,6 +386,51 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
         .unwrap();
     let world = World::new(dir.path());
     let _daemon = exercise_cargo_worktrees(&world);
+}
+
+#[test]
+fn real_cargo_binary_dep_info_worktrees_serve_exact_dependencies_and_stay_fresh() {
+    let dir = tempfile::Builder::new()
+        .prefix("rc-binary")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut world = World::new(dir.path());
+    world.binary_dep_info = true;
+    // The existing full ladder compares stock/compiled/served metadata, requires
+    // every dependency to commit and verify, then serves all without execution
+    // and requires Cargo itself to report Fresh on the immediate rebuild.
+    let _daemon = exercise_cargo_worktrees(&world);
+    for tree in ["cold", "served"] {
+        let worktree = world.root.join(tree);
+        let mut paths = Vec::new();
+        files_below(&worktree.join("target/debug"), &mut paths);
+        let dep_info: Vec<_> = paths
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("middle-") && name.ends_with(".d"))
+            })
+            .collect();
+        assert_eq!(dep_info.len(), 1);
+        let text = std::fs::read_to_string(&dep_info[0]).unwrap();
+        assert!(
+            text.contains("/lib/rustlib/"),
+            "missing real sysroot inputs: {text}"
+        );
+        assert!(
+            text.contains("libleaf-") && text.contains("libside-"),
+            "missing binary dependency evidence: {text}"
+        );
+        assert!(
+            text.contains(worktree.to_str().unwrap()),
+            "dep-info did not reach its actual subscriber: {text}"
+        );
+        if tree == "served" {
+            assert!(!text.contains(world.root.join("cold").to_str().unwrap()));
+            assert!(!text.contains("/__rabs/"));
+        }
+    }
 }
 
 /// The exact same acceptance ladder for registry and directory-source lanes.

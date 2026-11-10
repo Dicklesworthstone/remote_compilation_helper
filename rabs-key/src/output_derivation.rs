@@ -497,6 +497,15 @@ fn check_compilation_output_options(
                 value.as_deref() == Some("no")
                     && invocation.emit.iter().any(|kind| kind == "metadata")
             }
+            // This extends the existing .d file with binary input paths; it
+            // creates no additional output. The live capture must validate
+            // each path against the exact keyed dependency/sysroot inventory.
+            // Do not infer that binary dep-info closes proc-macro side effects
+            // or authorizes dropping unobserved crate-locator candidates.
+            "binary-dep-depinfo" => {
+                crate::binary_dep_info::flag_value(value.as_deref()).is_some()
+                    && invocation.emit.iter().any(|kind| kind == "dep-info")
+            }
             // This selects rustc's frontend pool, not another output mode.
             // Keep the user's exact flag in both existing key components:
             // parallel and serial compiles must earn their own comparisons.
@@ -1235,6 +1244,51 @@ mod tests {
             derive_dependency_output_declarations(&missing_evidence, "x86_64-unknown-linux-gnu")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn binary_dep_info_models_only_rustc_boolean_values_and_keeps_output_guards() {
+        let ordinary = dependency(&[]);
+        let expected =
+            derive_dependency_output_declarations(&ordinary, "x86_64-unknown-linux-gnu").unwrap();
+        for value in [
+            None,
+            Some("y"),
+            Some("yes"),
+            Some("on"),
+            Some("true"),
+            Some("n"),
+            Some("no"),
+            Some("off"),
+            Some("false"),
+        ] {
+            let mut inv = ordinary.clone();
+            inv.unstable
+                .push(("binary-dep-depinfo".into(), value.map(str::to_owned)));
+            assert_eq!(
+                derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu").unwrap(),
+                expected
+            );
+            assert_ne!(inv.canonical_bytes(), ordinary.canonical_bytes());
+            inv.emit = vec!["metadata".into(), "link".into()];
+            assert!(check_dependency_output_options(&inv).is_err());
+        }
+        for value in ["", "1", "0", "unknown", "YES", "false "] {
+            let mut inv = ordinary.clone();
+            inv.unstable
+                .push(("binary-dep-depinfo".into(), Some(value.into())));
+            inv.unstable
+                .push(("binary-dep-depinfo".into(), Some("yes".into())));
+            assert!(check_dependency_output_options(&inv).is_err(), "{value}");
+        }
+        for extra in [
+            "-Zno-codegen",
+            "-Cincremental=/mutable",
+            "--emit=dep-info,metadata=/other/result",
+        ] {
+            let inv = dependency(&["-Zbinary-dep-depinfo", extra]);
+            assert!(check_dependency_output_options(&inv).is_err(), "{extra}");
+        }
     }
 
     #[test]

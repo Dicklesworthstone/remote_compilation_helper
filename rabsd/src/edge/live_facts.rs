@@ -264,6 +264,18 @@ impl ToolchainGuard {
             .expect("admitted compiler has a sysroot")
     }
 
+    /// Exact file membership in the sysroot observation used by this request's
+    /// key. A path merely residing below the sysroot is not a captured input.
+    /// The caller must still revalidate this guard before and after capture.
+    #[must_use]
+    pub(crate) fn contains_sysroot_file(&self, path: &Path) -> bool {
+        self.observed
+            .inputs
+            .sysroot_files
+            .binary_search_by(|(observed, _)| observed.as_path().cmp(path))
+            .is_ok()
+    }
+
     /// Recheck the original compiler path and all its observed inputs without
     /// warming, probing, or adopting a newer memo generation.
     ///
@@ -3766,6 +3778,32 @@ esac
         assert_eq!(first.inputs.sysroot_files.len(), 2);
         assert_eq!(first.facts, probe_toolchain(&compiler, &[]).unwrap().facts);
         assert!(first.still_current());
+    }
+
+    #[test]
+    fn binary_dep_info_sysroot_membership_uses_the_original_keyed_observation() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let guard = ToolchainGuard {
+            observed: Arc::new(probe_toolchain(&compiler, &[]).unwrap()),
+        };
+        let core = root.join("lib/rustlib/test-host/lib/libcore.rlib");
+        let new = root.join("lib/rustlib/test-host/lib/libnew.rmeta");
+        assert!(guard.contains_sysroot_file(&core));
+        assert!(!guard.contains_sysroot_file(&compiler));
+        assert!(!guard.contains_sysroot_file(&root.join("lib/libdriver.so")));
+        assert!(!guard.contains_sysroot_file(&new));
+        guard.verify_unchanged(&compiler).unwrap();
+        std::fs::write(&new, b"added after keying").unwrap();
+        assert!(!guard.contains_sysroot_file(&new));
+        assert!(guard.verify_unchanged(&compiler).is_err());
+        let refreshed = ToolchainGuard {
+            observed: Arc::new(probe_toolchain(&compiler, &[]).unwrap()),
+        };
+        assert!(refreshed.contains_sysroot_file(&new));
+        assert!(!guard.contains_sysroot_file(&new));
+        std::fs::write(&core, b"changed original binary input").unwrap();
+        assert!(refreshed.verify_unchanged(&compiler).is_err());
     }
 
     #[test]
