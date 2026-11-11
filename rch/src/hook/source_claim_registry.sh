@@ -120,97 +120,17 @@ confirm_durable_record() {
 # the complete identity state under the activity and metadata locks.
 link_cancellation_record() {
     matches_request "$1"
-    printf '%s\n' "$requested" | python3 -I -S -c '
-import hashlib, os, stat, sys
-
-def identity(info):
-    return info.st_dev, info.st_ino
-
-def stamp(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
-            info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
-
-def private(info, directory=False):
-    kind = stat.S_ISDIR if directory else stat.S_ISREG
-    if not kind(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
-        raise ValueError("unsafe cancellation record ownership or type")
-
-try:
-    registry, source, destination, token, digest = sys.argv[1:]
-    base = token + "." + digest
-    claim, fence, receipt = base + ".claim", base + ".cancelling", "cancelled/" + base + ".claim"
-    allowed = ((claim, fence), (receipt, fence), (fence, receipt))
-    routes = [(left, right) for left, right in allowed
-              if source == registry + "/" + left and destination == registry + "/" + right]
-    if len(routes) != 1:
-        raise ValueError("invalid cancellation record link")
-    expected = sys.stdin.buffer.read(33554433)
-    if not 0 < len(expected) <= 33554432 or hashlib.sha256(expected).hexdigest() != digest:
-        raise ValueError("cancellation closure changed")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-    parent_path, registry_name = os.path.split(registry)
-    parent = os.open(parent_path, flags)
-    directory = os.open(registry_name, flags, dir_fd=parent)
-    bindings = [(None, parent_path, parent), (parent, registry_name, directory)]
-    directories = {"": directory}
-    if any("/" in name for name in routes[0]):
-        terminal = os.open("cancelled", flags, dir_fd=directory)
-        bindings.append((directory, "cancelled", terminal))
-        directories["cancelled"] = terminal
-
-    def verify_directories():
-        for owner, name, descriptor in bindings:
-            opened = os.fstat(descriptor)
-            private(opened, directory=True)
-            if identity(os.stat(name, dir_fd=owner, follow_symlinks=False)) != identity(opened):
-                raise ValueError("cancellation record directory changed")
-
-    source_parent, source_name = os.path.split(routes[0][0])
-    target_parent, target_name = os.path.split(routes[0][1])
-    source_directory, target_directory = directories[source_parent], directories[target_parent]
-    verify_directories()
-    descriptor = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                         dir_fd=source_directory)
-
-    def verify_record():
-        before = os.fstat(descriptor)
-        private(before)
-        if before.st_size != len(expected) or before.st_nlink < 1:
-            raise ValueError("cancellation source record changed")
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            content = stream.read(len(expected) + 1)
-        after = os.fstat(descriptor)
-        named = os.stat(source_name, dir_fd=source_directory, follow_symlinks=False)
-        if content != expected or stamp(before) != stamp(after) or stamp(named) != stamp(after):
-            raise ValueError("cancellation source identity or bytes changed")
-        return after
-
-    before = verify_record()
-    os.fsync(descriptor)
-    verify_directories()
-    if stamp(os.stat(source_name, dir_fd=source_directory, follow_symlinks=False)) != stamp(before):
-        raise ValueError("cancellation source changed before link")
-    os.link(source_name, target_name, src_dir_fd=source_directory,
-            dst_dir_fd=target_directory, follow_symlinks=False)
-    target = os.open(target_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                     dir_fd=target_directory)
-    if identity(os.fstat(target)) != identity(before):
-        raise ValueError("cancellation destination does not name the verified source")
-    os.fsync(descriptor)
-    os.fsync(target_directory)
-    if target_directory != directory:
-        os.fsync(directory)
-    verify_directories()
-    after = verify_record()
-    named = os.stat(target_name, dir_fd=target_directory, follow_symlinks=False)
-    if (stamp(after)[:-2] != stamp(before)[:-2] or after.st_nlink != before.st_nlink + 1
-            or stamp(os.fstat(target)) != stamp(after) or stamp(named) != stamp(after)):
-        raise ValueError("cancellation record changed after link")
-except (OSError, ValueError) as error:
-    print("RCH_SOURCE_CLAIM_LINK_FAILED " + str(error), file=sys.stderr)
-    sys.exit(1)
-' "$registry" "$1" "$2" "$token" "$digest"
+    if ! rch_wkr_locate; then
+        printf '%s\n' 'RCH_SOURCE_CLAIM_LINK_FAILED rch-wkr is not installed on this worker' >&2
+        return 1
+    fi
+    if ! rch_claim_link_probe=$("$RCH_WKR" source-claim-link probe </dev/null) \
+        || [ "$rch_claim_link_probe" != 'rch-wkr source-claim-link v1' ]; then
+        printf '%s\n' 'RCH_SOURCE_CLAIM_LINK_FAILED deploy the matching rch-wkr with source-claim-link support' >&2
+        return 1
+    fi
+    printf '%s\n' "$requested" | "$RCH_WKR" source-claim-link link \
+        "$registry" "$1" "$2" "$token" "$digest"
 }
 
 # Call only after confirming the exact completed cancellation receipt. Older
