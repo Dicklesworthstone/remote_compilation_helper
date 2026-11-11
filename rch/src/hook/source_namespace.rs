@@ -291,9 +291,10 @@ fn namespace_command(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let paths_script = rch_common::source_namespace_paths::shell_script(PATHS);
     let paths = |mode: &str| {
         format!(
-            "set -- {mode} {} {}\n{PATHS}",
+            "set -- {mode} {} {}\n{paths_script}",
             quote(&canonical),
             quote(&alias),
         )
@@ -582,6 +583,7 @@ mod tests {
         ] {
             let mut child = std::process::Command::new("sh")
                 .arg("-s")
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -976,6 +978,7 @@ mod tests {
         let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
         let mut child = std::process::Command::new("sh")
             .args(["-c", CONTROL])
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1041,6 +1044,7 @@ mod tests {
             let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
             let mut child = std::process::Command::new("sh")
                 .args(["-c", CONTROL])
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

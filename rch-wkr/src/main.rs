@@ -71,6 +71,12 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
+    /// Internal source namespace creation and read-only topology checks.
+    #[command(hide = true)]
+    SourceNamespacePaths {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
         /// Process to inspect; no signals are sent.
@@ -302,6 +308,9 @@ fn main() -> Result<()> {
     if let Commands::ResultDirectory { arguments } = &cli.command {
         std::process::exit(result_probe::main(arguments));
     }
+    if let Commands::SourceNamespacePaths { arguments } = &cli.command {
+        std::process::exit(rch_common::source_namespace_paths::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -390,6 +399,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::ResultDirectory { .. } => {
             anyhow::bail!("result-directory requires the synchronous worker entry point")
+        }
+        Commands::SourceNamespacePaths { .. } => {
+            anyhow::bail!("source-namespace-paths requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

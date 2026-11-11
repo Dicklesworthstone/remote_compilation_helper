@@ -3372,7 +3372,7 @@ fn source_topology_revalidation_command(fences: &[crate::history::SourceTopology
         "set -eu\nrch_source_topology_matches() (\nset -- check \"$1\" \"$2\"\n{}\n)\n",
         // rchd's own copy, so the published package builds; the hook's file
         // stays canonical and a test below fails when the two drift.
-        include_str!("source_namespace_paths.sh"),
+        rch_common::source_namespace_paths::shell_script(include_str!("source_namespace_paths.sh")),
     );
     for (index, fence) in fences.iter().enumerate() {
         let topology = &fence.mismatch.topology;
@@ -3958,7 +3958,8 @@ mod tests {
                 shell_escape::escape(command.as_str().into()).len() + "sh -c ".len()
                     <= SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES
             );
-            assert_eq!(command.matches("namespace_realpath() {").count(), 1);
+            assert_eq!(command.matches("rch_wkr_locate() {").count(), 1);
+            assert_eq!(command.matches("source-namespace-paths probe").count(), 1);
             assert_eq!(
                 command.matches("if rch_source_topology_matches ").count(),
                 range.len()
@@ -4050,6 +4051,7 @@ mod tests {
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(source_topology_revalidation_command(&fences))
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .output()
                 .unwrap();
             rch_common::CommandResult {

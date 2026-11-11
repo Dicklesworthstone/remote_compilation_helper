@@ -136,7 +136,9 @@ mod source_topology_cli {
             std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(
                 base.join("paths.sh"),
-                include_str!("../../src/hook/source_namespace_paths.sh"),
+                rch_common::source_namespace_paths::shell_script(include_str!(
+                    "../../src/hook/source_namespace_paths.sh"
+                )),
             )
             .unwrap();
             std::fs::write(
@@ -727,7 +729,7 @@ if 'RCH_NAMESPACE_SCOPE' not in payload:
     event('unexpected_control_command', 73)
     sys.exit('unexpected fixture SSH control command')
 paths = (base / 'paths.sh').read_text()
-assert 'RCH_SOURCE_TOPOLOGY_INCOMPATIBLE' in payload, 'missing namespace refusal protocol'
+assert 'source-namespace-paths probe' in payload, 'missing native namespace capability check'
 registry = root / 'registry'
 for name in ('', 'released', 'cancelled', 'quarantine'):
     (registry / name).mkdir(parents=True, exist_ok=True)

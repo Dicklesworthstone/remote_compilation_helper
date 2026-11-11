@@ -88,6 +88,7 @@ pub mod restart_admission;
 pub use restart_admission::{MaintenanceOwner, MaintenanceRecovery, RestartAdmissionResponse};
 pub mod rsync_flavor;
 pub mod schema_versions;
+pub mod source_namespace_paths;
 #[cfg(unix)]
 pub mod ssh;
 #[cfg(all(test, unix))]
