@@ -428,7 +428,7 @@ fn replacing_a_waiting_lock_is_refused_without_mutating_either_inode() {
 
 fn retry_command(fixture: &Fixture, seconds: u64, scale: &str, body: &str) -> Command {
     let program = format!(
-        "{}\nrch_source_attempt() {{ ( set -eu; {body}\n); }}\nrch_admission_retry_seconds={seconds}\n{}",
+        "{}\nrch_admission_fixture=$1\nrch_source_attempt() {{ ( set -eu; set -- \"$rch_admission_fixture\"; {body}\n); }}\nrch_admission_retry_seconds={seconds}\n{}",
         rch_common::wkr_locate::WKR_LOCATE_SHELL,
         include_str!("../../rch/src/hook/source_claim_admission.sh"),
     );

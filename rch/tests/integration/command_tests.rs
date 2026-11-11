@@ -143,7 +143,11 @@ mod source_topology_cli {
             .unwrap();
             std::fs::write(
                 base.join("admission.sh"),
-                include_str!("../../src/hook/source_claim_admission.sh"),
+                format!(
+                    "{}\n{}",
+                    rch_common::wkr_locate::WKR_LOCATE_SHELL,
+                    include_str!("../../src/hook/source_claim_admission.sh"),
+                ),
             )
             .unwrap();
             std::fs::write(
