@@ -12,6 +12,7 @@ mod file_sync;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+mod source_lock;
 mod source_retain;
 mod source_verifier;
 mod toolchain;
@@ -90,6 +91,12 @@ enum Commands {
     SourceRetain {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Internal advisory source locks and independently supervised liveness.
+    #[command(hide = true)]
+    SourceLock {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
     },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
@@ -331,6 +338,9 @@ fn main() -> Result<()> {
     if let Commands::SourceRetain { arguments } = &cli.command {
         std::process::exit(source_retain::main(arguments));
     }
+    if let Commands::SourceLock { arguments } = &cli.command {
+        std::process::exit(source_lock::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -428,6 +438,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceRetain { .. } => {
             anyhow::bail!("source-retain requires the synchronous worker entry point")
+        }
+        Commands::SourceLock { .. } => {
+            anyhow::bail!("source-lock requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

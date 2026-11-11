@@ -1,339 +1,512 @@
-//! Real-process source-lock admission tests. The Python driver coordinates
-//! native flock descriptors and the actual shipped holder; it does not model
-//! the locking algorithm. No SSH server or worker fleet is needed.
+//! Real-process admission through the shipped holder and matching worker.
+//! Native descriptors observe kernel locks; no SSH server or fleet is needed.
 #![cfg(target_os = "linux")]
+#![forbid(unsafe_code)]
 
-use std::process::Command;
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-fn check(backend: &str, scenario: &str) {
-    let directory = tempfile::tempdir().expect("source lock fixture");
-    let script = directory.path().join("holder.sh");
-    std::fs::write(&script, include_str!("../src/hook/source_lock_holder.sh"))
-        .expect("write production holder");
-    let output = Command::new("python3")
-        .args(["-I", "-c", DRIVER])
-        .arg(script)
-        .arg(directory.path())
-        .args([backend, scenario])
-        .output()
-        .expect("run Linux source lock regression (requires python3)");
+use rustix::fs::{FlockOperation, OFlags};
+use rustix::io::Errno;
+
+struct Fixture {
+    directory: tempfile::TempDir,
+    tools: PathBuf,
+    worker: PathBuf,
+    next: Cell<usize>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("source-lock-admission-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let tools = directory.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for name in ["sh", "cat"] {
+            std::os::unix::fs::symlink(format!("/bin/{name}"), tools.join(name)).unwrap();
+        }
+        Self {
+            directory,
+            tools,
+            worker: rch_common::testing::worker_binary(),
+            next: Cell::new(0),
+        }
+    }
+
+    fn paths(&self, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                let path = self
+                    .directory
+                    .path()
+                    .join(format!("source root '{index}.lock"));
+                std::fs::write(&path, b"").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn start(
+        &self,
+        paths: &[PathBuf],
+        modes: &[char],
+        terminal: Option<&str>,
+        extra: bool,
+    ) -> Holder {
+        assert_eq!(paths.len(), modes.len());
+        let index = self.next.get();
+        self.next.set(index + 1);
+        let plan = self.directory.path().join(format!("plan-{index}"));
+        let claim = self.directory.path().join(format!("claim-{index}"));
+        let mut records: String = paths
+            .iter()
+            .zip(modes)
+            .map(|(path, mode)| format!("{mode} {}\n", path.display()))
+            .collect();
+        if extra {
+            // A syntactically valid surplus row tests the exact count bound.
+            records.push_str(&format!(
+                "x {}\n",
+                self.directory.path().join("extra.lock").display()
+            ));
+        }
+        std::fs::write(&plan, records).unwrap();
+        std::fs::write(&claim, b"durable-claim-sentinel\n").unwrap();
+        let script = format!(
+            "{}\n{}",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            include_str!("../src/hook/source_lock_holder.sh")
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "exec 3<\"$1\"; exec 4<\"$2\"; shift 2; exec sh -c \"$@\"",
+                "source-lock-test",
+            ])
+            .arg(&plan)
+            .arg(&claim)
+            .arg(&script)
+            .arg("source-lock-holder")
+            .arg(paths.len().to_string())
+            .arg("READY")
+            .env("RCH_WKR_BIN", &self.worker)
+            .env("PATH", &self.tools);
+        if let Some(terminal) = terminal {
+            command.arg(terminal);
+        }
+        Holder::spawn(command)
+    }
+
+    fn exclusive(&self, paths: &[PathBuf]) -> Holder {
+        self.start(paths, &vec!['x'; paths.len()], None, false)
+    }
+}
+
+struct Holder {
+    child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    status: Option<ExitStatus>,
+}
+
+impl Holder {
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        nonblocking(&stdout);
+        nonblocking(&stderr);
+        Self {
+            child,
+            stdout,
+            stderr,
+            out: Vec::new(),
+            err: Vec::new(),
+            status: None,
+        }
+    }
+
+    fn drain(&mut self) {
+        fn read(reader: &mut impl Read, bytes: &mut Vec<u8>) {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("holder output: {error}"),
+                }
+            }
+        }
+        read(&mut self.stdout, &mut self.out);
+        read(&mut self.stderr, &mut self.err);
+    }
+
+    fn running(&mut self) {
+        self.drain();
+        if self.status.is_none() {
+            self.status = self.child.try_wait().unwrap();
+        }
+        assert!(
+            self.status.is_none(),
+            "holder exited {:?}: {}",
+            self.status,
+            String::from_utf8_lossy(&self.err)
+        );
+    }
+
+    fn line(&mut self) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.drain();
+            if let Some(end) = self.out.iter().position(|byte| *byte == b'\n') {
+                let line = self.out[..end].to_vec();
+                self.out.drain(..=end);
+                return line;
+            }
+            self.running();
+            assert!(
+                Instant::now() < deadline,
+                "holder never announced readiness"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn not_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            self.running();
+            assert!(
+                self.out.is_empty(),
+                "partial source ownership was announced: {:?}",
+                self.out
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn opened(&mut self, path: &Path) {
+        // Observe the owned holder reaching contention before probing its
+        // prefix. The script and worker execs retain this direct child's PID.
+        let descriptors = PathBuf::from(format!("/proc/{}/fd", self.child.id()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.running();
+            if let Ok(entries) = std::fs::read_dir(&descriptors)
+                && entries.filter_map(Result::ok).any(|entry| {
+                    std::fs::read_link(entry.path()).is_ok_and(|target| target == path)
+                })
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder never opened contended root: {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.stdin.take();
+    }
+
+    fn finish(&mut self, expected: i32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.drain();
+            if self.status.is_none() {
+                self.status = self.child.try_wait().unwrap();
+            }
+            if let Some(status) = self.status {
+                self.drain();
+                assert_eq!(
+                    status.code(),
+                    Some(expected),
+                    "stdout={}; stderr={}",
+                    String::from_utf8_lossy(&self.out),
+                    String::from_utf8_lossy(&self.err)
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder did not finish: {}",
+                String::from_utf8_lossy(&self.err)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        self.close();
+        if self.status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn nonblocking(fd: impl AsFd) {
+    let flags = rustix::fs::fcntl_getfl(&fd).unwrap();
+    rustix::fs::fcntl_setfl(fd, flags | OFlags::NONBLOCK).unwrap();
+}
+
+fn lock_file(path: &Path) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+fn block(path: &Path) -> File {
+    let file = lock_file(path);
+    rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap();
+    file
+}
+
+fn available(path: &Path, shared: bool) -> bool {
+    let mode = if shared {
+        FlockOperation::NonBlockingLockShared
+    } else {
+        FlockOperation::NonBlockingLockExclusive
+    };
+    match rustix::fs::flock(lock_file(path), mode) {
+        Ok(()) => true,
+        Err(Errno::AGAIN | Errno::ACCESS) => false,
+        Err(error) => panic!("probe native lock {}: {error}", path.display()),
+    }
+}
+
+fn complete_grant(paths: &[PathBuf], shared_first: bool) {
     assert!(
-        output.status.success(),
-        "{backend}/{scenario}: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        paths.iter().all(|path| !available(path, false)),
+        "announced grant omitted a source root"
+    );
+    if shared_first {
+        assert!(
+            available(&paths[0], true),
+            "shared intent upgraded to exclusive"
+        );
+    }
+}
+
+fn all_released(paths: &[PathBuf]) {
+    assert!(
+        paths.iter().all(|path| available(path, false)),
+        "holder leaked a source lock"
     );
 }
 
 #[test]
-fn native_waiter_does_not_reserve_unavailable_source_closure() {
-    for scenario in ["convoy_exclusive", "convoy_shared", "cancelled_waiter"] {
-        check("native", scenario);
+fn blocked_closures_release_all_prefix_locks_for_independent_builds() {
+    for count in [2, 32, 64] {
+        for shared_first in [false, true] {
+            let fixture = Fixture::new();
+            let paths = fixture.paths(count);
+            let busy = block(paths.last().unwrap());
+            let mut modes = vec!['x'; count];
+            if shared_first {
+                modes[0] = 's';
+            }
+            let mut waiting = fixture.start(&paths, &modes, None, false);
+            waiting.opened(paths.last().unwrap());
+            waiting.not_ready();
+            let mut independent = fixture.exclusive(&paths[..1]);
+            assert_eq!(independent.line(), b"READY");
+            assert!(
+                !available(paths.last().unwrap(), false),
+                "busy dependency was released early"
+            );
+            waiting.not_ready();
+            independent.close();
+            independent.finish(0);
+            drop(busy);
+            assert_eq!(waiting.line(), b"READY");
+            complete_grant(&paths, shared_first);
+            waiting.close();
+            waiting.finish(0);
+            all_released(&paths);
+        }
     }
 }
 
 #[test]
-fn native_retry_preserves_identity_and_complete_grant() {
-    for scenario in [
-        "path_replacement",
-        "inode_alias",
-        "terminal_handoff",
-        "mutual_exclusion",
-        "malformed_plan",
+fn cancelled_waiters_never_grant_or_leak_prefix_locks() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let paths = fixture.paths(count);
+        let busy = block(paths.last().unwrap());
+        let mut waiting = fixture.exclusive(&paths);
+        waiting.opened(paths.last().unwrap());
+        waiting.close();
+        waiting.finish(73);
+        assert!(String::from_utf8_lossy(&waiting.err).contains("requester"));
+        assert!(waiting.out.is_empty());
+        drop(busy);
+        all_released(&paths);
+    }
+}
+
+#[test]
+fn retry_rejects_replaced_lock_path_before_complete_grant() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let paths = fixture.paths(count);
+        let busy = block(paths.last().unwrap());
+        let mut waiting = fixture.exclusive(&paths);
+        waiting.opened(paths.last().unwrap());
+        let retained = paths[0].with_extension("retained");
+        std::fs::rename(&paths[0], &retained).unwrap();
+        std::fs::write(&paths[0], b"").unwrap();
+        drop(busy);
+        waiting.finish(73);
+        assert!(String::from_utf8_lossy(&waiting.err).contains("source lock path changed"));
+        assert!(waiting.out.is_empty());
+        assert!(available(&retained, false));
+        all_released(&paths);
+    }
+}
+
+#[test]
+fn physical_aliases_refuse_every_exclusive_and_shared_combination() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let mut paths = fixture.paths(count);
+        let alias = fixture.directory.path().join("physical alias.lock");
+        std::fs::hard_link(&paths[0], &alias).unwrap();
+        paths[1] = alias;
+        std::fs::write(&paths[0], b"retained original lock bytes").unwrap();
+        for (first, second) in [('x', 'x'), ('x', 's'), ('s', 'x'), ('s', 's')] {
+            let mut modes = vec!['x'; count];
+            modes[0] = first;
+            modes[1] = second;
+            let mut waiting = fixture.start(&paths, &modes, None, false);
+            waiting.finish(73);
+            assert!(String::from_utf8_lossy(&waiting.err).contains("duplicate source lock inode"));
+            assert!(waiting.out.is_empty());
+            all_released(&paths);
+            for path in &paths[..2] {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    b"retained original lock bytes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_inherits_complete_grant_and_untouched_fd4_claim_input() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let paths = fixture.paths(count);
+        let busy = block(paths.last().unwrap());
+        let terminal = "printf '%s\\n' \"$1\"; IFS= read -r claim <&4 || exit 91; printf 'CLAIM:%s\\n' \"$claim\"; IFS= read -r reply || exit 92; [ \"$reply\" = release ] || exit 93";
+        let mut waiting = fixture.start(&paths, &vec!['x'; count], Some(terminal), false);
+        waiting.opened(paths.last().unwrap());
+        waiting.not_ready();
+        drop(busy);
+        assert_eq!(waiting.line(), b"READY");
+        assert_eq!(waiting.line(), b"CLAIM:durable-claim-sentinel");
+        complete_grant(&paths, false);
+        waiting
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        waiting.close();
+        waiting.finish(0);
+        all_released(&paths);
+    }
+}
+
+#[test]
+fn sequential_holders_preserve_complete_mutual_exclusion() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let paths = fixture.paths(count);
+        let mut first = fixture.exclusive(&paths);
+        assert_eq!(first.line(), b"READY");
+        let mut second = fixture.exclusive(&paths);
+        second.opened(&paths[0]);
+        second.not_ready();
+        complete_grant(&paths, false);
+        first.close();
+        first.finish(0);
+        assert_eq!(second.line(), b"READY");
+        complete_grant(&paths, false);
+        second.close();
+        second.finish(0);
+        all_released(&paths);
+    }
+}
+
+#[test]
+fn malformed_plan_count_refuses_without_waiting_on_contended_dependency() {
+    for count in [2, 32, 64] {
+        let fixture = Fixture::new();
+        let paths = fixture.paths(count);
+        let busy = block(paths.last().unwrap());
+        let mut waiting = fixture.start(&paths, &vec!['x'; count], None, true);
+        waiting.finish(73);
+        assert!(String::from_utf8_lossy(&waiting.err).contains("count does not match"));
+        assert!(waiting.out.is_empty());
+        drop(busy);
+        all_released(&paths);
+    }
+}
+
+#[test]
+fn unavailable_or_mismatched_explicit_worker_never_acquires_source_locks() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for script in [
+        None,
+        Some("#!/bin/sh\nexit 2\n"),
+        Some("#!/bin/sh\nprintf 'rch-wkr source-lock v0\\n'\n"),
+        Some("#!/bin/sh\nprintf 'rch-wkr source-lock v1\\n'\nexit 3\n"),
     ] {
-        check("native", scenario);
-    }
-}
-
-#[test]
-fn gnu_waiter_does_not_reserve_unavailable_source_closure() {
-    for backend in ["gnu", "gnu_large"] {
-        for scenario in ["convoy_exclusive", "convoy_shared", "cancelled_waiter"] {
-            check(backend, scenario);
+        let mut fixture = Fixture::new();
+        fixture.worker = fixture.directory.path().join("selected-worker");
+        if let Some(script) = script {
+            std::fs::write(&fixture.worker, script).unwrap();
+            std::fs::set_permissions(&fixture.worker, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
+        let source = fixture.directory.path().join("must-remain-absent.lock");
+        let mut holder = fixture.exclusive(std::slice::from_ref(&source));
+        holder.finish(73);
+        assert!(holder.out.is_empty());
+        assert!(String::from_utf8_lossy(&holder.err).contains("RCH_SOURCE_LOCK_UNAVAILABLE"));
+        assert!(
+            !source.exists(),
+            "unsupported worker acquired a source lock"
+        );
     }
 }
-
-#[test]
-fn gnu_retry_preserves_identity_and_complete_grant() {
-    for backend in ["gnu", "gnu_large"] {
-        for scenario in [
-            "path_replacement",
-            "inode_alias",
-            "terminal_handoff",
-            "mutual_exclusion",
-            "malformed_plan",
-        ] {
-            check(backend, scenario);
-        }
-    }
-}
-
-const DRIVER: &str = r#"
-import fcntl
-import os
-from pathlib import Path
-import select
-import shutil
-import subprocess
-import sys
-import time
-
-script_path, root_path, backend, scenario = sys.argv[1:]
-script = Path(script_path).read_text()
-root = Path(root_path)
-count = {"native": 32, "gnu": 2, "gnu_large": 64}[backend]
-environment = os.environ.copy()
-if backend == "gnu_large":
-    # Exercise large GNU plans on workers without Python in PATH. The driver
-    # itself still uses Python; the actual holder gets only its existing tools.
-    binary_dir = root / "gnu-bin"
-    binary_dir.mkdir()
-    for name in ["sh", "bash", "flock", "cat", "uname"]:
-        executable = shutil.which(name)
-        assert executable is not None, "required fixture tool missing: " + name
-        (binary_dir / name).symlink_to(executable)
-    environment["PATH"] = str(binary_dir)
-holders = []
-blockers = []
-
-class Holder:
-    def __init__(self, paths, modes=None, terminal=None, malformed=False):
-        modes = modes or ["x"] * len(paths)
-        plan = root / ("plan-" + str(len(holders)))
-        text = "".join(mode + " " + str(path) + "\n" for mode, path in zip(modes, paths))
-        if malformed:
-            text += "unexpected trailing record\n"
-        plan.write_text(text)
-        claim = root / ("claim-" + str(len(holders)))
-        claim.write_bytes(b"durable-claim-sentinel\n")
-        args = ["sh", "-c",
-                'plan=$1; claim=$2; shift 2; exec 3<"$plan"; exec 4<"$claim"; exec sh -c "$@"',
-                "source-lock-test", str(plan), str(claim), script, script, str(len(paths)), "READY"]
-        if terminal is not None:
-            args += [terminal]
-        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, env=environment)
-        self.buffer = b""
-        holders.append(self)
-
-    def line(self, seconds=3):
-        deadline = time.monotonic() + seconds
-        while b"\n" not in self.buffer:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
-                raise AssertionError("holder did not make progress before the observation deadline")
-            data = os.read(self.process.stdout.fileno(), 4096)
-            if not data:
-                raise AssertionError("holder exited before readiness: " + self.process.stderr.read().decode())
-            self.buffer += data
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return line
-
-    def not_ready(self):
-        assert not self.buffer, self.buffer
-        if select.select([self.process.stdout], [], [], 0.1)[0]:
-            data = os.read(self.process.stdout.fileno(), 4096)
-            assert not data, "partial source ownership was announced as ready: " + repr(data)
-            assert self.process.poll() is None, "holder exited while expected to wait"
-
-    def opened(self, path):
-        # Wait for the real holder to reach the contested inode, rather than
-        # letting a probe win before acquisition has even started. All execs
-        # preserve the Popen PID. This observation grants no lock authority.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                files = Path("/proc/" + str(self.process.pid) + "/fd").iterdir()
-                if any(os.readlink(entry) == str(path) for entry in files):
-                    return
-            except FileNotFoundError:
-                pass
-            if self.process.poll() is not None:
-                raise AssertionError("holder exited during acquisition: " + self.process.stderr.read().decode())
-            time.sleep(0.005)
-        raise AssertionError("holder never opened the contended source root")
-
-    def close(self):
-        if not self.process.stdin.closed:
-            self.process.stdin.close()
-
-    def finished(self, code):
-        actual = self.process.wait(timeout=4)
-        error = self.process.stderr.read().decode()
-        assert actual == code, (actual, code, error)
-        return error
-
-
-def paths():
-    result = [root / ("source root " + str(i) + ".lock") for i in range(count)]
-    for path in result:
-        path.touch()
-    return result
-
-
-def block(path):
-    descriptor = path.open("r+b")
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
-    blockers.append(descriptor)
-    return descriptor
-
-
-def available(path, mode=fcntl.LOCK_EX):
-    with path.open("r+b") as descriptor:
-        try:
-            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        return True
-
-
-def complete_grant(items, shared_first=False):
-    assert all(not available(path) for path in items), "an announced grant omitted a source root"
-    if shared_first:
-        assert available(items[0], fcntl.LOCK_SH), "shared intent was upgraded to exclusive ownership"
-
-
-def convoy(shared_first):
-    items = paths()
-    busy = block(items[-1])
-    modes = ["s" if shared_first and i == 0 else "x" for i in range(count)]
-    waiting = Holder(items, modes)
-    waiting.opened(items[-1])
-    waiting.not_ready()
-    # A real second build requiring only the free prefix must progress while
-    # the first build's last dependency REMAINS owned by the external blocker.
-    independent = Holder([items[0]])
-    assert independent.line() == b"READY"
-    assert not available(items[-1]), "fixture released the busy dependency too early"
-    waiting.not_ready()
-    independent.close()
-    independent.finished(0)
-    busy.close()
-    assert waiting.line() == b"READY"
-    complete_grant(items, shared_first)
-    waiting.close()
-    waiting.finished(0)
-    assert all(available(path) for path in items), "completed holder leaked a source lock"
-
-
-def cancelled_waiter():
-    items = paths()
-    busy = block(items[-1])
-    waiting = Holder(items)
-    waiting.opened(items[-1])
-    waiting.close()
-    error = waiting.finished(73)
-    assert "requester" in error, error
-    assert waiting.process.stdout.read() == b"", "cancelled waiter announced a grant"
-    busy.close()
-    assert all(available(path) for path in items), "cancelled waiter leaked a source lock"
-
-
-def path_replacement():
-    items = paths()
-    busy = block(items[-1])
-    waiting = Holder(items)
-    waiting.opened(items[-1])
-    retained = items[0].with_suffix(".retained")
-    items[0].rename(retained)
-    items[0].touch()
-    busy.close()
-    error = waiting.finished(73)
-    assert "source lock path changed" in error, error
-    assert waiting.process.stdout.read() == b"", "replaced inode granted source ownership"
-    assert available(retained), "replaced lock inode remained held"
-    assert all(available(path) for path in items)
-
-
-def inode_alias():
-    items = paths()
-    alias = root / "physical alias.lock"
-    os.link(items[0], alias)
-    items[1] = alias
-    items[0].write_bytes(b"retained original lock bytes")
-    for first, second in [("x", "x"), ("x", "s"), ("s", "x"), ("s", "s")]:
-        modes = [first, second] + ["x"] * (count - 2)
-        waiting = Holder(items, modes)
-        error = waiting.finished(73)
-        assert "duplicate source lock inode" in error, error
-        assert waiting.process.stdout.read() == b""
-        assert all(available(path) for path in items)
-        assert items[0].read_bytes() == alias.read_bytes() == b"retained original lock bytes"
-
-
-def terminal_handoff():
-    items = paths()
-    busy = block(items[-1])
-    terminal = ('printf "%s\\n" "$1"; IFS= read -r claim <&4 || exit 91; '
-                'printf "CLAIM:%s\\n" "$claim"; IFS= read -r reply || exit 92; '
-                '[ "$reply" = release ] || exit 93')
-    waiting = Holder(items, terminal=terminal)
-    waiting.opened(items[-1])
-    waiting.not_ready()
-    busy.close()
-    assert waiting.line() == b"READY"
-    assert waiting.line() == b"CLAIM:durable-claim-sentinel"
-    complete_grant(items)
-    waiting.process.stdin.write(b"release\n")
-    waiting.process.stdin.flush()
-    waiting.close()
-    waiting.finished(0)
-    assert all(available(path) for path in items), "terminal handoff leaked a source lock"
-
-
-def mutual_exclusion():
-    items = paths()
-    first = Holder(items)
-    assert first.line() == b"READY"
-    second = Holder(items)
-    second.opened(items[0])
-    second.not_ready()
-    complete_grant(items)
-    first.close()
-    first.finished(0)
-    assert second.line() == b"READY"
-    complete_grant(items)
-    second.close()
-    second.finished(0)
-    assert all(available(path) for path in items)
-
-
-def malformed_plan():
-    items = paths()
-    # Validation cannot sit behind contention and keep reserving a prefix for
-    # a request that will never be eligible for a grant in the first place.
-    busy = block(items[-1])
-    waiting = Holder(items, malformed=True)
-    error = waiting.finished(73)
-    assert "count does not match" in error, error
-    assert waiting.process.stdout.read() == b""
-    busy.close()
-    assert all(available(path) for path in items)
-
-
-try:
-    if scenario == "convoy_exclusive":
-        convoy(False)
-    elif scenario == "convoy_shared":
-        convoy(True)
-    else:
-        {"cancelled_waiter": cancelled_waiter, "path_replacement": path_replacement,
-         "inode_alias": inode_alias, "terminal_handoff": terminal_handoff,
-         "mutual_exclusion": mutual_exclusion, "malformed_plan": malformed_plan}[scenario]()
-    print(backend + "/" + scenario + ": passed")
-finally:
-    # Stop only children this test created, via their still-owned Popen handles.
-    # Close requester streams first, exercising the real disconnect boundary.
-    for holder in holders:
-        holder.close()
-    for holder in holders:
-        try:
-            holder.process.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            holder.process.kill()
-            holder.process.wait(timeout=4)
-    for blocker in blockers:
-        blocker.close()
-"#;

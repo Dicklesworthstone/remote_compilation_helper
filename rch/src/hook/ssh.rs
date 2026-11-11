@@ -227,7 +227,6 @@ const SOURCE_LOCK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_LOCK_HEARTBEAT_FRAME: &[u8] = b"RCH_SOURCE_LOCK_HEARTBEAT\n";
 const SOURCE_LOCK_SESSION_READY: &str = "RCH_SOURCE_LOCK_SESSION_READY";
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-locks";
-const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
 // Observe cancellation without publishing retirement or changing ownership.
 // The heartbeat supervisor remains responsible for transport liveness; this
 // waiter only relinquishes kernel locks for this exact cancelled invocation.
@@ -1009,11 +1008,11 @@ fn build_remote_source_authority_lock_cmd(
         anyhow::bail!("invalid source-authority ready marker");
     }
     // The closure is data on fd 3, not an argument to SSH, sh, or flock.
-    // The fixed holder re-execs with --no-fork and inherits each acquired
-    // descriptor, avoiding both E2BIG and one live flock process per root.
+    // The native holder execs the terminal with each acquired descriptor,
+    // avoiding both E2BIG and one live flock process per root.
     // One descriptor per root is still necessary; exhaustion fails before
     // readiness and process exit releases every partially acquired lock.
-    let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    let holder = shell_escape::escape(crate::transfer::source_lock_holder_script().into());
     let records = locks
         .iter()
         .map(|lock| format!("{} {}", if lock.shared { "s" } else { "x" }, lock.path))
@@ -1520,7 +1519,7 @@ fn build_durable_source_authority_lock_cmd(
         // owns its complete root through a validated live source-pair guard.
         format!(
             "exec 3</dev/null; exec sh -c {holder} {holder} 0 {ready}",
-            holder = quote(SOURCE_AUTHORITY_LOCK_HOLDER),
+            holder = quote(&crate::transfer::source_lock_holder_script()),
             ready = quote(ready_marker),
         )
     } else {
@@ -1936,7 +1935,7 @@ fn source_authority_lock_transport(
 /// locks. An expired session retains durable ownership; it cannot authorize
 /// source cleanup or terminate an independently launched activity.
 fn source_authority_live_session_command(remote_cmd: &str, idle: Duration) -> String {
-    let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    let holder = shell_escape::escape(crate::transfer::source_lock_holder_script().into());
     // Keep heredoc writers parented to the delivery shell. Exec would let
     // their normal exit reach the observer that must revoke on any SIGCHLD.
     // The explicit exit also prevents shell tail-exec or another stdin read.

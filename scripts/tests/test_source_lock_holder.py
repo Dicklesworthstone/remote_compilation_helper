@@ -30,7 +30,7 @@ REPO = Path(__file__).resolve().parents[2]
 WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
 LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
     'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
-HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
+HOLDER = LOCATOR + "\n" + (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 RELEASE_WAITER = SSH_SOURCE.split(
     'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
@@ -56,8 +56,8 @@ ARTIFACT_HEADER_TEMPLATE = TRANSFER_SOURCE.split(
 FIDELITY_SOURCE = (REPO / "rch/src/hook/source_fidelity.rs").read_text()
 MANIFEST_TEMPLATE = FIDELITY_SOURCE.split(
     'fn remote_manifest_verifier_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
-MANIFEST_VERIFIER = FIDELITY_SOURCE.split(
-    'const REMOTE_VERIFY_PYTHON: &str = r#"', 1)[1].split('"#;', 1)[0]
+MANIFEST_VERIFIER_TEMPLATE = FIDELITY_SOURCE.split(
+    'fn remote_verify_command(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 FLOCK = shutil.which("flock")
 GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     [FLOCK, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -667,7 +667,7 @@ class SourceLockHolderTests(unittest.TestCase):
             path = directory / "flock"
             if not path.exists():
                 path.symlink_to(FLOCK)
-        return {"PATH": str(directory), "LC_ALL": "C"}
+        return {"PATH": str(directory), "LC_ALL": "C", "RCH_WKR_BIN": WORKER}
 
     def start(self, specs, portable=True, terminal=None, args=(), **options):
         plan = options.pop("plan", "".join("{} {}\n".format(mode, path) for mode, path in specs))
@@ -769,7 +769,7 @@ class SourceLockHolderTests(unittest.TestCase):
         process = subprocess.Popen(
             ["/bin/sh", "-s"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-            cwd=self.root,
+            cwd=self.root, env={**os.environ, "RCH_WKR_BIN": WORKER},
         )
         self.activity_processes.append(process)
         process.stdin.write(script.encode())
@@ -1282,13 +1282,14 @@ class SourceLockHolderTests(unittest.TestCase):
                     hashlib.sha256(data).hexdigest(), len(data), int(executable), path.name,
                 ) for path, data, executable in files)
                 total = sum(len(data) for _, data, _ in files)
-                # This is the exact production Python verifier, not a receipt
-                # stub. Its row count and byte denominator detect even one
+                # This runs the exact production native verifier. Its row
+                # count and byte denominator detect even one
                 # extra newline or shell expansion in the nested payload.
-                verifier = shlex.join([
-                    sys.executable, "-I", "-c", MANIFEST_VERIFIER,
-                    str(root), str(len(files)), str(total),
-                ])
+                verifier = ("RCH_WKR_BIN=" + shlex.quote(WORKER) + "; export RCH_WKR_BIN;\n"
+                            + MANIFEST_VERIFIER_TEMPLATE.replace("{locate}", LOCATOR)
+                            .replace("{root}", shlex.quote(str(root)))
+                            .replace("{file_count}", str(len(files)))
+                            .replace("{byte_count}", str(total)))
                 program = MANIFEST_TEMPLATE.format(
                     command=shlex.quote(verifier), payload=payload,
                     delimiter="RCH_TEST_MANIFEST_INPUT",
@@ -2115,12 +2116,13 @@ class SourceLockHolderTests(unittest.TestCase):
         holder.finish()
         self.assertEqual(holder.process.returncode, 0)
 
-    def test_missing_darwin_prerequisite_is_explicit_and_grants_nothing(self):
-        holder = self.start([("x", self.root / "absent")],
-                            env=self.environment(python=False))
+    def test_missing_native_worker_is_explicit_and_grants_nothing(self):
+        env = self.environment(python=False)
+        env["RCH_WKR_BIN"] = str(self.root / "missing-worker")
+        holder = self.start([("x", self.root / "absent")], env=env)
         stdout, stderr = holder.failure()
         self.assertEqual(holder.process.returncode, 73, stderr)
-        self.assertIn(b"Darwin source locking requires python3", stderr)
+        self.assertIn(b"rch-wkr source-lock v1 is required", stderr)
         self.assertEqual(stdout, b"")
         self.assertFalse((self.root / "absent").exists())
 

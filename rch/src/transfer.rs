@@ -78,9 +78,36 @@ rch_rpc_status=$?
 exit "$rch_rpc_status"
 }}
 "#,
-        supervisor = escape(Cow::Borrowed(include_str!("hook/source_lock_holder.sh"))),
+        supervisor = escape(Cow::Owned(source_lock_holder_script())),
         timeout_ms = timeout.as_millis(),
     )
+}
+
+/// Each holder runs in a fresh shell, so its worker locator must travel in
+/// that same program instead of relying on functions from a parent shell.
+pub(crate) fn source_lock_holder_script() -> String {
+    let script = format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        include_str!("hook/source_lock_holder.sh"),
+    );
+    #[cfg(test)]
+    {
+        // Command-text tests do not require a worker build. Executed fixtures
+        // still select the sibling build and preserve an explicit override.
+        format!(
+            "if [ \"${{RCH_WKR_BIN+x}}\" != x ]; then RCH_WKR_BIN={}; fi; export RCH_WKR_BIN;\n{script}",
+            escape(Cow::Owned(
+                native_control_worker_path_for_test()
+                    .to_string_lossy()
+                    .into_owned(),
+            )),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        script
+    }
 }
 
 /// Pass a trusted shell program without making it an exec argument or stdin.
@@ -1427,28 +1454,42 @@ pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn native_control_worker_for_test() -> PathBuf {
-    let binary = std::env::var_os("RCH_WKR_BIN")
+fn native_control_worker_path_for_test() -> PathBuf {
+    std::env::var_os("RCH_WKR_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let executable = std::env::current_exe().expect("current test executable");
             // Cargo places tests in either `deps/` or the per-unit
             // `build/<package>/<hash>/out/` tree. In both layouts the
             // normal worker binary is uplifted into that profile directory.
-            executable
-                .ancestors()
-                .skip(1)
-                .take(5)
-                .find(|directory| {
-                    matches!(
-                        directory.file_name().and_then(|name| name.to_str()),
-                        Some("deps" | "build")
+            std::env::current_exe()
+                .ok()
+                .and_then(|executable| {
+                    executable
+                        .ancestors()
+                        .skip(1)
+                        .take(5)
+                        .find(|directory| {
+                            matches!(
+                                directory.file_name().and_then(|name| name.to_str()),
+                                Some("deps" | "build")
+                            )
+                        })
+                        .and_then(Path::parent)
+                        .map(|profile| {
+                            profile.join(format!("rch-wkr{}", std::env::consts::EXE_SUFFIX))
+                        })
+                })
+                .unwrap_or_else(|| {
+                    PathBuf::from(
+                        "/nonexistent/build rch-wkr beside these tests or set RCH_WKR_BIN",
                     )
                 })
-                .and_then(Path::parent)
-                .expect("Cargo profile directory; otherwise set RCH_WKR_BIN")
-                .join(format!("rch-wkr{}", std::env::consts::EXE_SUFFIX))
-        });
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn native_control_worker_for_test() -> PathBuf {
+    let binary = native_control_worker_path_for_test();
     assert!(
         binary.is_file(),
         "build the matching rch-wkr binary or set RCH_WKR_BIN for native control tests: {}",
