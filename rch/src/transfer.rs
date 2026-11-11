@@ -6486,17 +6486,24 @@ exit \"$__rch_disk_status\"; }}"
                 &colored_command,
             );
 
-            // Darwin provides setsid(2), but not setsid(1). Use the same
-            // isolated Python syscall/exec path as the owned-group child;
-            // do not bypass session creation or the supervisor's witnesses.
+            // Darwin provides setsid(2), but not setsid(1): the deployed
+            // rch-wkr starts the session and execs. A missing or older rch-wkr
+            // names a command that does not exist, so the setup refusal below
+            // fires; never bypass session creation or the supervisor's witnesses.
             format!(
-                "case \"$(uname -s)\" in \
-Darwin) set -- python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])';; \
+                "{locate}case \"$(uname -s)\" in \
+Darwin) if rch_wkr_locate && \"$RCH_WKR\" setsid true 2>/dev/null; \
+then set -- \"$RCH_WKR\" setsid; else \
+printf '%s\\n' 'RCH: this Darwin worker has no rch-wkr setsid launcher; deploy the matching rch-wkr' >&2; \
+set -- rch-wkr-setsid-unavailable; fi;; \
 *) set -- setsid;; esac; \
 if ! command -v \"$1\" >/dev/null 2>&1; then \
 {}; fi; \
 mkdir -p {} && rm -f {} && {launch}",
-                setup_refusal, escaped_run_dir, escaped_pgid_file,
+                setup_refusal,
+                escaped_run_dir,
+                escaped_pgid_file,
+                locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
             )
         } else {
             timeout_wrapped_command
@@ -22806,8 +22813,13 @@ fn main() {
         assert!(command.contains("RCH_REMOTE_PROCESS_V1:"));
         assert!(command.contains("rch_remote_record \"$1\" \"$4\""));
         assert!(command.contains("*) set -- setsid;;"));
-        assert!(command.contains("Darwin) set -- python3 -I -S -c"));
-        assert!(command.contains("os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])"));
+        assert!(command.contains("then set -- \"$RCH_WKR\" setsid; else"));
+        assert!(
+            command.contains(
+                "deploy the matching rch-wkr' >&2; set -- rch-wkr-setsid-unavailable; fi;;"
+            )
+        );
+        assert!(command.contains("rch_wkr_locate()"));
         assert!(command.contains("command -v \"$1\""));
         assert!(command.contains("\"$@\" sh -c"));
         assert!(command.contains(&remote_pgid_file));

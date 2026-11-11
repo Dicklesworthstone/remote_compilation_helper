@@ -1098,6 +1098,20 @@ pub(super) fn source_registry_setup(registry: &str) -> String {
     )
 }
 
+/// Every recovery-reserve wrapper this module emits passes through here, so
+/// unit tests run the rch-wkr built from this tree, never one a test host
+/// happens to have installed. Production wrappers are unchanged.
+fn reserve_wrapper(wrapper: String) -> String {
+    #[cfg(test)]
+    {
+        rch_common::recovery_reserve::with_worker_binary(&wrapper, tests::tree_rch_wkr())
+    }
+    #[cfg(not(test))]
+    {
+        wrapper
+    }
+}
+
 fn source_registry_invocation(
     registry: &str,
     identity: &str,
@@ -1131,7 +1145,9 @@ fn source_registry_invocation(
         // Only the short grant transaction owns this shared lease. The source
         // holder's release waiter and compilation must never keep emergency
         // bytes unavailable to worker GC.
-        rch_common::recovery_reserve::admission_command(registry, &command)
+        reserve_wrapper(rch_common::recovery_reserve::admission_command(
+            registry, &command,
+        ))
     } else {
         command
     }
@@ -1510,8 +1526,8 @@ fn source_intent_command(
         // Hard-linking the immutable closure avoids data allocation, but a
         // full filesystem can still need bytes for directories and barriers.
         // The finite RPC guardian owns every process inheriting this lease.
-        Ok(rch_common::recovery_reserve::recovery_command(
-            registry, &command,
+        Ok(reserve_wrapper(
+            rch_common::recovery_reserve::recovery_command(registry, &command),
         ))
     } else {
         Ok(command)
@@ -1744,8 +1760,8 @@ fn source_cancellation_settlement_command(
         // Borrow storage outside it, in the same order as cancel/finish-cancel.
         // Only the recorded namespace can supply storage; a legacy /tmp
         // registry must not borrow a reserve from another filesystem.
-        Ok(rch_common::recovery_reserve::recovery_command(
-            selected, &command,
+        Ok(reserve_wrapper(
+            rch_common::recovery_reserve::recovery_command(selected, &command),
         ))
     } else {
         // Discovery remains read-only and cannot spend emergency storage.
@@ -2227,14 +2243,14 @@ fn clean_overlay_source_pair_lock_command(
         registry = quote(REMOTE_SOURCE_CLAIM_REGISTRY),
         claim = source_pair_custody_command("claim", lock_path, source_root, token),
     );
-    let creation = rch_common::recovery_reserve::admission_command(
+    let creation = reserve_wrapper(rch_common::recovery_reserve::admission_command(
         REMOTE_SOURCE_CLAIM_REGISTRY,
         &format!(
             "flock -x -- {} sh -c {}",
             quote(&format!("{REMOTE_SOURCE_CLAIM_REGISTRY}/metadata.lock")),
             quote(&creation),
         ),
-    );
+    ));
     let script = format!(
         "{setup}{creation}; \
          printf '%s\\n' {ready}; {waiter}; {retire}; printf '%s\\n' {release}",
@@ -3148,6 +3164,34 @@ pub(super) async fn ensure_worker_projects_topology(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    /// The rch-wkr Cargo built beside this test executable. Cargo uplifts it
+    /// to the profile directory, an ancestor of the test binary in both the
+    /// `deps/` and the `build/<package>/<hash>/out/` layouts. Without one, a
+    /// path that names the fix: every wrapper run then refuses (exit 74), and
+    /// tests that only inspect command text still pass.
+    pub(super) fn tree_rch_wkr() -> &'static std::path::Path {
+        static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        BINARY.get_or_init(|| {
+            let name = format!("rch-wkr{}", std::env::consts::EXE_SUFFIX);
+            std::env::current_exe()
+                .ok()
+                .and_then(|executable| {
+                    executable
+                        .ancestors()
+                        .skip(1)
+                        .take(6)
+                        .map(|directory| directory.join(&name))
+                        .find(|candidate| candidate.is_file())
+                })
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(
+                        "/nonexistent/build rch-wkr beside these tests: \
+                         cargo test -p rch-wkr -p rch --test setsid --bin rch",
+                    )
+                })
+        })
+    }
 
     #[tokio::test(start_paused = true)]
     async fn slow_path_control_deadline_checks_before_and_after_polling() {

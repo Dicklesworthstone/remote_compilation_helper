@@ -1,20 +1,20 @@
 //! Physically allocated worker-local emergency storage for recovery metadata.
 //!
-//! The helper runs from memory, so a full worker does not need to install a
-//! script before recovering. Only known, finite admission/GC/cancellation
-//! transactions use the inherited lease. Build processes and source release
-//! waiters never do.
+//! This module builds the shell wrappers; `rch-wkr recovery-reserve` (Rust,
+//! already deployed on every worker) owns the reserve itself, so a full worker
+//! needs to install nothing before recovering. Only known, finite
+//! admission/GC/cancellation transactions use the inherited lease. Build
+//! processes and source release waiters never do.
 
-use std::io::Write as _;
-use std::sync::LazyLock;
-
-const PROGRAM: &str = include_str!("recovery_reserve.py");
-const BOOTSTRAP: &str = "import base64,os,zlib;exec(compile(zlib.decompress(base64.b64decode(os.environ['RCH_RECOVERY_RESERVE_PROGRAM'])),'<rch-recovery-reserve>','exec'))";
-static ENCODED_PROGRAM: LazyLock<String> = LazyLock::new(|| pack(PROGRAM));
+use std::io::{Read as _, Write as _};
 
 /// GC control scratch uses the same filesystem whose reserve was released.
 /// The fallback preserves unwrapped read-only inventories and isolated guard
 /// fixtures; production recovery wrappers always set `RCH_GC_SCRATCH`.
+///
+/// `rch_gc_reserve_claim` binds or settles an emergency GC claim through the
+/// lease this shell inherited from `rch-wkr recovery-reserve`. Without a lease
+/// it is a no-op; with one, a missing worker binary refuses.
 pub const GC_SHELL_HELPERS: &str = r#"
 rch_gc_mktemp() {
     if [ -n "${RCH_GC_SCRATCH-}" ]; then
@@ -25,17 +25,27 @@ rch_gc_mktemp() {
 };
 rch_gc_reserve_claim() {
     [ -n "${RCH_RECOVERY_RESERVE_FD-}" ] || return 0;
-    [ -n "${RCH_RECOVERY_RESERVE_BOOTSTRAP-}" ] || return 1;
-    python3 -I -S -B -c "$RCH_RECOVERY_RESERVE_BOOTSTRAP" "$1" "$__gc_source_registry" "$2";
+    [ -n "${RCH_RECOVERY_RESERVE_WKR-}" ] || return 1;
+    "$RCH_RECOVERY_RESERVE_WKR" recovery-reserve "$1" "$__gc_source_registry" "$2";
 };
 "#;
+
+/// Exit status and stderr marker of every refused reserve operation.
+pub const UNSAFE_EXIT: i32 = 74;
+/// Exit status of a reserve that cannot be funded (ENOSPC, quota, headroom).
+pub const PRESSURE_EXIT: i32 = 75;
+/// The `rch-wkr recovery-reserve probe` reply. Wrappers require it before
+/// running an operation, so a worker with an older `rch-wkr` refuses with an
+/// explicit marker instead of misreading its argument parser's exit status.
+pub const PROBE_REPLY: &str = "rch-wkr recovery-reserve v1";
 
 // A fixed alphabet prevents recursive shell-quote expansion through the hook's
 // nested SSH/flock controllers. Compression is essential too: the daemon's
 // process-identity and GC protocol exceeds Linux's per-argument limit when
 // merely base64 encoded. Both ends use standard zlib framing.
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 fn encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
     for bytes in input.chunks(3) {
         result.push(char::from(ALPHABET[(bytes[0] >> 2) as usize]));
@@ -58,6 +68,36 @@ fn encode(input: &[u8]) -> String {
     result
 }
 
+/// Strict inverse of `encode`: only the alphabet, whole quanta, and at most
+/// two trailing `=`. Anything else is a damaged argument, never guessed at.
+fn decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (index, quantum) in bytes.chunks(4).enumerate() {
+        let last = index + 1 == bytes.len() / 4;
+        let padding = quantum
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'=')
+            .count();
+        if padding > 2 || (padding > 0 && !last) {
+            return None;
+        }
+        let mut value = 0u32;
+        for &byte in &quantum[..4 - padding] {
+            let digit = ALPHABET.iter().position(|&candidate| candidate == byte)?;
+            value = value << 6 | u32::try_from(digit).ok()?;
+        }
+        value <<= 6 * u32::try_from(padding).ok()?;
+        let decoded = value.to_be_bytes();
+        output.extend_from_slice(&decoded[1..4 - padding]);
+    }
+    Some(output)
+}
+
 fn pack(input: &str) -> String {
     let mut compressed = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     compressed
@@ -66,16 +106,40 @@ fn pack(input: &str) -> String {
     encode(&compressed.finish().expect("finish in-memory compression"))
 }
 
+/// Decode a wrapper payload argument (zlib, then the alphabet above) back to
+/// its shell text. `rch-wkr recovery-reserve` is the only consumer.
+///
+/// # Errors
+///
+/// Returns a description when the argument is not exactly what `pack`
+/// produces: a foreign character, bad padding, a damaged zlib stream or text
+/// that is not UTF-8.
+pub fn unpack(argument: &str) -> Result<String, String> {
+    let compressed = decode(argument).ok_or("payload is not valid base64")?;
+    let mut text = String::new();
+    flate2::read::ZlibDecoder::new(compressed.as_slice())
+        .read_to_string(&mut text)
+        .map_err(|error| format!("payload does not decompress: {error}"))?;
+    Ok(text)
+}
+
 fn command(operation: &str, registry: &str, payload: &str, reconcile: &str) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let payload = format!("{GC_SHELL_HELPERS}\n{payload}");
+    // Git for Windows rewrites arguments that look like POSIX paths when it
+    // starts a native .exe; base64 may begin with '/'. rch-wkr removes both
+    // variables again before it runs the payload.
     format!(
-        "( RCH_RECOVERY_RESERVE_PROGRAM={program}; \
-         RCH_RECOVERY_RESERVE_BOOTSTRAP={bootstrap}; \
-         export RCH_RECOVERY_RESERVE_PROGRAM RCH_RECOVERY_RESERVE_BOOTSTRAP; \
-         python3 -I -S -B -c \"$RCH_RECOVERY_RESERVE_BOOTSTRAP\" {operation} {registry} {payload} {reconcile} )",
-        program = *ENCODED_PROGRAM,
-        bootstrap = quote(BOOTSTRAP),
+        "( {locate}\
+         export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'; \
+         if ! rch_wkr_locate; then \
+         printf 'RCH_RECOVERY_RESERVE_UNSAFE %s: rch-wkr is not installed on this worker%s\\n' {registry} \"${{RCH_WKR_BIN:+ (RCH_WKR_BIN=$RCH_WKR_BIN)}}\" >&2; exit {UNSAFE_EXIT}; fi; \
+         if [ \"$(\"$RCH_WKR\" recovery-reserve probe 2>/dev/null)\" != {probe} ]; then \
+         printf 'RCH_RECOVERY_RESERVE_UNSAFE %s: %s predates recovery-reserve; deploy the matching rch-wkr\\n' {registry} \"$RCH_WKR\" >&2; exit {UNSAFE_EXIT}; fi; \
+         RCH_RECOVERY_RESERVE_WKR=$RCH_WKR; export RCH_RECOVERY_RESERVE_WKR; \
+         exec \"$RCH_WKR\" recovery-reserve {operation} {registry} {payload} {reconcile} )",
+        locate = crate::wkr_locate::WKR_LOCATE_SHELL,
+        probe = quote(PROBE_REPLY),
         registry = quote(registry),
         payload = quote(&pack(&payload)),
         reconcile = quote(&pack(&format!("{GC_SHELL_HELPERS}\n{reconcile}"))),
@@ -116,6 +180,21 @@ pub(crate) fn gc_command(registry: &str, payload: &str, reconcile: &str) -> Stri
     command("gc", registry, payload, reconcile)
 }
 
+/// Pin a wrapper from this module to one rch-wkr instead of the installed
+/// candidates. Tests use it to run the binary built from their own tree, never
+/// whatever a test host happens to have installed. Production wrappers always
+/// resolve the worker's deployed rch-wkr.
+#[must_use]
+pub fn with_worker_binary(wrapper: &str, binary: &std::path::Path) -> String {
+    let body = wrapper
+        .strip_prefix("( ")
+        .expect("recovery-reserve wrappers are subshells");
+    format!(
+        "( RCH_WKR_BIN={}; {body}",
+        shell_escape::escape(binary.to_string_lossy())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,23 +203,42 @@ mod tests {
     fn transport_has_standard_padding_and_no_shell_metacharacters() {
         for (input, output) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v")] {
             assert_eq!(encode(input.as_bytes()), output);
+            assert_eq!(decode(output).as_deref(), Some(input.as_bytes()));
         }
+        let packed = pack(GC_SHELL_HELPERS);
         assert!(
-            pack(PROGRAM)
+            packed
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
         );
+        assert_eq!(unpack(&packed).as_deref(), Ok(GC_SHELL_HELPERS));
     }
 
     #[test]
-    fn recovery_program_runs_without_a_worker_script_file() {
+    fn unpack_refuses_anything_pack_cannot_produce() {
+        let packed = pack("printf ready");
+        for damaged in [
+            format!("{packed}="),
+            format!("{packed}A"),
+            packed.replacen(|c: char| c.is_ascii_alphanumeric(), "-", 1),
+            format!("=A{}", &packed[2..]),
+            "Zm9v".to_owned(), // valid base64, not a zlib stream
+        ] {
+            assert!(unpack(&damaged).is_err(), "accepted {damaged:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_runs_the_worker_binary_never_an_interpreter() {
         let command = admission_command(
             "/var/tmp/rch-source-authority-locks/claims-v1",
             "printf ready",
         );
-        assert!(command.contains("python3 -I -S -B -c"));
-        assert!(command.contains(" admit "));
-        assert!(!command.contains("recovery_reserve.py"));
+        assert!(command.contains("rch_wkr_locate"));
+        assert!(command.contains("exec \"$RCH_WKR\" recovery-reserve admit "));
+        assert!(command.contains(&format!("!= '{PROBE_REPLY}'")));
+        assert!(!command.to_ascii_lowercase().contains("pyth"));
+        assert!(GC_SHELL_HELPERS.contains("\"$RCH_RECOVERY_RESERVE_WKR\" recovery-reserve"));
     }
 
     #[test]
@@ -171,54 +269,79 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn admission_wrapper_preserves_piped_roots_and_shared_lease() {
-        let directory = tempfile::tempdir().expect("private admission fixture");
-        let registry = directory.path().join("authority/claims");
-        let payload = "test -n \"$RCH_RECOVERY_RESERVE_FD\" && \
-                       test \"$RCH_RECOVERY_RESERVE_MODE\" = shared && cat";
-        let wrapped = admission_command(registry.to_str().unwrap(), payload);
-        let output = std::process::Command::new("sh")
-            .args([
-                "-c",
-                &format!("printf '/data/project\\n/data/dependency\\n' | {wrapped}"),
-            ])
+    fn run_wrapper(command: &str, wkr: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("RCH_WKR_BIN", wkr)
             .output()
-            .expect("execute actual admission wrapper");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        assert_eq!(output.stdout, b"/data/project\n/data/dependency\n");
-        assert_eq!(
-            std::fs::metadata(registry.join(".recovery-v1/reserve.v1"))
-                .unwrap()
-                .len(),
-            64 * 1024 * 1024,
-        );
+            .expect("run wrapper")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
-    fn native_recovery_reserve_preserves_ownership_on_full_filesystems() {
-        let guard = crate::stale_target_reap::source_claim_gc_guard_fragment_with_registry(
-            "__RCH_TEST_REGISTRY__",
-        );
-        let output = std::process::Command::new("python3")
-            .arg("-B")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/recovery_reserve.py"
-            ))
-            .env("RCH_TEST_GC_RESERVE_GUARD", guard)
-            .output()
-            .expect("python3 must run the native recovery reserve regressions");
+    fn missing_or_older_worker_binary_refuses_without_running_the_payload() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("payload-ran");
+        let payload = format!("touch {}", marker.display());
+        let registry = directory.path().join("authority/claims");
+        let command = admission_command(registry.to_str().unwrap(), &payload);
+
+        let missing = run_wrapper(&command, "/nonexistent/rch-wkr");
+        assert_eq!(missing.status.code(), Some(UNSAFE_EXIT));
         assert!(
-            output.status.success(),
-            "native reserve tests failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&missing.stderr).starts_with(&format!(
+                "RCH_RECOVERY_RESERVE_UNSAFE {}: rch-wkr is not installed",
+                registry.display()
+            ))
+        );
+
+        // An rch-wkr from before this subcommand rejects it as clap does.
+        let older = directory.path().join("rch-wkr");
+        std::fs::write(
+            &older,
+            "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let skewed = run_wrapper(&command, older.to_str().unwrap());
+        assert_eq!(skewed.status.code(), Some(UNSAFE_EXIT));
+        assert!(String::from_utf8_lossy(&skewed.stderr).contains("predates recovery-reserve"));
+        assert!(!marker.exists(), "a refused wrapper ran its payload");
+        assert!(!registry.exists(), "a refused wrapper touched the registry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_binary_replaces_every_installed_candidate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let calls = directory.path().join("calls");
+        let pinned = directory.path().join("pinned wkr");
+        std::fs::write(
+            &pinned,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$2\" = probe ] && echo '{PROBE_REPLY}'\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pinned, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = with_worker_binary(&admission_command("/registry", "true"), &pinned);
+        assert!(command.starts_with("( RCH_WKR_BIN='"));
+
+        // The environment names a missing binary; the pinned one still runs.
+        let output = run_wrapper(&command, "/nonexistent/rch-wkr");
+        assert!(output.status.success(), "{output:?}");
+        let calls = std::fs::read_to_string(calls).unwrap();
+        let operations: Vec<_> = calls
+            .lines()
+            .map(|line| line.split(' ').take(3).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(
+            operations,
+            ["recovery-reserve probe", "recovery-reserve admit /registry"]
         );
     }
 }

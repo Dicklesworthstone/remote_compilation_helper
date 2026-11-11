@@ -8,6 +8,7 @@
 mod cache;
 mod executor;
 mod prepare;
+mod recovery_reserve;
 mod toolchain;
 
 use anyhow::{Context, Result};
@@ -34,6 +35,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start a new session, then exec the command (Darwin has setsid(2) but
+    /// no setsid(1)). Internal: used by the remote build launcher.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Setsid {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// Worker-local recovery byte reserve for source-registry metadata.
+    /// Internal: driven by the wrappers in `rch_common::recovery_reserve`.
+    #[command(hide = true)]
+    RecoveryReserve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
         /// Process to inspect; no signals are sent.
@@ -251,6 +267,15 @@ fn main() -> Result<()> {
     if let Commands::ProcessIdentity { pid } = &cli.command {
         return print_process_identity(*pid);
     }
+    // Reserve operations run sh in place of this process while holding a
+    // lease; like the identity probe they need no runtime or logging.
+    if let Commands::RecoveryReserve { arguments } = &cli.command {
+        std::process::exit(recovery_reserve::main(arguments));
+    }
+    #[cfg(unix)]
+    if let Commands::Setsid { command } = &cli.command {
+        return exec_in_new_session(command);
+    }
     #[cfg(target_os = "linux")]
     if let Commands::PrepareInstaller {
         supervisor_pid,
@@ -294,6 +319,18 @@ fn is_lost_reader_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     message.starts_with("failed printing to std") && message.ends_with("(os error 32)")
 }
 
+/// `setsid(1)` for hosts without one: become a session leader, then exec.
+/// Only returns (exit 1) when the session or the exec fails.
+#[cfg(unix)]
+fn exec_in_new_session(command: &[std::ffi::OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    rustix::process::setsid().context("setsid")?;
+    let error = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .exec();
+    Err(error).with_context(|| format!("exec {}", command[0].to_string_lossy()))
+}
+
 fn print_process_identity(pid: u32) -> Result<()> {
     let witness = rch_common::process_identity::remote_process_witness(pid)
         .context("kernel process identity unavailable")?;
@@ -312,6 +349,13 @@ async fn run_worker(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
+        Commands::RecoveryReserve { .. } => {
+            anyhow::bail!("recovery-reserve requires the synchronous worker entry point")
+        }
+        #[cfg(unix)]
+        Commands::Setsid { .. } => {
+            anyhow::bail!("setsid requires the synchronous worker entry point")
+        }
         #[cfg(target_os = "linux")]
         Commands::PrepareInstaller { .. } => {
             anyhow::bail!("installer supervision requires the synchronous worker entry point")

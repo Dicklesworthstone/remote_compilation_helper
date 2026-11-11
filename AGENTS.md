@@ -32,6 +32,36 @@ success** — one line, revert, next lever, no retraction narrative.
 
 ---
 
+## RULE 0.75 - RUST ONLY: NO PYTHON, EVER
+
+JE, 2026-11-10: **"this is supposed to be an exclusively RUST project, no python!!!!"**
+
+RCH is Rust. No `rch`, `rchd`, `rch-wkr` or shim code path may start a Python interpreter on
+ANY host (Mac, Linux workers, the Windows worker), in ANY form:
+
+- no `Command::new("python3")`, and no `python3 -c '<program>'` inside a shell snippet sent over SSH;
+- no `include_str!("something.py")`, base64/zlib-packed Python, heredoc Python, or generated
+  `#!/usr/bin/env python3` helper scripts;
+- no tests that shell out to Python. Write the test in Rust.
+
+Python is not on every worker (on Windows `python3` is the Microsoft Store stub), so every
+embedded Python program is a latent pool outage, and it puts load-bearing protocol logic outside
+the compiler, clippy and the Rust test suite.
+
+**Worker-side logic goes in an `rch-wkr` subcommand** (it is deployed to every worker), or in plain
+POSIX sh when it is trivial. Shell snippets locate the binary with
+`rch_common::wkr_locate::WKR_LOCATE_SHELL` and refuse with a clear marker when the deployed
+`rch-wkr` is too old. They never fall back to anything else.
+
+Enforced by `rch-common/tests/no_python_guard.rs`, which counts Python in every `.rs` and `.sh`
+file (the shell scripts are embedded with `include_str!`) and counts `.py` files. Its `PORT_DEBT`
+table and `PY_FILES_DEBT` record the Python that remains from before this rule. They may only
+shrink: a port lowers or removes its entry in the same commit. **Never add or raise an entry**, and
+never weaken the guard to land a change. A `.py` file that a port leaves unused is still a file:
+RULE 1 applies, so list it for JE with the exact `git rm` command instead of deleting it.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.

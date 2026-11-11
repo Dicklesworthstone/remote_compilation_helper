@@ -122,6 +122,7 @@ pub const MANAGED_CARGO_ENV: [(&str, &str); 2] = [
 
 pub mod ui;
 pub mod util;
+pub mod wkr_locate;
 pub mod worker_config_validation;
 pub mod worker_facts;
 
