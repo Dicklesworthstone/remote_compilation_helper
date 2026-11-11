@@ -50,7 +50,6 @@ ACTIVITY_SOURCE = SSH_SOURCE.split('fn source_authority_activity_prefix_for_mode
 ACTIVITY_LITERAL = re.search(r'let check = ("(?:[^"\\]|\\[\s\S])*");', ACTIVITY_SOURCE).group(1)
 ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
 TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
-RETENTION = TRANSFER_SOURCE.split("fn remote_tree_retention_program() -> &'static str {", 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 FINITE_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 BOUNDED_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_bounded_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 ARTIFACT_HEADERS = TRANSFER_SOURCE.split('fn artifact_header_probe_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
@@ -502,7 +501,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
 
     def retention_command(self, identity=None, root=None, retained=None):
         return shlex.join([
-            sys.executable, "-I", "-c", RETENTION, "retain", str(root or self.source),
+            WORKER, "source-retain", "retain", str(root or self.source),
             str(retained or self.retained), identity or self.token, "0"])
 
     def retain_pair_tree(self, **arguments):

@@ -12,6 +12,7 @@ mod file_sync;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+mod source_retain;
 mod source_verifier;
 mod toolchain;
 
@@ -81,6 +82,12 @@ enum Commands {
     /// Internal exact source-content manifest verification over stdin.
     #[command(hide = true)]
     VerifySourceContent {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal no-replace retirement of an owned source tree.
+    #[command(hide = true)]
+    SourceRetain {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -321,6 +328,9 @@ fn main() -> Result<()> {
     if let Commands::VerifySourceContent { arguments } = &cli.command {
         std::process::exit(source_verifier::main(arguments));
     }
+    if let Commands::SourceRetain { arguments } = &cli.command {
+        std::process::exit(source_retain::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -415,6 +425,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::VerifySourceContent { .. } => {
             anyhow::bail!("verify-source-content requires the synchronous worker entry point")
+        }
+        Commands::SourceRetain { .. } => {
+            anyhow::bail!("source-retain requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

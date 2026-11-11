@@ -9871,14 +9871,11 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
     }
 
     /// Read-only admission probe for retained source pairs. It checks the
-    /// actual Linux no-replace syscall through libc, never a guessed syscall
-    /// number or a replacing/copying fallback. The eventual filesystem rename
+    /// actual Linux no-replace syscall, never a guessed syscall number or a
+    /// replacing/copying fallback. The eventual filesystem rename
     /// can still refuse; that leaves the durable source grant outstanding.
     pub(crate) fn remote_tree_retention_capability_command() -> String {
-        format!(
-            "python3 -I -c {} probe",
-            escape(Cow::from(Self::remote_tree_retention_program()))
-        )
+        Self::remote_tree_retention_worker_command("printf '%s\\n' 'RCH_SOURCE_RETENTION_CAPABLE'")
     }
 
     /// Move this invocation's owned source into its exact retained sibling.
@@ -9973,153 +9970,26 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
             "retained source identity must be 32 lowercase hexadecimal characters"
         );
-        Ok(format!(
-            "python3 -I -c {} retain {} {} {} {}",
-            escape(Cow::from(Self::remote_tree_retention_program())),
+        Ok(Self::remote_tree_retention_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-retain retain {} {} {} {}",
             escape(Cow::from(root)),
             escape(Cow::from(retained_root)),
             escape(Cow::from(identity)),
             u8::from(allow_absent_before_materialization),
-        ))
+        )))
     }
 
-    fn remote_tree_retention_program() -> &'static str {
-        r#"import ctypes
-import errno
-import hashlib
-import json
-import os
-import stat
-import sys
-
-def require(condition, reason):
-    if not condition:
-        raise RuntimeError(reason)
-
-def run():
-    require(sys.platform == "linux", "Linux source retention required")
-    require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
-            "directory descriptor support unavailable")
-    require(all(function in os.supports_dir_fd for function in
-                (os.open, os.stat, os.symlink, os.readlink)),
-            "relative directory operations unavailable")
-    library = ctypes.CDLL(None, use_errno=True)
-    rename = getattr(library, "renameat2", None)
-    require(rename is not None, "libc renameat2 unavailable")
-    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
-                       ctypes.c_char_p, ctypes.c_uint)
-    rename.restype = ctypes.c_int
-    # Linux renameat2(2), RENAME_NOREPLACE = 1. Empty names cannot mutate a
-    # path; ENOENT distinguishes an available syscall from ENOSYS/EPERM.
-    require(rename(-1, b"", -1, b"", 1) == -1 and ctypes.get_errno() == errno.ENOENT,
-            "Linux no-replace rename syscall unavailable")
-    if sys.argv[1:] == ["probe"]:
-        print("RCH_SOURCE_RETENTION_CAPABLE")
-        return
-    require(len(sys.argv) == 6 and sys.argv[1] == "retain", "invalid retention arguments")
-    root, retained, identity, allow_absent = sys.argv[2:]
-    def literal(path):
-        return (path.startswith("/") and not path.endswith("/") and "\\" not in path
-                and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
-                and all(part not in ("", ".", "..") for part in path[1:].split("/")))
-    require(literal(root) and literal(retained) and root != retained
-            and os.path.dirname(root) == os.path.dirname(retained), "invalid retained siblings")
-    require(len(identity) == 32 and all(ch in "0123456789abcdef" for ch in identity),
-            "invalid source identity")
-    require(allow_absent in ("0", "1"), "invalid absence policy")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    parent = os.open("/", flags)
-    try:
-        for component in os.path.dirname(root).split("/")[1:]:
-            if component:
-                try:
-                    descendant = os.open(component, flags, dir_fd=parent)
-                except FileNotFoundError:
-                    require(allow_absent == "1", "materialized source parent is missing")
-                    print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
-                    return
-                os.close(parent)
-                parent = descendant
-        source_name = os.path.basename(root)
-        retained_name = os.path.basename(retained)
-        marker_name = ".rch-retention-v1"
-        preimage = json.dumps(["rch.source_retention.v1", identity, root, retained],
-                             ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        marker_value = "rch-retention-v1:" + identity + ":" + hashlib.sha256(preimage).hexdigest()
-        def metadata(name):
-            try:
-                return os.stat(name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                return None
-        def directory(name):
-            descriptor = os.open(name, flags, dir_fd=parent)
-            require(os.fstat(descriptor).st_uid == os.geteuid(), "source directory has a foreign owner")
-            return descriptor
-        def marker(descriptor, create):
-            if create:
-                try:
-                    # symlink creation is atomic and never replaces an entry.
-                    # Its target is metadata only; it is never followed.
-                    os.symlink(marker_value, marker_name, dir_fd=descriptor)
-                except FileExistsError:
-                    pass
-            entry = os.stat(marker_name, dir_fd=descriptor, follow_symlinks=False)
-            require(stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.geteuid()
-                    and os.readlink(marker_name, dir_fd=descriptor) == marker_value,
-                    "source retention marker does not bind this identity and both paths")
-            os.fsync(descriptor)
-        source = metadata(source_name)
-        destination = metadata(retained_name)
-        if source is None:
-            if destination is None:
-                require(allow_absent == "1", "materialized source and retained snapshot are both missing")
-                print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
-                return
-            descriptor = directory(retained_name)
-            try:
-                marker(descriptor, False)
-                os.fsync(parent)
-                require(metadata(source_name) is None, "source appeared during retention reconciliation")
-                current = metadata(retained_name)
-                held = os.fstat(descriptor)
-                require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                        "retained source changed during reconciliation")
-            finally:
-                os.close(descriptor)
-            print("RCH_SOURCE_RETAINED")
-            return
-        require(stat.S_ISDIR(source.st_mode), "source root is not a real directory")
-        require(destination is None, "retained destination already exists while source is present")
-        descriptor = directory(source_name)
-        try:
-            held = os.fstat(descriptor)
-            require((source.st_dev, source.st_ino) == (held.st_dev, held.st_ino),
-                    "source changed before retention")
-            marker(descriptor, True)
-            current = metadata(source_name)
-            require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                    "source changed before no-replace rename")
-            if rename(parent, os.fsencode(source_name), parent, os.fsencode(retained_name), 1) != 0:
-                code = ctypes.get_errno()
-                raise OSError(code, "source no-replace rename refused: " + os.strerror(code))
-            os.fsync(parent)
-            current = metadata(retained_name)
-            require(metadata(source_name) is None and current is not None
-                    and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                    "source retention did not preserve the exact directory")
-            marker(descriptor, False)
-        finally:
-            os.close(descriptor)
-        print("RCH_SOURCE_RETAINED")
-    finally:
-        os.close(parent)
-
-try:
-    run()
-except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
-    sys.stderr.write("RCH_SOURCE_RETENTION_REFUSED: " + str(error) + "\n")
-    raise SystemExit(74)
-"#
+    fn remote_tree_retention_worker_command(command: &str) -> String {
+        format!(
+            "( {locate}\
+             if ! rch_wkr_locate; then \
+             printf '%s\\n' 'RCH_SOURCE_RETENTION_REFUSED: rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+             if ! __rch_retention_probe=$(\"$RCH_WKR\" source-retain probe) \
+             || [ \"$__rch_retention_probe\" != 'rch-wkr source-retain v1' ]; then \
+             printf '%s\\n' 'RCH_SOURCE_RETENTION_REFUSED: deploy the matching rch-wkr with source-retain support' >&2; exit 74; fi; \
+             {command} )",
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        )
     }
 
     /// Best-effort removal of an isolated remote tree (bd-p1vlb).
@@ -21332,6 +21202,65 @@ func main() {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_capability_requires_the_matching_native_worker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let capability = TransferPipeline::remote_tree_retention_capability_command();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &capability])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            .env("PATH", directory.path().join("no-tools"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"RCH_SOURCE_RETENTION_CAPABLE\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+
+        let retention = TransferPipeline::remote_tree_retention_command(
+            "/absent/source",
+            "/absent/retained",
+            "1234567890abcdef1234567890abcdef",
+            false,
+        )
+        .unwrap();
+        for (name, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "bad-status",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-retain v1\\n'; exit 3\n"),
+            ),
+            (
+                "bad-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-retain v0\\n'\n"),
+            ),
+        ] {
+            let binary = directory.path().join(name);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for command in [&capability, &retention] {
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .env("RCH_WKR_BIN", &binary)
+                    .env("PATH", directory.path().join("no-tools"))
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(74), "{name}: {output:?}");
+                assert!(output.stdout.is_empty(), "{name}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SOURCE_RETENTION_REFUSED:"),
+                    "{name}: {output:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn native_retained_source(
         source: &Path,
         retained: &Path,
@@ -21347,6 +21276,7 @@ func main() {
         .unwrap();
         std::process::Command::new("/bin/sh")
             .args(["-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("execute actual retained-source command")
     }
