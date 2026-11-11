@@ -12,6 +12,7 @@ mod file_sync;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+mod source_verifier;
 mod toolchain;
 
 use anyhow::{Context, Result};
@@ -74,6 +75,12 @@ enum Commands {
     /// Internal source namespace creation and read-only topology checks.
     #[command(hide = true)]
     SourceNamespacePaths {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal exact source-content manifest verification over stdin.
+    #[command(hide = true)]
+    VerifySourceContent {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -311,6 +318,9 @@ fn main() -> Result<()> {
     if let Commands::SourceNamespacePaths { arguments } = &cli.command {
         std::process::exit(rch_common::source_namespace_paths::main(arguments));
     }
+    if let Commands::VerifySourceContent { arguments } = &cli.command {
+        std::process::exit(source_verifier::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -402,6 +412,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceNamespacePaths { .. } => {
             anyhow::bail!("source-namespace-paths requires the synchronous worker entry point")
+        }
+        Commands::VerifySourceContent { .. } => {
+            anyhow::bail!("verify-source-content requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

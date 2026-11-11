@@ -1855,182 +1855,23 @@ fn remote_manifest_verifier_script(command: &str, payload: &[u8]) -> anyhow::Res
     ))
 }
 
-// The portable shell verifier forks several utilities for every file. Large
-// admitted source trees can exhaust the verification deadline before Cargo
-// starts. When available, an isolated Python process streams the same bytes
-// and checks the same hash, length, type, executable bit and total denominator.
-// A failed Python verification never falls back to another verifier.
-const REMOTE_VERIFY_PYTHON: &str = r#"
-import hashlib
-import os
-import stat
-import sys
-
-def refuse(code, reason, relative=""):
-    if isinstance(relative, bytes):
-        relative = relative.decode("utf-8", errors="backslashreplace")
-    suffix = ":" + relative if relative else ""
-    sys.stderr.write("RCH_SOURCE_CONTENT_ERROR:" + reason + suffix + "\n")
-    raise SystemExit(code)
-
-root, expected_count, expected_total = sys.argv[1:]
-root = os.fsencode(root)
-count = 0
-total = 0
-try:
-    for line in sys.stdin.buffer:
-        if not line.endswith(b"\n"):
-            refuse(67, "count")
-        expected_hash, expected_bytes, expected_exec, relative = line[:-1].split(b"\t", 3)
-        relative_str = relative.decode("utf-8")
-        if not relative:
-            refuse(62, "empty_path")
-        components = relative.split(b"/")
-        if any(part in (b"", b".", b"..") for part in components) or b"\\" in relative:
-            refuse(62, "unsafe_path", relative)
-        parent = root
-        for component in components[:-1]:
-            parent += b"/" + component
-            try:
-                parent_metadata = os.lstat(parent)
-            except OSError:
-                refuse(63, "not_directory", relative)
-            if not stat.S_ISDIR(parent_metadata.st_mode):
-                refuse(63, "not_directory", relative)
-        file = root + b"/" + relative
-        if expected_exec == b"L":
-            try:
-                metadata = os.lstat(file)
-            except OSError:
-                refuse(63, "not_symlink", relative)
-            if not stat.S_ISLNK(metadata.st_mode):
-                refuse(63, "not_symlink", relative)
-            target = os.readlink(file)
-            target_str = target.decode("utf-8")
-            if (
-                not target_str
-                or target_str.startswith("/")
-                or "\\" in target_str
-                or any(ord(ch) < 32 or ord(ch) == 127 for ch in target_str)
-            ):
-                refuse(63, "unsafe_symlink", relative)
-            parts = [
-                part
-                for part in relative_str.split("/")[:-1]
-                if part and part != "."
-            ]
-            for part in target_str.split("/"):
-                if part in ("", "."):
-                    continue
-                if part == "..":
-                    if not parts:
-                        refuse(63, "symlink_escape", relative)
-                    parts.pop()
-                else:
-                    parts.append(part)
-            actual_bytes = len(target)
-            if str(actual_bytes).encode("ascii") != expected_bytes:
-                refuse(64, "size", relative)
-            if hashlib.sha256(target).hexdigest().encode("ascii") != expected_hash:
-                refuse(65, "sha256", relative)
-        else:
-            try:
-                metadata = os.lstat(file)
-            except OSError:
-                refuse(63, "not_regular", relative)
-            if not stat.S_ISREG(metadata.st_mode):
-                refuse(63, "not_regular", relative)
-            hasher = hashlib.sha256()
-            actual_bytes = 0
-            with open(file, "rb") as source:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    actual_bytes += len(chunk)
-                    hasher.update(chunk)
-            if str(actual_bytes).encode("ascii") != expected_bytes:
-                refuse(64, "size", relative)
-            if hasher.hexdigest().encode("ascii") != expected_hash:
-                refuse(65, "sha256", relative)
-            actual_exec = b"1" if os.access(file, os.X_OK, effective_ids=True) else b"0"
-            if actual_exec != expected_exec:
-                refuse(66, "mode", relative)
-        count += 1
-        total += actual_bytes
-    if str(count) != expected_count:
-        refuse(67, "count", str(count))
-    if str(total) != expected_total:
-        refuse(68, "bytes", str(total))
-except (OSError, UnicodeError, ValueError, NotImplementedError) as error:
-    refuse(69, "read_or_manifest_" + type(error).__name__)
-sys.stdout.write("RCH_SOURCE_CONTENT_VERIFIED\t" + str(count) + "\t" + str(total) + "\n")
-"#;
-
 fn remote_verify_command(manifest: &SourceContentRootManifest) -> String {
     let root = shell_escape::escape(manifest.remote_root.clone().into());
-    let python = shell_escape::escape(REMOTE_VERIFY_PYTHON.into());
     format!(
-        "set -eu; root={root}; tab=$(printf '\\t'); count=0; total=0; \
-         if command -v python3 >/dev/null 2>&1; then exec python3 -I -c {python} \"$root\" {file_count} {byte_count}; fi; \
-         if command -v sha256sum >/dev/null 2>&1; then hash_file() {{ sha256sum -- \"$1\" | awk '{{print $1}}'; }}; hash_stdin() {{ sha256sum | awk '{{print $1}}'; }}; \
-         elif command -v shasum >/dev/null 2>&1; then hash_file() {{ shasum -a 256 -- \"$1\" | awk '{{print $1}}'; }}; hash_stdin() {{ shasum -a 256 | awk '{{print $1}}'; }}; \
-         else printf 'RCH_SOURCE_CONTENT_ERROR:sha256_tool_missing\\n' >&2; exit 61; fi; \
-         while IFS=\"$tab\" read -r expected_hash expected_bytes expected_exec relative; do \
-           [ -n \"$relative\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:empty_path\\n' >&2; exit 62; }}; \
-           ancestor=\"$root\"; remaining=\"$relative/\"; \
-           while [ -n \"$remaining\" ]; do \
-             component=${{remaining%%/*}}; remaining=${{remaining#*/}}; \
-             case \"$component\" in \"\"|.|..|*\\\\*) printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_path:%s\\n' \"$relative\" >&2; exit 62 ;; esac; \
-             if [ -n \"$remaining\" ]; then \
-               ancestor=\"$ancestor/$component\"; \
-               [ -d \"$ancestor\" ] && [ ! -L \"$ancestor\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_directory:%s\\n' \"$relative\" >&2; exit 63; }}; \
-             fi; \
-           done; \
-           file=\"$root/$relative\"; \
-           if [ \"$expected_exec\" = L ]; then \
-             [ -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
-             link_target=$(readlink \"$file\") || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
-             [ -n \"$link_target\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_symlink:%s\\n' \"$relative\" >&2; exit 63; }}; \
-             case \"$link_target\" in \
-               /*|*\\\\*) printf 'RCH_SOURCE_CONTENT_ERROR:unsafe_symlink:%s\\n' \"$relative\" >&2; exit 63 ;; \
-             esac; \
-             depth=0; rel_rest=$relative; \
-             while :; do \
-               case \"$rel_rest\" in \
-                 */*) seg=${{rel_rest%%/*}}; rel_rest=${{rel_rest#*/}}; \
-                      if [ -n \"$seg\" ] && [ \"$seg\" != . ]; then depth=$((depth + 1)); fi ;; \
-                 *) break ;; \
-               esac; \
-             done; \
-             tgt_rest=\"$link_target/\"; \
-             while [ -n \"$tgt_rest\" ]; do \
-               seg=${{tgt_rest%%/*}}; tgt_rest=${{tgt_rest#*/}}; \
-               case \"$seg\" in \
-                 \"\"|.) ;; \
-                 ..) if [ \"$depth\" -le 0 ]; then printf 'RCH_SOURCE_CONTENT_ERROR:symlink_escape:%s\\n' \"$relative\" >&2; exit 63; fi; \
-                     depth=$((depth - 1)) ;; \
-                 *) depth=$((depth + 1)) ;; \
-               esac; \
-             done; \
-             actual_bytes=$(printf '%s' \"$link_target\" | wc -c | tr -d '[:space:]'); \
-             [ \"$actual_bytes\" = \"$expected_bytes\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:size:%s\\n' \"$relative\" >&2; exit 64; }}; \
-             actual_hash=$(printf '%s' \"$link_target\" | hash_stdin); \
-             [ \"$actual_hash\" = \"$expected_hash\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:sha256:%s\\n' \"$relative\" >&2; exit 65; }}; \
-           else \
-             [ -f \"$file\" ] && [ ! -L \"$file\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:not_regular:%s\\n' \"$relative\" >&2; exit 63; }}; \
-             actual_bytes=$(wc -c < \"$file\" | tr -d '[:space:]'); \
-             [ \"$actual_bytes\" = \"$expected_bytes\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:size:%s\\n' \"$relative\" >&2; exit 64; }}; \
-             actual_hash=$(hash_file \"$file\"); \
-             [ \"$actual_hash\" = \"$expected_hash\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:sha256:%s\\n' \"$relative\" >&2; exit 65; }}; \
-             actual_exec=0; [ -x \"$file\" ] && actual_exec=1; \
-             [ \"$actual_exec\" = \"$expected_exec\" ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:mode:%s\\n' \"$relative\" >&2; exit 66; }}; \
-           fi; \
-           count=$((count + 1)); total=$((total + actual_bytes)); \
-         done; \
-         [ \"$count\" -eq {file_count} ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:count:%s\\n' \"$count\" >&2; exit 67; }}; \
-         [ \"$total\" -eq {byte_count} ] || {{ printf 'RCH_SOURCE_CONTENT_ERROR:bytes:%s\\n' \"$total\" >&2; exit 68; }}; \
-         printf 'RCH_SOURCE_CONTENT_VERIFIED\\t%s\\t%s\\n' \"$count\" \"$total\"",
+        r#"set -eu
+{locate}
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_SOURCE_CONTENT_ERROR:worker_missing: install rch-wkr on this worker' >&2
+    exit 61
+fi
+if ! rch_source_verifier_probe=$("$RCH_WKR" verify-source-content probe </dev/null 2>/dev/null) ||
+   [ "$rch_source_verifier_probe" != RCH_SOURCE_CONTENT_VERIFIER_V1 ]; then
+    printf '%s\n' 'RCH_SOURCE_CONTENT_ERROR:worker_unsupported: upgrade rch-wkr on this worker' >&2
+    exit 61
+fi
+exec "$RCH_WKR" verify-source-content verify {root} {file_count} {byte_count}
+"#,
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
         file_count = manifest.file_count,
         byte_count = manifest.byte_count,
     )
@@ -2609,7 +2450,7 @@ for index, argument in enumerate(sys.argv[1:], 1):
             payload.write(script)
             payload.seek(0)
             os.dup2(payload.fileno(), 0)
-        verifying = "RCH_SOURCE_CONTENT_VERIFIED" in command or b"RCH_SOURCE_CONTENT_VERIFIED" in script
+        verifying = "verify-source-content verify" in command or b"verify-source-content verify" in script
         if not verifying:
             os.execvp("sh", ["sh", "-c", command])
         status = subprocess.call(["sh", "-c", command])
@@ -2638,6 +2479,7 @@ sys.exit(99)
                     .env("RCH_SOURCE_PROOF_ROOT", fixture.path())
                     .env("RCH_SOURCE_PROOF_REGISTRY", &registry)
                     .env("RCH_SOURCE_PROOF_RSYNC", &rsync.path)
+                    .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                     .env(
                         "PATH",
                         format!(
@@ -3895,6 +3737,13 @@ sys.exit(99)
         }
         command
             .current_dir(&manifest.remote_root)
+            .env(
+                "RCH_WKR_BIN",
+                path_override
+                    .map(|path| path.join("rch-wkr"))
+                    .filter(|path| path.is_file())
+                    .unwrap_or_else(rch_common::testing::worker_binary),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -3959,13 +3808,10 @@ sys.exit(99)
             )
             .unwrap(),
         );
-        // A compiler source tree cannot replace the verifier's standard
-        // library imports. Python's isolated mode must ignore this module.
-        std::fs::write(
-            root.join("hashlib.py"),
-            b"raise RuntimeError('untrusted source import')\n",
-        )
-        .unwrap();
+        // Project content cannot replace the deployed verifier executable.
+        std::fs::write(root.join("rch-wkr"), b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(root.join("rch-wkr"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let manifest = SourceContentRootManifest {
             schema: ROOT_SCHEMA,
             ordinal: 0,
@@ -4099,7 +3945,7 @@ sys.exit(99)
             assert!(output.stdout.is_empty(), "{:?}", output);
         }
         // Byte-identical content outside the grant is still not the selected
-        // source. Check this with BOTH verifier implementations and framings.
+        // source. Check this with both direct and finite-input framings.
         let parent = root.join("nested");
         std::fs::create_dir(&parent).unwrap();
         std::fs::write(parent.join("input.rs"), b"selected bytes\n").unwrap();
@@ -4131,33 +3977,55 @@ sys.exit(99)
                 .starts_with(b"RCH_SOURCE_CONTENT_ERROR:not_directory:")
         );
         if path_override.is_none() {
-            // This deliberately failing interpreter is a must-reject control.
-            // Its exit must survive; a failed Python run cannot be retried as
-            // portable verification, even when that would also reject input.
-            let bin = temp.path().join("failed-python-bin");
+            // The deployed verifier's refusal must survive unchanged. It
+            // cannot be retried by a different verifier or admitted as success.
+            let bin = temp.path().join("failed-worker-bin");
             std::fs::create_dir(&bin).unwrap();
-            let python = bin.join("python3");
+            let worker = bin.join("rch-wkr");
             std::fs::write(
-                &python,
-                b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nexit 73\n",
+                &worker,
+                b"#!/bin/sh\nif [ \"${2-}\" = probe ]; then printf 'RCH_SOURCE_CONTENT_VERIFIER_V1\\n'; exit 0; fi\nwhile IFS= read -r line; do :; done\nexit 73\n",
             )
             .unwrap();
-            std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
             let output = run_source_verifier(&manifest, &payload, Some(&bin), finite_input);
             assert_eq!(output.status.code(), Some(73), "{:?}", output);
             assert!(output.stdout.is_empty(), "{:?}", output);
+
+            let older = bin.join("older-worker");
+            std::fs::write(&older, b"#!/bin/sh\nexit 2\n").unwrap();
+            let failed_probe = bin.join("failed-probe-worker");
+            std::fs::write(
+                &failed_probe,
+                b"#!/bin/sh\nprintf 'RCH_SOURCE_CONTENT_VERIFIER_V1\\n'\nexit 1\n",
+            )
+            .unwrap();
+            for worker in [&older, &failed_probe] {
+                std::fs::set_permissions(worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for worker in [bin.join("missing-worker"), older, failed_probe] {
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", &remote_verify_command(&manifest)])
+                    .env("RCH_WKR_BIN", worker)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(61), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(
+                    output
+                        .stderr
+                        .starts_with(b"RCH_SOURCE_CONTENT_ERROR:worker_"),
+                    "{output:?}"
+                );
+            }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn isolated_python_verifier_preserves_all_source_checks() {
-        let python = std::process::Command::new("python3")
-            .args(["-I", "-c", "import hashlib, os, stat, sys"])
-            .status()
-            .expect("Python verification must execute, not skip its assertions");
-        assert!(python.success());
+    fn native_verifier_preserves_all_source_checks() {
         for finite_input in [false, true] {
             check_source_verifier_controls(None, finite_input);
         }
@@ -4165,43 +4033,12 @@ sys.exit(99)
 
     #[cfg(unix)]
     #[test]
-    fn portable_verifier_without_python_preserves_all_source_checks() {
-        let search = std::env::var_os("PATH").expect("test has a tool search path");
-        let resolve = |name: &str| {
-            std::env::split_paths(&search)
-                .map(|directory| directory.join(name))
-                .find(|path| path.is_file())
-        };
-        let mut verified_hash_tools = 0;
-        for hash_tool in ["sha256sum", "shasum"] {
-            let Some(hash_path) = resolve(hash_tool) else {
-                continue;
-            };
-            let bin = tempfile::tempdir().expect("private portable verifier PATH");
-            for (name, path) in std::iter::once((hash_tool, hash_path)).chain(
-                ["awk", "wc", "tr", "readlink", "sh"]
-                    .into_iter()
-                    .map(|name| {
-                        (
-                            name,
-                            resolve(name).expect("portable verifier utility must be present"),
-                        )
-                    }),
-            ) {
-                let executable = path
-                    .canonicalize()
-                    .expect("portable verifier utility path resolves");
-                std::os::unix::fs::symlink(executable, bin.path().join(name)).unwrap();
-            }
-            for finite_input in [false, true] {
-                check_source_verifier_controls(Some(bin.path()), finite_input);
-            }
-            verified_hash_tools += 1;
+    fn native_verifier_with_only_shell_on_path_preserves_all_source_checks() {
+        let bin = tempfile::tempdir().expect("private native verifier PATH");
+        std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
+        for finite_input in [false, true] {
+            check_source_verifier_controls(Some(bin.path()), finite_input);
         }
-        assert!(
-            verified_hash_tools > 0,
-            "portable verification must execute with a genuine SHA-256 tool"
-        );
     }
 
     #[cfg(unix)]

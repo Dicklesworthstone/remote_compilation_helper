@@ -3,6 +3,7 @@
 //! Namespace path behavior is covered by the common module and worker CLI tests.
 #![cfg(target_os = "linux")]
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -74,7 +75,10 @@ impl NativeTopologyFixture {
         let canonical = root.path().join("canonical");
         let alias = root.path().join("alias");
         let roots = format!("{}\n{}\n", alias.display(), canonical.display());
-        let digest = format!("{:x}", Sha256::digest(roots.as_bytes()));
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(roots.as_bytes()) {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
         Self {
             root,
             registry,
