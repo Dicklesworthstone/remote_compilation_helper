@@ -366,28 +366,55 @@ fn outer_group_termination_reaches_the_collector_and_observed_command() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn embedded_diskless_capture_uses_the_native_worker_with_unusable_tmpdir() {
+fn embedded_diskless_capture_owns_timeout_with_unusable_tmpdir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let fixture = Fixture::new();
     let bin = fixture.directory.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    for name in ["timeout", "uname"] {
-        std::os::unix::fs::symlink(format!("/usr/bin/{name}"), bin.join(name)).unwrap();
-    }
-    let mut command = Command::new("/bin/sh");
-    fixture.configure(&mut command);
+    std::os::unix::fs::symlink("/usr/bin/uname", bin.join("uname")).unwrap();
+    let timeout_selected = fixture.directory.path().join("unsuitable-timeout-selected");
+    let unsuitable_timeout = bin.join("timeout");
+    std::fs::write(
+        &unsuitable_timeout,
+        "#!/bin/sh\n: > \"$RCH_TEST_TIMEOUT_SELECTED\"\nexit 91\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&unsuitable_timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
     let script = format!(
-        "{}\nrch_control_diskless=1\nrch_control_capture 2s /bin/sh -c 'printf \"witness\\n\\n\"'",
+        "{}\nrch_control_diskless=1\nrch_control_capture 2s /bin/sh -c \"$1\"",
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
     );
-    let output = command
-        .env("PATH", &bin)
-        .env("RCH_WKR_BIN", WORKER)
-        .args(["-c", &script])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"witness\n\n");
-    assert!(output.stderr.is_empty(), "{output:?}");
+    for (body, code, expected_stdout, expected_stderr) in [
+        (
+            "printf 'witness\\n\\n'",
+            0,
+            b"witness\n\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (":", 0, b"", b""),
+        (
+            "printf 'RCH_CONTROL_CAPTURE_STARTED_V1:\\n\\n'",
+            0,
+            b"RCH_CONTROL_CAPTURE_STARTED_V1:\n\n",
+            b"",
+        ),
+        ("printf 'failed\\n\\n'; exit 37", 37, b"", b"failed\n\n"),
+    ] {
+        let mut command = Command::new("/bin/sh");
+        fixture.configure(&mut command);
+        let output = command
+            .env("PATH", &bin)
+            .env("RCH_WKR_BIN", WORKER)
+            .env("RCH_TEST_TIMEOUT_SELECTED", &timeout_selected)
+            .args(["-c", &script, "capture-fixture", body])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{body}: {output:?}");
+        assert_eq!(output.stdout, expected_stdout, "{body}");
+        assert_eq!(output.stderr, expected_stderr, "{body}");
+        assert!(!timeout_selected.exists(), "generic timeout was selected");
+    }
     assert_eq!(std::fs::read(&fixture.blocked).unwrap(), b"preserve");
 }
 
@@ -403,12 +430,24 @@ fn missing_or_incompatible_native_helpers_refuse_before_observation() {
     let old = fixture.directory.path().join("old-worker");
     std::fs::write(&old, "#!/bin/sh\nprintf 'unknown worker protocol\\n'\n").unwrap();
     std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_cli = fixture.directory.path().join("old-worker-cli");
+    std::fs::write(
+        &old_cli,
+        "#!/bin/sh\nprintf '%s\\n' 'error: unrecognized subcommand scoped-launch' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&old_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let launched = fixture.directory.path().join("observation-started");
     let script = format!(
         "{}\nrch_control_diskless=1\nrch_control_capture 2s /bin/sh -c 'printf started > \"$1\"' observation \"$1\"",
         rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
     );
-    for worker in [fixture.directory.path().join("missing-worker"), old] {
+    for worker in [
+        fixture.directory.path().join("missing-worker"),
+        old,
+        old_cli.clone(),
+        PathBuf::from("/bin/true"),
+    ] {
         let mut command = Command::new("/bin/sh");
         fixture.configure(&mut command);
         let output = command
@@ -420,10 +459,13 @@ fn missing_or_incompatible_native_helpers_refuse_before_observation() {
             .unwrap();
         assert_eq!(output.status.code(), Some(125), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
+        let expected_prefix = if worker == old_cli {
+            "error: unrecognized subcommand scoped-launch\nRCH_CONTROL_CAPTURE_UNAVAILABLE:"
+        } else {
+            "RCH_CONTROL_CAPTURE_UNAVAILABLE:"
+        };
         assert!(
-            output
-                .stderr
-                .starts_with(b"RCH_CONTROL_CAPTURE_UNAVAILABLE:"),
+            output.stderr.starts_with(expected_prefix.as_bytes()),
             "{output:?}"
         );
         assert!(!launched.exists());

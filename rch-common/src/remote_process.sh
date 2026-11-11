@@ -727,8 +727,23 @@ rch_scope_launch_fd_present() (
     esac
 )
 
-# Kill helpers AND pipe holders in a private group, never the workload. Prefer
-# GNU (gnutimeout/gtimeout): uutils timeout kills only the direct child.
+# Native session ownership needs neither coreutils nor writable disk. Capture
+# closures before libstd opens absent standard descriptors.
+rch_native_group_timeout() {
+    rch_wkr_locate || {
+        printf '%s\n' 'RCH_SCOPED_LAUNCH_UNAVAILABLE: deploy a current rch-wkr' >&2
+        return 125
+    }
+    rch_control_closed_stdio=0
+    rch_scope_launch_fd_present 0 || rch_control_closed_stdio=$((rch_control_closed_stdio | 1))
+    rch_scope_launch_fd_present 1 || rch_control_closed_stdio=$((rch_control_closed_stdio | 2))
+    rch_scope_launch_fd_present 2 || rch_control_closed_stdio=$((rch_control_closed_stdio | 4))
+    "$RCH_WKR" scoped-launch timeout --closed-stdio "$rch_control_closed_stdio" "$@"
+}
+
+# Preserve the existing utility selection for ordinary file-backed controls.
+# Cancellation's memory collector uses native group ownership directly below:
+# a generic timeout may be uutils and terminate only its direct child.
 rch_group_timeout() {
     if command -v gnutimeout >/dev/null 2>&1; then
         gnutimeout "$@"
@@ -737,17 +752,7 @@ rch_group_timeout() {
     elif command -v timeout >/dev/null 2>&1; then
         timeout "$@"
     else
-        # Native session ownership needs neither coreutils nor writable disk.
-        # Capture closures before libstd opens absent standard descriptors.
-        rch_wkr_locate || {
-            printf '%s\n' 'RCH_SCOPED_LAUNCH_UNAVAILABLE: deploy a current rch-wkr' >&2
-            return 125
-        }
-        rch_control_closed_stdio=0
-        rch_scope_launch_fd_present 0 || rch_control_closed_stdio=$((rch_control_closed_stdio | 1))
-        rch_scope_launch_fd_present 1 || rch_control_closed_stdio=$((rch_control_closed_stdio | 2))
-        rch_scope_launch_fd_present 2 || rch_control_closed_stdio=$((rch_control_closed_stdio | 4))
-        "$RCH_WKR" scoped-launch timeout --closed-stdio "$rch_control_closed_stdio" "$@"
+        rch_native_group_timeout "$@"
     fi
 }
 
@@ -769,18 +774,22 @@ rch_control_budget() {
         rch_control_timeout=${rch_control_remaining}s
 }
 
-# The existing timeout owns the collector, command and inherited pipe holders
-# as one process group. Never create another session here. Buffer only bounded,
-# validated bytes in memory, so cancellation needs no space on the build disk.
+# The native timeout owns the collector, command and inherited pipe holders
+# as one process group. The collector never creates another session. Buffer
+# only bounded, validated bytes so cancellation needs no build-disk space.
 rch_control_capture_memory() {
     rch_wkr_locate || {
         printf '%s\n' 'RCH_CONTROL_CAPTURE_UNAVAILABLE: deploy a current rch-wkr' >&2
         return 125
     }
     rch_control_budget || return 125
+    rch_control_status=0
     rch_control_output=$(
         # Probe and observation share one timeout, including helper startup.
-        rch_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
+        rch_native_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
+            # Prove this timed shell ran even if an incompatible worker exits
+            # successfully without implementing the requested timeout command.
+            printf "%s" "RCH_CONTROL_CAPTURE_STARTED_V1:" || exit 125
             rch_native=$1
             shift
             rch_probe=$("$rch_native" control-capture probe </dev/null) || {
@@ -795,7 +804,15 @@ rch_control_capture_memory() {
         ' rch-control-memory "$RCH_WKR" "$rch_control_limit" "$@" </dev/null || exit $?
         # Preserve every trailing newline across shell command substitution.
         printf "."
-    ) || return $?
+    ) || rch_control_status=$?
+    case "$rch_control_output" in
+        RCH_CONTROL_CAPTURE_STARTED_V1:*)
+            rch_control_output=${rch_control_output#RCH_CONTROL_CAPTURE_STARTED_V1:};;
+        *)
+            printf '%s\n' 'RCH_CONTROL_CAPTURE_UNAVAILABLE: incompatible rch-wkr timeout' >&2
+            return 125;;
+    esac
+    [ "$rch_control_status" -eq 0 ] || return "$rch_control_status"
     rch_control_output=${rch_control_output%.}
     rch_control_in_budget || return 125
     printf "%s" "$rch_control_output" || return 125
