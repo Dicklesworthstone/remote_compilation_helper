@@ -34,7 +34,11 @@ fn source_topology_acknowledgement_and_release_protocol() {
     .expect("write compiled helpers");
     std::fs::write(
         &retry,
-        include_str!("../src/hook/source_claim_admission.sh"),
+        format!(
+            "{}\n{}",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            include_str!("../src/hook/source_claim_admission.sh"),
+        ),
     )
     .expect("write compiled admission retry");
 
@@ -153,9 +157,10 @@ impl NativeTopologyFixture {
              flock {invocation} <<'RCH_TOPOLOGY_TEST_ROOTS'\n{}\
              RCH_TOPOLOGY_TEST_ROOTS\n\
              status=$?\nprintf '%s\\n' \"$status\" >> {}\nexit \"$status\"\n\
-             ); }}\nrch_admission_retry_seconds=3\n{}",
+             ); }}\nrch_admission_retry_seconds=3\n{}\n{}",
             self.roots,
             quote(self.root.path().join("attempts").to_str().unwrap()),
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
             include_str!("../src/hook/source_claim_admission.sh")
         );
         let mut command = Command::new("sh");

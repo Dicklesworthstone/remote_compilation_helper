@@ -16,7 +16,11 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
     let admission = fixture.path().join("admission.sh");
     std::fs::write(
         &admission,
-        include_str!("../src/hook/source_claim_admission.sh"),
+        format!(
+            "{}\n{}",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            include_str!("../src/hook/source_claim_admission.sh"),
+        ),
     )
     .expect("write compiled admission program");
     for suite in [
@@ -25,10 +29,22 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
         "scripts/tests/test_source_namespace_delivery.py",
         "scripts/tests/test_source_namespace_native_timer.py",
     ] {
-        let output = std::process::Command::new("python3")
-            .arg(root.join(suite))
+        let mut command = std::process::Command::new("python3");
+        command.arg(root.join(suite));
+        if suite == "scripts/tests/test_source_namespace_control.py" {
+            // Metadata-lock cases now exercise the native worker directly in
+            // rch-wkr/tests/source_admission.rs. Keep every controller, retry,
+            // and timer case here until those separate suites are ported too.
+            command.args([
+                "SourceNamespaceControlTests",
+                "SourceClaimAdmissionTimingTests",
+                "SourceNamespaceTimerObserverTests",
+            ]);
+        }
+        let output = command
             .env("RCH_TEST_SOURCE_NAMESPACE_CONTROL", &control)
             .env("RCH_TEST_SOURCE_NAMESPACE_ADMISSION", &admission)
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
             .output()
             .expect("execute native namespace control tests");
         assert!(

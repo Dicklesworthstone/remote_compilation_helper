@@ -113,66 +113,6 @@ fn topology_refusal_detail(
     )
 }
 
-// A bounded, monotonic wait reports metadata contention independently of the
-// enclosing control group's 15-second execution deadline. This lock program is
-// remaining interpreter debt: its descriptor survives exec, and CONTROL kills
-// every inheriting descendant before acknowledgement.
-const REGISTRY_LOCK: &str = r#"
-import errno, fcntl, math, os, re, stat, sys, time
-try:
-    timing_text = os.environ.get('RCH_TIMING_SCALE', '1')
-    if (len(timing_text) > 128 or re.fullmatch(
-            r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?',
-            timing_text) is None):
-        raise ValueError('invalid transported scale')
-    timing_scale = float(timing_text)
-    if not math.isfinite(timing_scale) or not 1.0 <= timing_scale <= 10.0:
-        raise ValueError('scale outside [1, 10]')
-except ValueError:
-    print('RCH_SOURCE_NAMESPACE_INVALID_TIMING_SCALE', file=sys.stderr)
-    sys.exit(78)
-
-started = time.monotonic()
-deadline = started + 5 * timing_scale
-
-def require_admission_time():
-    now = time.monotonic()
-    if now >= deadline:
-        print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms={} lock={}'.format(
-            int((now - started) * 1000), sys.argv[1]), file=sys.stderr)
-        sys.exit(76)
-
-try:
-    lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    info = os.fstat(lock)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise OSError('invalid metadata lock inode')
-    while True:
-        named = os.stat(sys.argv[1], follow_symlinks=False)
-        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
-            raise OSError('metadata lock changed while waiting')
-        # A resumed waiter must not acquire after its observation window.
-        require_admission_time()
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError as error:
-            if error.errno not in (errno.EAGAIN, errno.EACCES):
-                raise
-        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
-    named = os.stat(sys.argv[1], follow_symlinks=False)
-    if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
-        raise OSError('metadata lock changed after acquisition')
-    os.set_inheritable(lock, True)
-    # Successful LOCK_NB can itself return after a scheduling stall. No
-    # initializer may run merely because acquisition eventually succeeded.
-    require_admission_time()
-    os.execvp(sys.argv[2], sys.argv[2:])
-except OSError as error:
-    print('RCH_SOURCE_NAMESPACE_METADATA_LOCK_INVALID {}'.format(error), file=sys.stderr)
-    sys.exit(73)
-"#;
-
 fn retryable_source_admission_error(error: &anyhow::Error) -> bool {
     let detail = format!("{error:#}");
     detail.contains("RCH: durable source ownership: unfinished overlapping source owner")
@@ -304,13 +244,13 @@ fn namespace_command(
     // exist in this parent. Every attempt drops its metadata flock before the
     // bounded wait, allowing exact-owner recovery to release the old claim.
     Ok(format!(
-        "{setup}rch_source_attempt() {{ (\nset -eu\n\
-         exec python3 -I -S -c {lock_program} \"$registry/metadata.lock\" sh -c {script} \
+        "{locate}{setup}rch_source_attempt() {{ (\nset -eu\n\
+         exec \"$rch_admission_worker\" source-admission metadata-lock \"$registry/metadata.lock\" sh -c {script} \
          rch-source-namespace \"$registry\" {identity} {digest} topology {check} {create} \
          <<'RCH_NAMESPACE_SCOPE'\n{body}RCH_NAMESPACE_SCOPE\n\
          ); }}\nrch_admission_retry_seconds=5\n{ADMISSION}",
         setup = super::ssh::source_registry_setup(registry),
-        lock_program = quote(REGISTRY_LOCK),
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
         script = quote(&registry_script),
         identity = quote(identity),
         check = quote(&paths("check")),
@@ -1160,21 +1100,26 @@ mod tests {
     #[test]
     fn source_namespace_registry_lock_process_protocol() {
         let fixture = tempfile::tempdir().unwrap().keep();
-        let compiled = fixture.join("registry-lock.py");
-        std::fs::write(&compiled, REGISTRY_LOCK).unwrap();
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../scripts/tests/test_source_namespace_control.py");
-        let output = std::process::Command::new("python3")
-            .arg(script)
-            .arg("SourceNamespaceRegistryLockTests")
-            .env("RCH_TEST_SOURCE_NAMESPACE_REGISTRY_LOCK", &compiled)
+        let policy = PathTopologyPolicy::new(fixture.join("canonical"), fixture.join("alias"));
+        let registry = fixture.join("registry");
+        let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
+            .env("RCH_TIMING_SCALE", "1")
+            .env("TOKIO_WORKER_THREADS", "0")
             .output()
-            .expect("Python 3 is required for native registry-lock qualification");
+            .expect("execute native registry-lock topology transaction");
         assert!(
             output.status.success(),
             "metadata-lock qualification failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(output.stdout, b"RCH_TOPOLOGY_OK\n");
+        assert_eq!(
+            std::fs::canonicalize(fixture.join("alias")).unwrap(),
+            fixture.join("canonical")
         );
     }
 }

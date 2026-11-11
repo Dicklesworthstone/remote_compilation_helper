@@ -12,6 +12,7 @@ mod file_sync;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+mod source_admission;
 mod source_claim_link;
 mod source_lock;
 mod source_release;
@@ -43,6 +44,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal bounded source-admission clock and metadata-lock handoff.
+    #[command(hide = true)]
+    SourceAdmission {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
     /// Internal bounded executable-header evidence for artifact preflight.
     #[command(hide = true)]
     ArtifactHeaders {
@@ -361,6 +368,9 @@ fn main() -> Result<()> {
     if let Commands::SourceRelease { arguments } = &cli.command {
         std::process::exit(source_release::main(arguments));
     }
+    if let Commands::SourceAdmission { arguments } = &cli.command {
+        std::process::exit(source_admission::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -437,6 +447,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
+        Commands::SourceAdmission { .. } => {
+            anyhow::bail!("source-admission requires the synchronous worker entry point")
+        }
         Commands::ArtifactHeaders { .. } => {
             anyhow::bail!("artifact-headers requires the synchronous worker entry point")
         }
