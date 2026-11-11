@@ -9,9 +9,11 @@
 //! Duplicating it inline exhausts Linux's per-argument limit after the surrounding
 //! execution/ownership/SSH layers quote the launch program.
 
-// Keep these inputs literal: the native Python suites reconstruct their exact
+// Keep these inputs literal: the native shell suites reconstruct their exact
 // expansion and compare it with the compiled constant when Cargo supplies it.
 const LAUNCH_SOURCE: &str = concat!(
+    include_str!("wkr_locate.sh"),
+    "\n",
     include_str!("remote_process.sh"),
     "\n",
     include_str!("remote_scoped_launch.sh"),

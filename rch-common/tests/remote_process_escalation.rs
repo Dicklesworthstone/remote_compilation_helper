@@ -6,7 +6,11 @@ use std::process::Command;
 
 fn run_case(body: &str) {
     for shell in ["sh", "bash"] {
-        let directory = tempfile::tempdir().expect("create fixture directory");
+        let directory = tempfile::Builder::new()
+            .prefix("remote-process-escalation-")
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("create fixture directory");
         std::fs::write(
             directory.path().join("protocol.sh"),
             rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
@@ -15,6 +19,7 @@ fn run_case(body: &str) {
         let script = format!("{}\n{body}", rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT);
         let output = Command::new(shell)
             .env_remove("RCH_TIMING_SCALE")
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
             .args(["-c", &script, "rch-process-test"])
             .arg(directory.path())
             .output()

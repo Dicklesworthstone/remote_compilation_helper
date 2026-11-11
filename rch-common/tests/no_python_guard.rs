@@ -36,9 +36,6 @@ const PY_FILES_DEBT: usize = 91;
 const PORT_DEBT: &[(&str, usize)] = &[
     ("install.sh", 4),
     ("rabs-key/src/bin/layer0_render.rs", 5),
-    ("rch-common/src/remote_process.sh", 7),
-    ("rch-common/src/remote_scoped_launch.rs", 1),
-    ("rch-common/src/remote_scoped_launch.sh", 9),
     ("rch-common/src/ssh.rs", 6),
     ("rch-common/src/stale_target_reap.rs", 5),
     ("rch-common/src/toolchain/worker_cache.rs", 7),
@@ -53,7 +50,7 @@ const PORT_DEBT: &[(&str, usize)] = &[
     ("rch-common/tests/remote_scoped_backpressure.rs", 1),
     ("rch-common/tests/remote_scoped_launch.rs", 2),
     ("rch-common/tests/remote_scoped_stdin.rs", 1),
-    ("rch-common/tests/worker_execution_policy.rs", 3),
+    ("rch-common/tests/worker_execution_policy.rs", 2),
     ("rch-wkr/src/executor.rs", 1),
     ("rch-wkr/tests/output_completion.rs", 2),
     ("rch-wkr/tests/prepare_transactions.rs", 2),

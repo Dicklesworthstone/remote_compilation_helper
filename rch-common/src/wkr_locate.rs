@@ -13,20 +13,7 @@
 /// POSIX sh: defines `rch_wkr_locate`, which sets `RCH_WKR` to the deployed
 /// binary and returns 0, or clears it and returns 127 when none is installed.
 /// Callers must refuse with their own marker on failure, never fall back.
-pub const WKR_LOCATE_SHELL: &str = r#"
-rch_wkr_locate() {
-    if [ -n "${RCH_WKR_BIN-}" ]; then
-        if [ -f "$RCH_WKR_BIN" ] && [ -x "$RCH_WKR_BIN" ]; then RCH_WKR=$RCH_WKR_BIN; return 0; fi;
-        RCH_WKR=; return 127;
-    fi;
-    for __rch_wkr_candidate in /usr/local/bin/rch-wkr "${HOME-}/.local/bin/rch-wkr" "${HOME-}/.local/bin/rch-wkr.exe"; do
-        if [ -f "$__rch_wkr_candidate" ] && [ -x "$__rch_wkr_candidate" ]; then
-            RCH_WKR=$__rch_wkr_candidate; return 0;
-        fi;
-    done;
-    RCH_WKR=; return 127;
-};
-"#;
+pub const WKR_LOCATE_SHELL: &str = include_str!("wkr_locate.sh");
 
 #[cfg(test)]
 mod tests {

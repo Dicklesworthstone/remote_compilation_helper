@@ -17,34 +17,12 @@ rch_scope_launch_fds() {
                 fi
             done;;
         Darwin)
-            # No substitution: its pipe would change the FD set. Encode input,
-            # stderr and a free slot in status 64..94, outside startup failures.
-            __sl_fd_probe=0
-            python3 -I -S -c '
-import errno, os, sys
-def opened(fd):
-    try:
-        os.fstat(fd)
-        return True
-    except OSError as error:
-        if error.errno != errno.EBADF:
-            raise
-        return False
-state = 64 + 8 * opened(0) + 16 * opened(2)
-for fd in range(4, 10):
-    if not opened(fd):
-        state += fd - 3
-        break
-sys.exit(state)
-' || __sl_fd_probe=$?
-            [ "$__sl_fd_probe" -ge 64 ] && [ "$__sl_fd_probe" -le 94 ] || return 1
-            __sl_free_fd=$((__sl_fd_probe & 7))
-            [ "$__sl_free_fd" -le 6 ] || return 1
-            [ "$((__sl_fd_probe & 8))" = 0 ] || __sl_open_fds=0
-            [ "$((__sl_fd_probe & 16))" = 0 ] || __sl_open_fds="$__sl_open_fds 2"
-            # Conservatively reserve all other slots; only one is borrowed.
-            for __sl_fd in 4 5 6 7 8 9; do
-                [ "$__sl_fd" = "$((__sl_free_fd + 3))" ] || __sl_open_fds="$__sl_open_fds $__sl_fd"
+            # Builtins inspect the original table before an exec can reopen
+            # closed standard descriptors. No substitution introduces a pipe.
+            for __sl_fd in 0 2 4 5 6 7 8 9; do
+                if rch_scope_launch_fd_present "$__sl_fd"; then
+                    __sl_open_fds="$__sl_open_fds $__sl_fd"
+                fi
             done;;
         *) return 1;;
     esac
@@ -113,17 +91,9 @@ rch_scope_launch_process() {
             # Only independent ESRCH proves this process absent after libproc
             # failure. This never proves group absence or authorizes signals.
             rch_observation_budget
-            rch_launch_absence=$(rch_control_capture "${rch_observation_seconds}s" python3 -I -S -c '
-import errno, os, sys
-try:
-    os.getpgid(int(sys.argv[1]))
-except OSError as error:
-    if error.errno == errno.ESRCH:
-        print("RCH_PROCESS_ABSENT_V1:" + sys.argv[1])
-        sys.exit(0)
-    raise
-sys.exit(1)
-' "$1") || return 2
+            rch_wkr_locate || return 2
+            rch_launch_absence=$(rch_control_capture "${rch_observation_seconds}s" \
+                "$RCH_WKR" scoped-launch absent "$1") || return 2
             [ "$rch_launch_absence" = "RCH_PROCESS_ABSENT_V1:$1" ] && return 1
             return 2
         fi
@@ -148,10 +118,11 @@ sys.exit(1)
 # does not expire early because its starting fractional second was discarded.
 rch_scope_launch_clock() {
     if [ "$(uname -s)" = Darwin ]; then
-        # Darwin continuous time includes suspend; Python monotonic does not.
+        # The native RAW clock retains Darwin's suspend-inclusive time domain.
         rch_observation_budget
-        rch_launch_now=$(rch_control_capture "${rch_observation_seconds}s" python3 -I -S -c \
-            'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
+        rch_wkr_locate || return 1
+        rch_launch_now=$(rch_control_capture "${rch_observation_seconds}s" \
+            "$RCH_WKR" control-clock ticks) || return 1
         rch_scope_uint "$rch_launch_now" && [ "${#rch_launch_now}" -le 15 ]
         return $?
     fi
@@ -168,7 +139,7 @@ rch_scope_launch_parent_alive() {
     rch_scope_launch_process "$__sl_parent" && [ "$rch_launch_birth" = "$__sl_parent_start" ]
 }
 
-# Bound marker delivery. Map fd 3 before Python closes nonstandard descriptors.
+# Bound marker delivery. Preserve fd 3 in the owned diagnostic child.
 rch_scope_launch_deadline_marker() {
     rch_timing_budget 1
     rch_group_timeout --signal=KILL "${rch_timing_scaled}s" /bin/sh -c 'printf "\n%s\n" "$1"' rch-deadline "$1" \
@@ -205,13 +176,8 @@ rch_scope_launch_kill_self() {
     elif [ "$(uname -s)" = Darwin ]; then
         # Kernel membership grants this in-session authority, never a receipt.
         rch_valid_pgid "$rch_pgid" || return 1
-        python3 -I -S -c '
-import os, signal, sys
-group = os.getpgrp()
-if group <= 1 or group != int(sys.argv[1]):
-    sys.exit(1)
-os.killpg(group, signal.SIGKILL)
-' "$rch_pgid"
+        rch_wkr_locate || return 1
+        "$RCH_WKR" scoped-launch kill-self "$rch_pgid"
     else
         rch_check_procfs_namespace && rch_read_process "$rch_self_pid" &&
             [ "$rch_observed_boot" = "$rch_boot" ] || return 1
@@ -332,11 +298,18 @@ rch_scope_launch_stop_setup() {
     fi
 }
 
-# Preserve child PID and FDs. Darwin supplies setsid(2) through Python.
+# Preserve child PID and FDs. The native session launcher restores explicitly
+# closed stdio after runtime startup; inherited nonstandard FDs stay untouched.
 rch_scope_launch_exec() {
     case "$(uname -s)" in
         Linux) exec setsid "$@";;
-        Darwin) exec python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@";;
+        Darwin)
+            rch_wkr_locate || return 125
+            __sl_closed_stdio=0
+            rch_scope_launch_fd_present 0 || __sl_closed_stdio=$((__sl_closed_stdio | 1))
+            rch_scope_launch_fd_present 1 || __sl_closed_stdio=$((__sl_closed_stdio | 2))
+            rch_scope_launch_fd_present 2 || __sl_closed_stdio=$((__sl_closed_stdio | 4))
+            exec "$RCH_WKR" setsid --closed-stdio "$__sl_closed_stdio" -- "$@";;
         *) return 125;;
     esac
 }
@@ -376,7 +349,7 @@ rch_scope_launch_supervise() {
     [ "$#" -gt 0 ] && rch_check_procfs_namespace || return 125
     case "$(uname -s)" in
         Linux) command -v setsid >/dev/null 2>&1 || return 125;;
-        Darwin) command -v python3 >/dev/null 2>&1 || return 125;;
+        Darwin) rch_wkr_locate || return 125;;
         *) return 125;;
     esac
     # Capture supervisor birth for the lost-parent watchdog before launch.

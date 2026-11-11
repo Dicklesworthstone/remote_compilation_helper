@@ -86,3 +86,35 @@ printf '%s' "$state" > "$1"
         );
     }
 }
+
+#[test]
+fn darwin_shell_launch_preserves_literal_arguments_and_closed_input() {
+    let owner = tempfile::Builder::new()
+        .prefix("rch-darwin-exec-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let payload = owner.path().join("payload");
+    std::fs::write(
+        &payload,
+        b"if ( : 3>&0 ) 2>/dev/null; then exit 91; fi\nprintf '%s\\n' \"$@\"\n",
+    )
+    .unwrap();
+    // Only OS dispatch is doubled. The sh descriptors, worker executable,
+    // setsid syscall, and final exec all run on the actual test host.
+    let script = format!(
+        "{}\nuname() {{ printf Darwin; }}\nexec 0<&-\nrch_scope_launch_exec /bin/sh \"$1\" 'a b' '\"$()!;*'\n",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+    );
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script, "rch-native-launch"])
+        .arg(payload)
+        .env("RCH_WKR_BIN", env!("CARGO_BIN_EXE_rch-wkr"))
+        .env("RCH_TIMING_SCALE", "1")
+        .env("TOKIO_WORKER_THREADS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"a b\n\"$()!;*\n");
+    assert!(output.stderr.is_empty());
+}
