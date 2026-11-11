@@ -4830,6 +4830,10 @@ sys.exit(99)
                 .arg("--test-threads=1")
                 .env(CHILD, "1")
                 .env("RCH_MOCK_SSH", "0")
+                .env(
+                    "RCH_WKR_BIN",
+                    crate::transfer::native_control_worker_for_test(),
+                )
                 .env("RCH_CUSTOM_TARGET_ROOT", fixture.path())
                 .env(
                     "RCH_CUSTOM_TARGET_REGISTRY",
@@ -5070,6 +5074,10 @@ sys.exit(99)
                 .arg("--test-threads=1")
                 .env("RCH110_PREFLIGHT_CHILD", "1")
                 .env("RCH_MOCK_SSH", "0")
+                .env(
+                    "RCH_WKR_BIN",
+                    crate::transfer::native_control_worker_for_test(),
+                )
                 .env(
                     "PATH",
                     format!(

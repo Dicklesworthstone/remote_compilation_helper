@@ -495,8 +495,10 @@ class SourceOwnershipSshTests(unittest.TestCase):
             path = "executable-{:04d}-{}".format(number, "x" * 100)
             os.link(seed, self.source / path)
             paths.append(path)
-        payload = json.dumps([str(self.source), None, paths], separators=(",", ":")).encode().hex()
-        return ARTIFACT_HEADERS.replace("{payload}", payload), paths, contents
+        payload = json.dumps([str(self.source), None, paths], separators=(",", ":"))
+        command = ("RCH_WKR_BIN=" + QUOTE(WORKER) + "; export RCH_WKR_BIN;\n"
+                   + ARTIFACT_HEADERS.replace("{locate}", LOCATOR).replace("{payload}", payload))
+        return command, paths, contents
 
     def retention_command(self, identity=None, root=None, retained=None):
         return shlex.join([

@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod artifact_headers;
 mod cache;
 mod executor;
 mod file_sync;
@@ -37,6 +38,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal bounded executable-header evidence for artifact preflight.
+    #[command(hide = true)]
+    ArtifactHeaders {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Start a new session, then exec the command (Darwin has setsid(2) but
     /// no setsid(1)). Internal: used by the remote build launcher.
     #[cfg(unix)]
@@ -286,6 +293,9 @@ fn main() -> Result<()> {
     if let Commands::RecoveryReserve { arguments } = &cli.command {
         std::process::exit(recovery_reserve::main(arguments));
     }
+    if let Commands::ArtifactHeaders { arguments } = &cli.command {
+        std::process::exit(artifact_headers::main(arguments));
+    }
     if let Commands::FileSync { arguments } = &cli.command {
         std::process::exit(file_sync::main(arguments));
     }
@@ -368,6 +378,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
+        Commands::ArtifactHeaders { .. } => {
+            anyhow::bail!("artifact-headers requires the synchronous worker entry point")
+        }
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
         Commands::RecoveryReserve { .. } => {
             anyhow::bail!("recovery-reserve requires the synchronous worker entry point")

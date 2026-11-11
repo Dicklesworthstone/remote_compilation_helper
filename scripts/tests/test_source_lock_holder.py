@@ -819,8 +819,9 @@ class SourceLockHolderTests(unittest.TestCase):
             name = "executable-{:04}-{}".format(index, "x" * 100)
             os.link(header, source / name)
             paths.append(name)
-        payload = json.dumps([str(source), None, paths], separators=(",", ":")).encode().hex()
-        command = ARTIFACT_HEADER_TEMPLATE.replace("{payload}", payload)
+        payload = json.dumps([str(source), None, paths], separators=(",", ":"))
+        command = ("RCH_WKR_BIN=" + shlex.quote(WORKER) + "; export RCH_WKR_BIN;\n"
+                   + ARTIFACT_HEADER_TEMPLATE.replace("{locate}", LOCATOR).replace("{payload}", payload))
         script, _ = self.bounded_activity_script(registry, command, 800)
         started = time.monotonic()
         process = self.start_finite_activity(script)
