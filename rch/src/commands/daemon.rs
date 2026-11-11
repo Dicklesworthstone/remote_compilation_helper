@@ -1397,8 +1397,10 @@ async fn verify_force_target(lease: &MaintenanceLease) -> Result<()> {
         "daemon status was not acknowledged"
     );
     let json = extract_json_body(&response).context("daemon status is incomplete")?;
+    // Wrong-typed fields can make Serde echo the complete untrusted value.
+    // Force-stop diagnostics must not disclose response bytes or grow with it.
     let status: crate::status_types::DaemonFullStatusResponse =
-        serde_json::from_str(json).context("daemon status is malformed")?;
+        serde_json::from_str(json).map_err(|_| anyhow::anyhow!("daemon status is malformed"))?;
     anyhow::ensure!(
         status.daemon.pid == process.pid && Path::new(&status.daemon.socket_path) == lease.path,
         "daemon status does not match the original kernel peer and configured socket"
@@ -1422,7 +1424,13 @@ async fn terminate_daemon_process(lease: &MaintenanceLease) -> Result<()> {
         "refusing unsafe daemon PID {}",
         lease.process.pid
     );
-    force_stop::stop(&lease.path, &lease.process, &lease.fence.daemon_incarnation).await
+    force_stop::stop(
+        &lease.path,
+        lease.process.pid,
+        &lease.process.identity,
+        &lease.fence.daemon_incarnation,
+    )
+    .await
 }
 
 fn report_stopped(
