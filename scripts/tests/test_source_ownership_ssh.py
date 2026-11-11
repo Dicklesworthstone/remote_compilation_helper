@@ -38,11 +38,15 @@ REPO = Path(__file__).resolve().parents[2]
 WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
 LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
     'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
-HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
+HOLDER = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+          + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n"
+          + (REPO / "rch/src/hook/source_lock_holder.sh").read_text())
 CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
 SETTLEMENT = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
-WAITER = SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+WAITER = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+          + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n"
+          + SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0])
 PAIR_CUSTODY = SSH_SOURCE.split('const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
 # Decode Rust's existing literal, including escaped-newline continuation. The
 # shell check itself is not a fixture implementation of the ownership rules.
@@ -385,7 +389,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
         return client
 
     def start_holder(self, idle=2, ready=True, acquire_command=None):
-        waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, "source",
+        waiter = shlex.join(["sh", "-c", WAITER, "rch-source-release", "source",
                              str(self.registry), self.token, self.digest, self.release])
         retirement = shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " + self.invocation("release")
         terminal = ("set -eu; ready=$1; roots=$(cat <&4); exec 4<&-; "
@@ -529,7 +533,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
         token = token or self.token
         release = "RCH_SOURCE_PAIR_RELEASE:" + token
         ready_marker = "RCH_SOURCE_PAIR_READY:" + token
-        waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, mode,
+        waiter = shlex.join(["sh", "-c", WAITER, "rch-source-release", mode,
                              str(self.registry), token, str(self.source), release])
         after = ("\nprintf '%s\\n' " + QUOTE(ready_marker) + "\n" + waiter + "\n" +
                  self.pair_program("release", self.source, token) +

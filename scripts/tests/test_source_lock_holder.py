@@ -32,7 +32,7 @@ LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
     'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
 HOLDER = LOCATOR + "\n" + (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
-RELEASE_WAITER = SSH_SOURCE.split(
+RELEASE_WAITER = LOCATOR + "\n" + SSH_SOURCE.split(
     'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
 PAIR_CUSTODY = SSH_SOURCE.split(
     'const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
@@ -1334,9 +1334,9 @@ class SourceLockHolderTests(unittest.TestCase):
         # Success here means only that the exact request was read: no fixture
         # manufactures a durable release receipt or an acknowledgment.
         terminal = ('set -eu; exec 4<&-; printf "%s\\n" "$1"; '
-                    'shift; exec python3 -I -S -c "$@"')
+                    'shift; exec sh -c "$@"')
         holder = self.start([("x", lock)], terminal=terminal,
-                            args=(RELEASE_WAITER, mode, str(registry), token,
+                            args=(RELEASE_WAITER, "rch-source-release", mode, str(registry), token,
                                   str(binding), release), session_idle=session_idle)
         self.assertEqual(holder.line(), b"READY")
         return holder, lock, release

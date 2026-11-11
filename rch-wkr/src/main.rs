@@ -14,6 +14,7 @@ mod recovery_reserve;
 mod result_probe;
 mod source_claim_link;
 mod source_lock;
+mod source_release;
 mod source_retain;
 mod source_verifier;
 mod toolchain;
@@ -104,6 +105,12 @@ enum Commands {
     SourceClaimLink {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Internal cancellation observation and exact source-lock release framing.
+    #[command(hide = true)]
+    SourceRelease {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
     },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
@@ -351,6 +358,9 @@ fn main() -> Result<()> {
     if let Commands::SourceClaimLink { arguments } = &cli.command {
         std::process::exit(source_claim_link::main(arguments));
     }
+    if let Commands::SourceRelease { arguments } = &cli.command {
+        std::process::exit(source_release::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -454,6 +464,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceClaimLink { .. } => {
             anyhow::bail!("source-claim-link requires the synchronous worker entry point")
+        }
+        Commands::SourceRelease { .. } => {
+            anyhow::bail!("source-release requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

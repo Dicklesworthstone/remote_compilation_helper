@@ -231,175 +231,17 @@ const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/var/tmp/rch-source-authority-lo
 // The heartbeat supervisor remains responsible for transport liveness; this
 // waiter only relinquishes kernel locks for this exact cancelled invocation.
 const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"
-import fcntl
-import hashlib
-import os
-import re
-import select
-import stat
-import sys
-
-LIMIT = 32 * 1024 * 1024
-
-def canonical_root(root):
-    return (root.startswith(b"/") and not any(c in root for c in (0, 10, 13))
-            and (root == b"/" or not root.endswith(b"/"))
-            and all(part not in (b"", b".", b"..") for part in root.split(b"/")[1:]
-                    if root != b"/"))
-
-def record(directory, name, digest):
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-    try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT:
-            raise ValueError("invalid cancellation record")
-        with os.fdopen(fd, "rb", closefd=False) as source:
-            content = source.read(LIMIT + 1)
-        after = os.fstat(fd)
-        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if (not os.path.samestat(before, after) or not os.path.samestat(after, named)
-                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                or len(content) != before.st_size or not content.endswith(b"\n")
-                or hashlib.sha256(content).hexdigest() != digest):
-            raise ValueError("changed cancellation record")
-        roots = content[:-1].split(b"\n")
-        if not all(canonical_root(root) for root in roots):
-            raise ValueError("invalid cancellation roots")
-        content.decode("utf-8")
-        return content, roots
-    finally:
-        os.close(fd)
-
-def cancelled(registry, token, mode, selector):
-    descriptors = []
-    try:
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-        directory = os.open(registry, directory_flags)
-        descriptors.append(directory)
-        mutex = os.open("metadata.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                        dir_fd=directory)
-        descriptors.append(mutex)
-        # Never wait under the source locks for an activity mutex. A coherent
-        # metadata snapshot needs only this nonblocking shared registry lock;
-        # cancellation publishes its fence after draining normal activity.
-        fcntl.flock(mutex, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        mutex_stat = os.fstat(mutex)
-        if (not stat.S_ISREG(mutex_stat.st_mode)
-                or not os.path.samestat(mutex_stat, os.stat(
-                    "metadata.lock", dir_fd=directory, follow_symlinks=False))):
-            return False
-        places = {"": directory}
-        fd = os.open("cancelled", directory_flags, dir_fd=directory)
-        descriptors.append(fd)
-        places["cancelled"] = fd
-        listings = {}
-        if mode == "source":
-            # Healthy source holders need only two name lookups, regardless
-            # of how many other jobs have retained terminal receipts.
-            found = False
-            for place, extension in (("", "cancelling"), ("cancelled", "claim")):
-                try:
-                    os.stat(token + "." + selector + "." + extension,
-                            dir_fd=places[place], follow_symlinks=False)
-                    found = True
-                except FileNotFoundError:
-                    pass
-            if not found:
-                return False
-        else:
-            # A pair can precede source admission and therefore does not yet
-            # know the digest. Discover only its cancellation candidate first.
-            listings = {place: os.listdir(fd) for place, fd in places.items()}
-            if not any(name.startswith(token + ".") and name.endswith(extension)
-                       for place, extension in (("", ".cancelling"), ("cancelled", ".claim"))
-                       for name in listings[place]):
-                return False
-        for place in ("released", "quarantine"):
-            fd = os.open(place, directory_flags, dir_fd=directory)
-            descriptors.append(fd)
-            places[place] = fd
-        records = {}
-        digests = set()
-        for place, fd in places.items():
-            for name in listings[place] if place in listings else os.listdir(fd):
-                if not name.startswith(token + ".") or not name.endswith(
-                        (".claim", ".pending", ".cancelling")):
-                    continue
-                match = re.fullmatch(re.escape(token) + r"\.([a-f0-9]{64})\.(claim|pending|cancelling)", name)
-                if match is None or (place, match[2]) in records:
-                    return False
-                digests.add(match[1])
-                records[place, match[2]] = (fd, name)
-        if len(digests) != 1:
-            return False
-        digest = next(iter(digests))
-        if mode == "source" and digest != selector:
-            return False
-        # Active ownership stays as the overlap fence through cleanup. An
-        # already terminal cancellation may retain its matching cancelling
-        # marker. Pending, released, quarantined or conflicting state is not
-        # permission to hand off even these transient locks.
-        keys = set(records)
-        if keys not in ({("", "claim"), ("", "cancelling")},
-                        {("cancelled", "claim")},
-                        {("cancelled", "claim"), ("", "cancelling")}):
-            return False
-        expected = None
-        for fd, name in records.values():
-            content, roots = record(fd, name, digest)
-            if expected is not None and content != expected:
-                return False
-            if mode == "pair" and os.fsencode(selector) not in roots:
-                return False
-            expected = content
-        return (os.path.samestat(os.fstat(directory), os.stat(registry, follow_symlinks=False))
-                and os.path.samestat(mutex_stat, os.stat(
-                    "metadata.lock", dir_fd=directory, follow_symlinks=False)))
-    except (OSError, ValueError):
-        # Ambiguity grants no handoff. Keep waiting for explicit retirement or
-        # a later valid fence; do not repair, delete or acknowledge any record.
-        return False
-    finally:
-        for fd in reversed(descriptors):
-            os.close(fd)
-
-try:
-    mode, registry, token, selector, release = sys.argv[1:]
-    if (mode not in ("source", "pair", "cleanup-pair")
-            or re.fullmatch(r"[a-f0-9-]{1,128}", token) is None):
-        raise ValueError("invalid source release identity or mode")
-    if mode == "source":
-        if re.fullmatch(r"[a-f0-9]{64}", selector) is None:
-            raise ValueError("invalid source release digest")
-        prefix = "RCH_SOURCE_AUTHORITY_RELEASE:"
-    else:
-        if not canonical_root(os.fsencode(selector)):
-            raise ValueError("invalid source pair root")
-        prefix = "RCH_SOURCE_PAIR_RELEASE:"
-    if release != prefix + token:
-        raise ValueError("invalid source release request")
-    expected = (release + "\n").encode("ascii")
-    incoming = bytearray()
-    requester = select.poll()
-    requester.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
-    while True:
-        if mode != "cleanup-pair" and cancelled(registry, token, mode, selector):
-            print("RCH: source invocation cancelled; yielding kernel locks without retiring ownership",
-                  file=sys.stderr)
-            sys.exit(75)
-        if requester.poll(250):
-            chunk = os.read(0, 4096)
-            if not chunk:
-                raise ValueError("source release requester disconnected before retirement")
-            incoming.extend(chunk)
-            if not expected.startswith(incoming):
-                raise ValueError("unexpected source release input")
-            if incoming == expected:
-                sys.exit(0)
-except (OSError, ValueError) as error:
-    print("RCH: source release wait failed: {}".format(error), file=sys.stderr)
-    sys.exit(73)
+set -eu
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH: source release wait failed: rch-wkr is not installed on this worker' >&2
+    exit 73
+fi
+if ! rch_release_probe=$("$RCH_WKR" source-release probe </dev/null) \
+    || [ "$rch_release_probe" != 'rch-wkr source-release v1' ]; then
+    printf '%s\n' 'RCH: source release wait failed: deploy the matching rch-wkr with source-release support' >&2
+    exit 73
+fi
+exec "$RCH_WKR" source-release wait "$@"
 "#;
 // Every caller holds the pair flock; claim additionally holds the registry
 // metadata mutex after checking its cancellation fences. Private same-directory
@@ -1477,9 +1319,19 @@ fn source_release_waiter_command(
     release: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let waiter = format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        SOURCE_AUTHORITY_RELEASE_WAITER,
+    );
+    #[cfg(test)]
+    let waiter = format!("{}{waiter}", test_worker_default());
+    // The waiter must return to this terminal: only the terminal may retire
+    // durable ownership and acknowledge release after a successful wait.
+    // Its fresh child shell receives the locator without consuming stdin.
     format!(
-        "python3 -I -S -c {waiter} {mode} {registry} {identity} {selector} {release}",
-        waiter = quote(SOURCE_AUTHORITY_RELEASE_WAITER),
+        "sh -c {waiter} rch-source-release {mode} {registry} {identity} {selector} {release}",
+        waiter = quote(&waiter),
         mode = quote(mode),
         registry = quote(registry),
         identity = quote(identity),
@@ -3222,6 +3074,236 @@ mod tests {
                     )
                 })
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    mod native_source_release_waiter {
+        use super::super::source_release_waiter_command;
+        use std::fs;
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Output, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Fixture {
+            root: PathBuf,
+            registry: PathBuf,
+            pair_root: PathBuf,
+            tools: PathBuf,
+            content: Vec<u8>,
+            digest: String,
+            token: &'static str,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                use sha2::{Digest as _, Sha256};
+
+                let root = super::source_lock_test_dir();
+                let registry = root.join("registry ' $HOME; $(false) `false` α");
+                for directory in [
+                    registry.clone(),
+                    registry.join("cancelled"),
+                    registry.join("released"),
+                    registry.join("quarantine"),
+                ] {
+                    fs::create_dir(&directory).unwrap();
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let mutex = registry.join("metadata.lock");
+                fs::write(&mutex, b"").unwrap();
+                fs::set_permissions(&mutex, fs::Permissions::from_mode(0o600)).unwrap();
+                let pair_root = root.join("source ' $HOME; $(false) `false` α");
+                fs::create_dir(&pair_root).unwrap();
+                let content = format!("{}\n", pair_root.display()).into_bytes();
+                let digest = Sha256::digest(&content)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let tools = root.join("native-only-tools");
+                fs::create_dir(&tools).unwrap();
+                symlink("/bin/sh", tools.join("sh")).unwrap();
+                Self {
+                    root,
+                    registry,
+                    pair_root,
+                    tools,
+                    content,
+                    digest,
+                    token: "aa-123",
+                }
+            }
+
+            fn release(&self, mode: &str) -> String {
+                let kind = if mode == "source" {
+                    "AUTHORITY"
+                } else {
+                    "PAIR"
+                };
+                format!("RCH_SOURCE_{kind}_RELEASE:{}", self.token)
+            }
+
+            fn retirement(&self) -> PathBuf {
+                self.root.join("retirement reached")
+            }
+
+            fn cancel(&self) -> (PathBuf, PathBuf) {
+                let stem = format!("{}.{}", self.token, self.digest);
+                let claim = self.registry.join(format!("{stem}.claim"));
+                let fence = self.registry.join(format!("{stem}.cancelling"));
+                fs::write(&claim, &self.content).unwrap();
+                fs::set_permissions(&claim, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::hard_link(&claim, &fence).unwrap();
+                (claim, fence)
+            }
+
+            fn run(&self, mode: &str, input: Option<&[u8]>, worker: &Path) -> Output {
+                let release = self.release(mode);
+                let selector = if mode == "source" {
+                    &self.digest
+                } else {
+                    self.pair_root.to_str().unwrap()
+                };
+                let waiter = source_release_waiter_command(
+                    mode,
+                    self.registry.to_str().unwrap(),
+                    self.token,
+                    selector,
+                    &release,
+                );
+                // This is the real caller boundary: set -e gates retirement
+                // and the terminal's acknowledgement on the child waiter's
+                // successful return. The marker represents that continuation,
+                // not a fixture-produced durable ownership receipt.
+                let terminal = format!(
+                    "set -eu; {waiter}; printf 'retired\\n' > {}; printf '%s\\n' {}",
+                    shell_escape::escape(self.retirement().to_string_lossy()),
+                    shell_escape::escape(release.into()),
+                );
+                let mut child = Command::new("/bin/sh")
+                    .args(["-c", &terminal])
+                    .env("PATH", &self.tools)
+                    .env("RCH_WKR_BIN", worker)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                if let Some(bytes) = input {
+                    let mut stdin = child.stdin.take().unwrap();
+                    stdin.write_all(bytes).unwrap();
+                }
+                // Keep stdin open for cancellation and worker-refusal controls
+                // so EOF cannot accidentally account for their exit status.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        drop(child.stdin.take());
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("release waiter did not finish: {output:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                child.wait_with_output().unwrap()
+            }
+        }
+
+        #[test]
+        fn exact_release_returns_to_terminal_with_literal_paths() {
+            let worker = rch_common::testing::worker_binary();
+            for mode in ["source", "pair", "cleanup-pair"] {
+                let fixture = Fixture::new();
+                let frame = format!("{}\n", fixture.release(mode));
+                let output = fixture.run(mode, Some(frame.as_bytes()), &worker);
+                assert!(output.status.success(), "mode={mode}: {output:?}");
+                assert_eq!(output.stdout, frame.as_bytes());
+                assert!(output.stderr.is_empty(), "{output:?}");
+                assert_eq!(fs::read(fixture.retirement()).unwrap(), b"retired\n");
+            }
+        }
+
+        #[test]
+        fn cancellation_stops_retirement_while_cleanup_accepts_explicit_release() {
+            let worker = rch_common::testing::worker_binary();
+            for mode in ["source", "pair"] {
+                let fixture = Fixture::new();
+                let (claim, fence) = fixture.cancel();
+                let inode = fs::metadata(&claim).unwrap().ino();
+                let output = fixture.run(mode, None, &worker);
+                assert_eq!(output.status.code(), Some(75), "mode={mode}: {output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!fixture.retirement().exists());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled"));
+
+                let frame = format!("{}\n", fixture.release("cleanup-pair"));
+                let cleanup = fixture.run("cleanup-pair", Some(frame.as_bytes()), &worker);
+                assert!(cleanup.status.success(), "{cleanup:?}");
+                assert_eq!(cleanup.stdout, frame.as_bytes());
+                assert_eq!(fs::read(fixture.retirement()).unwrap(), b"retired\n");
+                for record in [claim, fence] {
+                    assert_eq!(fs::read(&record).unwrap(), fixture.content);
+                    let metadata = fs::metadata(record).unwrap();
+                    assert_eq!(metadata.ino(), inode);
+                    assert_eq!(metadata.nlink(), 2);
+                }
+            }
+        }
+
+        #[test]
+        fn malformed_or_incomplete_release_never_retires_or_acknowledges() {
+            let worker = rch_common::testing::worker_binary();
+            for input in [
+                "",
+                "RCH_SOURCE_AUTHORITY_RELEASE:aa-123",
+                "RCH_SOURCE_AUTHORITY_RELEASE:wrong\n",
+                "RCH_SOURCE_AUTHORITY_RELEASE:aa-123\ntrailing\n",
+            ] {
+                let fixture = Fixture::new();
+                let output = fixture.run("source", Some(input.as_bytes()), &worker);
+                assert_eq!(
+                    output.status.code(),
+                    Some(73),
+                    "input={input:?}: {output:?}"
+                );
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!fixture.retirement().exists());
+            }
+        }
+
+        #[test]
+        fn matching_worker_is_required_before_waiting_or_retiring() {
+            for probe in [
+                None,
+                Some("exit 2"),
+                Some("printf '%s\\n' 'rch-wkr source-release v0'"),
+                Some("printf '%s\\n' 'rch-wkr source-release v1' 'surplus'"),
+                Some("printf '%s\\n' 'rch-wkr source-release v1'; exit 9"),
+            ] {
+                let fixture = Fixture::new();
+                let worker = fixture.root.join("worker ' wrong");
+                let reached_wait = fixture.root.join("unexpected wait");
+                if let Some(probe) = probe {
+                    let script = format!(
+                        "#!/bin/sh\nif [ \"$2\" = probe ]; then {probe}; exit $?; fi\nprintf called > {}; exit 98\n",
+                        shell_escape::escape(reached_wait.to_string_lossy()),
+                    );
+                    fs::write(&worker, script).unwrap();
+                    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let output = fixture.run("source", None, &worker);
+                assert_eq!(
+                    output.status.code(),
+                    Some(73),
+                    "probe={probe:?}: {output:?}"
+                );
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!fixture.retirement().exists());
+                assert!(!reached_wait.exists());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("release wait failed"));
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
