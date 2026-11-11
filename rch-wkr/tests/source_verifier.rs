@@ -151,6 +151,16 @@ fn refusal_frames_preserve_status_and_never_publish_partial_verification() {
         (row("../outside", b"data", "0"), "1", "4", 62, "unsafe_path"),
         (valid.clone(), "2", "4", 67, "count:1"),
         (valid.clone(), "1", "5", 68, "bytes:4"),
+        (valid.clone(), "1", "3", 68, "bytes:source"),
+        (valid.replace("\t4\t", "\t5\t"), "1", "4", 64, "size:source"),
+        (
+            valid.clone() + &row("source", b"data", "L"),
+            "2",
+            "8",
+            63,
+            "not_symlink:source",
+        ),
+        (valid.clone() + &valid, "2", "8", 69, "read_or_manifest"),
         (valid.trim_end().to_owned(), "1", "4", 67, "count"),
         (valid, "01", "4", 69, "read_or_manifest"),
     ] {

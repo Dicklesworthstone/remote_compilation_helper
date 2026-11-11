@@ -42,6 +42,13 @@ fn malformed() -> Failure {
 /// Run before the async runtime starts. The manifest is finite stdin data,
 /// never an exec argument; paths containing shell syntax stay literal.
 pub(crate) fn main(arguments: &[String]) -> i32 {
+    if !cfg!(unix) {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "RCH_SOURCE_CONTENT_ERROR:platform_unsupported"
+        );
+        return 69;
+    }
     if arguments == ["probe"] {
         return if writeln!(std::io::stdout().lock(), "{PROBE_REPLY}").is_ok() {
             0
@@ -107,7 +114,6 @@ fn entries(payload: &[u8], expected_count: usize) -> Result<Vec<Entry<'_>>, Fail
     if lines.len() != expected_count {
         return Err(refused(67, "count", &lines.len().to_string()));
     }
-    let mut paths = std::collections::HashSet::with_capacity(lines.len());
     lines
         .into_iter()
         .map(|line| {
@@ -134,7 +140,6 @@ fn entries(payload: &[u8], expected_count: usize) -> Result<Vec<Entry<'_>>, Fail
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 || !matches!(kind, "0" | "1" | "L")
-                || !paths.insert(path)
             {
                 return Err(malformed());
             }
@@ -150,6 +155,17 @@ fn entries(payload: &[u8], expected_count: usize) -> Result<Vec<Entry<'_>>, Fail
 
 #[cfg(unix)]
 fn verify(root: &Path, count: usize, total: u64, input: impl Read) -> Result<(), Failure> {
+    verify_with(root, count, total, input, |_, _| Ok(()))
+}
+
+#[cfg(unix)]
+fn verify_with(
+    root: &Path,
+    count: usize,
+    total: u64,
+    input: impl Read,
+    observe: impl FnMut(imp::Observation, &str) -> Result<(), Failure>,
+) -> Result<(), Failure> {
     if count > MAX_FILES || total > MAX_BYTES || !root.is_absolute() {
         return Err(malformed());
     }
@@ -168,7 +184,7 @@ fn verify(root: &Path, count: usize, total: u64, input: impl Read) -> Result<(),
             remaining.checked_sub(entry.bytes)
         })
         .ok_or_else(malformed)?;
-    imp::verify(root, &entries, total)
+    imp::verify_with(root, &entries, total, observe)
 }
 
 #[cfg(not(unix))]
@@ -182,6 +198,15 @@ mod imp {
     use rustix::fd::{AsFd, OwnedFd};
     use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags, Stat};
     use sha2::{Digest as _, Sha256};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Observation {
+        BeforeParentOpen,
+        BeforeFileOpen,
+        AfterFileRead,
+        AfterSymlinkRead,
+        BeforeResponse,
+    }
 
     fn same_inode(left: &Stat, right: &Stat) -> bool {
         left.st_dev == right.st_dev && left.st_ino == right.st_ino
@@ -201,7 +226,7 @@ mod imp {
     }
 
     fn directory_flags() -> OFlags {
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
     }
 
     fn named(parent: impl AsFd, name: &str) -> Result<Stat, Failure> {
@@ -242,14 +267,31 @@ mod imp {
         hex == expected
     }
 
-    fn verify_entry(root: &OwnedFd, entry: &Entry<'_>) -> Result<u64, Failure> {
+    fn verify_entry(
+        root: &OwnedFd,
+        entry: &Entry<'_>,
+        remaining_bytes: u64,
+        observe: &mut impl FnMut(Observation, &str) -> Result<(), Failure>,
+    ) -> Result<u64, Failure> {
         let parts: Vec<_> = entry.path.split('/').collect();
         let name = parts.last().ok_or_else(malformed)?;
         let mut parents: Vec<OwnedFd> = Vec::new();
         for part in &parts[..parts.len() - 1] {
             let parent = parents.last().unwrap_or(root);
+            let before =
+                named(parent, part).map_err(|_| refused(63, "not_directory", entry.path))?;
+            if FileType::from_raw_mode(before.st_mode) != FileType::Directory {
+                return Err(refused(63, "not_directory", entry.path));
+            }
+            observe(Observation::BeforeParentOpen, entry.path)?;
             let child = rustix::fs::openat(parent, *part, directory_flags(), Mode::empty())
                 .map_err(|_| refused(63, "not_directory", entry.path))?;
+            let opened = rustix::fs::fstat(&child).map_err(|_| malformed())?;
+            if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+                || !same_inode(&before, &opened)
+            {
+                return Err(refused(69, "parent_changed", entry.path));
+            }
             parents.push(child);
         }
         let parent = parents.last().unwrap_or(root);
@@ -275,10 +317,12 @@ mod imp {
             check_link_target(entry.path, target.as_bytes())?;
             bytes = target.as_bytes().len() as u64;
             hasher.update(target.as_bytes());
+            observe(Observation::AfterSymlinkRead, entry.path)?;
         } else {
             if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
                 return Err(refused(63, "not_regular", entry.path));
             }
+            observe(Observation::BeforeFileOpen, entry.path)?;
             let fd = rustix::fs::openat(
                 parent,
                 *name,
@@ -295,18 +339,31 @@ mod imp {
                 return Err(refused(69, "changed", entry.path));
             }
             let mut file = std::fs::File::from(fd);
-            let mut limited = (&mut file).take(entry.bytes + 1);
+            // One byte beyond the smaller admitted denominator proves the
+            // mismatch without hashing the rest of an unexpectedly large file.
+            let mut limited = (&mut file).take(entry.bytes.min(remaining_bytes) + 1);
             let mut buffer = [0_u8; 64 * 1024];
             let mut read_bytes = 0_u64;
             loop {
-                let read = limited.read(&mut buffer).map_err(|_| malformed())?;
+                let read = match limited.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(malformed()),
+                };
                 if read == 0 {
                     break;
                 }
                 read_bytes += read as u64;
+                if read_bytes > entry.bytes {
+                    return Err(refused(64, "size", entry.path));
+                }
+                if read_bytes > remaining_bytes {
+                    return Err(refused(68, "bytes", entry.path));
+                }
                 hasher.update(&buffer[..read]);
             }
             bytes = read_bytes;
+            observe(Observation::AfterFileRead, entry.path)?;
             if !same_generation(&before, &rustix::fs::fstat(&file).map_err(|_| malformed())?) {
                 return Err(refused(69, "changed", entry.path));
             }
@@ -314,16 +371,23 @@ mod imp {
         if bytes != entry.bytes {
             return Err(refused(64, "size", entry.path));
         }
+        if bytes > remaining_bytes {
+            return Err(refused(68, "bytes", entry.path));
+        }
         if !hash_matches(hasher, entry.hash) {
             return Err(refused(65, "sha256", entry.path));
         }
         if entry.kind != "L" {
-            let executable =
-                match rustix::fs::accessat(parent, *name, Access::EXEC_OK, AtFlags::EACCESS) {
-                    Ok(()) => true,
-                    Err(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) => false,
-                    Err(_) => return Err(malformed()),
-                };
+            let executable = match rustix::fs::accessat(
+                parent,
+                *name,
+                Access::EXEC_OK,
+                AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(()) => true,
+                Err(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) => false,
+                Err(_) => return Err(malformed()),
+            };
             if executable != (entry.kind == "1") {
                 return Err(refused(66, "mode", entry.path));
             }
@@ -344,13 +408,18 @@ mod imp {
                     &rustix::fs::fstat(child).map_err(|_| malformed())?,
                 )
             {
-                return Err(refused(63, "not_directory", entry.path));
+                return Err(refused(69, "parent_changed", entry.path));
             }
         }
         Ok(bytes)
     }
 
-    pub(super) fn verify(path: &Path, entries: &[Entry<'_>], total: u64) -> Result<(), Failure> {
+    pub(super) fn verify_with(
+        path: &Path,
+        entries: &[Entry<'_>],
+        total: u64,
+        mut observe: impl FnMut(Observation, &str) -> Result<(), Failure>,
+    ) -> Result<(), Failure> {
         // Only the explicitly selected root may be an alias (e.g. /tmp on
         // Darwin). Every component below it is descriptor-relative/no-follow.
         let resolved = path.canonicalize().map_err(|_| malformed())?;
@@ -359,30 +428,46 @@ mod imp {
         let identity = rustix::fs::fstat(&root).map_err(|_| malformed())?;
         let check_root = || {
             let current = rustix::fs::stat(path).map_err(|_| malformed())?;
-            if !same_inode(&identity, &current) {
+            if FileType::from_raw_mode(current.st_mode) != FileType::Directory
+                || !same_inode(&identity, &current)
+            {
                 return Err(refused(69, "root_changed", ""));
             }
             Ok(())
         };
         check_root()?;
         let mut bytes = 0_u64;
+        let mut paths = std::collections::HashSet::with_capacity(entries.len());
         for entry in entries {
-            bytes = bytes
-                .checked_add(verify_entry(&root, entry)?)
-                .ok_or_else(malformed)?;
+            check_root()?;
+            let remaining_bytes = total
+                .checked_sub(bytes)
+                .ok_or_else(|| refused(68, "bytes", &bytes.to_string()))?;
+            let entry_bytes = verify_entry(&root, entry, remaining_bytes, &mut observe)?;
+            // Keep the established entry-type/byte refusal when a malformed
+            // row also repeats an earlier path. Valid duplicate rows still
+            // cannot contribute to the denominator or authorize a receipt.
+            if !paths.insert(entry.path) {
+                return Err(malformed());
+            }
+            check_root()?;
+            bytes = bytes.checked_add(entry_bytes).ok_or_else(malformed)?;
         }
-        check_root()?;
         if bytes != total {
             return Err(refused(68, "bytes", &bytes.to_string()));
         }
+        observe(Observation::BeforeResponse, "")?;
+        check_root()?;
         Ok(())
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::imp::Observation;
     use super::*;
     use sha2::{Digest as _, Sha256};
+    use std::fs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     fn fixture() -> tempfile::TempDir {
@@ -400,6 +485,13 @@ mod tests {
             write!(hash, "{byte:02x}").unwrap();
         }
         format!("{hash}\t{}\t{kind}\t{path}\n", content.len())
+    }
+
+    fn file(root: &Path, name: &str, bytes: &[u8], mode: u32) {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
@@ -458,6 +550,7 @@ mod tests {
             (valid.clone(), 1, 7, 68),
             (valid.trim_end().to_owned(), 1, 6, 67),
             (valid.clone() + &valid, 2, 12, 69),
+            (valid.clone() + &row("source", b"source", "L"), 2, 12, 63),
             (row("../source", b"source", "0"), 1, 6, 62),
         ] {
             assert_eq!(
@@ -467,6 +560,201 @@ mod tests {
                 code,
                 "{manifest:?}"
             );
+        }
+    }
+
+    #[test]
+    fn byte_denominator_stops_before_finishing_an_overrun_or_opening_later_rows() {
+        let root = fixture();
+        file(root.path(), "first", b"abc", 0o644);
+        file(root.path(), "overrun", b"defgh", 0o644);
+        file(root.path(), "later", b"later bytes", 0o644);
+        let payload = row("first", b"abc", "0")
+            + &row("overrun", b"defgh", "0")
+            + &row("later", b"later bytes", "0");
+        let mut opened = Vec::new();
+        let mut finished = Vec::new();
+        let error = verify_with(root.path(), 3, 4, payload.as_bytes(), |point, relative| {
+            if point == Observation::BeforeFileOpen {
+                opened.push(relative.to_owned());
+            }
+            if point == Observation::AfterFileRead {
+                finished.push(relative.to_owned());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, 68);
+        assert_eq!(error.reason, "bytes:overrun");
+        assert_eq!(opened, ["first", "overrun"]);
+        assert_eq!(finished, ["first"]);
+
+        // A declared row size above the aggregate budget is still a size
+        // mismatch if the actual file ends within the admitted byte total.
+        let wrong_size = row("first", b"abc", "0").replace("\t3\t", "\t4\t");
+        assert_eq!(
+            verify(root.path(), 1, 3, wrong_size.as_bytes())
+                .unwrap_err()
+                .code,
+            64
+        );
+    }
+
+    #[test]
+    fn verifies_both_prefix_orders_and_selected_dependency_bytes() {
+        let root = fixture();
+        let mut rows = Vec::new();
+        for (name, bytes) in [
+            ("src-extra/input", b"extra".as_slice()),
+            ("src/input", b"plain".as_slice()),
+            ("node_modules/pinned", b"selected".as_slice()),
+        ] {
+            file(root.path(), name, bytes, 0o644);
+            rows.push(row(name, bytes, "0"));
+        }
+        for reverse in [false, true] {
+            if reverse {
+                rows.reverse();
+            }
+            verify(root.path(), 3, 18, rows.concat().as_bytes()).unwrap();
+        }
+        fs::write(root.path().join("node_modules/pinned"), b"modified").unwrap();
+        assert_eq!(
+            verify(root.path(), 3, 18, rows.concat().as_bytes())
+                .unwrap_err()
+                .code,
+            65
+        );
+    }
+
+    #[test]
+    fn effective_execute_check_does_not_use_an_any_mode_bit_shortcut() {
+        let root = fixture();
+        // Owners cannot borrow an execute bit granted only to others. Root
+        // instead has the kernel's special any-execute-bit rule.
+        file(root.path(), "input", b"abc", 0o641);
+        let expected = if rustix::process::geteuid().is_root() {
+            "1"
+        } else {
+            "0"
+        };
+        verify(root.path(), 1, 3, row("input", b"abc", expected).as_bytes()).unwrap();
+        let wrong = if expected == "1" { "0" } else { "1" };
+        assert_eq!(
+            verify(root.path(), 1, 3, row("input", b"abc", wrong).as_bytes())
+                .unwrap_err()
+                .code,
+            66
+        );
+    }
+
+    #[test]
+    fn refuses_parent_and_file_replacement_before_open() {
+        for event in [Observation::BeforeParentOpen, Observation::BeforeFileOpen] {
+            let root = fixture();
+            file(root.path(), "parent/input", b"abc", 0o644);
+            let payload = row("parent/input", b"abc", "0");
+            let mut changed = false;
+            let result = verify_with(root.path(), 1, 3, payload.as_bytes(), |point, _| {
+                if point == event && !changed {
+                    let old = if event == Observation::BeforeParentOpen {
+                        "parent"
+                    } else {
+                        "parent/input"
+                    };
+                    fs::rename(root.path().join(old), root.path().join("retained")).unwrap();
+                    file(root.path(), "parent/input", b"abc", 0o644);
+                    changed = true;
+                }
+                Ok(())
+            });
+            assert!(changed);
+            assert_eq!(result.unwrap_err().code, 69, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_file_replacement_content_and_mode_changes_after_read() {
+        for mutation in ["replace", "bytes", "mode"] {
+            let root = fixture();
+            file(root.path(), "input", b"abc", 0o644);
+            let payload = row("input", b"abc", "0");
+            let mut changed = false;
+            let result = verify_with(root.path(), 1, 3, payload.as_bytes(), |point, _| {
+                if point == Observation::AfterFileRead {
+                    match mutation {
+                        "replace" => {
+                            fs::rename(root.path().join("input"), root.path().join("retained"))
+                                .unwrap();
+                            file(root.path(), "input", b"abc", 0o644);
+                        }
+                        "bytes" => {
+                            fs::write(root.path().join("input"), b"longer contents").unwrap()
+                        }
+                        "mode" => fs::set_permissions(
+                            root.path().join("input"),
+                            fs::Permissions::from_mode(0o744),
+                        )
+                        .unwrap(),
+                        _ => unreachable!(),
+                    }
+                    changed = true;
+                }
+                Ok(())
+            });
+            assert!(changed);
+            assert_eq!(result.unwrap_err().code, 69, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn refuses_rebound_ancestors_roots_and_symlinks_before_receipt() {
+        for mutation in ["parent", "root", "link", "final-root"] {
+            let temp = fixture();
+            let root = temp.path().join("source");
+            file(&root, "parent/input", b"abc", 0o644);
+            symlink("input", root.join("parent/link")).unwrap();
+            let payload = if mutation == "link" {
+                row("parent/link", b"input", "L")
+            } else {
+                row("parent/input", b"abc", "0")
+            };
+            let mut changed = false;
+            let event = match mutation {
+                "link" => Observation::AfterSymlinkRead,
+                "final-root" => Observation::BeforeResponse,
+                _ => Observation::AfterFileRead,
+            };
+            let result = verify_with(
+                &root,
+                1,
+                if mutation == "link" { 5 } else { 3 },
+                payload.as_bytes(),
+                |point, _| {
+                    if point == event {
+                        match mutation {
+                            "parent" => {
+                                fs::rename(root.join("parent"), root.join("retained")).unwrap();
+                                file(&root, "parent/input", b"abc", 0o644);
+                            }
+                            "root" | "final-root" => {
+                                fs::rename(&root, temp.path().join("retained")).unwrap();
+                                file(&root, "parent/input", b"abc", 0o644);
+                            }
+                            "link" => {
+                                fs::rename(root.join("parent/link"), root.join("retained"))
+                                    .unwrap();
+                                symlink("input", root.join("parent/link")).unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        changed = true;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(changed);
+            assert_eq!(result.unwrap_err().code, 69, "{mutation}");
         }
     }
 
