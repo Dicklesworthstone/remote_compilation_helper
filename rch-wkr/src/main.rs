@@ -7,11 +7,14 @@
 
 mod artifact_headers;
 mod cache;
+mod control_capture;
+mod control_clock;
 mod executor;
 mod file_sync;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
 mod source_lock;
@@ -50,6 +53,24 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
     },
+    /// Internal storage-independent, bounded lifecycle command observation.
+    #[command(hide = true)]
+    ControlCapture {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal monotonic observation and source-admission budgets.
+    #[command(hide = true)]
+    ControlClock {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal descriptor and process-group checks for scoped launches.
+    #[command(hide = true)]
+    ScopedLaunch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
     /// Internal bounded executable-header evidence for artifact preflight.
     #[command(hide = true)]
     ArtifactHeaders {
@@ -61,6 +82,9 @@ enum Commands {
     #[cfg(unix)]
     #[command(hide = true)]
     Setsid {
+        /// Restore standard descriptors that were closed before worker startup.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=7))]
+        closed_stdio: u8,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<std::ffi::OsString>,
     },
@@ -336,6 +360,15 @@ fn main() -> Result<()> {
     if let Commands::ProcessIdentity { pid } = &cli.command {
         return print_process_identity(*pid);
     }
+    if let Commands::ControlCapture { arguments } = &cli.command {
+        std::process::exit(control_capture::main(arguments));
+    }
+    if let Commands::ControlClock { arguments } = &cli.command {
+        std::process::exit(control_clock::main(arguments));
+    }
+    if let Commands::ScopedLaunch { arguments } = &cli.command {
+        std::process::exit(scoped_launch::main(arguments));
+    }
     // Reserve operations run sh in place of this process while holding a
     // lease; like the identity probe they need no runtime or logging.
     if let Commands::RecoveryReserve { arguments } = &cli.command {
@@ -372,8 +405,12 @@ fn main() -> Result<()> {
         std::process::exit(source_admission::main(arguments));
     }
     #[cfg(unix)]
-    if let Commands::Setsid { command } = &cli.command {
-        return exec_in_new_session(command);
+    if let Commands::Setsid {
+        command,
+        closed_stdio,
+    } = &cli.command
+    {
+        return exec_in_new_session(command, *closed_stdio);
     }
     #[cfg(target_os = "linux")]
     if let Commands::PrepareInstaller {
@@ -421,9 +458,14 @@ fn is_lost_reader_panic(payload: &(dyn std::any::Any + Send)) -> bool {
 /// `setsid(1)` for hosts without one: become a session leader, then exec.
 /// Only returns (exit 1) when the session or the exec fails.
 #[cfg(unix)]
-fn exec_in_new_session(command: &[std::ffi::OsString]) -> Result<()> {
+fn exec_in_new_session(command: &[std::ffi::OsString], closed_stdio: u8) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     rustix::process::setsid().context("setsid")?;
+    for fd in 0..3 {
+        if closed_stdio & (1 << fd) != 0 {
+            nix::unistd::close(fd).context("restore closed standard descriptor")?;
+        }
+    }
     let error = std::process::Command::new(&command[0])
         .args(&command[1..])
         .exec();
@@ -449,6 +491,15 @@ async fn run_worker(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::SourceAdmission { .. } => {
             anyhow::bail!("source-admission requires the synchronous worker entry point")
+        }
+        Commands::ControlCapture { .. } => {
+            anyhow::bail!("control-capture requires the synchronous worker entry point")
+        }
+        Commands::ControlClock { .. } => {
+            anyhow::bail!("control-clock requires the synchronous worker entry point")
+        }
+        Commands::ScopedLaunch { .. } => {
+            anyhow::bail!("scoped-launch requires the synchronous worker entry point")
         }
         Commands::ArtifactHeaders { .. } => {
             anyhow::bail!("artifact-headers requires the synchronous worker entry point")
