@@ -22,6 +22,9 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKER = os.environ.get("RCH_WKR_BIN", str(ROOT / "target/debug/rch-wkr"))
+LOCATOR = (ROOT / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
 SOURCE = Path(os.environ.get("RCH_TEST_SOURCE_CLAIM_SCRIPT",
                              ROOT / "rch/src/hook/source_claim_registry.sh"))
 HELPER_FILE = os.environ.get("RCH_TEST_SOURCE_CLAIM_HELPERS")
@@ -30,7 +33,7 @@ if HELPER_FILE:
 else:
     HELPERS = (ROOT / "rch-common/src/stale_target_reap.rs").read_text().split(
         'pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
-SCRIPT = SOURCE.read_text()
+SCRIPT = LOCATOR + "\n" + SOURCE.read_text()
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 FLOCK = shutil.which("flock")
 AWK = shutil.which("awk")
@@ -61,7 +64,7 @@ class Fixture:
             (self.registry / name).mkdir()
         self.script = self.root / "transaction.sh"
         self.script.write_text("set -eu\n" + HELPERS + "\n" + script)
-        self.env = {**os.environ, "LC_ALL": "C"}
+        self.env = {**os.environ, "LC_ALL": "C", "RCH_WKR_BIN": WORKER}
 
     def record(self, token, roots, extension="claim", raw=None):
         content = body(roots) if raw is None else raw
@@ -89,17 +92,16 @@ class Fixture:
             tool = directory / "sync"
             tool.write_text("#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n")
             tool.chmod(0o700)
-            py = directory / "python3"
-            py.write_text(
+            worker = directory / "rch-wkr"
+            worker.write_text(
                 "#!/bin/sh\n"
-                'if [ "${1-}" = -I ] && [ "${2-}" = -S ] && [ "${3-}" = -c ]; then\n'
-                '  case "${4-}" in\n'
-                '    *os.fsync*) ' + shlex.quote(str(hook)) + ' -- "${5-}" || exit $?;;\n'
-                "  esac\n"
+                'if [ "${1-}" = file-sync ] && [ "${2-}" = sync ]; then\n'
+                '  ' + shlex.quote(str(hook)) + ' -- "${3-}" || exit $?\n'
                 "fi\n"
-                "exec " + shlex.quote(sys.executable or shutil.which("python3")) + ' "$@"\n'
+                "exec " + shlex.quote(self.env["RCH_WKR_BIN"]) + ' "$@"\n'
             )
-            py.chmod(0o700)
+            worker.chmod(0o700)
+            self.env["RCH_WKR_BIN"] = str(worker)
         else:
             tool = directory / name
             tool.write_text("#!/bin/sh\n" + source + "\n")
@@ -327,10 +329,8 @@ class InventoryTests(unittest.TestCase):
         self.assert_status(f.transact("bb", roots, "release"), 0)
         receipt = next((f.registry / "released").glob("bb.*.claim"))
         before = (receipt.stat().st_ino, receipt.read_bytes())
-        # The registry's barriers are fsyncs through its `python3 -c` adapter,
-        # not the sync utility: fail every one of them.
-        f.tools("python3", 'case "${4-}" in *os.fsync*) exit 91 ;; esac\nexec '
-                + shlex.quote(sys.executable) + ' "$@"')
+        # Fail each native per-file barrier while rejecting the sync utility.
+        f.tools("sync", "exit 91")
         result = f.transact("bb", roots, "released")
         self.assert_status(result, 73)
         self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)

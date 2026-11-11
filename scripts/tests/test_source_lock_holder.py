@@ -27,13 +27,16 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
+WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
+LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
 HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
 RELEASE_WAITER = SSH_SOURCE.split(
     'const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
 PAIR_CUSTODY = SSH_SOURCE.split(
     'const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
-CLAIM_REGISTRY = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+CLAIM_REGISTRY = LOCATOR + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
 CLAIM_HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 CLAIM_HELPERS = CLAIM_HELPER_SOURCE.split(
     'pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
@@ -750,7 +753,7 @@ class SourceLockHolderTests(unittest.TestCase):
                        *command]
         return subprocess.run(command, input=content, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=20, check=False,
-                              env={**os.environ, "LC_ALL": "C"})
+                              env={**os.environ, "LC_ALL": "C", "RCH_WKR_BIN": WORKER})
 
     def finite_activity_script(self, registry, command, token="aa"):
         prefix = shlex.join([

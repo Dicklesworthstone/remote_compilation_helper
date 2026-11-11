@@ -21,7 +21,10 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
+LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
+SCRIPT = LOCATOR + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
 HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPER_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 FLOCK = shutil.which("flock")
@@ -58,7 +61,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.registry.mkdir()
         for name in ("released", "cancelled", "quarantine"):
             (self.registry / name).mkdir()
-        self.env = {**os.environ, "LC_ALL": "C"}
+        self.env = {**os.environ, "LC_ALL": "C", "RCH_WKR_BIN": WORKER}
         self.script = self.root / "transaction.sh"
         self.script.write_text("set -eu\n" + HELPERS + "\n" + SCRIPT)
 
@@ -122,7 +125,10 @@ class SourceClaimRegistryTests(unittest.TestCase):
             tool = directory / name
             tool.write_text("#!/bin/sh\n" + program + "\n")
             tool.chmod(0o700)
-        return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+        env = {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+        if "rch-wkr" in tools:
+            env["RCH_WKR_BIN"] = str(directory / "rch-wkr")
+        return env
 
     def python_fault_env(self, injection, tools=None):
         # Run unchanged production Python with one syscall fault. The wrapper
@@ -157,16 +163,16 @@ os.open = without_allocation
 
     def barrier_env(self, program):
         # The registry fsyncs each record and directory itself through a
-        # `python3 -c` adapter, never the sync utility (GNU syncfs and uutils'
+        # native worker adapter, never the sync utility (GNU syncfs and uutils'
         # global sync wait on unrelated builds under the registry lock). Fake
         # that adapter: `program` sees the barrier path as $1 and fails the
         # barrier by exiting nonzero; otherwise the real fsync runs. A call to
         # the utility itself leaves a marker (see assert_no_sync_utility).
         return self.tools_env({
-            "python3": ('case "${4-}" in *os.fsync*)\n'
+            "rch-wkr": ('if [ "${1-}" = file-sync ] && [ "${2-}" = sync ]; then\n'
                         "  barrier() {\n" + program + "\n  }\n"
-                        '  barrier "$5" || exit\n'
-                        "esac\nexec " + shlex.quote(sys.executable) + ' "$@"'),
+                        '  barrier "$3" || exit\n'
+                        "fi\nexec " + shlex.quote(self.env["RCH_WKR_BIN"]) + ' "$@"'),
             "sync": "touch " + shlex.quote(str(self.root / "sync-utility-called")) + "\nexit 97",
         })
 

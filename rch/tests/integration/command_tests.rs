@@ -147,7 +147,8 @@ mod source_topology_cli {
             std::fs::write(
                 base.join("registry.sh"),
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
+                    rch_common::wkr_locate::WKR_LOCATE_SHELL,
                     rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
                     include_str!("../../src/hook/source_claim_registry.sh")
                 ),
@@ -311,6 +312,14 @@ mod source_topology_cli {
                 .env("RCH_STATE_HOME", base.join("state"))
                 .env("XDG_CACHE_HOME", base.join("cache"))
                 .env("RCH_TOPOLOGY_FIXTURE", base)
+                .env(
+                    "RCH_WKR_BIN",
+                    std::env::var_os("RCH_WKR_BIN")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            PathBuf::from(env!("CARGO_BIN_EXE_rch")).with_file_name("rch-wkr")
+                        }),
+                )
                 .env("RCH_DISABLE_CONFIG_CACHE", "1")
                 .env("RCH_NO_UPDATE_CHECK", "1")
                 .env("RCH_QUEUE_WHEN_BUSY", "0")

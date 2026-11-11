@@ -1087,7 +1087,7 @@ pub(super) fn source_registry_setup(registry: &str) -> String {
             .map(|parent| parent.join(".").display().to_string()),
     );
     let borrowed: Vec<_> = paths.iter().map(String::as_str).collect();
-    format!(
+    let setup = format!(
         "set -eu; umask 077; registry={registry}; \
          [ ! -L \"$registry\" ]; mkdir -p -- \"$registry\"; \
          for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do \
@@ -1095,20 +1095,60 @@ pub(super) fn source_registry_setup(registry: &str) -> String {
          [ ! -L \"$registry/metadata.lock\" ]; {sync_registry};\n",
         registry = quote(registry),
         sync_registry = crate::transfer::file_fsync_command(&borrowed),
+    );
+    #[cfg(test)]
+    {
+        format!("{}{setup}", test_worker_default())
+    }
+    #[cfg(not(test))]
+    {
+        setup
+    }
+}
+
+/// Local protocol fixtures use the matching build, while failure-injection
+/// fixtures may deliberately supply a wrapper around that worker. Export the
+/// default so setup, nested registry transactions and reserve payloads agree.
+#[cfg(test)]
+fn test_worker_default() -> String {
+    format!(
+        "if [ \"${{RCH_WKR_BIN+x}}\" != x ]; then RCH_WKR_BIN={}; fi; export RCH_WKR_BIN;\n",
+        shell_escape::escape(tests::tree_rch_wkr().to_string_lossy()),
     )
 }
 
 /// Every recovery-reserve wrapper this module emits passes through here, so
 /// unit tests run the rch-wkr built from this tree, never one a test host
-/// happens to have installed. Production wrappers are unchanged.
+/// happens to have installed, unless a fixture explicitly supplies a worker.
+/// Production wrappers are unchanged.
 fn reserve_wrapper(wrapper: String) -> String {
     #[cfg(test)]
     {
-        rch_common::recovery_reserve::with_worker_binary(&wrapper, tests::tree_rch_wkr())
+        format!("( {}{wrapper} )", test_worker_default())
     }
     #[cfg(not(test))]
     {
         wrapper
+    }
+}
+
+/// Every entry point embeds the same locator, record helpers and transaction.
+/// The registry's exact-file sync adapter must also exist in topology and
+/// cancellation transactions, not only ordinary source admission.
+pub(super) fn source_registry_script() -> String {
+    let script = format!(
+        "{}\n{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+        SOURCE_CLAIM_REGISTRY,
+    );
+    #[cfg(test)]
+    {
+        format!("{}{script}", test_worker_default())
+    }
+    #[cfg(not(test))]
+    {
+        script
     }
 }
 
@@ -1119,11 +1159,7 @@ fn source_registry_invocation(
     operation: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let script = format!(
-        "{}\n{}",
-        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
-        SOURCE_CLAIM_REGISTRY,
-    );
+    let script = source_registry_script();
     let command = format!(
         "flock -x -- {lock} sh -c {script} rch-source-registry {registry} {identity} {digest} {operation}",
         lock = quote(&format!("{registry}/metadata.lock")),
@@ -1733,11 +1769,7 @@ fn source_cancellation_settlement_command(
     validate_source_identity(identity)?;
     let (roots, digest) = source_claim_roots(roots)?;
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
-    let transaction = format!(
-        "{}\n{}",
-        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
-        SOURCE_CLAIM_REGISTRY,
-    );
+    let transaction = source_registry_script();
     let command = format!(
         "printf '%s' {roots} | exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected}\n",
         roots = quote(&roots),
@@ -5226,11 +5258,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     /// to a Mac worker was refused at the registry (2026-10-13).
     #[test]
     fn source_registry_script_parses_under_the_system_sh() {
-        let script = format!(
-            "{}\n{}",
-            rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
-            SOURCE_CLAIM_REGISTRY,
-        );
+        let script = source_registry_script();
         let output = std::process::Command::new("/bin/sh")
             .args(["-n", "-c", &script])
             .output()
@@ -5246,12 +5274,6 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[tokio::test]
     async fn durable_source_registry_flushes_only_named_objects_and_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
-        let python = std::process::Command::new("python3")
-            .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
-            .output()
-            .unwrap();
-        assert!(python.status.success());
-        let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
         let retained = tempfile::tempdir().unwrap().keep();
         for mode in ["ok", "registry", "pending"] {
             let root = retained.join(mode);
@@ -5262,24 +5284,27 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             std::fs::create_dir(&source).unwrap();
             // Utility sync must never be invoked: uutils may flush the whole
             // machine even with a file operand. The wrapper otherwise delegates
-            // to real Python and real fsync, injecting only the named failure.
+            // to the native worker's fsync, injecting only the named failure.
             std::fs::write(
                 bin.join("sync"),
                 "#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n",
             )
             .unwrap();
-            std::fs::write(bin.join("python3"), format!(
-                r#"#!{python}
-import os, sys
-args = sys.argv[1:]
-if len(args) >= 5 and args[:3] == ['-I', '-S', '-c'] and 'os.fsync(' in args[3]:
- mode = os.environ['RCH_TEST_FLUSH_MODE']
- if any((mode == 'registry' and path.endswith('/registry')) or (mode == 'pending' and os.path.basename(path).startswith('.record-write.')) for path in args[4:]):
-  sys.exit(86)
-os.execv({python:?}, [{python:?}] + args)
-"#
-            )).unwrap();
-            for name in ["sync", "python3"] {
+            std::fs::write(
+                bin.join("rch-wkr"),
+                r#"#!/bin/sh
+if [ "$1" = file-sync ] && [ "$2" = sync ]; then
+    for path do
+        case "$RCH_TEST_FLUSH_MODE:$path" in
+            registry:*/registry|pending:*/.record-write.*) exit 86;;
+        esac
+    done
+fi
+exec "$RCH_TEST_REAL_WKR" "$@"
+"#,
+            )
+            .unwrap();
+            for name in ["sync", "rch-wkr"] {
                 std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
                     .unwrap();
             }
@@ -5292,6 +5317,11 @@ os.execv({python:?}, [{python:?}] + args)
                 Command::new("sh")
                     .args(["-c", &command])
                     .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("RCH_WKR_BIN", bin.join("rch-wkr"))
+                    .env(
+                        "RCH_TEST_REAL_WKR",
+                        crate::transfer::native_control_worker_for_test(),
+                    )
                     .env("RCH_TEST_FLUSH_MODE", mode)
                     .kill_on_drop(true)
                     .output(),

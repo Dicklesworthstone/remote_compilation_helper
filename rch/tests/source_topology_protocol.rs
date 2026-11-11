@@ -17,7 +17,11 @@ fn source_topology_acknowledgement_and_release_protocol() {
     let paths = fixture.path().join("namespace-paths.sh");
     std::fs::write(
         &registry,
-        include_str!("../src/hook/source_claim_registry.sh"),
+        format!(
+            "{}\n{}",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            include_str!("../src/hook/source_claim_registry.sh"),
+        ),
     )
     .expect("write compiled registry");
     std::fs::write(
@@ -45,6 +49,15 @@ fn source_topology_acknowledgement_and_release_protocol() {
             .env("RCH_TEST_SOURCE_TOPOLOGY_RETRY", &retry)
             .env("RCH_TEST_SOURCE_NAMESPACE_PATHS", &paths)
             .env("RCH_TEST_SOURCE_TOPOLOGY_SHELL", "sh")
+            .env(
+                "RCH_WKR_BIN",
+                std::env::var_os("RCH_WKR_BIN")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(env!("CARGO_BIN_EXE_rch"))
+                            .with_file_name("rch-wkr")
+                    }),
+            )
             .output()
             .expect("Python 3 is required for the native source-topology regressions");
         assert!(

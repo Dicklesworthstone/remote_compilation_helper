@@ -7,8 +7,10 @@
 
 mod cache;
 mod executor;
+mod file_sync;
 mod prepare;
 mod recovery_reserve;
+mod result_probe;
 mod toolchain;
 
 use anyhow::{Context, Result};
@@ -47,6 +49,18 @@ enum Commands {
     /// Internal: driven by the wrappers in `rch_common::recovery_reserve`.
     #[command(hide = true)]
     RecoveryReserve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal durable-file sync used before publishing completion receipts.
+    #[command(hide = true)]
+    FileSync {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal descriptor-relative result-directory observation for recovery.
+    #[command(hide = true)]
+    ResultDirectory {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -272,6 +286,12 @@ fn main() -> Result<()> {
     if let Commands::RecoveryReserve { arguments } = &cli.command {
         std::process::exit(recovery_reserve::main(arguments));
     }
+    if let Commands::FileSync { arguments } = &cli.command {
+        std::process::exit(file_sync::main(arguments));
+    }
+    if let Commands::ResultDirectory { arguments } = &cli.command {
+        std::process::exit(result_probe::main(arguments));
+    }
     #[cfg(unix)]
     if let Commands::Setsid { command } = &cli.command {
         return exec_in_new_session(command);
@@ -351,6 +371,12 @@ async fn run_worker(cli: Cli) -> Result<()> {
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
         Commands::RecoveryReserve { .. } => {
             anyhow::bail!("recovery-reserve requires the synchronous worker entry point")
+        }
+        Commands::FileSync { .. } => {
+            anyhow::bail!("file-sync requires the synchronous worker entry point")
+        }
+        Commands::ResultDirectory { .. } => {
+            anyhow::bail!("result-directory requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

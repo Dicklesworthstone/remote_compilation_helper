@@ -35,18 +35,24 @@ fi
 # Explicit fsync preserves data, metadata and every checked directory barrier.
 # The local adapter also covers the shared record helpers without changing
 # their GC callers outside this transaction. Topology's -d calls also need a
-# directory fsync, not an implementation-dependent utility invocation. Python
-# is already required by namespace custody. Missing Python fails closed.
+# directory fsync, not an implementation-dependent utility invocation. The
+# native worker command must be present and speak the exact barrier protocol.
 sync() {
     case "${1-}" in
         -f|-d)
             shift
             if [ "${1-}" = -- ]; then shift; fi
             [ "$#" -eq 1 ] && [ -n "$1" ] || return 1
-            python3 -I -S -c 'import os, sys
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-try: os.fsync(fd)
-finally: os.close(fd)' "$1"
+            if ! rch_wkr_locate; then
+                printf '%s\n' 'RCH_FILE_SYNC_UNCONFIRMED rch-wkr is not installed on this worker' >&2
+                return 74
+            fi
+            if ! rch_claim_sync_probe=$("$RCH_WKR" file-sync probe) \
+                || [ "$rch_claim_sync_probe" != 'rch-wkr file-sync v1' ]; then
+                printf '%s\n' 'RCH_FILE_SYNC_UNCONFIRMED deploy the matching rch-wkr with file-sync support' >&2
+                return 74
+            fi
+            "$RCH_WKR" file-sync sync "$1"
             ;;
         *) return 1 ;;
     esac

@@ -20,7 +20,6 @@ use std::time::Duration;
 const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const PATHS: &str = include_str!("source_namespace_paths.sh");
 const ADMISSION: &str = include_str!("source_claim_admission.sh");
-const CLAIMS: &str = include_str!("source_claim_registry.sh");
 const CONTROL: &str = include_str!("source_namespace_control.sh");
 const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
 
@@ -115,9 +114,9 @@ fn topology_refusal_detail(
 }
 
 // A bounded, monotonic wait reports metadata contention independently of the
-// enclosing control group's 15-second execution deadline. Python is already
-// required for the registry's record/directory fsync. The descriptor survives
-// exec and CONTROL kills every inheriting descendant before acknowledgement.
+// enclosing control group's 15-second execution deadline. This lock program is
+// remaining interpreter debt: its descriptor survives exec, and CONTROL kills
+// every inheriting descendant before acknowledgement.
 const REGISTRY_LOCK: &str = r#"
 import errno, fcntl, math, os, re, stat, sys, time
 try:
@@ -299,10 +298,7 @@ fn namespace_command(
             quote(&alias),
         )
     };
-    let registry_script = format!(
-        "{}\n{CLAIMS}",
-        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
-    );
+    let registry_script = super::ssh::source_registry_script();
     // Match ssh.rs's registry layout. No source, pair or activity descriptors
     // exist in this parent. Every attempt drops its metadata flock before the
     // bounded wait, allowing exact-owner recovery to release the old claim.

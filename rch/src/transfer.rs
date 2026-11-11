@@ -1518,19 +1518,44 @@ fi
 
 /// Sync only these records, including directories. Explicit fsync avoids both
 /// syncfs and uutils versions that silently implement `sync FILE` as sync().
-/// Python is also used by the existing namespace and artifact custody paths.
-/// Missing Python or any failed barrier is an error, never a broad-sync fallback.
+/// The worker implements the barrier before starting its async runtime. An
+/// unavailable worker command or failed barrier retains unsettled ownership.
 pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
-    let script = "import os, sys\nfor path in sys.argv[1:]:\n fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n try: os.fsync(fd)\n finally: os.close(fd)";
     format!(
-        "python3 -I -S -c {} {}",
-        escape(Cow::Borrowed(script)),
-        paths
+        "( {locate}\
+         if ! rch_wkr_locate; then \
+         printf '%s\\n' 'RCH_FILE_SYNC_UNCONFIRMED rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+         if ! __rch_sync_probe=$(\"$RCH_WKR\" file-sync probe 2>/dev/null) \
+         || [ \"$__rch_sync_probe\" != 'rch-wkr file-sync v1' ]; then \
+         printf '%s\\n' 'RCH_FILE_SYNC_UNCONFIRMED deploy the matching rch-wkr with file-sync support' >&2; exit 74; fi; \
+         exec \"$RCH_WKR\" file-sync sync {paths} )",
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        paths = paths
             .iter()
             .map(|path| escape(Cow::Borrowed(*path)).into_owned())
             .collect::<Vec<_>>()
             .join(" ")
     )
+}
+
+#[cfg(test)]
+pub(crate) fn native_control_worker_for_test() -> PathBuf {
+    let binary = std::env::var_os("RCH_WKR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .expect("current test executable")
+                .parent()
+                .and_then(Path::parent)
+                .expect("Cargo target directory")
+                .join(format!("rch-wkr{}", std::env::consts::EXE_SUFFIX))
+        });
+    assert!(
+        binary.is_file(),
+        "build the matching rch-wkr binary or set RCH_WKR_BIN for native control tests: {}",
+        binary.display()
+    );
+    binary
 }
 
 /// Removes every file the durable supervisor writes beside `path`; the claim
@@ -11737,6 +11762,72 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn file_sync_command_flushes_literal_paths_and_refuses_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("receipt ' $value `literal`");
+        std::fs::write(&record, b"build-identity 101\n").unwrap();
+        let run = |paths: &[&str]| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &file_fsync_command(paths)])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .env("PATH", directory.path().join("no-tools"))
+                .output()
+                .unwrap()
+        };
+        let output = run(&[record.to_str().unwrap(), directory.path().to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(std::fs::read(&record).unwrap(), b"build-identity 101\n");
+
+        let link = directory.path().join("aliased-receipt");
+        std::os::unix::fs::symlink(&record, &link).unwrap();
+        for refused in [link, directory.path().join("missing")] {
+            let output = run(&[record.to_str().unwrap(), refused.to_str().unwrap()]);
+            assert_eq!(output.status.code(), Some(74), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_FILE_SYNC_UNCONFIRMED"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_sync_command_requires_an_available_matching_worker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        for (case, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "failed-probe",
+                Some("#!/bin/sh\nprintf 'rch-wkr file-sync v1\\n'; exit 3\n"),
+            ),
+            (
+                "wrong-protocol",
+                Some("#!/bin/sh\nprintf 'rch-wkr file-sync v0\\n'\n"),
+            ),
+        ] {
+            let binary = directory.path().join(case);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new("sh")
+                .args(["-c", &file_fsync_command(&[])])
+                .env("RCH_WKR_BIN", binary)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(74), "{case}: {output:?}");
+            assert!(output.stdout.is_empty(), "{case}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_FILE_SYNC_UNCONFIRMED"),
+                "{case}: {output:?}"
+            );
+        }
+    }
+
     #[test]
     fn git_archive_cache_protocol_requires_exact_operation_evidence() {
         use GitArchiveCacheOperation::{Publish, Restore};
@@ -12697,6 +12788,7 @@ esac
         let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
             .arg("-c")
             .arg(&command)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("run durable wrapper");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -12732,7 +12824,7 @@ esac
             let receipt = root.join("completion");
             let calls = root.join("sync.calls");
             let invocations = root.join("invocations");
-            let sync = bin.join("python3");
+            let sync = bin.join("rch-wkr");
             std::fs::write(
                 &sync,
                 "#!/bin/sh\n\
@@ -12742,7 +12834,7 @@ esac
                   if [ \"$RCH_TEST_SYNC_FAILURE\" = directory ] && [ -d \"$path\" ]; then exit 74; fi\n\
                   if [ \"$RCH_TEST_SYNC_FAILURE\" = receipt ] && [ \"$path\" = \"$RCH_TEST_RECEIPT\" ]; then exit 74; fi\n\
                  done\n\
-                 exec /usr/bin/python3 \"$@\"\n",
+                 exec \"$RCH_TEST_REAL_WKR\" \"$@\"\n",
             )
             .unwrap();
             std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -12763,6 +12855,8 @@ esac
                 .args(["--kill-after=2s", "10s", "sh"])
                 .arg(script)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("RCH_WKR_BIN", &sync)
+                .env("RCH_TEST_REAL_WKR", native_control_worker_for_test())
                 .env("RCH_TEST_SYNC_FAILURE", case)
                 .env("RCH_TEST_SYNC_LOG", &calls)
                 .env("RCH_TEST_RECEIPT", &receipt)
@@ -12812,7 +12906,11 @@ esac
         std::fs::write(&script, &command).unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new("sh").arg(&script).kill_on_drop(true).output(),
+            Command::new("sh")
+                .arg(&script)
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .kill_on_drop(true)
+                .output(),
         )
         .await
         .expect("large supervisor must finish")
@@ -12906,6 +13004,7 @@ esac
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &root)
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
@@ -12980,6 +13079,7 @@ esac
                     .env_clear()
                     .env("PATH", "/usr/bin:/bin")
                     .env("HOME", &directory)
+                    .env("RCH_WKR_BIN", native_control_worker_for_test())
                     .stdin(Stdio::null())
                     .kill_on_drop(true)
                     .output(),
@@ -13046,6 +13146,7 @@ esac
         let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
             .arg("-c")
             .arg(format!("umask 0022; {command}"))
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("run durable wrapper");
         assert!(output.status.success(), "{output:?}");
@@ -13088,6 +13189,7 @@ esac
                     let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
                         .arg("-c")
                         .arg(format!("( {command} ) | ( sleep 3; cat )"))
+                        .env("RCH_WKR_BIN", native_control_worker_for_test())
                         .output()
                         .expect("run durable wrapper");
                     String::from_utf8(output.stdout).unwrap()
@@ -13134,6 +13236,7 @@ esac
             .arg("sh")
             .arg("-c")
             .arg(&command)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -13194,6 +13297,7 @@ esac
                 .args(["--kill-after=2s", "10s", "flock", "-x"])
                 .arg(&lock)
                 .args(["sh", "-c", &command])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .output()
                 .unwrap()
         };
@@ -13267,6 +13371,7 @@ esac
             .args(["--kill-after=2s", "10s", "flock", "-x"])
             .arg(&lock)
             .args(["sh", "-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(255), "{output:?}");
@@ -13348,6 +13453,7 @@ esac
             .args(["--kill-after=2s", "10s", "flock", "-x"])
             .arg(&lock)
             .args(["sh", "-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(OwnedFd::from(writer)))

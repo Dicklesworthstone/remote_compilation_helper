@@ -35,6 +35,9 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
+WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
+LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
 HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
 CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
 SETTLEMENT = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
@@ -53,7 +56,9 @@ BOUNDED_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_bounded_
 ARTIFACT_HEADERS = TRANSFER_SOURCE.split('fn artifact_header_probe_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 HELPERS_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPERS_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
-TRANSACTION = HELPERS + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+TRANSACTION = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+               + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n" + HELPERS + "\n"
+               + (REPO / "rch/src/hook/source_claim_registry.sh").read_text())
 SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
 SSH = shutil.which("ssh")
 KEYGEN = shutil.which("ssh-keygen")
@@ -331,17 +336,17 @@ class SourceOwnershipSshTests(unittest.TestCase):
     def fail_sync_after_pending_publication(self, pending):
         tools = self.root / "pending-publication-tools"
         tools.mkdir(mode=0o700)
-        adapter = tools / "python3"
+        adapter = tools / "rch-wkr"
         # Real file writes and atomic publication run. Fail only the next
         # production fsync adapter call after this exact pending file exists;
         # the record's content has already been written and file-synced.
         adapter.write_text(
-            '#!/bin/sh\ncase "${4-}" in *os.fsync*)\n'
+            '#!/bin/sh\nif [ "${1-}" = file-sync ] && [ "${2-}" = sync ]; then\n'
             "  if [ -e " + QUOTE(str(pending)) + " ]; then\n"
             "    printf 'injected post-pending publication sync failure\\n' >&2\n"
-            "    exit 91\n  fi\nesac\nexec " + QUOTE(sys.executable) + ' "$@"\n')
+            "    exit 91\n  fi\nfi\nexec " + QUOTE(WORKER) + ' "$@"\n')
         adapter.chmod(0o700)
-        return "env PATH=" + QUOTE(str(tools)) + ':"$PATH" '
+        return "env RCH_WKR_BIN=" + QUOTE(str(adapter)) + " PATH=" + QUOTE(str(tools)) + ':"$PATH" '
 
     def authority_records(self):
         return {str(path.relative_to(self.root)): (path.stat().st_ino, path.read_bytes())
