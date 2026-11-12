@@ -164,7 +164,7 @@ impl Eq for PendingDiskFault {}
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
 /// A failed remote build's slot is released at completion, but its client
 /// lease keeps the worker's source claim until lease recovery retires it
-/// (exit 102 retrieval incomplete, 130 interrupted: 15-21 min on css). The
+/// (for example, exit 102 retrieval incomplete or 130 interrupted). The
 /// worker's source registry refuses the same project meanwhile, so selection
 /// must not keep choosing it (bd-jqhno).
 #[derive(Debug, Clone)]
@@ -175,8 +175,9 @@ struct SourceFence {
     created: Instant,
 }
 
-/// Lease recovery acts after 15 min of heartbeat staleness and scans every
-/// 5 min; a fence never outlives that window by much, whatever the lease says.
+/// Bound this scheduling cache independently of the recovery scan interval.
+/// Expiry permits another worker ownership probe; it does not prove settlement
+/// or authorize replacing an unresolved source claim.
 pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
 const SOURCE_FENCE_LIMIT: usize = 1024;
 

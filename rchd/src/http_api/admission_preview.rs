@@ -213,6 +213,7 @@ async fn observe(
     let history = Arc::clone(&ctx.history);
     let pool = ctx.pool.clone();
     let project = request.project.clone();
+    let lease_dir = ctx.client_lease_dir.clone();
     let (mut excluded, _permit) = tokio::task::spawn_blocking(move || {
         // Match actual admission: an active build consumes one project lane,
         // not necessarily the entire worker. Source fences below still apply
@@ -223,9 +224,9 @@ async fn observe(
             .filter(|(worker, count)| *count >= pool.project_lanes(worker) as usize)
             .map(|(worker, _)| worker)
             .collect();
-        excluded.extend(
-            history.source_fenced_workers(&project, crate::cancellation::client_lease_owns_source),
-        );
+        excluded.extend(history.source_fenced_workers(&project, |wrapper| {
+            crate::cancellation::client_lease_owns_source(&lease_dir, wrapper)
+        }));
         excluded.extend(history.live_checkout_fenced_workers(&project));
         excluded.extend(history.source_busy_fenced_workers(&project));
         (excluded, permit)

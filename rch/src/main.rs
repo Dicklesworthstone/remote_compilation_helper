@@ -2170,6 +2170,7 @@ async fn async_main() {
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
+        let exit_code = commands::jobs::automatic_recovery_exit_code(&error).unwrap_or(1);
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
         }
@@ -2228,7 +2229,7 @@ async fn async_main() {
         } else {
             let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }
 

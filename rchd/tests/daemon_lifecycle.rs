@@ -799,6 +799,404 @@ while True:
                 .success
         );
     }
+
+    mod automatic_recovery {
+        use super::*;
+        use nix::sys::signal::Signal;
+        use rch_common::job_identity::journal::JobJournalGate;
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+        use rch_common::{
+            CompilationKind, SelectionResponse, TransferConfig, WorkerConfig, WorkerId,
+        };
+        use serde_json::json;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::process::ExitStatusExt;
+
+        const PROJECT: &str = "interrupted-project";
+        const WORKER: &str = "worker-a";
+
+        fn spawn_mock_worker_daemon(root: &Path, socket: &Path) -> OwnedChild {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join("daemon.log"))
+                .unwrap();
+            let child = Fixture::command(root, socket, Path::new(env!("CARGO_BIN_EXE_rchd")))
+                // This supplies health/capacity only. No live remote worker is
+                // part of this test; worker settlement is injected below.
+                .env("RCH_MOCK_SSH", "1")
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("transport-bin").display()),
+                )
+                .args(["--foreground", "--metrics-port", "0", "--no-hot-reload"])
+                .arg("--socket")
+                .arg(socket)
+                .arg("--history-file")
+                .arg(root.join("history.jsonl"))
+                .arg("--workers-config")
+                .arg(root.join("config/workers.toml"))
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            OwnedChild(Some(child))
+        }
+
+        fn wait_mock_worker_ready(fixture: &Fixture) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                // Socket readiness precedes the first asynchronous health
+                // publication. Inspect an unrelated project without reserving
+                // slots so refusal assertions test ownership, not startup.
+                let response: SelectionResponse = serde_json::from_str(
+                    &send_request(
+                        &fixture.socket,
+                        "GET /select-worker?project=health-readiness&command=make&runtime=none&cores=1&dry_run=1",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if response.worker.is_some() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "mock worker did not become ready: {response:?}\n{}",
+                    std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn fixture() -> (Fixture, WorkerConfig) {
+            // Automatic recovery resolves the CLI beside the actual daemon,
+            // so a helper built in a separate target directory is insufficient.
+            let sibling_cli = rchd_binary_path().with_file_name("rch");
+            assert!(
+                sibling_cli.is_file(),
+                "build both binaries before automatic recovery integration tests: cargo build -p rch -p rchd --bins"
+            );
+            let root = tempfile::Builder::new()
+                .prefix("rch-automatic-recovery-")
+                .tempdir()
+                .unwrap();
+            let socket = root.path().join("rch.sock");
+            for directory in [
+                "config",
+                "state/job-leases",
+                "transport-bin",
+                "project/build",
+            ] {
+                std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            }
+            // An unexpected real transport attempt must fail locally instead
+            // of contacting any configured SSH host.
+            for name in ["ssh", "rsync"] {
+                let executable = root.path().join("transport-bin").join(name);
+                std::fs::write(&executable, "#!/bin/sh\nexit 97\n").unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let worker = WorkerConfig {
+                id: WorkerId::new(WORKER),
+                host: "unavailable.invalid".into(),
+                user: "fixture".into(),
+                identity_file: "/unused/worker-key".into(),
+                total_slots: 8,
+                ..WorkerConfig::default()
+            };
+            std::fs::write(
+                root.path().join("config/workers.toml"),
+                toml::to_string(&json!({"workers": [&worker]})).unwrap(),
+            )
+            .unwrap();
+            let daemon = spawn_mock_worker_daemon(root.path(), &socket);
+            let mut fixture = Fixture {
+                daemon,
+                root,
+                socket,
+            };
+            fixture.wait_ready();
+            wait_mock_worker_ready(&fixture);
+            (fixture, worker)
+        }
+
+        fn stop_daemon(fixture: &mut Fixture) {
+            let child = fixture.daemon.0.as_mut().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+
+        fn restart_daemon(fixture: &mut Fixture) {
+            stop_daemon(fixture);
+            fixture.daemon = spawn_mock_worker_daemon(fixture.root.path(), &fixture.socket);
+            fixture.wait_ready();
+            wait_mock_worker_ready(fixture);
+        }
+
+        fn selection(
+            fixture: &Fixture,
+            project: &str,
+            wrapper: &str,
+            pid: u32,
+        ) -> SelectionResponse {
+            let request = format!(
+                "GET /select-worker?project={project}&command=make&runtime=none&cores=2&hook_pid={pid}&local_wrapper_id={wrapper}"
+            );
+            serde_json::from_str(&send_request(&fixture.socket, &request).unwrap()).unwrap()
+        }
+
+        fn assert_fenced(fixture: &Fixture, available_slots: u32) {
+            let denied = selection(
+                fixture,
+                PROJECT,
+                &JobIdentity::new_local().local_wrapper_id,
+                std::process::id(),
+            );
+            assert!(denied.worker.is_none(), "{denied:?}");
+            assert_eq!(
+                denied.reason,
+                rch_common::SelectionReason::NoAdmissibleWorkers(
+                    "active_project_exclusion=1".into()
+                ),
+                "{denied:?}"
+            );
+            let diagnostics = denied.diagnostics.unwrap();
+            assert_eq!(diagnostics.active_project_exclusion_count, 1);
+            assert_eq!(diagnostics.workers[0].available_slots, available_slots);
+        }
+
+        fn release(fixture: &Fixture, build: u64, wrapper: &str, code: i32) {
+            let reply = send_request(
+                &fixture.socket,
+                &format!(
+                    "POST /release-worker?worker={WORKER}&slots=2&build_id={build}&local_wrapper_id={wrapper}&exit_code={code}"
+                ),
+            )
+            .unwrap();
+            let observed: Value = serde_json::from_str(
+                &send_request(
+                    &fixture.socket,
+                    &format!("GET /builds/{build}?local_wrapper_id={wrapper}"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(observed["status"], "completed", "{reply}; {observed}");
+            assert_eq!(observed["record"]["exit_code"], code);
+        }
+
+        fn read_lease(path: &Path) -> DurableJobLease {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        }
+
+        fn write_private_lease(path: &Path, lease: &DurableJobLease) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap()
+                .write_all(&serde_json::to_vec(lease).unwrap())
+                .unwrap();
+        }
+
+        /// Real daemon, CLI, admission, durable history and kernel process
+        /// identities; deterministic mock worker health and injected worker
+        /// settlement. The source/activity-lock proof itself belongs to the
+        /// worker protocol tests, not this local process integration fixture.
+        #[test]
+        fn interrupted_wrappers_automatically_restore_admission_after_worker_settlement() {
+            for (phase, signal, daemon_completed) in [
+                ("execute", Signal::SIGTERM, true),
+                ("execute", Signal::SIGKILL, false),
+                ("finalize", Signal::SIGINT, true),
+            ] {
+                let (mut fixture, worker) = fixture();
+                let owner = OwnedChild(Some(
+                    // Explicitly reset signals inherited from a detached test
+                    // runner. env execs cat, preserving this owned PID/birth.
+                    Command::new("/usr/bin/env")
+                        .args(["--default-signal=INT,TERM", "/bin/cat"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                ));
+                let pid = owner.id();
+                let ProcessObservation::Present(birth) = observe_process(pid) else {
+                    panic!("owned wrapper must have an observable kernel birth identity");
+                };
+                let now = chrono::Utc::now().timestamp_millis() as u64;
+                let mut lease = DurableJobLease::new(
+                    JobIdentity::new_local(),
+                    pid,
+                    None,
+                    None,
+                    now - 60_000,
+                    false,
+                    false,
+                    "blake3:interrupted-process-integration".into(),
+                );
+                lease.process_birth = Some(birth);
+                let wrapper = lease.identity.local_wrapper_id.clone();
+                let admitted = selection(&fixture, PROJECT, &wrapper, pid);
+                assert!(admitted.worker.is_some(), "{admitted:?}");
+                let build = admitted.build_id.unwrap();
+                lease.admit(build, WORKER.into(), now - 60_000);
+                lease.phase = phase.into();
+                let project = fixture.root.path().join("project");
+                let source = project.join("source.c");
+                let artifact = project.join("build/app");
+                std::fs::write(&source, b"original source").unwrap();
+                std::fs::write(&artifact, b"original artifact").unwrap();
+                let transfer = TransferConfig::default();
+                let identity = "0123456789abcdef0123456789abcdef";
+                lease.recovery = Some(json!({
+                    "version": 2, "wrapper_id": wrapper, "build_id": build,
+                    "worker": worker, "identity": identity,
+                    "completion": format!("{}/recovery-{build}-{identity}.done", transfer.remote_base.trim_end_matches('/')),
+                    "source_roots": ["/owned/project"], "source_authority_namespace": "current",
+                    "pair": null, "retire_root": null, "transfer": transfer,
+                    "project_root": project, "kind": CompilationKind::Make,
+                    "expected_triple": "x86_64-unknown-linux-gnu", "pinned_triple": null,
+                    "allow_foreign": false, "package_archive": false,
+                    "phases": [], "exit_code": null, "returned": null,
+                    "prepared": true, "execution_started": true, "preparation_cancelled": false,
+                    "sources_released": false, "pair_released": true, "tree_retired": true,
+                    "source_cancellation_settled": false, "retired": false,
+                }));
+                let path = fixture
+                    .root
+                    .path()
+                    .join("state/job-leases")
+                    .join(format!("{wrapper}.json"));
+                write_private_lease(&path, &lease);
+                assert_fenced(&fixture, 6);
+
+                // A stale heartbeat is not enough to take over a live owner.
+                restart_daemon(&mut fixture);
+                assert_eq!(read_lease(&path), lease);
+                assert_fenced(&fixture, 6);
+
+                // Own the test's mutation boundary across the unresolved
+                // restart; an automatic recovery cannot race the subsequently
+                // injected worker receipt or change custody underneath it.
+                let gate = JobJournalGate::try_acquire(&path).unwrap().unwrap();
+                owner.signal(signal);
+                assert_eq!(owner.finish().status.signal(), Some(signal as i32));
+                if !daemon_completed {
+                    let failed = fixture
+                        .cli(&["jobs", "cancel", &wrapper, "--timeout-secs", "1"])
+                        .finish();
+                    assert!(!failed.status.success(), "{failed:?}");
+                    assert_eq!(read_lease(&path), lease);
+                    assert_fenced(&fixture, 6);
+                }
+                restart_daemon(&mut fixture);
+                assert_eq!(read_lease(&path), lease);
+                assert_fenced(&fixture, 6);
+                if daemon_completed {
+                    // Reproduce the report's zero-active/eight-free state
+                    // after restart. Source fences are a transient scheduling
+                    // cache; the durable reservation above is what a restart
+                    // must restore until an exact release is acknowledged.
+                    release(&fixture, build, &wrapper, 130);
+                    assert!(
+                        admission_snapshot(&fixture.socket)
+                            .active_build_ids
+                            .is_empty()
+                    );
+                }
+                let available_slots = if daemon_completed { 8 } else { 6 };
+                assert_fenced(&fixture, available_slots);
+                let cancellation = fixture
+                    .cli(&["jobs", "cancel", &wrapper, "--timeout-secs", "1"])
+                    .finish();
+                if daemon_completed {
+                    assert!(cancellation.status.success(), "{cancellation:?}");
+                    let report: Value = serde_json::from_slice(&cancellation.stdout).unwrap();
+                    let report = report.get("data").unwrap_or(&report);
+                    assert_eq!(report["terminal_acknowledged"], false, "{report}");
+                } else {
+                    assert!(!cancellation.status.success(), "{cancellation:?}");
+                }
+                assert_eq!(read_lease(&path), lease);
+                assert_fenced(&fixture, available_slots);
+
+                stop_daemon(&mut fixture);
+                // Explicit worker-side settlement fixture, not proof inferred
+                // from elapsed time, wrapper death, or the daemon's free slots.
+                let mut settled = lease.clone();
+                let recipe = settled.recovery.as_mut().unwrap();
+                for field in ["sources_released", "source_cancellation_settled", "retired"] {
+                    recipe[field] = json!(true);
+                }
+                recipe["exit_code"] = json!(143);
+                recipe["returned"] = json!(143);
+                write_private_lease(&path, &settled);
+                drop(gate);
+                fixture.daemon = spawn_mock_worker_daemon(fixture.root.path(), &fixture.socket);
+                fixture.wait_ready();
+                wait_mock_worker_ready(&fixture);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let recovered = loop {
+                    let observed = read_lease(&path);
+                    if observed.terminal_acknowledged {
+                        break observed;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "automatic startup recovery did not settle {phase}/{signal:?}: {observed:?}\n{}",
+                        std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap()
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                assert_eq!(recovered.identity, lease.identity);
+                assert_eq!(recovered.owner_identity(), lease.owner_identity());
+                assert_eq!(recovered.wrapper_pid, pid);
+                assert_eq!(recovered.command_fingerprint, lease.command_fingerprint);
+                assert_eq!(recovered.exit_code, Some(143));
+                assert_eq!(
+                    recovered.recovery.as_ref().unwrap()["daemon_exit_code"],
+                    if daemon_completed { 130 } else { 143 }
+                );
+                assert!(
+                    admission_snapshot(&fixture.socket)
+                        .active_build_ids
+                        .is_empty()
+                );
+
+                // Inspection is insufficient: create a new actual reservation
+                // for this exact project, then verify its competitor is fenced.
+                let next_wrapper = JobIdentity::new_local().local_wrapper_id;
+                let successor = selection(&fixture, PROJECT, &next_wrapper, std::process::id());
+                assert!(successor.worker.is_some(), "{successor:?}");
+                assert_eq!(successor.worker.as_ref().unwrap().id.as_str(), WORKER);
+                assert_fenced(&fixture, 6);
+                let next_build = successor.build_id.unwrap();
+                release(&fixture, next_build, &next_wrapper, 0);
+                release(&fixture, next_build, &next_wrapper, 0);
+                let control_wrapper = JobIdentity::new_local().local_wrapper_id;
+                let control = selection(
+                    &fixture,
+                    "other-project",
+                    &control_wrapper,
+                    std::process::id(),
+                );
+                assert!(control.worker.is_some(), "{control:?}");
+                let selected = control.worker.as_ref().unwrap();
+                assert_eq!(selected.reserved_slots, Some(2));
+                assert_eq!(selected.slots_available, 6);
+                release(&fixture, control.build_id.unwrap(), &control_wrapper, 0);
+                assert_eq!(std::fs::read(source).unwrap(), b"original source");
+                assert_eq!(std::fs::read(artifact).unwrap(), b"original artifact");
+            }
+        }
+    }
 }
 
 /// Parse JSON response and extract a field

@@ -4979,9 +4979,11 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
             cancel_source_grant(session).await?;
             return Ok(EXIT_BUILD_ERROR);
         }
-        anyhow::bail!(
-            "same-id remote execution has no durable completion yet; command was not replayed"
-        );
+        // This observation is expected when a wrapper dies before its worker
+        // settles. Keep the source claim and retry without replaying the job.
+        // The daemon distinguishes this typed pending state from failures so
+        // an early safe probe does not impose a ten-minute failure backoff.
+        return Err(rch_common::job_recovery::WorkerSettlementPending.into());
     };
     // A legacy cancellation can stop before finish-cancel or lose its
     // completed receipt to retention. Its exact marker still denies normal
@@ -13813,6 +13815,152 @@ func TestValue(t *testing.T) {{
             before,
             "a started attempt cannot contact the worker's cancellation path or rewrite its journal"
         );
+    }
+
+    /// A real local wrapper dies; the isolated SSH-process fixture supplies
+    /// worker observations. This exercises detached recovery's production
+    /// entry point, not a live SSH worker or a compiler execution.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn dead_execute_wrapper_waits_for_worker_settlement_without_retirement() {
+        use rch_common::job_recovery::WorkerSettlementPending;
+        use rch_common::process_identity::{
+            OwnerPresence, ProcessObservation, observe_process, owner_presence,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        const CHILD: &str = "RCH_TEST_PENDING_RECOVERY_ROOT";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::dead_execute_wrapper_waits_for_worker_settlement_without_retirement"
+        );
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap().keep();
+            let ssh = root.join("ssh");
+            std::fs::write(
+                &ssh,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_TEST_PENDING_RECOVERY_ROOT
+mode=$(cat "$root/mode")
+case "$*" in
+  *'if [ -f '*)
+    printf 'completion\n' >> "$root/calls"
+    case "$mode" in
+      receipt-failed) exit 7 ;;
+      foreign-receipt) printf 'another-execution 0\n' ;;
+    esac
+    ;;
+  *'sh -s'*)
+    payload=$(cat)
+    case "$payload" in
+      *'rch-exec-probe'*) ;;
+      *) printf 'unexpected\n' >> "$root/calls"; exit 8 ;;
+    esac
+    printf 'probe\n' >> "$root/calls"
+    case "$mode" in
+      active) printf 'RCH_EXEC_ACTIVE\n' ;;
+      completion-race) printf 'RCH_EXEC_COMPLETED\n' ;;
+      malformed) printf 'RCH_EXEC_ACTIVE\nRCH_EXEC_LOST\n' ;;
+      failed) printf 'RCH_EXEC_ACTIVE\n'; exit 9 ;;
+      *) exit 10 ;;
+    esac
+    ;;
+  *) printf 'unexpected\n' >> "$root/calls"; exit 11 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(std::iter::once(root.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST.split_once("::").unwrap().1, "--nocapture"])
+                    .env(CHILD, &root)
+                    .env("PATH", path)
+                    .env_remove("RCH_MOCK_SSH")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("bounded pending-worker recovery fixture")
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.prepared = true;
+        recipe.execution_started = true;
+        writer
+            .set_recovery(serde_json::to_value(&recipe).unwrap())
+            .unwrap();
+        let mut wrapper = std::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = wrapper.id();
+        let observation = observe_process(pid);
+        wrapper.kill().unwrap();
+        wrapper.wait().unwrap();
+        let ProcessObservation::Present(birth) = observation else {
+            panic!("fixture wrapper has no precise process identity: {observation:?}");
+        };
+        {
+            let mut lease = writer.lease.lock().unwrap();
+            lease.wrapper_pid = pid;
+            lease.process_birth = Some(birth.clone());
+            lease.phase = "execute".into();
+        }
+        writer.persist().unwrap();
+        assert_eq!(owner_presence(pid, Some(&birth)), OwnerPresence::Absent);
+        let before = writer.snapshot();
+        let journal = std::fs::read(&writer.path).unwrap();
+        for (mode, pending, calls) in [
+            ("active", true, "completion\nprobe\n"),
+            ("completion-race", true, "completion\nprobe\n"),
+            ("malformed", false, "completion\nprobe\n"),
+            ("failed", false, "completion\nprobe\n"),
+            ("receipt-failed", false, "completion\n"),
+            ("foreign-receipt", false, "completion\n"),
+        ] {
+            std::fs::write(root.join("mode"), mode).unwrap();
+            std::fs::write(root.join("calls"), b"").unwrap();
+            let error = Box::pin(recover_job_with_daemon(&writer, async |_: &str| {
+                panic!("unsettled worker must not release daemon ownership")
+            }))
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.is::<WorkerSettlementPending>(),
+                pending,
+                "{mode}: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("calls")).unwrap(),
+                calls,
+                "{mode}"
+            );
+            assert_eq!(writer.snapshot(), before, "{mode}");
+            assert_eq!(std::fs::read(&writer.path).unwrap(), journal, "{mode}");
+            assert!(!load_recipe(&writer).unwrap().retired);
+            assert!(!writer.snapshot().terminal_acknowledged);
+            assert!(!cancel_preparation(&writer).await.unwrap());
+            assert!(writer.ensure_released_for_retry().is_err());
+            // A pending observation must release the local recovery gate so
+            // another bounded attempt can inspect later worker settlement.
+            drop(recovery_owner::claim_journal(&writer).await.unwrap());
+        }
     }
 
     #[test]

@@ -1463,8 +1463,10 @@ fn remote_execution_probe_script(
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     Ok(format!(
         "[ -d {registry} ] || {{ echo RCH_EXEC_LOST; exit 0; }}; \
-         flock -n {lock} sh -c 'if [ -e \"$1\" ] || [ -L \"$1\" ]; then echo RCH_EXEC_COMPLETED; \
-         else echo RCH_EXEC_LOST; fi' rch-exec-probe {receipt} || echo RCH_EXEC_ACTIVE",
+         if flock -n -E 75 {lock} sh -c 'if [ -e \"$1\" ] || [ -L \"$1\" ]; then echo RCH_EXEC_COMPLETED; \
+         else echo RCH_EXEC_LOST; fi' rch-exec-probe {receipt}; then :; \
+         else status=$?; if [ \"$status\" -eq 75 ]; then echo RCH_EXEC_ACTIVE; \
+         else exit \"$status\"; fi; fi",
         registry = quote(registry),
         lock = quote(&format!("{registry}/{identity}.activity.lock")),
         receipt = quote(receipt),
@@ -1472,8 +1474,9 @@ fn remote_execution_probe_script(
 }
 
 /// True only when the probe proves the execution is lost (see
-/// [`remote_execution_probe_script`]); any other answer or error keeps the
-/// conservative "not complete yet" verdict.
+/// [`remote_execution_probe_script`]). Active or newly completed executions
+/// remain pending; malformed or failed probes remain errors so they cannot
+/// bypass automatic recovery's failure backoff.
 pub(super) async fn remote_execution_lost(
     worker: &WorkerConfig,
     identity: &str,
@@ -1488,10 +1491,23 @@ pub(super) async fn remote_execution_lost(
         rch_common::timing::scale_duration(Duration::from_secs(15)),
     )
     .await?;
-    Ok(output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == "RCH_EXEC_LOST"))
+    parse_remote_execution_probe(&output)
+}
+
+fn parse_remote_execution_probe(output: &Output) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        output.status.success(),
+        "remote execution probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match std::str::from_utf8(&output.stdout)
+        .context("remote execution probe response is not UTF-8")?
+        .trim()
+    {
+        "RCH_EXEC_LOST" => Ok(true),
+        "RCH_EXEC_ACTIVE" | "RCH_EXEC_COMPLETED" => Ok(false),
+        _ => anyhow::bail!("invalid remote execution probe response; ownership retained"),
+    }
 }
 
 /// Reconcile an exact release after completed retrieval. This grants no source
@@ -3946,7 +3962,10 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .unwrap();
             let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
             assert!(output.status.success());
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            let lost = parse_remote_execution_probe(&output).unwrap();
+            let verdict = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+            assert_eq!(lost, verdict == "RCH_EXEC_LOST");
+            verdict
         };
 
         assert_eq!(probe(&registry), "RCH_EXEC_LOST", "free lock, no receipt");
@@ -3984,9 +4003,112 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         assert_eq!(probe(&registry), "RCH_EXEC_ACTIVE", "lock held");
         holder.kill().unwrap();
         holder.wait().unwrap();
+        assert_eq!(
+            probe(&registry),
+            "RCH_EXEC_LOST",
+            "killed and reaped activity owner without a receipt"
+        );
 
         std::fs::write(&receipt, "id 0\n").unwrap();
         assert_eq!(probe(&registry), "RCH_EXEC_COMPLETED", "receipt present");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_probe_requires_one_exact_successful_worker_verdict() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (stdout, expected) in [
+            ("RCH_EXEC_ACTIVE\n", Some(false)),
+            ("RCH_EXEC_COMPLETED\n", Some(false)),
+            ("RCH_EXEC_LOST\n", Some(true)),
+            ("", None),
+            ("RCH_EXEC_UNKNOWN\n", None),
+            ("diagnostic\nRCH_EXEC_LOST\n", None),
+            ("RCH_EXEC_ACTIVE\nRCH_EXEC_LOST\n", None),
+            ("RCH_EXEC_LOST\nRCH_EXEC_LOST\n", None),
+        ] {
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(
+                parse_remote_execution_probe(&output).ok(),
+                expected,
+                "{stdout:?}"
+            );
+        }
+        for stdout in [
+            b"RCH_EXEC_LOST\n".as_slice(),
+            b"RCH_EXEC_ACTIVE\n".as_slice(),
+        ] {
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: stdout.to_vec(),
+                stderr: b"worker probe failed".to_vec(),
+            };
+            assert!(parse_remote_execution_probe(&output).is_err());
+        }
+        let invalid_utf8 = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![0xff],
+            stderr: Vec::new(),
+        };
+        assert!(parse_remote_execution_probe(&invalid_utf8).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_execution_probe_keeps_flock_failures_distinct_from_contention() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        let bin = directory.path().join("bin");
+        let absent_bin = directory.path().join("empty-bin");
+        for path in [&registry, &bin, &absent_bin] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let script = remote_execution_probe_script(
+            registry.to_str().unwrap(),
+            "0123456789abcdef0123456789abcdef",
+            directory.path().join("receipt").to_str().unwrap(),
+        )
+        .unwrap();
+        let flock = bin.join("flock");
+        std::fs::write(
+            &flock,
+            "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -E ] && [ \"$3\" = 75 ] || exit 99\nexit \"$RCH_TEST_FLOCK_STATUS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&flock, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for status in [1, 2, 66, 69, 75, 127] {
+            let output = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", &bin)
+                .env("RCH_TEST_FLOCK_STATUS", status.to_string())
+                .output()
+                .unwrap();
+            if status == 75 {
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"RCH_EXEC_ACTIVE\n");
+                assert!(!parse_remote_execution_probe(&output).unwrap());
+            } else {
+                assert_eq!(output.status.code(), Some(status));
+                assert!(output.stdout.is_empty());
+                assert!(parse_remote_execution_probe(&output).is_err());
+            }
+        }
+        let unavailable = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", absent_bin)
+            .output()
+            .unwrap();
+        assert_eq!(unavailable.status.code(), Some(127));
+        assert!(unavailable.stdout.is_empty());
+        assert!(parse_remote_execution_probe(&unavailable).is_err());
     }
 
     #[cfg(target_os = "linux")]
