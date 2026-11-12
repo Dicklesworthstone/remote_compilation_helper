@@ -4,7 +4,6 @@ use crate::{
     DaemonContext,
     history::{QueuedBuildState, StuckDetectorSnapshot, WrapperCancellation},
 };
-use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -466,7 +465,17 @@ impl ActiveBuildCleanup {
 }
 
 fn build_stuck_evidence(build: &crate::history::ActiveBuildState, now: Instant) -> StuckEvidence {
-    let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
+    use rch_common::process_identity::{OwnerPresence, ProcessIdentity, owner_presence};
+
+    let expected = build
+        .hook_process_identity
+        .as_deref()
+        .and_then(ProcessIdentity::from_record);
+    // A PID can outlive its original hook through reuse or a zombie. Only
+    // proven absence of that owner is dead-hook evidence; failed inspection
+    // retains the build under the existing live-hook observation thresholds.
+    let hook_alive = build.hook_pid == 0
+        || owner_presence(build.hook_pid, expected.as_ref()) != OwnerPresence::Absent;
     let heartbeat_age_secs = now
         .checked_duration_since(build.last_heartbeat_mono)
         .unwrap_or_default()
@@ -506,27 +515,6 @@ fn live_hook_heartbeat_stale_secs(phase: &rch_common::BuildHeartbeatPhase) -> u6
     }
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    // Check /proc first (Linux only) - efficient check without syscall overhead
-    if cfg!(target_os = "linux") {
-        return Path::new(&format!("/proc/{}", pid)).exists();
-    }
-
-    // Fallback to kill -0 for other Unix systems
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,10 +522,145 @@ mod tests {
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod active_owners {
+        use super::*;
+        use crate::history::{ActiveBuildState, BuildHistory};
+        use rch_common::process_identity::{ProcessIdentity, ProcessStart};
+
+        struct Owner(std::process::Child);
+
+        impl Owner {
+            fn start() -> Self {
+                Self(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+        }
+
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn build(pid: u32) -> (ActiveBuildState, Instant) {
+            let mut build = BuildHistory::new(10)
+                .try_start_active_build_with_wrapper(
+                    "active-owner".into(),
+                    "worker".into(),
+                    "cargo check".into(),
+                    pid,
+                    None,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                )
+                .unwrap()
+                .unwrap();
+            // Synthetic ages exercise the real detector without waiting for
+            // a timeout: only a proven dead owner may trigger at this point.
+            let now = Instant::now() + Duration::from_secs(180);
+            build.started_at_mono = now - Duration::from_secs(180);
+            build.last_progress_mono = now - Duration::from_secs(120);
+            build.last_heartbeat_mono = now - Duration::from_secs(45);
+            (build, now)
+        }
+
+        fn assert_evidence(build: &mut ActiveBuildState, now: Instant, alive: bool) {
+            for phase in [
+                BuildHeartbeatPhase::SyncUp,
+                BuildHeartbeatPhase::Execute,
+                BuildHeartbeatPhase::SyncDown,
+                BuildHeartbeatPhase::Finalize,
+            ] {
+                build.heartbeat_phase = phase;
+                let evidence = build_stuck_evidence(build, now);
+                assert_eq!(evidence.hook_alive, alive, "{:?}", build.heartbeat_phase);
+                assert_eq!(
+                    evidence.should_remediate(),
+                    !alive,
+                    "{:?}",
+                    build.heartbeat_phase
+                );
+            }
+        }
+
+        #[test]
+        fn live_and_unverified_active_owners_keep_the_live_hook_grace() {
+            let mut owner = Owner::start();
+            let (mut build, now) = build(owner.0.id());
+            let actual = build.hook_process_identity.clone().unwrap();
+            assert_evidence(&mut build, now, true);
+            let mut incompatible = ProcessIdentity::from_record(&actual).unwrap();
+            incompatible.start = match incompatible.start {
+                ProcessStart::Linux { .. } => ProcessStart::Darwin {
+                    seconds: 1,
+                    microseconds: 0,
+                },
+                ProcessStart::Darwin { .. } => ProcessStart::Linux { ticks: 1 },
+            };
+            for expected in [
+                None,
+                Some(format!("{actual}-malformed")),
+                incompatible.to_record(),
+            ] {
+                build.hook_process_identity = expected;
+                assert_evidence(&mut build, now, true);
+            }
+            assert!(owner.0.try_wait().unwrap().is_none());
+        }
+
+        #[test]
+        fn replaced_active_owner_uses_dead_hook_threshold_without_signalling_occupant() {
+            let mut owner = Owner::start();
+            let (mut build, now) = build(owner.0.id());
+            let mut previous =
+                ProcessIdentity::from_record(build.hook_process_identity.as_deref().unwrap())
+                    .unwrap();
+            // Model a different recorded birth; do not claim actual PID reuse.
+            previous.start = match previous.start {
+                ProcessStart::Linux { ticks } => ProcessStart::Linux { ticks: ticks ^ 1 },
+                ProcessStart::Darwin {
+                    seconds,
+                    microseconds,
+                } => ProcessStart::Darwin {
+                    seconds,
+                    microseconds: (microseconds + 1) % 1_000_000,
+                },
+            };
+            build.hook_process_identity = previous.to_record();
+            assert_evidence(&mut build, now, false);
+            assert!(owner.0.try_wait().unwrap().is_none());
+        }
+
+        #[test]
+        fn exited_active_owner_uses_dead_hook_threshold_even_without_birth_record() {
+            let mut owner = Owner::start();
+            let (mut build, now) = build(owner.0.id());
+            assert!(build.hook_process_identity.is_some());
+            owner.0.kill().unwrap();
+            owner.0.wait().unwrap();
+            assert_evidence(&mut build, now, false);
+            build.hook_process_identity = None;
+            assert_evidence(&mut build, now, false);
+        }
+
+        #[test]
+        fn unrecorded_zero_pid_keeps_existing_active_owner_policy() {
+            let (mut build, now) = build(0);
+            assert_evidence(&mut build, now, true);
+        }
+    }
+
     #[cfg(unix)]
     mod recovered_queue {
         use super::*;
         use crate::history::BuildHistory;
+        use std::path::Path;
         use std::sync::Arc;
 
         struct Owner(std::process::Child);
