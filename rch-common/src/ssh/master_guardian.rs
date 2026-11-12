@@ -13,15 +13,16 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 const ARGUMENT: &str = "--rch-internal-ssh-master-guardian-v1";
 const EXECUTABLE_NAME: &str = "rch-ssh-guard";
 const RESULT: &str = "RCH_SSH_MASTER_RESULT_V1 ";
 const RESULT_LIMIT: usize = 128 * 1024;
 static REGISTERED: AtomicBool = AtomicBool::new(false);
-static HELPER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+#[cfg(not(target_os = "linux"))]
+static HELPER_PATH: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
 
 /// Call before constructing a runtime or handling ordinary CLI/hook input.
 ///
@@ -275,16 +276,21 @@ fn helper_command(
     arguments: Vec<OsString>,
     directory: &Path,
 ) -> io::Result<tokio::process::Command> {
-    let executable = HELPER_PATH
-        .get_or_init(|| {
-            std::env::current_exe()
-                .and_then(std::fs::canonicalize)
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map_err(|error| io::Error::other(error.clone()))?;
     let alias = directory.join(EXECUTABLE_NAME);
-    create_executable_alias(executable, &alias)?;
+    #[cfg(target_os = "linux")]
+    create_running_image_alias(&alias)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let executable = HELPER_PATH
+            .get_or_init(|| {
+                std::env::current_exe()
+                    .and_then(std::fs::canonicalize)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| io::Error::other(error.clone()))?;
+        create_executable_alias(executable, &alias)?;
+    }
     // Use this basename even when the alias is a Linux symlink. Canonicalizing
     // it here would make a name-based `killall rchd` kill the guardian too.
     let mut helper = tokio::process::Command::new(alias);
@@ -312,6 +318,29 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+#[cfg(target_os = "linux")]
+fn create_running_image_alias(alias: &Path) -> io::Result<()> {
+    // This kernel-owned magic link opens the running image even after an
+    // atomic upgrade unlinks its original pathname. Resolve it only inside
+    // exec, while the fork child still owns that image; never cache readlink
+    // text, canonicalize it, or tie it to the parent's continued existence.
+    let executable = Path::new("/proc/self/exe");
+    let original = std::fs::metadata(executable)?;
+    if !original.is_file() {
+        return Err(io::Error::other(
+            "SSH guardian running image is not a regular file",
+        ));
+    }
+    std::os::unix::fs::symlink(executable, alias)?;
+    if !same_file(&original, &std::fs::metadata(alias)?) {
+        return Err(io::Error::other(
+            "SSH guardian running image identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
 fn create_executable_alias(executable: &Path, alias: &Path) -> io::Result<()> {
     let original = std::fs::symlink_metadata(executable)?;
     if !original.is_file() {
@@ -336,24 +365,11 @@ fn create_executable_alias(executable: &Path, alias: &Path) -> io::Result<()> {
                     | io::ErrorKind::Unsupported
             ) =>
         {
-            // Linux takes comm from the original exec filename, even across
-            // a symlink. XNU instead uses the resolved final component, so a
-            // symlink on macOS would leave the helper's kernel name as rchd.
-            #[cfg(target_os = "linux")]
-            {
-                std::os::unix::fs::symlink(executable, alias)?;
-                if !same_file(&original, &std::fs::metadata(alias)?) {
-                    return Err(io::Error::other("SSH guardian executable identity changed"));
-                }
-                Ok(())
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // A split-filesystem or protected installation may require
-                // one private executable copy per connection. Prefer the
-                // zero-copy hard link, and retire either with its control dir.
-                copy_executable_alias(executable, alias, &original)
-            }
+            // XNU uses the resolved final component for the kernel process
+            // name, so a symlink would leave it as rchd. Split-filesystem or
+            // protected installations need a private executable copy instead.
+            // Prefer the zero-copy hard link, and retire either with its dir.
+            copy_executable_alias(executable, alias, &original)
         }
         // In particular, never replace an already existing alias.
         Err(error) => Err(error),
@@ -721,6 +737,76 @@ exit 37
         assert!(DirectoryIdentity::read(directory.path()).is_ok());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_image_alias_survives_atomic_executable_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("owner");
+        let alias = root.path().join(EXECUTABLE_NAME);
+        // A small disposable native executable keeps this regression separate
+        // from the test runner's own image and any concurrently running tests.
+        std::fs::copy("/bin/sh", &executable).unwrap();
+        create_running_image_alias(&alias).unwrap();
+        assert_eq!(
+            std::fs::read_link(&alias).unwrap(),
+            Path::new("/proc/self/exe")
+        );
+        let mut owner = Unrelated(
+            std::process::Command::new(&executable)
+                .args([
+                    "-c",
+                    r#": > "$1/ready"
+while [ ! -f "$1/replaced" ]; do sleep 0.01; done
+exec "$1/rch-ssh-guard" -c 'printf "resumed\n" > "$1/resumed"' rch-image-resumed "$1"
+"#,
+                    "rch-image-owner",
+                ])
+                .arg(root.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.path().join("ready").exists() {
+            assert!(owner.0.try_wait().unwrap().is_none());
+            assert!(
+                Instant::now() < deadline,
+                "disposable owner failed to start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 97\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+        assert!(
+            std::fs::read_link(format!("/proc/{}/exe", owner.0.id()))
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)")
+        );
+        std::fs::write(root.path().join("replaced"), b"continue").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = owner.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "running-image re-exec did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "re-exec must not run the replacement stub: {status}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("resumed")).unwrap(),
+            b"resumed\n"
+        );
+    }
+
     #[test]
     fn executable_hard_link_preserves_installed_file_permissions() {
         let root = tempfile::tempdir().unwrap();
@@ -748,6 +834,11 @@ exit 37
             create_executable_alias(&executable, &alias)
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            create_running_image_alias(&alias).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(alias).unwrap(), b"must survive");

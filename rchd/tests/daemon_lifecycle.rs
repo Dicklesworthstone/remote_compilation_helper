@@ -77,6 +77,305 @@ fn rchd_binary_path() -> PathBuf {
     cargo_target_dir().join("debug").join("rchd")
 }
 
+// Exercise the production guardian dispatch through ordinary daemon startup.
+// Only the SSH executable is replaced; the daemon, health monitor, connection
+// pool, process groups and parent-death pipe are real.
+#[cfg(target_os = "linux")]
+mod ssh_guardian_integration {
+    use super::*;
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    struct Daemon {
+        child: Child,
+        root: tempfile::TempDir,
+    }
+
+    struct Master {
+        pid: u32,
+        proxy: u32,
+        guardian: u32,
+        socket: PathBuf,
+    }
+
+    impl Master {
+        fn processes_exist(&self) -> bool {
+            [self.pid, self.proxy, self.guardian].iter().all(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(')')
+                            .and_then(|(_, fields)| fields.split_whitespace().next())
+                            .map(|state| !matches!(state, "Z" | "X"))
+                    })
+                    .unwrap_or(false)
+            })
+        }
+
+        fn reaped(&self) -> bool {
+            // Zombies still have /proc entries: merely delivering SIGKILL is
+            // insufficient. The independent guardian must also wait for them.
+            [self.pid, self.proxy]
+                .iter()
+                .all(|pid| !Path::new("/proc").join(pid.to_string()).exists())
+        }
+    }
+
+    impl Daemon {
+        fn start() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("rch-ssh-owner-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            for directory in ["bin", "config", "run"] {
+                std::fs::create_dir(root.path().join(directory)).unwrap();
+            }
+            std::fs::write(
+                root.path().join("config/workers.toml"),
+                "[[workers]]\nid = \"guardian-fixture\"\nhost = \"guardian.invalid\"\n\
+                 user = \"fixture\"\nidentity_file = \"/nonexistent/rch-guardian-key\"\n\
+                 total_slots = 1\n",
+            )
+            .unwrap();
+            let ssh = root.path().join("bin/ssh");
+            std::fs::write(
+                &ssh,
+                r#"#!/bin/sh
+set -eu
+root=$RCH_SSH_FIXTURE_ROOT
+request=$*
+operation=command
+socket=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -G) operation=config; shift ;;
+        -M) operation=master; shift ;;
+        -S) socket=$2; shift 2 ;;
+        -O) operation=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case "$operation" in
+    config) printf 'hostname none\nforkafterauthentication no\n'; exit 0 ;;
+    check) [ -f "$socket" ]; exit ;;
+    master)
+        sleep 60 </dev/null >/dev/null 2>&1 &
+        proxy=$!
+        printf '%s\t%s\t%s\t%s\n' "$$" "$proxy" "$socket" "$PPID" > "$root/master-$$"
+        : > "$socket"
+        wait "$proxy"
+        ;;
+    command)
+        case "$request" in
+            *rch_source_registry_health*)
+                printf '%s\n' "$socket" >> "$root/connected"
+                printf 'health_check\n'
+                ;;
+            *) printf '{}\n' ;;
+        esac
+        ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_rchd"))
+                .env_clear()
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+                )
+                .env("RCH_SSH_FIXTURE_ROOT", root.path())
+                .env("RCH_CONFIG_DIR", root.path().join("config"))
+                .env("RCH_STATE_HOME", root.path().join("state"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("XDG_STATE_HOME", root.path().join("xdg-state"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("RCH_NO_SELF_HEALING", "1")
+                .env("NO_COLOR", "1")
+                .args(["--foreground", "--metrics-port", "0", "--no-hot-reload"])
+                .arg("--socket")
+                .arg(root.path().join("rch.sock"))
+                .arg("--history-file")
+                .arg(root.path().join("history.jsonl"))
+                .arg("--workers-config")
+                .arg(root.path().join("config/workers.toml"))
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            Self { child, root }
+        }
+
+        fn masters(&self) -> Vec<Master> {
+            std::fs::read_dir(self.root.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| entry.file_name().as_encoded_bytes().starts_with(b"master-"))
+                .filter_map(|entry| {
+                    let record = std::fs::read_to_string(entry.path()).unwrap();
+                    let mut fields = record.trim_end().split('\t');
+                    Some(Master {
+                        pid: fields.next()?.parse().ok()?,
+                        proxy: fields.next()?.parse().ok()?,
+                        socket: PathBuf::from(fields.next()?),
+                        guardian: fields.next()?.parse().ok()?,
+                    })
+                })
+                .collect()
+        }
+
+        fn wait_connected(&mut self) -> Vec<Master> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let masters = self.masters();
+                let connected =
+                    std::fs::read_to_string(self.root.path().join("connected")).unwrap_or_default();
+                let established: Vec<_> = masters
+                    .into_iter()
+                    .filter(|master| {
+                        master.processes_exist()
+                            && connected
+                                .lines()
+                                .any(|path| Path::new(path) == master.socket)
+                    })
+                    .collect();
+                if !established.is_empty() {
+                    for master in &established {
+                        assert_eq!(
+                            std::fs::read_to_string(format!("/proc/{}/comm", master.guardian))
+                                .unwrap()
+                                .trim(),
+                            "rch-ssh-guard",
+                            "a daemon-name kill must not select its guardian",
+                        );
+                    }
+                    return established;
+                }
+                assert!(
+                    self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                    "daemon never established its SSH session: {}",
+                    std::fs::read_to_string(self.root.path().join("daemon.log")).unwrap(),
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn kill_and_assert_reaped(&mut self, whole_group: bool) {
+            if whole_group {
+                killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL).unwrap();
+            } else {
+                self.child.kill().unwrap();
+            }
+            self.child.wait().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let masters = self.masters();
+                assert!(!masters.is_empty(), "fixture must actually launch SSH");
+                if masters
+                    .iter()
+                    .all(|master| master.reaped() && !master.socket.parent().unwrap().exists())
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "SSH master/proxy or its private directory survived daemon death: {}",
+                    self.root.path().display(),
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn ssh_masters_and_proxies_exit_after_daemon_or_owner_group_sigkill() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ssh_guardian_integration::daemon_owner_crash_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RCH_TEST_DAEMON_SSH_GUARDIAN", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "daemon SSH lifecycle fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated subreaper used by the daemon SSH lifecycle regression"]
+    fn daemon_owner_crash_fixture() {
+        assert_eq!(
+            std::env::var("RCH_TEST_DAEMON_SSH_GUARDIAN").as_deref(),
+            Ok("1")
+        );
+        // This dedicated process runs only this fixture. Adopt orphaned
+        // guardians ourselves instead of depending on the host's PID 1 to
+        // reap them; never change subreaper behavior in the shared test runner.
+        rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT)).unwrap();
+        let result = std::panic::catch_unwind(exercise_owner_death);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let all_reaped = loop {
+            match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+                Ok(Some(_)) | Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::CHILD) => break true,
+                _ if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break false,
+            }
+        };
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(all_reaped, "daemon guardians must finish and be reaped too");
+    }
+
+    fn exercise_owner_death() {
+        let mut first = Daemon::start();
+        first.wait_connected();
+        let mut second = Daemon::start();
+        let unaffected = second.wait_connected();
+
+        first.kill_and_assert_reaped(false);
+        assert!(second.child.try_wait().unwrap().is_none());
+        assert!(
+            unaffected.iter().all(|master| {
+                master.processes_exist() && master.socket.parent().unwrap().is_dir()
+            }),
+            "another daemon's SSH ownership must remain intact"
+        );
+
+        // A caller's process-group cancellation must not kill the guardian
+        // alongside its owner and strand the master's separate process group.
+        second.kill_and_assert_reaped(true);
+    }
+}
+
 /// Send a request to the daemon via Unix socket and get the response body
 fn send_request(socket_path: &Path, request: &str) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket_path)?;
