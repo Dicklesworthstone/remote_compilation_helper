@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 use crate::api::is_process_alive;
-use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
+use crate::api::lease_owns_unretired_source;
 use crate::events::EventBus;
 use crate::workers::{OwnedRecoveryPermit, WorkerPool};
 use rch_common::WorkerConfig;
@@ -39,11 +39,10 @@ use tokio::task::{Id, JoinSet};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-/// How often the lease directory is checked for recoverable leases.
-const RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Do not contend with a just-finished wrapper's journal. This is a scheduling
-/// grace only; activity-lock and durable worker receipts authorize settlement.
-const TERMINAL_CANCELLATION_GRACE_MS: u64 = 15 * 60 * 1000;
+/// A dead wrapper can fence every worker for its project even after its slots
+/// have been released. Inspect promptly; ownership evidence, not heartbeat age,
+/// authorizes a recovery attempt. Failed attempts keep their longer backoff.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound both starts per scan interval and total in-flight recovery clients.
 /// A worker gets at most one client, so a stalled worker cannot consume every
 /// lane or serialize independent workers behind its timeout.
@@ -401,7 +400,7 @@ struct RecoveryCandidate {
     heartbeat_unix_ms: u64,
 }
 
-/// Only dead, stale source owners, pending daemon handoffs, or acknowledged
+/// Only dead source owners, pending daemon handoffs, or acknowledged
 /// cancellations lacking worker settlement enter the queue. Unreadable or
 /// noncanonical journals are not execution authority; the separate restart
 /// scan retains its fail-closed treatment of bad evidence.
@@ -425,20 +424,18 @@ fn recoverable_candidates(
         })
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
-            if terminal_cancellation_unsettled(lease) {
-                // lease_blocks_restart deliberately ignores terminal leases.
-                // Recovery must still exclude live or unverified wrappers.
-                return presence(lease) == OwnerPresence::Absent
-                    && lease.heartbeat_unix_ms > 0
-                    && (lease.heartbeat_unix_ms > now_unix_ms
-                        || now_unix_ms.saturating_sub(lease.heartbeat_unix_ms)
-                            >= TERMINAL_CANCELLATION_GRACE_MS);
-            }
-            !lease.terminal_acknowledged
-                && (lease_owns_unretired_source(lease)
-                    || retired_delivery(lease).is_some()
-                    || abandoned_without_recovery(lease, now_unix_ms))
-                && !lease_blocks_restart(lease, now_unix_ms, || presence(lease))
+            let unfinished = terminal_cancellation_unsettled(lease)
+                || (!lease.terminal_acknowledged
+                    && (lease_owns_unretired_source(lease)
+                        || retired_delivery(lease).is_some()
+                        || abandoned_without_recovery(lease, now_unix_ms)));
+            // A recent heartbeat cannot keep a provably dead owner alive.
+            // Reusing the restart barrier's fifteen-minute grace stranded
+            // execute/finalize leases after wrapper death or a build deadline
+            // (GH #134). Recovery still claims the journal's exclusive gate
+            // and confirms exact worker/daemon receipts before releasing any
+            // source fence; merely scheduling it changes no durable evidence.
+            unfinished && presence(lease) == OwnerPresence::Absent
         })
         .filter_map(|lease| {
             Some(RecoveryCandidate {
@@ -582,6 +579,14 @@ impl RecoveryQueue {
     }
 }
 
+fn recovery_scan_interval() -> tokio::time::Interval {
+    // The first tick is immediate: a daemon restart must not introduce a new
+    // grace window for leases whose recorded owner is already gone.
+    let mut ticker = tokio::time::interval(RECOVERY_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}
+
 /// Start the recovery loop. `socket` is this daemon's socket; the child
 /// `rch` is pointed at it so it never reconciles against another daemon.
 pub(crate) fn start(
@@ -599,9 +604,7 @@ pub(crate) fn start(
             }
         };
         let mut queue = RecoveryQueue::default();
-        let mut ticker =
-            tokio::time::interval_at(Instant::now() + RECOVERY_INTERVAL, RECOVERY_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = recovery_scan_interval();
         loop {
             tokio::select! {
                 completed = queue.next_completed(), if !queue.running.is_empty() => {
@@ -1028,6 +1031,20 @@ mod tests {
 
     fn test_recovery_window() -> RecoveryWindow {
         RecoveryWindow::new(TimingScale::default()).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_scan_runs_immediately_and_skips_missed_ticks() {
+        let started = Instant::now();
+        let mut ticker = recovery_scan_interval();
+        assert_eq!(ticker.tick().await, started);
+        assert_eq!(Instant::now(), started, "startup must not delay recovery");
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(30));
+
+        // A stalled scan must not replay a burst of missed admission budgets.
+        tokio::time::advance(Duration::from_secs(95)).await;
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(60));
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(150));
     }
 
     /// A fake `rch` for recovery: a hard link to one shim written once per
@@ -2352,10 +2369,12 @@ mod tests {
         }
 
         // A zero-status client without new settlement/acknowledgement evidence
-        // is a failed recovery. Repeated five-minute scans must back off, keep
-        // every durable reservation, and eventually inspect all nine wrappers.
+        // is a failed recovery. Scans over the same 45-minute retry window
+        // must back off, keep every durable reservation, and eventually
+        // inspect all nine wrappers even with the shorter polling interval.
         let mut queue = RecoveryQueue::default();
-        for _ in 0..9 {
+        let retry_window_end = Instant::now() + Duration::from_secs(45 * 60);
+        while Instant::now() < retry_window_end {
             queue.refresh(scan());
             queue.start_ready(Instant::now(), |job| {
                 let before = read_lease(directory.path(), &job.wrapper_id).unwrap();
@@ -3600,7 +3619,7 @@ mod tests {
     }
 
     #[test]
-    fn only_dead_stale_unacknowledged_source_owners_are_recoverable() {
+    fn only_provably_dead_unacknowledged_source_owners_are_recoverable() {
         let dir = tempfile::tempdir().unwrap();
         let now = 100 * 60 * 60 * 1000;
         let stale = now - 60 * 60 * 1000;
@@ -3629,7 +3648,13 @@ mod tests {
 
         let ids = recoverable_lease_ids(dir.path(), now, |pid| pid == live);
 
-        assert_eq!(ids, vec![leases[0].1.identity.local_wrapper_id.clone()]);
+        assert_eq!(
+            ids,
+            vec![
+                leases[0].1.identity.local_wrapper_id.clone(),
+                leases[2].1.identity.local_wrapper_id.clone(),
+            ]
+        );
     }
 
     #[test]
@@ -3654,12 +3679,133 @@ mod tests {
         )
         .unwrap();
 
-        for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
-            assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+        for heartbeat in [0, now - 60 * 60 * 1000, now, now + 60 * 60 * 1000] {
+            let mut lease = candidate.clone();
+            lease.heartbeat_unix_ms = heartbeat;
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(&lease).unwrap(),
+            )
+            .unwrap();
+            for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
+                assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+            }
+            let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
         }
-        let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn freshly_killed_execute_and_finalize_owners_are_queued_without_releasing_evidence() {
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+
+        let directory = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read -r gate"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let ProcessObservation::Present(birth) = observe_process(pid) else {
+            panic!("test wrapper must have a native process birth identity");
+        };
+        let mut journals = Vec::new();
+        let mut expected = Vec::new();
+        for phase in ["execute", "finalize"] {
+            let mut lease = lease(
+                now,
+                pid,
+                serde_json::json!({"source_roots":["/owned/source"],"retired":false}),
+            );
+            lease.phase = phase.into();
+            lease.process_birth = Some(birth.clone());
+            let path = directory
+                .path()
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            expected.push(lease.identity.local_wrapper_id);
+            journals.push((path, bytes));
+        }
+        let scan = || {
+            recoverable_candidates(directory.path(), now, |lease| {
+                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+            })
+        };
+        assert!(scan().is_empty(), "the live wrapper still owns both leases");
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        assert_eq!(owner_presence(pid, Some(&birth)), OwnerPresence::Absent);
+
+        expected.sort();
+        assert_eq!(
+            scan()
+                .into_iter()
+                .map(|candidate| candidate.wrapper_id)
+                .collect::<Vec<_>>(),
+            expected,
+            "a fresh heartbeat must not defer a provably dead execute/finalize owner"
+        );
+        for (path, bytes) in journals {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fresh_heartbeat_does_not_hide_recycled_wrapper_identity() {
+        use rch_common::process_identity::{ProcessStart, current_process_identity};
+
+        let directory = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let birth = current_process_identity().unwrap();
+        let mut previous_birth = birth.clone();
+        match &mut previous_birth.start {
+            ProcessStart::Linux { ticks } => *ticks = ticks.checked_add(1).unwrap(),
+            ProcessStart::Darwin { seconds, .. } => {
+                *seconds = seconds.checked_add(1).unwrap();
+            }
+        }
+        let mut expected = None;
+        for (identity, presence) in [
+            (Some(birth), OwnerPresence::Live),
+            (None, OwnerPresence::Unknown),
+            (Some(previous_birth), OwnerPresence::Absent),
+        ] {
+            let mut lease = lease(
+                now,
+                std::process::id(),
+                serde_json::json!({"source_roots":["/owned/source"],"retired":false}),
+            );
+            lease.process_birth = identity;
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(&lease).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()),
+                presence
+            );
+            if presence == OwnerPresence::Absent {
+                assert!(expected.is_none());
+                expected = Some(lease.identity.local_wrapper_id);
+            }
+        }
+        let candidates = recoverable_candidates(directory.path(), now, |lease| {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].wrapper_id, expected.unwrap());
     }
 
     #[test]
@@ -3761,6 +3907,7 @@ mod tests {
             interrupted.identity.local_wrapper_id.clone(),
         ];
         expected.sort();
+        expected.push(fresh.identity.local_wrapper_id.clone());
         for _restart in 0..2 {
             let candidates = recoverable_candidates(dir.path(), now, presence);
             assert_eq!(
@@ -4010,7 +4157,10 @@ mod tests {
         }
         assert_eq!(
             recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
-            std::slice::from_ref(&pending.identity.local_wrapper_id)
+            [
+                pending.identity.local_wrapper_id,
+                fresh.identity.local_wrapper_id,
+            ]
         );
     }
 

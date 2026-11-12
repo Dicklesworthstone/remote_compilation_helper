@@ -1652,17 +1652,6 @@ async fn main() -> Result<()> {
     let active_cleanup = cleanup::ActiveBuildCleanup::new(context.clone());
     let mut active_cleanup_handle = Some(active_cleanup.start());
 
-    // Finish dead client leases that still own worker source (bd-nalyr). An
-    // isolated test pool must not reconcile the operator's real leases.
-    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
-        let _lease_recovery = lease_recovery::start(
-            context.events.clone(),
-            cli.socket.clone(),
-            admin_disable_store.clone(),
-            context.pool.clone(),
-        );
-    }
-
     let worker_status_panel = Arc::new(Mutex::new(
         WorkerStatusPanel::new()
             .with_verbose(cli.verbose)
@@ -1974,6 +1963,19 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Finish dead client leases that still own worker source (bd-nalyr). Start
+    // only once startup is complete: the immediate scan must not race an IPC
+    // listener that is bound but not yet serving and back off for ten minutes.
+    // An isolated test pool must not reconcile the operator's real leases.
+    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
+        let _lease_recovery = lease_recovery::start(
+            context.events.clone(),
+            cli.socket.clone(),
+            admin_disable_store.clone(),
+            context.pool.clone(),
+        );
     }
 
     // Main accept loop - platform-specific due to SIGHUP handling
