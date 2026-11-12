@@ -58,7 +58,10 @@ impl Fixture {
             private_directory(path);
         }
         symlink("/bin/sh", native_path.join("sh")).unwrap();
-        let digest = format!("{:x}", Sha256::digest(ROOTS));
+        let digest: String = Sha256::digest(ROOTS)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let selected = if namespace == "current" {
             &current
         } else {

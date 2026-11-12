@@ -668,7 +668,11 @@ mod unix {
         ensure!(
             !roots.is_empty()
                 && roots.len() as u64 <= MAX_ROOTS_BYTES
-                && format!("{:x}", Sha256::digest(&roots)) == request.digest,
+                && Sha256::digest(&roots)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+                    == request.digest,
             "settlement roots do not match identity digest"
         );
         let mut state = State::open(request)?;
@@ -737,7 +741,10 @@ mod unix {
                     directory(path);
                     record(&path.join("metadata.lock"));
                 }
-                let digest = format!("{:x}", Sha256::digest(ROOTS));
+                let digest: String = Sha256::digest(ROOTS)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
                 if evidence {
                     record(&current.join(format!("{TOKEN}.{digest}.claim")));
                 }
