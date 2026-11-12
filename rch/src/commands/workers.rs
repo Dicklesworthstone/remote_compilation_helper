@@ -20,8 +20,8 @@ use crate::source_topology_probe;
 use crate::source_topology_probe::{SourceTopologyOutcome, SourceTopologyProbe};
 use crate::status_types::{
     DaemonFullStatusResponse, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
-    SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
-    WorkerStatusFromApi, extract_json_body,
+    SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesRefreshFromApi,
+    WorkerCapabilitiesResponseFromApi, WorkerStatusFromApi, extract_json_body,
 };
 use crate::ui::context::OutputContext;
 use crate::ui::progress::MultiProgressManager;
@@ -677,18 +677,58 @@ pub(super) fn summarize_capabilities(capabilities: &WorkerCapabilities) -> Strin
 /// Query the daemon for worker capabilities.
 pub(super) async fn query_workers_capabilities(
     refresh: bool,
+    worker_id: Option<&str>,
 ) -> Result<WorkerCapabilitiesResponseFromApi> {
-    let command = if refresh {
-        "GET /workers/capabilities?refresh=true\n"
-    } else {
-        "GET /workers/capabilities\n"
-    };
-    let response = send_daemon_command(command).await?;
+    let command = workers_capabilities_request(refresh, worker_id);
+    let response = send_daemon_command(&command).await?;
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
     let capabilities: WorkerCapabilitiesResponseFromApi =
         serde_json::from_str(json).context("Failed to parse worker capabilities response")?;
     Ok(capabilities)
+}
+
+fn workers_capabilities_request(refresh: bool, worker_id: Option<&str>) -> String {
+    let mut command = format!("GET /workers/capabilities?refresh={refresh}");
+    if let Some(id) = worker_id {
+        command.push_str("&worker=");
+        command.push_str(&urlencoding_encode(id));
+    }
+    command.push('\n');
+    command
+}
+
+/// A direct CLI probe never publishes its own observations into daemon state.
+/// Only a fresh daemon-owned probe of its current worker may clear old verdicts.
+/// Report that independent outcome without conflating it with build admission.
+fn daemon_refresh_after_probe(
+    worker: &WorkerConfig,
+    response: Result<WorkerCapabilitiesResponseFromApi>,
+) -> WorkerCapabilitiesRefreshFromApi {
+    let failed = |message| WorkerCapabilitiesRefreshFromApi {
+        attempted: true,
+        live: false,
+        source: "unverified".into(),
+        message: Some(message),
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return failed(format!("daemon capability refresh failed: {error}")),
+    };
+    let Some(current) = response
+        .workers
+        .into_iter()
+        .find(|current| current.id == worker.id.as_str())
+    else {
+        return failed("worker is absent from the daemon's current configuration".into());
+    };
+    if current.host != worker.host || current.user != worker.user {
+        return failed("daemon refreshed a different worker endpoint; reload the configuration and probe again".into());
+    }
+    match current.refresh {
+        Some(refresh) if refresh.attempted => refresh,
+        _ => failed("daemon did not confirm a capability refresh".into()),
+    }
 }
 
 /// Query the daemon for all worker SpeedScores.
@@ -852,7 +892,7 @@ pub async fn workers_capabilities(
     ctx: &OutputContext,
 ) -> Result<()> {
     let style = ctx.theme();
-    let response = query_workers_capabilities(refresh).await?;
+    let response = query_workers_capabilities(refresh, None).await?;
     let workers = response.workers;
     let local_capabilities = probe_local_capabilities().await;
     let local_has_any = has_any_capabilities(&local_capabilities);
@@ -1164,6 +1204,14 @@ pub async fn workers_probe(
                             ),
                         );
                         let capabilities = capability_result.as_ref().ok().cloned();
+                        let daemon_refresh = if capability_result.is_ok() {
+                            Some(daemon_refresh_after_probe(
+                                worker,
+                                query_workers_capabilities(true, Some(worker.id.as_str())).await,
+                            ))
+                        } else {
+                            None
+                        };
                         let disk = disk_info_from_probe(capabilities.as_ref(), daemon_worker);
                         let missing_components = capabilities.as_ref().map_or_else(
                             || declared_components.clone(),
@@ -1191,6 +1239,7 @@ pub async fn workers_probe(
                             error: error.clone(),
                             error_code: error_code.clone(),
                             capabilities: capabilities.clone(),
+                            daemon_refresh: daemon_refresh.clone(),
                             source_topology: Some(source_topology.clone()),
                             missing_components: missing_components.clone(),
                             disk: disk.clone(),
@@ -1245,6 +1294,16 @@ pub async fn workers_probe(
                                     );
                                 }
                             }
+                            if let Some(refresh) = daemon_refresh.as_ref() {
+                                let message = if refresh.live {
+                                    style.value("refreshed; the next build rechecks its toolchain")
+                                } else {
+                                    style.warning(refresh.message.as_deref().unwrap_or(
+                                        "refresh not confirmed; run rch workers capabilities --refresh",
+                                    ))
+                                };
+                                println!("    {} {}", style.key("Daemon capabilities:"), message);
+                            }
                         }
                     }
                     Ok(false) => {
@@ -1260,6 +1319,7 @@ pub async fn workers_probe(
                             error: Some("Health check failed".to_string()),
                             error_code: Some(code),
                             capabilities: None,
+                            daemon_refresh: None,
                             source_topology: None,
                             missing_components: Vec::new(),
                             disk: disk_info_from_probe(None, daemon_worker),
@@ -1284,6 +1344,7 @@ pub async fn workers_probe(
                             error: Some(report.clone()),
                             error_code: Some(code.clone()),
                             capabilities: None,
+                            daemon_refresh: None,
                             source_topology: None,
                             missing_components: Vec::new(),
                             disk: disk_info_from_probe(None, daemon_worker),
@@ -1313,6 +1374,7 @@ pub async fn workers_probe(
                     error: Some(report.clone()),
                     error_code: Some(code.clone()),
                     capabilities: None,
+                    daemon_refresh: None,
                     source_topology: None,
                     missing_components: Vec::new(),
                     disk: disk_info_from_probe(None, daemon_worker),
@@ -2259,6 +2321,95 @@ mod probe_summary_tests {
     use rch_common::WorkerId;
 
     #[test]
+    fn probe_refresh_request_targets_one_worker_and_cannot_change_refresh_policy() {
+        assert_eq!(
+            workers_capabilities_request(true, Some("worker-1")),
+            "GET /workers/capabilities?refresh=true&worker=worker-1\n",
+        );
+        assert_eq!(
+            workers_capabilities_request(true, Some("worker&refresh=false")),
+            "GET /workers/capabilities?refresh=true&worker=worker%26refresh%3Dfalse\n",
+        );
+        assert_eq!(
+            workers_capabilities_request(false, None),
+            "GET /workers/capabilities?refresh=false\n",
+        );
+    }
+
+    #[test]
+    fn probe_refresh_reports_only_matching_daemon_evidence_and_preserves_failures() {
+        let worker = WorkerConfig {
+            id: WorkerId::new("worker-1"),
+            host: "current.example".into(),
+            user: "builder".into(),
+            identity_file: "~/.ssh/id_rsa".into(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        let response = |id: &str, host: &str, user: &str, attempted, live| {
+            Ok(WorkerCapabilitiesResponseFromApi {
+                workers: vec![WorkerCapabilitiesFromApi {
+                    id: id.into(),
+                    host: host.into(),
+                    user: user.into(),
+                    capabilities: WorkerCapabilities::mock_with_rust(),
+                    source_topology_mismatches: Vec::new(),
+                    refresh: Some(WorkerCapabilitiesRefreshFromApi {
+                        attempted,
+                        live,
+                        source: if live { "live_probe" } else { "cached" }.into(),
+                        message: (!live).then(|| "probe remains unavailable".into()),
+                    }),
+                }],
+            })
+        };
+
+        let live = daemon_refresh_after_probe(
+            &worker,
+            response("worker-1", "current.example", "builder", true, true),
+        );
+        assert!(live.live);
+        assert!(live.attempted);
+        for (id, host, user, attempted, live) in [
+            ("other-worker", "current.example", "builder", true, true),
+            ("worker-1", "replacement.example", "builder", true, true),
+            (
+                "worker-1",
+                "current.example",
+                "replacement-user",
+                true,
+                true,
+            ),
+            ("worker-1", "current.example", "builder", false, true),
+            ("worker-1", "current.example", "builder", true, false),
+        ] {
+            let refresh =
+                daemon_refresh_after_probe(&worker, response(id, host, user, attempted, live));
+            assert!(!refresh.live);
+            assert!(refresh.message.is_some());
+        }
+        let mut probe = mk("ok", None, None);
+        probe.daemon_refresh = Some(daemon_refresh_after_probe(
+            &worker,
+            Err(anyhow::anyhow!("daemon socket unavailable")),
+        ));
+        let json = serde_json::to_value(&probe).unwrap();
+        assert_eq!(
+            json["status"], "ok",
+            "direct probe remains independently reported"
+        );
+        assert_eq!(json["daemon_refresh"]["live"], false);
+        assert!(
+            json["daemon_refresh"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("socket unavailable")
+        );
+    }
+
+    #[test]
     fn pending_named_tools_remain_visible_without_becoming_verified_or_absent() {
         assert_eq!(
             format_named_tool_matrix(&WorkerCapabilities::default()),
@@ -2288,6 +2439,7 @@ mod probe_summary_tests {
             error: error.map(String::from),
             error_code: error_code.map(String::from),
             capabilities: None,
+            daemon_refresh: None,
             source_topology: None,
             missing_components: Vec::new(),
             disk: WorkerDiskInfo::default(),

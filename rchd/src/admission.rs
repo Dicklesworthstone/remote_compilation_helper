@@ -32,8 +32,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 
-/// Reuse window for a successful concrete-toolchain execution check. Selection
-/// and reservation must agree on when that authorization expires.
+/// Maximum reuse window for a definitive concrete-toolchain execution check.
+/// Capability refreshes and worker reloads revoke evidence earlier. Selection
+/// may reuse a refusal; reservation always requires a fresh successful check.
 pub(crate) const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
 
 /// Immutable execution requirements for one selection/reservation attempt.

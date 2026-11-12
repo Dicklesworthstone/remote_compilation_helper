@@ -356,16 +356,23 @@ pub async fn reload_workers(
     // Compute diff
     let diff = compute_worker_diff(pool, &new_workers).await?;
 
-    if diff.is_empty() {
+    let mut result = if diff.is_empty() {
         info!("No configuration changes detected");
-        return Ok(ReloadResult {
-            warnings,
-            ..ReloadResult::new()
-        });
-    }
+        ReloadResult::new()
+    } else {
+        apply_worker_diff(pool, &diff).await?
+    };
 
-    // Apply changes
-    let mut result = apply_worker_diff(pool, &diff).await?;
+    // Reload is also the operator's request to reconsider repaired toolchains.
+    // Invalidate both verdicts and probes begun before this successful reload,
+    // even when workers.toml is unchanged. Neither an invalid snapshot nor an
+    // inventory removal can grant new execution evidence. Active reservations
+    // and independently measured capacity remain untouched.
+    for config in &new_workers {
+        if let Some(worker) = pool.get(&config.id).await {
+            worker.invalidate_toolchain_preflight().await;
+        }
+    }
     result.warnings.extend(warnings);
 
     info!(
@@ -814,6 +821,131 @@ enabled = true
             .await
             .unwrap();
         assert!(!result.has_changes());
+    }
+
+    #[tokio::test]
+    async fn successful_reload_revokes_preflight_and_old_probes_without_losing_ownership() {
+        let _guard = test_guard!();
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+        let config_content = r#"
+[[workers]]
+id = "reload-toolchain"
+host = "worker.example"
+user = "builder"
+total_slots = 8
+enabled = true
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+        let pool = WorkerPool::new();
+        reload_workers(&pool, Some(&workers_path), true)
+            .await
+            .unwrap();
+        let worker = pool.get(&WorkerId::new("reload-toolchain")).await.unwrap();
+        let mut capabilities = rch_common::WorkerCapabilities::mock_with_rust();
+        capabilities.build_disk_free_gb = Some(1000.0);
+        capabilities.build_disk_total_gb = Some(2000.0);
+        worker.set_capabilities(capabilities).await;
+        assert!(worker.reserve_slots(2).await);
+        let retained_capabilities = serde_json::to_value(worker.capabilities().await).unwrap();
+        let retained_disk = worker.disk_capacity_observation().await.unwrap();
+        assert_eq!(
+            retained_disk.current_free_gib("reload-toolchain"),
+            Some(1000)
+        );
+
+        for usable in [false, true] {
+            worker
+                .record_toolchain_preflight(
+                    "nightly-2026-11-11".into(),
+                    usable,
+                    (!usable).then(|| "toolchain_preflight_command_failed:1:missing".into()),
+                )
+                .await;
+            let old_capability_probe = worker.capability_probe_context().await;
+            let result = reload_workers(&pool, Some(&workers_path), true)
+                .await
+                .unwrap();
+            assert!(!result.has_changes());
+            assert!(
+                worker
+                    .toolchain_preflight_status("nightly-2026-11-11")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                !worker
+                    .publish_capabilities(
+                        old_capability_probe,
+                        rch_common::WorkerCapabilities::default(),
+                    )
+                    .await
+            );
+            assert_eq!(worker.used_slots(), 2);
+            assert_eq!(
+                serde_json::to_value(worker.capabilities().await).unwrap(),
+                retained_capabilities
+            );
+            assert_eq!(
+                worker
+                    .disk_capacity_observation()
+                    .await
+                    .unwrap()
+                    .observed_at(),
+                retained_disk.observed_at(),
+            );
+            assert_eq!(
+                retained_disk.current_free_gib("reload-toolchain"),
+                Some(1000)
+            );
+        }
+        worker.release_slots(2).await;
+        assert_eq!(worker.used_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_reload_preserves_current_toolchain_evidence() {
+        let _guard = test_guard!();
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+        std::fs::write(&workers_path, "[[workers]]\nid = ").unwrap();
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("retained");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            host: "worker.example".into(),
+            user: "builder".into(),
+            identity_file: "~/.ssh/id_rsa".into(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        for usable in [false, true] {
+            worker
+                .record_toolchain_preflight(
+                    "nightly-2026-11-11".into(),
+                    usable,
+                    (!usable).then(|| "toolchain_preflight_command_failed:1:missing".into()),
+                )
+                .await;
+            let before = worker
+                .toolchain_preflight_status("nightly-2026-11-11")
+                .await;
+            assert!(
+                reload_workers(&pool, Some(&workers_path), true)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                worker
+                    .toolchain_preflight_status("nightly-2026-11-11")
+                    .await,
+                before
+            );
+        }
     }
 
     #[tokio::test]

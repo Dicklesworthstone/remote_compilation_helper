@@ -786,3 +786,591 @@ fn test_graceful_degradation() {
         .info("[e2e::pipeline] TEST PASS: test_graceful_degradation");
     harness.mark_passed();
 }
+
+/// Opt-in process integration for GH #137. This runs an actual local OpenSSH
+/// server, the daemon's real toolchain probes, `rch-wkr capabilities`, and
+/// `rch-wkr execute` with real Cargo/compiler output. Only source-registry
+/// health is supplied by the fixture: the production registry has a fixed
+/// shared /var/tmp path and must not be touched by an isolated test.
+#[cfg(target_os = "linux")]
+mod toolchain_refresh_integration {
+    use super::*;
+    use rch_common::{SelectionResponse, ToolchainInfo, WorkerConfig, WorkerId};
+    use serde_json::{Value, json};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::Path;
+    use std::process::{Child, Command, Output, Stdio};
+    use std::time::Instant;
+
+    const WORKER: &str = "toolchain-refresh-worker";
+    const TOOLCHAIN: &str = "rch-issue-137";
+
+    struct OwnedChild(Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                // The still-owned, unreaped child pins this PID. SIGTERM uses
+                // the daemon's ordinary shutdown path, which closes its SSH
+                // masters before the fixture's sshd is stopped.
+                if let Ok(pid) = i32::try_from(self.0.id()) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while matches!(self.0.try_wait(), Ok(None)) {
+                    if Instant::now() >= deadline {
+                        let _ = self.0.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    struct FixtureDirectory(Option<tempfile::TempDir>);
+
+    impl FixtureDirectory {
+        fn path(&self) -> &Path {
+            self.0.as_ref().unwrap().path()
+        }
+    }
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let path = self.0.take().unwrap().keep();
+                eprintln!(
+                    "retained toolchain integration logs and outputs: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn bounded_output(command: &Command, seconds: u32) -> Output {
+        // These fixture commands inherit the test environment and only add
+        // explicit overrides. GNU timeout supervises the command's process
+        // group, including local compiler/SSH descendants, without targeting any
+        // pre-existing process on the host.
+        let mut bounded = Command::new(executable("timeout"));
+        bounded
+            .args(["--signal=TERM", "--kill-after=2s"])
+            .arg(format!("{seconds}s"))
+            .arg(command.get_program())
+            .args(command.get_args());
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    bounded.env(name, value);
+                }
+                None => {
+                    bounded.env_remove(name);
+                }
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            bounded.current_dir(directory);
+        }
+        bounded.output().expect("start bounded fixture command")
+    }
+
+    fn checked(command: &mut Command) -> Output {
+        let output = bounded_output(command, 60);
+        assert!(output.status.success(), "{command:?}: {output:?}");
+        output
+    }
+
+    fn executable(name: &str) -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .map(|directory| directory.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("required integration executable {name} is missing"))
+    }
+
+    fn quote(path: &Path) -> String {
+        shell_escape::escape(path.to_string_lossy()).into_owned()
+    }
+
+    fn write_executable(path: &Path, source: &str) {
+        std::fs::write(path, source).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn query(socket: &Path, request: &str) -> std::io::Result<Value> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(45)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        writeln!(stream, "{request}")?;
+        stream.flush()?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        let body = extract_json_body(&response).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, response.clone())
+        })?;
+        serde_json::from_str(body).map_err(std::io::Error::other)
+    }
+
+    fn encode(value: &str) -> String {
+        value.bytes().map(|byte| format!("%{byte:02X}")).collect()
+    }
+
+    struct Fixture {
+        // Stop the daemon and its SSH masters before the server and directory.
+        daemon: OwnedChild,
+        _sshd: OwnedChild,
+        root: FixtureDirectory,
+        socket: PathBuf,
+        rustup: PathBuf,
+        sysroot: PathBuf,
+        ssh: PathBuf,
+        user: String,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let daemon_binary = Path::new(env!("CARGO_BIN_EXE_rchd"));
+            // A small /tmp tmpfs cannot satisfy ordinary Cargo cold-build
+            // admission. Keep real project outputs on the build filesystem;
+            // the production disk budgets and reserve remain unchanged.
+            let root = FixtureDirectory(Some(
+                tempfile::Builder::new()
+                    .prefix("rch-toolchain-refresh-")
+                    .tempdir_in(daemon_binary.parent().expect("daemon binary directory"))
+                    .unwrap(),
+            ));
+            let ssh = executable("ssh");
+            let rustup = executable("rustup");
+            let compiler = checked(Command::new("rustc").args(["--print", "sysroot"]));
+            let sysroot = PathBuf::from(String::from_utf8(compiler.stdout).unwrap().trim());
+            let worker_binary = daemon_binary.with_file_name("rch-wkr");
+            assert!(
+                worker_binary.is_file(),
+                "build rch-wkr alongside rchd before this integration test"
+            );
+            let user = String::from_utf8(checked(Command::new("id").arg("-un")).stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+            for directory in [
+                "client-bin",
+                "worker-bin",
+                "config",
+                "state",
+                "run",
+                "cache",
+                "worker-cache",
+                "worker-cargo",
+                "worker-rustup",
+                "projects/fixture/src",
+            ] {
+                std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            }
+            symlink(root.path().join("projects"), root.path().join("alias")).unwrap();
+            for name in ["rustup", "cargo", "rustc"] {
+                symlink(&rustup, root.path().join("worker-bin").join(name)).unwrap();
+            }
+            symlink(&worker_binary, root.path().join("worker-bin/rch-wkr")).unwrap();
+            for name in ["host-key", "client-key"] {
+                checked(
+                    Command::new("ssh-keygen")
+                        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                        .arg(root.path().join(name)),
+                );
+            }
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let client_config = root.path().join("ssh_config");
+            std::fs::write(
+                &client_config,
+                format!(
+                    "Host *\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  IdentityFile {}\n  IdentitiesOnly yes\n  UserKnownHostsFile {}\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n  ConnectTimeout 3\n",
+                    root.path().join("client-key").display(),
+                    root.path().join("known_hosts").display(),
+                ),
+            )
+            .unwrap();
+            write_executable(
+                &root.path().join("client-bin/ssh"),
+                &format!(
+                    // The supervisor normally closes these masters on daemon
+                    // shutdown. Also bound their lifetime if an assertion or
+                    // external kill interrupts that cleanup.
+                    "#!/bin/sh\nexec {} --signal=TERM --kill-after=2s 180s {} -F {} \"$@\"\n",
+                    quote(&executable("timeout")),
+                    quote(&ssh),
+                    quote(&client_config)
+                ),
+            );
+            // The source-registry health command is the sole synthetic protocol
+            // result. All inventory, rustup, Cargo and worker execution commands
+            // use the actual installed binaries over an authenticated SSH channel.
+            write_executable(
+                &root.path().join("worker-entry"),
+                &format!(
+                    r#"#!/bin/sh
+export PATH={worker_bin}:/usr/bin:/bin
+export RUSTUP_HOME={rustup_home}
+export CARGO_HOME={cargo_home}
+export XDG_CACHE_HOME={worker_cache}
+export RUSTUP_TOOLCHAIN=rch-fixture-base
+export RCH_WKR_CANONICAL_ROOT={canonical}
+export RCH_WKR_ALIAS_ROOT={alias}
+case "$SSH_ORIGINAL_COMMAND" in
+    *rch_source_registry_health*) printf 'health_check\n'; exit 0 ;;
+    *'rch-wkr capabilities'*|*'rch-wkr telemetry'*|*'rch-wkr execute'*|*'rustup run rch-issue-137 '*|*'echo ok'*|*'debug/compiled_137'*) ;;
+    *) printf 'unexpected fixture command: %s\n' "$SSH_ORIGINAL_COMMAND" >&2; exit 97 ;;
+esac
+printf '%s\n' "$SSH_ORIGINAL_COMMAND" >> {commands}
+exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+"#,
+                    worker_bin = quote(&root.path().join("worker-bin")),
+                    rustup_home = quote(&root.path().join("worker-rustup")),
+                    cargo_home = quote(&root.path().join("worker-cargo")),
+                    worker_cache = quote(&root.path().join("worker-cache")),
+                    canonical = quote(&root.path().join("projects")),
+                    alias = quote(&root.path().join("alias")),
+                    commands = quote(&root.path().join("commands.log")),
+                ),
+            );
+            let server_config = root.path().join("sshd_config");
+            std::fs::write(
+                &server_config,
+                format!(
+                    "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nAllowUsers {user}\nForceCommand {}\n",
+                    root.path().join("host-key").display(),
+                    root.path().join("sshd.pid").display(),
+                    root.path().join("client-key.pub").display(),
+                    root.path().join("worker-entry").display(),
+                ),
+            )
+            .unwrap();
+            drop(listener);
+            let sshd_log = std::fs::File::create(root.path().join("sshd.log")).unwrap();
+            let sshd = OwnedChild(
+                Command::new("/usr/sbin/sshd")
+                    .args(["-D", "-e", "-f"])
+                    .arg(server_config)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(sshd_log)
+                    .spawn()
+                    .unwrap(),
+            );
+            checked(
+                Command::new(&rustup)
+                    .env("RUSTUP_HOME", root.path().join("worker-rustup"))
+                    .env("CARGO_HOME", root.path().join("worker-cargo"))
+                    .args(["toolchain", "link", "rch-fixture-base"])
+                    .arg(&sysroot),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let handshake = bounded_output(
+                    Command::new(&ssh)
+                        .arg("-F")
+                        .arg(&client_config)
+                        .arg(format!("{user}@127.0.0.1"))
+                        .arg("echo ok"),
+                    5,
+                );
+                if handshake.status.success() && handshake.stdout == b"ok\n" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "OpenSSH fixture did not become ready: {}",
+                    std::fs::read_to_string(root.path().join("sshd.log")).unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let worker = WorkerConfig {
+                id: WorkerId::new(WORKER),
+                host: "127.0.0.1".into(),
+                user: user.clone(),
+                identity_file: root.path().join("client-key").display().to_string(),
+                total_slots: 1,
+                ..WorkerConfig::default()
+            };
+            std::fs::write(
+                root.path().join("config/workers.toml"),
+                toml::to_string(&json!({"workers": [worker]})).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("config/daemon.toml"),
+                "health_check_interval_secs = 3600\n[cache_cleanup]\nenabled = false\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("config/config.toml"),
+                "[self_healing]\ndaemon_installs_hooks = false\n[self_test]\nenabled = false\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("projects/fixture/Cargo.toml"),
+                "[package]\nname = \"compiled_137\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("projects/fixture/src/main.rs"),
+                "fn main() { println!(\"compiled-and-executed:{}\", env!(\"RUSTUP_TOOLCHAIN\")); }\n",
+            )
+            .unwrap();
+            let socket = root.path().join("rch.sock");
+            let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
+            let daemon = OwnedChild(
+                Command::new(env!("CARGO_BIN_EXE_rchd"))
+                    .env_clear()
+                    .env(
+                        "PATH",
+                        format!("{}:/usr/bin:/bin", root.path().join("client-bin").display()),
+                    )
+                    .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CACHE_HOME", root.path().join("cache"))
+                    .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                    .env("RCH_CONFIG_DIR", root.path().join("config"))
+                    .env("RCH_STATE_HOME", root.path().join("state"))
+                    .env("RCH_WORKER_REAP_ENABLE", "0")
+                    .current_dir(root.path())
+                    .args([
+                        "--foreground",
+                        "--metrics-port",
+                        "0",
+                        "--no-hot-reload",
+                        "--socket",
+                    ])
+                    .arg(&socket)
+                    .arg("--workers-config")
+                    .arg(root.path().join("config/workers.toml"))
+                    .arg("--history-file")
+                    .arg(root.path().join("history.jsonl"))
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut fixture = Self {
+                daemon,
+                _sshd: sshd,
+                root,
+                socket,
+                rustup,
+                sysroot,
+                ssh,
+                user,
+            };
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                if query(&fixture.socket, "GET /select-worker?project=readiness&command=cargo%20build%20--offline&runtime=rust&cores=1&dry_run=1")
+                    .ok()
+                    .is_some_and(|response| !response["worker"].is_null())
+                {
+                    break;
+                }
+                assert!(
+                    fixture.daemon.0.try_wait().unwrap().is_none(),
+                    "daemon exited: {}",
+                    fixture.logs()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "worker never became ready: {}",
+                    fixture.logs()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            fixture
+        }
+
+        fn logs(&self) -> String {
+            std::fs::read_to_string(self.root.path().join("daemon.log")).unwrap()
+        }
+
+        fn install(&self) {
+            checked(
+                Command::new(&self.rustup)
+                    .env("RUSTUP_HOME", self.root.path().join("worker-rustup"))
+                    .env("CARGO_HOME", self.root.path().join("worker-cargo"))
+                    .args(["toolchain", "link", TOOLCHAIN])
+                    .arg(&self.sysroot),
+            );
+        }
+
+        fn preflight_count(&self) -> usize {
+            std::fs::read_to_string(self.root.path().join("commands.log"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(&format!("rustup run {TOOLCHAIN} rustc --version")))
+                .count()
+        }
+
+        fn select(&self) -> (SelectionResponse, String) {
+            let wrapper = rch_common::job_identity::JobIdentity::new_local().local_wrapper_id;
+            let toolchain =
+                serde_json::to_string(&ToolchainInfo::new(TOOLCHAIN, None, TOOLCHAIN)).unwrap();
+            let response = query(
+                &self.socket,
+                &format!(
+                    "GET /select-worker?project=refresh-fixture&command=cargo%20build%20--offline&runtime=rust&cores=1&hook_pid={}&local_wrapper_id={wrapper}&toolchain={}",
+                    std::process::id(), encode(&toolchain),
+                ),
+            )
+            .unwrap();
+            (serde_json::from_value(response).unwrap(), wrapper)
+        }
+
+        fn refuse(&self) {
+            let (response, _) = self.select();
+            assert!(response.worker.is_none(), "{response:?}");
+            assert!(response.build_id.is_none(), "{response:?}");
+            assert!(
+                format!("{response:?}").contains("toolchain_preflight_command_failed"),
+                "{response:?}\n{}",
+                self.logs()
+            );
+        }
+
+        fn refresh(&self) -> Value {
+            let response = query(
+                &self.socket,
+                &format!("GET /workers/capabilities?refresh=true&worker={WORKER}"),
+            )
+            .unwrap();
+            assert_eq!(
+                response["workers"].as_array().unwrap().len(),
+                1,
+                "{response}"
+            );
+            assert_eq!(
+                response["workers"][0]["refresh"]["live"],
+                true,
+                "{response}\n{}",
+                self.logs()
+            );
+            response
+        }
+
+        fn execute_admitted(&self, iteration: usize) {
+            let (selected, wrapper) = self.select();
+            assert_eq!(
+                selected.worker.as_ref().map(|worker| worker.id.as_str()),
+                Some(WORKER),
+                "{selected:?}\n{}",
+                self.logs()
+            );
+            let build = selected.build_id.expect("real daemon reservation");
+            assert!(build > 0);
+            let project = self.root.path().join("projects/fixture");
+            let target = self.root.path().join(format!("output-{iteration}"));
+            let remote = format!(
+                // The worker's disk guard and Cargo must observe the same
+                // output path. Each build uses a fresh directory, so a cached
+                // executable cannot masquerade as compiler execution.
+                "CARGO_TARGET_DIR={} rch-wkr execute --workdir {} --toolchain {TOOLCHAIN} --command 'cargo build --offline --quiet' && {}",
+                quote(&target),
+                quote(&project),
+                quote(&target.join("debug/compiled_137")),
+            );
+            let output = checked(
+                Command::new(&self.ssh)
+                    .arg("-F")
+                    .arg(self.root.path().join("ssh_config"))
+                    .arg(format!("{}@127.0.0.1", self.user))
+                    .arg(remote),
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                format!("compiled-and-executed:{TOOLCHAIN}")
+            );
+            assert!(
+                target.join("debug/compiled_137").is_file(),
+                "fresh compiler output must exist"
+            );
+            query(&self.socket, &format!("POST /release-worker?worker={WORKER}&slots=1&build_id={build}&local_wrapper_id={wrapper}&exit_code=0")).unwrap();
+            let record = query(
+                &self.socket,
+                &format!("GET /builds/{build}?local_wrapper_id={wrapper}"),
+            )
+            .unwrap();
+            assert_eq!(record["status"], "completed", "{record}");
+            assert_eq!(record["record"]["exit_code"], 0, "{record}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires OpenSSH server, GNU timeout, rustup/compiler, built rch-wkr, and build-disk headroom"]
+    fn toolchain_refresh_restores_executable_admission() {
+        let fixture = Fixture::new();
+        let daemon_incarnation =
+            query(&fixture.socket, "GET /restart-admission").unwrap()["daemon_incarnation"].clone();
+        assert!(!daemon_incarnation.is_null());
+        fixture.refuse();
+        assert_eq!(fixture.preflight_count(), 1);
+        fixture.install();
+        for _ in 0..2 {
+            fixture.refuse();
+        }
+        assert_eq!(
+            fixture.preflight_count(),
+            1,
+            "definitive negative was reused"
+        );
+
+        let refreshed = fixture.refresh();
+        assert!(
+            refreshed["workers"][0]["capabilities"]["rustup_toolchains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == TOOLCHAIN),
+            "{refreshed}"
+        );
+        fixture.execute_admitted(1);
+        fixture.execute_admitted(2);
+        assert_eq!(
+            fixture.preflight_count(),
+            2,
+            "fresh success is reused for repeated actual builds"
+        );
+
+        // Preserve the linked toolchain while making its requested name absent.
+        // A refreshed inventory must also revoke stale positive evidence.
+        let installed = fixture
+            .root
+            .path()
+            .join("worker-rustup/toolchains")
+            .join(TOOLCHAIN);
+        let detached = fixture.root.path().join("detached-toolchain");
+        std::fs::rename(&installed, &detached).unwrap();
+        fixture.refresh();
+        fixture.refuse();
+        assert_eq!(fixture.preflight_count(), 3);
+        std::fs::rename(&detached, &installed).unwrap();
+        fixture.refuse();
+        assert_eq!(fixture.preflight_count(), 3);
+
+        let reload = query(&fixture.socket, "POST /reload").unwrap();
+        assert_eq!(reload["success"], true, "{reload}");
+        assert_eq!(
+            reload["updated"], 0,
+            "the unchanged inventory must still invalidate toolchain evidence"
+        );
+        fixture.execute_admitted(3);
+        assert_eq!(fixture.preflight_count(), 4);
+        assert_eq!(
+            query(&fixture.socket, "GET /restart-admission").unwrap()["daemon_incarnation"],
+            daemon_incarnation,
+            "recovery never restarts the daemon"
+        );
+    }
+}

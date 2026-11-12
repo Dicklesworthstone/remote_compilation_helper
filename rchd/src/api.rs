@@ -148,6 +148,7 @@ enum ApiRequest {
     SpeedScores,
     WorkersCapabilities {
         refresh: bool,
+        worker_id: Option<WorkerId>,
     },
     BenchmarkTrigger {
         worker_id: WorkerId,
@@ -1038,9 +1039,9 @@ async fn handle_connection_with_metrics(
             let response = handle_speedscore_list(&ctx).await;
             (serde_json::to_string(&response)?, "application/json")
         }
-        Ok(ApiRequest::WorkersCapabilities { refresh }) => {
+        Ok(ApiRequest::WorkersCapabilities { refresh, worker_id }) => {
             metrics::inc_requests("workers-capabilities");
-            let response = handle_workers_capabilities(&ctx, refresh).await;
+            let response = handle_workers_capabilities(&ctx, refresh, worker_id.as_ref()).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::BenchmarkTrigger { worker_id }) => {
@@ -1387,6 +1388,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let (path_only, query) = split_path_query(path);
         if path_only == "/workers/capabilities" {
             let mut refresh = false;
+            let mut worker_id = None;
             for param in query.split('&') {
                 if param.is_empty() {
                     continue;
@@ -1396,9 +1398,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 let value = kv.next().unwrap_or("");
                 if key == "refresh" && (value == "1" || value.eq_ignore_ascii_case("true")) {
                     refresh = true;
+                } else if key == "worker" {
+                    anyhow::ensure!(worker_id.is_none(), "duplicate worker filter");
+                    let id = percent_unescape_query_value(value);
+                    anyhow::ensure!(!id.is_empty(), "worker filter cannot be empty");
+                    worker_id = Some(WorkerId::new(id));
                 }
             }
-            return Ok(ApiRequest::WorkersCapabilities { refresh });
+            return Ok(ApiRequest::WorkersCapabilities { refresh, worker_id });
         }
     }
 
@@ -2584,8 +2591,9 @@ async fn handle_speedscore_list(ctx: &DaemonContext) -> ApiResponse<SpeedScoreLi
 async fn handle_workers_capabilities(
     ctx: &DaemonContext,
     refresh: bool,
+    worker_id: Option<&WorkerId>,
 ) -> ApiResponse<WorkerCapabilitiesResponse> {
-    ApiResponse::Ok(get_workers_capabilities(ctx, refresh).await)
+    ApiResponse::Ok(get_workers_capabilities(ctx, refresh, worker_id).await)
 }
 
 async fn handle_benchmark_trigger(
@@ -7520,18 +7528,36 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /workers/capabilities").unwrap();
         match req {
-            ApiRequest::WorkersCapabilities { refresh } => {
+            ApiRequest::WorkersCapabilities { refresh, worker_id } => {
                 assert!(!refresh);
+                assert!(worker_id.is_none());
             }
             _ => assert!(false, "expected workers capabilities request"),
         }
 
         let req = parse_request("GET /workers/capabilities?refresh=true").unwrap();
         match req {
-            ApiRequest::WorkersCapabilities { refresh } => {
+            ApiRequest::WorkersCapabilities { refresh, worker_id } => {
                 assert!(refresh);
+                assert!(worker_id.is_none());
             }
             _ => assert!(false, "expected workers capabilities request"),
+        }
+
+        let req =
+            parse_request("GET /workers/capabilities?worker=worker%2D1&refresh=true").unwrap();
+        match req {
+            ApiRequest::WorkersCapabilities { refresh, worker_id } => {
+                assert!(refresh);
+                assert_eq!(worker_id, Some(WorkerId::new("worker-1")));
+            }
+            _ => panic!("expected targeted worker capabilities request"),
+        }
+        for invalid in [
+            "GET /workers/capabilities?refresh=true&worker=",
+            "GET /workers/capabilities?worker=worker1&worker=worker2",
+        ] {
+            assert!(parse_request(invalid).is_err(), "accepted {invalid}");
         }
     }
 
@@ -12426,7 +12452,7 @@ mod tests {
         let pool = WorkerPool::new();
         let ctx = make_test_context(pool);
 
-        let response = handle_workers_capabilities(&ctx, false).await;
+        let response = handle_workers_capabilities(&ctx, false, None).await;
         match response {
             ApiResponse::Ok(r) => {
                 assert!(r.workers.is_empty());
@@ -12443,7 +12469,7 @@ mod tests {
         pool.add_worker(make_test_worker("worker2", 4)).await;
         let ctx = make_test_context(pool);
 
-        let response = handle_workers_capabilities(&ctx, false).await;
+        let response = handle_workers_capabilities(&ctx, false, None).await;
         match response {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.workers.len(), 2);
@@ -12454,6 +12480,91 @@ mod tests {
             }
             _ => assert!(false, "expected ok response"),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_capability_refresh_invalidates_only_current_worker_preflight() {
+        let _guard = test_guard!();
+        struct MockOverrideGuard;
+        impl Drop for MockOverrideGuard {
+            fn drop(&mut self) {
+                rch_common::mock::clear_mock_overrides();
+            }
+        }
+        rch_common::mock::set_mock_enabled_override(Some(true));
+        let _mock_guard = MockOverrideGuard;
+        let pool = WorkerPool::new();
+        let target_id = WorkerId::new("target");
+        let other_id = WorkerId::new("other");
+        for id in [&target_id, &other_id] {
+            pool.add_worker(make_test_worker(id.as_str(), 8)).await;
+            pool.get(id)
+                .await
+                .unwrap()
+                .record_toolchain_preflight(
+                    "nightly-2026-11-11".into(),
+                    false,
+                    Some("toolchain_preflight_command_failed:1:missing".into()),
+                )
+                .await;
+        }
+        let target = pool.get(&target_id).await.unwrap();
+        let other = pool.get(&other_id).await.unwrap();
+        let ctx = make_test_context(pool);
+
+        // An overlapping inventory request is reported as cached and cannot
+        // clear a refusal before the live probe has actually published.
+        let inventory_in_flight = target.try_capability_probe().unwrap();
+        let response = handle_workers_capabilities(&ctx, true, Some(&target_id)).await;
+        let ApiResponse::Ok(response) = response else {
+            panic!("overlapping refresh query failed");
+        };
+        assert_eq!(response.workers.len(), 1);
+        assert!(!response.workers[0].refresh.as_ref().unwrap().live);
+        assert!(
+            !target
+                .toolchain_preflight_status("nightly-2026-11-11")
+                .await
+                .unwrap()
+                .usable
+        );
+        drop(inventory_in_flight);
+
+        let response = handle_workers_capabilities(&ctx, true, Some(&target_id)).await;
+        let ApiResponse::Ok(response) = response else {
+            panic!("targeted refresh failed");
+        };
+        assert_eq!(response.workers.len(), 1);
+        assert_eq!(response.workers[0].id, "target");
+        assert!(response.workers[0].refresh.as_ref().unwrap().live);
+        assert!(
+            target
+                .toolchain_preflight_status("nightly-2026-11-11")
+                .await
+                .is_none()
+        );
+        assert!(
+            !other
+                .toolchain_preflight_status("nightly-2026-11-11")
+                .await
+                .unwrap()
+                .usable
+        );
+
+        let response =
+            handle_workers_capabilities(&ctx, true, Some(&WorkerId::new("absent"))).await;
+        let ApiResponse::Ok(response) = response else {
+            panic!("missing worker query failed");
+        };
+        assert!(response.workers.is_empty());
+        assert!(
+            !other
+                .toolchain_preflight_status("nightly-2026-11-11")
+                .await
+                .unwrap()
+                .usable
+        );
     }
 
     // =========================================================================
@@ -12909,7 +13020,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|action| action.contains("--refresh"))
         }));
-        let capabilities = get_workers_capabilities(&ctx, false).await;
+        let capabilities = get_workers_capabilities(&ctx, false, None).await;
         assert_eq!(
             capabilities
                 .workers
@@ -13419,7 +13530,7 @@ mod tests {
                 .starts_with("worker capability probe")
         );
         assert!(ctx.history.source_topology_fences().is_empty());
-        let capabilities = get_workers_capabilities(&ctx, false).await;
+        let capabilities = get_workers_capabilities(&ctx, false, None).await;
         assert_eq!(
             capabilities.workers[0].source_topology_mismatches,
             reported.source_topology_mismatches

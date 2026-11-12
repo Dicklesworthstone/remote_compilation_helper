@@ -392,7 +392,7 @@ async fn api_status_handler(State(state): State<Arc<ApiState>>) -> Response {
     }
 }
 
-/// `GET /workers/capabilities[?refresh=1]` — the same body as the socket's
+/// `GET /workers/capabilities[?refresh=1&worker=ID]` — the same body as the socket's
 /// `/workers/capabilities`.
 async fn api_capabilities_handler(
     State(state): State<Arc<ApiState>>,
@@ -402,7 +402,12 @@ async fn api_capabilities_handler(
         .get("refresh")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    Json(crate::workers::get_workers_capabilities(&state.ctx, refresh).await).into_response()
+    let worker_id = q.get("worker").map(rch_common::WorkerId::new);
+    if worker_id.as_ref().is_some_and(|id| id.as_str().is_empty()) {
+        return (StatusCode::BAD_REQUEST, "worker filter cannot be empty\n").into_response();
+    }
+    Json(crate::workers::get_workers_capabilities(&state.ctx, refresh, worker_id.as_ref()).await)
+        .into_response()
 }
 
 /// `GET /workers/config` — the static half of the worker view (tags, priority,
