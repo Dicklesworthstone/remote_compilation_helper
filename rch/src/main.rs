@@ -2117,6 +2117,10 @@ fn reliability_metrics_requested(cli: &Cli) -> bool {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = rch_common::ssh::run_ssh_master_guardian_if_requested() {
+        std::process::exit(code);
+    }
     // Every agent Bash command runs this binary as a hook. Answer the common
     // pass-through before building the CLI or the runtime (bd-1nhd).
     if hook::try_fast_passthrough() {

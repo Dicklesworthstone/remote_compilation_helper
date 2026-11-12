@@ -20,6 +20,10 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
+mod master_guardian;
+pub use master_guardian::run_ssh_master_guardian_if_requested;
+use master_guardian::{SshChild, SshControlDir};
+
 // Re-export platform-independent utilities for backwards compatibility
 pub use crate::ssh_utils::{
     CommandResult, EnvPrefix, build_env_prefix, is_retryable_transport_error,
@@ -126,6 +130,7 @@ struct SshProcessState {
     draining: bool,
     stopping: bool,
     outcome: Option<std::result::Result<ExitStatus, String>>,
+    diagnostic: String,
 }
 
 /// Run one command and wait for its entire descendant tree on Linux.
@@ -710,7 +715,7 @@ struct OwnedSshProcess {
 impl OwnedSshProcess {
     fn spawn(
         command: &mut tokio::process::Command,
-        control_dir: Option<Arc<tempfile::TempDir>>,
+        control_dir: Option<Arc<SshControlDir>>,
         idle_timeout: Option<Duration>,
     ) -> Result<Self> {
         Self::spawn_with_admission(command, control_dir, idle_timeout, None)
@@ -718,7 +723,7 @@ impl OwnedSshProcess {
 
     fn spawn_with_admission(
         command: &mut tokio::process::Command,
-        control_dir: Option<Arc<tempfile::TempDir>>,
+        control_dir: Option<Arc<SshControlDir>>,
         idle_timeout: Option<Duration>,
         admission: Option<PoolWorkerAdmission>,
     ) -> Result<Self> {
@@ -728,13 +733,14 @@ impl OwnedSshProcess {
                 .is_none_or(PoolWorkerAdmission::is_current),
             "SSH worker pool admission was revoked"
         );
-        let mut child = OwnedProcessGroup::spawn(command)?;
+        let mut child = SshChild::spawn(command, control_dir.as_ref())?;
         let (state, mut changes) = watch::channel(SshProcessState {
             active_commands: 0,
             idle_since: Instant::now(),
             draining: false,
             stopping: false,
             outcome: None,
+            diagnostic: String::new(),
         });
         let updates = state.clone();
         let supervisor = tokio::spawn(async move {
@@ -787,6 +793,7 @@ impl OwnedSshProcess {
             };
             updates.send_modify(|state| {
                 state.stopping = true;
+                state.diagnostic = child.diagnostic().to_owned();
                 state.outcome = Some(outcome.map_err(|error| error.to_string()));
             });
         });
@@ -889,7 +896,7 @@ struct OwnedSshSession {
     // exit` in Drop. Our foreground process supervisor performs that cleanup.
     session: Session,
     process: OwnedSshProcess,
-    _control_dir: Arc<tempfile::TempDir>,
+    _control_dir: Arc<SshControlDir>,
     can_disable_background: bool,
 }
 
@@ -905,7 +912,7 @@ pub struct OwnedSshTransport {
     socket: PathBuf,
     can_disable_background: bool,
     activity: SshProcessUse,
-    _control_dir: Arc<tempfile::TempDir>,
+    _control_dir: Arc<SshControlDir>,
     pool_admission: Option<PoolWorkerAdmission>,
 }
 
@@ -1265,24 +1272,6 @@ impl SshClient {
             Instant::now() < deadline,
             "SSH connection timed out before spawn"
         );
-        let directory = control_directory
-            .map(Path::to_path_buf)
-            .unwrap_or_else(ssh_control_directory);
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .context("Failed to protect SSH control directory")?;
-        }
-        let control_dir = Arc::new(
-            tempfile::Builder::new()
-                .prefix("rch-")
-                .tempdir_in(directory)
-                .context("Failed to create private SSH control directory")?,
-        );
-        let socket = control_dir.path().join("master");
-        let log = control_dir.path().join("log");
         let idle_timeout =
             match control_persist_mode(control_master, self.options.control_persist_idle) {
                 ControlPersistMode::IdleFor(seconds) => {
@@ -1305,6 +1294,30 @@ impl SshClient {
         // a global IgnoreUnknown override would break the user's own list.
         let can_disable_background =
             ssh_can_disable_background_before(ssh_program, deadline).await?;
+        ensure_ssh_deadline(Some(deadline))?;
+        // Probe before creating a per-connection directory: a stalled client
+        // capability check must not leave empty directories if the owner dies.
+        let directory = control_directory
+            .map(Path::to_path_buf)
+            .unwrap_or_else(ssh_control_directory);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .context("Failed to protect SSH control directory")?;
+        }
+        let control_dir = Arc::new(
+            SshControlDir::new(
+                tempfile::Builder::new()
+                    .prefix("rch-")
+                    .tempdir_in(directory)
+                    .context("Failed to create private SSH control directory")?,
+            )
+            .context("Failed to protect private SSH control directory")?,
+        );
+        let socket = control_dir.path().join("master");
+        let log = control_dir.path().join("log");
         let mut command = self.master_command(
             ssh_program,
             destination,
@@ -1889,7 +1902,12 @@ async fn wait_for_ssh_master(
         let outcome = process.state.borrow().outcome.clone();
         if let Some(outcome) = outcome {
             let status = outcome.map_err(anyhow::Error::msg)?;
-            let diagnostic = ssh_connect_diagnostic(log);
+            let retained = process.state.borrow().diagnostic.clone();
+            let diagnostic = if retained.is_empty() {
+                ssh_connect_diagnostic(log)
+            } else {
+                retained
+            };
             anyhow::bail!("SSH master exited before becoming ready ({status}): {diagnostic}");
         }
         anyhow::ensure!(
@@ -5328,8 +5346,18 @@ exec sleep 30
             let directory = fake.directory.path().to_owned();
             let connecting =
                 tokio::spawn(async move { client.connect_using(&program, Some(&directory)).await });
+            fake.wait_for_pid("capability-pids").await;
+            assert!(
+                std::fs::read_dir(fake.directory.path())
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("rch-")),
+                "a stalled capability probe must not create a private control directory"
+            );
             if cancelled {
-                fake.wait_for_pid("capability-pids").await;
                 connecting.abort();
                 assert!(connecting.await.unwrap_err().is_cancelled());
             } else {
@@ -5354,7 +5382,9 @@ exec sleep 30
 
     #[tokio::test]
     async fn foreground_options_preserve_user_ignore_unknown_configuration() {
-        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let directory = Arc::new(
+            SshControlDir::new(tempfile::Builder::new().prefix("rch-").tempdir().unwrap()).unwrap(),
+        );
         let config = directory.path().join("user-config");
         std::fs::write(
             &config,

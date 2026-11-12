@@ -1184,8 +1184,18 @@ pub(crate) fn arm_shutdown_watchdog() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if let Some(code) = rch_common::ssh::run_ssh_master_guardian_if_requested() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the daemon runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches)?;
     let startup_started = Instant::now();
