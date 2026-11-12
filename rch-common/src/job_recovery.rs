@@ -32,6 +32,12 @@ use crate::job_identity::{JobIdentity, JobLifecycleState};
 /// scan while retaining the original journal and worker ownership.
 pub const AUTOMATIC_RECOVERY_PENDING_EXIT_CODE: i32 = 75;
 
+/// Internal exit status for daemon-managed recovery that could not acquire
+/// the job journal's exclusive gate because another handle still holds it.
+/// This defers the attempt until a later scan without adding failure backoff;
+/// it proves neither worker settlement nor absence of the journal's owner.
+pub const AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE: i32 = 76;
+
 /// The original execution has no durable completion, and recovery has not
 /// proved it gone. Age or wrapper death cannot authorize retirement or replay.
 /// Manual recovery reports this as an error; only the daemon-managed command

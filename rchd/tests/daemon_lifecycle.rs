@@ -825,6 +825,7 @@ while True:
                 // This supplies health/capacity only. No live remote worker is
                 // part of this test; worker settlement is injected below.
                 .env("RCH_MOCK_SSH", "1")
+                .env("RUST_LOG", "rchd::lease_recovery=debug")
                 .env(
                     "PATH",
                     format!("{}:/usr/bin:/bin", root.join("transport-bin").display()),
@@ -1138,11 +1139,43 @@ while True:
                 recipe["exit_code"] = json!(143);
                 recipe["returned"] = json!(143);
                 write_private_lease(&path, &settled);
-                drop(gate);
+                let log_path = fixture.root.path().join("daemon.log");
+                let previous_log_len = std::fs::read_to_string(&log_path).unwrap().len();
                 fixture.daemon = spawn_mock_worker_daemon(fixture.root.path(), &fixture.socket);
                 fixture.wait_ready();
                 wait_mock_worker_ready(&fixture);
+                let incarnation = admission_snapshot(&fixture.socket).daemon_incarnation;
+
+                // Start with a real contended journal, and observe the actual
+                // recovery child being reaped before releasing it. Restarting
+                // after this point would erase the ten-minute failure backoff
+                // that this regression must distinguish from a normal deferral.
                 let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let log = std::fs::read_to_string(&log_path).unwrap();
+                    if log[previous_log_len..].lines().any(|line| {
+                        line.contains(&wrapper)
+                            && line.contains(
+                                "Job journal is busy; deferring automatic recovery until the next scan",
+                            )
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "automatic recovery never observed the held journal gate: {log}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert_eq!(read_lease(&path), settled);
+                if !daemon_completed {
+                    assert_fenced(&fixture, 6);
+                }
+                drop(gate);
+
+                // Keep the production thirty-second scan interval. A real
+                // failure's ten-minute backoff cannot satisfy this deadline.
+                let deadline = Instant::now() + Duration::from_secs(45);
                 let recovered = loop {
                     let observed = read_lease(&path);
                     if observed.terminal_acknowledged {
@@ -1150,8 +1183,8 @@ while True:
                     }
                     assert!(
                         Instant::now() < deadline,
-                        "automatic startup recovery did not settle {phase}/{signal:?}: {observed:?}\n{}",
-                        std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap()
+                        "automatic recovery did not retry after journal contention for {phase}/{signal:?}: {observed:?}\n{}",
+                        std::fs::read_to_string(&log_path).unwrap()
                     );
                     std::thread::sleep(Duration::from_millis(20));
                 };
@@ -1159,6 +1192,11 @@ while True:
                 assert_eq!(recovered.owner_identity(), lease.owner_identity());
                 assert_eq!(recovered.wrapper_pid, pid);
                 assert_eq!(recovered.command_fingerprint, lease.command_fingerprint);
+                assert_eq!(
+                    admission_snapshot(&fixture.socket).daemon_incarnation,
+                    incarnation,
+                    "the same daemon must retry contention without a restart"
+                );
                 assert_eq!(recovered.exit_code, Some(143));
                 assert_eq!(
                     recovered.recovery.as_ref().unwrap()["daemon_exit_code"],

@@ -3,14 +3,17 @@
 //! environment changes are involved.
 #![cfg(target_os = "linux")]
 
+use rch_common::job_identity::journal::JobJournalGate;
 use rch_common::job_identity::{DurableJobLease, JobIdentity};
+use rch_common::job_recovery::AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE;
+use rch_common::process_identity::{ProcessObservation, observe_process};
 use rch_common::{CompilationKind, TransferConfig, WorkerConfig, WorkerId};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread::{self, JoinHandle};
@@ -422,6 +425,213 @@ fn owner_exit_during_status_does_not_erase_a_new_recovery_intent() {
     assert!(output_text(&output).contains("use jobs recover"));
     assert_eq!(fs::read(&fixture.lease_path).unwrap(), retained);
     assert!(!fixture.cancel_receipt().exists());
+}
+
+/// The CLI and journal gate are real; the Unix-socket peer supplies only the
+/// daemon protocol. Worker settlement is injected explicitly, so this test
+/// does not stand in for worker cleanup or actual daemon admission tests.
+#[test]
+fn managed_journal_contention_defers_without_acknowledging_or_weakening_recovery() {
+    let mut fixture = Fixture::new(true);
+    fs::set_permissions(
+        fixture.lease_path.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut owner = OwnedChild(Some(
+        Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let pid = owner.0.as_ref().unwrap().id();
+    let ProcessObservation::Present(birth) = observe_process(pid) else {
+        panic!("owned wrapper must have a native process birth identity");
+    };
+    fixture.lease.wrapper_pid = pid;
+    fixture.lease.process_start_ticks = Some(process_start_ticks(pid));
+    fixture.lease.process_birth = Some(birth);
+    fixture.lease.phase = "execute".into();
+
+    let project = fixture.root.path().join("project");
+    fs::create_dir_all(project.join("build")).unwrap();
+    let source = project.join("source.c");
+    let artifact = project.join("build/app");
+    fs::write(&source, b"original source").unwrap();
+    fs::write(&artifact, b"original artifact").unwrap();
+    let worker = WorkerConfig {
+        id: WorkerId::new("worker-a"),
+        host: "unavailable.invalid".into(),
+        user: "fixture".into(),
+        identity_file: "/unused/worker-key".into(),
+        ..WorkerConfig::default()
+    };
+    let transfer = TransferConfig::default();
+    let identity = "0123456789abcdef0123456789abcdef";
+    fixture.lease.recovery = Some(json!({
+        "version": 2, "wrapper_id": fixture.lease.identity.local_wrapper_id,
+        "build_id": 42, "worker": worker, "identity": identity,
+        "completion": format!(
+            "{}/recovery-42-{identity}.done", transfer.remote_base.trim_end_matches('/'),
+        ),
+        "source_roots": ["/owned/project"], "source_authority_namespace": "current",
+        "pair": null, "retire_root": null, "transfer": transfer,
+        "project_root": project, "kind": CompilationKind::Make,
+        "expected_triple": "x86_64-unknown-linux-gnu", "pinned_triple": null,
+        "allow_foreign": false, "package_archive": false, "phases": [],
+        "exit_code": null, "returned": null, "prepared": true,
+        "execution_started": true, "preparation_cancelled": false,
+        "sources_released": false, "pair_released": true, "tree_retired": true,
+        "source_cancellation_settled": false, "retired": false,
+        "custody_note": {"original_path": "/original//evidence/", "keep": [9, "exact"]},
+    }));
+    write_lease(&fixture.lease_path, &fixture.lease);
+    fs::set_permissions(&fixture.lease_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&fixture.lease_path).unwrap();
+    owner.0.as_mut().unwrap().kill().unwrap();
+    assert_eq!(owner.finish().status.signal(), Some(9));
+
+    let transport_bin = fixture.root.path().join("transport-bin");
+    let sentinel = fixture.root.path().join("transport-attempted");
+    fs::create_dir(&transport_bin).unwrap();
+    for name in ["ssh", "rsync"] {
+        let executable = transport_bin.join(name);
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$RCH_TEST_TRANSPORT_SENTINEL\"\nexit 97\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // A free local gate proves nothing about the worker. The enforced local
+    // settlement path must still reject its unfinished source obligations.
+    // These local refusals run before the peer's bounded request window.
+    let unsettled = fixture
+        .spawn_local_settlement(&transport_bin, &sentinel)
+        .finish();
+    assert_eq!(unsettled.status.code(), Some(1));
+    assert!(output_text(&unsettled).contains("settled worker obligations"));
+    assert_eq!(fs::read(&fixture.lease_path).unwrap(), before);
+
+    // Only actual lock contention is a deferral. An unsafe gate remains a
+    // validation failure even for a daemon-managed child.
+    let gate_path = fixture.lease_path.with_extension("recovery.lock");
+    fs::set_permissions(&gate_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let unsafe_gate = fixture
+        .spawn_local_settlement(&transport_bin, &sentinel)
+        .finish();
+    assert_eq!(unsafe_gate.status.code(), Some(1));
+    assert!(output_text(&unsafe_gate).contains("unsafe recovery lock file"));
+    assert_eq!(fs::read(&fixture.lease_path).unwrap(), before);
+    fs::set_permissions(&gate_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let gate = JobJournalGate::try_acquire(&fixture.lease_path)
+        .unwrap()
+        .unwrap();
+    let mut active = fixture.active();
+    active["active"]["slots"] = json!(3);
+    let daemon = peer(
+        &fixture.socket,
+        vec![
+            fixture.active(),
+            fixture.active(),
+            active,
+            json!({}),
+            fixture.completed(143),
+        ],
+        |_| {},
+    );
+
+    let mut managed = fixture.command("recover", Some(5));
+    managed
+        .args(["--daemon-managed", "false"])
+        .env("PATH", &transport_bin)
+        .env("RCH_TEST_TRANSPORT_SENTINEL", &sentinel)
+        .process_group(0)
+        .stdin(Stdio::piped());
+    let deferred = OwnedChild(Some(managed.spawn().unwrap())).finish();
+    assert_eq!(
+        deferred.status.code(),
+        Some(AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE),
+        "{}",
+        output_text(&deferred)
+    );
+    assert_eq!(fs::read(&fixture.lease_path).unwrap(), before);
+    gate.verify().unwrap();
+
+    let mut manual_command = fixture.command("recover", Some(5));
+    manual_command
+        .env("PATH", &transport_bin)
+        .env("RCH_TEST_TRANSPORT_SENTINEL", &sentinel);
+    let manual = OwnedChild(Some(manual_command.spawn().unwrap())).finish();
+    assert_eq!(manual.status.code(), Some(1), "{}", output_text(&manual));
+    assert!(output_text(&manual).contains("journal is held by another handle"));
+    assert_eq!(fs::read(&fixture.lease_path).unwrap(), before);
+    gate.verify().unwrap();
+    let mut settled = fixture.lease.clone();
+    let recipe = settled.recovery.as_mut().unwrap();
+    for field in ["sources_released", "source_cancellation_settled", "retired"] {
+        recipe[field] = json!(true);
+    }
+    recipe["exit_code"] = json!(143);
+    recipe["returned"] = json!(143);
+    write_lease(&fixture.lease_path, &settled);
+    fs::set_permissions(&fixture.lease_path, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(gate);
+
+    let recovered = output_json(
+        &fixture
+            .spawn_local_settlement(&transport_bin, &sentinel)
+            .finish(),
+    );
+    assert_eq!(recovered["status"], "recovered");
+    assert_eq!(recovered["exit_code"], 143);
+    assert_eq!(recovered["terminal_acknowledged"], true);
+    let wrapper = &fixture.lease.identity.local_wrapper_id;
+    let query = format!("GET /builds/42?local_wrapper_id={wrapper}\n");
+    assert_eq!(
+        daemon.join().unwrap(),
+        vec![
+            query.clone(),
+            query.clone(),
+            query.clone(),
+            format!(
+                "POST /release-worker?worker=worker-a&slots=3&build_id=42&local_wrapper_id={wrapper}&exit_code=143\n"
+            ),
+            query,
+        ]
+    );
+    let after: DurableJobLease =
+        serde_json::from_slice(&fs::read(&fixture.lease_path).unwrap()).unwrap();
+    assert!(after.terminal_acknowledged);
+    assert_eq!(after.identity, fixture.lease.identity);
+    assert_eq!(after.worker_id, fixture.lease.worker_id);
+    assert_eq!(after.exit_code, Some(143));
+    assert_eq!(after.wrapper_pid, pid);
+    assert_eq!(after.process_start_ticks, fixture.lease.process_start_ticks);
+    assert_eq!(after.boot_id, fixture.lease.boot_id);
+    assert_eq!(after.process_birth, fixture.lease.process_birth);
+    assert_eq!(after.command_fingerprint, fixture.lease.command_fingerprint);
+    let mut expected_recipe = settled.recovery.unwrap();
+    expected_recipe["daemon_exit_code"] = json!(143);
+    assert_eq!(after.recovery, Some(expected_recipe));
+
+    // With the peer gone, an acknowledged retry is local and byte preserving.
+    let acknowledged = fs::read(&fixture.lease_path).unwrap();
+    let repeated = output_json(
+        &fixture
+            .spawn_local_settlement(&transport_bin, &sentinel)
+            .finish(),
+    );
+    assert_eq!(repeated, recovered);
+    assert_eq!(fs::read(&fixture.lease_path).unwrap(), acknowledged);
+    assert!(!sentinel.exists(), "worker transport was invoked");
+    assert!(!fixture.cancel_receipt().exists());
+    assert_eq!(fs::read(source).unwrap(), b"original source");
+    assert_eq!(fs::read(artifact).unwrap(), b"original artifact");
 }
 
 #[test]

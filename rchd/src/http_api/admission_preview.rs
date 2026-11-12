@@ -507,7 +507,8 @@ mod tests {
     ) -> crate::history::ActiveBuildState {
         let worker = ctx.pool.get(&WorkerId::new(worker_id)).await.unwrap();
         assert!(worker.reserve_slots(1).await);
-        ctx.history
+        let admission = ctx
+            .history
             .try_start_active_build_in_lanes(
                 project.into(),
                 worker_id.into(),
@@ -527,8 +528,11 @@ mod tests {
                 None,
                 ctx.pool.project_lanes(worker_id),
             )
-            .unwrap()
-            .expect("fixture must own a real project lane")
+            .unwrap();
+        let crate::history::ActiveBuildAdmission::Admitted(state) = admission else {
+            panic!("fixture must own a real project lane: {admission:?}");
+        };
+        *state
     }
 
     async fn finish_lane_owner(ctx: &DaemonContext, owner: &crate::history::ActiveBuildState) {

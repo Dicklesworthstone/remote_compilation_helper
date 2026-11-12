@@ -7,7 +7,9 @@
 use crate::DaemonContext;
 use crate::alerts::AlertInfo;
 use crate::events::EventBus;
-use crate::history::{BuildHistory, QueueSelectionContract, QueuedWaiterClaim};
+use crate::history::{
+    ActiveBuildAdmission, BuildHistory, QueueSelectionContract, QueuedWaiterClaim,
+};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::reload;
@@ -3086,8 +3088,11 @@ async fn handle_select_worker_mode(
                         ctx.pool.project_lanes(id.as_str()),
                     );
                     let state = match admission {
-                        Ok(Some(state)) => state,
-                        Ok(None) => {
+                        Ok(ActiveBuildAdmission::Admitted(state)) => *state,
+                        Ok(
+                            refusal @ (ActiveBuildAdmission::Rejected
+                            | ActiveBuildAdmission::SourceFenceChanged),
+                        ) => {
                             drop(circuit_permit);
                             worker.release_slots(reserve_slots).await;
                             if local_wrapper_id
@@ -3112,7 +3117,24 @@ async fn handle_select_worker_mode(
                                         .is_some_and(|id| ctx.history.has_queued_wrapper(id)),
                                 "wrapper already owns a queued selection"
                             );
-                            excluded_worker_ids.insert(id.as_str().to_string());
+                            if matches!(refusal, ActiveBuildAdmission::SourceFenceChanged) {
+                                if reservation_attempts >= MAX_ATTEMPTS {
+                                    return Ok(SelectionResponse {
+                                        worker: None,
+                                        reason: SelectionReason::AllWorkersBusy,
+                                        build_id: None,
+                                        diagnostics: None,
+                                    });
+                                }
+                                // A concurrent completion may already have
+                                // retired its source. Reconcile outside history
+                                // locks before deciding whether to exclude it,
+                                // preserving unrelated reservation/queue refusals.
+                                excluded_worker_ids
+                                    .extend(project_excluded_workers(ctx, &request.project));
+                            } else {
+                                excluded_worker_ids.insert(id.as_str().to_string());
+                            }
                             continue;
                         }
                         Err(error) => {
@@ -9990,6 +10012,173 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
+    async fn source_fence_racing_selection_reconciles_before_reserving_a_successor() {
+        use rch_common::job_identity::JobIdentity;
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+
+        let _guard = test_guard!();
+        for settled_before_reservation in [false, true] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            set_test_build_disk(&pool, "worker1", 100.0).await;
+            let ctx = make_test_context(pool);
+            let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let request = source_fence_test_request(crate::history::observable_test_process_id());
+            assert!(project_excluded_workers(&ctx, &request.project).is_empty());
+
+            // Pause the actual selector after its permissive project snapshot
+            // and worker choice, at the same asynchronous audit publication
+            // used by the topology-admission race regression.
+            let audit = ctx.worker_selector.audit_log.write().await;
+            let selecting = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some(JobIdentity::new_local().local_wrapper_id),
+            );
+            tokio::pin!(selecting);
+            tokio::task::unconstrained(std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(selecting.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            }))
+            .await;
+            assert!(ctx.history.active_builds().is_empty());
+            assert_eq!(worker.used_slots(), 0);
+
+            // Another runtime thread can reserve, publish and complete an
+            // attempt while that selector is suspended. Use the production
+            // ownership and release paths to establish its unresolved fence.
+            let mut wrapper = LeaseWrapper::start();
+            let ProcessObservation::Present(birth) = observe_process(wrapper.0.id()) else {
+                panic!("test wrapper must have a native birth identity");
+            };
+            let mut lease = DurableJobLease::new(
+                JobIdentity::new_local(),
+                wrapper.0.id(),
+                None,
+                None,
+                1_000,
+                false,
+                true,
+                "blake3:source-fence-race".into(),
+            );
+            lease.process_birth = Some(birth);
+            assert!(worker.reserve_slots(2).await);
+            let owner = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    request.project.clone(),
+                    "worker1".into(),
+                    request.command.clone().unwrap(),
+                    wrapper.0.id(),
+                    Some(lease.identity.local_wrapper_id.clone()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .expect("the concurrent attempt must own its reserved slots");
+            lease.admit(owner.id, "worker1".into(), 1_000);
+            lease.phase = "finalize".into();
+            lease.recovery = Some(serde_json::json!({
+                "source_roots": ["/owned/interrupted-project"],
+                "pair": null, "retire_root": null,
+                "execution_started": true, "retired": false
+            }));
+            let path = ctx
+                .client_lease_dir
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            wrapper.interrupt();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                release_source_fence_test_build(&ctx, &lease),
+            )
+            .await
+            .unwrap();
+            assert!(ctx.history.active_builds().is_empty());
+            assert_eq!(worker.available_slots().await, 8);
+
+            if settled_before_reservation {
+                // Inject the authoritative settlement boundary, not a worker
+                // probe: the eager terminal fence still needs reconciliation.
+                settle_source_fence_test_lease(&path, &lease);
+            }
+            drop(audit);
+            let response = tokio::time::timeout(Duration::from_secs(5), selecting)
+                .await
+                .unwrap()
+                .unwrap();
+            let attempts: Vec<_> = ctx
+                .worker_selector
+                .get_audit_log(None)
+                .await
+                .into_iter()
+                .filter(|entry| entry.project == request.project)
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "the new fence must force a fresh selection"
+            );
+            assert_eq!(attempts[0].selected_worker_id.as_deref(), Some("worker1"));
+            assert_eq!(
+                attempts[1].selected_worker_id.as_deref(),
+                settled_before_reservation.then_some("worker1")
+            );
+
+            let admitted = if settled_before_reservation {
+                response
+            } else {
+                assert!(response.worker.is_none());
+                assert_eq!(
+                    response.reason,
+                    SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".into())
+                );
+                assert!(ctx.history.active_builds().is_empty());
+                assert_eq!(worker.available_slots().await, 8);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                settle_source_fence_test_lease(&path, &lease);
+                handle_select_worker_with_wrapper(
+                    &ctx,
+                    request.clone(),
+                    false,
+                    None,
+                    Some(JobIdentity::new_local().local_wrapper_id),
+                )
+                .await
+                .unwrap()
+            };
+            assert_eq!(admitted.reason, SelectionReason::Success);
+            assert_eq!(admitted.worker.as_ref().unwrap().id.as_str(), "worker1");
+            assert_ne!(admitted.build_id, Some(owner.id));
+            assert_eq!(ctx.history.active_builds().len(), 1);
+            assert_eq!(worker.used_slots(), 2);
+            let competitor = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some(JobIdentity::new_local().local_wrapper_id),
+            )
+            .await
+            .unwrap();
+            assert!(competitor.worker.is_none());
+            assert_eq!(
+                competitor.reason,
+                SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".into())
+            );
+            assert_eq!(ctx.history.active_builds().len(), 1);
+            assert_eq!(worker.used_slots(), 2);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
     async fn interrupted_execute_and_finalize_source_fences_restore_real_admission() {
         use rch_common::job_identity::JobIdentity;
         use rch_common::process_identity::{ProcessObservation, ProcessStart, observe_process};
@@ -12525,7 +12714,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert!(start("one").is_some());
+        assert!(matches!(start("one"), ActiveBuildAdmission::Admitted(_)));
         // One lane (the default): a second build of the project is excluded.
         assert!(project_excluded_workers(&ctx, "lane-project").contains("worker1"));
         pool.set_project_lanes(std::collections::HashMap::from([(
@@ -12533,7 +12722,10 @@ mod tests {
             2,
         )]));
         assert!(!project_excluded_workers(&ctx, "lane-project").contains("worker1"));
-        assert_eq!(start("two").unwrap().project_lane, 1);
+        let ActiveBuildAdmission::Admitted(second) = start("two") else {
+            panic!("the second project lane must admit another build");
+        };
+        assert_eq!(second.project_lane, 1);
         assert!(project_excluded_workers(&ctx, "lane-project").contains("worker1"));
         assert!(project_excluded_workers(&ctx, "other-project").is_empty());
         // Out-of-range settings are clamped.

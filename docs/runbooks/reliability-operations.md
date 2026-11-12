@@ -128,10 +128,15 @@ Recovery starts at most four clients per scan, with at most four in flight and
 one per worker. Pending executions take turns with other eligible leases. When
 the worker still reports execution activity, or completion appears between the
 receipt read and activity probe, recovery retains ownership and retries on a
-later scan. Genuine transport, protocol, journal, and reconciliation failures
-retain exponential backoff from ten minutes to six hours. These are attempt
-bounds, not completion promises: worker settlement, administrative disable,
-transport dormancy, and queued recovery can extend the wait.
+later scan. A journal gate held by another handle also defers automatic recovery
+until a later scan; brief local contention does not create a ten-minute failure
+delay. This observation proves nothing about the worker or the gate owner's
+process identity. Manual recovery continues to report the held journal as an
+explicit error. Neither kind of deferral clears an earlier genuine failure.
+Transport, protocol, journal validation, and reconciliation failures retain
+exponential backoff from ten minutes to six hours. These are attempt bounds,
+not completion promises: worker settlement, administrative disable, transport
+dormancy, and queued recovery can extend the wait.
 
 A cancellation response of `completed` describes daemon accounting and can
 still leave worker source ownership unresolved. Consequently, zero active builds

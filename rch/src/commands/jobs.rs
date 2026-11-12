@@ -73,17 +73,26 @@ pub async fn run(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> 
     }
 }
 
-/// Marked only after a daemon-owned recovery attempt has unwound. A typed
-/// worker observation from an ordinary manual command remains an error.
+/// Marked only after a daemon-owned recovery attempt has unwound. Typed
+/// observations from an ordinary manual command remain explicit errors.
 #[derive(Debug, thiserror::Error)]
 #[error("automatic recovery is waiting for worker settlement; ownership retained")]
 struct AutomaticRecoveryPending;
+
+#[derive(Debug, thiserror::Error)]
+#[error("automatic recovery is waiting for the job journal owner; ownership retained")]
+struct AutomaticRecoveryDeferred;
 
 #[cfg(unix)]
 fn automatic_recovery_result(result: Result<()>) -> Result<()> {
     result.map_err(|error| {
         if error.is::<rch_common::job_recovery::WorkerSettlementPending>() {
             error.context(AutomaticRecoveryPending)
+        } else if error.is::<crate::hook::JobJournalBusy>() {
+            // Only the journal gate's exact contention result is deferred.
+            // Namespace, permissions, identity and other I/O failures must
+            // remain failures, even if their diagnostics mention a busy lock.
+            error.context(AutomaticRecoveryDeferred)
         } else {
             error
         }
@@ -94,9 +103,13 @@ fn automatic_recovery_result(result: Result<()>) -> Result<()> {
 /// their journal/transport guards have been dropped. Never infer a retryable
 /// observation from diagnostic text or a remote workload's exit code.
 pub(crate) fn automatic_recovery_exit_code(error: &anyhow::Error) -> Option<i32> {
-    error
-        .is::<AutomaticRecoveryPending>()
-        .then_some(rch_common::job_recovery::AUTOMATIC_RECOVERY_PENDING_EXIT_CODE)
+    if error.is::<AutomaticRecoveryPending>() {
+        Some(rch_common::job_recovery::AUTOMATIC_RECOVERY_PENDING_EXIT_CODE)
+    } else if error.is::<AutomaticRecoveryDeferred>() {
+        Some(rch_common::job_recovery::AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -1186,10 +1199,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn journal_contention_is_deferred_only_for_daemon_managed_recovery() {
+        use rch_common::job_recovery::AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE;
+
+        for contextual in [false, true] {
+            let busy = anyhow::Error::new(crate::hook::JobJournalBusy);
+            let busy = if contextual {
+                busy.context("claim the original job journal")
+            } else {
+                busy
+            };
+            assert_eq!(automatic_recovery_exit_code(&busy), None);
+
+            let managed = automatic_recovery_result(Err(busy)).unwrap_err();
+            assert!(managed.is::<crate::hook::JobJournalBusy>());
+            assert!(!managed.is::<AutomaticRecoveryPending>());
+            assert_eq!(
+                automatic_recovery_exit_code(&managed),
+                Some(AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE)
+            );
+            assert_eq!(
+                automatic_recovery_exit_code(&managed.context("outer CLI boundary")),
+                Some(AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn automatic_recovery_keeps_real_failures_and_diagnostic_lookalikes_as_errors() {
         for error in [
             anyhow::anyhow!(rch_common::job_recovery::WorkerSettlementPending.to_string()),
+            anyhow::anyhow!(crate::hook::JobJournalBusy.to_string()),
             anyhow::anyhow!("remote completion identity mismatch"),
+            std::io::Error::from(std::io::ErrorKind::WouldBlock).into(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
             std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
         ] {
             let expected = format!("{error:#}");

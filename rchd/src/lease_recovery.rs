@@ -24,7 +24,9 @@ use rch_common::job_identity::{
     DurableJobLease, default_job_lease_directory, local_terminal_settlement_candidate,
     source_recovery_resources_retired,
 };
-use rch_common::job_recovery::AUTOMATIC_RECOVERY_PENDING_EXIT_CODE;
+use rch_common::job_recovery::{
+    AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE, AUTOMATIC_RECOVERY_PENDING_EXIT_CODE,
+};
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use rch_common::ssh::{OwnedProcessGroup, ssh_can_disable_background};
 use rch_common::timing::{MAX_CONTROL_TIMEOUT, TIMING_SCALE_ENV, TimingScale, ceil_seconds};
@@ -124,7 +126,8 @@ enum RecoveryOutcome {
     /// The worker still owns an execution or its completion raced the probe.
     /// Keep ownership and retry on the next scan, without failure backoff.
     SettlementPending,
-    /// Administrative disable, transport backoff, or an owned recovery flight.
+    /// Administrative disable, transport backoff, an owned recovery flight,
+    /// or contention for the exact journal's exclusive ownership gate.
     /// Neither establishes lease completion nor counts as a failed recovery.
     Deferred,
 }
@@ -950,6 +953,16 @@ async fn recover_in_with_policy(
         // This status never confirms completion, releases a reservation, or
         // retires a source fence. Only the exact journal check below can do so.
         return Ok(RecoveryOutcome::SettlementPending);
+    }
+    if automatic_ssh.is_some() && status.code() == Some(AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE) {
+        // Another handle owns the journal gate. Do not turn momentary local
+        // contention into ten minutes of failure backoff, or infer anything
+        // about the worker from an attempt that could not claim the journal.
+        debug!(
+            wrapper_id,
+            "Job journal is busy; deferring automatic recovery until the next scan"
+        );
+        return Ok(RecoveryOutcome::Deferred);
     }
     if status.success() {
         let after = read_lease(lease_dir, wrapper_id)?;
@@ -3501,52 +3514,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_worker_settlement_retries_next_scan_without_failure_backoff() {
-        let job = candidate("pending-execution", "worker");
-        let mut queue = RecoveryQueue::default();
-        queue
-            .backoff
-            .record_failure(&job.wrapper_id, Instant::now());
-        let previous_failure = queue.backoff.failures[&job.wrapper_id];
-        tokio::time::advance(BACKOFF_BASE).await;
+    async fn retryable_recovery_outcomes_wait_for_next_scan_without_failure_backoff() {
+        for retryable in [
+            RecoveryOutcome::SettlementPending,
+            RecoveryOutcome::Deferred,
+        ] {
+            let job = candidate("pending-recovery", "worker");
+            let mut queue = RecoveryQueue::default();
+            queue
+                .backoff
+                .record_failure(&job.wrapper_id, Instant::now());
+            let previous_failure = queue.backoff.failures[&job.wrapper_id];
+            tokio::time::advance(BACKOFF_BASE).await;
 
-        for _ in 0..3 {
+            for _ in 0..3 {
+                queue.refresh(vec![job.clone()]);
+                queue.start_ready_if(
+                    Instant::now(),
+                    |_| true,
+                    move |_| async move { Ok(retryable) },
+                );
+                assert_eq!(queue.running.len(), 1);
+                assert_eq!(queue.next_completed().await.unwrap().1, Ok(retryable));
+                assert_eq!(queue.backoff.failures[&job.wrapper_id], previous_failure);
+                queue.start_ready_if(
+                    Instant::now(),
+                    |_| true,
+                    |_| async { panic!("deferred recovery must wait for another scan") },
+                );
+                assert!(queue.running.is_empty());
+                assert!(queue.pending.is_empty());
+                tokio::time::advance(RECOVERY_INTERVAL).await;
+            }
+
             queue.refresh(vec![job.clone()]);
-            queue.start_ready_if(
-                Instant::now(),
-                |_| true,
-                |_| async { Ok(RecoveryOutcome::SettlementPending) },
-            );
-            assert_eq!(queue.running.len(), 1);
-            assert_eq!(
-                queue.next_completed().await.unwrap().1,
-                Ok(RecoveryOutcome::SettlementPending)
-            );
-            assert_eq!(queue.backoff.failures[&job.wrapper_id], previous_failure);
-            queue.start_ready_if(
-                Instant::now(),
-                |_| true,
-                |_| async { panic!("pending settlement must wait for another scan") },
-            );
-            assert!(queue.running.is_empty());
-            assert!(queue.pending.is_empty());
+            queue.start_ready(Instant::now(), |_| async { Err("transport failed".into()) });
+            assert!(queue.next_completed().await.unwrap().1.is_err());
+            assert_eq!(queue.backoff.failures[&job.wrapper_id].0, 2);
             tokio::time::advance(RECOVERY_INTERVAL).await;
+            queue.refresh(vec![job]);
+            queue.start_ready(Instant::now(), |_| async {
+                panic!("a genuine failure must retain exponential backoff")
+            });
+            assert!(queue.running.is_empty());
         }
-
-        queue.refresh(vec![job.clone()]);
-        queue.start_ready(Instant::now(), |_| async { Err("transport failed".into()) });
-        assert!(queue.next_completed().await.unwrap().1.is_err());
-        assert_eq!(queue.backoff.failures[&job.wrapper_id].0, 2);
-        tokio::time::advance(RECOVERY_INTERVAL).await;
-        queue.refresh(vec![job]);
-        queue.start_ready(Instant::now(), |_| async {
-            panic!("a genuine failure must retain exponential backoff")
-        });
-        assert!(queue.running.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_executions_cannot_starve_unattempted_leases_on_the_same_worker() {
+    async fn retryable_recoveries_cannot_starve_unattempted_leases_on_the_same_worker() {
         let candidates: Vec<_> = (0..2 * MAX_RECOVERIES_PER_CYCLE + 1)
             .map(|index| candidate(&format!("job-{index}"), "same-worker"))
             .collect();
@@ -3554,77 +3569,90 @@ mod tests {
             .iter()
             .map(|job| job.wrapper_id.clone())
             .collect();
-        let mut queue = RecoveryQueue::default();
-        let mut attempted = Vec::new();
-        for _ in 0..3 {
-            queue.refresh(candidates.clone());
-            for _ in 0..MAX_RECOVERIES_PER_CYCLE {
+        for retryable in [
+            RecoveryOutcome::SettlementPending,
+            RecoveryOutcome::Deferred,
+        ] {
+            let mut queue = RecoveryQueue::default();
+            let mut attempted = Vec::new();
+            for _ in 0..3 {
+                queue.refresh(candidates.clone());
+                for _ in 0..MAX_RECOVERIES_PER_CYCLE {
+                    queue.start_ready_if(
+                        Instant::now(),
+                        |_| true,
+                        move |_| async move { Ok(retryable) },
+                    );
+                    assert_eq!(queue.running.len(), 1, "one recovery per worker");
+                    let (job, outcome) = queue.next_completed().await.unwrap();
+                    assert_eq!(outcome, Ok(retryable));
+                    attempted.push(job.wrapper_id);
+                }
                 queue.start_ready_if(
                     Instant::now(),
                     |_| true,
-                    |_| async { Ok(RecoveryOutcome::SettlementPending) },
+                    |_| async { panic!("deferred recovery bypassed the per-scan budget") },
                 );
-                assert_eq!(queue.running.len(), 1, "one recovery per worker");
-                let (job, outcome) = queue.next_completed().await.unwrap();
-                assert_eq!(outcome, Ok(RecoveryOutcome::SettlementPending));
-                attempted.push(job.wrapper_id);
+                assert!(queue.running.is_empty());
+                assert!(queue.backoff.failures.is_empty());
+                tokio::time::advance(RECOVERY_INTERVAL).await;
             }
-            queue.start_ready_if(
-                Instant::now(),
-                |_| true,
-                |_| async { panic!("pending execution bypassed the per-scan budget") },
-            );
-            assert!(queue.running.is_empty());
-            assert!(queue.backoff.failures.is_empty());
-            tokio::time::advance(RECOVERY_INTERVAL).await;
+            assert_eq!(&attempted[..expected.len()], expected.as_slice());
         }
-        assert_eq!(&attempted[..expected.len()], expected.as_slice());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn managed_pending_exit_retains_ownership_and_does_not_confirm_recovery() {
+    async fn managed_retryable_exits_retain_ownership_and_do_not_confirm_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let endpoint = recovery_worker("pending-client");
         let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
-        let child = fake_rch(
-            directory.path(),
-            &format!("exit {AUTOMATIC_RECOVERY_PENDING_EXIT_CODE}\n"),
-        );
         let socket = directory.path().join("unused.sock");
-        let outcome = recover_in_with_policy(
-            &child,
-            &socket,
-            directory.path(),
-            &candidate.wrapper_id,
-            Some(&candidate),
-            RecoveryClientPolicy::Network {
-                can_disable_background: false,
-            },
-            test_recovery_window(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, RecoveryOutcome::SettlementPending);
-        assert_eq!(
-            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
-            owned
-        );
-        assert!(verify_recovery_completion(&owned, &owned).is_err());
-        assert!(
-            recover_in(
+        for (exit_code, expected) in [
+            (
+                AUTOMATIC_RECOVERY_PENDING_EXIT_CODE,
+                RecoveryOutcome::SettlementPending,
+            ),
+            (
+                AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE,
+                RecoveryOutcome::Deferred,
+            ),
+        ] {
+            let child = fake_rch(directory.path(), &format!("exit {exit_code}\n"));
+            let outcome = recover_in_with_policy(
                 &child,
                 &socket,
                 directory.path(),
                 &candidate.wrapper_id,
-                Some(&candidate)
+                Some(&candidate),
+                RecoveryClientPolicy::Network {
+                    can_disable_background: false,
+                },
+                test_recovery_window(),
             )
             .await
-            .is_err(),
-            "the pending exit code is reserved for the managed protocol"
-        );
+            .unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+                owned
+            );
+            assert!(verify_recovery_completion(&owned, &owned).is_err());
+            assert!(
+                recover_in(
+                    &child,
+                    &socket,
+                    directory.path(),
+                    &candidate.wrapper_id,
+                    Some(&candidate)
+                )
+                .await
+                .is_err(),
+                "retryable exit codes are reserved for the managed protocol"
+            );
+        }
 
-        let child = fake_rch(directory.path(), "exit 1\n");
+        let child = fake_rch(directory.path(), "echo 'job journal is busy' >&2\nexit 1\n");
         assert!(
             recover_in_with_policy(
                 &child,

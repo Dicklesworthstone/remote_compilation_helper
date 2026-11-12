@@ -7858,7 +7858,7 @@ mod tests {
         );
 
         let history = Arc::new(crate::history::BuildHistory::new(10));
-        let admitted = history
+        let admission = history
             .try_start_active_build_in_lanes(
                 "namespace-attempt".into(),
                 "active-project".into(),
@@ -7873,8 +7873,10 @@ mod tests {
                 request.source_topology.clone(),
                 1,
             )
-            .unwrap()
             .unwrap();
+        let crate::history::ActiveBuildAdmission::Admitted(admitted) = admission else {
+            panic!("namespace fixture must be admitted: {admission:?}");
+        };
         history
             .record_source_topology_mismatch(
                 admitted.id,
