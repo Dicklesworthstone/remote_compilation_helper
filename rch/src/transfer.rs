@@ -5406,7 +5406,7 @@ impl TransferPipeline {
     // Selection runs entirely locally. Windows include-only tar uploads must
     // use the same rsync filters as POSIX uploads, without enabling the separate
     // remote source-content receipt protocol or symlinks on Windows.
-    async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
+    pub(crate) async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
         Ok(self
             .enumerate_source_upload_selection(false, false)
             .await?

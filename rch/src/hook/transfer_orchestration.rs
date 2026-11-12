@@ -38,7 +38,8 @@ use super::daemon_ipc::urlencoding_encode;
 use super::dependency_closure::{
     SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_owned_sync_closure_layout,
     build_sync_closure_manifest, build_sync_closure_plan, merge_sync_result,
-    verify_remote_dependency_manifests, workspace_metadata_sync_patterns,
+    verify_remote_dependency_manifests, verify_selected_dependency_inputs,
+    workspace_metadata_sync_patterns,
 };
 use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
 use super::progress_reporting::{
@@ -2067,6 +2068,21 @@ async fn execute_remote_compilation_inner(
         && !transfer_config.bwlimit_kbps.is_some_and(|limit| limit > 0);
     let mut queued_uploads = Vec::new();
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
+    let dependency_selection_authorities = if exact_dependency_closure_sync
+        && !super::ssh::should_skip_remote_preflight(&worker_config)
+    {
+        if explicit_manifest_root.is_some() {
+            cargo_manifest::manifest_preflight_projection(
+                &sync_plan,
+                &raw_sync_roots,
+                topology_policy,
+            )?
+        } else {
+            sync_plan.iter().cloned().enumerate().collect()
+        }
+    } else {
+        Vec::new()
+    };
     for (root_index, entry) in sync_plan.iter().enumerate() {
         let root_overlay = clean_overlay
             .map(|spec| {
@@ -2187,6 +2203,24 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+
+        let authorities: Vec<_> = dependency_selection_authorities
+            .iter()
+            .filter(|(index, _)| *index == root_index)
+            .map(|(_, authority)| authority)
+            .collect();
+        if !authorities.is_empty() {
+            verify_selected_dependency_inputs(
+                &worker_config,
+                entry,
+                &authorities,
+                &root_pipeline,
+                prepared_source_root
+                    .as_ref()
+                    .map(|root| root.selected_file_paths()),
+            )
+            .await?;
+        }
 
         if let Some(spec) = root_overlay {
             reporter.verbose(&format!(

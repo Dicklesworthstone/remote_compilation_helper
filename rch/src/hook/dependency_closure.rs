@@ -139,6 +139,7 @@ pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under the canonical project root (path_topology.canonical_root, default /data/projects, alias /dp) and retry.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION: &str = "Cargo path materialization is incomplete; repair the reported repository manifest/path dependency before retrying remote Cargo execution.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_SELECTION: &str = "Restore the reported local Cargo input or include it in the transfer by adjusting .rchignore or [transfer].exclude_patterns. If the target is intentionally omitted, remove its declaration or disable its Cargo auto-discovery in Cargo.toml. rch sync --force respects transfer filters and cannot restore excluded inputs.";
 const DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW: usize = 128;
 const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
     "Cargo.toml",
@@ -655,6 +656,95 @@ pub(super) fn synced_dependency_preflight_checks(
         .filter(|(_, outcome)| matches!(outcome, SyncRootOutcome::Synced))
         .flat_map(|(entry, _)| dependency_preflight_checks_for_entry(entry))
         .collect()
+}
+
+/// Prove that the actual transfer can supply its required Cargo inputs before
+/// uploading or probing the worker. A retained, excluded worker file must not
+/// make an impossible source closure appear healthy (#135).
+///
+/// `authorities` are package roots projected onto this transfer; a repository
+/// basis may have no Cargo.toml of its own. Reuse rsync's real selection instead
+/// of interpreting its patterns again, including tracked-input exceptions and
+/// the covering root's .rchignore.
+pub(super) async fn verify_selected_dependency_inputs(
+    worker: &WorkerConfig,
+    transfer: &SyncClosurePlanEntry,
+    authorities: &[&SyncClosurePlanEntry],
+    pipeline: &TransferPipeline,
+    captured_selection: Option<Vec<PathBuf>>,
+) -> anyhow::Result<()> {
+    if authorities.is_empty() {
+        return Ok(());
+    }
+    let selected: std::collections::BTreeSet<_> = match captured_selection {
+        Some(paths) => paths,
+        None if WorkerPlatform::from_worker(worker).is_windows() => {
+            pipeline.enumerate_source_upload_files().await?
+        }
+        None => pipeline.enumerate_source_content_selection().await?.0,
+    }
+    .into_iter()
+    .collect();
+    let mut checks: Vec<_> = authorities
+        .iter()
+        .flat_map(|entry| dependency_preflight_checks_for_entry(entry))
+        .collect();
+    checks.sort_by(|left, right| {
+        (&left.required_path, left.required_kind).cmp(&(&right.required_path, right.required_kind))
+    });
+    checks.dedup_by(|left, right| {
+        left.required_path == right.required_path && left.required_kind == right.required_kind
+    });
+    let mut evidence = Vec::new();
+    for check in checks {
+        let relative = Path::new(&check.required_path)
+            .strip_prefix(&transfer.remote_root)
+            .context("Cargo preflight input is outside its covering source transfer")?;
+        if selected.contains(relative) {
+            continue;
+        }
+        let local = transfer.local_root.join(relative);
+        let detail = if local.is_file() {
+            format!(
+                "required Cargo {} {} is excluded from the source transfer rooted at {}; check {} and [transfer].exclude_patterns; a stale worker copy cannot satisfy this input",
+                check.required_kind,
+                local.display(),
+                transfer.local_root.display(),
+                transfer.local_root.join(".rchignore").display(),
+            )
+        } else {
+            format!(
+                "required Cargo {} {} is missing from the local source transfer rooted at {}; restore the input or correct its Cargo.toml declaration",
+                check.required_kind,
+                local.display(),
+                transfer.local_root.display(),
+            )
+        };
+        evidence.push(DependencyPreflightEvidence {
+            root: check.root,
+            manifest: check.manifest,
+            required_path: check.required_path,
+            required_kind: check.required_kind,
+            status: DependencyPreflightStatus::MaterializationUnavailable,
+            reason_code: DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+            detail,
+            is_primary: check.is_primary,
+        });
+    }
+    if evidence.is_empty() {
+        return Ok(());
+    }
+    Err(
+        DependencyPreflightFailure::from_report(DependencyPreflightReport {
+            schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
+            worker: worker.id.as_str().to_owned(),
+            verified: false,
+            reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION),
+            remediation: Some(DEPENDENCY_PREFLIGHT_REMEDIATION_SELECTION),
+            evidence,
+        })
+        .into(),
+    )
 }
 
 pub(super) fn build_dependency_preflight_report(
@@ -1336,6 +1426,209 @@ pub(super) fn dependency_preflight_timeout(check_count: usize) -> Duration {
         .div_ceil(DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW)
         .max(1);
     Duration::from_secs(20).saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
+}
+
+#[cfg(all(test, unix))]
+mod source_selection_tests {
+    use super::*;
+    use rch_common::test_guard;
+    use std::fs;
+
+    fn fixture(extra: &str) -> (tempfile::TempDir, SyncClosurePlanEntry, WorkerConfig) {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("package with ' quote");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"selection-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        fs::write(root.join("tests/ignored.rs"), "#[test] fn fixture() {}\n").unwrap();
+        let remote_root = storage.path().join("worker/source");
+        let entry = SyncClosurePlanEntry {
+            local_root: root,
+            remote_root: remote_root.to_str().unwrap().to_owned(),
+            project_id: "selection-fixture".into(),
+            root_hash: "fixture".into(),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        };
+        let worker = WorkerConfig {
+            id: WorkerId::new("selection-fixture"),
+            host: "selection-fixture.invalid".into(),
+            ..WorkerConfig::default()
+        };
+        (storage, entry, worker)
+    }
+
+    fn pipeline(entry: &SyncClosurePlanEntry, settings: TransferConfig) -> TransferPipeline {
+        TransferPipeline::new(
+            entry.local_root.clone(),
+            entry.project_id.clone(),
+            entry.root_hash.clone(),
+            settings,
+        )
+        .with_remote_path_override(entry.remote_root.clone())
+    }
+
+    #[tokio::test]
+    async fn dependency_selection_rejects_ignored_entrypoint_despite_stale_worker_copy() {
+        let _guard = test_guard!();
+        let (_storage, entry, worker) = fixture("");
+        fs::write(entry.local_root.join(".rchignore"), "/tests/ignored.rs\n").unwrap();
+        for relative in ["Cargo.toml", "src/lib.rs", "tests/ignored.rs"] {
+            let remote = Path::new(&entry.remote_root).join(relative);
+            fs::create_dir_all(remote.parent().unwrap()).unwrap();
+            fs::copy(entry.local_root.join(relative), &remote).unwrap();
+        }
+        let checks = dependency_preflight_checks_for_entry(&entry);
+        let command = build_remote_dependency_preflight_command(&checks).unwrap();
+        let old_probe = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(old_probe.status.success(), "{old_probe:?}");
+
+        let pipeline = pipeline(&entry, TransferConfig::default());
+        let failure =
+            verify_selected_dependency_inputs(&worker, &entry, &[&entry], &pipeline, None)
+                .await
+                .expect_err("a retained worker file cannot repair an excluded Cargo input")
+                .downcast::<DependencyPreflightFailure>()
+                .unwrap();
+        assert_eq!(
+            failure.reason_code,
+            DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
+        );
+        assert_eq!(failure.report.evidence.len(), 1);
+        let evidence = &failure.report.evidence[0];
+        assert_eq!(evidence.required_kind, "source_entrypoint");
+        assert_eq!(
+            Path::new(&evidence.required_path),
+            Path::new(&entry.remote_root).join("tests/ignored.rs")
+        );
+        assert!(
+            evidence
+                .detail
+                .contains("excluded from the source transfer")
+        );
+        assert!(
+            evidence
+                .detail
+                .contains(entry.local_root.join("tests/ignored.rs").to_str().unwrap())
+        );
+        assert!(
+            evidence
+                .detail
+                .contains(entry.local_root.join(".rchignore").to_str().unwrap())
+        );
+        assert!(
+            failure
+                .remediation
+                .contains("cannot restore excluded inputs")
+        );
+        assert!(!failure.remediation.contains("rch sync --worker"));
+
+        let prepared = super::super::source_fidelity::prepare_source_content_root(
+            0,
+            &entry,
+            &pipeline.clone().with_sync_checksum(true),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            entry.local_root.join(".rchignore"),
+            "# input is now selected\n",
+        )
+        .unwrap();
+        let captured_failure = verify_selected_dependency_inputs(
+            &worker,
+            &entry,
+            &[&entry],
+            &pipeline,
+            Some(prepared.selected_file_paths()),
+        )
+        .await
+        .expect_err("receipt preflight must reuse its captured selection, not enumerate again")
+        .downcast::<DependencyPreflightFailure>()
+        .unwrap();
+        assert_eq!(captured_failure.report, failure.report);
+        verify_selected_dependency_inputs(&worker, &entry, &[&entry], &pipeline, None)
+            .await
+            .expect("including the required input must repair the source-policy conflict");
+    }
+
+    #[tokio::test]
+    async fn dependency_selection_preserves_manifest_auto_discovery_and_explicit_targets() {
+        let _guard = test_guard!();
+        let (_storage, entry, worker) = fixture("autotests = false\n");
+        fs::write(
+            entry.local_root.join(".rchignore"),
+            "/tests/\n/unrelated/\n",
+        )
+        .unwrap();
+        fs::create_dir_all(entry.local_root.join("unrelated")).unwrap();
+        fs::write(
+            entry.local_root.join("unrelated/note.txt"),
+            "not a Cargo input\n",
+        )
+        .unwrap();
+        let pipeline = pipeline(&entry, TransferConfig::default());
+        verify_selected_dependency_inputs(&worker, &entry, &[&entry], &pipeline, None)
+            .await
+            .expect("disabled targets and unrelated excluded files are not required inputs");
+
+        let manifest = fs::read_to_string(entry.local_root.join("Cargo.toml")).unwrap();
+        fs::write(
+            entry.local_root.join("Cargo.toml"),
+            format!("{manifest}\n[[test]]\nname = \"explicit\"\npath = \"tests/ignored.rs\"\n"),
+        )
+        .unwrap();
+        let failure =
+            verify_selected_dependency_inputs(&worker, &entry, &[&entry], &pipeline, None)
+                .await
+                .expect_err("an explicit test remains required when auto-discovery is disabled")
+                .downcast::<DependencyPreflightFailure>()
+                .unwrap();
+        assert_eq!(failure.report.evidence.len(), 1);
+        assert!(failure.evidence_summary().contains("tests/ignored.rs"));
+    }
+
+    #[tokio::test]
+    async fn dependency_selection_checks_config_filters_for_posix_and_windows_uploads() {
+        let _guard = test_guard!();
+        let (_storage, entry, mut worker) = fixture("");
+        let settings = TransferConfig {
+            exclude_patterns: vec!["/tests/ignored.rs".into()],
+            ..TransferConfig::default()
+        };
+        for windows in [false, true] {
+            worker.tags = if windows {
+                vec!["os:windows".into()]
+            } else {
+                Vec::new()
+            };
+            let pipeline = pipeline(&entry, settings.clone())
+                .with_worker_platform(WorkerPlatform::from_worker(&worker));
+            let failure =
+                verify_selected_dependency_inputs(&worker, &entry, &[&entry], &pipeline, None)
+                    .await
+                    .expect_err("the exact source filter must also apply to Windows tar selection")
+                    .downcast::<DependencyPreflightFailure>()
+                    .unwrap();
+            assert_eq!(failure.report.evidence.len(), 1);
+            assert!(failure.evidence_summary().contains("tests/ignored.rs"));
+            assert!(
+                failure
+                    .evidence_summary()
+                    .contains("[transfer].exclude_patterns")
+            );
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

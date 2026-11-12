@@ -157,6 +157,18 @@ pub(super) struct PreparedSourceContentRoot {
     coalesced: Vec<PreparedSourceContentRoot>,
 }
 
+impl PreparedSourceContentRoot {
+    /// Reuse the already captured upload selection for local Cargo preflight
+    /// rather than enumerate it again when a source receipt is requested.
+    pub(super) fn selected_file_paths(&self) -> Vec<PathBuf> {
+        self.manifest
+            .files
+            .iter()
+            .map(|file| PathBuf::from(&file.path))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct SourceContentReceipt {
     schema: &'static str,
