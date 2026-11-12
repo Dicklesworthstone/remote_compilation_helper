@@ -20,6 +20,7 @@ mod source_claim_link;
 mod source_lock;
 mod source_release;
 mod source_retain;
+mod source_settlement;
 mod source_verifier;
 mod toolchain;
 
@@ -142,6 +143,12 @@ enum Commands {
     SourceRelease {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal exact namespace discovery and terminal cancellation settlement.
+    #[command(hide = true)]
+    SourceSettlement {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
     },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
@@ -401,6 +408,9 @@ fn main() -> Result<()> {
     if let Commands::SourceRelease { arguments } = &cli.command {
         std::process::exit(source_release::main(arguments));
     }
+    if let Commands::SourceSettlement { arguments } = &cli.command {
+        std::process::exit(source_settlement::main(arguments));
+    }
     if let Commands::SourceAdmission { arguments } = &cli.command {
         std::process::exit(source_admission::main(arguments));
     }
@@ -531,6 +541,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceRelease { .. } => {
             anyhow::bail!("source-release requires the synchronous worker entry point")
+        }
+        Commands::SourceSettlement { .. } => {
+            anyhow::bail!("source-settlement requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

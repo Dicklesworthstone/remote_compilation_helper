@@ -5177,7 +5177,9 @@ exec sleep 30
         let socket = transport.socket.clone();
         client.disconnect().await.unwrap();
         assert!(transport.arguments().is_err());
-        assert!(socket.parent().unwrap().is_dir());
+        // A stale transport cannot retain the stopped master's private
+        // directory: the guardian retires it before disconnect completes.
+        assert!(!socket.parent().unwrap().exists());
         drop(transport);
         assert!(!socket.parent().unwrap().exists());
         fake.assert_reaped().await;

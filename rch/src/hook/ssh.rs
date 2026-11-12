@@ -243,6 +243,19 @@ if ! rch_release_probe=$("$RCH_WKR" source-release probe </dev/null) \
 fi
 exec "$RCH_WKR" source-release wait "$@"
 "#;
+const SOURCE_AUTHORITY_SETTLEMENT: &str = r#"
+set -eu
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_SOURCE_CANCELLATION_UNSETTLED rch-wkr is not installed on this worker' >&2
+    exit 73
+fi
+if ! rch_settlement_probe=$("$RCH_WKR" source-settlement probe </dev/null) \
+    || [ "$rch_settlement_probe" != 'rch-wkr source-settlement v1' ]; then
+    printf '%s\n' 'RCH_SOURCE_CANCELLATION_UNSETTLED deploy the matching rch-wkr with source-settlement support' >&2
+    exit 73
+fi
+exec "$RCH_WKR" source-settlement "$@"
+"#;
 // Every caller holds the pair flock; claim additionally holds the registry
 // metadata mutex after checking its cancellation fences. Private same-directory
 // writes prevent a failed write or killed initializer from truncating the last
@@ -1637,10 +1650,17 @@ fn source_cancellation_settlement_command(
     let (roots, digest) = source_claim_roots(roots)?;
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let transaction = source_registry_script();
+    let coordinator = format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        SOURCE_AUTHORITY_SETTLEMENT,
+    );
+    #[cfg(test)]
+    let coordinator = format!("{}{coordinator}", test_worker_default());
     let command = format!(
-        "printf '%s' {roots} | exec python3 -I -S -c {coordinator} {registry} {legacy} {identity} {digest} {transaction} {operation} {expected}\n",
+        "printf '%s' {roots} | sh -c {coordinator} rch-source-settlement {registry} {legacy} {identity} {digest} {transaction} {operation} {expected}\n",
         roots = quote(&roots),
-        coordinator = quote(include_str!("source_cancel_settlement.py")),
+        coordinator = quote(&coordinator),
         registry = quote(registry),
         legacy = quote(legacy_registry),
         identity = quote(identity),
@@ -4662,6 +4682,60 @@ assert not namespace['direct_topology'](['/first', '/alias'], '/first')
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cancellation_requires_matching_native_settlement_worker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for probe in [
+            None,
+            Some("exit 2"),
+            Some("printf '%s\\n' 'rch-wkr source-settlement v0'"),
+            Some("printf '%s\\n' 'rch-wkr source-settlement v1' 'surplus'"),
+            Some("printf '%s\\n' 'rch-wkr source-settlement v1'; exit 9"),
+        ] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let worker = directory.path().join("worker ' wrong");
+            let reached = directory.path().join("unexpected-settlement");
+            if let Some(probe) = probe {
+                let script = format!(
+                    "#!/bin/sh\nif [ \"$2\" = probe ]; then {probe}; exit $?; fi\nprintf called > {}; exit 98\n",
+                    shell_escape::escape(reached.to_string_lossy()),
+                );
+                std::fs::write(&worker, script).unwrap();
+                std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let command = source_cancellation_settlement_command(
+                directory.path().join("current").to_str().unwrap(),
+                directory.path().join("legacy").to_str().unwrap(),
+                &["/owned/source".to_owned()],
+                "ac05",
+                "locate",
+                "",
+            )
+            .unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .env("RCH_WKR_BIN", &worker)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "probe={probe:?}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(!reached.exists());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("RCH_SOURCE_CANCELLATION_UNSETTLED")
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
