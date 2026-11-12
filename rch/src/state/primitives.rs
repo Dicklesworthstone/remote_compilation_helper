@@ -176,7 +176,8 @@ fn atomic_write_with_temporary_name(
     path: &Path,
     content: &[u8],
     temporary: &std::ffi::OsStr,
-    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
+    #[cfg(unix)] mode: rustix::fs::RawMode,
+    #[cfg(not(unix))] _mode: u32,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -782,6 +783,48 @@ mod tests {
             fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_requested_creation_modes() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        // Rustix uses the platform's mode_t, while std takes u32. Keep both
+        // literal inputs exact and compare real creation under the same umask.
+        let modes: [(rustix::fs::RawMode, u32); 6] = [
+            (0o600, 0o600),
+            (0o640, 0o640),
+            (0o666, 0o666),
+            (0o700, 0o700),
+            (0o755, 0o755),
+            (0o200, 0o200),
+        ];
+        for (mode, reference_mode) in modes {
+            let target = directory.path().join(format!("target-{mode:o}"));
+            let reference = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(reference_mode)
+                .open(directory.path().join(format!("reference-{mode:o}")))
+                .unwrap();
+            atomic_write_with_temporary_name(
+                &target,
+                b"mode-preserving bytes",
+                std::ffi::OsStr::new("held.tmp"),
+                mode,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                reference.metadata().unwrap().permissions().mode() & 0o7777,
+                "requested creation mode {reference_mode:o} changed"
+            );
+        }
     }
 
     #[test]
