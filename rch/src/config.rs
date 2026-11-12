@@ -797,9 +797,11 @@ struct PartialGeneralConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialSelectionConfig {
     disk_gb_per_slot: Option<f64>,
+    disk_warning_free_ratio: Option<f64>,
     disk_critical_free_ratio: Option<f64>,
     // Only presence is needed for attribution. Full config loading validates
     // and decodes both the numeric cap and the explicit "uncapped" spelling.
+    disk_warning_ratio_cap_gb: Option<toml::Value>,
     disk_critical_ratio_cap_gb: Option<toml::Value>,
     #[serde(default)]
     weights: PartialSelectionWeights,
@@ -1524,6 +1526,8 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.allow_local_fallback",
         "compilation.remote_build_jobs",
         "selection.disk_gb_per_slot",
+        "selection.disk_warning_free_ratio",
+        "selection.disk_warning_ratio_cap_gb",
         "selection.disk_critical_free_ratio",
         "selection.disk_critical_ratio_cap_gb",
         "selection.weights.disk",
@@ -1668,6 +1672,17 @@ fn apply_layer(
     if let Some(disk_gb_per_slot) = layer.selection.disk_gb_per_slot {
         config.selection.disk_gb_per_slot = disk_gb_per_slot;
         set_source(sources, "selection.disk_gb_per_slot", source.clone());
+    }
+    if let Some(ratio) = layer.selection.disk_warning_free_ratio {
+        config.selection.disk_warning_free_ratio = ratio;
+        set_source(sources, "selection.disk_warning_free_ratio", source.clone());
+    }
+    if layer.selection.disk_warning_ratio_cap_gb.is_some() {
+        set_source(
+            sources,
+            "selection.disk_warning_ratio_cap_gb",
+            source.clone(),
+        );
     }
     if let Some(ratio) = layer.selection.disk_critical_free_ratio {
         config.selection.disk_critical_free_ratio = ratio;
@@ -4618,6 +4633,8 @@ max_concurrent_workers = 3
     #[test]
     fn disk_ratio_policy_sources_preserve_explicit_overrides_and_unrelated_layers() {
         let _guard = test_guard!();
+        let warning_ratio_key = "selection.disk_warning_free_ratio";
+        let warning_cap_key = "selection.disk_warning_ratio_cap_gb";
         let ratio_key = "selection.disk_critical_free_ratio";
         let cap_key = "selection.disk_critical_ratio_cap_gb";
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4626,22 +4643,32 @@ max_concurrent_workers = 3
 
         let defaults = load_config_with_sources_from_paths(Some(&user_path), None, None)
             .expect("missing config uses defaults");
+        assert_eq!(defaults.config.selection.disk_warning_ratio_cap_gb, None);
+        assert_eq!(defaults.config.selection.disk_warning_free_ratio, 0.12);
         assert_eq!(
             defaults.config.selection.disk_critical_ratio_cap_gb,
             Some(25.0)
         );
         assert_eq!(defaults.sources[cap_key], ConfigValueSource::Default);
         assert_eq!(defaults.sources[ratio_key], ConfigValueSource::Default);
+        assert_eq!(
+            defaults.sources[warning_cap_key],
+            ConfigValueSource::Default
+        );
+        assert_eq!(
+            defaults.sources[warning_ratio_key],
+            ConfigValueSource::Default
+        );
 
-        for (value, expected_cap) in [
-            ("15.0", Some(15.0)),
-            ("30.0", Some(30.0)),
-            ("\"uncapped\"", None),
+        for (value, expected_cap, warning_value, expected_warning_cap) in [
+            ("15.0", Some(15.0), "25.0", Some(25.0)),
+            ("30.0", Some(30.0), "100.0", Some(100.0)),
+            ("\"uncapped\"", None, "\"uncapped\"", None),
         ] {
             std::fs::write(
                 &user_path,
                 format!(
-                    "[selection]\ndisk_critical_free_ratio = 0.03\ndisk_critical_ratio_cap_gb = {value}\n"
+                    "[selection]\ndisk_critical_free_ratio = 0.03\ndisk_critical_ratio_cap_gb = {value}\ndisk_warning_free_ratio = 0.2\ndisk_warning_ratio_cap_gb = {warning_value}\n"
                 ),
             )
             .unwrap();
@@ -4655,6 +4682,11 @@ max_concurrent_workers = 3
             );
             assert_eq!(layered.config.selection.disk_critical_free_ratio, 0.03);
             assert_eq!(
+                layered.config.selection.disk_warning_ratio_cap_gb,
+                expected_warning_cap
+            );
+            assert_eq!(layered.config.selection.disk_warning_free_ratio, 0.2);
+            assert_eq!(
                 layered.sources[cap_key],
                 ConfigValueSource::UserConfig(user_path.clone())
             );
@@ -4662,15 +4694,26 @@ max_concurrent_workers = 3
                 layered.sources[ratio_key],
                 ConfigValueSource::UserConfig(user_path.clone())
             );
+            for key in [warning_cap_key, warning_ratio_key] {
+                assert_eq!(
+                    layered.sources[key],
+                    ConfigValueSource::UserConfig(user_path.clone())
+                );
+            }
             let cached: RchConfig =
                 serde_json::from_slice(&serde_json::to_vec(&layered.config).unwrap()).unwrap();
             assert_eq!(cached.selection.disk_critical_ratio_cap_gb, expected_cap);
+            assert_eq!(
+                cached.selection.disk_warning_ratio_cap_gb,
+                expected_warning_cap
+            );
+            assert_eq!(cached.selection.disk_warning_free_ratio, 0.2);
 
             // Explicit defaults must override the user policy, including an
             // unconditional ratio, and name the project as their source.
             std::fs::write(
                 &project_path,
-                "[selection]\ndisk_critical_free_ratio = 0.05\ndisk_critical_ratio_cap_gb = 25.0\n",
+                "[selection]\ndisk_critical_free_ratio = 0.05\ndisk_critical_ratio_cap_gb = 25.0\ndisk_warning_free_ratio = 0.12\ndisk_warning_ratio_cap_gb = \"uncapped\"\n",
             )
             .unwrap();
             let project =
@@ -4681,6 +4724,8 @@ max_concurrent_workers = 3
                 Some(25.0)
             );
             assert_eq!(project.config.selection.disk_critical_free_ratio, 0.05);
+            assert_eq!(project.config.selection.disk_warning_ratio_cap_gb, None);
+            assert_eq!(project.config.selection.disk_warning_free_ratio, 0.12);
             assert_eq!(
                 project.sources[cap_key],
                 ConfigValueSource::ProjectConfig(project_path.clone())
@@ -4689,6 +4734,12 @@ max_concurrent_workers = 3
                 project.sources[ratio_key],
                 ConfigValueSource::ProjectConfig(project_path.clone())
             );
+            for key in [warning_cap_key, warning_ratio_key] {
+                assert_eq!(
+                    project.sources[key],
+                    ConfigValueSource::ProjectConfig(project_path.clone())
+                );
+            }
         }
     }
 

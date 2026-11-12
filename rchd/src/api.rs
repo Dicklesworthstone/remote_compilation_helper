@@ -1169,6 +1169,7 @@ async fn handle_connection_with_metrics(
                         "added": reload_result.added,
                         "updated": reload_result.updated,
                         "removed": reload_result.removed,
+                        "disk_policy_changed": reload_result.disk_policy_changed,
                         "warnings": reload_result.warnings
                     });
                     (response.to_string(), "application/json")

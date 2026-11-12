@@ -216,6 +216,7 @@ pub struct DaemonReloadResponse {
     pub added: usize,
     pub updated: usize,
     pub removed: usize,
+    pub disk_policy_changed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -662,7 +662,23 @@ pub fn load_self_test_config() -> Result<SelfTestConfig> {
 
 /// Load full RCH configuration and install its validated control timing policy.
 pub fn load_rch_config() -> Result<RchConfig> {
-    let path = config_dir().map(|dir| dir.join("config.toml"));
+    load_rch_config_with_source().map(|(config, _)| config)
+}
+
+/// Return the exact launch-time path with the config so later reloads cannot
+/// switch to another platform config directory or resolve a relative path anew.
+pub fn load_rch_config_with_source() -> Result<(RchConfig, Option<PathBuf>)> {
+    let path = config_dir()
+        .map(|dir| {
+            let path = dir.join("config.toml");
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(path))
+            }
+        })
+        .transpose()
+        .context("Could not resolve RCH configuration path")?;
     let timing_override = match std::env::var(rch_common::timing::TIMING_SCALE_ENV) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -672,7 +688,7 @@ pub fn load_rch_config() -> Result<RchConfig> {
     };
     let config = load_rch_config_from_path(path.as_deref(), timing_override.as_deref())?;
     rch_common::timing::install(config.timeouts.scale);
-    Ok(config)
+    Ok((config, path))
 }
 
 fn load_rch_config_from_path(

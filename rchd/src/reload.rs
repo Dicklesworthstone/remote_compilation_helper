@@ -1,10 +1,11 @@
-//! Hot-reload support for the daemon's worker configuration.
+//! Hot-reload support for worker inventory and the daemon's disk pressure policy.
 //!
 //! Watch the selected workers file (including custom filenames) without a
 //! daemon restart. Invalid or unavailable snapshots retain the current fleet;
 //! only an explicit `workers = []` requests an empty fleet.
 
 use crate::config::{self, WorkersConfig};
+use crate::disk_pressure::DiskPressurePolicyConfig;
 use crate::workers::WorkerPool;
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -45,6 +46,8 @@ pub struct ReloadResult {
     pub updated: usize,
     /// Number of workers removed.
     pub removed: usize,
+    /// Whether the shared disk pressure policy changed.
+    pub disk_policy_changed: bool,
     /// Any warnings generated during reload.
     pub warnings: Vec<String>,
 }
@@ -55,12 +58,13 @@ impl ReloadResult {
             added: 0,
             updated: 0,
             removed: 0,
+            disk_policy_changed: false,
             warnings: Vec::new(),
         }
     }
 
     pub fn has_changes(&self) -> bool {
-        self.added > 0 || self.updated > 0 || self.removed > 0
+        self.added > 0 || self.updated > 0 || self.removed > 0 || self.disk_policy_changed
     }
 }
 
@@ -356,12 +360,20 @@ pub async fn reload_workers(
     // Compute diff
     let diff = compute_worker_diff(pool, &new_workers).await?;
 
+    // Read the launch-time main config too. Invalid disk settings retain the
+    // previous policy and abort before changing worker inventory. A missing
+    // optional config file retains the current policy.
+    let disk_policy_changed = DiskPressurePolicyConfig::reload_configured()?;
+
     let mut result = if diff.is_empty() {
-        info!("No configuration changes detected");
+        if !disk_policy_changed {
+            info!("No configuration changes detected");
+        }
         ReloadResult::new()
     } else {
         apply_worker_diff(pool, &diff).await?
     };
+    result.disk_policy_changed = disk_policy_changed;
 
     // Reload is also the operator's request to reconsider repaired toolchains.
     // Invalidate both verdicts and probes begun before this successful reload,
@@ -376,8 +388,8 @@ pub async fn reload_workers(
     result.warnings.extend(warnings);
 
     info!(
-        "Reload complete: {} added, {} updated, {} removed",
-        result.added, result.updated, result.removed
+        "Reload complete: {} added, {} updated, {} removed; disk policy changed: {}",
+        result.added, result.updated, result.removed, result.disk_policy_changed
     );
 
     Ok(result)
@@ -465,13 +477,26 @@ impl ConfigWatcher {
         // a custom basename but then reread the default workers.toml instead.
         self.config.workers_config_path = Some(workers_path.clone());
 
+        // The disk policy lives in config.toml, independently of a custom
+        // workers filename or directory. Watch its parent for atomic edits.
+        let policy_path = DiskPressurePolicyConfig::configured_path().and_then(|path| {
+            let parent = path.parent()?.canonicalize().ok()?;
+            Some(parent.join(path.file_name()?))
+        });
+
         let watcher_tx = tx.clone();
         let watched_path = workers_path.clone();
+        let watched_policy = policy_path.clone();
         let debounce = Duration::from_millis(self.config.debounce_ms);
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-                Ok(event) if event_requires_workers_reload(&event, &watched_path) => {
-                    debug!("Workers config changed: {:?}", watched_path);
+                Ok(event)
+                    if event_requires_workers_reload(&event, &watched_path)
+                        || watched_policy
+                            .as_deref()
+                            .is_some_and(|path| event_requires_workers_reload(&event, path)) =>
+                {
+                    debug!("Worker or disk policy configuration changed");
                     queue_workers_reload(&watcher_tx, &watched_path);
                 }
                 Ok(_) => {}
@@ -481,6 +506,11 @@ impl ConfigWatcher {
                 }
             })?;
         watcher.watch(&parent, RecursiveMode::NonRecursive)?;
+        if let Some(policy_parent) = policy_path.as_deref().and_then(Path::parent)
+            && policy_parent != parent
+        {
+            watcher.watch(policy_parent, RecursiveMode::NonRecursive)?;
+        }
         info!("Watching workers configuration {:?}", workers_path);
         self._watcher = Some(watcher);
 
@@ -547,8 +577,8 @@ impl ConfigWatcher {
             Ok(result) => {
                 if result.has_changes() {
                     info!(
-                        "Configuration reloaded: {} added, {} updated, {} removed",
-                        result.added, result.updated, result.removed
+                        "Configuration reloaded: {} added, {} updated, {} removed; disk policy changed: {}",
+                        result.added, result.updated, result.removed, result.disk_policy_changed
                     );
                 } else {
                     debug!("Configuration reload: no changes");
@@ -1027,6 +1057,14 @@ enabled = true
         let mut result = ReloadResult::new();
         result.removed = 1;
         assert!(result.has_changes());
+    }
+
+    #[test]
+    fn test_reload_result_has_changes_for_disk_policy_only() {
+        let mut result = ReloadResult::new();
+        result.disk_policy_changed = true;
+        assert!(result.has_changes());
+        assert_eq!(result.added + result.updated + result.removed, 0);
     }
 
     #[test]

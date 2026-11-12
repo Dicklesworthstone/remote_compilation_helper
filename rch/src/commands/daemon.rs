@@ -37,6 +37,8 @@ struct ReloadApiResponse {
     #[serde(default)]
     removed: usize,
     #[serde(default)]
+    disk_policy_changed: bool,
+    #[serde(default)]
     warnings: Vec<String>,
     #[serde(default)]
     error: Option<String>,
@@ -1896,7 +1898,10 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                         return Ok(());
                     }
 
-                    let has_changes = reload.added > 0 || reload.updated > 0 || reload.removed > 0;
+                    let has_changes = reload.added > 0
+                        || reload.updated > 0
+                        || reload.removed > 0
+                        || reload.disk_policy_changed;
 
                     if ctx.is_json() {
                         let _ = ctx.json(&ApiResponse::ok(
@@ -1906,11 +1911,12 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                                 added: reload.added,
                                 updated: reload.updated,
                                 removed: reload.removed,
+                                disk_policy_changed: reload.disk_policy_changed,
                                 warnings: reload.warnings.clone(),
                                 message: if has_changes {
                                     Some(format!(
-                                        "Configuration reloaded: {} added, {} updated, {} removed",
-                                        reload.added, reload.updated, reload.removed
+                                        "Configuration reloaded: {} added, {} updated, {} removed; disk policy changed: {}",
+                                        reload.added, reload.updated, reload.removed, reload.disk_policy_changed
                                     ))
                                 } else {
                                     Some("No configuration changes detected".to_string())
@@ -1927,6 +1933,11 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                                 "  {} workers added, {} updated, {} removed",
                                 reload.added, reload.updated, reload.removed
                             );
+                            if reload.disk_policy_changed {
+                                println!(
+                                    "  Disk pressure policy updated; worker assessments refresh within 30 seconds"
+                                );
+                            }
                         } else {
                             println!(
                                 "{} No configuration changes detected",
@@ -2159,7 +2170,18 @@ mod tests {
         assert_eq!(parsed.added, 0);
         assert_eq!(parsed.updated, 0);
         assert_eq!(parsed.removed, 0);
+        assert!(!parsed.disk_policy_changed);
         assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn reload_api_response_reports_policy_only_changes() {
+        let parsed: ReloadApiResponse = serde_json::from_str(
+            r#"{"success":true,"added":0,"updated":0,"removed":0,"disk_policy_changed":true}"#,
+        )
+        .unwrap();
+        assert!(parsed.success && parsed.disk_policy_changed);
+        assert_eq!(parsed.added + parsed.updated + parsed.removed, 0);
     }
 
     #[test]
