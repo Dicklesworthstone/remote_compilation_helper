@@ -4311,8 +4311,12 @@ impl TransferPipeline {
                         || token.starts_with("--split-string")
                 })
             });
-            let home = if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment
-            {
+            let home = if self.compilation_kind == Some(CompilationKind::Job) {
+                // Job admission permits scripts with Cargo-looking argument
+                // data. Keep accounting for the isolated cache that the shell
+                // creates, while resolving only the job's actual env prefix.
+                crate::hook::job_disk_home_override(command)
+            } else if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment {
                 Ok(None)
             } else {
                 crate::hook::cargo_disk_home_override(command)
@@ -14761,6 +14765,70 @@ Number of files transferred: 42
         assert!(guarded.contains("\"cargo_cache\":null"));
     }
 
+    #[test]
+    fn cargo_disk_cache_plan_accepts_explicit_job_scripts() {
+        let worker = WorkerId::new("cache/worker");
+        for (requested, home) in [
+            (
+                "bash scripts/gate_of_record_job.sh /stage cargo_test_05 cargo -j 2 test -p mtdt-page --test movement_headings",
+                None,
+            ),
+            ("bash scripts/cargo_gate.sh row -i CARGO_HOME=payload", None),
+            (
+                "env -- CARGO_HOME='/worker/job cache' bash scripts/gate.sh cargo_test cargo",
+                Some("/worker/job cache"),
+            ),
+            ("cargo check --locked", None),
+        ] {
+            let pipeline = disk_budget_test_pipeline(Path::new("/tmp/job-cache-plan"), None, 20)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(requested, &worker);
+            let cache = pipeline
+                .cargo_disk_cache
+                .as_ref()
+                .expect("supervised cache");
+            assert!(cache.verified, "{requested}");
+            assert_eq!(cache.additional_home.as_deref(), home, "{requested}");
+            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let command = pipeline.build_remote_command(&isolated, None);
+            assert!(
+                command.contains("\"cargo_cache_required\":true"),
+                "{requested}"
+            );
+            assert!(command.contains("\"verified\":true"), "{requested}");
+            assert!(command.contains("\"name\":\"rch-cargo-cache-cache-worker\""));
+            assert!(command.contains("\"max_growth_bytes\":8388608"));
+            assert!(command.contains("\"min_free_bytes\":1048576"));
+        }
+    }
+
+    #[test]
+    fn cargo_disk_cache_plan_keeps_explicit_job_home_refusals() {
+        let worker = WorkerId::new("cache/worker");
+        for requested in [
+            "env -u CARGO_HOME bash scripts/gate.sh cargo_test cargo",
+            "CARGO_HOME=relative bash scripts/gate.sh cargo_test cargo",
+            "CARGO_HOME=$HOME/cache bash scripts/gate.sh cargo_test cargo",
+            "env -i cargo check",
+            "CARGO_HOME=relative cargo check",
+        ] {
+            let pipeline = disk_budget_test_pipeline(Path::new("/tmp/job-cache-plan"), None, 20)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(requested, &worker);
+            assert!(
+                !pipeline.cargo_disk_cache.as_ref().unwrap().verified,
+                "{requested}"
+            );
+            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let command = pipeline.build_remote_command(&isolated, None);
+            assert!(
+                command.contains("\"cargo_cache_required\":true"),
+                "{requested}"
+            );
+            assert!(command.contains("\"verified\":false"), "{requested}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cargo_disk_cache_unresolved_scope_refuses_before_workload_and_learning() {
@@ -20672,8 +20740,15 @@ func main() {
             shell_words::quote(explicit_home.to_str().unwrap()),
             shell_words::quote(inner)
         );
-        let workload = crate::hook::add_cargo_isolation(&requested, &WorkerId::new("cache-worker"));
-        let command = cargo_home_boundary_pipeline(&source).build_remote_command(&workload, None);
+        let worker = WorkerId::new("cache-worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(&requested, &worker);
+        let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
+        assert!(cache.verified);
+        assert_eq!(cache.additional_home.as_deref(), explicit_home.to_str());
+        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let command = pipeline.build_remote_command(&workload, None);
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
             .current_dir(&retained)
@@ -20686,6 +20761,72 @@ func main() {
             format!("{}\ncargo-out", explicit_home.display()).into_bytes()
         );
         assert_eq!(output.stderr, b"cargo-err");
+    }
+
+    /// Execute the real isolation/launch shell with a job argv sentinel. The
+    /// disk plan is tested separately above; this fixture starts no supervisor
+    /// and makes no worker-fleet or compilation claim.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_job_script_preserves_argument_data_and_worker_home() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker_base = retained.join("worker volume");
+        let source = retained.join("source");
+        for directory in [&worker_base, &source] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let script = source.join("gate_of_record_job.sh");
+        std::fs::write(
+            &script,
+            "set -eu\nprintf '%s\\0' \"$CARGO_HOME\" \"$@\"\nprintf 'job-stderr' >&2\nexit 42\n",
+        )
+        .unwrap();
+        let args = [
+            "cargo_test_05",
+            "cargo",
+            "-j",
+            "2",
+            "test",
+            "-p",
+            "mtdt-page",
+            "--test",
+            "movement_headings",
+            "-i",
+            "CARGO_HOME=payload",
+        ];
+        let requested = format!(
+            "sh {} {}",
+            shell_words::quote(script.to_str().unwrap()),
+            shell_words::join(args)
+        );
+        let worker = WorkerId::new("cache/worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_env_allowlist(Vec::new())
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(&requested, &worker);
+        let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
+        assert!(cache.verified);
+        assert!(cache.additional_home.is_none());
+        let expected_home = worker_base.canonicalize().unwrap().join(&cache.name);
+        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let command = pipeline.build_remote_command(&workload, None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(&retained)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &retained)
+            .env("TMPDIR", &worker_base)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        let expected = std::iter::once(expected_home.to_str().unwrap())
+            .chain(args)
+            .flat_map(|value| value.bytes().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stderr, b"job-stderr");
     }
 
     #[cfg(unix)]
