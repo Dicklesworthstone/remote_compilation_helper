@@ -1495,9 +1495,39 @@ mod linux {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SourceStamp {
+        Directory {
+            identity: FileIdentity,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+        },
+        NonDirectory(Stamp),
+    }
+
+    impl SourceStamp {
+        fn of(metadata: &fs::Metadata) -> Self {
+            if metadata.is_dir() {
+                // The retained tree places selected entries beneath private
+                // mode-0700 directories. Track source identity, ownership and
+                // permissions while captures create siblings in shared ancestors.
+                Self::Directory {
+                    identity: FileIdentity::of(metadata),
+                    mode: metadata.mode(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                }
+            } else {
+                Self::NonDirectory(Stamp::of(metadata))
+            }
+        }
+    }
+
+    #[derive(Debug)]
     struct SourceWitness {
-        stamp: Stamp,
+        stamp: SourceStamp,
         symlink: Option<PathBuf>,
+        directory_handle: Option<File>,
     }
 
     struct Measurement<'a> {
@@ -1523,12 +1553,9 @@ mod linux {
             metadata: &fs::Metadata,
             symlink: Option<PathBuf>,
         ) -> Result<(), RuntimeCohortError> {
-            let witness = SourceWitness {
-                stamp: Stamp::of(metadata),
-                symlink,
-            };
+            let stamp = SourceStamp::of(metadata);
             if let Some(previous) = self.witnesses.get(path) {
-                if previous != &witness {
+                if previous.stamp != stamp || previous.symlink != symlink {
                     return Err(invalid(
                         "runtime source topology changed during observation",
                     ));
@@ -1537,7 +1564,36 @@ mod linux {
                 if self.witnesses.len() >= MAX_RUNTIME_ENTRIES {
                     return Err(invalid("runtime source entry budget exhausted"));
                 }
-                self.witnesses.insert(path.to_path_buf(), witness);
+                let directory_handle = if metadata.is_dir() {
+                    // Hold the directory inode through capture to prevent reuse
+                    // after replacement. O_PATH supports execute-only directories.
+                    let descriptor = rustix::fs::open(
+                        path,
+                        rustix::fs::OFlags::PATH
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(io::Error::from)?;
+                    let handle = File::from(descriptor);
+                    if SourceStamp::of(&handle.metadata()?) != stamp {
+                        return Err(invalid(
+                            "runtime source directory changed during acquisition",
+                        ));
+                    }
+                    Some(handle)
+                } else {
+                    None
+                };
+                self.witnesses.insert(
+                    path.to_path_buf(),
+                    SourceWitness {
+                        stamp,
+                        symlink,
+                        directory_handle,
+                    },
+                );
             }
             Ok(())
         }
@@ -1546,8 +1602,15 @@ mod linux {
             for (path, expected) in &self.witnesses {
                 check_cancelled(cancelled)?;
                 let metadata = fs::symlink_metadata(path)?;
-                if Stamp::of(&metadata) != expected.stamp {
+                if SourceStamp::of(&metadata) != expected.stamp {
                     return Err(invalid("runtime source changed during observation"));
+                }
+                if let Some(handle) = &expected.directory_handle
+                    && SourceStamp::of(&handle.metadata()?) != expected.stamp
+                {
+                    return Err(invalid(
+                        "runtime source directory changed during observation",
+                    ));
                 }
                 if let Some(target) = &expected.symlink
                     && fs::read_link(path)? != *target
@@ -1656,7 +1719,10 @@ mod linux {
                 .witnesses
                 .get(path)
                 .ok_or_else(|| invalid("runtime file was not traced"))?;
-            if witness.stamp != measured.stamp {
+            if !matches!(
+                &witness.stamp,
+                SourceStamp::NonDirectory(stamp) if *stamp == measured.stamp
+            ) {
                 return Err(invalid(
                     "runtime file changed between topology and byte observation",
                 ));
@@ -2788,6 +2854,143 @@ mod linux {
         }
 
         #[test]
+        fn unrelated_ancestor_activity_preserves_selected_runtime() {
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let source = directory.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let library = source.join("libfixture.so");
+            fs::write(&library, b"selected runtime bytes").unwrap();
+            let owner = RuntimeDirectory::new(directory.path()).unwrap();
+            let mut measurement = Measurement::new(Some(&owner));
+            measurement.trace(&library, &|| false).unwrap();
+            measurement.file(&library, &|| false).unwrap();
+            let selected_before = Stamp::of(&fs::metadata(&library).unwrap());
+            let ancestor_before = Stamp::of(&fs::metadata(directory.path()).unwrap());
+
+            fs::write(directory.path().join("unselected-entry"), b"unrelated").unwrap();
+            // Make the ancestor timestamp change explicit even on filesystems
+            // whose directory timestamps have coarse resolution.
+            File::open(directory.path())
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+                )
+                .unwrap();
+            let ancestor_after = Stamp::of(&fs::metadata(directory.path()).unwrap());
+            assert_eq!(ancestor_before.device, ancestor_after.device);
+            assert_eq!(ancestor_before.inode, ancestor_after.inode);
+            assert_eq!(ancestor_before.mode, ancestor_after.mode);
+            assert_ne!(ancestor_before.modified, ancestor_after.modified);
+            assert_eq!(selected_before, Stamp::of(&fs::metadata(&library).unwrap()));
+            assert_eq!(fs::read(&library).unwrap(), b"selected runtime bytes");
+            measurement.verify_sources(&|| false).unwrap_or_else(|error| {
+                panic!("{error:?}, unchanged selected file, ancestor {ancestor_before:?} -> {ancestor_after:?}")
+            });
+            measurement.tree.finish(&owner).unwrap();
+            assert_eq!(
+                fs::read(owner.destination(&library).unwrap()).unwrap(),
+                b"selected runtime bytes"
+            );
+        }
+
+        #[test]
+        fn source_directory_modes_are_checked_on_reobservation_and_verification() {
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let before = fs::metadata(directory.path()).unwrap();
+            let mut measurement = Measurement::new(None);
+            measurement
+                .witness(directory.path(), &before, None)
+                .unwrap();
+            measurement.verify_sources(&|| false).unwrap();
+            fs::set_permissions(
+                directory.path(),
+                fs::Permissions::from_mode((before.mode() & 0o777) ^ 0o010),
+            )
+            .unwrap();
+            let after = fs::metadata(directory.path()).unwrap();
+            assert!(measurement.witness(directory.path(), &after, None).is_err());
+            assert!(measurement.verify_sources(&|| false).is_err());
+        }
+
+        #[test]
+        fn source_directory_identity_does_not_require_read_permission() {
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let source = directory.path().join("source");
+            fs::create_dir(&source).unwrap();
+            let library = source.join("libfixture.so");
+            fs::write(&library, b"selected runtime bytes").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o100)).unwrap();
+            let mut measurement = Measurement::new(None);
+            let captured = (|| {
+                let resolved = measurement.trace(&library, &|| false)?;
+                measurement.file(&resolved, &|| false)?;
+                measurement.verify_sources(&|| false)
+            })();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+            captured.unwrap();
+        }
+
+        #[test]
+        fn source_directory_replacement_refuses_an_unchanged_selected_file() {
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let source = directory.path().join("source");
+            let replacement = directory.path().join("replacement");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&replacement).unwrap();
+            let library = source.join("libfixture.so");
+            fs::write(&library, b"same selected inode and bytes").unwrap();
+            fs::hard_link(&library, replacement.join("libfixture.so")).unwrap();
+            let before = Stamp::of(&fs::metadata(&library).unwrap());
+            let mut measurement = Measurement::new(None);
+            measurement.trace(&library, &|| false).unwrap();
+            measurement.file(&library, &|| false).unwrap();
+            fs::rename(&source, directory.path().join("retained-original")).unwrap();
+            fs::rename(&replacement, &source).unwrap();
+            assert_eq!(before, Stamp::of(&fs::metadata(&library).unwrap()));
+            assert_eq!(
+                fs::read(&library).unwrap(),
+                b"same selected inode and bytes"
+            );
+            assert!(measurement.verify_sources(&|| false).is_err());
+        }
+
+        #[test]
+        fn source_alias_retarget_refuses_identical_selected_bytes() {
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let library = directory.path().join("library");
+            let alternative = directory.path().join("alternative");
+            fs::write(&library, b"same selected inode and bytes").unwrap();
+            fs::hard_link(&library, &alternative).unwrap();
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&library, &alias).unwrap();
+            let before = Stamp::of(&fs::metadata(&library).unwrap());
+            let mut measurement = Measurement::new(None);
+            measurement.trace(&alias, &|| false).unwrap();
+            measurement.file(&library, &|| false).unwrap();
+            fs::rename(&alias, directory.path().join("retained-alias")).unwrap();
+            std::os::unix::fs::symlink(&alternative, &alias).unwrap();
+            assert_eq!(before, Stamp::of(&fs::metadata(&alias).unwrap()));
+            assert_eq!(fs::read(&alias).unwrap(), b"same selected inode and bytes");
+            assert!(measurement.verify_sources(&|| false).is_err());
+        }
+
+        #[test]
         fn same_read_capture_keeps_bytes_and_aliases_after_source_changes() {
             let directory = tempfile::Builder::new()
                 .permissions(fs::Permissions::from_mode(0o700))
@@ -2806,7 +3009,22 @@ mod linux {
             let resolved = measurement.trace(&absolute, &|| false).unwrap();
             assert_eq!(resolved, library);
             let measured = measurement.file(&resolved, &|| false).unwrap();
-            measurement.verify_sources(&|| false).unwrap();
+            measurement
+                .verify_sources(&|| false)
+                .unwrap_or_else(|error| {
+                    let witnesses: Vec<_> = measurement
+                        .witnesses
+                        .iter()
+                        .map(|(path, expected)| {
+                            (
+                                path,
+                                expected,
+                                fs::symlink_metadata(path).map(|metadata| Stamp::of(&metadata)),
+                            )
+                        })
+                        .collect();
+                    panic!("{error:?}, source witnesses {witnesses:?}")
+                });
             measurement.tree.finish(&owner).unwrap();
             assert_eq!(
                 fs::read_link(owner.destination(&absolute).unwrap()).unwrap(),

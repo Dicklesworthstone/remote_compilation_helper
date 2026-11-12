@@ -415,8 +415,19 @@ struct Entry {
 
 #[derive(Debug)]
 struct ProjectionWriter {
-    file: Arc<File>,
+    file: Arc<CacheWriterLock>,
     local: AtomicU8,
+}
+
+/// Shared through the final retained projection lease. Kernel descriptor
+/// duplicates from process creation cannot extend this owner's authority.
+#[derive(Debug)]
+pub(crate) struct CacheWriterLock(File);
+
+impl Drop for CacheWriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// An owned nonblocking guard can move with the source I/O task between frames.
@@ -439,15 +450,15 @@ impl Drop for LocalCacheWriter {
 }
 
 enum CacheWriter {
-    Process { file: File },
+    Process { file: Arc<CacheWriterLock> },
     Local { guard: LocalCacheWriter },
 }
 
 impl CacheWriter {
     fn verify(&self, root: &Path) -> io::Result<()> {
         let file = match self {
-            Self::Process { file } => file,
-            Self::Local { guard } => &guard.owner.file,
+            Self::Process { file } => &file.0,
+            Self::Local { guard } => &guard.owner.file.0,
         };
         let metadata = file.metadata()?;
         if !ordinary(&metadata) || !same_inode(&metadata, &fs::symlink_metadata(root.join("lock"))?)
@@ -775,8 +786,8 @@ impl SourceCache {
         Ok(())
     }
 
-    fn reserve_projection_budget(&self, enabled: bool) -> io::Result<Option<Arc<File>>> {
-        let Some(_writer) = self.writer()? else {
+    fn reserve_projection_budget(&self, enabled: bool) -> io::Result<Option<Arc<CacheWriterLock>>> {
+        let Some(writer) = self.writer()? else {
             return Ok(None);
         };
         if !enabled {
@@ -794,8 +805,10 @@ impl SourceCache {
             fs::remove_file(&entry.path)?;
             total -= entry.bytes;
         }
-        match _writer {
-            CacheWriter::Process { file } => Ok(Some(Arc::new(file))),
+        match writer {
+            // Move the held lock into the projection pool without releasing
+            // it. Its existing Arc lifetime includes every retained image.
+            CacheWriter::Process { file } => Ok(Some(file)),
             CacheWriter::Local { .. } => {
                 Err(invalid("source cache projection budget already owned"))
             }
@@ -917,7 +930,7 @@ impl SourceCache {
         private_directory(&self.root)?;
         let path = self.root.join("lock");
         if let Some(owner) = &self.projection_writer {
-            let metadata = owner.file.metadata()?;
+            let metadata = owner.file.0.metadata()?;
             if !ordinary(&metadata) || !same_inode(&metadata, &fs::symlink_metadata(&path)?) {
                 return Err(invalid("retained source cache writer identity changed"));
             }
@@ -987,7 +1000,9 @@ impl SourceCache {
                     *quarantine = Some(file);
                     return Ok(None);
                 }
-                Ok(Some(CacheWriter::Process { file }))
+                Ok(Some(CacheWriter::Process {
+                    file: Arc::new(CacheWriterLock(file)),
+                }))
             }
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error),
@@ -1655,6 +1670,60 @@ mod tests {
             assert_eq!(remember_output(&cache, &output.path, &bytes).unwrap(), 1);
             assert_eq!(cache.load(&output).unwrap().bytes(), bytes);
         }
+    }
+
+    #[test]
+    fn released_writer_does_not_leave_authority_in_a_duplicated_descriptor() {
+        let parent = private();
+        let cache = SourceCache::open(parent.path(), 8).unwrap();
+        let writer = cache.writer().unwrap().unwrap();
+        let duplicate = match &writer {
+            CacheWriter::Process { file } => file.0.try_clone().unwrap(),
+            CacheWriter::Local { .. } => panic!("tiny cache unexpectedly retained a projection"),
+        };
+        assert!(cache.writer().unwrap().is_none());
+        // A process spawn can inherit the same open-file description before
+        // exec closes CLOEXEC descriptors. Retaining one here makes that
+        // kernel ownership interval deterministic without process timing.
+        drop(writer);
+        let next = cache.writer().unwrap();
+        drop(duplicate);
+        assert!(
+            next.is_some(),
+            "released writer authority remained in its duplicated descriptor"
+        );
+        assert!(cache.writer().unwrap().is_none());
+        drop(next);
+        assert!(cache.writer().unwrap().is_some());
+    }
+
+    #[test]
+    fn projection_retains_writer_authority_through_its_last_lease() {
+        let parent = private();
+        let cache = SourceCache::open(parent.path(), MIN_PROJECTION_CACHE_BYTES).unwrap();
+        let projection = cache.projections().unwrap();
+        let duplicate = cache
+            .projection_writer
+            .as_ref()
+            .unwrap()
+            .file
+            .0
+            .try_clone()
+            .unwrap();
+        let independent = File::open(cache.root.join("lock")).unwrap();
+        assert!(matches!(
+            independent.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(cache);
+        assert!(matches!(
+            independent.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(projection);
+        let acquired = independent.try_lock();
+        drop(duplicate);
+        acquired.unwrap();
     }
 
     #[test]

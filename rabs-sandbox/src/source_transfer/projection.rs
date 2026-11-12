@@ -5,6 +5,7 @@
 //! in the transfer. This is materialization reuse, never action-cache authority.
 
 use super::*;
+use crate::source_cache::CacheWriterLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -174,7 +175,7 @@ struct Parent {
     directory: File,
     metadata: fs::Metadata,
     preserve: AtomicBool,
-    retention_lock: Option<Arc<File>>,
+    retention_lock: Option<Arc<CacheWriterLock>>,
 }
 
 impl Parent {
@@ -663,7 +664,7 @@ impl SourceProjectionPool {
     /// and its final execution lease have released their owned images. The
     /// caller retains responsibility for acquiring/validating that lock; it is
     /// not source identity or publication authority. Set only before first use.
-    pub fn with_retention_lock(mut self, guard: Arc<File>) -> io::Result<Self> {
+    pub(crate) fn with_retention_lock(mut self, guard: Arc<CacheWriterLock>) -> io::Result<Self> {
         let parent = Arc::get_mut(&mut self.parent)
             .filter(|parent| parent.retention_lock.is_none())
             .ok_or_else(|| invalid("source projection retention lock is already in use"))?;
