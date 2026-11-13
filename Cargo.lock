@@ -5435,6 +5435,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "shell-escape",
+ "shell-words",
  "shellexpand",
  "tempfile",
  "thiserror 2.0.20",

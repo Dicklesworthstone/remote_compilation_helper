@@ -61,7 +61,7 @@ const PORT_DEBT: &[(&str, usize)] = &[
     ("rch/src/hook/tests.rs", 5),
     ("rch/src/hook/transfer_orchestration.rs", 3),
     ("rch/src/main.rs", 1),
-    ("rch/src/transfer.rs", 8),
+    ("rch/src/transfer.rs", 3),
     ("rch/src/transfer/node_prepare_tests.rs", 2),
     ("rch/src/update/install/daemon_shutdown.rs", 2),
     ("rch/tests/integration/command_tests.rs", 1),
