@@ -22,6 +22,7 @@ mod source_pair;
 mod source_release;
 mod source_retain;
 mod source_settlement;
+mod source_upload;
 mod source_verifier;
 mod toolchain;
 
@@ -156,6 +157,12 @@ enum Commands {
     SourcePair {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Internal source receiver admission under an exact durable source grant.
+    #[command(hide = true)]
+    SourceUpload {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
     },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
@@ -421,6 +428,9 @@ fn main() -> Result<()> {
     if let Commands::SourcePair { arguments } = &cli.command {
         std::process::exit(source_pair::main(arguments));
     }
+    if let Commands::SourceUpload { arguments } = &cli.command {
+        std::process::exit(source_upload::main(arguments));
+    }
     if let Commands::SourceAdmission { arguments } = &cli.command {
         std::process::exit(source_admission::main(arguments));
     }
@@ -557,6 +567,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourcePair { .. } => {
             anyhow::bail!("source-pair requires the synchronous worker entry point")
+        }
+        Commands::SourceUpload { .. } => {
+            anyhow::bail!("source-upload requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

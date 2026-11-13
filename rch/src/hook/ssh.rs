@@ -906,186 +906,6 @@ pub(crate) fn source_authority_activity_prefix(identity: &str) -> anyhow::Result
     source_authority_activity_prefix_at(REMOTE_SOURCE_CLAIM_REGISTRY, identity)
 }
 
-// Ordinary source receivers may share an activity lease only while their
-// destination trees are disjoint. The supervisor retains every descriptor
-// even when rsync closes its inherited FDs. All other source activity keeps
-// the existing exclusive lease, including verification and cancellation.
-const SOURCE_UPLOAD_ACTIVITY: &str = r#"
-import fcntl
-import hashlib
-import os
-import stat
-import subprocess
-import sys
-
-LIMIT = 32 * 1024 * 1024
-
-def canonical(path):
-    return (path.startswith("/") and not any(c in path for c in ("\0", "\n", "\r"))
-            and (path == "/" or (not path.endswith("/")
-                 and all(part not in ("", ".", "..") for part in path.split("/")[1:]))))
-
-def ancestors(path):
-    result = [path]
-    while path != "/":
-        path = os.path.dirname(path)
-        result.append(path)
-    return result
-
-def checked_lock(directory, name, mode):
-    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                 0o600, dir_fd=directory)
-    try:
-        fcntl.flock(fd, mode)
-        opened = os.fstat(fd)
-        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(opened, named):
-            raise ValueError("upload lock changed")
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-def checked_namespace(directory, registry, activity, token):
-    if not os.path.samestat(os.fstat(directory), os.stat(registry, follow_symlinks=False)):
-        raise ValueError("source registry changed")
-    if not os.path.samestat(os.fstat(activity), os.stat(
-            token + ".activity.lock", dir_fd=directory, follow_symlinks=False)):
-        raise ValueError("source activity lock changed")
-
-def active_roots(directory, token, root):
-    names = [name for name in os.listdir(directory)
-             if name.startswith(token + ".") and name.endswith(".claim")]
-    if len(names) != 1:
-        raise ValueError("source grant is absent or duplicated")
-    name = names[0]
-    digest = name[len(token) + 1:-6]
-    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise ValueError("invalid source grant identity")
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-    try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT:
-            raise ValueError("invalid source grant record")
-        with os.fdopen(fd, "rb", closefd=False) as source:
-            content = source.read(LIMIT + 1)
-        after = os.fstat(fd)
-        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if (not os.path.samestat(before, after) or not os.path.samestat(after, named)
-                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                or len(content) != before.st_size or not content.endswith(b"\n")
-                or hashlib.sha256(content).hexdigest() != digest):
-            raise ValueError("source grant content changed")
-    finally:
-        os.close(fd)
-    try:
-        os.stat(token + "." + digest + ".cancelling", dir_fd=directory,
-                follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        raise ValueError("source grant is cancelling")
-    roots = content[:-1].decode("utf-8").split("\n")
-    if not all(canonical(candidate) for candidate in roots):
-        raise ValueError("invalid source grant roots")
-    if not any(candidate == "/" or root == candidate or root.startswith(candidate + "/")
-               for candidate in roots):
-        raise ValueError("upload destination is outside its source grant")
-    return roots
-
-def direct_topology(roots, root):
-    # Inspect each directory prefix once, not the contents of any source tree.
-    # Distinct names for one directory also catch static bind-mount aliases,
-    # including an absent destination below an existing alias. Unsupported
-    # aliases use the original exclusive activity protocol on this connection.
-    selected_roots = {*roots, root}
-    paths = {path for selected in selected_roots for path in ancestors(selected)}
-    stamps = set()
-    for selected in selected_roots:
-        try:
-            selected_metadata = os.lstat(selected)
-        except FileNotFoundError:
-            selected_metadata = None
-        if selected_metadata is None or not stat.S_ISREG(selected_metadata.st_mode):
-            # The ordinary receiver also owns its guarded scratch sweep. An
-            # aliased scratch directory or stamp must not write outside that
-            # root while a sibling receiver runs under the shared activity.
-            scratch = os.path.join(selected, ".rch-tmp")
-            stamp = os.path.join(scratch, ".rch-prune-stamp")
-            paths.update((scratch, stamp))
-            stamps.add(stamp)
-    identities = {}
-    for path in sorted(paths):
-        try:
-            metadata = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(metadata.st_mode):
-            return False
-        if not stat.S_ISDIR(metadata.st_mode):
-            # A grant can additionally own a freshness-control file. Only its
-            # final component may be a regular file; it cannot be an upload root.
-            if (path == root or (path not in roots and path not in stamps)
-                    or not stat.S_ISREG(metadata.st_mode)):
-                raise ValueError("source topology is not a directory")
-            continue
-        identity = (metadata.st_dev, metadata.st_ino)
-        if identity in identities and identities[identity] != path:
-            return False
-        identities[identity] = path
-    return True
-
-def run():
-    registry, token, root = sys.argv[1:4]
-    command = sys.argv[4:]
-    if not canonical(root) or root == "/" or not command:
-        raise ValueError("invalid upload destination or command")
-    directory = os.open(registry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    activity = None
-    locks = []
-    try:
-        activity = checked_lock(directory, token + ".activity.lock", fcntl.LOCK_SH)
-        # A separate, stable upload-lock namespace avoids both reacquiring the
-        # durable holder's source locks and accumulating new files per attempt.
-        for path in sorted(ancestors(root)):
-            digest = hashlib.sha256(b"rch.source-upload-lock.v1\0" + path.encode("utf-8")).hexdigest()
-            locks.append(checked_lock(directory, "upload." + digest + ".lock",
-                                      fcntl.LOCK_EX if path == root else fcntl.LOCK_SH))
-        # Validate only after every potentially queued lock. No receiver,
-        # destination setup or stdin read happens before this boundary.
-        checked_namespace(directory, registry, activity, token)
-        roots = active_roots(directory, token, root)
-        if not direct_topology(roots, root):
-            for fd in reversed(locks):
-                os.close(fd)
-            locks.clear()
-            # Never upgrade a shared lock in place: two alias uploads could
-            # otherwise deadlock. Cancellation may win this gap; recheck it.
-            fcntl.flock(activity, fcntl.LOCK_UN)
-            fcntl.flock(activity, fcntl.LOCK_EX)
-            checked_namespace(directory, registry, activity, token)
-            active_roots(directory, token, root)
-        # Keep both supervisor-held locks and inherited descriptors. The
-        # foreground receiver can sanitize FDs without opening a writer race;
-        # normal descendants retain the lease if their supervisor disappears.
-        checked_namespace(directory, registry, activity, token)
-        status = subprocess.call(command, pass_fds=(activity, *locks))
-        return status if status >= 0 else 128 - status
-    finally:
-        for fd in reversed(locks):
-            os.close(fd)
-        if activity is not None:
-            os.close(activity)
-        os.close(directory)
-
-try:
-    sys.exit(run())
-except (OSError, ValueError) as error:
-    print("RCH: source upload authority: " + str(error), file=sys.stderr)
-    sys.exit(73)
-"#;
-
 fn source_authority_upload_prefix_at(
     registry: &str,
     identity: &str,
@@ -1095,9 +915,21 @@ fn source_authority_upload_prefix_at(
     source_authority_lock_plan(&[root.to_owned()], false)?;
     anyhow::ensure!(root != "/", "cannot upload the filesystem root");
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let launcher = format!(
+        "{}\n\
+         rch_wkr_locate || {{ echo 'RCH: source upload authority: native worker unavailable' >&2; exit 73; }}; \
+         __rch_upload_probe=$(\"$RCH_WKR\" source-upload probe </dev/null) || \
+         {{ echo 'RCH: source upload authority: native worker probe failed' >&2; exit 73; }}; \
+         [ \"$__rch_upload_probe\" = 'rch-wkr source-upload v1' ] || \
+         {{ echo 'RCH: source upload authority: incompatible native worker' >&2; exit 73; }}; \
+         exec \"$RCH_WKR\" source-upload run \"$@\"",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+    );
+    #[cfg(test)]
+    let launcher = format!("{}{launcher}", test_worker_default());
     Ok(format!(
-        "nohup python3 -I -S -c {script} {registry} {identity} {root}",
-        script = quote(SOURCE_UPLOAD_ACTIVITY),
+        "nohup sh -c {launcher} rch-source-upload {registry} {identity} {root}",
+        launcher = quote(&launcher),
         registry = quote(registry),
         identity = quote(identity),
         root = quote(root),
@@ -4459,36 +4291,51 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
-    fn source_upload_topology_detects_directory_identity_aliases_in_missing_prefixes() {
-        // This is a unit test of the topology decision, not a privileged bind
-        // mount experiment. Actual symlink fallback runs in the test above.
-        let check = r#"
-import os, stat, sys, types
-namespace = {}
-exec(sys.argv[1].rsplit('\ntry:\n    sys.exit(run())', 1)[0], namespace)
-identities = {'/': 1, '/first': 2, '/alias': 2}
-def inspect(path):
-    if path not in identities:
-        raise FileNotFoundError(path)
-    return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=3,
-                                 st_ino=identities[path])
-namespace['os'] = types.SimpleNamespace(path=os.path, lstat=inspect)
-assert not namespace['direct_topology'](['/first/missing', '/alias/other'], '/first/missing')
-assert namespace['direct_topology'](['/first/missing', '/first/other'], '/first/missing')
-identities.update({'/alias': 3, '/first/.rch-tmp': 4, '/alias/.rch-tmp': 4})
-assert not namespace['direct_topology'](['/first', '/alias'], '/first')
-"#;
-        let output = std::process::Command::new("python3")
-            .args(["-I", "-S", "-c", check, SOURCE_UPLOAD_ACTIVITY])
-            .output()
+    fn source_upload_requires_matching_native_worker_before_receiver() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for probe in [
+            None,
+            Some("exit 2"),
+            Some("printf '%s\\n' 'rch-wkr source-upload v0'"),
+            Some("printf '%s\\n' 'rch-wkr source-upload v1' 'surplus'"),
+            Some("printf '%s\\n' 'rch-wkr source-upload v1'; exit 9"),
+        ] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let worker = directory.path().join("worker ' wrong");
+            let reached = directory.path().join("unexpected-upload");
+            if let Some(probe) = probe {
+                let script = format!(
+                    "#!/bin/sh\nif [ \"$2\" = probe ]; then {probe}; exit $?; fi\nprintf called > {}; exit 98\n",
+                    shell_escape::escape(reached.to_string_lossy()),
+                );
+                std::fs::write(&worker, script).unwrap();
+                std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let prefix = source_authority_upload_prefix_at(
+                directory.path().join("registry").to_str().unwrap(),
+                "c001",
+                directory.path().join("source").to_str().unwrap(),
+            )
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &format!("exec {prefix} sh -c 'exit 99'")])
+                .env("RCH_WKR_BIN", &worker)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73), "{probe:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("source upload authority"));
+            assert!(
+                !reached.exists(),
+                "incompatible worker must not receive the upload"
+            );
+        }
     }
 
     #[cfg(unix)]
