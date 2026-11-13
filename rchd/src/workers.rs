@@ -2785,17 +2785,20 @@ impl ToolchainPreflightStatus {
 
     /// Whether this verdict says anything about the toolchain itself.
     ///
-    /// Only `toolchain_preflight_command_failed` means the probe ran and the
-    /// toolchain is missing or broken. A connect failure or timeout (the probe
-    /// runs over SSH against possibly loaded workers) says nothing about the
-    /// toolchain, and caching it as "unusable" for the full TTL excluded a
-    /// healthy worker from every build for that toolchain for 10 minutes.
+    /// Only `toolchain_preflight_command_failed` with an ordinary command
+    /// failure means the probe ran and the toolchain is missing or broken.
+    /// A connect failure, SSH 255, timeout, or killed probe says nothing about
+    /// the toolchain. Caching those as "unusable" for the full TTL would exclude
+    /// a healthy worker from every build for that toolchain for 10 minutes.
     pub fn is_definitive(&self) -> bool {
         self.usable
             || self
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.starts_with("toolchain_preflight_command_failed"))
+                .and_then(|reason| reason.strip_prefix("toolchain_preflight_command_failed:"))
+                .and_then(|detail| detail.split_once(':'))
+                .and_then(|(code, _)| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code, 1..=123 | 126..=127))
     }
 
     /// How long to reuse this verdict: `definitive_ttl` for a real answer,
@@ -8222,9 +8225,33 @@ mod tests {
         assert!(broken.is_definitive());
         assert!(broken.is_reusable(long, short));
 
-        let unreachable = verdict(false, Some("toolchain_preflight_connect_failed:timed out"));
-        assert!(!unreachable.is_definitive());
-        assert!(!unreachable.is_reusable(long, short));
+        for reason in [
+            "toolchain_preflight_connect_failed:timed out",
+            "toolchain_preflight_transport_failed:255:Connection reset by peer",
+            "toolchain_preflight_inconclusive:137:Killed",
+            "toolchain_preflight_command_failed:255:Connection reset by peer",
+            "toolchain_preflight_command_failed:137:Killed",
+            "toolchain_preflight_command_failed:124:Timed out",
+            "toolchain_preflight_command_failed:125:Wrapper failed",
+            "toolchain_preflight_command_failed:-1:No exit status",
+            "toolchain_preflight_command_failed:0:Invalid failure",
+            "toolchain_preflight_command_failed:unavailable",
+            "toolchain_preflight_command_failed_extra:1:Invalid reason",
+        ] {
+            let unreachable = verdict(false, Some(reason));
+            assert!(!unreachable.is_definitive(), "{reason}");
+            assert!(!unreachable.is_reusable(long, short), "{reason}");
+        }
+
+        for reason in [
+            "toolchain_preflight_command_failed:101:Toolchain panicked",
+            "toolchain_preflight_command_failed:126:Cannot execute",
+            "toolchain_preflight_command_failed:127:Command not found",
+        ] {
+            let broken = verdict(false, Some(reason));
+            assert!(broken.is_definitive(), "{reason}");
+            assert!(broken.is_reusable(long, short), "{reason}");
+        }
 
         let healthy = verdict(true, None);
         assert!(healthy.is_definitive());

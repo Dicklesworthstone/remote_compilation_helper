@@ -4684,15 +4684,29 @@ async fn probe_worker_toolchain(
         result.map_err(|err| format!("toolchain_preflight_command_error:{err}"))
     };
 
-    match result {
-        Ok(output) if output.success() => Ok(()),
-        Ok(output) => Err(format!(
-            "toolchain_preflight_command_failed:{}:{}",
-            output.exit_code,
-            short_preflight_error(&output.stderr)
-        )),
-        Err(reason) => Err(reason),
+    result.and_then(toolchain_preflight_command_result)
+}
+
+fn toolchain_preflight_command_result(output: rch_common::CommandResult) -> Result<(), String> {
+    if output.success() {
+        return Ok(());
     }
+    // SSH reports transport loss as a completed command with status 255, not
+    // necessarily an I/O error. A killed probe likewise cannot establish that
+    // an installed toolchain is broken. Keep these refusals transient instead
+    // of excluding the worker for the ten-minute missing-toolchain TTL.
+    let reason = match output.exit_code {
+        255 => "toolchain_preflight_transport_failed",
+        1..=123 | 126..=127 => "toolchain_preflight_command_failed",
+        // Include timeout/wrapper failures (124/125), shell signal statuses,
+        // and missing/invalid exit statuses. Every case still fails admission.
+        _ => "toolchain_preflight_inconclusive",
+    };
+    Err(format!(
+        "{reason}:{}:{}",
+        output.exit_code,
+        short_preflight_error(&output.stderr)
+    ))
 }
 
 /// Test both Cargo entry points in the managed environment used by real jobs.
@@ -9139,6 +9153,153 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
+    }
+
+    #[test]
+    fn toolchain_preflight_classifies_command_transport_and_interrupted_exits() {
+        for (exit_code, reason) in [
+            (0, None),
+            (1, Some("toolchain_preflight_command_failed")),
+            (101, Some("toolchain_preflight_command_failed")),
+            (123, Some("toolchain_preflight_command_failed")),
+            (124, Some("toolchain_preflight_inconclusive")),
+            (125, Some("toolchain_preflight_inconclusive")),
+            (126, Some("toolchain_preflight_command_failed")),
+            (127, Some("toolchain_preflight_command_failed")),
+            (128, Some("toolchain_preflight_inconclusive")),
+            (130, Some("toolchain_preflight_inconclusive")),
+            (137, Some("toolchain_preflight_inconclusive")),
+            (143, Some("toolchain_preflight_inconclusive")),
+            (255, Some("toolchain_preflight_transport_failed")),
+            (-1, Some("toolchain_preflight_inconclusive")),
+            (256, Some("toolchain_preflight_inconclusive")),
+        ] {
+            let result = toolchain_preflight_command_result(rch_common::CommandResult {
+                exit_code,
+                stdout: String::new(),
+                stderr: " probe failed\nsecond line\r\n".into(),
+                duration_ms: 10,
+            });
+            assert_eq!(
+                result.err(),
+                reason.map(|reason| format!("{reason}:{exit_code}:probe failed second line")),
+                "exit {exit_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn toolchain_preflight_transient_exits_reprobe_without_authorizing_failed_commands() {
+        let _guard = test_guard!();
+        for exit_code in [255, 137, -1, 124, 125, 1, 126, 127] {
+            let pool = WorkerPool::new();
+            let worker = make_worker("recovering-probe", 8, 50.0);
+            worker
+                .set_capabilities(WorkerCapabilities::mock_with_rust())
+                .await;
+            pool.add_worker_state(worker).await;
+            let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+            let worker = pool.get(&WorkerId::new("recovering-probe")).await.unwrap();
+            let mut request = tool_gate_request();
+            request.job_mode = false;
+            request.command = Some("cargo check".into());
+            request.required_runtime = RequiredRuntime::Rust;
+            request.toolchain = Some(ToolchainInfo::new(
+                "nightly",
+                Some("2026-11-11".into()),
+                "nightly-2026-11-11",
+            ));
+            let requirements = ExecutionRequirements::new(&request);
+            let toolchain = requirements.preflight_toolchain().unwrap();
+            let failure = toolchain_preflight_with(&worker, toolchain, |_, _| {
+                std::future::ready(toolchain_preflight_command_result(
+                    rch_common::CommandResult {
+                        exit_code,
+                        stdout: String::new(),
+                        stderr: "probe did not establish a working toolchain".into(),
+                        duration_ms: 1,
+                    },
+                ))
+            })
+            .await
+            .expect("all nonzero statuses refuse the current request");
+            let selected = selector.select(&pool, &request).await;
+            assert!(selected.worker.is_none(), "exit {exit_code}");
+            assert_eq!(selected.reason, SelectionReason::AllWorkersFailedPreflight);
+            assert_eq!(worker.used_slots(), 0);
+            assert_eq!(
+                toolchain_preflight_with(&worker, toolchain, |_, _| async {
+                    panic!("fresh failures must retain the transient backoff");
+                })
+                .await
+                .as_deref(),
+                Some(failure.as_str())
+            );
+
+            // Advance only this verdict's age. No sleep, global clock change,
+            // refresh or daemon restart is needed to retry transient failures.
+            worker
+                .record_toolchain_preflight_at(
+                    toolchain.into(),
+                    false,
+                    Some(failure.clone()),
+                    chrono::Utc::now().timestamp_millis() - 120_000,
+                )
+                .await;
+            assert!(
+                worker
+                    .reserve_slots_for_selection(
+                        1,
+                        &worker.endpoint_snapshot().await,
+                        &requirements,
+                        None,
+                    )
+                    .await
+                    .is_none(),
+                "expiry alone cannot authorize a build"
+            );
+            let probed = std::cell::Cell::new(false);
+            let result = toolchain_preflight_with(&worker, toolchain, |_, _| {
+                probed.set(true);
+                std::future::ready(toolchain_preflight_command_result(
+                    rch_common::CommandResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        duration_ms: 1,
+                    },
+                ))
+            })
+            .await;
+            if matches!(exit_code, 1 | 126 | 127) {
+                assert!(!probed.get(), "a real command failure retains the full TTL");
+                assert_eq!(result.as_deref(), Some(failure.as_str()));
+                assert!(selector.select(&pool, &request).await.worker.is_none());
+            } else {
+                assert!(
+                    probed.get(),
+                    "exit {exit_code} must be reprobed after backoff"
+                );
+                assert!(result.is_none());
+                let selected = selector.select(&pool, &request).await;
+                assert_eq!(selected.reason, SelectionReason::Success);
+                assert!(Arc::ptr_eq(&worker, selected.worker.as_ref().unwrap()));
+                assert!(
+                    worker
+                        .reserve_slots_for_selection(
+                            1,
+                            &worker.endpoint_snapshot().await,
+                            &requirements,
+                            selected.circuit_permit.as_ref(),
+                        )
+                        .await
+                        .is_some()
+                );
+                assert_eq!(worker.used_slots(), 1);
+                worker.release_slots(1).await;
+            }
+            assert_eq!(worker.used_slots(), 0);
+        }
     }
 
     #[tokio::test]
