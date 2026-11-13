@@ -1045,10 +1045,11 @@ fn gc_claim_fixture(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf, Vec<u8>) {
     std::fs::create_dir(&registry).unwrap();
     let candidate = fixture.directory.path().join("claim-pool");
     let payload = format!("{}\n", candidate.display()).into_bytes();
-    let name = format!(
-        "fc-00000000-0000-4000-8000-000000000001.{:x}.claim",
-        Sha256::digest(&payload),
-    );
+    let digest: String = Sha256::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
     let claim = registry.join(name);
     std::fs::write(&claim, &payload).unwrap();
     (registry, candidate, claim, payload)

@@ -106,9 +106,6 @@ pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;
 
-/// Standard-library-only worker guard shared by SSH and direct execution.
-pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
-
 /// Paired loop-break markers for an RCH-managed Cargo child process.
 ///
 /// Install both only after execution has been admitted: on a worker command,

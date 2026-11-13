@@ -3555,22 +3555,39 @@ impl TransferPipeline {
                     "receipt": null, "warm_policy": null,
                     "require_incremental_tracking": true,
                 });
-                // The monitor and rsync inherit the original binary input
-                // stream. Server arguments are appended by rsync after this
-                // fragment and forwarded unchanged through the activity fence.
-                format!(
-                    "env RCH_TIMING_SCALE={} python3 -I -S -c {} {} {} {} {} {} standalone rsync",
-                    rch_common::timing::configured().env_value(),
-                    escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT)),
-                    budget.max_growth_bytes,
-                    budget.min_free_bytes,
-                    escape(Cow::Owned(format!(
-                        "{}_SOURCE_UPLOAD_DISK_BUDGET:",
-                        self.deadline_marker
-                    ))),
-                    escape(Cow::Borrowed(source.as_str())),
-                    escape(Cow::Owned(plan.to_string())),
-                )
+                let marker = format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", self.deadline_marker);
+                let refusal = format!(
+                    "{marker}{}",
+                    serde_json::json!({
+                        "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+                        "max_growth_bytes": budget.max_growth_bytes,
+                        "min_free_bytes": budget.min_free_bytes, "started": false,
+                        "detail": "deploy rch-wkr with native disk-supervise support",
+                    })
+                );
+                // The monitor and rsync inherit the original binary input.
+                // Keep the whole capability check inside one command, so a
+                // failed destination setup cannot fall through to the receiver.
+                // rsync's appended server arguments remain separate argv values.
+                let program = format!(
+                    r#"set -eu
+{locate}
+if ! rch_wkr_locate || ! rch_disk_version=$("$RCH_WKR" disk-supervise probe) \
+    || [ "$rch_disk_version" != 'rch-wkr disk-supervise v1' ]; then
+    printf '%s\n' {refusal} >&2
+    exit 120
+fi
+exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {marker} {target} {plan} standalone rsync "$@""#,
+                    locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+                    refusal = escape(Cow::Owned(refusal)),
+                    scale = rch_common::timing::configured().env_value(),
+                    budget = budget.max_growth_bytes,
+                    floor = budget.min_free_bytes,
+                    marker = escape(Cow::Owned(marker)),
+                    target = escape(Cow::Borrowed(source.as_str())),
+                    plan = escape(Cow::Owned(plan.to_string())),
+                );
+                format!("sh -c {} rch-source-upload", escape(Cow::Owned(program)))
             }
             None => "rsync".to_owned(),
         };
@@ -6046,7 +6063,6 @@ mkdir -p {source}
             "cargo_cache_required": self.cargo_disk_cache.is_some()
                 || (!self.cargo_disk_scope_captured && command.contains("cargo")),
         });
-        let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
         let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
         let plan = escape(Cow::Owned(plan.to_string()));
@@ -6057,12 +6073,19 @@ mkdir -p {source}
             "standalone"
         };
         let refusal =
-            self.disk_prestart_refusal("worker Python disk supervisor is unavailable", 120);
+            self.disk_prestart_refusal("deploy rch-wkr with native disk-supervise support", 120);
         let program = format!(
-            "{}if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
-            rch_common::timing::shell_prefix(),
+            r#"{timing}
+{locate}
+if ! rch_wkr_locate || ! rch_disk_version=$("$RCH_WKR" disk-supervise probe) \
+    || [ "$rch_disk_version" != 'rch-wkr disk-supervise v1' ]; then
+    {refusal}
+fi
+"$RCH_WKR" disk-supervise {} {} {marker} {target} {plan} {mode} sh -lc {command}"#,
             budget.max_growth_bytes,
             budget.min_free_bytes,
+            timing = rch_common::timing::shell_prefix(),
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
         );
         // This composition can exceed the single-argument limit independently
         // of the outer session wrapper, even when each embedded program fits.
@@ -15553,7 +15576,8 @@ Number of files transferred: 42
     #[test]
     fn disk_budget_missing_capability_has_durable_exact_prestart_receipt() {
         let retained = tempfile::tempdir().unwrap().keep();
-        for (name, build_id, expected) in [("python", None, 120), ("setsid", Some(11), 125)] {
+        for (name, build_id, expected) in [("disk-supervise", None, 120), ("setsid", Some(11), 125)]
+        {
             let directory = retained.join(name);
             let bin = directory.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
@@ -15571,13 +15595,17 @@ Number of files transferred: 42
                 pipeline.build_remote_command("printf started > workload-started", None),
             )
             .unwrap();
-            let output = std::process::Command::new("/bin/sh")
+            let mut command = std::process::Command::new("/bin/sh");
+            command
                 .arg(&script)
                 .env_clear()
                 .env("HOME", &directory)
-                .env("PATH", &bin)
-                .output()
-                .unwrap();
+                .env("PATH", &bin);
+            if name == "disk-supervise" {
+                // The locator also checks installation paths outside PATH.
+                command.env("RCH_WKR_BIN", directory.join("absent-rch-wkr"));
+            }
+            let output = command.output().unwrap();
             let result = CommandResult {
                 exit_code: output.status.code().unwrap(),
                 stdout: String::from_utf8(output.stdout).unwrap(),
@@ -16754,15 +16782,18 @@ Number of files transferred: 42
         let bin = retained.join("bin");
         std::fs::create_dir(&bin).unwrap();
         // This is a command-construction test, not a process-ownership proof.
-        // Capture the exact embedded supervisor and plan, then relay the
+        // Capture the native supervisor argv and plan, then relay the
         // command so a real shell can check rsync's binary protocol stream.
-        let capture = bin.join("python3");
+        let capture = bin.join("rch-wkr");
         std::fs::write(
             &capture,
             "#!/bin/sh\nset -eu\n\
             [ \"$RCH_ACTIVITY_TEST\" = \"$RCH_TEST_EXPECTED_ACTIVITY\" ]\n\
+            if [ \"$1\" = disk-supervise ] && [ \"$2\" = probe ]; then\n\
+                printf 'rch-wkr disk-supervise v1\\n'; exit 0\n\
+            fi\n\
             printf '%s\\0' \"$@\" > \"$RCH_TEST_UPLOAD_ARGV\"\n\
-            shift 10\nexec \"$@\"\n",
+            shift 7\nexec \"$@\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -16833,6 +16864,7 @@ Number of files transferred: 42
             let mut child = std::process::Command::new("sh")
                 .args(["-c", &program])
                 .env("PATH", &path)
+                .env("RCH_WKR_BIN", &capture)
                 .env(
                     "RCH_TEST_EXPECTED_ACTIVITY",
                     if mode == 2 { "shared" } else { "owned" },
@@ -16855,28 +16887,21 @@ Number of files transferred: 42
                 .unwrap()
                 .split(|byte| *byte == 0)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                &captured[..3],
-                [b"-I".as_slice(), b"-S".as_slice(), b"-c".as_slice()]
-            );
+            assert_eq!(captured[0], b"disk-supervise");
+            assert_eq!(captured[1], (3_u64 << 30).to_string().as_bytes());
+            assert_eq!(captured[2], (10_u64 << 30).to_string().as_bytes());
             assert_eq!(
                 captured[3],
-                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT.as_bytes()
-            );
-            assert_eq!(captured[4], (3_u64 << 30).to_string().as_bytes());
-            assert_eq!(captured[5], (10_u64 << 30).to_string().as_bytes());
-            assert_eq!(
-                captured[6],
                 format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", pipeline.deadline_marker).as_bytes()
             );
-            assert_eq!(captured[7], remote.as_bytes());
-            let plan: serde_json::Value = serde_json::from_slice(captured[8]).unwrap();
+            assert_eq!(captured[4], remote.as_bytes());
+            let plan: serde_json::Value = serde_json::from_slice(captured[5]).unwrap();
             assert_eq!(
                 plan,
                 serde_json::json!({"probe": [remote], "output": [remote], "receipt": null, "warm_policy": null, "require_incremental_tracking": true})
             );
-            assert_eq!(captured[9], b"standalone");
-            assert_eq!(captured[10], b"rsync");
+            assert_eq!(captured[6], b"standalone");
+            assert_eq!(captured[7], b"rsync");
             let mut expected = server_args.to_vec();
             *expected.last_mut().unwrap() = remote;
             let expected = expected

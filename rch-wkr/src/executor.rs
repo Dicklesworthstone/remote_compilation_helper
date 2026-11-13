@@ -574,14 +574,9 @@ pub async fn execute_with_disk_budget(
         } else {
             prepared::workload_command(crate::prepare::DependencyLayout::NodeModules, command)?
         };
-        let mut guarded = managed_command("python3");
+        let mut guarded = managed_command(crate::native_worker_executable()?);
         guarded
-            .args([
-                "-I",
-                "-S",
-                "-c",
-                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT,
-            ])
+            .arg("disk-supervise")
             .arg(budget.max_growth_bytes.to_string())
             .arg(budget.min_free_bytes.to_string())
             .arg(&marker)

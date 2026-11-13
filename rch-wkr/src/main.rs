@@ -9,6 +9,7 @@ mod artifact_headers;
 mod cache;
 mod control_capture;
 mod control_clock;
+mod disk_supervisor;
 mod executor;
 mod file_sync;
 mod git_archive_cache;
@@ -68,6 +69,12 @@ enum Commands {
     ControlClock {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Internal disk reservation, measurement and execution supervision.
+    #[command(hide = true)]
+    DiskSupervise {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
     },
     /// Internal descriptor and process-group checks for scoped launches.
     #[command(hide = true)]
@@ -378,6 +385,42 @@ enum OutputFormat {
     Pretty,
 }
 
+/// Reexecute this deployed worker without relying on the remote shell's PATH.
+pub(crate) fn native_worker_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+    }
+    #[cfg(test)]
+    {
+        // The unit-test executable has libtest's entry point. Its child must
+        // use the real worker binary to exercise the production CLI contract.
+        if let Some(path) = std::env::var_os("RCH_WKR_BIN") {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "RCH_WKR_BIN must name the matching worker binary",
+            ));
+        }
+        let current = std::env::current_exe()?;
+        let name = format!("rch-wkr{}", std::env::consts::EXE_SUFFIX);
+        current
+            .ancestors()
+            .skip(1)
+            .map(|directory| directory.join(&name))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "build rch-wkr beside these tests or set RCH_WKR_BIN",
+                )
+            })
+    }
+}
+
 fn main() -> Result<()> {
     exit_quietly_when_stdout_reader_is_gone();
     let cli = Cli::parse();
@@ -393,6 +436,9 @@ fn main() -> Result<()> {
     }
     if let Commands::ControlClock { arguments } = &cli.command {
         std::process::exit(control_clock::main(arguments));
+    }
+    if let Commands::DiskSupervise { arguments } = &cli.command {
+        std::process::exit(disk_supervisor::main(arguments));
     }
     if let Commands::ScopedLaunch { arguments } = &cli.command {
         std::process::exit(scoped_launch::main(arguments));
@@ -537,6 +583,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::ControlClock { .. } => {
             anyhow::bail!("control-clock requires the synchronous worker entry point")
+        }
+        Commands::DiskSupervise { .. } => {
+            anyhow::bail!("disk-supervise requires the synchronous worker entry point")
         }
         Commands::ScopedLaunch { .. } => {
             anyhow::bail!("scoped-launch requires the synchronous worker entry point")
