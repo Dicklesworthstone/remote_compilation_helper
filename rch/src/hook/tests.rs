@@ -9818,8 +9818,8 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
             "#!/bin/sh\nprintf 'cargo-body:%s:%s\\n' \"$1\" \"$2\"\nexit 37\n",
         ),
         (
-            "cargo-rabs",
-            "#!/usr/bin/env python3\nRCH_WORKER_PREPARATION_API = 1\ndef prepare(environment, no_start=False):\n    import sys\n    print('preparation-entered', file=sys.stderr)\n    return environment\n",
+            "rch-wkr",
+            "#!/bin/sh\n[ \"$1\" = worker-cache ] && [ \"$2\" = --protocol ] && [ \"$3\" = v1 ] && [ \"$4\" = -- ] || exit 93\nshift 4\nprintf 'preparation-entered\\n' >&2\nexec \"$@\"\n",
         ),
     ] {
         let path = bin.join(name);
@@ -9839,6 +9839,7 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
             .current_dir(&source)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("RCH_CH_BASE", &root)
+            .env("RCH_WKR_BIN", bin.join("rch-wkr"))
             .env_remove("RCH_RABS_WORKER_ACTIVE")
             .output()
             .unwrap();

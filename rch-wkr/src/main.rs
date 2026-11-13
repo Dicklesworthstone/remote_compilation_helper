@@ -30,6 +30,7 @@ mod source_upload;
 mod source_verifier;
 mod staging_gc;
 mod toolchain;
+mod worker_cache;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -76,6 +77,12 @@ enum Commands {
     /// Internal descriptor-relative staging collection under source custody.
     #[command(hide = true)]
     StagingGc {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal worker-local RABS preparation followed by one Cargo exec.
+    #[command(hide = true)]
+    WorkerCache {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
     },
@@ -461,6 +468,9 @@ fn main() -> Result<()> {
     if let Commands::StagingGc { arguments } = &cli.command {
         std::process::exit(staging_gc::main(arguments));
     }
+    if let Commands::WorkerCache { arguments } = &cli.command {
+        std::process::exit(worker_cache::main(arguments));
+    }
     if let Commands::ControlClock { arguments } = &cli.command {
         std::process::exit(control_clock::main(arguments));
     }
@@ -616,6 +626,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::StagingGc { .. } => {
             anyhow::bail!("staging-gc requires the synchronous worker entry point")
+        }
+        Commands::WorkerCache { .. } => {
+            anyhow::bail!("worker-cache requires the synchronous worker entry point")
         }
         Commands::ControlClock { .. } => {
             anyhow::bail!("control-clock requires the synchronous worker entry point")

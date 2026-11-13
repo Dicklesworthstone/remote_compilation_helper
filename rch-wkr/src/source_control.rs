@@ -7,6 +7,16 @@
 
 use std::ffi::OsString;
 
+/// Confirm that an unreaped private-session leader has no executing members.
+/// The caller must retain its direct-child relationship throughout this check.
+#[cfg(target_os = "linux")]
+pub(crate) fn session_quiescent(
+    leader: rustix::process::Pid,
+    allowance: std::time::Duration,
+) -> std::io::Result<bool> {
+    imp::session_quiescent(leader, allowance)
+}
+
 pub fn main(arguments: &[OsString]) -> i32 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -851,6 +861,13 @@ mod imp {
             io::ErrorKind::TimedOut,
             "source execution expired",
         ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn session_quiescent(group: Pid, allowance: Duration) -> Result<bool> {
+        let nanos = u64::try_from(allowance.as_nanos())
+            .map_err(|_| invalid("unbounded session-settlement allowance"))?;
+        quiescent(group, now().saturating_add(nanos), &AtomicBool::new(false))
     }
 
     fn quiescent(group: Pid, deadline: u64, interrupted: &AtomicBool) -> Result<bool> {
