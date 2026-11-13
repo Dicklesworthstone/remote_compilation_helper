@@ -4847,15 +4847,30 @@ impl TransferPipeline {
             .as_deref()
             .context("Git archive cache has no paired target")?;
         let source = self.remote_path();
-        // The same guarded mkdir used by the cold rsync receiver prepares
-        // sibling source roots under the existing durable source grant. The
-        // helper never creates ancestors above the exact paired target.
+        // Probe before preparing source: an older deployed worker must not
+        // silently bypass the native protocol. The same guarded mkdir as the
+        // cold rsync receiver then prepares sibling source roots under the
+        // existing durable grant. The helper never creates target ancestors.
         Ok(format!(
-            "set -eu\n{guard} || exit 73\numask 0022\nmkdir -p {source}\nif ! command -v python3 >/dev/null 2>&1; then\nprintf 'RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_UNAVAILABLE\\n'\nexit 0\nfi\npython3 -I -c {program} {operation} {source} {target} {slot} {digest} {size} {reserve}",
+            r#"set -eu
+{locate}
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_GIT_ARCHIVE_CACHE_ERROR: rch-wkr is not installed on this worker' >&2
+    exit 74
+fi
+if ! rch_archive_version=$("$RCH_WKR" git-archive-cache probe) \
+    || [ "$rch_archive_version" != 'rch-wkr git-archive-cache v1' ]; then
+    printf '%s\n' 'RCH_GIT_ARCHIVE_CACHE_ERROR: deploy the matching rch-wkr with git-archive-cache support' >&2
+    exit 74
+fi
+{guard} || exit 73
+umask 0022
+mkdir -p {source}
+"$RCH_WKR" git-archive-cache {operation} {source} {target} {slot} {digest} {size} {reserve}"#,
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
             guard = live_checkout_sync_guard(&source),
             source = escape(Cow::Borrowed(&source)),
             target = escape(Cow::Borrowed(target)),
-            program = escape(Cow::Borrowed(include_str!("transfer/git_archive_cache.py"))),
             operation = operation.as_str(),
             slot = escape(Cow::Borrowed(&cache.slot)),
             digest = escape(Cow::Borrowed(digest)),
@@ -11823,9 +11838,140 @@ mod tests {
         let script = first_cache
             .git_archive_cache_script(GitArchiveCacheOperation::Restore, &digest, 10240)
             .unwrap();
+        assert!(script.contains("rch_wkr_locate"));
+        assert!(script.contains("\"$RCH_WKR\" git-archive-cache probe"));
+        assert!(script.contains("\"$RCH_WKR\" git-archive-cache restore"));
         let fenced = first_cache.source_activity_rpc_script(&script, Duration::from_secs(3));
         assert!(fenced.contains("--rch-finite-rpc 3000"));
         assert!(fenced.contains(first_cache.source_authority_prefix.as_ref().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_archive_cache_generated_script_executes_native_reuse_with_literal_roots() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::PermissionsExt as _;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = std::fs::canonicalize(&retained).unwrap();
+        let source = root.join("source ' $literal `name` α");
+        let target = root.join("target ' $literal `name` β");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "repo".into(),
+            "abcd".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_clean_overlay_archive_cache(Some(0))
+        .unwrap();
+        let payload = b"independently pinned Git archive bytes";
+        let digest: String = Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let run = |operation, expected| {
+            let script = pipeline
+                .git_archive_cache_script(operation, &digest, payload.len() as u64)
+                .unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                GitArchiveCacheStatus::parse(operation, &output.stdout, &output.stderr).unwrap(),
+                expected
+            );
+        };
+        run(
+            GitArchiveCacheOperation::Restore,
+            GitArchiveCacheStatus::Miss,
+        );
+        assert!(!target.exists());
+        let archive = source.join(".rch-clean-overlay-base.tar");
+        std::fs::write(&archive, payload).unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+        run(
+            GitArchiveCacheOperation::Publish,
+            GitArchiveCacheStatus::Published,
+        );
+        std::fs::rename(&source, root.join("retained-source")).unwrap();
+        run(
+            GitArchiveCacheOperation::Restore,
+            GitArchiveCacheStatus::Hit,
+        );
+        assert_eq!(std::fs::read(archive).unwrap(), payload);
+        assert_eq!(std::fs::read_dir(source).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_archive_cache_generated_script_refuses_old_workers_before_source_setup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = std::fs::canonicalize(&retained).unwrap();
+        let source = root.join("absent-source");
+        let target = root.join("absent-target");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "repo".into(),
+            "abcd".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_clean_overlay_archive_cache(Some(0))
+        .unwrap();
+        for (case, program) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "failed-probe",
+                Some("#!/bin/sh\nprintf 'rch-wkr git-archive-cache v1\\n'; exit 3\n"),
+            ),
+            (
+                "wrong-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr git-archive-cache v0\\n'\n"),
+            ),
+            (
+                "unexpected-output",
+                Some("#!/bin/sh\nprintf 'unexpected banner\\nrch-wkr git-archive-cache v1\\n'\n"),
+            ),
+        ] {
+            let binary = root.join(case);
+            if let Some(program) = program {
+                std::fs::write(&binary, program).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for operation in [
+                GitArchiveCacheOperation::Restore,
+                GitArchiveCacheOperation::Publish,
+            ] {
+                let script = pipeline
+                    .git_archive_cache_script(operation, &"a".repeat(64), 10240)
+                    .unwrap();
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", &script])
+                    .env("RCH_WKR_BIN", &binary)
+                    .env("PATH", root.join("no-tools"))
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(74), "{case}: {output:?}");
+                assert!(output.stdout.is_empty(), "{case}: {output:?}");
+                assert!(
+                    output.stderr.starts_with(b"RCH_GIT_ARCHIVE_CACHE_ERROR:"),
+                    "{case}: {output:?}"
+                );
+                assert!(!source.exists());
+                assert!(!target.exists());
+            }
+        }
     }
 
     #[tokio::test]

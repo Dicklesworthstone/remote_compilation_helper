@@ -1,30 +1,45 @@
-//! Process-level tests for the exact cache program embedded by transfer.rs.
-//! That program runs before remote Cargo on every clean-overlay job.
+//! Cache bypass must still repair a receiver with the same size and timestamp.
+//! Native cache lifecycle and fault tests live with the worker implementation.
 #[cfg(unix)]
 #[test]
-fn git_archive_cache_process_protocol() {
-    // The suite asserts cache behavior below trusted ancestors, which only a
-    // root-owned sticky base promises on every host. macOS /tmp is an alias.
-    let base = if cfg!(target_os = "macos") {
-        "/private/tmp"
-    } else {
-        "/tmp"
-    };
-    let fixtures = tempfile::Builder::new()
-        .prefix("rch-git-archive-cache-")
-        .tempdir_in(base)
-        .expect("create the fixture base");
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../scripts/tests/test_git_archive_cache.py");
-    let output = std::process::Command::new("python3")
-        .arg(script)
-        .env("TMPDIR", fixtures.path())
-        .output()
-        .expect("python3 is required for Git archive cache process tests");
-    assert!(
-        output.status.success(),
-        "Git archive cache tests failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+fn git_archive_cache_fallback_repairs_equal_size_equal_mtime_corrupt_receivers() {
+    use std::fs::{self, File, FileTimes};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime};
+
+    let fixtures = tempfile::tempdir().unwrap().keep();
+    let payload: Vec<u8> = (0..20_480).map(|index| (index % 251) as u8).collect();
+    let sender = fixtures.join("selected archive");
+    fs::write(&sender, &payload).unwrap();
+    fs::set_permissions(&sender, fs::Permissions::from_mode(0o600)).unwrap();
+    let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    File::open(&sender)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(timestamp))
+        .unwrap();
+    let mut damaged = payload.clone();
+    *damaged.last_mut().unwrap() ^= 1;
+    for integrity in ["--checksum", "--ignore-times"] {
+        let receiver = fixtures.join(format!("cache receiver {integrity}"));
+        fs::write(&receiver, &damaged).unwrap();
+        fs::set_permissions(&receiver, fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(&receiver)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(timestamp))
+            .unwrap();
+        let before = fs::metadata(&receiver).unwrap();
+        let selected = fs::metadata(&sender).unwrap();
+        assert_eq!(before.len(), selected.len());
+        assert_eq!(before.modified().unwrap(), selected.modified().unwrap());
+        let output = Command::new("rsync")
+            .args(["-a", "--no-owner", "--no-group", "--partial", integrity])
+            .arg(&sender)
+            .arg(&receiver)
+            .output()
+            .expect("rsync is required for the native transfer integrity regression");
+        assert!(output.status.success(), "{integrity}: {output:?}");
+        assert!(output.stderr.is_empty(), "{integrity}: {output:?}");
+        assert_eq!(fs::read(receiver).unwrap(), payload, "{integrity}");
+    }
 }

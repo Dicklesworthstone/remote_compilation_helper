@@ -11,6 +11,7 @@ mod control_capture;
 mod control_clock;
 mod executor;
 mod file_sync;
+mod git_archive_cache;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
@@ -101,6 +102,12 @@ enum Commands {
     /// Internal durable-file sync used before publishing completion receipts.
     #[command(hide = true)]
     FileSync {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal verified Git source-archive cache for clean-overlay transfer.
+    #[command(hide = true)]
+    GitArchiveCache {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -401,6 +408,9 @@ fn main() -> Result<()> {
     if let Commands::FileSync { arguments } = &cli.command {
         std::process::exit(file_sync::main(arguments));
     }
+    if let Commands::GitArchiveCache { arguments } = &cli.command {
+        std::process::exit(git_archive_cache::main(arguments));
+    }
     if let Commands::ResultDirectory { arguments } = &cli.command {
         std::process::exit(result_probe::main(arguments));
     }
@@ -540,6 +550,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::FileSync { .. } => {
             anyhow::bail!("file-sync requires the synchronous worker entry point")
+        }
+        Commands::GitArchiveCache { .. } => {
+            anyhow::bail!("git-archive-cache requires the synchronous worker entry point")
         }
         Commands::ResultDirectory { .. } => {
             anyhow::bail!("result-directory requires the synchronous worker entry point")
