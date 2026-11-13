@@ -39,7 +39,7 @@
 //!   worker; ordinary network failures and administrative exclusions do not.
 
 use crate::config::StaleTargetReapConfig;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{WorkerPool, WorkerState, ensure_posix_gc_worker};
 use rch_common::stale_target_reap;
 use rch_common::{CommandResult, SshClient, SshOptions, WorkerId};
 use std::sync::Arc;
@@ -367,6 +367,7 @@ impl StaleTargetReaper {
             .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let start = Instant::now();
         let config = worker_state.config.read().await.clone();
+        ensure_posix_gc_worker(&config)?;
         let worker_id = config.id.clone();
 
         let mut metrics = ReapMetrics::default();
@@ -949,6 +950,37 @@ mod tests {
         assert_eq!(stats.workers_skipped, 1);
         assert_eq!(stats.workers_swept, 0);
         assert_eq!(stats.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn windows_workers_are_skipped_and_refused_at_sweep_dispatch() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("windows-sweep");
+        pool.add_worker(rch_common::WorkerConfig {
+            id: worker_id.clone(),
+            tags: vec!["os:WiNdOwS".into()],
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let reaper = StaleTargetReaper::new(
+            pool,
+            StaleTargetReapConfig {
+                // The invalid base prevents SSH even if the regression
+                // returns. Platform refusal must occur before base handling.
+                remote_base: "/".into(),
+                ..Default::default()
+            },
+        );
+        let stats = reaper.run_cycle().await;
+        assert_eq!(stats.workers_checked, 1);
+        assert_eq!(stats.workers_skipped, 1);
+        assert_eq!(stats.workers_swept, 0);
+        assert_eq!(stats.errors, 0);
+        let error = reaper.sweep_worker(&worker, 720).await.unwrap_err();
+        assert!(error.to_string().contains("Windows collection"), "{error}");
+        assert!(worker.background_probe().await.is_some());
+        assert_eq!(worker.status().await, WorkerStatus::Healthy);
     }
 
     #[tokio::test]

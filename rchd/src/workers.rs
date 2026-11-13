@@ -741,6 +741,19 @@ pub(crate) enum RegistryStoragePressure {
     RecoveryPending,
 }
 
+/// The daemon's collection scripts use POSIX process and descriptor snapshots.
+/// Git for Windows can provide those commands without exposing native Cargo
+/// processes, so successful snapshots there cannot authorize deletion. Keep
+/// this check on the config actually used to dispatch every mutating sweep,
+/// including an explicitly requested cleanup that skips scheduling policy.
+pub(crate) fn ensure_posix_gc_worker(config: &WorkerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        rch_common::types::declared_os(&config.tags).as_deref() != Some("windows"),
+        "Windows collection is unavailable without native process/handle and durable ownership checks; use rch gc --dry-run for inventory"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct RegistryStoragePressureEvidence {
     reason: RegistryStoragePressure,
@@ -1282,6 +1295,9 @@ impl WorkerState {
     /// not build admission or recovery from an open command/transport circuit.
     /// Callers still execute under a revocable background network permit.
     pub(crate) async fn background_disk_recovery_allowed(&self) -> bool {
+        if ensure_posix_gc_worker(&self.config.read().await).is_err() {
+            return false;
+        }
         let Some(network) = self.background_probe().await else {
             return false;
         };
@@ -9362,6 +9378,46 @@ mod tests {
 
         state.set_last_latency_ms(None);
         assert!(state.last_latency_ms().is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_never_uses_posix_collection_for_windows_workers() {
+        for (tag, supported) in [
+            (None, true),
+            (Some("os:linux"), true),
+            (Some("os:darwin"), true),
+            (Some("os:windows"), false),
+            (Some("os:WiNdOwS"), false),
+        ] {
+            let mut config = test_config("storage-platform");
+            config.tags = tag.into_iter().map(str::to_owned).collect();
+            let worker = WorkerState::new(config);
+            assert_eq!(
+                worker.background_disk_recovery_allowed().await,
+                supported,
+                "healthy worker: {tag:?}"
+            );
+            // Storage pressure may permit otherwise excluded POSIX workers,
+            // but it cannot make the MSYS process view authoritative.
+            let endpoint = worker.endpoint_snapshot().await;
+            let network = worker.background_probe().await.unwrap();
+            assert!(
+                worker
+                    .record_registry_storage_pressure(
+                        &endpoint,
+                        &network,
+                        Some(RegistryStoragePressure::NoSpace),
+                    )
+                    .await
+            );
+            worker.apply_health_status(WorkerStatus::Unreachable).await;
+            assert_eq!(
+                worker.background_disk_recovery_allowed().await,
+                supported,
+                "worker with confirmed pressure: {tag:?}"
+            );
+            assert!(worker.background_probe().await.is_some());
+        }
     }
 
     #[tokio::test]
