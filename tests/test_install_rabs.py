@@ -9,7 +9,6 @@ import io
 import json
 import os
 from pathlib import Path
-import runpy
 import shlex
 import shutil
 import subprocess
@@ -44,7 +43,6 @@ class InstallTests(unittest.TestCase):
         for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
-        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         self.launcher("first")
 
     def launcher(self, label):
@@ -91,26 +89,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(links, {name: (self.bin / name).lstat().st_ino for name in installer.TOOLS})
         self.assertIn("second", subprocess.check_output([str(self.bin / "cargo-rabs")], text=True))
 
-    def test_installed_recovery_uses_its_generation_across_an_atomic_upgrade(self):
-        self.run_install()
-        original = self.bin / self.current()
-        driver = self.bin / "rabs-recover"
-        help_text = subprocess.check_output([str(driver), "--help"], text=True)
-        self.assertIn("--resume-to", help_text)
-        self.assertIn("--acknowledge", help_text)
-        # Load the actual installed driver, then switch the public links while
-        # this caller is still inspecting its result. Native execution remains
-        # an explicit ELF fixture; the generation resolution is production code.
-        recovery = runpy.run_path(str(driver))
-        self.launcher("second")
-        self.run_install()
-        self.assertNotEqual(original, self.bin / self.current())
-        self.assertEqual(recovery["daemon_path"](None, {}), str(original / "rabsd"))
-        current = runpy.run_path(str(driver))
-        self.assertEqual(current["daemon_path"](None, {}),
-                         str(self.bin / self.current() / "rabsd"))
+    # Native sibling selection across activation is exercised by the real
+    # subprocess regression in rabs-cli/tests/recovery.rs, not script imports.
 
-    def test_invalid_recovery_launcher_cannot_replace_an_active_toolset(self):
+    def test_invalid_native_recovery_cannot_replace_an_active_toolset(self):
         self.run_install()
         original = self.current()
         path = self.bundle / "rabs-recover"
@@ -234,7 +216,8 @@ class InstallTests(unittest.TestCase):
         for name in installer.PYTHON_TOOLS:
             shutil.copy2(self.bundle / name, scripts / name)
         build = self.root / "custom-target" / "x86_64-unknown-linux-gnu"
-        for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
+        for name, profile in [("rabs-wrap", "wrapper-release"), ("rabs-recover", "wrapper-release"),
+                              ("rabsd", "daemon-release"),
                               ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
                               ("rabs-delivery-cas", "daemon-release")]:
             directory = build / profile
@@ -558,7 +541,7 @@ esac
         # Retained executable outputs must not stand in for this invocation's
         # artifacts. The Cargo double below overwrites only its selected paths.
         stale_marker = b"\nretained source build output\n"
-        for name in ("rch", "rabs-wrap"):
+        for name in ("rch", "rabs-wrap", "rabs-recover"):
             (target / "wrapper-release" / name).write_bytes(
                 (self.bundle / name).read_bytes() + stale_marker)
             (target / "wrapper-release" / name).chmod(0o755)
@@ -592,6 +575,7 @@ output="$target_dir${target:+/$target}/$profile"
 mkdir -p "$output"
 for package in $packages; do
     case "$package" in
+        rabs-cli) names='rabs-recover' ;;
         rabs-wkr) names='rabs-wkr rabs-cargo-root' ;;
         rabsd) names='rabsd rabs-delivery-cas' ;;
         *) names=$package ;;
@@ -621,7 +605,8 @@ done
             "build --locked --profile wrapper-release -p rch --bin rch" + layout,
             "build --locked --profile daemon-release -p rchd -p rch-wkr"
             " --bin rchd --bin rch-wkr" + layout,
-            "build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap" + layout,
+            "build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli"
+            " --bin rabs-wrap --bin rabs-recover" + layout,
             "build --locked --profile daemon-release -p rabsd -p rabs-wkr"
             " --bin rabsd --bin rabs-wkr --bin rabs-cargo-root --bin rabs-delivery-cas" + layout,
         ])
@@ -721,7 +706,6 @@ class PackageTests(unittest.TestCase):
         for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
-        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         (self.bundle / "cargo-rabs").write_text(
             "#!/usr/bin/env python3\nprint('packaged launcher')\n", encoding="utf-8")
         (self.bundle / "cargo-rabs").chmod(0o755)
@@ -789,7 +773,7 @@ class PackageTests(unittest.TestCase):
         for profile in ("wrapper-release", "daemon-release"):
             (build / profile).mkdir(parents=True)
         for name in installer.NATIVE_TOOLS:
-            profile = "wrapper-release" if name == "rabs-wrap" else "daemon-release"
+            profile = "wrapper-release" if name in ("rabs-wrap", "rabs-recover") else "daemon-release"
             shutil.copy2(self.bundle / name, build / profile / name)
         code, stdout, error = self.main("--from-build", str(build), "--package", str(self.output),
                                        "--target", self.target)

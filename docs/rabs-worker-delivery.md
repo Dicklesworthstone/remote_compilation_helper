@@ -1211,7 +1211,7 @@ The worker still performs its normal acquisition and execution checks. A
 different installation is a miss. Preparing the pool does not extend a build
 deadline or establish that the cold network-upload path meets that deadline.
 
-#### Recover completed SDK files after an interrupted upload
+#### Recover SDK files and partial prefixes after an interrupted upload
 
 To retain progress before an entire SDK has arrived, set
 `RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES` on the worker to a decimal byte budget,
@@ -1222,8 +1222,10 @@ state directory after restarting. This is a separate budget from source-file
 reuse and `RABS_WORKER_TOOLCHAIN_CACHE_BYTES`. Neither setting implicitly enables
 the other, and their retained disk usage adds together when both are enabled.
 
-The worker advertises `toolchain-file-reuse-v1` only with a configured file
-cache. After authenticated negotiation and a whole-SDK cache miss, the
+The worker advertises `toolchain-file-reuse-v1` and the optional
+`toolchain-file-prefix-v1` extension only with a configured file cache. Each
+capability requires its own authenticated selection; prefix reuse also requires
+file reuse. After negotiation and a whole-SDK cache miss, the
 coordinator sends the captured regular-file identities in pages of at most
 1,024 files and 256 KiB. These hashes come from the SDK's existing complete byte
 scan. The worker verifies reusable bytes into a private snapshot before reporting
@@ -1235,11 +1237,29 @@ only the payload chunks of verified file hits are omitted.
 Each newly completed file that fits the cache is independently copied and
 verified before its final chunk acknowledgment. A connection lost before the SDK
 seal can therefore leave useful completed files for a fresh upload. A changed
-SDK can also reuse identical file contents from an earlier SDK. Partial files
-are uploaded again from offset zero; this capability does not resume byte ranges
-within a file. Cache absence, corruption, writer contention or a full budget can
-produce misses without authorizing different compiler bytes. Loss of optional
-cache storage can discard progress; it cannot supply an unverified hit.
+SDK can also reuse identical file contents from an earlier SDK.
+
+With prefix reuse selected, an interrupted regular file can also retain a
+bounded prefix in the same byte cache. On the next upload, the worker snapshots
+the actual retained bytes and offers their length and SHA-256. The coordinator
+independently hashes that exact range from its retained SDK file. Matching bytes
+allow transmission to start at the offered offset; a digest disagreement selects
+offset zero and sends the complete file. A prefix hash never establishes the
+identity of the missing tail or authorizes execution.
+
+The selected offset and hash accompany each regular-file entry, and the worker's
+entry acknowledgment must confirm that exact offset before it can release
+transfer credit. Prefix offers share the existing 256 KiB page-reply bound;
+optional hints that do not fit are omitted and those files start at zero.
+Older peers continue using completed-file reuse with its unchanged frames and
+upload partial files from zero. Source-file transfer is unchanged.
+
+Cache absence, corruption, writer contention or a full budget can produce misses
+without authorizing different compiler bytes. Prefix growth stops when the
+configured capacity cannot accommodate another chunk, preserving the retained
+prefix. Loss of optional cache storage can discard progress; it cannot supply an
+unverified hit. Actual retained bytes are checked again after a worker restart;
+there is no trusted saved offset to replay.
 
 Retained file objects are bounded and reclaimable. During an upload the worker
 also owns a hit snapshot bounded by the smaller of the declared SDK size and

@@ -523,7 +523,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 grant.get("source_transfer").is_none()
                     && grant.get("toolchain_transfer").is_none()
                     && grant.get("toolchain_reuse").is_none()
-                    && grant.get("toolchain_file_reuse").is_none(),
+                    && grant.get("toolchain_file_reuse").is_none()
+                    && grant.get("toolchain_prefix_reuse").is_none(),
                 "input transfer was not authorized by this operator session",
             )?;
             grant.clone()
@@ -632,7 +633,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // frames inside this negotiation frontier: the public adapter never
         // allows arbitrary source writes, and a failed seal cannot dispatch.
         if let Some(upload) = &self.source {
-            upload.transmit(
+            upload.transmit_with_prefix(
                 &mut self.inner,
                 &self.expected_operation,
                 grant.get("toolchain_reuse").is_some_and(|value| {
@@ -640,6 +641,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 }),
                 grant.get("toolchain_file_reuse").is_some_and(|value| {
                     value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_FILE_REUSE_VERSION
+                }),
+                grant.get("toolchain_prefix_reuse").is_some_and(|value| {
+                    value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_PREFIX_REUSE_VERSION
                 }),
             )?;
         }
@@ -3270,17 +3274,20 @@ mod tests {
     #[test]
     fn unsolicited_toolchain_reuse_grants_require_retained_input_ownership_before_challenge() {
         use rabs_sandbox::toolchain_transfer::{
-            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
+            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_PREFIX_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+            TOOLCHAIN_TRANSFER_VERSION,
         };
         for (field, version) in [
             ("toolchain_transfer", TOOLCHAIN_TRANSFER_VERSION),
             ("toolchain_reuse", TOOLCHAIN_REUSE_VERSION),
             ("toolchain_file_reuse", TOOLCHAIN_FILE_REUSE_VERSION),
+            ("toolchain_prefix_reuse", TOOLCHAIN_PREFIX_REUSE_VERSION),
         ] {
             let mut offered = hello();
             offered["toolchain_transfers"] = json!([TOOLCHAIN_TRANSFER_VERSION]);
             offered["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
             offered["toolchain_file_reuses"] = json!([TOOLCHAIN_FILE_REUSE_VERSION]);
+            offered["toolchain_prefix_reuses"] = json!([TOOLCHAIN_PREFIX_REUSE_VERSION]);
             let mut peer = peer(offered, response());
             let offered = peer.receive().unwrap();
             let mut selected = grant();

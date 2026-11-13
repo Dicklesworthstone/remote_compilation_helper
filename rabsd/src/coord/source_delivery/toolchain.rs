@@ -13,12 +13,12 @@ use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use rabs_sandbox::toolchain_transfer::{
     MAX_TOOLCHAIN_CHUNK, MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES,
-    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
-    TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry, ToolchainEntryKind,
+    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_PREFIX_REUSE_VERSION,
+    TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry, ToolchainEntryKind,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
@@ -28,6 +28,21 @@ mod pipeline;
 // The shared window spans entries and chunks, including small and empty files.
 // Only acknowledgment descriptors are retained, never queued payload buffers.
 const CHUNK_WINDOW: usize = 4;
+
+#[derive(Clone, Copy)]
+struct FileResume {
+    offset: u64,
+    sha256: [u8; 32],
+}
+
+impl FileResume {
+    fn empty() -> Self {
+        Self {
+            offset: 0,
+            sha256: Sha256::digest([]).into(),
+        }
+    }
+}
 
 fn check_reply(
     reply: &Value,
@@ -192,7 +207,48 @@ impl ToolchainUpload {
         if reuse {
             grant["toolchain_reuse"] = json!(TOOLCHAIN_REUSE_VERSION);
         }
-        select_file_reuse(hello, grant, self.entries.iter())
+        select_file_reuse(hello, grant, self.entries.iter())?;
+        let prefix = grant.get("toolchain_file_reuse").is_some()
+            && hello["toolchain_prefix_reuses"]
+                .as_array()
+                .is_some_and(|versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == TOOLCHAIN_PREFIX_REUSE_VERSION)
+                });
+        require(
+            grant
+                .get("toolchain_prefix_reuse")
+                .is_none_or(|value| prefix && value == TOOLCHAIN_PREFIX_REUSE_VERSION),
+            "conflicting or unadvertised toolchain prefix reuse selection",
+        )?;
+        if prefix {
+            grant["toolchain_prefix_reuse"] = json!(TOOLCHAIN_PREFIX_REUSE_VERSION);
+        }
+        Ok(())
+    }
+
+    fn prefix_digest<P: WorkerPeer + ?Sized>(
+        &self,
+        peer: &mut P,
+        path: &str,
+        length: u64,
+    ) -> io::Result<[u8; 32]> {
+        let mut hash = Sha256::new();
+        let mut offset = 0;
+        while offset < length {
+            peer.checkpoint()?;
+            let maximum = (length - offset).min(MAX_TOOLCHAIN_CHUNK as u64) as usize;
+            let chunk = self.prepared.read_chunk(path, offset, maximum, || false)?;
+            require(
+                !chunk.is_empty() && chunk.len() <= maximum,
+                "retained toolchain prefix read changed its range",
+            )?;
+            hash.update(&chunk);
+            offset += chunk.len() as u64;
+        }
+        peer.checkpoint()?;
+        Ok(hash.finalize().into())
     }
 
     /// Exchange the retained file identities in bounded pages before any tree
@@ -202,7 +258,8 @@ impl ToolchainUpload {
         &self,
         peer: &mut P,
         request_id: u64,
-    ) -> io::Result<BTreeSet<String>> {
+        prefix_selected: bool,
+    ) -> io::Result<BTreeMap<String, FileResume>> {
         peer.checkpoint()?;
         let identity = self.prepared.identity();
         let files = self.prepared.files()?;
@@ -223,7 +280,7 @@ impl ToolchainUpload {
             "toolchain file manifest differs from the retained dataset totals",
         )?;
         let sha256 = hex(&identity.sha256);
-        let mut missing = BTreeSet::new();
+        let mut resumes = BTreeMap::new();
         let mut offset = 0;
         while offset < files.len() {
             peer.checkpoint()?;
@@ -257,7 +314,11 @@ impl ToolchainUpload {
                 request_id,
                 &identity.sha256,
                 "toolchain-file-manifest-accepted",
-                5,
+                if prefix_selected { 6 } else { 5 },
+            )?;
+            require(
+                serde_json::to_vec(&reply)?.len() <= MAX_TOOLCHAIN_FILE_PAGE_BYTES,
+                "toolchain file manifest reply exceeds its byte bound",
             )?;
             require(
                 reply["next_offset"].as_u64() == Some(next as u64),
@@ -269,6 +330,7 @@ impl ToolchainUpload {
                 .ok_or_else(|| {
                     invalid("toolchain file manifest missing set is absent or excessive")
                 })?;
+            let mut missing = BTreeSet::new();
             for path in paths {
                 let path = path
                     .as_str()
@@ -280,6 +342,63 @@ impl ToolchainUpload {
                         && missing.insert(path.to_owned()),
                     "toolchain file manifest missing set contains a duplicate or foreign path",
                 )?;
+            }
+            for file in &files[offset..next] {
+                let resume = if missing.contains(&file.path) {
+                    FileResume::empty()
+                } else {
+                    FileResume {
+                        offset: file.bytes,
+                        sha256: file.sha256,
+                    }
+                };
+                require(
+                    resumes.insert(file.path.clone(), resume).is_none(),
+                    "toolchain file manifest repeats a retained path",
+                )?;
+            }
+            if prefix_selected {
+                let prefixes = reply["prefixes"]
+                    .as_array()
+                    .filter(|prefixes| prefixes.len() <= missing.len())
+                    .ok_or_else(|| invalid("toolchain prefixes are absent or excessive"))?;
+                let mut offered = BTreeSet::new();
+                for prefix in prefixes {
+                    require(
+                        prefix.as_object().is_some_and(|object| {
+                            object.len() == 3
+                                && ["path", "offset", "sha256"]
+                                    .iter()
+                                    .all(|key| object.contains_key(*key))
+                        }),
+                        "toolchain prefix has invalid fields",
+                    )?;
+                    let path = prefix["path"]
+                        .as_str()
+                        .ok_or_else(|| invalid("toolchain prefix path must be a string"))?;
+                    let index = files[offset..next]
+                        .binary_search_by(|file| file.path.as_str().cmp(path))
+                        .map_err(|_| invalid("toolchain prefix names a foreign file"))?;
+                    let file = &files[offset + index];
+                    let length = prefix["offset"]
+                        .as_u64()
+                        .filter(|length| *length > 0 && *length < file.bytes)
+                        .ok_or_else(|| invalid("toolchain prefix offset is outside its file"))?;
+                    require(
+                        missing.contains(path) && offered.insert(path.to_owned()),
+                        "toolchain prefix is duplicated or not missing on this page",
+                    )?;
+                    let expected = digest(&prefix["sha256"])?;
+                    // A stored worker prefix is an untrusted byte hint. Its
+                    // claimed digest never selects an offset until the retained
+                    // source independently hashes that exact bounded range.
+                    if self.prefix_digest(peer, path, length)? == expected {
+                        *resumes.get_mut(path).expect("manifest file was inserted") = FileResume {
+                            offset: length,
+                            sha256: expected,
+                        };
+                    }
+                }
             }
             offset = next;
         }
@@ -300,7 +419,7 @@ impl ToolchainUpload {
                 && reply["bytes"].as_u64() == Some(identity.bytes),
             "worker accepted different toolchain file manifest totals",
         )?;
-        Ok(missing)
+        Ok(resumes)
     }
 
     pub(super) fn transmit<P: WorkerPeer + ?Sized>(
@@ -310,7 +429,22 @@ impl ToolchainUpload {
         reuse_selected: bool,
         file_reuse_selected: bool,
     ) -> io::Result<()> {
+        self.transmit_with_prefix(peer, request, reuse_selected, file_reuse_selected, false)
+    }
+
+    pub(super) fn transmit_with_prefix<P: WorkerPeer + ?Sized>(
+        &self,
+        peer: &mut P,
+        request: &Value,
+        reuse_selected: bool,
+        file_reuse_selected: bool,
+        prefix_selected: bool,
+    ) -> io::Result<()> {
         self.validate_request(request)?;
+        require(
+            !prefix_selected || file_reuse_selected,
+            "toolchain prefix reuse requires negotiated file reuse",
+        )?;
         let id = request["request_id"]
             .as_u64()
             .ok_or_else(|| invalid("toolchain request identity"))?;
@@ -328,8 +462,8 @@ impl ToolchainUpload {
             Some(false) => {}
             None => return Err(invalid("toolchain ready seal must be a boolean")),
         }
-        let missing = if file_reuse_selected {
-            Some(self.transmit_file_manifest(peer, id)?)
+        let resumes = if file_reuse_selected {
+            Some(self.transmit_file_manifest(peer, id, prefix_selected)?)
         } else {
             None
         };
@@ -344,19 +478,26 @@ impl ToolchainUpload {
                     json!({"kind":"file", "bytes":bytes, "executable":executable})
                 }
             };
-            window.queue(
-                &json!({"kind":"toolchain-entry", "request_id":id, "sha256":sha256,
-                "path":entry.path, "entry":value}),
-                pipeline::ExpectedAck::Entry { path: &entry.path },
-            )?;
+            let resume = resumes
+                .as_ref()
+                .and_then(|files| files.get(&entry.path))
+                .copied()
+                .unwrap_or_else(FileResume::empty);
+            let mut frame = json!({"kind":"toolchain-entry", "request_id":id, "sha256":sha256,
+                "path":entry.path, "entry":value});
+            let expected =
+                if prefix_selected && matches!(&entry.kind, ToolchainEntryKind::File { .. }) {
+                    frame["resume"] = json!({"offset":resume.offset, "sha256":hex(&resume.sha256)});
+                    pipeline::ExpectedAck::ResumedEntry {
+                        path: &entry.path,
+                        next_offset: resume.offset,
+                    }
+                } else {
+                    pipeline::ExpectedAck::Entry { path: &entry.path }
+                };
+            window.queue(&frame, expected)?;
             if let ToolchainEntryKind::File { bytes, .. } = &entry.kind {
-                if missing
-                    .as_ref()
-                    .is_some_and(|paths| !paths.contains(&entry.path))
-                {
-                    continue;
-                }
-                let mut offset = 0_u64;
+                let mut offset = resume.offset;
                 while offset < *bytes {
                     // The retained inventory checks the opened file's identity
                     // and stamps around every bounded read. A changed sender
@@ -402,6 +543,7 @@ impl ToolchainUpload {
 mod tests {
     use super::*;
     mod pipeline_tests;
+    mod prefix_tests;
     use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits, capture_toolchain};
     use rabs_sandbox::toolchain_transfer::{
         ToolchainCheckpointError, ToolchainFile, ToolchainReceiver,

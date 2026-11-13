@@ -1,5 +1,8 @@
 //! Real filesystem and owned-I/O-task recovery tests; no simulated cache hits.
 
+#[path = "prefix_tests.rs"]
+mod prefix_tests;
+
 use super::*;
 use rabs_sandbox::toolchain_dataset::capture_toolchain;
 use sha2::{Digest, Sha256};

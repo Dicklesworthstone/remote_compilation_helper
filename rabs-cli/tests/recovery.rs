@@ -14,6 +14,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rabs-recover");
 const PIN: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -168,7 +169,11 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(BINARY);
+        self.command_using(Path::new(BINARY))
+    }
+
+    fn command_using(&self, binary: &Path) -> Command {
+        let mut command = Command::new(binary);
         command
             .arg(&self.intent)
             .env_remove("CARGO_RABS_DAEMON")
@@ -257,6 +262,9 @@ fn native_daemon_fixture() {
     assert!(request.set_len(2 * 1024 * 1024).is_err());
     let mut bytes = Vec::new();
     request.read_to_end(&mut bytes).unwrap();
+    if let Some(ready) = std::env::var_os("RABS_RECOVER_TEST_READY") {
+        new_file(Path::new(&ready), b"native transport entered", 0o600);
+    }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).unwrap();
     let arguments: Vec<_> = arguments
@@ -268,6 +276,7 @@ fn native_daemon_fixture() {
         "state":std::env::var("RABS_STATE_DIR").unwrap(),
         "tls":[std::env::var("RABS_COORD_TLS_CA").unwrap(),std::env::var("RABS_COORD_TLS_CERT").unwrap(),std::env::var("RABS_COORD_TLS_KEY").unwrap()],
         "unrelated":std::env::var("RABS_RECOVER_TEST_UNRELATED").unwrap(), "sealed":true,
+        "generation":std::env::var("RABS_RECOVER_TEST_GENERATION").ok(),
     });
     // create_new makes a second transport execution fail rather than masking
     // duplicate handoffs by overwriting the first result.
@@ -706,6 +715,91 @@ fn explicit_daemon_selection_never_falls_through_or_recurses() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(37), "{output:?}");
+}
+
+#[test]
+fn installed_sibling_generation_survives_activation_during_native_recovery() {
+    let first = Fixture::live();
+    let second = Fixture::live();
+    let versions = first.root.join("versions");
+    private_directory(&versions);
+    for generation in ["alpha", "beta"] {
+        let directory = versions.join(generation);
+        private_directory(&directory);
+        fs::copy(BINARY, directory.join("rabs-recover")).unwrap();
+        let adapter = format!(
+            "#!/bin/sh\nRABS_RECOVER_TEST_GENERATION={generation}\nexport RABS_RECOVER_TEST_GENERATION\nexec {} --exact native_daemon_fixture --ignored --nocapture -- \"$@\"\n",
+            quote(std::env::current_exe().unwrap().as_os_str())
+        );
+        new_file(&directory.join("rabsd"), adapter.as_bytes(), 0o700);
+    }
+    let current = first.root.join("current");
+    let next = first.root.join("next-activation");
+    symlink(versions.join("alpha"), &current).unwrap();
+    symlink(versions.join("beta"), &next).unwrap();
+    let public = first.root.join("public");
+    private_directory(&public);
+    symlink(current.join("rabs-recover"), public.join("rabs-recover")).unwrap();
+    symlink(current.join("rabsd"), public.join("rabsd")).unwrap();
+    let driver = public.join("rabs-recover");
+    let ready = first.root.join("old-native-transport-ready");
+    let mut child = first
+        .command_using(&driver)
+        .arg("--resume-to")
+        .arg(first.root.join("old delivery"))
+        .env("PATH", &public)
+        .env("RABS_RECOVER_TEST_READY", &ready)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let old_pid = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "old recovery exited before native transport handoff"
+        );
+        assert!(Instant::now() < deadline, "native transport did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Exchange activates beta atomically while retaining both symlink objects
+    // and both complete generations. The alpha transport is still in flight.
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &next,
+        rustix::fs::CWD,
+        &current,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .unwrap();
+    assert_eq!(fs::read_link(&current).unwrap(), versions.join("beta"));
+    assert_eq!(fs::read_link(&next).unwrap(), versions.join("alpha"));
+    stdin.write_all(b"finish original recovery").unwrap();
+    drop(stdin);
+    let original = child.wait_with_output().unwrap();
+    assert_eq!(original.status.code(), Some(37), "{original:?}");
+    assert_eq!(first.report()["generation"], "alpha");
+    assert_eq!(first.report()["pid"], old_pid);
+    assert_eq!(first.report()["state"], first.state.to_str().unwrap());
+    assert_eq!(first.report()["request"], json!(first.request_bytes));
+    let current = second
+        .command_using(&driver)
+        .arg("--resume-to")
+        .arg(second.root.join("new delivery"))
+        .env("PATH", public)
+        .output()
+        .unwrap();
+    assert_eq!(current.status.code(), Some(37), "{current:?}");
+    assert_eq!(second.report()["generation"], "beta");
+    assert_eq!(second.report()["state"], second.state.to_str().unwrap());
+    assert_eq!(second.report()["request"], json!(second.request_bytes));
+    for generation in ["alpha", "beta"] {
+        assert!(versions.join(generation).join("rabs-recover").is_file());
+        assert!(versions.join(generation).join("rabsd").is_file());
+    }
 }
 
 #[test]

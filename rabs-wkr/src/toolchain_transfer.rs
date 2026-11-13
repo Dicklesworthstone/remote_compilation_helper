@@ -11,14 +11,15 @@ use crate::source_transfer::hex;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_transfer::{
     MAX_TOOLCHAIN_CHUNK, MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_FILE_PAGE_ENTRIES,
-    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
-    TOOLCHAIN_TRANSFER_VERSION, TOOLCHAIN_UPLOAD_BUDGET, ToolchainCheckpointError, ToolchainEntry,
-    ToolchainEntryKind, ToolchainFile, ToolchainReceiver,
+    MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_PREFIX_REUSE_VERSION,
+    TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION, TOOLCHAIN_UPLOAD_BUDGET,
+    ToolchainCheckpointError, ToolchainEntry, ToolchainEntryKind, ToolchainFile, ToolchainReceiver,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
@@ -154,6 +155,28 @@ pub fn selected_file_reuse(
     }
 }
 
+/// Prefix hints extend completed-file reuse only after a separate authenticated
+/// version selection. Local cache contents cannot implicitly enable this wire.
+pub fn selected_prefix_reuse(
+    frame: &str,
+    authenticated: bool,
+    file_reuse_enabled: bool,
+) -> Result<bool, String> {
+    let value: Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
+    match value.get("toolchain_prefix_reuse") {
+        None => Ok(false),
+        Some(selection) if selection.as_str() == Some(TOOLCHAIN_PREFIX_REUSE_VERSION) => {
+            if !authenticated || !file_reuse_enabled {
+                return Err(
+                    "toolchain prefix reuse requires authenticated selected file reuse".to_owned(),
+                );
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported toolchain_prefix_reuse selection".to_owned()),
+    }
+}
+
 struct PlannedFile {
     expected: ToolchainFile,
     hit: Option<cache::SnapshotRange>,
@@ -172,12 +195,14 @@ struct FileReuse {
     snapshots: Option<cache::Snapshots>,
     writer: Option<cache::CacheWriter>,
     sealed: bool,
+    prefixes: bool,
 }
 
 impl FileReuse {
     fn new(
         cache: ToolchainFileCache,
         identity: &ToolchainIdentity,
+        prefixes: bool,
         stopped: &impl Fn() -> bool,
     ) -> Self {
         Self {
@@ -199,6 +224,7 @@ impl FileReuse {
                 }
             },
             sealed: false,
+            prefixes,
         }
     }
 
@@ -226,6 +252,7 @@ impl FileReuse {
             return Err("toolchain file manifest page exceeds count bound".to_owned());
         }
         let mut missing = Vec::new();
+        let mut prefixes = Vec::new();
         for value in page {
             fields(value, &["path", "bytes", "executable", "sha256"])?;
             let path = value["path"]
@@ -275,25 +302,54 @@ impl FileReuse {
                 .ok_or("toolchain file manifest exceeds metadata bound")?;
             let hit = match &mut self.snapshots {
                 Some(snapshots) => snapshots
-                    .append(&expected, stopped)
+                    .append(&expected, self.prefixes, stopped)
                     .map_err(|error| error.to_string())?,
                 None => None,
             };
-            if hit.is_some() {
+            if hit.is_some_and(|hit| hit.bytes == expected.bytes) {
                 if let Some(writer) = &mut self.writer {
                     writer.protect(&expected.sha256);
                 }
             } else {
                 missing.push(path.to_owned());
+                if let Some(hit) = hit {
+                    prefixes.push(json!({"path":path, "offset":hit.bytes,
+                        "sha256":hex(&hit.sha256)}));
+                }
             }
             self.last_path = Some(path.to_owned());
             self.files
                 .insert(path.to_owned(), PlannedFile { expected, hit });
         }
-        Ok(
-            json!({"kind":"toolchain-file-manifest-accepted", "request_id":frame["request_id"],
-            "sha256":frame["sha256"], "next_offset":self.count, "missing":missing}),
-        )
+        let mut reply = json!({"kind":"toolchain-file-manifest-accepted", "request_id":frame["request_id"],
+            "sha256":frame["sha256"], "next_offset":self.count, "missing":missing});
+        if self.prefixes {
+            reply["prefixes"] = json!([]);
+            let mut bytes = serde_json::to_vec(&reply)
+                .map_err(|error| error.to_string())?
+                .len();
+            let selected = reply["prefixes"].as_array_mut().unwrap();
+            for prefix in prefixes {
+                let next = bytes
+                    + serde_json::to_vec(&prefix)
+                        .map_err(|error| error.to_string())?
+                        .len()
+                    + usize::from(!selected.is_empty());
+                if next <= MAX_TOOLCHAIN_FILE_PAGE_BYTES {
+                    bytes = next;
+                    selected.push(prefix);
+                } else if let Some(path) = prefix["path"].as_str()
+                    && let Some(file) = self.files.get_mut(path)
+                {
+                    // Unadvertised bytes cannot become a selectable prefix.
+                    file.hit = None;
+                }
+            }
+            if bytes > MAX_TOOLCHAIN_FILE_PAGE_BYTES {
+                return Err("toolchain prefix reply exceeds its page bound".to_owned());
+            }
+        }
+        Ok(reply)
     }
 
     fn seal(
@@ -315,8 +371,9 @@ impl FileReuse {
         &mut self,
         receiver: &mut ToolchainReceiver,
         entry: ToolchainEntry,
+        resume: Option<(u64, [u8; 32])>,
         stopped: &impl Fn() -> bool,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         if !self.sealed {
             return Err("toolchain file manifest must be sealed before entries".to_owned());
         }
@@ -341,23 +398,112 @@ impl FileReuse {
         };
         receiver.entry(entry).map_err(|error| error.to_string())?;
         if let Some(PlannedFile { expected, hit }) = expected {
-            if let Some(hit) = hit {
+            let (offset, sha256) = if self.prefixes {
+                let (offset, sha256) = resume.ok_or("toolchain file requires prefix selection")?;
+                if offset == 0 {
+                    if sha256 != <[u8; 32]>::from(Sha256::digest([])) {
+                        return Err("zero toolchain prefix requires the empty digest".to_owned());
+                    }
+                } else if !hit.is_some_and(|hit| hit.bytes == offset && hit.sha256 == sha256) {
+                    return Err("toolchain prefix differs from its owned offer".to_owned());
+                }
+                (offset, sha256)
+            } else {
+                if resume.is_some() {
+                    return Err("toolchain prefix reuse was not negotiated".to_owned());
+                }
+                hit.map_or((0, Sha256::digest([]).into()), |hit| {
+                    (hit.bytes, hit.sha256)
+                })
+            };
+            let mut prefix = None;
+            if let Some(hit) = hit.filter(|hit| hit.bytes == offset && hit.sha256 == sha256) {
                 let mut file = self
                     .snapshots
                     .as_mut()
                     .ok_or("toolchain hit snapshot owner unavailable")?
                     .materialize(hit, stopped)
                     .map_err(|error| error.to_string())?;
-                receiver
-                    .import_file(&expected, &mut file, stopped)
-                    .map_err(|error| error.to_string())?;
-            } else if expected.bytes == 0 {
+                if hit.bytes == expected.bytes {
+                    receiver
+                        .import_file(&expected, &mut file, stopped)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(offset);
+                }
+                Self::import_prefix(receiver, &expected, &mut file, offset, sha256, stopped)?;
+                prefix = Some(file);
+            }
+            if expected.bytes == 0 {
                 self.remember(receiver, &expected, stopped)?;
             } else {
+                if self.prefixes
+                    && let Some(writer) = &mut self.writer
+                    && let Err(error) =
+                        writer.begin_prefix(&expected, prefix.as_mut(), offset, sha256, stopped)
+                {
+                    eprintln!(
+                        "rabs-wkr: optional toolchain prefix checkpoint unavailable: {error}"
+                    );
+                    self.writer = None;
+                }
                 self.current = Some(expected);
             }
+            return Ok(offset);
         }
-        Ok(())
+        if resume.is_some() {
+            return Err("non-file toolchain entry cannot select a prefix".to_owned());
+        }
+        Ok(0)
+    }
+
+    fn import_prefix(
+        receiver: &mut ToolchainReceiver,
+        expected: &ToolchainFile,
+        input: &mut std::fs::File,
+        bytes: u64,
+        sha256: [u8; 32],
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut copy = || -> io::Result<()> {
+            let before = input.metadata()?;
+            if bytes == 0 || bytes >= expected.bytes || before.len() != bytes {
+                return Err(io::Error::other("invalid owned toolchain prefix range"));
+            }
+            input.rewind()?;
+            let mut offset = 0_u64;
+            let mut hash = Sha256::new();
+            let mut buffer = [0_u8; MAX_TOOLCHAIN_CHUNK];
+            while offset < bytes {
+                if stopped() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "toolchain prefix import stopped",
+                    ));
+                }
+                let count = (bytes - offset).min(buffer.len() as u64) as usize;
+                input.read_exact(&mut buffer[..count])?;
+                let chunk = &buffer[..count];
+                hash.update(chunk);
+                receiver.write_chunk(
+                    &expected.path,
+                    offset,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )?;
+                offset += count as u64;
+            }
+            if stopped()
+                || input.read(&mut buffer[..1])? != 0
+                || !cache::same_state(&before, &input.metadata()?)
+                || <[u8; 32]>::from(hash.finalize()) != sha256
+            {
+                return Err(io::Error::other(
+                    "owned toolchain prefix changed during import",
+                ));
+            }
+            Ok(())
+        };
+        copy().map_err(|error| error.to_string())
     }
 
     fn completed(
@@ -365,13 +511,20 @@ impl FileReuse {
         receiver: &mut ToolchainReceiver,
         path: &str,
         offset: u64,
+        bytes: &[u8],
         stopped: &impl Fn() -> bool,
     ) -> Result<(), String> {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|file| file.path == path && file.bytes == offset)
+        if self.prefixes
+            && let Some(expected) = self.current.as_ref().filter(|file| file.path == path)
+            && let Some(writer) = &mut self.writer
+            && let Err(error) = writer.append_prefix(expected, offset, bytes, stopped)
         {
+            eprintln!("rabs-wkr: optional toolchain prefix checkpoint unavailable: {error}");
+            self.writer = None;
+        }
+        if self.current.as_ref().is_some_and(|file| {
+            file.path == path && offset.checked_add(bytes.len() as u64) == Some(file.bytes)
+        }) {
             let expected = self.current.take().expect("completed file was selected");
             self.remember(receiver, &expected, stopped)?;
         }
@@ -387,6 +540,11 @@ impl FileReuse {
         let Some(writer) = &mut self.writer else {
             return Ok(());
         };
+        if let Err(error) = writer.finish_prefix(expected, stopped) {
+            eprintln!("rabs-wkr: optional toolchain prefix checkpoint unavailable: {error}");
+            self.writer = None;
+            return Ok(());
+        }
         match writer.remember(receiver, expected, stopped) {
             Ok(()) => Ok(()),
             Err(ToolchainCheckpointError::Source(error)) => Err(error.to_string()),
@@ -633,7 +791,13 @@ impl ToolchainOwner {
                 )
             }
             Some("toolchain-entry") => {
-                fields(frame, &["kind", "request_id", "sha256", "path", "entry"])?;
+                let prefix_entry = file_reuse.as_ref().is_some_and(|reuse| reuse.prefixes)
+                    && frame["entry"]["kind"] == "file";
+                if prefix_entry {
+                    fields(frame, &["kind", "request_id", "sha256", "path", "entry", "resume"])?;
+                } else {
+                    fields(frame, &["kind", "request_id", "sha256", "path", "entry"])?;
+                }
                 if receiver.entry_count() >= self.entries {
                     return Err("toolchain entry count exceeds declaration".to_owned());
                 }
@@ -672,14 +836,30 @@ impl ToolchainOwner {
                     path: path.to_owned(),
                     kind,
                 };
-                match file_reuse {
-                    Some(reuse) => reuse.entry(receiver, entry, &stopped)?,
-                    None => receiver.entry(entry).map_err(|error| error.to_string())?,
-                }
-                Ok(
+                let resume = if prefix_entry {
+                    let resume = &frame["resume"];
+                    fields(resume, &["offset", "sha256"])?;
+                    Some((
+                        resume["offset"].as_u64().ok_or("toolchain resume offset must be unsigned")?,
+                        digest(&resume["sha256"])?,
+                    ))
+                } else {
+                    None
+                };
+                let next_offset = match file_reuse {
+                    Some(reuse) => reuse.entry(receiver, entry, resume, &stopped)?,
+                    None => {
+                        receiver.entry(entry).map_err(|error| error.to_string())?;
+                        0
+                    }
+                };
+                let mut reply =
                     json!({"kind":"toolchain-entry-accepted", "request_id":self.request_id,
-                        "sha256":identity, "path":path}),
-                )
+                        "sha256":identity, "path":path});
+                if prefix_entry {
+                    reply["next_offset"] = json!(next_offset);
+                }
+                Ok(reply)
             }
             Some("toolchain-chunk") => {
                 if file_reuse.as_ref().is_some_and(|reuse| !reuse.sealed) {
@@ -711,7 +891,7 @@ impl ToolchainOwner {
                     .write_chunk(path, offset, &bytes, digest(&frame["chunk_sha256"])?)
                     .map_err(|error| error.to_string())?;
                 if let Some(reuse) = file_reuse {
-                    reuse.completed(receiver, path, next, &stopped)?;
+                    reuse.completed(receiver, path, offset, &bytes, &stopped)?;
                 }
                 Ok(
                     json!({"kind":"toolchain-chunk-accepted", "request_id":self.request_id,
@@ -756,6 +936,7 @@ struct TransferState {
     owner: Option<ToolchainOwner>,
     reuse: bool,
     file_cache: Option<ToolchainFileCache>,
+    prefix_reuse: bool,
     // Test receivers get a real isolated pool, avoiding process-global registry
     // changes or environment mutation while parallel tests own other sessions.
     #[cfg(test)]
@@ -794,6 +975,9 @@ impl TransferState {
             return Err("toolchain upload cancelled".to_owned());
         }
         if frame["kind"] == "toolchain-begin" {
+            if self.prefix_reuse && self.file_cache.is_none() {
+                return Err("toolchain prefix reuse requires selected file reuse".to_owned());
+            }
             fields(frame, &["kind", "request_id", "identity", "entries"])?;
             let identity =
                 parse_toolchain_identity(&json!({"toolchain_identity":frame["identity"]}))?
@@ -855,7 +1039,7 @@ impl TransferState {
                     prepared: None,
                     receiver,
                     file_reuse: self.file_cache.clone().map(|cache| {
-                        FileReuse::new(cache, &identity, &|| {
+                        FileReuse::new(cache, &identity, self.prefix_reuse, &|| {
                             cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
                         })
                     }),
@@ -976,10 +1160,23 @@ impl ToolchainTransferTask {
     /// never permits the receiver to skip the sender's full transfer protocol.
     #[must_use]
     pub fn with_configuration(reuse: bool, file_cache: Option<ToolchainFileCache>) -> Self {
+        Self::with_prefix_configuration(reuse, file_cache, false)
+    }
+
+    /// Prefix selection is separate from cache configuration and whole-file
+    /// reuse. Admission validates the authenticated wire selection before this
+    /// owner is created; legacy callers retain completed-file-only semantics.
+    #[must_use]
+    pub fn with_prefix_configuration(
+        reuse: bool,
+        file_cache: Option<ToolchainFileCache>,
+        prefix_reuse: bool,
+    ) -> Self {
         Self {
             state: Some(TransferState {
                 reuse,
                 file_cache,
+                prefix_reuse,
                 ..TransferState::default()
             }),
             shared: Arc::new(Mutex::new(CompletionState::default())),

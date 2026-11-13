@@ -1,9 +1,12 @@
-//! Bounded, optional reuse of completed SDK files across interrupted uploads.
+//! Bounded, optional reuse of SDK bytes across interrupted uploads.
 //!
 //! Byte objects carry no SDK or execution authority. Every lookup verifies the
 //! actual file into a private upload snapshot, and the ordinary receiver still
 //! seals the complete SDK. A single nonblocking writer inventories once per
 //! upload, protects its hits, and checkpoints completed files before their ACK.
+//! Negotiated prefix recovery uses the same object names and capacity. A short
+//! object is only a hint until its independently copied hash is checked by the
+//! sender; old completed-file readers continue to treat short objects as misses.
 
 use rabs_sandbox::toolchain_transfer::{
     MAX_TOOLCHAIN_CHUNK, ToolchainCheckpointError, ToolchainFile, ToolchainReceiver,
@@ -48,7 +51,7 @@ fn same_inode(_a: &Metadata, _b: &Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn same_state(a: &Metadata, b: &Metadata) -> bool {
+pub(super) fn same_state(a: &Metadata, b: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     same_inode(a, b)
         && a.len() == b.len()
@@ -61,7 +64,7 @@ fn same_state(a: &Metadata, b: &Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
-fn same_state(_a: &Metadata, _b: &Metadata) -> bool {
+pub(super) fn same_state(_a: &Metadata, _b: &Metadata) -> bool {
     false
 }
 
@@ -289,6 +292,7 @@ impl ToolchainFileCache {
             evictable: BTreeSet::new(),
             protected: BTreeSet::new(),
             total: 0,
+            active: None,
         };
         for (index, entry) in fs::read_dir(&self.root.path)?.enumerate() {
             checkpoint(stopped)?;
@@ -339,18 +343,24 @@ impl ToolchainFileCache {
         &self,
         expected: &ToolchainFile,
         output: &mut File,
+        allow_prefix: bool,
+        capacity: u64,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<(u64, [u8; 32])> {
         checkpoint(stopped)?;
         let name = object_name(&expected.sha256);
         let mut input = self.open_child(&name, false)?;
         let before = input.metadata()?;
-        if !private_file(&before, 1, false) || before.len() != expected.bytes {
+        let bytes = before.len();
+        if !private_file(&before, 1, false)
+            || bytes > capacity
+            || !(bytes == expected.bytes || allow_prefix && bytes > 0 && bytes < expected.bytes)
+        {
             return Err(invalid(
                 "toolchain cache object has an unexpected type or length",
             ));
         }
-        let mut remaining = expected.bytes;
+        let mut remaining = bytes;
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; MAX_TOOLCHAIN_CHUNK];
         while remaining != 0 {
@@ -362,16 +372,17 @@ impl ToolchainFileCache {
             remaining -= count as u64;
         }
         checkpoint(stopped)?;
+        let actual: [u8; 32] = hash.finalize().into();
         if input.read(&mut buffer[..1])? != 0
             || !same_state(&before, &input.metadata()?)
             || !same_state(&before, &self.open_child(&name, false)?.metadata()?)
-            || <[u8; 32]>::from(hash.finalize()) != expected.sha256
+            || bytes == expected.bytes && actual != expected.sha256
         {
             return Err(invalid(
                 "toolchain cache object changed or failed its digest",
             ));
         }
-        Ok(())
+        Ok((bytes, actual))
     }
 }
 
@@ -388,6 +399,14 @@ pub(super) struct CacheWriter {
     evictable: BTreeSet<(SystemTime, String)>,
     protected: BTreeSet<String>,
     total: u64,
+    active: Option<ActivePrefix>,
+}
+
+struct ActivePrefix {
+    expected: ToolchainFile,
+    file: File,
+    offset: u64,
+    writable: bool,
 }
 
 impl CacheWriter {
@@ -453,6 +472,220 @@ impl CacheWriter {
         Ok(true)
     }
 
+    /// The retained bytes are hints, never a completed-file assertion. Publish
+    /// the ordinary read-only object name with a held writable descriptor, then
+    /// grow it only while this same nonblocking writer owns the cache lock.
+    /// A crash can leave any shorter length; a later sender must hash-agree on
+    /// the independently snapshotted range before those bytes may be skipped.
+    pub(super) fn begin_prefix(
+        &mut self,
+        expected: &ToolchainFile,
+        mut seed: Option<&mut File>,
+        offset: u64,
+        sha256: [u8; 32],
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.check(stopped)?;
+        if self.active.is_some() {
+            return Err(invalid("another toolchain prefix owns the cache writer"));
+        }
+        if expected.bytes == 0 || offset >= expected.bytes {
+            return Err(invalid("toolchain prefix requires an unfinished file"));
+        }
+        let name = object_name(&expected.sha256);
+        // A duplicate content identity may already have completed earlier in
+        // this same upload. Preserve that protected complete object.
+        if self.protected.contains(&name) || offset > self.cache.max_bytes {
+            return Ok(());
+        }
+        if self.entries.contains_key(&name) {
+            self.remove(&name, stopped)?;
+        }
+        if !self.reserve(offset, true, stopped)? {
+            return Ok(());
+        }
+        let mut file = self.cache.open_child(INCOMING, true)?;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
+        let mut hash = Sha256::new();
+        if offset != 0 {
+            let input = seed
+                .as_mut()
+                .ok_or_else(|| invalid("toolchain prefix seed is missing"))?;
+            let before = input.metadata()?;
+            if !private_file(&before, 0, false) || before.len() != offset {
+                return Err(invalid("toolchain prefix seed is not an owned snapshot"));
+            }
+            input.rewind()?;
+            let mut remaining = offset;
+            let mut buffer = [0_u8; MAX_TOOLCHAIN_CHUNK];
+            while remaining != 0 {
+                checkpoint(stopped)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                input.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                file.write_all(&buffer[..count])?;
+                remaining -= count as u64;
+            }
+            if input.read(&mut buffer[..1])? != 0 || !same_state(&before, &input.metadata()?) {
+                return Err(invalid("toolchain prefix seed changed during copying"));
+            }
+        }
+        if <[u8; 32]>::from(hash.finalize()) != sha256 {
+            return Err(invalid(
+                "toolchain prefix seed digest differs from selection",
+            ));
+        }
+        self.check(stopped)?;
+        let metadata = file.metadata()?;
+        if !private_file(&metadata, 1, false)
+            || metadata.len() != offset
+            || !same_state(
+                &metadata,
+                &self.cache.open_child(INCOMING, false)?.metadata()?,
+            )
+        {
+            return Err(invalid(
+                "toolchain prefix destination changed before publication",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        rustix::fs::renameat(
+            &self.cache.root.directory,
+            INCOMING,
+            &self.cache.root.directory,
+            name.as_str(),
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "toolchain prefix reuse requires Linux",
+        ));
+        let metadata = file.metadata()?;
+        let used = metadata.modified()?;
+        self.total += offset;
+        self.entries.insert(
+            name.clone(),
+            Entry {
+                bytes: offset,
+                used,
+                metadata,
+            },
+        );
+        self.protected.insert(name);
+        self.active = Some(ActivePrefix {
+            expected: expected.clone(),
+            file,
+            offset,
+            writable: true,
+        });
+        checkpoint(stopped)
+    }
+
+    /// Called only after the ordinary receiver accepts these exact contiguous
+    /// bytes. A failed or partial optional append cannot authorize a hit: fresh
+    /// lookup rehashes its actual length and the sender checks that prefix.
+    pub(super) fn append_prefix(
+        &mut self,
+        expected: &ToolchainFile,
+        offset: u64,
+        bytes: &[u8],
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.check(stopped)?;
+        let Some(active) = &self.active else {
+            return Ok(());
+        };
+        if &active.expected != expected {
+            return Err(invalid("toolchain prefix content identity changed"));
+        }
+        if !active.writable {
+            return Ok(());
+        }
+        let next = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|next| *next <= expected.bytes)
+            .ok_or_else(|| invalid("toolchain prefix exceeds its file"))?;
+        let name = object_name(&expected.sha256);
+        let stored = self
+            .entries
+            .get(&name)
+            .ok_or_else(|| invalid("toolchain prefix inventory disappeared"))?;
+        if offset != active.offset
+            || bytes.is_empty()
+            || bytes.len() > MAX_TOOLCHAIN_CHUNK
+            || !same_state(&stored.metadata, &active.file.metadata()?)
+            || !same_state(
+                &stored.metadata,
+                &self.cache.open_child(&name, false)?.metadata()?,
+            )
+        {
+            return Err(invalid(
+                "toolchain prefix offset or owned generation changed",
+            ));
+        }
+        if !self.reserve(bytes.len() as u64, false, stopped)? {
+            // Keep the largest retained prefix within the same total capacity.
+            // Stop growing it, but retain ownership until ordinary completion.
+            self.active.as_mut().unwrap().writable = false;
+            return Ok(());
+        }
+        let active = self.active.as_mut().unwrap();
+        if active.file.stream_position()? != offset {
+            return Err(invalid("toolchain prefix writer cursor changed"));
+        }
+        active.file.write_all(bytes)?;
+        let metadata = active.file.metadata()?;
+        if !private_file(&metadata, 1, false)
+            || metadata.len() != next
+            || !same_state(&metadata, &self.cache.open_child(&name, false)?.metadata()?)
+        {
+            return Err(invalid("toolchain prefix changed during append"));
+        }
+        active.offset = next;
+        self.total += bytes.len() as u64;
+        let used = metadata.modified()?;
+        self.entries.insert(
+            name,
+            Entry {
+                bytes: next,
+                used,
+                metadata,
+            },
+        );
+        self.check(stopped)
+    }
+
+    pub(super) fn finish_prefix(
+        &mut self,
+        expected: &ToolchainFile,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.check(stopped)?;
+        if let Some(active) = self.active.take() {
+            if &active.expected != expected {
+                return Err(invalid("another toolchain prefix was completed"));
+            }
+            let name = object_name(&expected.sha256);
+            let entry = self
+                .entries
+                .get(&name)
+                .ok_or_else(|| invalid("completed toolchain prefix disappeared"))?;
+            if !same_state(&entry.metadata, &active.file.metadata()?)
+                || !same_state(
+                    &entry.metadata,
+                    &self.cache.open_child(&name, false)?.metadata()?,
+                )
+            {
+                return Err(invalid("completed toolchain prefix generation changed"));
+            }
+            self.protected.remove(&name);
+            self.evictable.insert((entry.used, name));
+        }
+        Ok(())
+    }
+
     /// Destination errors merely disable optional checkpoints. Source errors
     /// revoke this upload; they are never translated into cache misses.
     pub(super) fn remember(
@@ -469,6 +702,20 @@ impl CacheWriter {
         }
         if self.entries.contains_key(&name) {
             // This name was reported missing, so it failed verified lookup.
+            // It may now be a useful short prefix. Reserve its growth before
+            // replacing it, so a complete object which cannot fit does not
+            // discard the bounded recovery bytes already retained.
+            let previous = self.entries[&name].bytes;
+            self.protect(&expected.sha256);
+            let fits = self
+                .reserve(expected.bytes.saturating_sub(previous), false, stopped)
+                .map_err(Destination)?;
+            self.protected.remove(&name);
+            self.evictable
+                .insert((self.entries[&name].used, name.clone()));
+            if !fits {
+                return Ok(());
+            }
             // Replace only the inventoried ordinary object, never unknown state.
             self.remove(&name, stopped).map_err(Destination)?;
         }
@@ -536,7 +783,8 @@ impl CacheWriter {
 #[derive(Clone, Copy)]
 pub(super) struct SnapshotRange {
     offset: u64,
-    bytes: u64,
+    pub(super) bytes: u64,
+    pub(super) sha256: [u8; 32],
 }
 
 /// One anonymous spool bounds file descriptors independently of SDK file count.
@@ -567,10 +815,11 @@ impl Snapshots {
     pub(super) fn append(
         &mut self,
         expected: &ToolchainFile,
+        allow_prefix: bool,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Option<SnapshotRange>> {
         checkpoint(stopped)?;
-        if !self.writable || self.frozen.is_some() || expected.bytes > self.max_bytes - self.bytes {
+        if !self.writable || self.frozen.is_some() {
             return Ok(None);
         }
         let offset = self.bytes;
@@ -578,23 +827,29 @@ impl Snapshots {
             self.writable = false;
             return Ok(None);
         }
-        if self
-            .cache
-            .copy_verified(expected, &mut self.spool, stopped)
-            .is_err()
-        {
-            checkpoint(stopped)?;
-            // Existing advertised ranges remain independent and intact. A
-            // failed optional append cannot turn them into a later cache miss.
-            if self.spool.set_len(offset).is_err() {
-                self.writable = false;
+        let (bytes, sha256) = match self.cache.copy_verified(
+            expected,
+            &mut self.spool,
+            allow_prefix,
+            self.max_bytes - self.bytes,
+            stopped,
+        ) {
+            Ok(verified) => verified,
+            Err(_) => {
+                checkpoint(stopped)?;
+                // Existing advertised ranges remain independent and intact. A
+                // failed optional append cannot turn them into a later miss.
+                if self.spool.set_len(offset).is_err() {
+                    self.writable = false;
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-        self.bytes += expected.bytes;
+        };
+        self.bytes += bytes;
         Ok(Some(SnapshotRange {
             offset,
-            bytes: expected.bytes,
+            bytes,
+            sha256,
         }))
     }
 
@@ -646,6 +901,13 @@ impl Snapshots {
         file.rewind()?;
         checkpoint(stopped)?;
         Ok(file)
+    }
+
+    #[cfg(test)]
+    pub(super) fn corrupt_owned_snapshot_for_test(&mut self) {
+        assert!(self.bytes > 0 && self.frozen.is_some());
+        self.spool.rewind().unwrap();
+        self.spool.write_all(&[0x99]).unwrap();
     }
 }
 

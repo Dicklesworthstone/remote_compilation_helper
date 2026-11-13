@@ -16,19 +16,22 @@ pub(super) const MAX_IN_FLIGHT_BYTES: usize = 1024 * 1024;
 
 pub(super) enum ExpectedAck<'a> {
     Entry { path: &'a str },
+    ResumedEntry { path: &'a str, next_offset: u64 },
     Chunk { path: &'a str, next_offset: u64 },
 }
 
 impl ExpectedAck<'_> {
     fn path(&self) -> &str {
         match self {
-            Self::Entry { path } | Self::Chunk { path, .. } => path,
+            Self::Entry { path } | Self::ResumedEntry { path, .. } | Self::Chunk { path, .. } => {
+                path
+            }
         }
     }
 
     fn check_request(&self, frame: &Value, request_id: u64, identity: &[u8; 32]) -> io::Result<()> {
         let kind = match self {
-            Self::Entry { .. } => "toolchain-entry",
+            Self::Entry { .. } | Self::ResumedEntry { .. } => "toolchain-entry",
             Self::Chunk { .. } => "toolchain-chunk",
         };
         require(
@@ -37,12 +40,21 @@ impl ExpectedAck<'_> {
                 && frame["path"].as_str() == Some(self.path())
                 && digest(&frame["sha256"])? == *identity,
             "toolchain upload window cannot send a foreign or non-payload control",
-        )
+        )?;
+        if let Self::ResumedEntry { next_offset, .. } = self {
+            require(
+                frame["entry"]["kind"] == "file"
+                    && frame["resume"]["offset"].as_u64() == Some(*next_offset),
+                "toolchain entry acknowledgment does not bind the selected prefix",
+            )?;
+        }
+        Ok(())
     }
 
     fn check_reply(&self, reply: &Value, request_id: u64, identity: &[u8; 32]) -> io::Result<()> {
         let (kind, fields) = match self {
             Self::Entry { .. } => ("toolchain-entry-accepted", 4),
+            Self::ResumedEntry { .. } => ("toolchain-entry-accepted", 5),
             Self::Chunk { .. } => ("toolchain-chunk-accepted", 5),
         };
         require(
@@ -55,7 +67,7 @@ impl ExpectedAck<'_> {
                 && reply["path"].as_str() == Some(self.path()),
             "toolchain acknowledgment kind, shape, identity or entry mismatch",
         )?;
-        if let Self::Chunk { next_offset, .. } = self {
+        if let Self::Chunk { next_offset, .. } | Self::ResumedEntry { next_offset, .. } = self {
             require(
                 reply["next_offset"].as_u64() == Some(*next_offset),
                 "toolchain acknowledgment does not cover the transmitted range",

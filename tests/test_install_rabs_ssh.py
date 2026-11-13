@@ -76,7 +76,6 @@ class SSHDeploymentTests(unittest.TestCase):
         for name in installer.NATIVE_TOOLS:
             shutil.copyfile(executable, self.bundle / name)
             (self.bundle / name).chmod(0o755)
-        shutil.copy2(SCRIPT.with_name("rabs-recover"), self.bundle / "rabs-recover")
         self.launcher("first")
         self.env = {"PATH": str(self.ssh_bin) + os.pathsep + os.environ.get("PATH", ""),
                     "RABS_SSH_TEST_ROOT": str(self.root)}
@@ -353,7 +352,8 @@ class SSHDeploymentTests(unittest.TestCase):
         for name in installer.PYTHON_TOOLS:
             shutil.copy2(self.bundle / name, scripts / name)
         target = checkout / "target" / "selected-platform"
-        for name, profile in [("rabs-wrap", "wrapper-release"), ("rabsd", "daemon-release"),
+        for name, profile in [("rabs-wrap", "wrapper-release"), ("rabs-recover", "wrapper-release"),
+                              ("rabsd", "daemon-release"),
                               ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
                               ("rabs-delivery-cas", "daemon-release")]:
             directory = target / profile

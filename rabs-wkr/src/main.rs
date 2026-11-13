@@ -29,7 +29,8 @@ use rabs_sandbox::dependency_context::{
 };
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use rabs_sandbox::toolchain_transfer::{
-    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION,
+    TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_PREFIX_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+    TOOLCHAIN_TRANSFER_VERSION,
 };
 use rabs_wkr::artifacts::{
     self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts,
@@ -817,7 +818,7 @@ fn main() {
                  --source-cache-bytes or RABS_WORKER_SOURCE_CACHE_BYTES bounds verified input reuse (default 536870912; 0 disables).\n\
                  Source bytes persist below the private worker state directory; RABS_SOURCE_CACHE_DIR selects another private directory.\n\
                  Inputs are reverified and copied into a fresh receiver before every execution.\n\
-                 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES retains completed SDK files across interrupted uploads (default 0/off; maximum 68719476736).\n\
+                 RABS_WORKER_TOOLCHAIN_FILE_CACHE_BYTES retains SDK files and sender-verified prefixes across interrupted uploads (default 0/off; maximum 68719476736).\n\
                  SDK file bytes persist below worker state; each upload also owns bounded private hit snapshots and still verifies the complete SDK.\n\
                  --target-cache-bytes or RABS_WORKER_TARGET_CACHE_BYTES enables bounded private Cargo seeds (default 0/off).\n\
                  --target-cache-epoch or RABS_WORKER_TARGET_CACHE_EPOCH also retains seeds across restarts.\n\
@@ -1795,6 +1796,7 @@ where
         input_budgets,
         None,
         None,
+        false,
         launch,
         heartbeat,
     )
@@ -1822,6 +1824,7 @@ async fn drive_session_with_reader<S, L, H>(
     input_budgets: InputBudgets,
     source_cache: Option<SourceCache>,
     toolchain_file_cache: Option<ToolchainFileCache>,
+    toolchain_prefix_reuse_enabled: bool,
     mut launch: L,
     mut heartbeat: H,
 ) -> Result<(), String>
@@ -1842,6 +1845,9 @@ where
     }
     if toolchain_file_cache.is_some() && !toolchain_transfer_enabled {
         return Err("toolchain file reuse requires toolchain transfer".to_owned());
+    }
+    if toolchain_prefix_reuse_enabled && toolchain_file_cache.is_none() {
+        return Err("toolchain prefix reuse requires selected file reuse".to_owned());
     }
     if dependency_mode.is_some()
         && !(source_transfer_enabled && toolchain_transfer_enabled && artifact_transfer_enabled)
@@ -1864,8 +1870,11 @@ where
             .then_some(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET),
         source_cache,
     );
-    let mut toolchain_transfer =
-        ToolchainTransferTask::with_configuration(toolchain_reuse_enabled, toolchain_file_cache);
+    let mut toolchain_transfer = ToolchainTransferTask::with_prefix_configuration(
+        toolchain_reuse_enabled,
+        toolchain_file_cache,
+        toolchain_prefix_reuse_enabled,
+    );
     let mut input_deadline = InputDeadline::new(input_budgets);
     let mut deferred = DeferredFrames::default();
     let mut retained_result: Option<(u64, String)> = None;
@@ -2256,6 +2265,7 @@ fn worker_hello(
         "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "toolchain_file_reuses": if toolchain_file_cache_enabled { vec![TOOLCHAIN_FILE_REUSE_VERSION] } else { Vec::<&str>::new() },
+        "toolchain_prefix_reuses": if toolchain_file_cache_enabled { vec![TOOLCHAIN_PREFIX_REUSE_VERSION] } else { Vec::<&str>::new() },
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
@@ -2404,6 +2414,7 @@ async fn session_loop(
         receive_toolchain,
         reuse_toolchain,
         reuse_toolchain_files,
+        reuse_toolchain_prefixes,
         output_preview,
         metadata_prefetch,
         execution_lease,
@@ -2482,6 +2493,11 @@ async fn session_loop(
                 toolchain,
                 resources.toolchain_file_cache.is_some(),
             )?;
+            let prefix_reuse = toolchain_transfer::selected_prefix_reuse(
+                &ack,
+                local_identity.is_some(),
+                file_reuse,
+            )?;
             let preview = output_preview_requested(&ack)?;
             let prefetch = metadata_prefetch_requested(&ack)?;
             let dependency_context = dependency_context_selection(
@@ -2510,6 +2526,7 @@ async fn session_loop(
                 toolchain,
                 reuse,
                 file_reuse,
+                prefix_reuse,
                 preview,
                 prefetch,
                 lease,
@@ -2560,6 +2577,7 @@ async fn session_loop(
             .toolchain_file_cache
             .clone()
             .filter(|_| reuse_toolchain_files),
+        reuse_toolchain_prefixes,
         |request, timeout, artifacts, source, toolchain, lease| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -3939,6 +3957,7 @@ mod tests {
                 InputBudgets::default(),
                 None,
                 None,
+                false,
                 |_, _, _, _, _, _| panic!("standby and control frames cannot launch execution"),
                 pressure,
             ))
@@ -3997,6 +4016,7 @@ mod tests {
                 InputBudgets::default(),
                 None,
                 None,
+                false,
                 |_, _, _, _, _, _| panic!("control frames must not launch execution"),
                 pressure,
             ))
@@ -5239,12 +5259,17 @@ mod tests {
         );
         assert_eq!(hello["request_high_water"], 80);
         assert_eq!(hello["toolchain_file_reuses"], serde_json::json!([]));
+        assert_eq!(hello["toolchain_prefix_reuses"], serde_json::json!([]));
         let file_reuse: serde_json::Value =
             serde_json::from_str(&worker_hello(&report(), &journal, true, Some(0))).unwrap();
         assert_eq!(file_reuse["load_x100"], 0);
         assert_eq!(
             file_reuse["toolchain_file_reuses"],
             serde_json::json!([TOOLCHAIN_FILE_REUSE_VERSION])
+        );
+        assert_eq!(
+            file_reuse["toolchain_prefix_reuses"],
+            serde_json::json!([TOOLCHAIN_PREFIX_REUSE_VERSION])
         );
         assert_eq!(hello["recovery_protocols"][0], RECOVERY_PROTOCOL);
         assert_eq!(

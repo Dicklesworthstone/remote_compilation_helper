@@ -22,6 +22,9 @@ pub const TOOLCHAIN_TRANSFER_VERSION: &str = "toolchain-tree-v1";
 pub const TOOLCHAIN_REUSE_VERSION: &str = "toolchain-reuse-v1";
 /// Optional completed-file recovery, independent of whole-image retention.
 pub const TOOLCHAIN_FILE_REUSE_VERSION: &str = "toolchain-file-reuse-v1";
+/// Optional sender-verified prefix recovery within a single SDK file. Prefix
+/// agreement only skips transferred bytes; the complete tree seal is required.
+pub const TOOLCHAIN_PREFIX_REUSE_VERSION: &str = "toolchain-file-prefix-v1";
 pub const MAX_TOOLCHAIN_FILE_PAGE_ENTRIES: usize = 1024;
 pub const MAX_TOOLCHAIN_FILE_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_TOOLCHAIN_CHUNK: usize = 64 * 1024;

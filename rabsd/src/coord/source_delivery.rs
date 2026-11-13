@@ -1267,7 +1267,8 @@ impl SourceUpload {
             require(
                 grant.get("toolchain_transfer").is_none()
                     && grant.get("toolchain_reuse").is_none()
-                    && grant.get("toolchain_file_reuse").is_none(),
+                    && grant.get("toolchain_file_reuse").is_none()
+                    && grant.get("toolchain_prefix_reuse").is_none(),
                 "toolchain transfer was not authorized by this upload",
             )?;
         }
@@ -1286,11 +1287,34 @@ impl SourceUpload {
         toolchain_reuse_selected: bool,
         toolchain_file_reuse_selected: bool,
     ) -> io::Result<()> {
+        self.transmit_with_prefix(
+            peer,
+            request,
+            toolchain_reuse_selected,
+            toolchain_file_reuse_selected,
+            false,
+        )
+    }
+
+    pub(crate) fn transmit_with_prefix<P: WorkerPeer + ?Sized>(
+        &self,
+        peer: &mut P,
+        request: &Value,
+        toolchain_reuse_selected: bool,
+        toolchain_file_reuse_selected: bool,
+        toolchain_prefix_reuse_selected: bool,
+    ) -> io::Result<()> {
         self.validate_request(request)?;
         require(
-            !(toolchain_reuse_selected || toolchain_file_reuse_selected)
+            !(toolchain_reuse_selected
+                || toolchain_file_reuse_selected
+                || toolchain_prefix_reuse_selected)
                 || self.toolchain.is_some(),
             "toolchain reuse requires an authorized toolchain upload",
+        )?;
+        require(
+            !toolchain_prefix_reuse_selected || toolchain_file_reuse_selected,
+            "toolchain prefix reuse requires negotiated file reuse",
         )?;
         let id = request["request_id"]
             .as_u64()
@@ -1385,12 +1409,22 @@ impl SourceUpload {
             "worker did not seal the complete source projection",
         )?;
         if let Some(toolchain) = &self.toolchain {
-            toolchain.transmit(
-                peer,
-                request,
-                toolchain_reuse_selected,
-                toolchain_file_reuse_selected,
-            )?;
+            if toolchain_prefix_reuse_selected {
+                toolchain.transmit_with_prefix(
+                    peer,
+                    request,
+                    toolchain_reuse_selected,
+                    toolchain_file_reuse_selected,
+                    true,
+                )?;
+            } else {
+                toolchain.transmit(
+                    peer,
+                    request,
+                    toolchain_reuse_selected,
+                    toolchain_file_reuse_selected,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2421,7 +2455,7 @@ mod tests {
     #[test]
     fn source_authority_cannot_select_or_start_unretained_toolchain_reuse() {
         use rabs_sandbox::toolchain_transfer::{
-            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
+            TOOLCHAIN_FILE_REUSE_VERSION, TOOLCHAIN_PREFIX_REUSE_VERSION, TOOLCHAIN_REUSE_VERSION,
         };
 
         let root = tempfile::tempdir().unwrap();
@@ -2429,15 +2463,18 @@ mod tests {
         let hello = json!({"source_transfers":[SOURCE_TRANSFER],
             "toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION],
             "toolchain_reuses":[TOOLCHAIN_REUSE_VERSION],
-            "toolchain_file_reuses":[TOOLCHAIN_FILE_REUSE_VERSION]});
+            "toolchain_file_reuses":[TOOLCHAIN_FILE_REUSE_VERSION],
+            "toolchain_prefix_reuses":[TOOLCHAIN_PREFIX_REUSE_VERSION]});
         let grant = json!({"kind":"session-ok"});
         let selected = upload.grant(&hello, &grant).unwrap();
         assert!(selected.get("toolchain_transfer").is_none());
         assert!(selected.get("toolchain_reuse").is_none());
         assert!(selected.get("toolchain_file_reuse").is_none());
+        assert!(selected.get("toolchain_prefix_reuse").is_none());
         for (field, version) in [
             ("toolchain_reuse", TOOLCHAIN_REUSE_VERSION),
             ("toolchain_file_reuse", TOOLCHAIN_FILE_REUSE_VERSION),
+            ("toolchain_prefix_reuse", TOOLCHAIN_PREFIX_REUSE_VERSION),
         ] {
             let mut unsolicited = grant.clone();
             unsolicited[field] = json!(version);
@@ -2446,6 +2483,11 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         assert!(upload.transmit(&mut peer, &request, true, false).is_err());
         assert!(upload.transmit(&mut peer, &request, false, true).is_err());
+        assert!(
+            upload
+                .transmit_with_prefix(&mut peer, &request, false, true, true)
+                .is_err()
+        );
         assert!(peer.sent.is_empty());
     }
 
