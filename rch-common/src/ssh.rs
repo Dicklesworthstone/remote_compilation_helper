@@ -591,6 +591,51 @@ async fn read_control_stream(
     ))
 }
 
+/// Retain a bounded diagnostic preview while draining the real stream to EOF.
+/// The caller owns the execution deadline. Reaching the preview limit must not
+/// close a command's pipe early or turn a partial response into complete output.
+async fn read_command_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<String> {
+    const MARKER: &str = "\n...[output truncated]...\n";
+    let prefix_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid SSH output limit")
+        })?;
+    // One extra byte distinguishes a complete, exactly-full response from an
+    // actual overflow. No later output is retained in memory.
+    let mut prefix = reader.take(prefix_limit);
+    let mut output = Vec::new();
+    prefix.read_to_end(&mut output).await?;
+    let truncated = output.len() > limit;
+    let mut remainder = prefix.into_inner();
+    let mut sink = tokio::io::sink();
+    tokio::io::copy(&mut remainder, &mut sink).await?;
+    output.truncate(limit);
+    if let Err(error) = std::str::from_utf8(&output) {
+        // A byte limit may cut a valid multibyte character. Only that trailing
+        // incomplete character may be discarded, and only on real overflow.
+        if !truncated || error.error_len().is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        output.truncate(error.valid_up_to());
+    }
+    if truncated {
+        let marker = &MARKER.as_bytes()[..MARKER.len().min(limit)];
+        let available = &output[..output.len().min(limit - marker.len())];
+        // The marker supplies a newline, so never append it to a cut control
+        // receipt. As with streaming OutputPreview, retain only whole lines.
+        let boundary = memchr::memrchr(b'\n', available).map_or(0, |index| index + 1);
+        output.truncate(boundary);
+        output.extend_from_slice(marker);
+    }
+    String::from_utf8(output)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// A bounded UTF-8 line reader whose pending bytes survive a cancelled read.
 /// Keeping that state here allows both pipes to participate directly in a
 /// select without detached reader tasks or an unbounded queue of large lines.
@@ -1572,41 +1617,16 @@ impl SshClient {
             let stderr_handle = child.stderr().take();
 
             let stdout_fut = async {
-                if let Some(out) = stdout_handle {
-                    let reader = BufReader::new(out);
-                    let mut take = reader.take(MAX_OUTPUT_SIZE);
-                    let mut buf = String::new();
-                    take.read_to_string(&mut buf).await?;
-                    // Drain the rest to prevent SIGPIPE or blocking
-                    let mut reader = take.into_inner();
-                    let mut sink = tokio::io::sink();
-                    tokio::io::copy(&mut reader, &mut sink).await?;
-                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
-                        buf.push_str("\n...[output truncated]...\n");
-                    }
-                    Ok::<String, anyhow::Error>(buf)
-                } else {
-                    Ok(String::new())
-                }
+                Ok::<_, anyhow::Error>(match stdout_handle {
+                    Some(out) => read_command_output(out, MAX_OUTPUT_SIZE as usize).await?,
+                    None => String::new(),
+                })
             };
-
             let stderr_fut = async {
-                if let Some(err) = stderr_handle {
-                    let reader = BufReader::new(err);
-                    let mut take = reader.take(MAX_OUTPUT_SIZE);
-                    let mut buf = String::new();
-                    take.read_to_string(&mut buf).await?;
-                    // Drain the rest to prevent SIGPIPE or blocking
-                    let mut reader = take.into_inner();
-                    let mut sink = tokio::io::sink();
-                    tokio::io::copy(&mut reader, &mut sink).await?;
-                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
-                        buf.push_str("\n...[output truncated]...\n");
-                    }
-                    Ok::<String, anyhow::Error>(buf)
-                } else {
-                    Ok(String::new())
-                }
+                Ok::<_, anyhow::Error>(match stderr_handle {
+                    Some(err) => read_command_output(err, MAX_OUTPUT_SIZE as usize).await?,
+                    None => String::new(),
+                })
             };
 
             let (stdout, stderr) = tokio::try_join!(stdout_fut, stderr_fut)?;
@@ -2169,7 +2189,6 @@ async fn system_ssh_execute_before(
     caller_deadline: Option<Instant>,
 ) -> Result<CommandResult> {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let start = std::time::Instant::now();
@@ -2229,20 +2248,16 @@ async fn system_ssh_execute_before(
         };
 
         let stdout_fut = async {
-            let mut buf = String::new();
-            if let Some(out) = stdout {
-                let mut handle = out.take(MAX_OUTPUT_SIZE);
-                handle.read_to_string(&mut buf).await?;
-            }
-            Ok::<String, anyhow::Error>(buf)
+            Ok::<_, anyhow::Error>(match stdout {
+                Some(out) => read_command_output(out, MAX_OUTPUT_SIZE as usize).await?,
+                None => String::new(),
+            })
         };
         let stderr_fut = async {
-            let mut buf = String::new();
-            if let Some(err) = stderr {
-                let mut handle = err.take(MAX_OUTPUT_SIZE);
-                handle.read_to_string(&mut buf).await?;
-            }
-            Ok::<String, anyhow::Error>(buf)
+            Ok::<_, anyhow::Error>(match stderr {
+                Some(err) => read_command_output(err, MAX_OUTPUT_SIZE as usize).await?,
+                None => String::new(),
+            })
         };
 
         let ((), stdout, stderr) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
@@ -3505,6 +3520,105 @@ while True: signal.pause()
             }
         }
     }
+    #[tokio::test]
+    async fn command_output_preserves_complete_bytes_and_reports_real_overflow() {
+        const MARKER: &str = "\n...[output truncated]...\n";
+        for text in [String::new(), "complete\n".to_string(), "x".repeat(64)] {
+            assert_eq!(
+                read_command_output(text.as_bytes(), 64).await.unwrap(),
+                text,
+                "a complete response, including the exact limit, is not truncated"
+            );
+        }
+        for text in [
+            format!("ok\n{}", "x".repeat(100)),
+            format!("ok\n{}", "€".repeat(25)),
+        ] {
+            let output = read_command_output(text.as_bytes(), 64).await.unwrap();
+            assert_eq!(output, format!("ok\n{MARKER}"));
+            assert!(output.len() <= 64);
+        }
+        let malformed = read_command_output(b"bad\xff\n".as_slice(), 64)
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.kind(), std::io::ErrorKind::InvalidData);
+        let mut malformed_overflow = b"bad\xff\n".to_vec();
+        malformed_overflow.extend_from_slice(&[b'x'; 100]);
+        assert_eq!(
+            read_command_output(malformed_overflow.as_slice(), 64)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+            "truncating a preview must not hide invalid captured UTF-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_output_requires_eof_after_preview_limit() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        writer.write_all(&[b'x'; 129]).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                read_command_output(reader, 64),
+            )
+            .await
+            .is_err(),
+            "a full preview is not EOF while a writer still owns its pipe"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn command_output_drains_real_stdout_and_stderr_before_waiting() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let finished = directory.join("finished");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"set -eu
+i=0
+while [ "$i" -lt 16384 ]; do
+    printf 'stdout payload 01234567890123456789012345678901234567890123456789\n'
+    printf 'stderr payload 01234567890123456789012345678901234567890123456789\n' >&2
+    i=$((i + 1))
+done
+printf 'complete\n' > "$1"
+exit 37
+"#,
+                "rch-output-fixture",
+            ])
+            .arg(&finished)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = OwnedProcessGroup::spawn(&mut command).unwrap();
+        let stdout = child.take_stdout().unwrap();
+        let stderr = child.take_stderr().unwrap();
+        let (stdout, stderr, status) = tokio::time::timeout(Duration::from_secs(10), async {
+            let (stdout, stderr) = tokio::try_join!(
+                read_command_output(stdout, 128),
+                read_command_output(stderr, 128),
+            )?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((stdout, stderr, status))
+        })
+        .await
+        .expect("both over-limit native pipes must drain without deadlock")
+        .unwrap();
+        assert_eq!(status.code(), Some(37), "preserve the command's actual exit");
+        assert_eq!(std::fs::read(&finished).unwrap(), b"complete\n");
+        for (output, prefix) in [(stdout, "stdout payload"), (stderr, "stderr payload")] {
+            assert!(output.starts_with(prefix));
+            assert!(output.ends_with("\n...[output truncated]...\n"));
+            assert!(output.len() <= 128);
+        }
+    }
+
     #[test]
     fn test_command_result_success() {
         let _guard = test_guard!();
