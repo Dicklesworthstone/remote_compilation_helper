@@ -246,14 +246,9 @@ impl StaleTargetReaper {
                 info!("Worker stale-target reaper disabled");
                 return;
             }
-            // Validate the base once up-front; a bad base disables the whole sweep
-            // rather than risking an unsafe embedded path.
-            if let Some(unsafe_base) = reaper
-                .scan_bases()
-                .into_iter()
-                .find(|base| !stale_target_reap::is_safe_reap_base(base))
-            {
-                warn!("Worker stale-target reaper disabled: unsafe reap base {unsafe_base:?}");
+            // Validate every configured root before starting the sweep loop.
+            if let Err(error) = reaper.scan_bases() {
+                warn!(%error, "Worker stale-target reaper disabled: invalid scan roots");
                 return;
             }
             info!(
@@ -340,19 +335,28 @@ impl StaleTargetReaper {
         true
     }
 
-    /// Every root this sweep must walk: the repo mirror tree, plus the pooled
-    /// `store_base` when pooled stores are placed off that tree (issue #64).
-    /// De-duplicated, so the common `store_base == remote_base` case sweeps
-    /// once.
-    fn scan_bases(&self) -> Vec<String> {
-        let normalize = |base: &str| base.trim_end_matches('/').to_string();
-        let mut bases = vec![normalize(&self.config.remote_base)];
-        if let Some(store_base) = self.config.store_base.as_deref().map(normalize)
-            && !bases.contains(&store_base)
-        {
-            bases.push(store_base);
-        }
-        bases
+    /// Scan configured mirror, pool, and extra roots using the same validation
+    /// and normalization as `rch gc`. Reject the complete set on any invalid
+    /// root before a caller can dispatch a partially configured sweep.
+    fn scan_bases(&self) -> anyhow::Result<Vec<String>> {
+        let pooled = rch_common::remediation_config::PooledTargetConfig {
+            remote_base: self.config.remote_base.clone(),
+            store_base: self.config.store_base.clone(),
+            gc_extra_roots: self.config.gc_extra_roots.clone(),
+            ..Default::default()
+        };
+        let roots = rch_common::gc_roots::derive_gc_roots(&pooled, &[]);
+        anyhow::ensure!(
+            roots.rejected.is_empty(),
+            "invalid stale-target sweep roots: {}",
+            roots
+                .rejected
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        Ok(roots.scan_bases())
     }
 
     /// Run the sweep script on a single worker and return its metrics.
@@ -370,13 +374,11 @@ impl StaleTargetReaper {
         ensure_posix_gc_worker(&config)?;
         let worker_id = config.id.clone();
 
+        // Validate every configured root before dispatching the first command,
+        // including calls through run_cycle() that bypass start().
+        let bases = self.scan_bases()?;
         let mut metrics = ReapMetrics::default();
-        for base in self.scan_bases() {
-            // Bases were validated once in `start()`, but re-check
-            // defensively: config can be hot-reloaded between cycles.
-            if !stale_target_reap::is_safe_reap_base(&base) {
-                anyhow::bail!("unsafe reap base {base:?}");
-            }
+        for base in bases {
             let cmd = build_sweep_command(
                 &base,
                 idle_minutes,
@@ -922,6 +924,7 @@ mod tests {
         // where rch actually places per-job target dirs — NOT `/tmp/rch`.
         assert_eq!(c.remote_base, rch_common::DEFAULT_CANONICAL_PROJECT_ROOT);
         assert_eq!(c.remote_base, "/data/projects");
+        assert!(c.gc_extra_roots.is_empty());
     }
 
     #[tokio::test]
@@ -1009,6 +1012,130 @@ mod tests {
         assert!(!reaper.is_worker_sweepable(&worker, &worker_id).await);
     }
 
+    #[test]
+    fn scan_bases_preserve_configured_extra_roots() {
+        let remediation: rch_common::remediation_config::RemediationConfig = toml::from_str(
+            r#"
+            [pooled_target]
+            remote_base = "/data/projects/"
+            store_base = "/mnt/pools/"
+            gc_extra_roots = ["/srv/old-rch/", "/mnt/pools", "/srv/old-rch", "/data/projects", "/opt/rch"]
+            "#,
+        )
+        .unwrap();
+        let projected = StaleTargetReapConfig::from_remediation(&remediation);
+        let round_trip: StaleTargetReapConfig =
+            toml::from_str(&toml::to_string(&projected).unwrap()).unwrap();
+        let reaper = StaleTargetReaper::new(WorkerPool::new(), round_trip);
+        assert_eq!(
+            reaper.scan_bases().unwrap(),
+            vec!["/data/projects", "/mnt/pools", "/srv/old-rch", "/opt/rch"],
+            "preserve explicit roots in order, normalize and deduplicate without inventing roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_later_root_refuses_the_sweep_before_ssh() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("invalid-reap-roots");
+        pool.add_worker(rch_common::WorkerConfig {
+            id: worker_id.clone(),
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let mut reaper = StaleTargetReaper::new(
+            pool,
+            StaleTargetReapConfig {
+                remote_base: "/data/projects".into(),
+                store_base: Some("/mnt/rch-pools".into()),
+                gc_extra_roots: vec!["/srv/old-rch".into(), "/tmp/../etc".into()],
+                ..Default::default()
+            },
+        );
+        // If validation regresses to a per-root loop, an earlier valid root
+        // must fail locally before SSH spawn, never contact a real worker.
+        reaper.ssh_options.connect_timeout = Duration::ZERO;
+        let error = reaper.sweep_worker(&worker, 720).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid stale-target sweep roots"),
+            "{message}"
+        );
+        assert!(message.contains("gc_extra_roots"), "{message}");
+        assert!(message.contains("/tmp/../etc"), "{message}");
+        let stats = reaper.run_cycle().await;
+        assert_eq!(stats.workers_checked, 1);
+        assert_eq!(stats.workers_swept, 0);
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.total_removed, 0);
+        assert!(worker.background_probe().await.is_some());
+        assert_eq!(worker.status().await, WorkerStatus::Healthy);
+    }
+
+    #[test]
+    fn sweep_configured_extra_root_reaps_only_stale_targets() {
+        use std::fs;
+        use std::path::Path;
+        use std::time::SystemTime;
+
+        let fixture = tempfile::tempdir().unwrap().keep();
+        let mirror = fixture.join("projects");
+        let extra = fixture.join("old-worker-root");
+        fs::create_dir_all(&mirror).unwrap();
+        let aged = |path: &Path| {
+            fs::create_dir_all(path).unwrap();
+            let artifact = path.join("artifact.o");
+            fs::write(&artifact, b"stale artifact").unwrap();
+            let old = SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+            for entry in [artifact.as_path(), path] {
+                fs::File::open(entry)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(old))
+                    .unwrap();
+            }
+        };
+        let stale = extra.join("repo/.rch-target-w-job-old-1-0");
+        let bystander = extra.join("repo/target");
+        aged(&stale);
+        aged(&bystander);
+        let fresh = extra.join("repo/.rch-target-w-job-fresh-1-0");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("artifact.o"), b"active artifact").unwrap();
+
+        let reaper = StaleTargetReaper::new(
+            WorkerPool::new(),
+            StaleTargetReapConfig {
+                remote_base: mirror.to_str().unwrap().to_string(),
+                gc_extra_roots: vec![extra.to_str().unwrap().to_string()],
+                ..Default::default()
+            },
+        );
+        let mut removed = 0;
+        for base in reaper.scan_bases().unwrap() {
+            let command = isolated_sweep_command(&fixture, Path::new(&base), None, None);
+            let result = run_sweep(&command, &fixture);
+            assert!(
+                result.status.success(),
+                "sweep failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            removed += parse_reap_metrics(&String::from_utf8_lossy(&result.stdout))
+                .expect("sweep metrics")
+                .removed;
+        }
+        assert!(!stale.exists(), "explicit extra roots must actually be swept");
+        assert!(
+            fresh.exists(),
+            "the existing idle floor must protect fresh targets"
+        );
+        assert!(
+            bystander.exists(),
+            "ordinary target directories must remain untouched"
+        );
+        assert_eq!(removed, 1);
+    }
+
     /// Issue #64: pooled stores placed off the mirror tree must still be
     /// swept, so the reaper walks `store_base` in addition to `remote_base` —
     /// and sweeps once when the two coincide.
@@ -1024,6 +1151,7 @@ mod tests {
                 },
             )
             .scan_bases()
+            .unwrap()
         };
 
         assert_eq!(reaper(None), vec!["/data/projects".to_string()]);

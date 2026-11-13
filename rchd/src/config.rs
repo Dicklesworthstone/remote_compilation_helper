@@ -193,9 +193,14 @@ pub struct StaleTargetReapConfig {
     /// Where pooled target stores are PLACED on the worker (issue #64). When
     /// set, the sweep walks this root in addition to [`Self::remote_base`],
     /// since warm pools then live off the repo mirror tree. Unset keeps
-    /// today's single-root sweep.
+    /// the mirror root as the only configured root unless extra roots are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_base: Option<String>,
+
+    /// Additional operator-configured roots to scan for the same stale target
+    /// classes. Shared with `rch gc`; no extra roots are added by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gc_extra_roots: Vec<String>,
 }
 
 fn default_worker_reap_pooled_idle_hours() -> u32 {
@@ -243,6 +248,7 @@ impl Default for StaleTargetReapConfig {
             pooled_idle_hours: default_worker_reap_pooled_idle_hours(),
             max_cache_gb: default_worker_reap_max_cache_gb(),
             store_base: None,
+            gc_extra_roots: Vec::new(),
         }
     }
 }
@@ -298,6 +304,7 @@ impl StaleTargetReapConfig {
             pooled_idle_hours: rem.pooled_target.reaper_pooled_idle_hours,
             max_cache_gb: rem.pooled_target.reaper_max_cache_gb,
             store_base: rem.pooled_target.store_base.clone(),
+            gc_extra_roots: rem.pooled_target.gc_extra_roots.clone(),
         }
     }
 }
@@ -866,6 +873,7 @@ mod tests {
         assert_eq!(from_cfg.idle_hours, runtime.idle_hours);
         assert_eq!(from_cfg.remote_base, runtime.remote_base);
         assert_eq!(from_cfg.store_base, runtime.store_base);
+        assert_eq!(from_cfg.gc_extra_roots, runtime.gc_extra_roots);
     }
 
     #[test]
