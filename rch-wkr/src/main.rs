@@ -19,6 +19,7 @@ mod result_probe;
 mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
+mod source_control;
 mod source_freshness;
 mod source_lock;
 mod source_pair;
@@ -62,6 +63,12 @@ enum Commands {
     /// Internal storage-independent, bounded lifecycle command observation.
     #[command(hide = true)]
     ControlCapture {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal bounded source-namespace execution and session settlement.
+    #[command(hide = true)]
+    SourceControl {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
     },
@@ -441,6 +448,9 @@ fn main() -> Result<()> {
     if let Commands::ControlCapture { arguments } = &cli.command {
         std::process::exit(control_capture::main(arguments));
     }
+    if let Commands::SourceControl { arguments } = &cli.command {
+        std::process::exit(source_control::main(arguments));
+    }
     if let Commands::ControlClock { arguments } = &cli.command {
         std::process::exit(control_clock::main(arguments));
     }
@@ -590,6 +600,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::ControlCapture { .. } => {
             anyhow::bail!("control-capture requires the synchronous worker entry point")
+        }
+        Commands::SourceControl { .. } => {
+            anyhow::bail!("source-control requires the synchronous worker entry point")
         }
         Commands::ControlClock { .. } => {
             anyhow::bail!("control-clock requires the synchronous worker entry point")
