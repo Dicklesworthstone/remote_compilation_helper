@@ -28,6 +28,7 @@ mod source_retain;
 mod source_settlement;
 mod source_upload;
 mod source_verifier;
+mod staging_gc;
 mod toolchain;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,12 @@ enum Commands {
     /// Internal bounded source-namespace execution and session settlement.
     #[command(hide = true)]
     SourceControl {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal descriptor-relative staging collection under source custody.
+    #[command(hide = true)]
+    StagingGc {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
     },
@@ -451,6 +458,9 @@ fn main() -> Result<()> {
     if let Commands::SourceControl { arguments } = &cli.command {
         std::process::exit(source_control::main(arguments));
     }
+    if let Commands::StagingGc { arguments } = &cli.command {
+        std::process::exit(staging_gc::main(arguments));
+    }
     if let Commands::ControlClock { arguments } = &cli.command {
         std::process::exit(control_clock::main(arguments));
     }
@@ -603,6 +613,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceControl { .. } => {
             anyhow::bail!("source-control requires the synchronous worker entry point")
+        }
+        Commands::StagingGc { .. } => {
+            anyhow::bail!("staging-gc requires the synchronous worker entry point")
         }
         Commands::ControlClock { .. } => {
             anyhow::bail!("control-clock requires the synchronous worker entry point")

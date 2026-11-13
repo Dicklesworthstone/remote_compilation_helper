@@ -53,7 +53,6 @@ const PORT_DEBT: &[(&str, usize)] = &[
     ("rch-wkr/tests/output_completion.rs", 2),
     ("rch-wkr/tests/prepare_transactions.rs", 2),
     ("rch-wkr/tests/toolchain_execution.rs", 11),
-    ("rch/src/cache_gc.rs", 2),
     ("rch/src/hook/repo_updater/status_probe.rs", 2),
     ("rch/src/hook/source_fidelity.rs", 1),
     ("rch/src/hook/tests.rs", 5),
