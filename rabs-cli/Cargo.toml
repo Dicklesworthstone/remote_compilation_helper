@@ -1,0 +1,31 @@
+[package]
+name = "rabs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Native operator commands for retained RABS results"
+publish = false
+
+[[bin]]
+name = "rabs-recover"
+path = "src/main.rs"
+
+# Operator-only dependency cone. Recovery delegates authenticated transport to
+# rabsd; it must not pull a daemon, runtime, or compiler wrapper into this CLI.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[lints.rust]
+unsafe_code = "forbid"

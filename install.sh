@@ -872,9 +872,10 @@ build_rabs_toolset() {
     [[ "${WITH_RABS:-false}" == "true" ]] || return 0
     local project_dir="$1"
     info "Building the requested RABS toolset..."
-    if ! cargo build --locked --profile wrapper-release -p rabs-wrap --bin rabs-wrap \
+    if ! cargo build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli \
+        --bin rabs-wrap --bin rabs-recover \
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
-        die "Requested RABS wrapper build failed; installation stopped"
+        die "Requested RABS wrapper/operator build failed; installation stopped"
     fi
     if ! cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr \
         --bin rabsd --bin rabs-wkr --bin rabs-cargo-root --bin rabs-delivery-cas \

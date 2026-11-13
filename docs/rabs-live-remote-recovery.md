@@ -1,14 +1,22 @@
 # Recover a retained live remote dependency result
 
-`scripts/rabs-recover` connects the live remote lane's retained `recovery.json`
+The native Rust `rabs-recover` command connects the live remote lane's retained `recovery.json`
 and `request.json` to the **existing native TLS result-recovery operator**. It
-never sends a new compiler execution. Linux, Python 3.9+, procfs and Linux
-sealed memory-file support are required. The complete `install-rabs` toolset
+never sends a new compiler execution. Linux, procfs and sealed memory-file
+support are required; recovery itself needs no interpreter. The complete `install-rabs` toolset
 installs this command as `rabs-recover` alongside its matching `rabsd` and the
 `rabs-delivery-cas` archive/restore operator. The main installer includes them
 when `--with-rabs` is selected. Existing installations need a complete updated
 bundle; supplying only a new launcher is refused before generation activation.
-The repository script remains usable directly with an updated `rabsd`.
+For a source checkout, build the native operator with:
+
+```bash
+cargo build --locked --profile wrapper-release -p rabs-cli --bin rabs-recover
+```
+
+The existing bundle installer and `cargo-rabs` launcher retain their separate
+installation requirements. The old recovery script is retained as historical
+source and is no longer selected by the toolset installer.
 
 ## Inspect first
 
@@ -118,10 +126,13 @@ malicious process sharing the operator's credentials and mutating its other
 state. Retained and newly recovered directories consume disk until explicitly
 handled; this command introduces no automatic cleanup policy.
 
-The Python regression suite exercises actual file/descriptor/sealing/process
-behavior with an explicit `rabsd` executable fixture. It is not a native TLS,
-Rust compilation, real worker-result retrieval or Cargo performance result:
+The Rust regression suite exercises actual file, descriptor, sealing and exec
+behavior with an explicit native `rabsd` fixture. It covers both retained
+dependency and canonical Cargo intents, byte identity, private records,
+original admission state, prefix selection and refusal before handoff. These
+tests establish the operator contract; real TLS worker-result retrieval and
+Cargo performance require separate integration qualification:
 
 ```bash
-python3 -I -S scripts/tests/test_rabs_recover.py -v
+cargo test --locked -p rabs-cli
 ```

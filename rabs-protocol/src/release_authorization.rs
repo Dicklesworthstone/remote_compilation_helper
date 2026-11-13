@@ -280,7 +280,12 @@ where
 {
     if !matches!(
         tool,
-        "rabs-wrap" | "rabsd" | "rabs-wkr" | "rabs-cargo-root" | "rabs-delivery-cas"
+        "rabs-wrap"
+            | "rabsd"
+            | "rabs-wkr"
+            | "rabs-cargo-root"
+            | "rabs-delivery-cas"
+            | "rabs-recover"
     ) {
         return None;
     }
@@ -674,6 +679,10 @@ mod tests {
         assert!(
             build_info_for_args("rabs-delivery-cas", ["--rabs-build-info", "archive"]).is_none()
         );
+        let retained = build_info_for_args("rabs-recover", ["--rabs-build-info"])
+            .expect("native retained-result recovery must identify its compiled source");
+        assert!(retained.contains("\"tool\":\"rabs-recover\""));
+        assert!(build_info_for_args("rabs-recover", ["--rabs-build-info", "/operation"]).is_none());
         for args in [
             vec![],
             vec!["--version"],

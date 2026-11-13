@@ -102,9 +102,10 @@ not restart or kill them. Existing daemon configuration is not changed.
 
 An extracted, trusted bundle works with `--from-bundle`. Locally built tools
 work with `--from-build /path/to/target/<target-triple>`, which selects
-`wrapper-release/rabs-wrap`,
+`wrapper-release/{rabs-wrap,rabs-recover}`,
 `daemon-release/{rabsd,rabs-wkr,rabs-cargo-root,rabs-delivery-cas}`, and the
-checkout's `scripts/cargo-rabs` and `scripts/rabs-recover`. No compiler runs on
+checkout's `scripts/cargo-rabs`. Recovery is a native executable from the same
+compiled source identity as the other native tools. No compiler runs on
 the deployment path. Missing or malformed recovery tools refuse the complete
 installation before activation, preserving the previous generation.
 

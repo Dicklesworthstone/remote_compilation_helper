@@ -60,6 +60,13 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          corpus and emits the divergence corpus; process effects are \
          its purpose)",
     ),
+    (
+        "rabs-cli",
+        5,
+        "protocol build identity + serde/serde_json for bounded recovery records \
+         + sha2 for exact saved-request identity + rustix for retained descriptors \
+         and sealed native handoff; no daemon or async runtime dependency",
+    ),
     ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
     (
         "rabsd",

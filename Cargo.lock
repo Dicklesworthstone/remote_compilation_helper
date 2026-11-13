@@ -5121,6 +5121,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rabs-cli"
+version = "2.1.36"
+dependencies = [
+ "rabs-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+]
+
+[[package]]
 name = "rabs-key"
 version = "2.1.36"
 dependencies = [
