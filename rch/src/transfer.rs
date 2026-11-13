@@ -9441,215 +9441,28 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 && control_dir == format!("{source_container}.freshness"),
             "owned source freshness requires the entire source container and its exact control sibling"
         );
-        let program = if mark_verified {
-            Self::owned_source_refresh_preparation_script().to_owned()
-        } else {
-            format!(
-                "{}\n{}",
-                Self::owned_source_refresh_preparation_script(),
-                Self::clean_overlay_freshness_ledger_script()
-            )
-        };
-        Ok(format!(
-            "python3 -I -c {} {} {} {} {} {} {}",
-            escape(Cow::from(program)),
+        Ok(Self::source_freshness_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-freshness owned {} {} {} {} {} {}",
             escape(Cow::from(source_container)),
             escape(Cow::from(self.remote_cargo_target_dir())),
             escape(Cow::from(format!("{control_dir}/epoch-v1"))),
             escape(Cow::from(identity)),
             escape(Cow::from(attempt)),
             if mark_verified { "verify" } else { "refresh" },
-        ))
+        )))
     }
 
-    fn owned_source_refresh_preparation_script() -> &'static str {
-        r#"import hashlib, json, os, stat, sys
-
-def rch_owned_require(condition, reason):
-    if not condition:
-        raise RuntimeError('RCH: owned source freshness refused: ' + reason)
-
-rch_owned_require(sys.platform == 'linux', 'Linux worker required')
-rch_owned_require(len(sys.argv) == 7, 'invalid freshness arguments')
-rch_root, rch_pool, rch_epoch, rch_identity, rch_attempt, rch_operation = sys.argv[1:]
-rch_control = os.path.dirname(rch_epoch)
-def rch_literal(path):
-    return (path.startswith('/') and not path.endswith('/') and '\\' not in path
-            and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
-            and all(part not in ('', '.', '..') for part in path[1:].split('/')))
-rch_owned_require(all(rch_literal(path) for path in (rch_root, rch_pool, rch_control)),
-                  'nonliteral source, target or control path')
-rch_owned_require(rch_control == rch_root + '.freshness'
-                  and os.path.basename(rch_epoch) == 'epoch-v1',
-                  'control directory is outside its exact authority')
-rch_owned_require(rch_pool != rch_root and not rch_pool.startswith(rch_root + '/')
-                  and rch_pool != rch_control and not rch_pool.startswith(rch_control + '/'),
-                  'stable target must be outside source and control trees')
-rch_owned_require(len(rch_identity) == 64
-                  and all(ch in '0123456789abcdefABCDEF' for ch in rch_identity),
-                  'invalid freshness identity')
-rch_owned_require(len(rch_attempt) == 32
-                  and all(ch in '0123456789abcdef' for ch in rch_attempt),
-                  'invalid freshness attempt')
-rch_owned_require(rch_operation in ('refresh', 'verify'), 'invalid freshness operation')
-rch_owned_previous_qualified = False
-rch_intent = {'schema': 'rch.source_freshness_attempt.v1', 'source_root': rch_root,
-              'target_root': rch_pool, 'content_identity': rch_identity, 'attempt': rch_attempt}
-def rch_encoded(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
-
-def rch_sha256(value):
-    return hashlib.sha256(value).hexdigest()
-
-rch_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-rch_parent = os.open('/', rch_flags)
-try:
-    for rch_part in os.path.dirname(rch_root).split('/')[1:]:
-        if rch_part:
-            rch_child = os.open(rch_part, rch_flags, dir_fd=rch_parent)
-            os.close(rch_parent)
-            rch_parent = rch_child
-    rch_source_fd = os.open(os.path.basename(rch_root), rch_flags, dir_fd=rch_parent)
-    try:
-        rch_owned_require(os.fstat(rch_source_fd).st_uid == os.geteuid(),
-                          'source container has a foreign owner')
-    finally:
-        os.close(rch_source_fd)
-    if rch_operation == 'refresh':
-        try:
-            os.mkdir(os.path.basename(rch_control), mode=0o700, dir_fd=rch_parent)
-        except FileExistsError:
-            pass
-    rch_control_fd = os.open(os.path.basename(rch_control), rch_flags, dir_fd=rch_parent)
-    try:
-        rch_info = os.fstat(rch_control_fd)
-        rch_owned_require(rch_info.st_uid == os.geteuid()
-                          and stat.S_IMODE(rch_info.st_mode) & 0o077 == 0,
-                          'control directory must be private and owned by this worker user')
-        os.fsync(rch_control_fd)
-        os.fsync(rch_parent)
-
-        def rch_read_control(name, cap):
-            try:
-                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-                                     dir_fd=rch_control_fd)
-            except FileNotFoundError:
-                return None
-            with os.fdopen(descriptor, 'rb') as stream:
-                before = os.fstat(stream.fileno())
-                rch_owned_require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid(),
-                                  'freshness control must be a regular owned file')
-                if before.st_size > cap:
-                    return None
-                data = stream.read(cap + 1)
-                after = os.fstat(stream.fileno())
-                rch_owned_require((before.st_dev, before.st_ino, before.st_size,
-                                   before.st_mtime_ns, before.st_ctime_ns)
-                                  == (after.st_dev, after.st_ino, after.st_size,
-                                      after.st_mtime_ns, after.st_ctime_ns)
-                                  and len(data) == before.st_size,
-                                  'freshness control changed while reading')
-                return data, before
-
-        def rch_decode_intent(encoded):
-            if encoded is None:
-                return None
-            try:
-                value = json.loads(encoded[0])
-                if (set(value) == set(rch_intent) and rch_encoded(value) == encoded[0]
-                    and value['schema'] == rch_intent['schema']
-                    and value['source_root'] == rch_root and value['target_root'] == rch_pool
-                    and isinstance(value['attempt'], str) and len(value['attempt']) == 32
-                    and all(ch in '0123456789abcdef' for ch in value['attempt'])
-                    and isinstance(value['content_identity'], str)
-                    and len(value['content_identity']) == 64
-                    and all(ch in '0123456789abcdefABCDEF' for ch in value['content_identity'])):
-                    return value
-            except (ValueError, TypeError, KeyError, UnicodeError):
-                pass
-            return None
-
-        def rch_qualification(intent):
-            if intent is None:
-                return None
-            epoch = rch_read_control('epoch-v1', 65)
-            ledger = rch_read_control('epoch-v1.files-v2', 64 * 1024**2)
-            if epoch is None or ledger is None:
-                return None
-            try:
-                document = json.loads(ledger[0])
-                payload = document['payload']
-                if (epoch[0] == (intent['content_identity'] + '\n').encode('ascii')
-                    and payload['identity'] == intent['content_identity']
-                    and payload['schema'] == 2 and payload['epoch_ns'] == epoch[1].st_mtime_ns
-                    and document['sha256'] == rch_sha256(rch_encoded(payload))):
-                    return rch_encoded({'schema': 'rch.source_freshness_verified.v1',
-                                        'intent': intent, 'epoch_sha256': rch_sha256(epoch[0]),
-                                        'ledger_sha256': rch_sha256(ledger[0]),
-                                        'epoch_mtime_ns': epoch[1].st_mtime_ns})
-            except (ValueError, TypeError, KeyError, UnicodeError):
-                pass
-            return None
-
-        def rch_stage_control(prefix, data):
-            name = prefix + '.pending.' + os.urandom(16).hex()
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                 0o600, dir_fd=rch_control_fd)
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            return name
-
-        current = rch_read_control('current-attempt-v1', 64 * 1024)
-        if rch_operation == 'refresh':
-            previous = rch_decode_intent(current)
-            expected = rch_qualification(previous)
-            if expected is not None and previous['attempt'] != rch_attempt:
-                proof = rch_read_control('verified-' + previous['attempt'] + '.json', 64 * 1024)
-                rch_owned_previous_qualified = proof is not None and proof[0] == expected
-            # Publish this unqualified attempt before the shared ledger changes
-            # source timestamps. A crash or failed post-proof cannot authorize
-            # the next invocation to reuse the previous successful attempt.
-            pending = rch_stage_control('current-attempt-v1', rch_encoded(rch_intent))
-            os.replace(pending, 'current-attempt-v1',
-                       src_dir_fd=rch_control_fd, dst_dir_fd=rch_control_fd)
-            os.fsync(rch_control_fd)
-        else:
-            rch_owned_require(current is not None and current[0] == rch_encoded(rch_intent),
-                              'verified attempt does not match the current preparation')
-            expected = rch_qualification(rch_intent)
-            rch_owned_require(expected is not None, 'verified attempt has no matching ledger and epoch')
-            name = 'verified-' + rch_attempt + '.json'
-            existing = rch_read_control(name, 64 * 1024)
-            if existing is None:
-                pending = rch_stage_control(name, expected)
-                try:
-                    # A hard link publishes the fully durable record without
-                    # replacing any existing entry. Keep its staging link too.
-                    os.link(pending, name, src_dir_fd=rch_control_fd,
-                            dst_dir_fd=rch_control_fd, follow_symlinks=False)
-                except FileExistsError:
-                    pass
-                existing = rch_read_control(name, 64 * 1024)
-            rch_owned_require(existing is not None and existing[0] == expected,
-                              'verified attempt conflicts with retained evidence')
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rch_control_fd)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            os.fsync(rch_control_fd)
-            print('RCH_SOURCE_FRESHNESS_VERIFIED')
-            sys.exit(0)
-    finally:
-        os.close(rch_control_fd)
-finally:
-    os.close(rch_parent)
-# Keep the existing ledger's argument contract unchanged. Its optional gate
-# defaults to true for clean-overlay callers, which do not run this prelude.
-sys.argv = sys.argv[:5]
-"#
+    fn source_freshness_worker_command(command: &str) -> String {
+        format!(
+            "( {locate}\
+             if ! rch_wkr_locate; then \
+             printf '%s\\n' 'RCH_SOURCE_FRESHNESS_UNAVAILABLE: rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+             if ! __rch_freshness_probe=$(\"$RCH_WKR\" source-freshness probe) \
+             || [ \"$__rch_freshness_probe\" != 'rch-wkr source-freshness v1' ]; then \
+             printf '%s\\n' 'RCH_SOURCE_FRESHNESS_UNAVAILABLE: deploy the matching rch-wkr with source-freshness support' >&2; exit 74; fi; \
+             {command} )",
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        )
     }
 
     /// Apply a content epoch while the source-pair lease is held, after complete
@@ -9712,245 +9525,14 @@ sys.argv = sys.argv[:5]
                 blake3::hash(root.as_bytes()).to_hex()
             )
         };
-        let anchor = format!("{control}.freshness-anchor");
         let epoch = format!("{control}.freshness-epoch-v1");
-        let conservative = format!(
-            "set -eu; root={root}; pool={pool}; anchor={anchor}; epoch={epoch}; identity={identity}; \
-             [ ! -L \"$anchor\" ] && [ ! -L \"$epoch\" ] && [ ! -L \"$pool\" ]; \
-             [ ! -e \"$epoch\" ] || [ -f \"$epoch\" ]; \
-             if [ -f \"$epoch\" ] && [ \"$(wc -c < \"$epoch\" | tr -d ' ')\" = 65 ] && \
-             [ \"$(cat \"$epoch\")\" = \"$identity\" ]; then \
-             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$epoch\" {{}} +; exit 0; fi; \
-             stamp=$(mktemp \"$epoch.pending.XXXXXX\"); \
-             printf '%s\\n' \"$identity\" > \"$stamp\"; touch \"$anchor\"; \
-             if [ -d \"$pool\" ]; then \
-             find \"$pool\" -type f -exec sh -c \
-             'anchor=$1; shift; for file do if [ \"$file\" -nt \"$anchor\" ]; then touch -r \"$file\" \"$anchor\" || exit; fi; done' \
-             sh \"$anchor\" {{}} +; fi; \
-             attempts=0; touch \"$stamp\"; \
-             until [ \"$stamp\" -nt \"$anchor\" ]; do \
-             attempts=$((attempts + 1)); if [ \"$attempts\" -gt 5 ]; then \
-             echo 'RCH: worker clock cannot advance beyond cached artifacts; source freshness unproved' >&2; exit 1; fi; \
-             sleep 1; touch \"$stamp\"; done; \
-             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$stamp\" {{}} +; \
-             mv -f \"$stamp\" \"$epoch\"",
-            root = quote(&root),
-            pool = quote(&pool),
-            anchor = quote(&anchor),
-            epoch = quote(&epoch),
-            identity = quote(identity),
-        );
-        Ok(format!(
-            "if command -v python3 >/dev/null 2>&1; then python3 -c {script} {root} {pool} {epoch} {identity}; \
-             else printf '%s\\n' 'RCH: python3 unavailable; using conservative whole-source freshness' >&2; \
-             {conservative}; fi",
-            script = quote(Self::clean_overlay_freshness_ledger_script()),
+        Ok(Self::source_freshness_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-freshness overlay {root} {pool} {epoch} {identity}",
             root = quote(&root),
             pool = quote(&pool),
             epoch = quote(&epoch),
             identity = quote(identity),
-        ))
-    }
-
-    /// Metadata only: source bytes are always rematerialized under the existing
-    /// source-pair lease. Compare against the immediate predecessor, never a
-    /// historical content-to-time cache (which would make A -> B -> A stale).
-    fn clean_overlay_freshness_ledger_script() -> &'static str {
-        r#"import hashlib, json, os, stat, sys, tempfile, time
-
-root, pool, epoch, identity = sys.argv[1:]
-ledger = epoch + '.files-v2'
-MAX_ENTRIES = 200000
-MAX_BYTES = 8 * 1024**3
-MAX_LEDGER = 64 * 1024**2
-
-def require(condition, reason):
-    if not condition:
-        raise RuntimeError('RCH: source freshness unproved: ' + reason)
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
-
-def digest(value):
-    return hashlib.sha256(canonical(value)).hexdigest()
-
-def regular_control(path):
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    require(stat.S_ISREG(info.st_mode), 'nonregular freshness control')
-    return info
-
-require(stat.S_ISDIR(os.lstat(root).st_mode), 'source root is not a real directory')
-try:
-    pool_info = os.lstat(pool)
-except FileNotFoundError:
-    pool_info = None
-require(pool_info is None or stat.S_ISDIR(pool_info.st_mode), 'target pool is not a real directory')
-root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-root_identity = os.fstat(root_fd)
-
-def parent_fd(relative):
-    descriptor = os.dup(root_fd)
-    parts = relative.split('/') if relative else ['.']
-    try:
-        for part in parts[:-1]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = next_fd
-        return descriptor, parts[-1]
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-epoch_info = regular_control(epoch)
-ledger_info = regular_control(ledger)
-previous = {}
-if (globals().get('rch_owned_previous_qualified', True)
-    and epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER):
-    try:
-        with os.fdopen(os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
-            encoded = stream.read(MAX_LEDGER + 1)
-        require(len(encoded) <= MAX_LEDGER, 'freshness ledger grew beyond cap')
-        stored = json.loads(encoded)
-        payload = stored['payload']
-        with os.fdopen(os.open(epoch, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
-            marker = stream.read(66)
-        valid = (stored['sha256'] == digest(payload)
-                 and payload['schema'] == 2
-                 and marker == (payload['identity'] + '\n').encode('ascii')
-                 and epoch_info.st_mtime_ns == payload['epoch_ns']
-                 and isinstance(payload['entries'], dict)
-                 and len(payload['entries']) <= MAX_ENTRIES)
-        for path, entry in payload['entries'].items():
-            valid = valid and (path == '' or (not path.startswith('/')
-                and all(part not in ('', '.', '..') for part in path.split('/'))))
-            valid = valid and (set(entry) == {'fingerprint', 'mtime_ns'}
-                and isinstance(entry['fingerprint'], str) and len(entry['fingerprint']) == 64
-                and all(c in '0123456789abcdef' for c in entry['fingerprint'])
-                and type(entry['mtime_ns']) is int and 0 <= entry['mtime_ns'] <= payload['epoch_ns'])
-        if valid:
-            previous = payload['entries']
-    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
-        pass
-
-def inventory():
-    entries = {}
-    total = 0
-    def visit(relative, depth):
-        nonlocal total
-        require(depth <= 128 and len(entries) < MAX_ENTRIES, 'source inventory cap exceeded')
-        directory_fd, name = parent_fd(relative)
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        mode = stat.S_IMODE(before.st_mode)
-        entries[relative] = None
-        if stat.S_ISREG(before.st_mode):
-            total += before.st_size
-            require(total <= MAX_BYTES, 'source byte cap exceeded')
-            hasher = hashlib.sha256()
-            # Reject a symlink substitution between lstat and open.
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-            with os.fdopen(descriptor, 'rb') as stream:
-                opened = os.fstat(stream.fileno())
-                require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'source replaced while hashing')
-                read_bytes = 0
-                for block in iter(lambda: stream.read(1024 * 1024), b''):
-                    read_bytes += len(block)
-                    require(read_bytes <= before.st_size, 'source grew while hashing')
-                    hasher.update(block)
-            value = ['file', mode, before.st_size, hasher.hexdigest()]
-        elif stat.S_ISLNK(before.st_mode):
-            value = ['symlink', mode, os.readlink(name, dir_fd=directory_fd)]
-        elif stat.S_ISDIR(before.st_mode):
-            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
-            try:
-                children = []
-                with os.scandir(child_fd) as listing:
-                    for child in listing:
-                        require(len(children) + len(entries) < MAX_ENTRIES, 'source directory cap exceeded')
-                        children.append(child.name)
-                children.sort()
-            finally:
-                os.close(child_fd)
-            value = ['directory', mode, [[name, visit(os.path.join(relative, name), depth + 1)] for name in children]]
-        else:
-            raise RuntimeError('RCH: unsupported source entry type')
-        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        os.close(directory_fd)
-        require((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                == (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
-                'source changed while hashing')
-        fingerprint = digest(value)
-        entries[relative] = {'fingerprint': fingerprint}
-        return fingerprint
-    visit('', 0)
-    named_root = os.lstat(root)
-    require((named_root.st_dev, named_root.st_ino) == (root_identity.st_dev, root_identity.st_ino), 'source root replaced')
-    return entries
-
-current = inventory()
-changed = [path for path, entry in current.items()
-           if previous.get(path, {}).get('fingerprint') != entry['fingerprint']]
-# A new metadata seal can retain source timestamps even when only the selected
-# commit changed. Changed inputs must still be newer than ALL cached artifacts.
-anchor_ns = max([0] + [entry['mtime_ns'] for entry in previous.values()])
-def traversal_error(error):
-    raise error
-
-if changed and pool_info is not None:
-    for directory, directories, files in os.walk(pool, followlinks=False, onerror=traversal_error):
-        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
-        for name in files:
-            info = os.lstat(os.path.join(directory, name))
-            if stat.S_ISREG(info.st_mode):
-                anchor_ns = max(anchor_ns, info.st_mtime_ns)
-deadline = time.monotonic() + 5
-stamp_ns = time.time_ns()
-while stamp_ns <= anchor_ns:
-    require(time.monotonic() < deadline, 'worker clock cannot advance beyond cached artifacts')
-    time.sleep(0.01)
-    stamp_ns = time.time_ns()
-
-for relative, entry in sorted(current.items(), key=lambda item: item[0].count('/'), reverse=True):
-    prior = previous.get(relative)
-    modified = prior['mtime_ns'] if prior and prior['fingerprint'] == entry['fingerprint'] else stamp_ns
-    directory_fd, name = parent_fd(relative)
-    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    os.utime(name, ns=(info.st_atime_ns, modified), dir_fd=directory_fd, follow_symlinks=False)
-    require(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mtime_ns == modified, 'source timestamp precision changed')
-    os.close(directory_fd)
-    entry['mtime_ns'] = modified
-verified = inventory()
-require({path: entry['fingerprint'] for path, entry in current.items()}
-        == {path: entry['fingerprint'] for path, entry in verified.items()}, 'source changed during freshness refresh')
-
-payload = {'schema': 2, 'identity': identity, 'epoch_ns': stamp_ns, 'entries': current}
-encoded = canonical({'payload': payload, 'sha256': digest(payload)})
-require(len(encoded) <= MAX_LEDGER, 'freshness ledger cap exceeded')
-def stage(path, data):
-    descriptor, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + '.pending.', dir=os.path.dirname(path))
-    with os.fdopen(descriptor, 'wb') as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    return temporary
-
-pending_ledger = stage(ledger, encoded)
-pending_epoch = stage(epoch, (identity + '\n').encode('ascii'))
-os.utime(pending_epoch, ns=(stamp_ns, stamp_ns), follow_symlinks=False)
-require(os.lstat(pending_epoch).st_mtime_ns == stamp_ns, 'epoch timestamp precision changed')
-# The epoch is the commit marker. A crash between these replacements leaves a
-# mismatched pair, causing conservative freshness on the next invocation.
-os.replace(pending_ledger, ledger)
-os.replace(pending_epoch, epoch)
-directory_fd = os.open(os.path.dirname(epoch), os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(changed), len(changed)))
-"#
+        )))
     }
 
     /// Read-only admission probe for retained source pairs. It checks the
@@ -21775,6 +21357,95 @@ func main() {
     }
 
     #[cfg(target_os = "linux")]
+    fn native_freshness_shell() -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            // The complete source-freshness path needs only the shell's
+            // builtins and the matching native worker, including recovery.
+            .env("PATH", "");
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_freshness_requires_matching_worker_before_touching_source() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().unwrap().keep();
+        let source = fixture.join("source with ' quotes");
+        std::fs::create_dir(&source).unwrap();
+        let input = source.join("input");
+        std::fs::write(&input, b"selected source").unwrap();
+        let before = std::fs::metadata(&input).unwrap().modified().unwrap();
+        let pipeline = TransferPipeline::new(
+            source.clone(),
+            "freshness".into(),
+            "capability".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let command = pipeline
+            .clean_overlay_source_refresh_command(&"a".repeat(64))
+            .unwrap();
+        for (name, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "bad-status",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-freshness v1\\n'; exit 3\n"),
+            ),
+            (
+                "bad-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-freshness v0\\n'\n"),
+            ),
+            (
+                "extra-output",
+                Some("#!/bin/sh\nprintf 'banner\\nrch-wkr source-freshness v1\\n'\n"),
+            ),
+        ] {
+            let binary = fixture.join(name);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env("RCH_WKR_BIN", binary)
+                .env("PATH", "")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(74), "{name}: {output:?}");
+            assert!(output.stdout.is_empty(), "{name}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("RCH_SOURCE_FRESHNESS_UNAVAILABLE:"),
+                "{name}: {output:?}"
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), b"selected source");
+            assert_eq!(
+                std::fs::metadata(&input).unwrap().modified().unwrap(),
+                before
+            );
+            assert!(
+                !fixture
+                    .join("source with ' quotes.freshness-epoch-v1")
+                    .exists()
+            );
+        }
+
+        let output = native_freshness_shell()
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("RCH_SOURCE_FRESHNESS_V2 "));
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read(&input).unwrap(), b"selected source");
+    }
+
+    #[cfg(target_os = "linux")]
     fn native_owned_source_freshness(
         pipeline: &TransferPipeline,
         identity: &str,
@@ -21792,7 +21463,7 @@ func main() {
                 mark_verified,
             )
             .unwrap();
-        std::process::Command::new("/bin/sh")
+        native_freshness_shell()
             .args(["-c", &command])
             .output()
             .unwrap()
@@ -21958,23 +21629,21 @@ func main() {
                     std::fs::write(source.join("input"), b"B").unwrap();
                 }
                 "before-ledger" => {
-                    // Run the exact durable preparation prefix but stop before
-                    // the shared ledger executes, as an interrupted SSH can.
-                    let output = std::process::Command::new("python3")
-                        .args([
-                            "-I",
-                            "-c",
-                            TransferPipeline::owned_source_refresh_preparation_script(),
-                        ])
-                        .arg(&source)
-                        .arg(&pool)
-                        .arg(control.join("epoch-v1"))
-                        .arg(&identity)
-                        .arg(unfinished)
-                        .arg("refresh")
-                        .output()
-                        .unwrap();
-                    assert!(output.status.success(), "{output:?}");
+                    // Model an interrupted request after its new intent was
+                    // durable but before the shared ledger changed. Worker
+                    // unit tests inject that failure into the actual writer.
+                    let intent = serde_json::json!({
+                        "schema": "rch.source_freshness_attempt.v1",
+                        "source_root": source,
+                        "target_root": pool,
+                        "content_identity": identity,
+                        "attempt": unfinished,
+                    });
+                    std::fs::write(
+                        control.join("current-attempt-v1"),
+                        serde_json::to_vec(&intent).unwrap(),
+                    )
+                    .unwrap();
                 }
                 "malformed-attempt" => {
                     std::fs::write(control.join("current-attempt-v1"), b"incomplete attempt")
@@ -22266,7 +21935,7 @@ fn main() {
             let identity = blake3::hash(format!("selected-commit-{run}").as_bytes())
                 .to_hex()
                 .to_string();
-            let refresh = std::process::Command::new("sh")
+            let refresh = native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22371,7 +22040,7 @@ fn main() {
                 let identity = blake3::hash(format!("whole-closure-{run}").as_bytes())
                     .to_hex()
                     .to_string();
-                let output = std::process::Command::new("sh")
+                let output = native_freshness_shell()
                     .args([
                         "-c",
                         &pipeline
@@ -22444,7 +22113,7 @@ fn main() {
         };
         let identity = "a".repeat(64);
         let run = || {
-            std::process::Command::new("sh")
+            native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22469,9 +22138,9 @@ fn main() {
             std::fs::metadata(&outside).unwrap().modified().unwrap(),
             outside_time
         );
-        // Deterministic I/O fault injection into the real helper, rather than a
-        // chmod test that silently passes under a root worker. An unreadable
-        // artifact subtree must not be omitted from the freshness upper bound.
+        // A substituted artifact pool must refuse before touching timestamps
+        // or publishing either control. Worker unit tests also inject a scan
+        // I/O failure into the real walker, including under a root worker.
         std::fs::create_dir(&pool).unwrap();
         let saved_epoch = std::fs::read(&epoch).unwrap();
         let saved_ledger = std::fs::read(&ledger).unwrap();
@@ -22480,24 +22149,13 @@ fn main() {
             .unwrap()
             .modified()
             .unwrap();
-        let fault_script = format!(
-            "import os, sys\noriginal_scandir = os.scandir\ndef unreadable_pool(path):\n    if path == sys.argv[2]:\n        raise PermissionError('injected unreadable artifact pool')\n    return original_scandir(path)\nos.scandir = unreadable_pool\n{}",
-            TransferPipeline::clean_overlay_freshness_ledger_script()
-        );
-        let failed = std::process::Command::new("python3")
-            .args(["-c", &fault_script])
-            .arg(&root)
-            .arg(&pool)
-            .arg(&epoch)
-            .arg(&identity)
-            .output()
-            .unwrap();
+        let retained_pool = retained.join("retained-pool");
+        std::fs::rename(&pool, &retained_pool).unwrap();
+        symlink(&outside, &pool).unwrap();
+        let failed = run();
         assert!(
             !failed.status.success(),
-            "unreadable artifacts must fail closed"
-        );
-        assert!(
-            String::from_utf8_lossy(&failed.stderr).contains("injected unreadable artifact pool")
+            "substituted artifacts must fail closed: {failed:?}"
         );
         assert_eq!(std::fs::read(&epoch).unwrap(), saved_epoch);
         assert_eq!(std::fs::read(&ledger).unwrap(), saved_ledger);
@@ -22508,6 +22166,8 @@ fn main() {
                 .unwrap(),
             before_failure
         );
+        std::fs::rename(&pool, retained.join("retained-pool-link")).unwrap();
+        std::fs::rename(&retained_pool, &pool).unwrap();
         std::fs::rename(&root, retained.join("retired-first")).unwrap();
         materialize();
         // A valid ledger with a different commit marker models interruption
@@ -22576,7 +22236,7 @@ fn main() {
         let first = "a".repeat(64);
         let second = "b".repeat(64);
         let run = |identity: &str| {
-            std::process::Command::new("sh")
+            native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22735,7 +22395,7 @@ fn main() {
                 .with_remote_path_override(root.to_string_lossy().into_owned())
                 .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
                 assert!(
-                    std::process::Command::new("sh")
+                    native_freshness_shell()
                         .args([
                             "-c",
                             &pipeline

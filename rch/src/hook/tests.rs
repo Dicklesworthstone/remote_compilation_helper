@@ -3118,7 +3118,8 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
                             .unwrap(),
                     ])
                     .env_clear()
-                    .env("PATH", &path)
+                    .env("PATH", "")
+                    .env("RCH_WKR_BIN", crate::transfer::native_control_worker_for_test())
                     .output()
                     .unwrap();
                 assert!(output.status.success(), "{output:?}");
