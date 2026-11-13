@@ -262,216 +262,16 @@ exec "$RCH_WKR" source-settlement "$@"
 // complete owner. A receipt is immutable and always durable before owner release.
 // This helper never removes or repairs ambiguous records, nor grants source access.
 const SOURCE_PAIR_CUSTODY: &str = r#"
-import os
-import re
-import stat
-import sys
-
-stage = "validation"
-descriptors = []
-
-def refuse(reason):
-    raise ValueError(reason)
-
-def safe(info, directory=False):
-    kind = stat.S_ISDIR if directory else stat.S_ISREG
-    if (not kind(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_mode & 0o022 or (not directory and info.st_nlink != 1)):
-        refuse("unsafe source pair record ownership, type or links")
-
-def stamp(info):
-    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
-            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-def verify_parent():
-    current = os.fstat(directory)
-    safe(current, directory=True)
-    named = os.stat(parent, follow_symlinks=False)
-    if not os.path.samestat(current, named):
-        refuse("source pair parent changed during publication")
-
-def verify(record):
-    name, fd, content, before = record
-    current = os.fstat(fd)
-    safe(current)
-    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
-    os.lseek(fd, 0, os.SEEK_SET)
-    if (stamp(current) != stamp(before) or stamp(named) != stamp(before)
-            or os.read(fd, 130) != content or stamp(os.fstat(fd)) != stamp(before)):
-        refuse("source pair record identity or exact bytes changed")
-    verify_parent()
-
-def read_record(name, receipt=False):
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-    except FileNotFoundError:
-        return None
-    descriptors.append(fd)
-    before = os.fstat(fd)
-    safe(before)
-    content = os.read(fd, 130)
-    if not (1 < len(content) <= 129 and content.endswith(b"\n")
-            and (re.fullmatch(rb"[a-f0-9-]{1,128}\n", content)
-                 or (not receipt and content == b"released\n"))):
-        refuse("source pair has an unfinished owner or malformed release receipt")
-    record = name, fd, content, before
-    verify(record)
-    if receipt and content != token_bytes:
-        refuse("source pair release receipt belongs to another identity")
-    return record
-
-def confirm(record):
-    global stage
-    stage = "confirmation"
-    verify(record)
-    os.fsync(record[1])
-    os.fsync(directory)
-    verify(record)
-
-def publish(name, content, previous):
-    global stage
-    stage = "publication"
-    verify_parent()
-    temporary = ".pair-write." + os.urandom(16).hex()
-    fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                 0o600, dir_fd=directory)
-    descriptors.append(fd)
-    offset = 0
-    while offset < len(content):
-        written = os.write(fd, content[offset:])
-        if written <= 0:
-            refuse("incomplete private source pair publication")
-        offset += written
-    os.fsync(fd)
-    before = os.fstat(fd)
-    private = temporary, fd, content, before
-    verify(private)
-    if previous is None:
-        try:
-            os.stat(name, dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            refuse("source pair publication destination appeared")
-    else:
-        verify(previous)
-    # All legitimate publishers retain the same pair flock. Check the exact
-    # expected destination immediately before this indivisible replacement;
-    # immutable receipts only take the absent-destination arm above. A failed
-    # barrier keeps the new complete name and any private failure evidence.
-    os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
-    result = name, fd, content, os.fstat(fd)
-    confirm(result)
-    return result
-
-def receipt_or_publish():
-    if receipt_record is not None:
-        confirm(receipt_record)
-        return receipt_record
-    return publish(receipt_name, token_bytes, None)
-
-def require_root_absent():
-    try:
-        os.lstat(root)
-    except FileNotFoundError:
-        return
-    refuse("source pair has unretired source; refusing release or reuse")
-
-try:
-    operation, owner, receipt, token, root = sys.argv[1:]
-    if operation not in ("claim", "recover", "release", "cancel-owned", "cancel-unowned", "released"):
-        refuse("invalid source pair custody operation")
-    if re.fullmatch(r"[a-f0-9-]{1,128}", token) is None:
-        refuse("invalid source pair custody identity")
-    token_bytes = (token + "\n").encode("ascii")
-    parent, owner_name = os.path.split(owner)
-    receipt_parent, receipt_name = os.path.split(receipt)
-    if (not os.path.isabs(parent) or parent != receipt_parent or not owner_name
-            or not receipt_name or owner_name == receipt_name or not os.path.isabs(root)):
-        refuse("invalid source pair custody paths")
-    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    descriptors.append(directory)
-    verify_parent()
-    receipt_record = read_record(receipt_name, receipt=True)
-    if operation == "released" and receipt_record is None:
-        print("pending", end="", flush=True)
-    else:
-        owner_record = read_record(owner_name)
-        owner_bytes = owner_record[2] if owner_record is not None else None
-        if receipt_record is not None and owner_record is None:
-            refuse("source pair release receipt has no owner record")
-        if operation == "claim":
-            if receipt_record is not None:
-                refuse("source pair identity already released")
-            if owner_bytes not in (None, b"released\n"):
-                refuse("source pair has an unfinished owner; refusing reuse")
-            require_root_absent()
-            publish(owner_name, token_bytes, owner_record)
-        elif operation == "recover":
-            if owner_bytes != token_bytes or receipt_record is not None:
-                refuse("source pair has an unfinished owner or a completed release")
-            confirm(owner_record)
-        elif operation == "release":
-            if owner_bytes == b"released\n" and receipt_record is not None:
-                confirm(receipt_record)
-                confirm(owner_record)
-            else:
-                if owner_bytes != token_bytes:
-                    refuse("source pair owner changed before release")
-                require_root_absent()
-                receipt_or_publish()
-                publish(owner_name, b"released\n", owner_record)
-        elif operation == "released":
-            # A historical receipt never authorizes touching a successor's
-            # source tree or changing its complete owner. Missing/malformed
-            # owner evidence is not silently repaired from an old receipt.
-            confirm(receipt_record)
-            if owner_bytes == token_bytes:
-                require_root_absent()
-                publish(owner_name, b"released\n", owner_record)
-            else:
-                confirm(owner_record)
-            print("released", end="", flush=True)
-        elif operation == "cancel-owned":
-            if owner_bytes == token_bytes:
-                if receipt_record is not None:
-                    # Release can stop after the durable receipt and before
-                    # replacing its exact owner. Finish only that frontier;
-                    # neither a partial owner nor a successor is repaired.
-                    require_root_absent()
-                    confirm(receipt_record)
-                    publish(owner_name, b"released\n", owner_record)
-                    print("unowned", end="", flush=True)
-                else:
-                    confirm(owner_record)
-                    print("owned", end="", flush=True)
-            else:
-                if receipt_record is not None:
-                    confirm(receipt_record)
-                if owner_record is not None:
-                    confirm(owner_record)
-                print("unowned", end="", flush=True)
-        else:
-            # The caller has independently proved the source intent unowned.
-            # A pair acquired before that intent can be retired, but this
-            # operation never inspects or grants access to its source path.
-            if owner_bytes == token_bytes:
-                receipt_or_publish()
-                publish(owner_name, b"released\n", owner_record)
-            else:
-                if receipt_record is not None:
-                    confirm(receipt_record)
-                if owner_record is not None:
-                    confirm(owner_record)
-            print("unowned", end="", flush=True)
-except (OSError, ValueError) as error:
-    diagnostic = ("RCH_SOURCE_PAIR_PUBLICATION_UNCONFIRMED" if stage != "validation"
-                  else "RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED")
-    print(diagnostic + " stage=" + stage + ": " + str(error), file=sys.stderr)
-    sys.exit(73)
-finally:
-    for fd in reversed(descriptors):
-        os.close(fd)
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED deploy rch-wkr with source-pair support' >&2
+    exit 73
+fi
+if ! rch_pair_probe=$("$RCH_WKR" source-pair probe </dev/null) \
+    || [ "$rch_pair_probe" != 'rch-wkr source-pair v1' ]; then
+    printf '%s\n' 'RCH_SOURCE_PAIR_OWNERSHIP_UNCONFIRMED deploy the matching rch-wkr with source-pair support' >&2
+    exit 73
+fi
+exec "$RCH_WKR" source-pair "$@"
 "#;
 const SOURCE_CLAIM_REGISTRY: &str = include_str!("source_claim_registry.sh");
 const REMOTE_SOURCE_CLAIM_REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
@@ -2133,9 +1933,16 @@ fn source_pair_custody_command(
         "{lock_path}.released-{}",
         blake3::hash(token.as_bytes()).to_hex()
     );
+    let program = format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        SOURCE_PAIR_CUSTODY,
+    );
+    #[cfg(test)]
+    let program = format!("{}{program}", test_worker_default());
     format!(
-        "python3 -I -S -c {program} {operation} {owner} {receipt} {token} {root}",
-        program = quote(SOURCE_PAIR_CUSTODY),
+        "sh -c {program} rch-source-pair {operation} {owner} {receipt} {token} {root}",
+        program = quote(&program),
         operation = quote(operation),
         owner = quote(&owner),
         receipt = quote(&receipt),

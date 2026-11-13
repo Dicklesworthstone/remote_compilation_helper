@@ -18,6 +18,7 @@ mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
 mod source_lock;
+mod source_pair;
 mod source_release;
 mod source_retain;
 mod source_settlement;
@@ -147,6 +148,12 @@ enum Commands {
     /// Internal exact namespace discovery and terminal cancellation settlement.
     #[command(hide = true)]
     SourceSettlement {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal durable custody and release receipts for clean-overlay pairs.
+    #[command(hide = true)]
+    SourcePair {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -411,6 +418,9 @@ fn main() -> Result<()> {
     if let Commands::SourceSettlement { arguments } = &cli.command {
         std::process::exit(source_settlement::main(arguments));
     }
+    if let Commands::SourcePair { arguments } = &cli.command {
+        std::process::exit(source_pair::main(arguments));
+    }
     if let Commands::SourceAdmission { arguments } = &cli.command {
         std::process::exit(source_admission::main(arguments));
     }
@@ -544,6 +554,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceSettlement { .. } => {
             anyhow::bail!("source-settlement requires the synchronous worker entry point")
+        }
+        Commands::SourcePair { .. } => {
+            anyhow::bail!("source-pair requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {
