@@ -8,7 +8,7 @@
 use super::super::ssh::{
     RemoteSourceAuthorityLock, acquire_remote_source_authority_lock,
     canonical_source_authority_root, run_offload_ssh_command_with_stdin,
-    validate_source_authority_intent,
+    source_namespace_control_script, validate_source_authority_intent,
 };
 use super::{PathTopologyPolicy, SyncClosurePlanEntry, WorkerConfig};
 use anyhow::Context as _;
@@ -20,7 +20,6 @@ use std::time::Duration;
 const REGISTRY: &str = "/var/tmp/rch-source-authority-locks/claims-v1";
 const PATHS: &str = include_str!("source_namespace_paths.sh");
 const ADMISSION: &str = include_str!("source_claim_admission.sh");
-const CONTROL: &str = include_str!("source_namespace_control.sh");
 const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
 
 /// A completed namespace verdict proved that this worker's existing physical
@@ -290,7 +289,7 @@ fn namespace_preflight_command(
         &guard,
         rch_common::timing::scale_duration(Duration::from_secs(30)),
     );
-    let controller = shell_escape::escape(CONTROL.into());
+    let controller = shell_escape::escape(source_namespace_control_script().into());
     let mut delimiter = format!("RCH_NAMESPACE_{}", uuid::Uuid::new_v4().simple());
     while initializer.lines().any(|line| line == delimiter) {
         delimiter.push('_');
@@ -917,7 +916,7 @@ mod tests {
         let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
         let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
         let mut child = std::process::Command::new("sh")
-            .args(["-c", CONTROL])
+            .args(["-c", &source_namespace_control_script()])
             .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -983,7 +982,7 @@ mod tests {
             let policy = PathTopologyPolicy::new(canonical.to_path_buf(), alias.clone());
             let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
             let mut child = std::process::Command::new("sh")
-                .args(["-c", CONTROL])
+                .args(["-c", &source_namespace_control_script()])
                 .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

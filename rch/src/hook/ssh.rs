@@ -1066,6 +1066,15 @@ fn source_intent_command(
     }
 }
 
+/// Pair the native namespace controller adapter with the shared worker locator.
+pub(super) fn source_namespace_control_script() -> String {
+    format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        include_str!("source_namespace_control.sh"),
+    )
+}
+
 /// Bound the worker process tree as well as the local SSH client. A client
 /// timeout alone can leave a queued flock transaction that wakes much later
 /// and publishes cancellation after its caller has gone. The controller
@@ -1080,7 +1089,7 @@ async fn run_source_metadata_rpc(
         "{}set -- {}\n{}",
         rch_common::timing::shell_prefix(),
         shell_escape::escape(contract.into()),
-        include_str!("source_namespace_control.sh"),
+        source_namespace_control_script(),
     );
     run_offload_ssh_command_with_stdin(
         worker,
@@ -1864,7 +1873,7 @@ async fn spawn_source_authority_lock(
     }
     cmd.arg(&destination);
     let platform = WorkerPlatform::from_worker(worker);
-    // Python process groups are available on Linux/Darwin, not native Windows.
+    // Native session supervision is available on Linux/Darwin, not Windows.
     // Windows retains its existing transport until a native liveness backend
     // has been qualified; never silently claim that TCP keepalive is the same.
     let heartbeat = !platform.is_windows();
@@ -2228,16 +2237,29 @@ async fn run_offload_ssh_command_with_optional_stdin(
     cmd.kill_on_drop(true);
 
     use anyhow::Context as _;
-    use tokio::io::AsyncWriteExt as _;
 
     anyhow::ensure!(
         tokio::time::Instant::now() < deadline,
         "SSH command timed out after {:?}",
         timeout_duration
     );
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
+
+    collect_offload_ssh_child(child, stdin_payload, timeout_duration, deadline).await
+}
+
+/// Collect the configured foreground transport, preserving explicit refusals
+/// while requiring a complete upload before accepting a successful response.
+async fn collect_offload_ssh_child(
+    mut child: tokio::process::Child,
+    stdin_payload: Option<&[u8]>,
+    timeout_duration: Duration,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<Output> {
+    use anyhow::Context as _;
+    use tokio::io::AsyncWriteExt as _;
 
     // Drain stdout/stderr concurrently with the wait so that even verbose
     // remote output never deadlocks the child on a full pipe buffer.
@@ -2248,11 +2270,24 @@ async fn run_offload_ssh_command_with_optional_stdin(
     let collect = async {
         let stdin_fut = async {
             if let (Some(mut pipe), Some(payload)) = (stdin_pipe.take(), stdin_payload.as_deref()) {
-                pipe.write_all(payload).await?;
-                pipe.shutdown().await?;
+                let written = async {
+                    pipe.write_all(payload).await?;
+                    pipe.shutdown().await
+                }
+                .await;
                 drop(pipe);
+                match written {
+                    Ok(()) => {}
+                    // A worker can refuse before reading its program. Keep
+                    // draining its diagnostic and require an actual failure
+                    // status before treating this early closure as a reply.
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                        return Ok(Some(error));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            Ok::<_, std::io::Error>(())
+            Ok::<_, std::io::Error>(None)
         };
         let stdout_fut = async {
             match stdout_pipe.take() {
@@ -2272,8 +2307,16 @@ async fn run_offload_ssh_command_with_optional_stdin(
                 None => Ok(Vec::new()),
             }
         };
-        let ((), stdout_bytes, stderr_bytes) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
+        let (upload_error, stdout_bytes, stderr_bytes) =
+            tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
         let status = child.wait().await?;
+        // A success receipt cannot establish that an incompletely uploaded
+        // program ran. Preserve the original upload error in that case.
+        if status.success()
+            && let Some(error) = upload_error
+        {
+            return Err(error);
+        }
         Ok::<_, std::io::Error>(Output {
             status,
             stdout: stdout_bytes,
@@ -2722,6 +2765,63 @@ pub(super) async fn ensure_worker_projects_topology(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[cfg(unix)]
+    fn offload_capture_fixture(program: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .args(["-c", program])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offload_capture_preserves_early_refusal_after_incomplete_upload() {
+        // The child never reads stdin, so this cannot fit into its pipe before
+        // closure. Exercise the same post-spawn collector used by real SSH.
+        let input = vec![b'x'; 8 * 1024 * 1024];
+        for status in [2, 73, 75] {
+            let child = offload_capture_fixture(&format!(
+                "exec 0<&-; printf 'partial reply\\n'; printf 'early refusal\\n' >&2; exit {status}"
+            ));
+            let budget = Duration::from_secs(5);
+            let output = collect_offload_ssh_child(
+                child,
+                Some(&input),
+                budget,
+                tokio::time::Instant::now() + budget,
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.status.code(), Some(status));
+            assert_eq!(output.stdout, b"partial reply\n");
+            assert_eq!(output.stderr, b"early refusal\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offload_capture_rejects_success_after_incomplete_upload() {
+        let input = vec![b'x'; 8 * 1024 * 1024];
+        let child = offload_capture_fixture("exec 0<&-; printf 'RCH_TOPOLOGY_OK\\n'; exit 0");
+        let budget = Duration::from_secs(5);
+        let error = collect_offload_ssh_child(
+            child,
+            Some(&input),
+            budget,
+            tokio::time::Instant::now() + budget,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe,
+        );
+    }
 
     /// The rch-wkr Cargo built beside this test executable. Cargo uplifts it
     /// to the profile directory, an ancestor of the test binary in both the
@@ -4465,10 +4565,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             };
             let remote = build_remote_shell_command(
                 WorkerPlatform::Posix,
-                &format!(
-                    "set -- {contract}\n{}",
-                    include_str!("source_namespace_control.sh")
-                ),
+                &format!("set -- {contract}\n{}", source_namespace_control_script()),
             );
             if attempt == 4 {
                 // Replace just this name: the complete receipt and original
@@ -4498,12 +4595,13 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 })
             });
             // Use the real generated upload, login-shell quoting and bounded
-            // controller. The standalone Python qualification uses shlex and
-            // cannot detect a regression in these Rust command boundaries.
+            // controller, including the exact shell boundaries used in
+            // production to preserve quoted evidence and reply contracts.
             let mut child = Command::new("sh")
                 .args(["-c", &remote])
                 .current_dir(directory.path())
                 .env("TMPDIR", &control)
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
