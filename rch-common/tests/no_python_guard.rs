@@ -37,7 +37,6 @@ const PORT_DEBT: &[(&str, usize)] = &[
     ("install.sh", 4),
     ("rabs-key/src/bin/layer0_render.rs", 5),
     ("rch-common/src/ssh.rs", 6),
-    ("rch-common/src/stale_target_reap.rs", 5),
     ("rch-common/src/toolchain/worker_cache.rs", 7),
     ("rch-common/tests/control_deadlines.rs", 2),
     ("rch-common/tests/isolated_staging.rs", 2),
