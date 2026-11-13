@@ -353,6 +353,9 @@ impl Drop for OwnedProcessGroup {
 /// returned as successful output. The local child and its process group remain
 /// owned until both pipes drain and the child is reaped. A pipe-holding descendant
 /// therefore expires the operation even if its leader already exited.
+/// A peer which closes its input early can still return a complete refusal:
+/// BrokenPipe preserves that non-success status and its bounded diagnostics.
+/// An incomplete upload can never authorize a successful response.
 ///
 /// SSH callers must configure a foreground transport before calling this helper.
 /// Local transport cleanup does not establish that a remote workload has stopped.
@@ -521,14 +524,20 @@ async fn capture_control_output_with_ownership(
             if let Some(input) = input {
                 let mut stdin = stdin
                     .ok_or_else(|| std::io::Error::other("control command stdin pipe missing"))?;
-                stdin.write_all(input).await?;
+                let written = stdin.write_all(input).await;
                 // Close stdin after the finite program, allowing the peer to
-                // finish parsing it while output collection continues.
+                // finish parsing it while output collection continues. Close
+                // it on refusal too; only BrokenPipe is deferred until status.
                 drop(stdin);
+                return match written {
+                    Ok(()) => Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(Some(error)),
+                    Err(error) => Err(error),
+                };
             }
-            Ok::<_, std::io::Error>(())
+            Ok::<_, std::io::Error>(None)
         };
-        let ((), stdout, stderr) = tokio::try_join!(
+        let (upload_error, stdout, stderr) = tokio::try_join!(
             upload,
             read_control_stream(stdout, "stdout", stdout_buffer),
             read_control_stream(stderr, "stderr", stderr_buffer),
@@ -537,6 +546,11 @@ async fn capture_control_output_with_ownership(
         // group members there. Locally forcing EOF must never turn partial
         // evidence into success; supervised callers verify their own receipt.
         let status = process.wait().await?;
+        if status.success()
+            && let Some(error) = upload_error
+        {
+            return Err(error);
+        }
         Ok(std::process::Output {
             status,
             stdout,
@@ -3561,12 +3575,9 @@ while True: signal.pause()
         let (mut writer, reader) = tokio::io::duplex(256);
         writer.write_all(&[b'x'; 129]).await.unwrap();
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(25),
-                read_command_output(reader, 64),
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(Duration::from_millis(25), read_command_output(reader, 64),)
+                .await
+                .is_err(),
             "a full preview is not EOF while a writer still owns its pipe"
         );
         drop(writer);
@@ -3610,7 +3621,11 @@ exit 37
         .await
         .expect("both over-limit native pipes must drain without deadlock")
         .unwrap();
-        assert_eq!(status.code(), Some(37), "preserve the command's actual exit");
+        assert_eq!(
+            status.code(),
+            Some(37),
+            "preserve the command's actual exit"
+        );
         assert_eq!(std::fs::read(&finished).unwrap(), b"complete\n");
         for (output, prefix) in [(stdout, "stdout payload"), (stderr, "stderr payload")] {
             assert!(output.starts_with(prefix));
