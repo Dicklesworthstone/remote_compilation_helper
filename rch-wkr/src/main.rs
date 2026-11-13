@@ -19,6 +19,7 @@ mod result_probe;
 mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
+mod source_freshness;
 mod source_lock;
 mod source_pair;
 mod source_release;
@@ -133,6 +134,12 @@ enum Commands {
     /// Internal exact source-content manifest verification over stdin.
     #[command(hide = true)]
     VerifySourceContent {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal content-aware source timestamp preparation and qualification.
+    #[command(hide = true)]
+    SourceFreshness {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -466,6 +473,9 @@ fn main() -> Result<()> {
     if let Commands::VerifySourceContent { arguments } = &cli.command {
         std::process::exit(source_verifier::main(arguments));
     }
+    if let Commands::SourceFreshness { arguments } = &cli.command {
+        std::process::exit(source_freshness::main(arguments));
+    }
     if let Commands::SourceRetain { arguments } = &cli.command {
         std::process::exit(source_retain::main(arguments));
     }
@@ -611,6 +621,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::VerifySourceContent { .. } => {
             anyhow::bail!("verify-source-content requires the synchronous worker entry point")
+        }
+        Commands::SourceFreshness { .. } => {
+            anyhow::bail!("source-freshness requires the synchronous worker entry point")
         }
         Commands::SourceRetain { .. } => {
             anyhow::bail!("source-retain requires the synchronous worker entry point")
