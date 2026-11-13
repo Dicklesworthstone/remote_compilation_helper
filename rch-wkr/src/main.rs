@@ -5,11 +5,32 @@
 
 #![forbid(unsafe_code)]
 
+mod artifact_headers;
 mod cache;
+mod control_capture;
+mod control_clock;
+mod disk_supervisor;
 mod executor;
+mod file_sync;
+mod git_archive_cache;
 mod prepare;
 mod recovery_reserve;
+mod result_probe;
+mod scoped_launch;
+mod source_admission;
+mod source_claim_link;
+mod source_control;
+mod source_freshness;
+mod source_lock;
+mod source_pair;
+mod source_release;
+mod source_retain;
+mod source_settlement;
+mod source_upload;
+mod source_verifier;
+mod staging_gc;
 mod toolchain;
+mod worker_cache;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,11 +56,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal bounded source-admission clock and metadata-lock handoff.
+    #[command(hide = true)]
+    SourceAdmission {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal storage-independent, bounded lifecycle command observation.
+    #[command(hide = true)]
+    ControlCapture {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal bounded source-namespace execution and session settlement.
+    #[command(hide = true)]
+    SourceControl {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal descriptor-relative staging collection under source custody.
+    #[command(hide = true)]
+    StagingGc {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal worker-local RABS preparation followed by one Cargo exec.
+    #[command(hide = true)]
+    WorkerCache {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal monotonic observation and source-admission budgets.
+    #[command(hide = true)]
+    ControlClock {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal disk reservation, measurement and execution supervision.
+    #[command(hide = true)]
+    DiskSupervise {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal descriptor and process-group checks for scoped launches.
+    #[command(hide = true)]
+    ScopedLaunch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal bounded executable-header evidence for artifact preflight.
+    #[command(hide = true)]
+    ArtifactHeaders {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Start a new session, then exec the command (Darwin has setsid(2) but
     /// no setsid(1)). Internal: used by the remote build launcher.
     #[cfg(unix)]
     #[command(hide = true)]
     Setsid {
+        /// Restore standard descriptors that were closed before worker startup.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=7))]
+        closed_stdio: u8,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<std::ffi::OsString>,
     },
@@ -49,6 +127,84 @@ enum Commands {
     RecoveryReserve {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
+    },
+    /// Internal durable-file sync used before publishing completion receipts.
+    #[command(hide = true)]
+    FileSync {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal verified Git source-archive cache for clean-overlay transfer.
+    #[command(hide = true)]
+    GitArchiveCache {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal descriptor-relative result-directory observation for recovery.
+    #[command(hide = true)]
+    ResultDirectory {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal source namespace creation and read-only topology checks.
+    #[command(hide = true)]
+    SourceNamespacePaths {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal exact source-content manifest verification over stdin.
+    #[command(hide = true)]
+    VerifySourceContent {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal content-aware source timestamp preparation and qualification.
+    #[command(hide = true)]
+    SourceFreshness {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal no-replace retirement of an owned source tree.
+    #[command(hide = true)]
+    SourceRetain {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal advisory source locks and independently supervised liveness.
+    #[command(hide = true)]
+    SourceLock {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal no-copy publication of verified source cancellation records.
+    #[command(hide = true)]
+    SourceClaimLink {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal cancellation observation and exact source-lock release framing.
+    #[command(hide = true)]
+    SourceRelease {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
+    /// Internal exact namespace discovery and terminal cancellation settlement.
+    #[command(hide = true)]
+    SourceSettlement {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal durable custody and release receipts for clean-overlay pairs.
+    #[command(hide = true)]
+    SourcePair {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal source receiver admission under an exact durable source grant.
+    #[command(hide = true)]
+    SourceUpload {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
     },
     /// Read a Darwin kernel birth/group witness for remote lifecycle control.
     ProcessIdentity {
@@ -257,6 +413,42 @@ enum OutputFormat {
     Pretty,
 }
 
+/// Reexecute this deployed worker without relying on the remote shell's PATH.
+pub(crate) fn native_worker_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+    }
+    #[cfg(test)]
+    {
+        // The unit-test executable has libtest's entry point. Its child must
+        // use the real worker binary to exercise the production CLI contract.
+        if let Some(path) = std::env::var_os("RCH_WKR_BIN") {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "RCH_WKR_BIN must name the matching worker binary",
+            ));
+        }
+        let current = std::env::current_exe()?;
+        let name = format!("rch-wkr{}", std::env::consts::EXE_SUFFIX);
+        current
+            .ancestors()
+            .skip(1)
+            .map(|directory| directory.join(&name))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "build rch-wkr beside these tests or set RCH_WKR_BIN",
+                )
+            })
+    }
+}
+
 fn main() -> Result<()> {
     exit_quietly_when_stdout_reader_is_gone();
     let cli = Cli::parse();
@@ -267,14 +459,84 @@ fn main() -> Result<()> {
     if let Commands::ProcessIdentity { pid } = &cli.command {
         return print_process_identity(*pid);
     }
+    if let Commands::ControlCapture { arguments } = &cli.command {
+        std::process::exit(control_capture::main(arguments));
+    }
+    if let Commands::SourceControl { arguments } = &cli.command {
+        std::process::exit(source_control::main(arguments));
+    }
+    if let Commands::StagingGc { arguments } = &cli.command {
+        std::process::exit(staging_gc::main(arguments));
+    }
+    if let Commands::WorkerCache { arguments } = &cli.command {
+        std::process::exit(worker_cache::main(arguments));
+    }
+    if let Commands::ControlClock { arguments } = &cli.command {
+        std::process::exit(control_clock::main(arguments));
+    }
+    if let Commands::DiskSupervise { arguments } = &cli.command {
+        std::process::exit(disk_supervisor::main(arguments));
+    }
+    if let Commands::ScopedLaunch { arguments } = &cli.command {
+        std::process::exit(scoped_launch::main(arguments));
+    }
     // Reserve operations run sh in place of this process while holding a
     // lease; like the identity probe they need no runtime or logging.
     if let Commands::RecoveryReserve { arguments } = &cli.command {
         std::process::exit(recovery_reserve::main(arguments));
     }
+    if let Commands::ArtifactHeaders { arguments } = &cli.command {
+        std::process::exit(artifact_headers::main(arguments));
+    }
+    if let Commands::FileSync { arguments } = &cli.command {
+        std::process::exit(file_sync::main(arguments));
+    }
+    if let Commands::GitArchiveCache { arguments } = &cli.command {
+        std::process::exit(git_archive_cache::main(arguments));
+    }
+    if let Commands::ResultDirectory { arguments } = &cli.command {
+        std::process::exit(result_probe::main(arguments));
+    }
+    if let Commands::SourceNamespacePaths { arguments } = &cli.command {
+        std::process::exit(rch_common::source_namespace_paths::main(arguments));
+    }
+    if let Commands::VerifySourceContent { arguments } = &cli.command {
+        std::process::exit(source_verifier::main(arguments));
+    }
+    if let Commands::SourceFreshness { arguments } = &cli.command {
+        std::process::exit(source_freshness::main(arguments));
+    }
+    if let Commands::SourceRetain { arguments } = &cli.command {
+        std::process::exit(source_retain::main(arguments));
+    }
+    if let Commands::SourceLock { arguments } = &cli.command {
+        std::process::exit(source_lock::main(arguments));
+    }
+    if let Commands::SourceClaimLink { arguments } = &cli.command {
+        std::process::exit(source_claim_link::main(arguments));
+    }
+    if let Commands::SourceRelease { arguments } = &cli.command {
+        std::process::exit(source_release::main(arguments));
+    }
+    if let Commands::SourceSettlement { arguments } = &cli.command {
+        std::process::exit(source_settlement::main(arguments));
+    }
+    if let Commands::SourcePair { arguments } = &cli.command {
+        std::process::exit(source_pair::main(arguments));
+    }
+    if let Commands::SourceUpload { arguments } = &cli.command {
+        std::process::exit(source_upload::main(arguments));
+    }
+    if let Commands::SourceAdmission { arguments } = &cli.command {
+        std::process::exit(source_admission::main(arguments));
+    }
     #[cfg(unix)]
-    if let Commands::Setsid { command } = &cli.command {
-        return exec_in_new_session(command);
+    if let Commands::Setsid {
+        command,
+        closed_stdio,
+    } = &cli.command
+    {
+        return exec_in_new_session(command, *closed_stdio);
     }
     #[cfg(target_os = "linux")]
     if let Commands::PrepareInstaller {
@@ -322,9 +584,14 @@ fn is_lost_reader_panic(payload: &(dyn std::any::Any + Send)) -> bool {
 /// `setsid(1)` for hosts without one: become a session leader, then exec.
 /// Only returns (exit 1) when the session or the exec fails.
 #[cfg(unix)]
-fn exec_in_new_session(command: &[std::ffi::OsString]) -> Result<()> {
+fn exec_in_new_session(command: &[std::ffi::OsString], closed_stdio: u8) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     rustix::process::setsid().context("setsid")?;
+    for fd in 0..3 {
+        if closed_stdio & (1 << fd) != 0 {
+            nix::unistd::close(fd).context("restore closed standard descriptor")?;
+        }
+    }
     let error = std::process::Command::new(&command[0])
         .args(&command[1..])
         .exec();
@@ -348,9 +615,75 @@ async fn run_worker(cli: Cli) -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
+        Commands::SourceAdmission { .. } => {
+            anyhow::bail!("source-admission requires the synchronous worker entry point")
+        }
+        Commands::ControlCapture { .. } => {
+            anyhow::bail!("control-capture requires the synchronous worker entry point")
+        }
+        Commands::SourceControl { .. } => {
+            anyhow::bail!("source-control requires the synchronous worker entry point")
+        }
+        Commands::StagingGc { .. } => {
+            anyhow::bail!("staging-gc requires the synchronous worker entry point")
+        }
+        Commands::WorkerCache { .. } => {
+            anyhow::bail!("worker-cache requires the synchronous worker entry point")
+        }
+        Commands::ControlClock { .. } => {
+            anyhow::bail!("control-clock requires the synchronous worker entry point")
+        }
+        Commands::DiskSupervise { .. } => {
+            anyhow::bail!("disk-supervise requires the synchronous worker entry point")
+        }
+        Commands::ScopedLaunch { .. } => {
+            anyhow::bail!("scoped-launch requires the synchronous worker entry point")
+        }
+        Commands::ArtifactHeaders { .. } => {
+            anyhow::bail!("artifact-headers requires the synchronous worker entry point")
+        }
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
         Commands::RecoveryReserve { .. } => {
             anyhow::bail!("recovery-reserve requires the synchronous worker entry point")
+        }
+        Commands::FileSync { .. } => {
+            anyhow::bail!("file-sync requires the synchronous worker entry point")
+        }
+        Commands::GitArchiveCache { .. } => {
+            anyhow::bail!("git-archive-cache requires the synchronous worker entry point")
+        }
+        Commands::ResultDirectory { .. } => {
+            anyhow::bail!("result-directory requires the synchronous worker entry point")
+        }
+        Commands::SourceNamespacePaths { .. } => {
+            anyhow::bail!("source-namespace-paths requires the synchronous worker entry point")
+        }
+        Commands::VerifySourceContent { .. } => {
+            anyhow::bail!("verify-source-content requires the synchronous worker entry point")
+        }
+        Commands::SourceFreshness { .. } => {
+            anyhow::bail!("source-freshness requires the synchronous worker entry point")
+        }
+        Commands::SourceRetain { .. } => {
+            anyhow::bail!("source-retain requires the synchronous worker entry point")
+        }
+        Commands::SourceLock { .. } => {
+            anyhow::bail!("source-lock requires the synchronous worker entry point")
+        }
+        Commands::SourceClaimLink { .. } => {
+            anyhow::bail!("source-claim-link requires the synchronous worker entry point")
+        }
+        Commands::SourceRelease { .. } => {
+            anyhow::bail!("source-release requires the synchronous worker entry point")
+        }
+        Commands::SourceSettlement { .. } => {
+            anyhow::bail!("source-settlement requires the synchronous worker entry point")
+        }
+        Commands::SourcePair { .. } => {
+            anyhow::bail!("source-pair requires the synchronous worker entry point")
+        }
+        Commands::SourceUpload { .. } => {
+            anyhow::bail!("source-upload requires the synchronous worker entry point")
         }
         #[cfg(unix)]
         Commands::Setsid { .. } => {

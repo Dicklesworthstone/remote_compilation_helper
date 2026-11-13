@@ -341,6 +341,8 @@ The existing selection settings remain independent controls:
 [selection]
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
+disk_warning_free_ratio = 0.12
+disk_warning_ratio_cap_gb = "uncapped"
 disk_critical_free_ratio = 0.05
 disk_critical_ratio_cap_gb = 25.0
 ```
@@ -375,9 +377,38 @@ stricter mode. Numeric caps must be finite and at least 10 GiB. The CLI rejects
 invalid values before writing; invalid numeric file settings make the daemon
 use the stricter uncapped rule and log the reason.
 
-Restart the daemon after selection-policy changes; the startup log records the
-effective critical thresholds, protected floor and per-slot budget. Update the
-dispatcher, daemon, and worker together: a new dispatcher talking to an older
+The warning ratio is separately configurable. Its defaults retain the previous
+12% warning with no absolute cap. For a large build disk, for example:
+
+```toml
+[selection]
+disk_warning_free_ratio = 0.07
+disk_warning_ratio_cap_gb = 50.0
+```
+
+This warns on the ratio only when the disk is at most 7% free **and** has at most
+50 GiB free. A 1,900 GiB disk with 171 GiB available therefore avoids the ratio
+warning. The independent 25 GiB warning floor, 10 GiB critical floor, critical
+ratio, memory/I/O pressure, `/tmp` safety floor and build reservations remain
+active. Warning caps must be finite and at least 25 GiB, or `"uncapped"`.
+Ratios must satisfy `0 < disk_critical_free_ratio < disk_warning_free_ratio < 1`.
+The `[remediation.disk_pressure] warning_avail_pct` setting controls disk
+pressure reports; daemon selection uses these `[selection]` settings.
+
+Use `rch config set selection.disk_warning_free_ratio 0.07` and
+`rch config set selection.disk_warning_ratio_cap_gb 50` to edit the dispatcher
+config, then `rch daemon reload`. The reload reports whether the disk policy
+changed, and worker assessments adopt it on the next monitor cycle (within
+30 seconds). Automatic config watching and SIGHUP use the same reload path.
+Invalid reloads preserve the last installed policy. Removing a config file
+also preserves that policy; reset the keys or write an explicit configuration
+to restore defaults. `rch config get selection.disk_warning_ratio_cap_gb
+--sources` shows the effective setting and where it came from.
+
+The four disk ratio/cap settings reload without restarting the daemon. Other
+selection settings, including the protected floor and per-slot budget, still
+require a restart. The startup log records the effective thresholds. Update
+the dispatcher, daemon, and worker together: a new dispatcher talking to an older
 daemon uses a conservative cold command budget and a 10 GiB floor, without the
 new daemon history policy.
 

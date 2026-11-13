@@ -7,9 +7,11 @@
 
 use crate::telemetry::TelemetryStore;
 use crate::workers::{WorkerPool, WorkerState};
+use anyhow::Context;
 use rch_common::WorkerCapabilities;
 use rch_telemetry::protocol::ReceivedTelemetry;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -425,7 +427,7 @@ impl DiskSlotPolicy {
 }
 
 /// Policy thresholds for pressure classification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiskPressurePolicyConfig {
     /// Poll cadence for monitor evaluations.
     pub poll_interval: Duration,
@@ -437,6 +439,9 @@ pub struct DiskPressurePolicyConfig {
     pub critical_free_gb: f64,
     /// Warning free-ratio threshold.
     pub warning_free_ratio: f64,
+    /// Optional absolute cap on the warning ratio rule. Independent absolute
+    /// floors, critical pressure and per-build admission remain enforced.
+    pub warning_free_ratio_cap_gb: Option<f64>,
     /// Critical free-ratio threshold.
     pub critical_free_ratio: f64,
     /// When set, the critical ratio rule applies only at or below this many
@@ -466,7 +471,8 @@ impl Default for DiskPressurePolicyConfig {
             telemetry_stale_after: Duration::from_secs(90),
             warning_free_gb: 25.0,
             critical_free_gb: 10.0,
-            warning_free_ratio: 0.12,
+            warning_free_ratio: selection.disk_warning_free_ratio,
+            warning_free_ratio_cap_gb: selection.disk_warning_ratio_cap_gb,
             critical_free_ratio: selection.disk_critical_free_ratio,
             critical_free_ratio_cap_gb: selection.disk_critical_ratio_cap_gb,
             tmp_critical_free_gb: 2.0,
@@ -478,8 +484,79 @@ impl Default for DiskPressurePolicyConfig {
     }
 }
 
-static CONFIGURED_POLICY: std::sync::OnceLock<DiskPressurePolicyConfig> =
+static CONFIGURED_POLICY: std::sync::OnceLock<Arc<DiskPressurePolicyStore>> =
     std::sync::OnceLock::new();
+
+/// One reloadable policy shared by the monitor, capability publication and
+/// admission. The source path is frozen at startup, like workers.toml.
+struct DiskPressurePolicyStore {
+    policy: std::sync::RwLock<DiskPressurePolicyConfig>,
+    source_path: Option<PathBuf>,
+}
+
+impl DiskPressurePolicyStore {
+    fn new(policy: DiskPressurePolicyConfig, source_path: Option<PathBuf>) -> Self {
+        Self {
+            policy: std::sync::RwLock::new(policy),
+            source_path,
+        }
+    }
+
+    fn snapshot(&self) -> DiskPressurePolicyConfig {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn reload(&self) -> anyhow::Result<bool> {
+        let Some(path) = &self.source_path else {
+            return Ok(false);
+        };
+        // Serialize the read as well as publication so a slow old reload
+        // cannot overwrite a newer configuration snapshot.
+        let mut current = self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A config file is optional on first-run installations. Its
+                // removal during an editor's atomic replacement must not reset
+                // an already installed policy either.
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not reload disk pressure policy from {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        let config: rch_common::RchConfig = toml::from_str(&contents).with_context(|| {
+            format!("Invalid disk pressure configuration in {}", path.display())
+        })?;
+        DiskPressurePolicyConfig::validate_selection(&config.selection).with_context(|| {
+            format!("Retaining disk pressure policy; invalid {}", path.display())
+        })?;
+        let next = DiskPressurePolicyConfig::from_selection(&config.selection);
+        if *current == next {
+            return Ok(false);
+        }
+        info!(
+            warning_free_ratio = next.warning_free_ratio,
+            warning_free_ratio_cap_gb = ?next.warning_free_ratio_cap_gb,
+            critical_free_ratio = next.critical_free_ratio,
+            critical_free_ratio_cap_gb = ?next.critical_free_ratio_cap_gb,
+            "Reloaded disk pressure policy; existing observations will be re-evaluated"
+        );
+        *current = next;
+        Ok(true)
+    }
+}
 
 impl DiskPressurePolicyConfig {
     /// The default policy with the operator's `[selection]` disk overrides.
@@ -487,6 +564,36 @@ impl DiskPressurePolicyConfig {
     /// stricter unconditional ratio rule, and both cases are logged.
     pub fn from_selection(selection: &rch_common::SelectionConfig) -> Self {
         let mut policy = Self::default();
+        let warning = selection.disk_warning_free_ratio;
+        let critical = selection.disk_critical_free_ratio;
+        // Validate the pair together: an invalid warning override must never
+        // silently make a previously valid critical override less protective.
+        if warning.is_finite()
+            && critical.is_finite()
+            && critical > 0.0
+            && warning > 0.0
+            && warning < 1.0
+            && warning > critical
+        {
+            policy.warning_free_ratio = warning;
+        } else {
+            tracing::warn!(
+                warning,
+                critical,
+                "ignoring selection.disk_warning_free_ratio outside (critical ratio, 1)"
+            );
+        }
+        policy.warning_free_ratio_cap_gb = match selection.disk_warning_ratio_cap_gb {
+            Some(cap) if cap.is_finite() && cap >= policy.warning_free_gb => Some(cap),
+            Some(cap) => {
+                tracing::warn!(
+                    cap,
+                    "invalid selection.disk_warning_ratio_cap_gb; using the stricter uncapped warning rule (cap must be finite and at least warning_free_gb)"
+                );
+                None
+            }
+            None => None,
+        };
         let ratio = selection.disk_critical_free_ratio;
         if ratio.is_finite() && ratio > 0.0 && ratio < policy.warning_free_ratio {
             policy.critical_free_ratio = ratio;
@@ -510,14 +617,61 @@ impl DiskPressurePolicyConfig {
         policy
     }
 
-    /// Install the daemon's policy once at startup.
-    pub fn install(policy: Self) {
-        let _ = CONFIGURED_POLICY.set(policy);
+    fn validate_selection(selection: &rch_common::SelectionConfig) -> anyhow::Result<()> {
+        let warning = selection.disk_warning_free_ratio;
+        let critical = selection.disk_critical_free_ratio;
+        anyhow::ensure!(
+            warning.is_finite()
+                && critical.is_finite()
+                && critical > 0.0
+                && critical < warning
+                && warning < 1.0,
+            "selection disk ratios must satisfy 0 < disk_critical_free_ratio < disk_warning_free_ratio < 1"
+        );
+        for (name, cap, floor) in [
+            (
+                "disk_warning_ratio_cap_gb",
+                selection.disk_warning_ratio_cap_gb,
+                25.0,
+            ),
+            (
+                "disk_critical_ratio_cap_gb",
+                selection.disk_critical_ratio_cap_gb,
+                10.0,
+            ),
+        ] {
+            anyhow::ensure!(
+                cap.is_none_or(|cap| cap.is_finite() && cap >= floor),
+                "selection.{name} must be finite and at least {floor} GiB, or uncapped"
+            );
+        }
+        Ok(())
+    }
+
+    /// Install the daemon's policy and freeze its reload source at startup.
+    pub fn install(policy: Self, source_path: Option<PathBuf>) {
+        let _ = CONFIGURED_POLICY.set(Arc::new(DiskPressurePolicyStore::new(policy, source_path)));
     }
 
     /// The installed policy, or the default before startup installs one.
     pub fn configured() -> Self {
-        CONFIGURED_POLICY.get().cloned().unwrap_or_default()
+        CONFIGURED_POLICY
+            .get()
+            .map(|store| store.snapshot())
+            .unwrap_or_default()
+    }
+
+    pub fn configured_path() -> Option<&'static Path> {
+        CONFIGURED_POLICY
+            .get()
+            .and_then(|store| store.source_path.as_deref())
+    }
+
+    /// A failed reload leaves the previously installed policy intact.
+    pub fn reload_configured() -> anyhow::Result<bool> {
+        CONFIGURED_POLICY
+            .get()
+            .map_or(Ok(false), |store| store.reload())
     }
 }
 
@@ -533,7 +687,7 @@ type LoggedVerdict = (PressureState, PressureConfidence, String, Instant);
 pub struct DiskPressureMonitor {
     pool: WorkerPool,
     telemetry: Arc<TelemetryStore>,
-    config: DiskPressurePolicyConfig,
+    policy: Arc<DiskPressurePolicyStore>,
     /// Receives build-disk probes for footprint learning (bd-wv746).
     history: Option<Arc<crate::history::BuildHistory>>,
     /// Each worker's last logged verdict. Compared here rather than with the
@@ -551,10 +705,20 @@ impl DiskPressureMonitor {
         Self {
             pool,
             telemetry,
-            config,
+            policy: Arc::new(DiskPressurePolicyStore::new(config, None)),
             history: None,
             last_logged: std::sync::Mutex::default(),
         }
+    }
+
+    /// Production monitors follow the same live policy as worker admission.
+    /// Explicit policies in isolated monitors and tests remain independent.
+    #[must_use]
+    pub fn with_configured_policy(mut self) -> Self {
+        if let Some(policy) = CONFIGURED_POLICY.get() {
+            self.policy = policy.clone();
+        }
+        self
     }
 
     /// Log a changed verdict now, and an unchanged non-healthy one once per
@@ -592,7 +756,7 @@ impl DiskPressureMonitor {
     /// Start periodic pressure evaluation.
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut ticker = interval(self.config.poll_interval);
+            let mut ticker = interval(self.policy.snapshot().poll_interval);
             loop {
                 ticker.tick().await;
                 if let Err(e) = self.evaluate_once().await {
@@ -626,7 +790,8 @@ impl DiskPressureMonitor {
         }
         let capabilities = worker.capabilities().await;
         let telemetry = self.telemetry.latest_for_endpoint(&endpoint);
-        let next = evaluate_pressure_policy(&capabilities, telemetry.as_ref(), &self.config);
+        let next =
+            evaluate_pressure_policy(&capabilities, telemetry.as_ref(), &self.policy.snapshot());
         worker.set_pressure_assessment(next.clone()).await;
 
         if self.decision_log_due(&worker_id, &next, Instant::now()) {
@@ -934,13 +1099,14 @@ fn classify_tmp_mount(
             ),
         );
     }
-    if tmp_free_ratio <= config.warning_free_ratio {
+    if warning_ratio_breached(tmp_free_gb, tmp_free_ratio, config) {
         return (
             PressureState::Warning,
             confidence,
             "tmp_ratio_below_warning".to_string(),
             format!(
-                "tmp_free_ratio<=warning_free_ratio; /tmp free_gb={tmp_free_gb}, free_ratio={tmp_free_ratio}"
+                "tmp_free_ratio<={}; warning_ratio_cap_gb={:?}; /tmp free_gb={tmp_free_gb}, free_ratio={tmp_free_ratio}",
+                config.warning_free_ratio, config.warning_free_ratio_cap_gb
             ),
         );
     }
@@ -988,6 +1154,30 @@ fn critical_ratio_rule(config: &DiskPressurePolicyConfig) -> String {
         None => format!(
             "disk_free_ratio<={} (selection.disk_critical_ratio_cap_gb=uncapped)",
             config.critical_free_ratio
+        ),
+    }
+}
+
+fn warning_ratio_breached(
+    disk_free_gb: f64,
+    disk_free_ratio: f64,
+    config: &DiskPressurePolicyConfig,
+) -> bool {
+    disk_free_ratio <= config.warning_free_ratio
+        && config
+            .warning_free_ratio_cap_gb
+            .is_none_or(|cap| disk_free_gb <= cap)
+}
+
+fn warning_ratio_rule(config: &DiskPressurePolicyConfig) -> String {
+    match config.warning_free_ratio_cap_gb {
+        Some(cap) => format!(
+            "disk_free_ratio<={} && disk_free_gb<={cap} (selection.disk_warning_ratio_cap_gb={cap})",
+            config.warning_free_ratio
+        ),
+        None => format!(
+            "disk_free_ratio<={} (selection.disk_warning_ratio_cap_gb=uncapped)",
+            config.warning_free_ratio
         ),
     }
 }
@@ -1051,12 +1241,12 @@ fn classify_with_fresh_telemetry(
             "disk_free_gb<=warning_free_gb".to_string(),
         );
     }
-    if disk_free_ratio <= config.warning_free_ratio {
+    if warning_ratio_breached(disk_free_gb, disk_free_ratio, config) {
         return (
             PressureState::Warning,
             PressureConfidence::High,
             "disk_ratio_below_warning".to_string(),
-            "disk_free_ratio<=warning_free_ratio".to_string(),
+            warning_ratio_rule(config),
         );
     }
     if disk_io_util_pct
@@ -1114,7 +1304,7 @@ fn classify_without_fresh_telemetry(
         );
     }
     if (absolute_gb && disk_free_gb <= config.warning_free_gb)
-        || disk_free_ratio <= config.warning_free_ratio
+        || warning_ratio_breached(disk_free_gb, disk_free_ratio, config)
     {
         return (
             PressureState::Warning,
@@ -1911,6 +2101,210 @@ mod tests {
             evaluate_pressure_policy(&test_capabilities(20.0, 900.0), Some(&telemetry), &policy);
         assert_eq!(io.state, PressureState::Critical);
         assert_eq!(io.reason_code, "disk_io_saturated_with_low_headroom");
+    }
+
+    #[test]
+    fn warning_ratio_and_cap_relieve_large_disks_without_disabling_other_guards() {
+        let telemetry = test_received_telemetry(30.0, 40.0, 0);
+        let caps = test_capabilities(171.0, 1900.0);
+        assert_eq!(
+            evaluate_pressure_policy(
+                &caps,
+                Some(&telemetry),
+                &DiskPressurePolicyConfig::default()
+            )
+            .state,
+            PressureState::Warning
+        );
+
+        for selection in [
+            rch_common::SelectionConfig {
+                disk_warning_free_ratio: 0.07,
+                ..Default::default()
+            },
+            rch_common::SelectionConfig {
+                disk_warning_ratio_cap_gb: Some(50.0),
+                ..Default::default()
+            },
+        ] {
+            let policy = DiskPressurePolicyConfig::from_selection(&selection);
+            assert_eq!(
+                evaluate_pressure_policy(&caps, Some(&telemetry), &policy).state,
+                PressureState::Healthy
+            );
+            assert_eq!(
+                evaluate_pressure_policy(&caps, None, &policy).state,
+                PressureState::TelemetryGap
+            );
+            let memory = test_received_telemetry(30.0, 95.0, 0);
+            assert_eq!(
+                evaluate_pressure_policy(&caps, Some(&memory), &policy).reason_code,
+                "memory_pressure_critical"
+            );
+            let io = test_received_telemetry(90.0, 40.0, 0);
+            assert_eq!(
+                evaluate_pressure_policy(&caps, Some(&io), &policy).reason_code,
+                "disk_io_high"
+            );
+            let tmp = caps_with_build_disk((1.0, 16.0), Some((171.0, 1900.0)));
+            assert_eq!(
+                evaluate_pressure_policy(&tmp, Some(&telemetry), &policy).reason_code,
+                "tmp_free_below_floor"
+            );
+            assert_eq!(
+                evaluate_pressure_policy(
+                    &test_capabilities(9.0, 1900.0),
+                    Some(&telemetry),
+                    &policy
+                )
+                .state,
+                PressureState::Critical
+            );
+            assert_eq!(
+                evaluate_pressure_policy(
+                    &test_capabilities(24.0, 300.0),
+                    Some(&telemetry),
+                    &policy
+                )
+                .reason_code,
+                "disk_free_below_warning_gb"
+            );
+        }
+
+        let capped = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_warning_ratio_cap_gb: Some(50.0),
+            ..Default::default()
+        });
+        for latest in [Some(&telemetry), None] {
+            assert_eq!(
+                evaluate_pressure_policy(&test_capabilities(50.0, 1900.0), latest, &capped).state,
+                PressureState::Warning
+            );
+            assert_ne!(
+                evaluate_pressure_policy(&test_capabilities(50.01, 1900.0), latest, &capped).state,
+                PressureState::Warning
+            );
+            assert_eq!(
+                evaluate_pressure_policy(&test_capabilities(25.0, 1900.0), latest, &capped).state,
+                PressureState::Critical
+            );
+        }
+        let warning =
+            evaluate_pressure_policy(&test_capabilities(50.0, 1900.0), Some(&telemetry), &capped);
+        assert!(warning.policy_rule.contains("disk_warning_ratio_cap_gb=50"));
+    }
+
+    #[test]
+    fn invalid_warning_settings_keep_ordered_fallback_thresholds() {
+        for (warning, critical) in [
+            (0.03, -0.1),
+            (0.03, 0.05),
+            (0.03, f64::NEG_INFINITY),
+            (f64::NAN, 0.05),
+            (1.0, 0.05),
+            (0.0, 0.05),
+        ] {
+            let selection = rch_common::SelectionConfig {
+                disk_warning_free_ratio: warning,
+                disk_critical_free_ratio: critical,
+                disk_warning_ratio_cap_gb: Some(24.0),
+                ..Default::default()
+            };
+            assert!(DiskPressurePolicyConfig::validate_selection(&selection).is_err());
+            let policy = DiskPressurePolicyConfig::from_selection(&selection);
+            assert!(
+                policy.critical_free_ratio < policy.warning_free_ratio,
+                "{warning}, {critical}"
+            );
+            assert_eq!(policy.warning_free_ratio_cap_gb, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_policy_reload_updates_running_monitor_and_retains_last_good_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let policy = Arc::new(DiskPressurePolicyStore::new(
+            DiskPressurePolicyConfig::default(),
+            Some(path.clone()),
+        ));
+        assert!(
+            !policy.reload().unwrap(),
+            "first-run config file is optional"
+        );
+        let pool = WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("worker-1"),
+            host: "worker".to_string(),
+            user: "builder".to_string(),
+            identity_file: "/test/key".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        worker
+            .set_capabilities(test_capabilities(171.0, 1900.0))
+            .await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        telemetry.ingest_for_endpoint(
+            test_received_telemetry(30.0, 40.0, 0).telemetry,
+            TelemetrySource::SshPoll,
+            &worker.endpoint_snapshot().await,
+        );
+        let mut monitor = DiskPressureMonitor::new(pool, telemetry, policy.snapshot());
+        monitor.policy = policy.clone();
+        monitor.evaluate_once().await.unwrap();
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
+
+        std::fs::write(&path, "[selection]\ndisk_warning_free_ratio = 0.07\ndisk_warning_ratio_cap_gb = 50\ndisk_critical_free_ratio = 0.04\n").unwrap();
+        assert!(policy.reload().unwrap());
+        assert!(
+            !policy.reload().unwrap(),
+            "unchanged policy is not reported as changed"
+        );
+        monitor.evaluate_once().await.unwrap();
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Healthy
+        );
+        assert_eq!(policy.snapshot().critical_free_ratio, 0.04);
+        let accepted = policy.snapshot();
+
+        for invalid in [
+            "[selection",
+            "[selection]\ndisk_warning_free_ratio = 0.03\n",
+            "[selection]\ndisk_warning_ratio_cap_gb = 24\n",
+            "[selection]\ndisk_critical_ratio_cap_gb = 9\n",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(policy.reload().is_err(), "{invalid}");
+            assert_eq!(policy.snapshot(), accepted);
+        }
+        std::fs::rename(&path, dir.path().join("config.pending")).unwrap();
+        assert!(!policy.reload().unwrap());
+        assert_eq!(
+            policy.snapshot(),
+            accepted,
+            "a missing file must not reset a tuned policy"
+        );
+
+        std::fs::write(
+            &path,
+            "[selection]\ndisk_warning_free_ratio = 0.12\ndisk_warning_ratio_cap_gb = 'uncapped'\n",
+        )
+        .unwrap();
+        assert!(policy.reload().unwrap());
+        monitor.evaluate_once().await.unwrap();
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Warning
+        );
     }
 
     #[test]

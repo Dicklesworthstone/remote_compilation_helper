@@ -744,88 +744,31 @@ fn dedup_candidate_file(var: &str) -> String {
 
 /// Capture both producer completion and the snapshot writer's status. Some
 /// lsof versions return success after stdout hit ENOSPC, so redirecting the
-/// producer straight to disk is insufficient. Python streams its pipe into
-/// the existing snapshot and keeps the producer unreaped until group cleanup.
+/// producer straight to disk is insufficient. The native worker streams its
+/// pipe into the existing snapshot and keeps it unreaped until group cleanup.
 /// Shell job PIDs cannot provide that custody: a shell can reap before wait.
 /// There is no in-band marker for process arguments or readlink paths to forge.
-/// Missing Python or non-reaping wait support leaves the inventory unavailable.
-const GC_SNAPSHOT_CAPTURE: &str = r#"__gc_capture() {
-  python3 -I -S -c '
-import errno, os, signal, stat, subprocess, sys
-
-if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
-    sys.exit(1)
-signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-child = None
-owned = False
-settling = False
-cancelled = False
-output = None
-success = False
-
-def interrupted(number, frame):
-    global cancelled
-    cancelled = True
-    # Defer interruption across Popen publication and final reaping. A signal
-    # must not lose a newly spawned child or interrupt after waitpid reaped it.
-    if owned and not settling:
-        raise InterruptedError("GC inventory interrupted")
-
-for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-    signal.signal(number, interrupted)
-
-def retire():
-    global owned, settling
-    if owned:
-        settling = True
-        # No poll/waitpid has reaped this session leader. Even an exited
-        # producer still reserves its PID/PGID while its descendants stop.
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        owned = False
-        child.wait()
-
-try:
-    output = os.open(sys.argv[1], os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    info = os.fstat(output)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
-        raise ValueError("unsafe GC snapshot")
-    os.ftruncate(output, 0)
-    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             start_new_session=True, close_fds=True)
-    owned = True
-    if cancelled:
-        raise InterruptedError("GC inventory interrupted")
-    while True:
-        chunk = os.read(child.stdout.fileno(), 65536)
-        if not chunk:
-            break
-        remaining = memoryview(chunk)
-        while remaining:
-            count = os.write(output, remaining)
-            if count == 0:
-                raise OSError(errno.EIO, "short GC snapshot write")
-            remaining = remaining[count:]
-    completed_output = output
-    output = None
-    os.close(completed_output)
-    result = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
-    success = result.si_code == os.CLD_EXITED and result.si_status == 0
-    retire()
-except (OSError, ValueError):
-    success = False
-finally:
-    retire()
-    if child is not None and child.stdout is not None:
-        child.stdout.close()
-    if output is not None:
-        os.close(output)
-sys.exit(0 if success and not cancelled else 1)
-' "$@";
-}; "#;
+/// An absent or older worker leaves the inventory unavailable, never free.
+const GC_SNAPSHOT_CAPTURE: &str = concat!(
+    include_str!("wkr_locate.sh"),
+    r#"
+__gc_capture() {
+  if [ "${__gc_snapshot_ready:-0}" != 1 ]; then
+    if rch_wkr_locate &&
+      __gc_snapshot_version=$("$RCH_WKR" control-capture snapshot-probe 8>&-) &&
+      [ "$__gc_snapshot_version" = 'rch-wkr control-capture snapshot v1' ]; then
+      __gc_snapshot_worker=$RCH_WKR
+      __gc_snapshot_ready=1
+    else
+      printf '%s\n' 'RCH_GC_SNAPSHOT_UNAVAILABLE: deploy rch-wkr with native snapshot capture' >&2
+      return 1
+    fi
+  fi
+  # The supervising shell retains its metadata flock. Inventory producers
+  # must not inherit that witness and keep the registry locked after it exits.
+  "$__gc_snapshot_worker" control-capture snapshot 30000 "$@" 8>&-
+}; "#
+);
 
 /// Shell fragment that builds the two GATE SNAPSHOTS every collection of a
 /// pooled/cache dir is required to clear, plus the `__gc_gates_ok` helper that
@@ -3302,26 +3245,74 @@ exec /usr/bin/find "$@"
         assert!(cmd.contains("__proc_ok\" -ne 1 ]; then printf unknown"));
     }
 
-    /// The companion executes these exact compiled bytes, including a private
-    /// Linux tmpfs filled to ENOSPC. It also runs standalone on recovery hosts
-    /// where the workspace's native dependencies cannot be built.
-    #[cfg(target_os = "linux")]
+    /// Missing native support must disable both gates without inspecting an
+    /// empty/partial file as a free inventory. Worker integration tests exercise
+    /// successful captures, producer/writer failures and process settlement.
+    #[cfg(unix)]
     #[test]
-    fn gc_inventory_completion_and_disk_failure_contract() {
-        let output = std::process::Command::new("python3")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/gc_gate_snapshots.py"
-            ))
-            .env("RCH_TEST_GC_GATE_SCRIPT", gate_snapshot_fragment())
+    fn gc_inventory_requires_native_snapshot_support() {
+        let scratch = tempfile::tempdir().unwrap().keep();
+        let script = format!(
+            "__tmpbase=$TMPDIR; {} printf 'handles=%s processes=%s\\n' \
+             \"$(__gc_handles /candidate/pool)\" \"$(__gc_procs /candidate/pool)\"; \
+             if __gc_gates_ok /candidate/pool; then exit 9; fi; exit 0",
+            gate_snapshot_fragment()
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("TMPDIR", &scratch)
+            .env("RCH_GC_SCRATCH", &scratch)
+            .env("RCH_WKR_BIN", "/absent/rch-wkr")
             .output()
-            .expect("GC inventory integration tests require python3");
+            .expect("run native-inventory refusal");
         assert!(
             output.status.success(),
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("handles=unknown processes=unknown")
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_GC_SNAPSHOT_UNAVAILABLE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_inventory_requires_success_and_preserves_mount_spaces() {
+        for (row, status, expected) in [
+            (
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/test 10000 9000 1000 90% /Volumes/Build  Disk\n",
+                0,
+                "mount=/Volumes/Build  Disk\n",
+            ),
+            (
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/test 10000 9000 1000 90% /Volumes/Build  Disk\n",
+                1,
+                "unknown\n",
+            ),
+            ("", 0, "unknown\n"),
+            ("Filesystem only\n", 0, "unknown\n"),
+            (
+                "Filesystem\n/dev/test invalid 0 0 0% /tmp\n",
+                0,
+                "unknown\n",
+            ),
+        ] {
+            let script = format!(
+                "df() {{ printf '%s' \"$RCH_TEST_DF_ROW\"; return {status}; }}; \
+                 {GC_FILESYSTEM_SNAPSHOT}\
+                 if value=$(__gc_df_field /any mount); then printf 'mount=%s\\n' \"$value\"; \
+                 else printf 'unknown\\n'; fi;"
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("RCH_TEST_DF_ROW", row)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
     }
 
     /// The gates must ride on the SAME temp-base resolution that creates the

@@ -6,7 +6,7 @@
 #![allow(dead_code)] // Scaffold code - will be wired into main.rs
 
 use crate::config::CacheCleanupConfig;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{WorkerPool, WorkerState, ensure_posix_gc_worker};
 use rch_common::timing::scale_duration;
 use rch_common::{SshClient, SshOptions, WorkerId};
 use std::collections::HashMap;
@@ -684,6 +684,7 @@ impl CacheCleanupScheduler {
             .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let start = Instant::now();
         let config = worker_state.config.read().await.clone();
+        ensure_posix_gc_worker(&config)?;
 
         info!(
             "Starting cache cleanup on worker {} (max_age={}h, min_free={}GB)",
@@ -1158,6 +1159,38 @@ mod tests {
         // Worker is healthy, all slots available, circuit closed
         let eligible = scheduler.is_worker_eligible(&worker_state).await;
         assert!(eligible);
+    }
+
+    #[tokio::test]
+    async fn windows_cleanup_is_skipped_and_manual_cleanup_cannot_bypass_platform_guard() {
+        let pool = WorkerPool::new();
+        let mut config = create_test_worker_config("windows-cleanup");
+        config.tags = vec!["os:WiNdOwS".into()];
+        let worker_id = config.id.clone();
+        pool.add_worker(config).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let scheduler = CacheCleanupScheduler::new(
+            pool,
+            CacheCleanupConfig {
+                idle_threshold_secs: 0,
+                // Keep this regression local if the guard is removed:
+                // command construction must fail before any SSH starts.
+                remote_base: "/invalid\nroot".into(),
+                ..Default::default()
+            },
+        );
+        assert!(!scheduler.is_worker_eligible(&worker).await);
+        let stats = scheduler.run_cleanup_cycle().await;
+        assert_eq!(stats.workers_checked, 1);
+        assert_eq!(stats.workers_skipped, 1);
+        assert_eq!(stats.workers_cleaned, 0);
+        assert_eq!(stats.errors, 0);
+        let error = scheduler.cleanup_worker_now(&worker_id).await.unwrap_err();
+        assert!(error.to_string().contains("Windows collection"), "{error}");
+        assert!(scheduler.last_cleanup.read().await.is_empty());
+        assert!(scheduler.idle_since.read().await.is_empty());
+        assert!(worker.background_probe().await.is_some());
+        assert_eq!(worker.status().await, WorkerStatus::Healthy);
     }
 
     #[tokio::test]

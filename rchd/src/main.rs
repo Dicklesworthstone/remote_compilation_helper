@@ -1184,8 +1184,18 @@ pub(crate) fn arm_shutdown_watchdog() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if let Some(code) = rch_common::ssh::run_ssh_master_guardian_if_requested() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the daemon runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches)?;
     let startup_started = Instant::now();
@@ -1207,13 +1217,15 @@ async fn main() -> Result<()> {
     // #69: resolve the endpoint before delegation or binding, not after the
     // listener is already live. Invalid configuration must not silently launch
     // a daemon on a different endpoint. Operator-owned files are not rewritten.
-    let mut rch_config = config::load_rch_config()
+    let (mut rch_config, disk_policy_path) = config::load_rch_config_with_source()
         .context("could not resolve RCH configuration before binding the daemon socket")?;
     rch_config.self_healing = rch_config.self_healing.with_env_overrides();
     // Before any worker is evaluated: placement, the monitor and the sweep
     // all read this one disk policy (bd-xxck3).
     let disk_policy = DiskPressurePolicyConfig::from_selection(&rch_config.selection);
     info!(
+        warning_free_ratio = disk_policy.warning_free_ratio,
+        warning_free_ratio_cap_gb = ?disk_policy.warning_free_ratio_cap_gb,
         critical_free_ratio = disk_policy.critical_free_ratio,
         critical_free_ratio_cap_gb = ?disk_policy.critical_free_ratio_cap_gb,
         critical_free_gb = disk_policy.critical_free_gb,
@@ -1221,7 +1233,7 @@ async fn main() -> Result<()> {
         disk_gb_per_slot = rch_config.selection.disk_gb_per_slot,
         "effective disk pressure policy (GiB); an uncapped ratio has no absolute cap"
     );
-    DiskPressurePolicyConfig::install(disk_policy);
+    DiskPressurePolicyConfig::install(disk_policy, disk_policy_path);
     let (socket, client_socket) =
         daemon_socket_for_startup(&matches, &rch_config.general.socket_path, |name| {
             std::env::var(name).ok()
@@ -1652,17 +1664,6 @@ async fn main() -> Result<()> {
     let active_cleanup = cleanup::ActiveBuildCleanup::new(context.clone());
     let mut active_cleanup_handle = Some(active_cleanup.start());
 
-    // Finish dead client leases that still own worker source (bd-nalyr). An
-    // isolated test pool must not reconcile the operator's real leases.
-    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
-        let _lease_recovery = lease_recovery::start(
-            context.events.clone(),
-            cli.socket.clone(),
-            admin_disable_store.clone(),
-            context.pool.clone(),
-        );
-    }
-
     let worker_status_panel = Arc::new(Mutex::new(
         WorkerStatusPanel::new()
             .with_verbose(cli.verbose)
@@ -1739,6 +1740,7 @@ async fn main() -> Result<()> {
         telemetry_store.clone(),
         DiskPressurePolicyConfig::configured(),
     )
+    .with_configured_policy()
     .with_build_history(context.history.clone());
     let _disk_pressure_handle = disk_pressure_monitor.start();
     info!("Disk pressure monitor started");
@@ -1974,6 +1976,19 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Finish dead client leases that still own worker source (bd-nalyr). Start
+    // only once startup is complete: the immediate scan must not race an IPC
+    // listener that is bound but not yet serving and back off for ten minutes.
+    // An isolated test pool must not reconcile the operator's real leases.
+    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
+        let _lease_recovery = lease_recovery::start(
+            context.events.clone(),
+            cli.socket.clone(),
+            admin_disable_store.clone(),
+            context.pool.clone(),
+        );
     }
 
     // Main accept loop - platform-specific due to SIGHUP handling

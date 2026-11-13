@@ -1,25 +1,20 @@
 //! Opt-in RCH-dispatched Cargo with worker-local RABS (plan §3.7).
 //!
 //! This extends the existing remote-command builder, not the scheduler or
-//! artifact transport. The worker's installed cargo-rabs owns daemon startup
+//! artifact transport. The deployed native worker owns bounded daemon startup
 //! and environment preparation; rabs-wrap/rabsd retain all cache authority.
 
 use std::borrow::Cow;
 
-const WORKER_PREPARE: &str = include_str!("worker_cache.py");
-
-// RCH's Windows worker also runs Git's sh. Refuse the Linux-only accelerator
-// before importing Python or the launcher on other platforms. Missing Python
-// likewise preserves the original executable and argv. No eval or retry.
-// Isolate interpreter startup before any adapter import: project modules,
-// PYTHONPATH and site hooks otherwise run before preparation's deadline and
-// cancellation guards. Keep PYTHON* in the environment for Cargo/build scripts;
-// these interpreter flags apply only to the worker's stdlib-only bootstrap.
-const PLATFORM_RUNNER: &str = r#"program=$1; shift
-if [ "$(uname -s 2>/dev/null)" = Linux ] && command -v python3 >/dev/null 2>&1; then
-    exec python3 -I -S -c "$program" "$@"
+// The accelerator is Linux-only; other worker platforms preserve stock Cargo.
+const PLATFORM_RUNNER: &str = r#"if [ "$(uname -s 2>/dev/null)" != Linux ]; then
+    exec "$@"
 fi
-exec "$@""#;
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_RABS_WORKER_UNAVAILABLE: install the matching native rch-wkr' >&2
+    exit 73
+fi
+exec "$RCH_WKR" worker-cache --protocol v1 -- "$@""#;
 
 pub(super) fn enabled() -> bool {
     std::env::var_os("RCH_RABS_WORKER_CACHE").as_deref() == Some(std::ffi::OsStr::new("1"))
@@ -34,10 +29,10 @@ pub(super) fn runner_for(command: &str) -> Option<String> {
     if command.get(start..end)? != "cargo" {
         return None;
     }
+    let program = format!("{}\n{PLATFORM_RUNNER}", crate::wkr_locate::WKR_LOCATE_SHELL);
     Some(format!(
-        "sh -c {} rch-rabs-worker {}",
-        shell_escape::escape(Cow::Borrowed(PLATFORM_RUNNER)),
-        shell_escape::escape(Cow::Borrowed(WORKER_PREPARE)),
+        "sh -c {} rch-rabs-worker",
+        shell_escape::escape(Cow::Borrowed(&program)),
     ))
 }
 
@@ -122,35 +117,12 @@ mod tests {
         assert_eq!(wrapped.matches("rch-rabs-worker").count(), 1);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn worker_bootstrap_isolates_python_without_changing_cargo_inputs() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root");
-        let fixture = tempfile::tempdir().expect("bootstrap fixture").keep();
-        let runner = fixture.join("runner.sh");
-        let adapter = fixture.join("adapter.py");
-        std::fs::write(&runner, PLATFORM_RUNNER).expect("write compiled runner");
-        std::fs::write(&adapter, WORKER_PREPARE).expect("write compiled adapter");
-        for suite in [
-            "tests/test_rabs_worker_bootstrap.py",
-            "tests/test_rabs_worker_lifetime.py",
-            "tests/test_rabs_worker_cleanup.py",
-        ] {
-            let output = std::process::Command::new("python3")
-                .args(["-I", "-S"])
-                .arg(root.join(suite))
-                .env("RCH_TEST_WORKER_RUNNER", &runner)
-                .env("RCH_TEST_WORKER_ADAPTER", &adapter)
-                .output()
-                .expect("execute native worker-bootstrap regressions");
-            assert!(
-                output.status.success(),
-                "suite={suite}\nstdout={}\nstderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
+    fn worker_bootstrap_uses_the_deployed_native_protocol() {
+        assert!(PLATFORM_RUNNER.contains("worker-cache --protocol v1 -- \"$@\""));
+        assert!(PLATFORM_RUNNER.contains("RCH_RABS_WORKER_UNAVAILABLE"));
+        let runner = runner_for("cargo check").unwrap();
+        assert!(runner.contains("rch_wkr_locate"));
+        assert!(runner.ends_with("rch-rabs-worker"));
     }
 }

@@ -8,10 +8,12 @@ cross-worker cache sharing, or automatic `rabs-wkr` action dispatch.
 
 ## Enable for a build
 
-Use a rebuilt RCH containing this adapter, and install the complete matching
-RABS toolset on each selected Linux worker. The worker's execution PATH must
-resolve `cargo-rabs`; that installed launcher must advertise preparation API
-version 1. Python 3.9+ is required. Existing installation instructions are in
+Use matching rebuilt `rch` and `rch-wkr` binaries, and install `rabs-wrap` and
+`rabsd` on each selected Linux worker. Preparation runs entirely in the native
+`rch-wkr worker-cache` command; it does not load the `cargo-rabs` script or an
+interpreter. The RABS binaries are located beside the deployed worker or on
+its execution PATH, with explicit `CARGO_RABS_WRAP` and `CARGO_RABS_DAEMON`
+overrides available. Existing installation instructions are in
 [rabs-ssh-deployment.md](rabs-ssh-deployment.md).
 
 ```sh
@@ -85,15 +87,13 @@ Normal local mode and the version-1 imported `prepare()` API are unchanged.
 
 ### Worker-side preparation
 
-RCH's existing environment controls run before preparation. The adapter then
-loads the worker-installed launcher's versioned `prepare` API without running
-its CLI, and finally execs the unchanged `rustup run <toolchain> cargo ...`
-(or original unpinned Cargo) argv. This ordering preserves Rustup's direct
-Cargo selection and custom-toolchain fallback; resolving Cargo from PATH after
-running Python inside `rustup run` would not be equivalent.
+RCH's existing environment controls run before native preparation. The worker
+then execs the unchanged `rustup run <toolchain> cargo ...` (or original
+unpinned Cargo) argv. This preserves Rustup's direct Cargo selection and
+custom-toolchain fallback.
 
-The launcher remains the only owner of bounded daemon startup, dual lifetime
-locks, ownership checks and crash recovery. It resolves its existing
+The native preparer owns bounded daemon startup, dual lifetime locks,
+ownership checks and crash recovery. It resolves the existing
 `RABS_CONFIG`, `RABS_SOCKET_PATH`, `RABS_STATE_DIR`, `CARGO_RABS_DAEMON`,
 `CARGO_RABS_WRAP` and `CARGO_RABS_STARTUP_MS` settings in the worker environment.
 A running daemon is neither reconfigured nor stopped. Explicit custom or
@@ -101,17 +101,24 @@ disabled wrapper environment settings retain the launcher's stock-Cargo
 fallback. As with direct `cargo rabs`, successful setup explicitly selects
 `rabs-wrap`, overriding Cargo's `build.rustc-wrapper` configuration.
 
-Missing Python/launcher, unsupported preparation API or a setup failure does
-not fail or repeat the compilation: the original command runs once. Setup
-failures emit a worker-stderr explanation. After exec there is no retry branch.
+Missing RABS binaries or a confirmed setup failure uses the original command
+once, with a worker-stderr explanation. A missing or outdated native worker
+refuses the native protocol and needs an installation update. After Cargo
+exec there is no retry branch.
 Arguments, cwd, target directory, selected toolchain, inherited jobserver
 handles and the command's exit status remain under their existing owners.
 `RCH_RABS_WORKER_ACTIVE=1` prevents repeated preparation in an already-prepared
 process tree; it is not cache-hit or compiler-skip authority.
 
-Preparation runs in an owned helper under `RCH_RABS_PREPARE_TIMEOUT_MS`
+Preparation runs in a private session with an independent guardian under
+`RCH_RABS_PREPARE_TIMEOUT_MS`
 (0 skips setup, maximum 35000 ms; default `CARGO_RABS_STARTUP_MS` plus 2000 ms,
-or 7000 ms without that override). Cargo retains its original descriptors.
+or 7000 ms without that override). The guardian watches both the original
+deadline and the adapter's private owner connection, including when the
+adapter is stopped or killed. The adapter retains its guardian as an unreaped
+child until an independent process-and-thread census confirms settlement.
+Unconfirmed cleanup returns 255 and does not run Cargo, even after a setup
+failure that would otherwise allow fallback. Cargo retains its original descriptors.
 Captured setup diagnostics are replayed by a separate, short-lived process
 with only stderr, not by a potentially blocking write in the Cargo parent.
 Replay has a 100 ms delivery budget and up to 250 ms of cooperative cleanup;
@@ -124,7 +131,7 @@ Readable setup logs retain their raw bytes up to the existing 16 KiB capture
 bound. Slow, closed or unavailable diagnostic sinks can lose a suffix or the
 whole setup diagnostic; this is not a durable logging contract. Cancellation
 during replay terminates the owned relay and does not start Cargo. SIGCHLD
-auto-reap or a custom child reaper bypasses setup before any helper is forked,
+auto-reap bypasses setup before any helper is started,
 because those contexts cannot provide the retained PID ownership required for
 safe cleanup. The original child-reaping disposition is not overwritten.
 Kernel-blocked operations can outlive cooperative deadlines with SIGKILL
@@ -148,14 +155,18 @@ existing live dependency class and its path/input contracts.
 
 ## Validation boundaries
 
-`tests/test_rabs_worker_cache.py` executes the exact embedded shell and Python
-adapter with the real launcher and real Linux processes, Unix sockets, locks
-and jobserver pipes. Its 23 tests include concurrent startup, managed crash
-recovery, refusal of incompatible launchers before source execution, opaque
-argv, exec-once exit/signal behavior and a PATH-shim sensitivity control.
-Cargo, Rustup and the daemon in these tests are fixture executables. The
-original launcher behavior remains covered by its 50 regressions. Five additional
-Rust unit tests exercise command construction and opt-out parity.
+`rch-wkr/tests/worker_cache.rs` exercises the production native worker with
+real Linux processes, Unix sockets, inherited descriptors and cancellation.
+The native preparation module also tests authenticated readiness, worker
+configuration, startup-lock ownership and process-bound recovery receipts.
+The Cargo/daemon programs used for isolated protocol tests are explicit fixture
+executables; those tests do not establish compiler cache hits or fleet speedups.
+The shared command-builder tests cover toolchain selection, quoting and opt-out
+parity. The workspace's no-interpreter guard includes the native worker path.
+
+The remaining results below describe historical scripted-launcher and fleet
+qualification. They do not qualify the new native worker adapter; the retained
+script fixtures are not executed by its Rust test suite.
 
 Eighteen additional tests in `scripts/tests/test_cargo_rabs.py` exercise the
 remote entry point with real exec, signals, streams, cwd and jobserver handles.

@@ -11,7 +11,11 @@ fn source_claim_inventory_preserves_complete_ownership_checks() {
     let helpers = fixture.join("helpers.sh");
     std::fs::write(
         &script,
-        include_str!("../src/hook/source_claim_registry.sh"),
+        format!(
+            "{}\n{}",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            include_str!("../src/hook/source_claim_registry.sh"),
+        ),
     )
     .expect("write compiled transaction");
     std::fs::write(
@@ -26,6 +30,15 @@ fn source_claim_inventory_preserves_complete_ownership_checks() {
             .env("RCH_TEST_SOURCE_CLAIM_SCRIPT", &script)
             .env("RCH_TEST_SOURCE_CLAIM_HELPERS", &helpers)
             .env("RCH_TEST_SHELL", shell)
+            .env(
+                "RCH_WKR_BIN",
+                std::env::var_os("RCH_WKR_BIN")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(env!("CARGO_BIN_EXE_rch"))
+                            .with_file_name("rch-wkr")
+                    }),
+            )
             .output()
             .expect("execute native source-inventory regressions");
         assert!(

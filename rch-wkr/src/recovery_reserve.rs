@@ -392,7 +392,6 @@ mod imp {
         environment: Vec<(String, String)>,
     }
 
-    const AUTHORITY: usize = 0;
     const REGISTRY: usize = 1;
     const PRIVATE_DIR: usize = 2;
 

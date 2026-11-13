@@ -164,19 +164,31 @@ impl Eq for PendingDiskFault {}
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
 /// A failed remote build's slot is released at completion, but its client
 /// lease keeps the worker's source claim until lease recovery retires it
-/// (exit 102 retrieval incomplete, 130 interrupted: 15-21 min on css). The
+/// (for example, exit 102 retrieval incomplete or 130 interrupted). The
 /// worker's source registry refuses the same project meanwhile, so selection
 /// must not keep choosing it (bd-jqhno).
 #[derive(Debug, Clone)]
 struct SourceFence {
+    build_id: u64,
     project_id: String,
     worker_id: String,
     wrapper: String,
     created: Instant,
 }
 
-/// Lease recovery acts after 15 min of heartbeat staleness and scans every
-/// 5 min; a fence never outlives that window by much, whatever the lease says.
+/// A new source fence needs lease reconciliation before selection can retry.
+/// Distinguish that advisory refresh from ordinary admission rejection and
+/// from an I/O failure that may already have published durable ownership.
+#[derive(Debug)]
+pub(crate) enum ActiveBuildAdmission {
+    Admitted(Box<ActiveBuildState>),
+    Rejected,
+    SourceFenceChanged,
+}
+
+/// Bound this scheduling cache independently of the recovery scan interval.
+/// Expiry permits another worker ownership probe; it does not prove settlement
+/// or authorize replacing an unresolved source claim.
 pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
 const SOURCE_FENCE_LIMIT: usize = 1024;
 
@@ -773,6 +785,10 @@ impl BuildHistory {
             None,
             1,
         )
+        .map(|admission| match admission {
+            ActiveBuildAdmission::Admitted(state) => Some(*state),
+            ActiveBuildAdmission::Rejected | ActiveBuildAdmission::SourceFenceChanged => None,
+        })
     }
 
     /// Admit a build into the lowest free of the worker's `project_lanes`
@@ -793,7 +809,7 @@ impl BuildHistory {
         worker_endpoint: Option<WorkerEndpointSnapshot>,
         requested_source_topology: Option<rch_common::SourceTopology>,
         project_lanes: u32,
-    ) -> std::io::Result<Option<ActiveBuildState>> {
+    ) -> std::io::Result<ActiveBuildAdmission> {
         if disk.warm_policy.is_some()
             && (location != BuildLocation::Remote || worker_endpoint.is_none())
         {
@@ -880,7 +896,26 @@ impl BuildHistory {
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed() {
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
+        }
+        // Completion publishes a source fence under this same active lock
+        // before removing its old owner. A selector may have taken an empty
+        // exclusion snapshot before awaiting worker admission. Do not commit
+        // a successor against the newly fenced source; let the caller release
+        // its provisional slots and reconcile leases outside these locks.
+        if state.location == BuildLocation::Remote
+            && self
+                .source_fences
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .any(|fence| {
+                    fence.project_id == state.project_id
+                        && fence.worker_id == state.worker_id
+                        && fence.created.elapsed() < SOURCE_FENCE_MAX_AGE
+                })
+        {
+            return Ok(ActiveBuildAdmission::SourceFenceChanged);
         }
         // Selection is advisory until this ownership commit. A refusing
         // attempt may have published a permanent exclusion while this caller
@@ -899,7 +934,7 @@ impl BuildHistory {
                     && &fence.mismatch.topology == topology
             })
         {
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
         }
         // Completion publishes its terminal disk intent under this same
         // active lock, before it can await the separate bypass-store lock.
@@ -915,7 +950,7 @@ impl BuildHistory {
             },
         );
         if pending_disk_fault {
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
         }
         // This lock also serializes completion. Two selectors may have seen
         // the same free-space sample; only durable admission spends its budget.
@@ -923,7 +958,7 @@ impl BuildHistory {
             .check_disk_headroom_locked(&active, &state.worker_id, &disk)
             .is_err()
         {
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
         }
         {
             let queue = self.queued.read().unwrap_or_else(|e| e.into_inner());
@@ -932,7 +967,7 @@ impl BuildHistory {
             });
             if let Some(claim) = waiter {
                 let Some(row) = queue.iter().find(|row| row.id == claim.queue_id) else {
-                    return Ok(None);
+                    return Ok(ActiveBuildAdmission::Rejected);
                 };
                 if row.waiter_claim != Some(claim.nonce)
                     || row.recovered
@@ -942,12 +977,12 @@ impl BuildHistory {
                     || row.project_id != state.project_id
                     || row.command != state.command
                 {
-                    return Ok(None);
+                    return Ok(ActiveBuildAdmission::Rejected);
                 }
             } else if owned_row.is_some_and(|row| row.selection_contract.is_some()) {
                 // A new request cannot steal a queued request's authority, even
                 // when a worker became free between the two requests.
-                return Ok(None);
+                return Ok(ActiveBuildAdmission::Rejected);
             }
         }
         if state
@@ -955,7 +990,7 @@ impl BuildHistory {
             .as_deref()
             .is_some_and(|id| self.wrapper_cancelled(id))
         {
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
         }
         if state.local_wrapper_id.as_deref().is_some_and(|wrapper| {
             wrapper.is_empty()
@@ -966,7 +1001,7 @@ impl BuildHistory {
             // A durable wrapper identity is a single live execution authority.
             // Allowing the same wrapper onto two workers makes a lost selection
             // reply or retry indistinguishable from duplicate execution.
-            return Ok(None);
+            return Ok(ActiveBuildAdmission::Rejected);
         }
         // Lanes are separate worker mirrors, locks and targets (bd-sgvod), so
         // a project may hold one active build per lane on a worker.
@@ -979,7 +1014,7 @@ impl BuildHistory {
             .collect();
         match (0..project_lanes.max(1)).find(|lane| !used_lanes.contains(lane)) {
             Some(lane) => state.project_lane = lane,
-            None => return Ok(None),
+            None => return Ok(ActiveBuildAdmission::Rejected),
         }
         if state.location == BuildLocation::Remote {
             // Overlapping builds on one worker share its free-space drop, so
@@ -1001,7 +1036,7 @@ impl BuildHistory {
         } else {
             self.persist_ownership(&active, None)?;
         }
-        Ok(Some(state))
+        Ok(ActiveBuildAdmission::Admitted(Box::new(state)))
     }
 
     #[cfg(test)]
@@ -1559,7 +1594,9 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|fence| {
                     !released.iter().any(|gone| {
-                        gone.wrapper == fence.wrapper && gone.worker_id == fence.worker_id
+                        gone.build_id == fence.build_id
+                            && gone.wrapper == fence.wrapper
+                            && gone.worker_id == fence.worker_id
                     })
                 });
         }
@@ -3227,6 +3264,7 @@ impl BuildHistory {
                 fences.remove(0);
             }
             fences.push(SourceFence {
+                build_id,
                 project_id: state.project_id.clone(),
                 worker_id: state.worker_id.clone(),
                 wrapper: wrapper.to_owned(),
@@ -3670,7 +3708,7 @@ mod tests {
             tags: vec![],
             tools: vec![],
         });
-        history
+        let admission = history
             .try_start_active_build_in_lanes(
                 format!("project-{owner}"),
                 "layout-worker".into(),
@@ -3685,8 +3723,11 @@ mod tests {
                 topology,
                 1,
             )
-            .unwrap()
-            .unwrap()
+            .unwrap();
+        let ActiveBuildAdmission::Admitted(state) = admission else {
+            panic!("source topology fixture must be admitted: {admission:?}");
+        };
+        *state
     }
 
     fn source_topology_test_mismatch() -> rch_common::SourceTopologyMismatch {
@@ -3983,6 +4024,152 @@ mod tests {
         assert!(history.source_fenced_workers("music", |_| true).is_empty());
     }
 
+    fn source_fence_admission(history: &BuildHistory, wrapper: &str) -> ActiveBuildAdmission {
+        history
+            .try_start_active_build_in_lanes(
+                "fenced-project".into(),
+                "fenced-worker".into(),
+                "cargo check".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                None,
+                None,
+                1,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn atomic_admission_rechecks_source_fence_after_terminal_completion() {
+        let history = BuildHistory::new(10);
+        let wrapper = "rchw-10000000-0000-4000-8000-0000000000f1";
+        let ActiveBuildAdmission::Admitted(owner) = source_fence_admission(&history, wrapper)
+        else {
+            panic!("initial owner must be admitted");
+        };
+        let earlier_source_exclusions = history.source_fenced_workers("fenced-project", |_| true);
+        assert!(earlier_source_exclusions.is_empty());
+
+        history
+            .complete_durable(
+                owner.id,
+                "fenced-worker",
+                Some(wrapper),
+                disk_budget_completion(130),
+            )
+            .unwrap();
+        assert!(history.active_builds().is_empty());
+        let successor = "rchw-10000000-0000-4000-8000-0000000000f2";
+        assert!(matches!(
+            source_fence_admission(&history, successor),
+            ActiveBuildAdmission::SourceFenceChanged
+        ));
+        assert!(history.active_builds().is_empty());
+
+        // Reconciliation retains unresolved ownership, and only the exact
+        // lease's settled-source observation permits a fresh admission.
+        assert_eq!(
+            history.source_fenced_workers("fenced-project", |_| true),
+            HashSet::from(["fenced-worker".into()])
+        );
+        assert!(matches!(
+            source_fence_admission(&history, successor),
+            ActiveBuildAdmission::SourceFenceChanged
+        ));
+        assert!(
+            history
+                .source_fenced_workers("fenced-project", |observed| {
+                    assert_eq!(observed, wrapper);
+                    false
+                })
+                .is_empty()
+        );
+        let ActiveBuildAdmission::Admitted(next) = source_fence_admission(&history, successor)
+        else {
+            panic!("settled source must restore admission");
+        };
+        assert_ne!(next.id, owner.id);
+        assert!(matches!(
+            source_fence_admission(&history, "competing-wrapper"),
+            ActiveBuildAdmission::Rejected
+        ));
+
+        // This is still a bounded scheduling cache: preserve its existing
+        // expiry policy at the atomic check as well as the advisory read.
+        history
+            .complete_durable(
+                next.id,
+                "fenced-worker",
+                Some(successor),
+                disk_budget_completion(130),
+            )
+            .unwrap();
+        history.source_fences.lock().unwrap()[0].created =
+            Instant::now().checked_sub(SOURCE_FENCE_MAX_AGE).unwrap();
+        assert!(matches!(
+            source_fence_admission(&history, "after-cache-expiry"),
+            ActiveBuildAdmission::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn stale_source_reconciliation_cannot_remove_a_new_attempts_fence() {
+        let history = BuildHistory::new(10);
+        let wrapper = "rchw-10000000-0000-4000-8000-0000000000f1";
+        let ActiveBuildAdmission::Admitted(first) = source_fence_admission(&history, wrapper)
+        else {
+            panic!("initial owner must be admitted");
+        };
+        history
+            .complete_durable(
+                first.id,
+                "fenced-worker",
+                Some(wrapper),
+                disk_budget_completion(130),
+            )
+            .unwrap();
+
+        history.source_fenced_workers("fenced-project", |observed| {
+            assert_eq!(observed, wrapper);
+            // This read observed settlement of the first attempt. Before it
+            // prunes that snapshot, another selector reconciles the old fence
+            // and the same wrapper retries and completes on the same worker.
+            assert!(
+                history
+                    .source_fenced_workers("fenced-project", |_| false)
+                    .is_empty()
+            );
+            let ActiveBuildAdmission::Admitted(next) = source_fence_admission(&history, wrapper)
+            else {
+                panic!("the wrapper may retry after its prior source is settled");
+            };
+            assert_ne!(next.id, first.id);
+            history
+                .complete_durable(
+                    next.id,
+                    "fenced-worker",
+                    Some(wrapper),
+                    disk_budget_completion(130),
+                )
+                .unwrap();
+            false
+        });
+
+        assert_eq!(
+            history.source_fenced_workers("fenced-project", |_| true),
+            HashSet::from(["fenced-worker".into()])
+        );
+        assert!(matches!(
+            source_fence_admission(&history, "competing-wrapper"),
+            ActiveBuildAdmission::SourceFenceChanged
+        ));
+        assert!(history.active_builds().is_empty());
+    }
+
     fn disk_budget_admit(
         history: &BuildHistory,
         project: &str,
@@ -4034,7 +4221,7 @@ mod tests {
         // bd-sgvod: three lanes on one worker, one project.
         let history = BuildHistory::new(10);
         let start = |worker: &str, wrapper: &str, lanes: u32| {
-            history
+            let admission = history
                 .try_start_active_build_in_lanes(
                     "mtdt".into(),
                     worker.into(),
@@ -4049,7 +4236,14 @@ mod tests {
                     None,
                     lanes,
                 )
-                .unwrap()
+                .unwrap();
+            match admission {
+                ActiveBuildAdmission::Admitted(state) => Some(*state),
+                ActiveBuildAdmission::Rejected => None,
+                ActiveBuildAdmission::SourceFenceChanged => {
+                    panic!("lane fixture has no unresolved source fence");
+                }
+            }
         };
         let a = start("hz3", "w-a", 3).expect("lane 0");
         let b = start("hz3", "w-b", 3).expect("lane 1");

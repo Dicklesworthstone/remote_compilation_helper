@@ -440,12 +440,19 @@ pub(super) fn rewrite_cargo_target_dir_command_for_remote(
 pub(super) fn managed_clean_overlay_cargo_tokens(
     command: &str,
 ) -> anyhow::Result<(Vec<String>, usize)> {
-    literal_cargo_tokens(command, false)
+    literal_command_tokens(command, CommandPrefixMode::Cargo)
 }
 
-fn literal_cargo_tokens(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandPrefixMode {
+    Cargo,
+    ClassifiedCargo,
+    Job,
+}
+
+fn literal_command_tokens(
     command: &str,
-    allow_classified_wrappers: bool,
+    mode: CommandPrefixMode,
 ) -> anyhow::Result<(Vec<String>, usize)> {
     // shell_words preserves literal argv, not shell evaluation. Refuse syntax
     // whose expansion or execution would change when those words are re-quoted.
@@ -475,18 +482,35 @@ fn literal_cargo_tokens(
     if escaped || quote.is_some() {
         anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
     }
-    cargo_command_tokens_with_wrappers(command, allow_classified_wrappers)
+    command_tokens_with_wrappers(command, mode)
 }
 
 /// Resolve only a literal command-local Cargo home. The isolated worker home
 /// otherwise remains authoritative. Removing its environment or introducing
 /// shell evaluation cannot certify a bounded set of cache output roots.
 pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<String>> {
-    let (tokens, cargo_index) = literal_cargo_tokens(command, false)?;
+    let (tokens, executable_index) = literal_command_tokens(command, CommandPrefixMode::Cargo)?;
+    disk_home_override(&tokens, executable_index)
+}
+
+/// An explicitly admitted job may invoke a script whose arguments mention
+/// Cargo. Resolve the environment presented to that executable, without
+/// interpreting its payload as another command or an environment prefix.
+/// Nested commands remain the job's responsibility; the isolated worker home
+/// and any literal top-level override still belong to the disk monitor.
+pub(crate) fn job_disk_home_override(command: &str) -> anyhow::Result<Option<String>> {
+    let (tokens, executable_index) = literal_command_tokens(command, CommandPrefixMode::Job)?;
+    disk_home_override(&tokens, executable_index)
+}
+
+fn disk_home_override(
+    tokens: &[String],
+    executable_index: usize,
+) -> anyhow::Result<Option<String>> {
     let mut selected = None;
     let mut inherited = true;
     let mut index = 0;
-    while index < cargo_index {
+    while index < executable_index {
         match Path::new(&tokens[index])
             .file_name()
             .and_then(|name| name.to_str())
@@ -494,7 +518,7 @@ pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<S
             Some("env") => {
                 index += 1;
                 let mut options = true;
-                while index < cargo_index {
+                while index < executable_index {
                     let token = &tokens[index];
                     if super::is_shell_assignment(token) {
                         if let Some(value) = token.strip_prefix("CARGO_HOME=") {
@@ -544,7 +568,7 @@ pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<S
             }
             Some("time") => {
                 index += 1;
-                while index < cargo_index && tokens[index].starts_with('-') {
+                while index < executable_index && tokens[index].starts_with('-') {
                     let token = &tokens[index];
                     // Option values remain opaque, even when they spell an
                     // assignment or an environment-clearing option.
@@ -576,13 +600,14 @@ pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<S
 /// prefixes. Shared with target detection so `env --` and wrapper option values
 /// are not mistaken for Cargo's argument separator or executable.
 fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
-    cargo_command_tokens_with_wrappers(command, false)
+    command_tokens_with_wrappers(command, CommandPrefixMode::Cargo)
 }
 
-fn cargo_command_tokens_with_wrappers(
+fn command_tokens_with_wrappers(
     command: &str,
-    allow_classified_wrappers: bool,
+    mode: CommandPrefixMode,
 ) -> anyhow::Result<(Vec<String>, usize)> {
+    let allow_classified_wrappers = mode == CommandPrefixMode::ClassifiedCargo;
     let mut tokens = shell_words::split(command)?;
     let assignment = super::is_shell_assignment;
     // Quoting an assignment as an entire shell word makes it an executable.
@@ -693,6 +718,10 @@ fn cargo_command_tokens_with_wrappers(
             _ if allow_classified_wrappers => {
                 let cargo_index = classified_cargo_suffix(&tokens, wrapper_start)?;
                 return Ok((tokens, cargo_index));
+            }
+            _ if mode == CommandPrefixMode::Job => {
+                anyhow::ensure!(!token.is_empty(), "missing job executable");
+                break;
             }
             _ => anyhow::bail!("unsupported executable prefix in managed Cargo command: {token}"),
         }
@@ -1040,7 +1069,8 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         !stamp.is_empty() && !stamp.chars().any(char::is_control),
         "invalid build-source stamp"
     );
-    let (mut tokens, cargo_index) = literal_cargo_tokens(command, true)?;
+    let (mut tokens, cargo_index) =
+        literal_command_tokens(command, CommandPrefixMode::ClassifiedCargo)?;
     let end = tokens
         .iter()
         .enumerate()
@@ -1259,7 +1289,8 @@ fn skip_env_option_prefix(tokens: &[String], mut index: usize) -> usize {
 /// option value cannot make those two operations disagree about the target.
 fn cargo_target_dir_flag_span(tokens: &[String]) -> Option<(std::ops::Range<usize>, String)> {
     let command = shell_words::join(tokens);
-    let (normalized, cargo_index) = cargo_command_tokens_with_wrappers(&command, true).ok()?;
+    let (normalized, cargo_index) =
+        command_tokens_with_wrappers(&command, CommandPrefixMode::ClassifiedCargo).ok()?;
     // The shared parser may add `env` for leading assignments. Map its index
     // back to the original argv; never reconstruct or change wrapper arguments.
     let added = normalized.len().checked_sub(tokens.len())?;
@@ -1453,6 +1484,100 @@ mod managed_build_dir_tests {
                 super::cargo_disk_home_override(command).is_err(),
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn job_disk_cache_scope_treats_script_arguments_as_data() {
+        for command in [
+            "bash scripts/gate_of_record_job.sh /stage cargo_test_05 cargo -j 2 test -p mtdt-page --test movement_headings",
+            "bash scripts/cargo_gate.sh /stage row",
+            "./cargo-gate.sh row",
+            "bash scripts/gate.sh cargo -i --ignore-environment -S --split-string=CARGO_HOME=relative CARGO_HOME=relative",
+            "time -f CARGO_HOME=/format bash scripts/gate.sh cargo",
+            "env -C CARGO_HOME=/cwd bash scripts/gate.sh cargo",
+            "rustup run CARGO_HOME=/toolchain bash scripts/gate.sh cargo",
+            "sh -c 'cargo test -- --nocapture'",
+        ] {
+            assert_eq!(
+                super::job_disk_home_override(command).unwrap(),
+                None,
+                "{command}"
+            );
+            assert!(
+                super::cargo_disk_home_override(command).is_err(),
+                "arbitrary scripts still require explicit job admission: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_disk_cache_scope_preserves_literal_top_level_homes() {
+        for (command, home) in [
+            (
+                "CARGO_HOME='/worker/cache with spaces' bash scripts/gate.sh cargo",
+                "/worker/cache with spaces",
+            ),
+            (
+                "env -- CARGO_HOME=/worker/cache bash scripts/gate.sh cargo",
+                "/worker/cache",
+            ),
+            (
+                "env -i CARGO_HOME=/worker/cache bash scripts/gate.sh cargo",
+                "/worker/cache",
+            ),
+            (
+                "env -u CARGO_HOME CARGO_HOME=/worker/cache bash scripts/gate.sh cargo",
+                "/worker/cache",
+            ),
+            (
+                "rustup run nightly env CARGO_HOME=/worker/cache bash scripts/gate.sh cargo",
+                "/worker/cache",
+            ),
+            (
+                "time -f CARGO_HOME=/format env CARGO_HOME=/worker/cache bash scripts/gate.sh cargo",
+                "/worker/cache",
+            ),
+        ] {
+            assert_eq!(
+                super::job_disk_home_override(command).unwrap().as_deref(),
+                Some(home),
+                "{command}"
+            );
+        }
+
+        // `--job` can also name Cargo itself. Its home contract is unchanged.
+        for command in [
+            "cargo check",
+            "env -- CARGO_INCREMENTAL=1 rustup run nightly cargo test",
+            "CARGO_HOME='/worker/cache with spaces' cargo check",
+            "env -i CARGO_HOME=/worker/cache cargo check",
+        ] {
+            assert_eq!(
+                super::job_disk_home_override(command).unwrap(),
+                super::cargo_disk_home_override(command).unwrap(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_disk_cache_scope_rejects_unbounded_top_level_homes() {
+        for command in [
+            "CARGO_HOME=relative bash scripts/gate.sh cargo",
+            "CARGO_HOME= bash scripts/gate.sh cargo",
+            "CARGO_HOME=$HOME/cache bash scripts/gate.sh cargo",
+            "env -i bash scripts/gate.sh cargo",
+            "env -u CARGO_HOME bash scripts/gate.sh cargo CARGO_HOME=/payload",
+            "env --unset=CARGO_HOME bash scripts/gate.sh cargo",
+            "env -uCARGO_HOME bash scripts/gate.sh cargo",
+            "env -u CARGO_HOME time -f CARGO_HOME=/format bash scripts/gate.sh cargo",
+            "env -S 'CARGO_HOME=/worker/cache OTHER=1' bash scripts/gate.sh cargo",
+            "bash scripts/gate.sh cargo; cargo build",
+            "env -u CARGO_HOME cargo check",
+            "CARGO_HOME=relative cargo check",
+        ] {
+            assert!(super::job_disk_home_override(command).is_err(), "{command}");
         }
     }
 

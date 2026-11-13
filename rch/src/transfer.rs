@@ -78,9 +78,36 @@ rch_rpc_status=$?
 exit "$rch_rpc_status"
 }}
 "#,
-        supervisor = escape(Cow::Borrowed(include_str!("hook/source_lock_holder.sh"))),
+        supervisor = escape(Cow::Owned(source_lock_holder_script())),
         timeout_ms = timeout.as_millis(),
     )
+}
+
+/// Each holder runs in a fresh shell, so its worker locator must travel in
+/// that same program instead of relying on functions from a parent shell.
+pub(crate) fn source_lock_holder_script() -> String {
+    let script = format!(
+        "{}\n{}",
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        include_str!("hook/source_lock_holder.sh"),
+    );
+    #[cfg(test)]
+    {
+        // Command-text tests do not require a worker build. Executed fixtures
+        // still select the sibling build and preserve an explicit override.
+        format!(
+            "if [ \"${{RCH_WKR_BIN+x}}\" != x ]; then RCH_WKR_BIN={}; fi; export RCH_WKR_BIN;\n{script}",
+            escape(Cow::Owned(
+                native_control_worker_path_for_test()
+                    .to_string_lossy()
+                    .into_owned(),
+            )),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        script
+    }
 }
 
 /// Pass a trusted shell program without making it an exec argument or stdin.
@@ -104,7 +131,6 @@ fn artifact_header_probe_script(
     cargo_target_root: Option<&str>,
     paths: &[String],
 ) -> anyhow::Result<String> {
-    use std::fmt::Write as _;
     const MAX_HEADER_CANDIDATES: usize = 16_384;
     const MAX_HEADER_PATH_BYTES: usize = 4_096;
     anyhow::ensure!(
@@ -123,135 +149,24 @@ fn artifact_header_probe_script(
         }),
         "artifact platform preflight selected an unsafe path"
     );
-    let bytes = serde_json::to_vec(&(remote, cargo_target_root, paths))?;
-    let mut payload = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(payload, "{byte:02x}")?;
-    }
+    let payload = serde_json::to_string(&(remote, cargo_target_root, paths))?;
     Ok(format!(
-        r#"python3 -I - <<'RCH_ARTIFACT_HEADERS'
-import json, os, stat
-root_name, target_name, paths = json.loads(bytes.fromhex('{payload}'))
-
-def require(condition, detail):
-    if not condition:
-        raise RuntimeError(detail)
-
-def same_inode(left, right):
-    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
-
-def generation(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
-            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-def open_root(path):
-    resolved = os.path.realpath(path)
-    descriptor = os.open(
-        resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    )
-    try:
-        require(same_inode(os.fstat(descriptor), os.stat(path)),
-                'artifact probe root changed while opening')
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-root = open_root(root_name)
-target = None
-result = []
-try:
-    for path in paths:
-        parts = path.split('/')
-        require(parts and all(part not in ('', '.', '..') for part in parts),
-                'artifact path is not a literal relative path')
-        opened = [os.dup(root)]
-        directory = opened[0]
-        chain = []
-        file_descriptor = None
-        target_alias = False
-        try:
-            if parts[0] == 'target' and len(parts) > 1:
-                selected = os.stat('target', dir_fd=root, follow_symlinks=False)
-                if stat.S_ISLNK(selected.st_mode):
-                    require(target_name is not None, 'target alias has no authorized root')
-                    if target is None:
-                        target = open_root(target_name)
-                    require(same_inode(
-                        os.stat('target', dir_fd=root, follow_symlinks=True),
-                        os.fstat(target)
-                    ), 'target alias has a different authorized root')
-                    directory = os.dup(target)
-                    opened.append(directory)
-                    parts = parts[1:]
-                    target_alias = True
-
-            for part in parts[:-1]:
-                next_directory = os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=directory,
-                )
-                opened.append(next_directory)
-                chain.append((directory, part, next_directory))
-                directory = next_directory
-
-            file_descriptor = os.open(
-                parts[-1],
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-                | os.O_NONBLOCK | os.O_NOCTTY,
-                dir_fd=directory,
-            )
-            before = os.fstat(file_descriptor)
-            require(stat.S_ISREG(before.st_mode), 'artifact header is not a regular file')
-            wanted = min(64, before.st_size)
-            prefix = bytearray()
-            while len(prefix) < wanted:
-                chunk = os.read(file_descriptor, wanted - len(prefix))
-                require(chunk, 'artifact header was truncated while reading')
-                prefix.extend(chunk)
-
-            after = os.fstat(file_descriptor)
-            named = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
-            require(
-                generation(before) == generation(after) == generation(named),
-                'artifact changed while reading its header',
-            )
-            for parent, name, child in reversed(chain):
-                require(
-                    same_inode(
-                        os.stat(name, dir_fd=parent, follow_symlinks=False),
-                        os.fstat(child),
-                    ),
-                    'artifact directory changed while reading its header',
-                )
-            if target_alias:
-                require(
-                    same_inode(
-                        os.stat('target', dir_fd=root, follow_symlinks=True),
-                        os.fstat(target),
-                    ),
-                    'target alias changed while reading its header',
-                )
-            result.append([path, list(prefix)])
-        finally:
-            if file_descriptor is not None:
-                os.close(file_descriptor)
-            for descriptor in reversed(opened):
-                os.close(descriptor)
-
-    require(same_inode(os.fstat(root), os.stat(root_name)),
-            'artifact probe root changed before response')
-    if target is not None:
-        require(same_inode(os.fstat(target), os.stat(target_name)),
-                'authorized target root changed before response')
-    print(json.dumps(result, separators=(',', ':')))
-finally:
-    if target is not None:
-        os.close(target)
-    os.close(root)
+        r#"(
+{locate}
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_ARTIFACT_HEADERS_UNAVAILABLE rch-wkr is not installed on this worker' >&2
+    exit 73
+fi
+if ! rch_header_version=$("$RCH_WKR" artifact-headers probe) \
+    || [ "$rch_header_version" != 'rch-wkr artifact-headers v1' ]; then
+    printf '%s\n' 'RCH_ARTIFACT_HEADERS_UNAVAILABLE deploy the matching rch-wkr with artifact-headers support' >&2
+    exit 73
+fi
+exec "$RCH_WKR" artifact-headers inspect <<'RCH_ARTIFACT_HEADERS'
+{payload}
 RCH_ARTIFACT_HEADERS
-"#
+)"#,
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
     ))
 }
 
@@ -1518,19 +1433,69 @@ fi
 
 /// Sync only these records, including directories. Explicit fsync avoids both
 /// syncfs and uutils versions that silently implement `sync FILE` as sync().
-/// Python is also used by the existing namespace and artifact custody paths.
-/// Missing Python or any failed barrier is an error, never a broad-sync fallback.
+/// The worker implements the barrier before starting its async runtime. An
+/// unavailable worker command or failed barrier retains unsettled ownership.
 pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
-    let script = "import os, sys\nfor path in sys.argv[1:]:\n fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n try: os.fsync(fd)\n finally: os.close(fd)";
     format!(
-        "python3 -I -S -c {} {}",
-        escape(Cow::Borrowed(script)),
-        paths
+        "( {locate}\
+         if ! rch_wkr_locate; then \
+         printf '%s\\n' 'RCH_FILE_SYNC_UNCONFIRMED rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+         if ! __rch_sync_probe=$(\"$RCH_WKR\" file-sync probe 2>/dev/null) \
+         || [ \"$__rch_sync_probe\" != 'rch-wkr file-sync v1' ]; then \
+         printf '%s\\n' 'RCH_FILE_SYNC_UNCONFIRMED deploy the matching rch-wkr with file-sync support' >&2; exit 74; fi; \
+         exec \"$RCH_WKR\" file-sync sync {paths} )",
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        paths = paths
             .iter()
             .map(|path| escape(Cow::Borrowed(*path)).into_owned())
             .collect::<Vec<_>>()
             .join(" ")
     )
+}
+
+#[cfg(test)]
+fn native_control_worker_path_for_test() -> PathBuf {
+    std::env::var_os("RCH_WKR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            // Cargo places tests in either `deps/` or the per-unit
+            // `build/<package>/<hash>/out/` tree. In both layouts the
+            // normal worker binary is uplifted into that profile directory.
+            std::env::current_exe()
+                .ok()
+                .and_then(|executable| {
+                    executable
+                        .ancestors()
+                        .skip(1)
+                        .take(5)
+                        .find(|directory| {
+                            matches!(
+                                directory.file_name().and_then(|name| name.to_str()),
+                                Some("deps" | "build")
+                            )
+                        })
+                        .and_then(Path::parent)
+                        .map(|profile| {
+                            profile.join(format!("rch-wkr{}", std::env::consts::EXE_SUFFIX))
+                        })
+                })
+                .unwrap_or_else(|| {
+                    PathBuf::from(
+                        "/nonexistent/build rch-wkr beside these tests or set RCH_WKR_BIN",
+                    )
+                })
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn native_control_worker_for_test() -> PathBuf {
+    let binary = native_control_worker_path_for_test();
+    assert!(
+        binary.is_file(),
+        "build the matching rch-wkr binary or set RCH_WKR_BIN for native control tests: {}",
+        binary.display()
+    );
+    binary
 }
 
 /// Removes every file the durable supervisor writes beside `path`; the claim
@@ -3590,22 +3555,39 @@ impl TransferPipeline {
                     "receipt": null, "warm_policy": null,
                     "require_incremental_tracking": true,
                 });
-                // The monitor and rsync inherit the original binary input
-                // stream. Server arguments are appended by rsync after this
-                // fragment and forwarded unchanged through the activity fence.
-                format!(
-                    "env RCH_TIMING_SCALE={} python3 -I -S -c {} {} {} {} {} {} standalone rsync",
-                    rch_common::timing::configured().env_value(),
-                    escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT)),
-                    budget.max_growth_bytes,
-                    budget.min_free_bytes,
-                    escape(Cow::Owned(format!(
-                        "{}_SOURCE_UPLOAD_DISK_BUDGET:",
-                        self.deadline_marker
-                    ))),
-                    escape(Cow::Borrowed(source.as_str())),
-                    escape(Cow::Owned(plan.to_string())),
-                )
+                let marker = format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", self.deadline_marker);
+                let refusal = format!(
+                    "{marker}{}",
+                    serde_json::json!({
+                        "reason": "monitor_unavailable", "free_bytes": 0, "growth_bytes": 0,
+                        "max_growth_bytes": budget.max_growth_bytes,
+                        "min_free_bytes": budget.min_free_bytes, "started": false,
+                        "detail": "deploy rch-wkr with native disk-supervise support",
+                    })
+                );
+                // The monitor and rsync inherit the original binary input.
+                // Keep the whole capability check inside one command, so a
+                // failed destination setup cannot fall through to the receiver.
+                // rsync's appended server arguments remain separate argv values.
+                let program = format!(
+                    r#"set -eu
+{locate}
+if ! rch_wkr_locate || ! rch_disk_version=$("$RCH_WKR" disk-supervise probe) \
+    || [ "$rch_disk_version" != 'rch-wkr disk-supervise v1' ]; then
+    printf '%s\n' {refusal} >&2
+    exit 120
+fi
+exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {marker} {target} {plan} standalone rsync "$@""#,
+                    locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+                    refusal = escape(Cow::Owned(refusal)),
+                    scale = rch_common::timing::configured().env_value(),
+                    budget = budget.max_growth_bytes,
+                    floor = budget.min_free_bytes,
+                    marker = escape(Cow::Owned(marker)),
+                    target = escape(Cow::Borrowed(source.as_str())),
+                    plan = escape(Cow::Owned(plan.to_string())),
+                );
+                format!("sh -c {} rch-source-upload", escape(Cow::Owned(program)))
             }
             None => "rsync".to_owned(),
         };
@@ -4346,8 +4328,12 @@ impl TransferPipeline {
                         || token.starts_with("--split-string")
                 })
             });
-            let home = if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment
-            {
+            let home = if self.compilation_kind == Some(CompilationKind::Job) {
+                // Job admission permits scripts with Cargo-looking argument
+                // data. Keep accounting for the isolated cache that the shell
+                // creates, while resolving only the job's actual env prefix.
+                crate::hook::job_disk_home_override(command)
+            } else if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment {
                 Ok(None)
             } else {
                 crate::hook::cargo_disk_home_override(command)
@@ -4878,15 +4864,30 @@ impl TransferPipeline {
             .as_deref()
             .context("Git archive cache has no paired target")?;
         let source = self.remote_path();
-        // The same guarded mkdir used by the cold rsync receiver prepares
-        // sibling source roots under the existing durable source grant. The
-        // helper never creates ancestors above the exact paired target.
+        // Probe before preparing source: an older deployed worker must not
+        // silently bypass the native protocol. The same guarded mkdir as the
+        // cold rsync receiver then prepares sibling source roots under the
+        // existing durable grant. The helper never creates target ancestors.
         Ok(format!(
-            "set -eu\n{guard} || exit 73\numask 0022\nmkdir -p {source}\nif ! command -v python3 >/dev/null 2>&1; then\nprintf 'RCH_GIT_ARCHIVE_CACHE_V1 BYPASS_UNAVAILABLE\\n'\nexit 0\nfi\npython3 -I -c {program} {operation} {source} {target} {slot} {digest} {size} {reserve}",
+            r#"set -eu
+{locate}
+if ! rch_wkr_locate; then
+    printf '%s\n' 'RCH_GIT_ARCHIVE_CACHE_ERROR: rch-wkr is not installed on this worker' >&2
+    exit 74
+fi
+if ! rch_archive_version=$("$RCH_WKR" git-archive-cache probe) \
+    || [ "$rch_archive_version" != 'rch-wkr git-archive-cache v1' ]; then
+    printf '%s\n' 'RCH_GIT_ARCHIVE_CACHE_ERROR: deploy the matching rch-wkr with git-archive-cache support' >&2
+    exit 74
+fi
+{guard} || exit 73
+umask 0022
+mkdir -p {source}
+"$RCH_WKR" git-archive-cache {operation} {source} {target} {slot} {digest} {size} {reserve}"#,
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
             guard = live_checkout_sync_guard(&source),
             source = escape(Cow::Borrowed(&source)),
             target = escape(Cow::Borrowed(target)),
-            program = escape(Cow::Borrowed(include_str!("transfer/git_archive_cache.py"))),
             operation = operation.as_str(),
             slot = escape(Cow::Borrowed(&cache.slot)),
             digest = escape(Cow::Borrowed(digest)),
@@ -5437,7 +5438,7 @@ impl TransferPipeline {
     // Selection runs entirely locally. Windows include-only tar uploads must
     // use the same rsync filters as POSIX uploads, without enabling the separate
     // remote source-content receipt protocol or symlinks on Windows.
-    async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
+    pub(crate) async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
         Ok(self
             .enumerate_source_upload_selection(false, false)
             .await?
@@ -6062,7 +6063,6 @@ impl TransferPipeline {
             "cargo_cache_required": self.cargo_disk_cache.is_some()
                 || (!self.cargo_disk_scope_captured && command.contains("cargo")),
         });
-        let script = escape(Cow::Borrowed(rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT));
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
         let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
         let plan = escape(Cow::Owned(plan.to_string()));
@@ -6073,12 +6073,19 @@ impl TransferPipeline {
             "standalone"
         };
         let refusal =
-            self.disk_prestart_refusal("worker Python disk supervisor is unavailable", 120);
+            self.disk_prestart_refusal("deploy rch-wkr with native disk-supervise support", 120);
         let program = format!(
-            "{}if ! command -v python3 >/dev/null 2>&1; then {refusal}; fi; python3 -I -S -c {script} {} {} {marker} {target} {plan} {mode} sh -lc {command}",
-            rch_common::timing::shell_prefix(),
+            r#"{timing}
+{locate}
+if ! rch_wkr_locate || ! rch_disk_version=$("$RCH_WKR" disk-supervise probe) \
+    || [ "$rch_disk_version" != 'rch-wkr disk-supervise v1' ]; then
+    {refusal}
+fi
+"$RCH_WKR" disk-supervise {} {} {marker} {target} {plan} {mode} sh -lc {command}"#,
             budget.max_growth_bytes,
             budget.min_free_bytes,
+            timing = rch_common::timing::shell_prefix(),
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
         );
         // This composition can exceed the single-argument limit independently
         // of the outer session wrapper, even when each embedded program fits.
@@ -9434,215 +9441,28 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 && control_dir == format!("{source_container}.freshness"),
             "owned source freshness requires the entire source container and its exact control sibling"
         );
-        let program = if mark_verified {
-            Self::owned_source_refresh_preparation_script().to_owned()
-        } else {
-            format!(
-                "{}\n{}",
-                Self::owned_source_refresh_preparation_script(),
-                Self::clean_overlay_freshness_ledger_script()
-            )
-        };
-        Ok(format!(
-            "python3 -I -c {} {} {} {} {} {} {}",
-            escape(Cow::from(program)),
+        Ok(Self::source_freshness_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-freshness owned {} {} {} {} {} {}",
             escape(Cow::from(source_container)),
             escape(Cow::from(self.remote_cargo_target_dir())),
             escape(Cow::from(format!("{control_dir}/epoch-v1"))),
             escape(Cow::from(identity)),
             escape(Cow::from(attempt)),
             if mark_verified { "verify" } else { "refresh" },
-        ))
+        )))
     }
 
-    fn owned_source_refresh_preparation_script() -> &'static str {
-        r#"import hashlib, json, os, stat, sys
-
-def rch_owned_require(condition, reason):
-    if not condition:
-        raise RuntimeError('RCH: owned source freshness refused: ' + reason)
-
-rch_owned_require(sys.platform == 'linux', 'Linux worker required')
-rch_owned_require(len(sys.argv) == 7, 'invalid freshness arguments')
-rch_root, rch_pool, rch_epoch, rch_identity, rch_attempt, rch_operation = sys.argv[1:]
-rch_control = os.path.dirname(rch_epoch)
-def rch_literal(path):
-    return (path.startswith('/') and not path.endswith('/') and '\\' not in path
-            and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
-            and all(part not in ('', '.', '..') for part in path[1:].split('/')))
-rch_owned_require(all(rch_literal(path) for path in (rch_root, rch_pool, rch_control)),
-                  'nonliteral source, target or control path')
-rch_owned_require(rch_control == rch_root + '.freshness'
-                  and os.path.basename(rch_epoch) == 'epoch-v1',
-                  'control directory is outside its exact authority')
-rch_owned_require(rch_pool != rch_root and not rch_pool.startswith(rch_root + '/')
-                  and rch_pool != rch_control and not rch_pool.startswith(rch_control + '/'),
-                  'stable target must be outside source and control trees')
-rch_owned_require(len(rch_identity) == 64
-                  and all(ch in '0123456789abcdefABCDEF' for ch in rch_identity),
-                  'invalid freshness identity')
-rch_owned_require(len(rch_attempt) == 32
-                  and all(ch in '0123456789abcdef' for ch in rch_attempt),
-                  'invalid freshness attempt')
-rch_owned_require(rch_operation in ('refresh', 'verify'), 'invalid freshness operation')
-rch_owned_previous_qualified = False
-rch_intent = {'schema': 'rch.source_freshness_attempt.v1', 'source_root': rch_root,
-              'target_root': rch_pool, 'content_identity': rch_identity, 'attempt': rch_attempt}
-def rch_encoded(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
-
-def rch_sha256(value):
-    return hashlib.sha256(value).hexdigest()
-
-rch_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-rch_parent = os.open('/', rch_flags)
-try:
-    for rch_part in os.path.dirname(rch_root).split('/')[1:]:
-        if rch_part:
-            rch_child = os.open(rch_part, rch_flags, dir_fd=rch_parent)
-            os.close(rch_parent)
-            rch_parent = rch_child
-    rch_source_fd = os.open(os.path.basename(rch_root), rch_flags, dir_fd=rch_parent)
-    try:
-        rch_owned_require(os.fstat(rch_source_fd).st_uid == os.geteuid(),
-                          'source container has a foreign owner')
-    finally:
-        os.close(rch_source_fd)
-    if rch_operation == 'refresh':
-        try:
-            os.mkdir(os.path.basename(rch_control), mode=0o700, dir_fd=rch_parent)
-        except FileExistsError:
-            pass
-    rch_control_fd = os.open(os.path.basename(rch_control), rch_flags, dir_fd=rch_parent)
-    try:
-        rch_info = os.fstat(rch_control_fd)
-        rch_owned_require(rch_info.st_uid == os.geteuid()
-                          and stat.S_IMODE(rch_info.st_mode) & 0o077 == 0,
-                          'control directory must be private and owned by this worker user')
-        os.fsync(rch_control_fd)
-        os.fsync(rch_parent)
-
-        def rch_read_control(name, cap):
-            try:
-                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-                                     dir_fd=rch_control_fd)
-            except FileNotFoundError:
-                return None
-            with os.fdopen(descriptor, 'rb') as stream:
-                before = os.fstat(stream.fileno())
-                rch_owned_require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid(),
-                                  'freshness control must be a regular owned file')
-                if before.st_size > cap:
-                    return None
-                data = stream.read(cap + 1)
-                after = os.fstat(stream.fileno())
-                rch_owned_require((before.st_dev, before.st_ino, before.st_size,
-                                   before.st_mtime_ns, before.st_ctime_ns)
-                                  == (after.st_dev, after.st_ino, after.st_size,
-                                      after.st_mtime_ns, after.st_ctime_ns)
-                                  and len(data) == before.st_size,
-                                  'freshness control changed while reading')
-                return data, before
-
-        def rch_decode_intent(encoded):
-            if encoded is None:
-                return None
-            try:
-                value = json.loads(encoded[0])
-                if (set(value) == set(rch_intent) and rch_encoded(value) == encoded[0]
-                    and value['schema'] == rch_intent['schema']
-                    and value['source_root'] == rch_root and value['target_root'] == rch_pool
-                    and isinstance(value['attempt'], str) and len(value['attempt']) == 32
-                    and all(ch in '0123456789abcdef' for ch in value['attempt'])
-                    and isinstance(value['content_identity'], str)
-                    and len(value['content_identity']) == 64
-                    and all(ch in '0123456789abcdefABCDEF' for ch in value['content_identity'])):
-                    return value
-            except (ValueError, TypeError, KeyError, UnicodeError):
-                pass
-            return None
-
-        def rch_qualification(intent):
-            if intent is None:
-                return None
-            epoch = rch_read_control('epoch-v1', 65)
-            ledger = rch_read_control('epoch-v1.files-v2', 64 * 1024**2)
-            if epoch is None or ledger is None:
-                return None
-            try:
-                document = json.loads(ledger[0])
-                payload = document['payload']
-                if (epoch[0] == (intent['content_identity'] + '\n').encode('ascii')
-                    and payload['identity'] == intent['content_identity']
-                    and payload['schema'] == 2 and payload['epoch_ns'] == epoch[1].st_mtime_ns
-                    and document['sha256'] == rch_sha256(rch_encoded(payload))):
-                    return rch_encoded({'schema': 'rch.source_freshness_verified.v1',
-                                        'intent': intent, 'epoch_sha256': rch_sha256(epoch[0]),
-                                        'ledger_sha256': rch_sha256(ledger[0]),
-                                        'epoch_mtime_ns': epoch[1].st_mtime_ns})
-            except (ValueError, TypeError, KeyError, UnicodeError):
-                pass
-            return None
-
-        def rch_stage_control(prefix, data):
-            name = prefix + '.pending.' + os.urandom(16).hex()
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                 0o600, dir_fd=rch_control_fd)
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            return name
-
-        current = rch_read_control('current-attempt-v1', 64 * 1024)
-        if rch_operation == 'refresh':
-            previous = rch_decode_intent(current)
-            expected = rch_qualification(previous)
-            if expected is not None and previous['attempt'] != rch_attempt:
-                proof = rch_read_control('verified-' + previous['attempt'] + '.json', 64 * 1024)
-                rch_owned_previous_qualified = proof is not None and proof[0] == expected
-            # Publish this unqualified attempt before the shared ledger changes
-            # source timestamps. A crash or failed post-proof cannot authorize
-            # the next invocation to reuse the previous successful attempt.
-            pending = rch_stage_control('current-attempt-v1', rch_encoded(rch_intent))
-            os.replace(pending, 'current-attempt-v1',
-                       src_dir_fd=rch_control_fd, dst_dir_fd=rch_control_fd)
-            os.fsync(rch_control_fd)
-        else:
-            rch_owned_require(current is not None and current[0] == rch_encoded(rch_intent),
-                              'verified attempt does not match the current preparation')
-            expected = rch_qualification(rch_intent)
-            rch_owned_require(expected is not None, 'verified attempt has no matching ledger and epoch')
-            name = 'verified-' + rch_attempt + '.json'
-            existing = rch_read_control(name, 64 * 1024)
-            if existing is None:
-                pending = rch_stage_control(name, expected)
-                try:
-                    # A hard link publishes the fully durable record without
-                    # replacing any existing entry. Keep its staging link too.
-                    os.link(pending, name, src_dir_fd=rch_control_fd,
-                            dst_dir_fd=rch_control_fd, follow_symlinks=False)
-                except FileExistsError:
-                    pass
-                existing = rch_read_control(name, 64 * 1024)
-            rch_owned_require(existing is not None and existing[0] == expected,
-                              'verified attempt conflicts with retained evidence')
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rch_control_fd)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            os.fsync(rch_control_fd)
-            print('RCH_SOURCE_FRESHNESS_VERIFIED')
-            sys.exit(0)
-    finally:
-        os.close(rch_control_fd)
-finally:
-    os.close(rch_parent)
-# Keep the existing ledger's argument contract unchanged. Its optional gate
-# defaults to true for clean-overlay callers, which do not run this prelude.
-sys.argv = sys.argv[:5]
-"#
+    fn source_freshness_worker_command(command: &str) -> String {
+        format!(
+            "( {locate}\
+             if ! rch_wkr_locate; then \
+             printf '%s\\n' 'RCH_SOURCE_FRESHNESS_UNAVAILABLE: rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+             if ! __rch_freshness_probe=$(\"$RCH_WKR\" source-freshness probe) \
+             || [ \"$__rch_freshness_probe\" != 'rch-wkr source-freshness v1' ]; then \
+             printf '%s\\n' 'RCH_SOURCE_FRESHNESS_UNAVAILABLE: deploy the matching rch-wkr with source-freshness support' >&2; exit 74; fi; \
+             {command} )",
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        )
     }
 
     /// Apply a content epoch while the source-pair lease is held, after complete
@@ -9705,256 +9525,22 @@ sys.argv = sys.argv[:5]
                 blake3::hash(root.as_bytes()).to_hex()
             )
         };
-        let anchor = format!("{control}.freshness-anchor");
         let epoch = format!("{control}.freshness-epoch-v1");
-        let conservative = format!(
-            "set -eu; root={root}; pool={pool}; anchor={anchor}; epoch={epoch}; identity={identity}; \
-             [ ! -L \"$anchor\" ] && [ ! -L \"$epoch\" ] && [ ! -L \"$pool\" ]; \
-             [ ! -e \"$epoch\" ] || [ -f \"$epoch\" ]; \
-             if [ -f \"$epoch\" ] && [ \"$(wc -c < \"$epoch\" | tr -d ' ')\" = 65 ] && \
-             [ \"$(cat \"$epoch\")\" = \"$identity\" ]; then \
-             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$epoch\" {{}} +; exit 0; fi; \
-             stamp=$(mktemp \"$epoch.pending.XXXXXX\"); \
-             printf '%s\\n' \"$identity\" > \"$stamp\"; touch \"$anchor\"; \
-             if [ -d \"$pool\" ]; then \
-             find \"$pool\" -type f -exec sh -c \
-             'anchor=$1; shift; for file do if [ \"$file\" -nt \"$anchor\" ]; then touch -r \"$file\" \"$anchor\" || exit; fi; done' \
-             sh \"$anchor\" {{}} +; fi; \
-             attempts=0; touch \"$stamp\"; \
-             until [ \"$stamp\" -nt \"$anchor\" ]; do \
-             attempts=$((attempts + 1)); if [ \"$attempts\" -gt 5 ]; then \
-             echo 'RCH: worker clock cannot advance beyond cached artifacts; source freshness unproved' >&2; exit 1; fi; \
-             sleep 1; touch \"$stamp\"; done; \
-             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$stamp\" {{}} +; \
-             mv -f \"$stamp\" \"$epoch\"",
-            root = quote(&root),
-            pool = quote(&pool),
-            anchor = quote(&anchor),
-            epoch = quote(&epoch),
-            identity = quote(identity),
-        );
-        Ok(format!(
-            "if command -v python3 >/dev/null 2>&1; then python3 -c {script} {root} {pool} {epoch} {identity}; \
-             else printf '%s\\n' 'RCH: python3 unavailable; using conservative whole-source freshness' >&2; \
-             {conservative}; fi",
-            script = quote(Self::clean_overlay_freshness_ledger_script()),
+        Ok(Self::source_freshness_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-freshness overlay {root} {pool} {epoch} {identity}",
             root = quote(&root),
             pool = quote(&pool),
             epoch = quote(&epoch),
             identity = quote(identity),
-        ))
-    }
-
-    /// Metadata only: source bytes are always rematerialized under the existing
-    /// source-pair lease. Compare against the immediate predecessor, never a
-    /// historical content-to-time cache (which would make A -> B -> A stale).
-    fn clean_overlay_freshness_ledger_script() -> &'static str {
-        r#"import hashlib, json, os, stat, sys, tempfile, time
-
-root, pool, epoch, identity = sys.argv[1:]
-ledger = epoch + '.files-v2'
-MAX_ENTRIES = 200000
-MAX_BYTES = 8 * 1024**3
-MAX_LEDGER = 64 * 1024**2
-
-def require(condition, reason):
-    if not condition:
-        raise RuntimeError('RCH: source freshness unproved: ' + reason)
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
-
-def digest(value):
-    return hashlib.sha256(canonical(value)).hexdigest()
-
-def regular_control(path):
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    require(stat.S_ISREG(info.st_mode), 'nonregular freshness control')
-    return info
-
-require(stat.S_ISDIR(os.lstat(root).st_mode), 'source root is not a real directory')
-try:
-    pool_info = os.lstat(pool)
-except FileNotFoundError:
-    pool_info = None
-require(pool_info is None or stat.S_ISDIR(pool_info.st_mode), 'target pool is not a real directory')
-root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-root_identity = os.fstat(root_fd)
-
-def parent_fd(relative):
-    descriptor = os.dup(root_fd)
-    parts = relative.split('/') if relative else ['.']
-    try:
-        for part in parts[:-1]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = next_fd
-        return descriptor, parts[-1]
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-epoch_info = regular_control(epoch)
-ledger_info = regular_control(ledger)
-previous = {}
-if (globals().get('rch_owned_previous_qualified', True)
-    and epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER):
-    try:
-        with os.fdopen(os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
-            encoded = stream.read(MAX_LEDGER + 1)
-        require(len(encoded) <= MAX_LEDGER, 'freshness ledger grew beyond cap')
-        stored = json.loads(encoded)
-        payload = stored['payload']
-        with os.fdopen(os.open(epoch, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
-            marker = stream.read(66)
-        valid = (stored['sha256'] == digest(payload)
-                 and payload['schema'] == 2
-                 and marker == (payload['identity'] + '\n').encode('ascii')
-                 and epoch_info.st_mtime_ns == payload['epoch_ns']
-                 and isinstance(payload['entries'], dict)
-                 and len(payload['entries']) <= MAX_ENTRIES)
-        for path, entry in payload['entries'].items():
-            valid = valid and (path == '' or (not path.startswith('/')
-                and all(part not in ('', '.', '..') for part in path.split('/'))))
-            valid = valid and (set(entry) == {'fingerprint', 'mtime_ns'}
-                and isinstance(entry['fingerprint'], str) and len(entry['fingerprint']) == 64
-                and all(c in '0123456789abcdef' for c in entry['fingerprint'])
-                and type(entry['mtime_ns']) is int and 0 <= entry['mtime_ns'] <= payload['epoch_ns'])
-        if valid:
-            previous = payload['entries']
-    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
-        pass
-
-def inventory():
-    entries = {}
-    total = 0
-    def visit(relative, depth):
-        nonlocal total
-        require(depth <= 128 and len(entries) < MAX_ENTRIES, 'source inventory cap exceeded')
-        directory_fd, name = parent_fd(relative)
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        mode = stat.S_IMODE(before.st_mode)
-        entries[relative] = None
-        if stat.S_ISREG(before.st_mode):
-            total += before.st_size
-            require(total <= MAX_BYTES, 'source byte cap exceeded')
-            hasher = hashlib.sha256()
-            # Reject a symlink substitution between lstat and open.
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-            with os.fdopen(descriptor, 'rb') as stream:
-                opened = os.fstat(stream.fileno())
-                require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'source replaced while hashing')
-                read_bytes = 0
-                for block in iter(lambda: stream.read(1024 * 1024), b''):
-                    read_bytes += len(block)
-                    require(read_bytes <= before.st_size, 'source grew while hashing')
-                    hasher.update(block)
-            value = ['file', mode, before.st_size, hasher.hexdigest()]
-        elif stat.S_ISLNK(before.st_mode):
-            value = ['symlink', mode, os.readlink(name, dir_fd=directory_fd)]
-        elif stat.S_ISDIR(before.st_mode):
-            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
-            try:
-                children = []
-                with os.scandir(child_fd) as listing:
-                    for child in listing:
-                        require(len(children) + len(entries) < MAX_ENTRIES, 'source directory cap exceeded')
-                        children.append(child.name)
-                children.sort()
-            finally:
-                os.close(child_fd)
-            value = ['directory', mode, [[name, visit(os.path.join(relative, name), depth + 1)] for name in children]]
-        else:
-            raise RuntimeError('RCH: unsupported source entry type')
-        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        os.close(directory_fd)
-        require((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                == (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
-                'source changed while hashing')
-        fingerprint = digest(value)
-        entries[relative] = {'fingerprint': fingerprint}
-        return fingerprint
-    visit('', 0)
-    named_root = os.lstat(root)
-    require((named_root.st_dev, named_root.st_ino) == (root_identity.st_dev, root_identity.st_ino), 'source root replaced')
-    return entries
-
-current = inventory()
-changed = [path for path, entry in current.items()
-           if previous.get(path, {}).get('fingerprint') != entry['fingerprint']]
-# A new metadata seal can retain source timestamps even when only the selected
-# commit changed. Changed inputs must still be newer than ALL cached artifacts.
-anchor_ns = max([0] + [entry['mtime_ns'] for entry in previous.values()])
-def traversal_error(error):
-    raise error
-
-if changed and pool_info is not None:
-    for directory, directories, files in os.walk(pool, followlinks=False, onerror=traversal_error):
-        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
-        for name in files:
-            info = os.lstat(os.path.join(directory, name))
-            if stat.S_ISREG(info.st_mode):
-                anchor_ns = max(anchor_ns, info.st_mtime_ns)
-deadline = time.monotonic() + 5
-stamp_ns = time.time_ns()
-while stamp_ns <= anchor_ns:
-    require(time.monotonic() < deadline, 'worker clock cannot advance beyond cached artifacts')
-    time.sleep(0.01)
-    stamp_ns = time.time_ns()
-
-for relative, entry in sorted(current.items(), key=lambda item: item[0].count('/'), reverse=True):
-    prior = previous.get(relative)
-    modified = prior['mtime_ns'] if prior and prior['fingerprint'] == entry['fingerprint'] else stamp_ns
-    directory_fd, name = parent_fd(relative)
-    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    os.utime(name, ns=(info.st_atime_ns, modified), dir_fd=directory_fd, follow_symlinks=False)
-    require(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mtime_ns == modified, 'source timestamp precision changed')
-    os.close(directory_fd)
-    entry['mtime_ns'] = modified
-verified = inventory()
-require({path: entry['fingerprint'] for path, entry in current.items()}
-        == {path: entry['fingerprint'] for path, entry in verified.items()}, 'source changed during freshness refresh')
-
-payload = {'schema': 2, 'identity': identity, 'epoch_ns': stamp_ns, 'entries': current}
-encoded = canonical({'payload': payload, 'sha256': digest(payload)})
-require(len(encoded) <= MAX_LEDGER, 'freshness ledger cap exceeded')
-def stage(path, data):
-    descriptor, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + '.pending.', dir=os.path.dirname(path))
-    with os.fdopen(descriptor, 'wb') as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    return temporary
-
-pending_ledger = stage(ledger, encoded)
-pending_epoch = stage(epoch, (identity + '\n').encode('ascii'))
-os.utime(pending_epoch, ns=(stamp_ns, stamp_ns), follow_symlinks=False)
-require(os.lstat(pending_epoch).st_mtime_ns == stamp_ns, 'epoch timestamp precision changed')
-# The epoch is the commit marker. A crash between these replacements leaves a
-# mismatched pair, causing conservative freshness on the next invocation.
-os.replace(pending_ledger, ledger)
-os.replace(pending_epoch, epoch)
-directory_fd = os.open(os.path.dirname(epoch), os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(changed), len(changed)))
-"#
+        )))
     }
 
     /// Read-only admission probe for retained source pairs. It checks the
-    /// actual Linux no-replace syscall through libc, never a guessed syscall
-    /// number or a replacing/copying fallback. The eventual filesystem rename
+    /// actual Linux no-replace syscall, never a guessed syscall number or a
+    /// replacing/copying fallback. The eventual filesystem rename
     /// can still refuse; that leaves the durable source grant outstanding.
     pub(crate) fn remote_tree_retention_capability_command() -> String {
-        format!(
-            "python3 -I -c {} probe",
-            escape(Cow::from(Self::remote_tree_retention_program()))
-        )
+        Self::remote_tree_retention_worker_command("printf '%s\\n' 'RCH_SOURCE_RETENTION_CAPABLE'")
     }
 
     /// Move this invocation's owned source into its exact retained sibling.
@@ -10049,153 +9635,26 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
             "retained source identity must be 32 lowercase hexadecimal characters"
         );
-        Ok(format!(
-            "python3 -I -c {} retain {} {} {} {}",
-            escape(Cow::from(Self::remote_tree_retention_program())),
+        Ok(Self::remote_tree_retention_worker_command(&format!(
+            "exec \"$RCH_WKR\" source-retain retain {} {} {} {}",
             escape(Cow::from(root)),
             escape(Cow::from(retained_root)),
             escape(Cow::from(identity)),
             u8::from(allow_absent_before_materialization),
-        ))
+        )))
     }
 
-    fn remote_tree_retention_program() -> &'static str {
-        r#"import ctypes
-import errno
-import hashlib
-import json
-import os
-import stat
-import sys
-
-def require(condition, reason):
-    if not condition:
-        raise RuntimeError(reason)
-
-def run():
-    require(sys.platform == "linux", "Linux source retention required")
-    require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
-            "directory descriptor support unavailable")
-    require(all(function in os.supports_dir_fd for function in
-                (os.open, os.stat, os.symlink, os.readlink)),
-            "relative directory operations unavailable")
-    library = ctypes.CDLL(None, use_errno=True)
-    rename = getattr(library, "renameat2", None)
-    require(rename is not None, "libc renameat2 unavailable")
-    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
-                       ctypes.c_char_p, ctypes.c_uint)
-    rename.restype = ctypes.c_int
-    # Linux renameat2(2), RENAME_NOREPLACE = 1. Empty names cannot mutate a
-    # path; ENOENT distinguishes an available syscall from ENOSYS/EPERM.
-    require(rename(-1, b"", -1, b"", 1) == -1 and ctypes.get_errno() == errno.ENOENT,
-            "Linux no-replace rename syscall unavailable")
-    if sys.argv[1:] == ["probe"]:
-        print("RCH_SOURCE_RETENTION_CAPABLE")
-        return
-    require(len(sys.argv) == 6 and sys.argv[1] == "retain", "invalid retention arguments")
-    root, retained, identity, allow_absent = sys.argv[2:]
-    def literal(path):
-        return (path.startswith("/") and not path.endswith("/") and "\\" not in path
-                and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
-                and all(part not in ("", ".", "..") for part in path[1:].split("/")))
-    require(literal(root) and literal(retained) and root != retained
-            and os.path.dirname(root) == os.path.dirname(retained), "invalid retained siblings")
-    require(len(identity) == 32 and all(ch in "0123456789abcdef" for ch in identity),
-            "invalid source identity")
-    require(allow_absent in ("0", "1"), "invalid absence policy")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    parent = os.open("/", flags)
-    try:
-        for component in os.path.dirname(root).split("/")[1:]:
-            if component:
-                try:
-                    descendant = os.open(component, flags, dir_fd=parent)
-                except FileNotFoundError:
-                    require(allow_absent == "1", "materialized source parent is missing")
-                    print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
-                    return
-                os.close(parent)
-                parent = descendant
-        source_name = os.path.basename(root)
-        retained_name = os.path.basename(retained)
-        marker_name = ".rch-retention-v1"
-        preimage = json.dumps(["rch.source_retention.v1", identity, root, retained],
-                             ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        marker_value = "rch-retention-v1:" + identity + ":" + hashlib.sha256(preimage).hexdigest()
-        def metadata(name):
-            try:
-                return os.stat(name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                return None
-        def directory(name):
-            descriptor = os.open(name, flags, dir_fd=parent)
-            require(os.fstat(descriptor).st_uid == os.geteuid(), "source directory has a foreign owner")
-            return descriptor
-        def marker(descriptor, create):
-            if create:
-                try:
-                    # symlink creation is atomic and never replaces an entry.
-                    # Its target is metadata only; it is never followed.
-                    os.symlink(marker_value, marker_name, dir_fd=descriptor)
-                except FileExistsError:
-                    pass
-            entry = os.stat(marker_name, dir_fd=descriptor, follow_symlinks=False)
-            require(stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.geteuid()
-                    and os.readlink(marker_name, dir_fd=descriptor) == marker_value,
-                    "source retention marker does not bind this identity and both paths")
-            os.fsync(descriptor)
-        source = metadata(source_name)
-        destination = metadata(retained_name)
-        if source is None:
-            if destination is None:
-                require(allow_absent == "1", "materialized source and retained snapshot are both missing")
-                print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
-                return
-            descriptor = directory(retained_name)
-            try:
-                marker(descriptor, False)
-                os.fsync(parent)
-                require(metadata(source_name) is None, "source appeared during retention reconciliation")
-                current = metadata(retained_name)
-                held = os.fstat(descriptor)
-                require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                        "retained source changed during reconciliation")
-            finally:
-                os.close(descriptor)
-            print("RCH_SOURCE_RETAINED")
-            return
-        require(stat.S_ISDIR(source.st_mode), "source root is not a real directory")
-        require(destination is None, "retained destination already exists while source is present")
-        descriptor = directory(source_name)
-        try:
-            held = os.fstat(descriptor)
-            require((source.st_dev, source.st_ino) == (held.st_dev, held.st_ino),
-                    "source changed before retention")
-            marker(descriptor, True)
-            current = metadata(source_name)
-            require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                    "source changed before no-replace rename")
-            if rename(parent, os.fsencode(source_name), parent, os.fsencode(retained_name), 1) != 0:
-                code = ctypes.get_errno()
-                raise OSError(code, "source no-replace rename refused: " + os.strerror(code))
-            os.fsync(parent)
-            current = metadata(retained_name)
-            require(metadata(source_name) is None and current is not None
-                    and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
-                    "source retention did not preserve the exact directory")
-            marker(descriptor, False)
-        finally:
-            os.close(descriptor)
-        print("RCH_SOURCE_RETAINED")
-    finally:
-        os.close(parent)
-
-try:
-    run()
-except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
-    sys.stderr.write("RCH_SOURCE_RETENTION_REFUSED: " + str(error) + "\n")
-    raise SystemExit(74)
-"#
+    fn remote_tree_retention_worker_command(command: &str) -> String {
+        format!(
+            "( {locate}\
+             if ! rch_wkr_locate; then \
+             printf '%s\\n' 'RCH_SOURCE_RETENTION_REFUSED: rch-wkr is not installed on this worker' >&2; exit 74; fi; \
+             if ! __rch_retention_probe=$(\"$RCH_WKR\" source-retain probe) \
+             || [ \"$__rch_retention_probe\" != 'rch-wkr source-retain v1' ]; then \
+             printf '%s\\n' 'RCH_SOURCE_RETENTION_REFUSED: deploy the matching rch-wkr with source-retain support' >&2; exit 74; fi; \
+             {command} )",
+            locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        )
     }
 
     /// Best-effort removal of an isolated remote tree (bd-p1vlb).
@@ -11737,6 +11196,154 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn artifact_headers_native_probe_preserves_data_and_authorized_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source '\nRCH_ARTIFACT_HEADERS\n");
+        let target = directory.path().join("target pool");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::os::unix::fs::symlink(&target, source.join("target")).unwrap();
+        let path = "target/debug/é '$literal`program`".to_owned();
+        let bytes: Vec<u8> = (0..=255).collect();
+        std::fs::write(source.join(&path), &bytes).unwrap();
+        let run = |authorized: Option<&str>, paths: &[String]| {
+            let script =
+                artifact_header_probe_script(source.to_str().unwrap(), authorized, paths).unwrap();
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .env("PATH", directory.path().join("no-tools"))
+                .output()
+                .unwrap()
+        };
+        let output = run(target.to_str(), &[path.clone(), path.clone()]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let headers: Vec<(String, Vec<u8>)> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                (path.clone(), bytes[..64].to_vec()),
+                (path.clone(), bytes[..64].to_vec()),
+            ]
+        );
+        for (authorized, paths) in [
+            (None, vec![path.clone()]),
+            (source.to_str(), vec![path.clone()]),
+            (target.to_str(), vec![path, "target/debug/missing".into()]),
+        ] {
+            let output = run(authorized, &paths);
+            assert_eq!(output.status.code(), Some(73), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_headers_probe_refuses_unsupported_workers_before_reading_outputs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        for (case, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "bad-status",
+                Some("#!/bin/sh\nprintf 'rch-wkr artifact-headers v1\\n'; exit 3\n"),
+            ),
+            (
+                "bad-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr artifact-headers v0\\n'\n"),
+            ),
+        ] {
+            let binary = directory.path().join(case);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let script = artifact_header_probe_script("/absent", None, &["binary".into()]).unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("RCH_WKR_BIN", binary)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73), "{case}: {output:?}");
+            assert!(output.stdout.is_empty(), "{case}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("RCH_ARTIFACT_HEADERS_UNAVAILABLE"),
+                "{case}: {output:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_sync_command_flushes_literal_paths_and_refuses_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("receipt ' $value `literal`");
+        std::fs::write(&record, b"build-identity 101\n").unwrap();
+        let run = |paths: &[&str]| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &file_fsync_command(paths)])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .env("PATH", directory.path().join("no-tools"))
+                .output()
+                .unwrap()
+        };
+        let output = run(&[record.to_str().unwrap(), directory.path().to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(std::fs::read(&record).unwrap(), b"build-identity 101\n");
+
+        let link = directory.path().join("aliased-receipt");
+        std::os::unix::fs::symlink(&record, &link).unwrap();
+        for refused in [link, directory.path().join("missing")] {
+            let output = run(&[record.to_str().unwrap(), refused.to_str().unwrap()]);
+            assert_eq!(output.status.code(), Some(74), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_FILE_SYNC_UNCONFIRMED"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_sync_command_requires_an_available_matching_worker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        for (case, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "failed-probe",
+                Some("#!/bin/sh\nprintf 'rch-wkr file-sync v1\\n'; exit 3\n"),
+            ),
+            (
+                "wrong-protocol",
+                Some("#!/bin/sh\nprintf 'rch-wkr file-sync v0\\n'\n"),
+            ),
+        ] {
+            let binary = directory.path().join(case);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new("sh")
+                .args(["-c", &file_fsync_command(&[])])
+                .env("RCH_WKR_BIN", binary)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(74), "{case}: {output:?}");
+            assert!(output.stdout.is_empty(), "{case}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_FILE_SYNC_UNCONFIRMED"),
+                "{case}: {output:?}"
+            );
+        }
+    }
+
     #[test]
     fn git_archive_cache_protocol_requires_exact_operation_evidence() {
         use GitArchiveCacheOperation::{Publish, Restore};
@@ -11836,9 +11443,140 @@ mod tests {
         let script = first_cache
             .git_archive_cache_script(GitArchiveCacheOperation::Restore, &digest, 10240)
             .unwrap();
+        assert!(script.contains("rch_wkr_locate"));
+        assert!(script.contains("\"$RCH_WKR\" git-archive-cache probe"));
+        assert!(script.contains("\"$RCH_WKR\" git-archive-cache restore"));
         let fenced = first_cache.source_activity_rpc_script(&script, Duration::from_secs(3));
         assert!(fenced.contains("--rch-finite-rpc 3000"));
         assert!(fenced.contains(first_cache.source_authority_prefix.as_ref().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_archive_cache_generated_script_executes_native_reuse_with_literal_roots() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::PermissionsExt as _;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = std::fs::canonicalize(&retained).unwrap();
+        let source = root.join("source ' $literal `name` α");
+        let target = root.join("target ' $literal `name` β");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "repo".into(),
+            "abcd".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_clean_overlay_archive_cache(Some(0))
+        .unwrap();
+        let payload = b"independently pinned Git archive bytes";
+        let digest: String = Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let run = |operation, expected| {
+            let script = pipeline
+                .git_archive_cache_script(operation, &digest, payload.len() as u64)
+                .unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                GitArchiveCacheStatus::parse(operation, &output.stdout, &output.stderr).unwrap(),
+                expected
+            );
+        };
+        run(
+            GitArchiveCacheOperation::Restore,
+            GitArchiveCacheStatus::Miss,
+        );
+        assert!(!target.exists());
+        let archive = source.join(".rch-clean-overlay-base.tar");
+        std::fs::write(&archive, payload).unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+        run(
+            GitArchiveCacheOperation::Publish,
+            GitArchiveCacheStatus::Published,
+        );
+        std::fs::rename(&source, root.join("retained-source")).unwrap();
+        run(
+            GitArchiveCacheOperation::Restore,
+            GitArchiveCacheStatus::Hit,
+        );
+        assert_eq!(std::fs::read(archive).unwrap(), payload);
+        assert_eq!(std::fs::read_dir(source).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_archive_cache_generated_script_refuses_old_workers_before_source_setup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = std::fs::canonicalize(&retained).unwrap();
+        let source = root.join("absent-source");
+        let target = root.join("absent-target");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "repo".into(),
+            "abcd".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_clean_overlay_archive_cache(Some(0))
+        .unwrap();
+        for (case, program) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "failed-probe",
+                Some("#!/bin/sh\nprintf 'rch-wkr git-archive-cache v1\\n'; exit 3\n"),
+            ),
+            (
+                "wrong-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr git-archive-cache v0\\n'\n"),
+            ),
+            (
+                "unexpected-output",
+                Some("#!/bin/sh\nprintf 'unexpected banner\\nrch-wkr git-archive-cache v1\\n'\n"),
+            ),
+        ] {
+            let binary = root.join(case);
+            if let Some(program) = program {
+                std::fs::write(&binary, program).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for operation in [
+                GitArchiveCacheOperation::Restore,
+                GitArchiveCacheOperation::Publish,
+            ] {
+                let script = pipeline
+                    .git_archive_cache_script(operation, &"a".repeat(64), 10240)
+                    .unwrap();
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", &script])
+                    .env("RCH_WKR_BIN", &binary)
+                    .env("PATH", root.join("no-tools"))
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(74), "{case}: {output:?}");
+                assert!(output.stdout.is_empty(), "{case}: {output:?}");
+                assert!(
+                    output.stderr.starts_with(b"RCH_GIT_ARCHIVE_CACHE_ERROR:"),
+                    "{case}: {output:?}"
+                );
+                assert!(!source.exists());
+                assert!(!target.exists());
+            }
+        }
     }
 
     #[tokio::test]
@@ -12697,6 +12435,7 @@ esac
         let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
             .arg("-c")
             .arg(&command)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("run durable wrapper");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -12732,7 +12471,7 @@ esac
             let receipt = root.join("completion");
             let calls = root.join("sync.calls");
             let invocations = root.join("invocations");
-            let sync = bin.join("python3");
+            let sync = bin.join("rch-wkr");
             std::fs::write(
                 &sync,
                 "#!/bin/sh\n\
@@ -12742,7 +12481,7 @@ esac
                   if [ \"$RCH_TEST_SYNC_FAILURE\" = directory ] && [ -d \"$path\" ]; then exit 74; fi\n\
                   if [ \"$RCH_TEST_SYNC_FAILURE\" = receipt ] && [ \"$path\" = \"$RCH_TEST_RECEIPT\" ]; then exit 74; fi\n\
                  done\n\
-                 exec /usr/bin/python3 \"$@\"\n",
+                 exec \"$RCH_TEST_REAL_WKR\" \"$@\"\n",
             )
             .unwrap();
             std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -12763,6 +12502,8 @@ esac
                 .args(["--kill-after=2s", "10s", "sh"])
                 .arg(script)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("RCH_WKR_BIN", &sync)
+                .env("RCH_TEST_REAL_WKR", native_control_worker_for_test())
                 .env("RCH_TEST_SYNC_FAILURE", case)
                 .env("RCH_TEST_SYNC_LOG", &calls)
                 .env("RCH_TEST_RECEIPT", &receipt)
@@ -12812,7 +12553,11 @@ esac
         std::fs::write(&script, &command).unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new("sh").arg(&script).kill_on_drop(true).output(),
+            Command::new("sh")
+                .arg(&script)
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
+                .kill_on_drop(true)
+                .output(),
         )
         .await
         .expect("large supervisor must finish")
@@ -12906,6 +12651,7 @@ esac
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &root)
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),
@@ -12980,6 +12726,7 @@ esac
                     .env_clear()
                     .env("PATH", "/usr/bin:/bin")
                     .env("HOME", &directory)
+                    .env("RCH_WKR_BIN", native_control_worker_for_test())
                     .stdin(Stdio::null())
                     .kill_on_drop(true)
                     .output(),
@@ -13046,6 +12793,7 @@ esac
         let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
             .arg("-c")
             .arg(format!("umask 0022; {command}"))
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("run durable wrapper");
         assert!(output.status.success(), "{output:?}");
@@ -13088,6 +12836,7 @@ esac
                     let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
                         .arg("-c")
                         .arg(format!("( {command} ) | ( sleep 3; cat )"))
+                        .env("RCH_WKR_BIN", native_control_worker_for_test())
                         .output()
                         .expect("run durable wrapper");
                     String::from_utf8(output.stdout).unwrap()
@@ -13134,6 +12883,7 @@ esac
             .arg("sh")
             .arg("-c")
             .arg(&command)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -13194,6 +12944,7 @@ esac
                 .args(["--kill-after=2s", "10s", "flock", "-x"])
                 .arg(&lock)
                 .args(["sh", "-c", &command])
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .output()
                 .unwrap()
         };
@@ -13267,6 +13018,7 @@ esac
             .args(["--kill-after=2s", "10s", "flock", "-x"])
             .arg(&lock)
             .args(["sh", "-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(255), "{output:?}");
@@ -13348,6 +13100,7 @@ esac
             .args(["--kill-after=2s", "10s", "flock", "-x"])
             .arg(&lock)
             .args(["sh", "-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(OwnedFd::from(writer)))
@@ -14763,6 +14516,70 @@ Number of files transferred: 42
         assert!(guarded.contains("\"cargo_cache\":null"));
     }
 
+    #[test]
+    fn cargo_disk_cache_plan_accepts_explicit_job_scripts() {
+        let worker = WorkerId::new("cache/worker");
+        for (requested, home) in [
+            (
+                "bash scripts/gate_of_record_job.sh /stage cargo_test_05 cargo -j 2 test -p mtdt-page --test movement_headings",
+                None,
+            ),
+            ("bash scripts/cargo_gate.sh row -i CARGO_HOME=payload", None),
+            (
+                "env -- CARGO_HOME='/worker/job cache' bash scripts/gate.sh cargo_test cargo",
+                Some("/worker/job cache"),
+            ),
+            ("cargo check --locked", None),
+        ] {
+            let pipeline = disk_budget_test_pipeline(Path::new("/tmp/job-cache-plan"), None, 20)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(requested, &worker);
+            let cache = pipeline
+                .cargo_disk_cache
+                .as_ref()
+                .expect("supervised cache");
+            assert!(cache.verified, "{requested}");
+            assert_eq!(cache.additional_home.as_deref(), home, "{requested}");
+            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let command = pipeline.build_remote_command(&isolated, None);
+            assert!(
+                command.contains("\"cargo_cache_required\":true"),
+                "{requested}"
+            );
+            assert!(command.contains("\"verified\":true"), "{requested}");
+            assert!(command.contains("\"name\":\"rch-cargo-cache-cache-worker\""));
+            assert!(command.contains("\"max_growth_bytes\":8388608"));
+            assert!(command.contains("\"min_free_bytes\":1048576"));
+        }
+    }
+
+    #[test]
+    fn cargo_disk_cache_plan_keeps_explicit_job_home_refusals() {
+        let worker = WorkerId::new("cache/worker");
+        for requested in [
+            "env -u CARGO_HOME bash scripts/gate.sh cargo_test cargo",
+            "CARGO_HOME=relative bash scripts/gate.sh cargo_test cargo",
+            "CARGO_HOME=$HOME/cache bash scripts/gate.sh cargo_test cargo",
+            "env -i cargo check",
+            "CARGO_HOME=relative cargo check",
+        ] {
+            let pipeline = disk_budget_test_pipeline(Path::new("/tmp/job-cache-plan"), None, 20)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(requested, &worker);
+            assert!(
+                !pipeline.cargo_disk_cache.as_ref().unwrap().verified,
+                "{requested}"
+            );
+            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let command = pipeline.build_remote_command(&isolated, None);
+            assert!(
+                command.contains("\"cargo_cache_required\":true"),
+                "{requested}"
+            );
+            assert!(command.contains("\"verified\":false"), "{requested}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cargo_disk_cache_unresolved_scope_refuses_before_workload_and_learning() {
@@ -15341,7 +15158,8 @@ Number of files transferred: 42
     #[test]
     fn disk_budget_missing_capability_has_durable_exact_prestart_receipt() {
         let retained = tempfile::tempdir().unwrap().keep();
-        for (name, build_id, expected) in [("python", None, 120), ("setsid", Some(11), 125)] {
+        for (name, build_id, expected) in [("disk-supervise", None, 120), ("setsid", Some(11), 125)]
+        {
             let directory = retained.join(name);
             let bin = directory.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
@@ -15359,13 +15177,17 @@ Number of files transferred: 42
                 pipeline.build_remote_command("printf started > workload-started", None),
             )
             .unwrap();
-            let output = std::process::Command::new("/bin/sh")
+            let mut command = std::process::Command::new("/bin/sh");
+            command
                 .arg(&script)
                 .env_clear()
                 .env("HOME", &directory)
-                .env("PATH", &bin)
-                .output()
-                .unwrap();
+                .env("PATH", &bin);
+            if name == "disk-supervise" {
+                // The locator also checks installation paths outside PATH.
+                command.env("RCH_WKR_BIN", directory.join("absent-rch-wkr"));
+            }
+            let output = command.output().unwrap();
             let result = CommandResult {
                 exit_code: output.status.code().unwrap(),
                 stdout: String::from_utf8(output.stdout).unwrap(),
@@ -16542,15 +16364,18 @@ Number of files transferred: 42
         let bin = retained.join("bin");
         std::fs::create_dir(&bin).unwrap();
         // This is a command-construction test, not a process-ownership proof.
-        // Capture the exact embedded supervisor and plan, then relay the
+        // Capture the native supervisor argv and plan, then relay the
         // command so a real shell can check rsync's binary protocol stream.
-        let capture = bin.join("python3");
+        let capture = bin.join("rch-wkr");
         std::fs::write(
             &capture,
             "#!/bin/sh\nset -eu\n\
             [ \"$RCH_ACTIVITY_TEST\" = \"$RCH_TEST_EXPECTED_ACTIVITY\" ]\n\
+            if [ \"$1\" = disk-supervise ] && [ \"$2\" = probe ]; then\n\
+                printf 'rch-wkr disk-supervise v1\\n'; exit 0\n\
+            fi\n\
             printf '%s\\0' \"$@\" > \"$RCH_TEST_UPLOAD_ARGV\"\n\
-            shift 10\nexec \"$@\"\n",
+            shift 7\nexec \"$@\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -16621,6 +16446,7 @@ Number of files transferred: 42
             let mut child = std::process::Command::new("sh")
                 .args(["-c", &program])
                 .env("PATH", &path)
+                .env("RCH_WKR_BIN", &capture)
                 .env(
                     "RCH_TEST_EXPECTED_ACTIVITY",
                     if mode == 2 { "shared" } else { "owned" },
@@ -16643,28 +16469,21 @@ Number of files transferred: 42
                 .unwrap()
                 .split(|byte| *byte == 0)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                &captured[..3],
-                [b"-I".as_slice(), b"-S".as_slice(), b"-c".as_slice()]
-            );
+            assert_eq!(captured[0], b"disk-supervise");
+            assert_eq!(captured[1], (3_u64 << 30).to_string().as_bytes());
+            assert_eq!(captured[2], (10_u64 << 30).to_string().as_bytes());
             assert_eq!(
                 captured[3],
-                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT.as_bytes()
-            );
-            assert_eq!(captured[4], (3_u64 << 30).to_string().as_bytes());
-            assert_eq!(captured[5], (10_u64 << 30).to_string().as_bytes());
-            assert_eq!(
-                captured[6],
                 format!("{}_SOURCE_UPLOAD_DISK_BUDGET:", pipeline.deadline_marker).as_bytes()
             );
-            assert_eq!(captured[7], remote.as_bytes());
-            let plan: serde_json::Value = serde_json::from_slice(captured[8]).unwrap();
+            assert_eq!(captured[4], remote.as_bytes());
+            let plan: serde_json::Value = serde_json::from_slice(captured[5]).unwrap();
             assert_eq!(
                 plan,
                 serde_json::json!({"probe": [remote], "output": [remote], "receipt": null, "warm_policy": null, "require_incremental_tracking": true})
             );
-            assert_eq!(captured[9], b"standalone");
-            assert_eq!(captured[10], b"rsync");
+            assert_eq!(captured[6], b"standalone");
+            assert_eq!(captured[7], b"rsync");
             let mut expected = server_args.to_vec();
             *expected.last_mut().unwrap() = remote;
             let expected = expected
@@ -20674,8 +20493,15 @@ func main() {
             shell_words::quote(explicit_home.to_str().unwrap()),
             shell_words::quote(inner)
         );
-        let workload = crate::hook::add_cargo_isolation(&requested, &WorkerId::new("cache-worker"));
-        let command = cargo_home_boundary_pipeline(&source).build_remote_command(&workload, None);
+        let worker = WorkerId::new("cache-worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(&requested, &worker);
+        let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
+        assert!(cache.verified);
+        assert_eq!(cache.additional_home.as_deref(), explicit_home.to_str());
+        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let command = pipeline.build_remote_command(&workload, None);
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
             .current_dir(&retained)
@@ -20688,6 +20514,72 @@ func main() {
             format!("{}\ncargo-out", explicit_home.display()).into_bytes()
         );
         assert_eq!(output.stderr, b"cargo-err");
+    }
+
+    /// Execute the real isolation/launch shell with a job argv sentinel. The
+    /// disk plan is tested separately above; this fixture starts no supervisor
+    /// and makes no worker-fleet or compilation claim.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_job_script_preserves_argument_data_and_worker_home() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker_base = retained.join("worker volume");
+        let source = retained.join("source");
+        for directory in [&worker_base, &source] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let script = source.join("gate_of_record_job.sh");
+        std::fs::write(
+            &script,
+            "set -eu\nprintf '%s\\0' \"$CARGO_HOME\" \"$@\"\nprintf 'job-stderr' >&2\nexit 42\n",
+        )
+        .unwrap();
+        let args = [
+            "cargo_test_05",
+            "cargo",
+            "-j",
+            "2",
+            "test",
+            "-p",
+            "mtdt-page",
+            "--test",
+            "movement_headings",
+            "-i",
+            "CARGO_HOME=payload",
+        ];
+        let requested = format!(
+            "sh {} {}",
+            shell_words::quote(script.to_str().unwrap()),
+            shell_words::join(args)
+        );
+        let worker = WorkerId::new("cache/worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_env_allowlist(Vec::new())
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(&requested, &worker);
+        let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
+        assert!(cache.verified);
+        assert!(cache.additional_home.is_none());
+        let expected_home = worker_base.canonicalize().unwrap().join(&cache.name);
+        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let command = pipeline.build_remote_command(&workload, None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(&retained)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &retained)
+            .env("TMPDIR", &worker_base)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        let expected = std::iter::once(expected_home.to_str().unwrap())
+            .chain(args)
+            .flat_map(|value| value.bytes().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stderr, b"job-stderr");
     }
 
     #[cfg(unix)]
@@ -21245,6 +21137,65 @@ func main() {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_capability_requires_the_matching_native_worker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let capability = TransferPipeline::remote_tree_retention_capability_command();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &capability])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            .env("PATH", directory.path().join("no-tools"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"RCH_SOURCE_RETENTION_CAPABLE\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+
+        let retention = TransferPipeline::remote_tree_retention_command(
+            "/absent/source",
+            "/absent/retained",
+            "1234567890abcdef1234567890abcdef",
+            false,
+        )
+        .unwrap();
+        for (name, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "bad-status",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-retain v1\\n'; exit 3\n"),
+            ),
+            (
+                "bad-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-retain v0\\n'\n"),
+            ),
+        ] {
+            let binary = directory.path().join(name);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for command in [&capability, &retention] {
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .env("RCH_WKR_BIN", &binary)
+                    .env("PATH", directory.path().join("no-tools"))
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(74), "{name}: {output:?}");
+                assert!(output.stdout.is_empty(), "{name}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SOURCE_RETENTION_REFUSED:"),
+                    "{name}: {output:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn native_retained_source(
         source: &Path,
         retained: &Path,
@@ -21260,6 +21211,7 @@ func main() {
         .unwrap();
         std::process::Command::new("/bin/sh")
             .args(["-c", &command])
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .expect("execute actual retained-source command")
     }
@@ -21405,6 +21357,95 @@ func main() {
     }
 
     #[cfg(target_os = "linux")]
+    fn native_freshness_shell() -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            // The complete source-freshness path needs only the shell's
+            // builtins and the matching native worker, including recovery.
+            .env("PATH", "");
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_freshness_requires_matching_worker_before_touching_source() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().unwrap().keep();
+        let source = fixture.join("source with ' quotes");
+        std::fs::create_dir(&source).unwrap();
+        let input = source.join("input");
+        std::fs::write(&input, b"selected source").unwrap();
+        let before = std::fs::metadata(&input).unwrap().modified().unwrap();
+        let pipeline = TransferPipeline::new(
+            source.clone(),
+            "freshness".into(),
+            "capability".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let command = pipeline
+            .clean_overlay_source_refresh_command(&"a".repeat(64))
+            .unwrap();
+        for (name, script) in [
+            ("missing", None),
+            ("old", Some("#!/bin/sh\nexit 2\n")),
+            (
+                "bad-status",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-freshness v1\\n'; exit 3\n"),
+            ),
+            (
+                "bad-version",
+                Some("#!/bin/sh\nprintf 'rch-wkr source-freshness v0\\n'\n"),
+            ),
+            (
+                "extra-output",
+                Some("#!/bin/sh\nprintf 'banner\\nrch-wkr source-freshness v1\\n'\n"),
+            ),
+        ] {
+            let binary = fixture.join(name);
+            if let Some(script) = script {
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env("RCH_WKR_BIN", binary)
+                .env("PATH", "")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(74), "{name}: {output:?}");
+            assert!(output.stdout.is_empty(), "{name}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("RCH_SOURCE_FRESHNESS_UNAVAILABLE:"),
+                "{name}: {output:?}"
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), b"selected source");
+            assert_eq!(
+                std::fs::metadata(&input).unwrap().modified().unwrap(),
+                before
+            );
+            assert!(
+                !fixture
+                    .join("source with ' quotes.freshness-epoch-v1")
+                    .exists()
+            );
+        }
+
+        let output = native_freshness_shell()
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("RCH_SOURCE_FRESHNESS_V2 "));
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read(&input).unwrap(), b"selected source");
+    }
+
+    #[cfg(target_os = "linux")]
     fn native_owned_source_freshness(
         pipeline: &TransferPipeline,
         identity: &str,
@@ -21422,7 +21463,7 @@ func main() {
                 mark_verified,
             )
             .unwrap();
-        std::process::Command::new("/bin/sh")
+        native_freshness_shell()
             .args(["-c", &command])
             .output()
             .unwrap()
@@ -21588,23 +21629,21 @@ func main() {
                     std::fs::write(source.join("input"), b"B").unwrap();
                 }
                 "before-ledger" => {
-                    // Run the exact durable preparation prefix but stop before
-                    // the shared ledger executes, as an interrupted SSH can.
-                    let output = std::process::Command::new("python3")
-                        .args([
-                            "-I",
-                            "-c",
-                            TransferPipeline::owned_source_refresh_preparation_script(),
-                        ])
-                        .arg(&source)
-                        .arg(&pool)
-                        .arg(control.join("epoch-v1"))
-                        .arg(&identity)
-                        .arg(unfinished)
-                        .arg("refresh")
-                        .output()
-                        .unwrap();
-                    assert!(output.status.success(), "{output:?}");
+                    // Model an interrupted request after its new intent was
+                    // durable but before the shared ledger changed. Worker
+                    // unit tests inject that failure into the actual writer.
+                    let intent = serde_json::json!({
+                        "schema": "rch.source_freshness_attempt.v1",
+                        "source_root": source,
+                        "target_root": pool,
+                        "content_identity": identity,
+                        "attempt": unfinished,
+                    });
+                    std::fs::write(
+                        control.join("current-attempt-v1"),
+                        serde_json::to_vec(&intent).unwrap(),
+                    )
+                    .unwrap();
                 }
                 "malformed-attempt" => {
                     std::fs::write(control.join("current-attempt-v1"), b"incomplete attempt")
@@ -21896,7 +21935,7 @@ fn main() {
             let identity = blake3::hash(format!("selected-commit-{run}").as_bytes())
                 .to_hex()
                 .to_string();
-            let refresh = std::process::Command::new("sh")
+            let refresh = native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22001,7 +22040,7 @@ fn main() {
                 let identity = blake3::hash(format!("whole-closure-{run}").as_bytes())
                     .to_hex()
                     .to_string();
-                let output = std::process::Command::new("sh")
+                let output = native_freshness_shell()
                     .args([
                         "-c",
                         &pipeline
@@ -22074,7 +22113,7 @@ fn main() {
         };
         let identity = "a".repeat(64);
         let run = || {
-            std::process::Command::new("sh")
+            native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22099,9 +22138,9 @@ fn main() {
             std::fs::metadata(&outside).unwrap().modified().unwrap(),
             outside_time
         );
-        // Deterministic I/O fault injection into the real helper, rather than a
-        // chmod test that silently passes under a root worker. An unreadable
-        // artifact subtree must not be omitted from the freshness upper bound.
+        // A substituted artifact pool must refuse before touching timestamps
+        // or publishing either control. Worker unit tests also inject a scan
+        // I/O failure into the real walker, including under a root worker.
         std::fs::create_dir(&pool).unwrap();
         let saved_epoch = std::fs::read(&epoch).unwrap();
         let saved_ledger = std::fs::read(&ledger).unwrap();
@@ -22110,24 +22149,13 @@ fn main() {
             .unwrap()
             .modified()
             .unwrap();
-        let fault_script = format!(
-            "import os, sys\noriginal_scandir = os.scandir\ndef unreadable_pool(path):\n    if path == sys.argv[2]:\n        raise PermissionError('injected unreadable artifact pool')\n    return original_scandir(path)\nos.scandir = unreadable_pool\n{}",
-            TransferPipeline::clean_overlay_freshness_ledger_script()
-        );
-        let failed = std::process::Command::new("python3")
-            .args(["-c", &fault_script])
-            .arg(&root)
-            .arg(&pool)
-            .arg(&epoch)
-            .arg(&identity)
-            .output()
-            .unwrap();
+        let retained_pool = retained.join("retained-pool");
+        std::fs::rename(&pool, &retained_pool).unwrap();
+        symlink(&outside, &pool).unwrap();
+        let failed = run();
         assert!(
             !failed.status.success(),
-            "unreadable artifacts must fail closed"
-        );
-        assert!(
-            String::from_utf8_lossy(&failed.stderr).contains("injected unreadable artifact pool")
+            "substituted artifacts must fail closed: {failed:?}"
         );
         assert_eq!(std::fs::read(&epoch).unwrap(), saved_epoch);
         assert_eq!(std::fs::read(&ledger).unwrap(), saved_ledger);
@@ -22138,6 +22166,8 @@ fn main() {
                 .unwrap(),
             before_failure
         );
+        std::fs::rename(&pool, retained.join("retained-pool-link")).unwrap();
+        std::fs::rename(&retained_pool, &pool).unwrap();
         std::fs::rename(&root, retained.join("retired-first")).unwrap();
         materialize();
         // A valid ledger with a different commit marker models interruption
@@ -22206,7 +22236,7 @@ fn main() {
         let first = "a".repeat(64);
         let second = "b".repeat(64);
         let run = |identity: &str| {
-            std::process::Command::new("sh")
+            native_freshness_shell()
                 .args([
                     "-c",
                     &pipeline
@@ -22365,7 +22395,7 @@ fn main() {
                 .with_remote_path_override(root.to_string_lossy().into_owned())
                 .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
                 assert!(
-                    std::process::Command::new("sh")
+                    native_freshness_shell()
                         .args([
                             "-c",
                             &pipeline

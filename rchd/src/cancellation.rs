@@ -196,9 +196,8 @@ fn provably_abandoned_unlaunched(
 
 /// Whether this dispatcher's client lease for `wrapper` still owns worker
 /// source. An unreadable lease fails closed (treated as owning).
-pub(crate) fn client_lease_owns_source(wrapper: &str) -> bool {
-    let path =
-        rch_common::job_identity::default_job_lease_directory().join(format!("{wrapper}.json"));
+pub(crate) fn client_lease_owns_source(lease_dir: &std::path::Path, wrapper: &str) -> bool {
+    let path = lease_dir.join(format!("{wrapper}.json"));
     match std::fs::read(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
@@ -487,7 +486,9 @@ impl CancellationOrchestrator {
                 };
             };
             let abandoned_unlaunched =
-                provably_abandoned_unlaunched(&build, Instant::now(), client_lease_owns_source);
+                provably_abandoned_unlaunched(&build, Instant::now(), |wrapper| {
+                    client_lease_owns_source(&ctx.client_lease_dir, wrapper)
+                });
             let record = CancellationRecord {
                 build_id,
                 worker_id: build.worker_id,

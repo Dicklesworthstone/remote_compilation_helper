@@ -12,67 +12,27 @@ set -eu
 # operation which succeeds within its enclosing control deadline.
 # These clock helpers own no execution authority. The enclosing controller
 # still bounds each attempt and must settle its group before publishing output.
-rch_admission_clock='
-import math
-import os
-import re
-import sys
-import time
-
-MAX_BUDGET_NS = 600 * 1000000000
-MAX_CLOCK_NS = (1 << 63) - 1
-
-def number(text):
-    if len(text) > 20 or re.fullmatch(r"[0-9]+", text) is None:
-        raise ValueError("invalid clock argument")
-    return int(text)
-
-try:
-    if len(sys.argv) != 3:
-        raise ValueError("invalid clock invocation")
-    operation, value = sys.argv[1], number(sys.argv[2])
-    if operation == "budget":
-        if not 1 <= value <= 60:
-            raise ValueError("invalid retry window")
-        text = os.environ.get("RCH_TIMING_SCALE", "1")
-        if (len(text) > 128 or re.fullmatch(
-                r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
-                text) is None):
-            raise ValueError("invalid transported scale")
-        scale = float(text)
-        if not math.isfinite(scale) or not 1.0 <= scale <= 10.0:
-            raise ValueError("invalid transported scale")
-        budget = math.ceil(value * scale * 1000000000)
-        if not 0 < budget <= MAX_BUDGET_NS:
-            raise ValueError("invalid scaled window")
-        print(budget)
-    elif operation == "start":
-        now = time.monotonic_ns()
-        if not 0 < value <= MAX_BUDGET_NS or not 0 <= now <= MAX_CLOCK_NS - value:
-            raise ValueError("invalid absolute deadline")
-        print(now + value)
-    elif operation in ("check", "wait"):
-        now = time.monotonic_ns()
-        if not 0 < value <= MAX_CLOCK_NS or value - now > MAX_BUDGET_NS:
-            raise ValueError("invalid absolute deadline")
-        if now >= value:
-            sys.exit(75)
-        if operation == "wait":
-            # Preserve the ordinary retry cadence, including at scale ten.
-            time.sleep(min(1.0, (value - now) / 1000000000))
-        sys.exit(0 if time.monotonic_ns() < value else 75)
-    else:
-        raise ValueError("invalid clock operation")
-except (OSError, OverflowError, ValueError):
-    print("RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE", file=sys.stderr)
-    sys.exit(73)
-'
-rch_admission_budget=$(python3 -I -S -c "$rch_admission_clock" budget \
+# The caller composes WKR_LOCATE_SHELL before this program. Resolve and verify
+# the deployed native protocol before the first source transaction can mutate.
+rch_wkr_locate || {
+    printf '%s\n' 'RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE rch-wkr is required' >&2
+    exit 73
+}
+rch_admission_worker=$RCH_WKR
+rch_admission_probe=$("$rch_admission_worker" source-admission probe </dev/null) || {
+    printf '%s\n' 'RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE upgrade rch-wkr' >&2
+    exit 73
+}
+[ "$rch_admission_probe" = 'rch-wkr source-admission v1' ] || {
+    printf '%s\n' 'RCH_SOURCE_ADMISSION_CLOCK_UNAVAILABLE unsupported rch-wkr' >&2
+    exit 73
+}
+rch_admission_budget=$("$rch_admission_worker" source-admission budget \
     "${rch_admission_retry_seconds-}" </dev/null) || exit 73
 rch_admission_deadline=
 rch_admission_require_time() {
     set +e
-    python3 -I -S -c "$rch_admission_clock" "$1" "$rch_admission_deadline" </dev/null
+    "$rch_admission_worker" source-admission "$1" "$rch_admission_deadline" </dev/null
     rch_admission_clock_status=$?
     set -e
     case "$rch_admission_clock_status" in
@@ -111,7 +71,7 @@ while :; do
         *) exit "$rch_admission_result" ;;
     esac
     if [ -z "$rch_admission_deadline" ]; then
-        rch_admission_deadline=$(python3 -I -S -c "$rch_admission_clock" start \
+        rch_admission_deadline=$("$rch_admission_worker" source-admission start \
             "$rch_admission_budget" </dev/null) || exit 73
     fi
     rch_admission_require_time wait 75

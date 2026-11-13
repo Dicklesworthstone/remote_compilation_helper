@@ -34,7 +34,9 @@ tempfile = "3.25.0"
 rch-telemetry = { path = "../rch-telemetry", version = "2.1.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.5", features = ["fs", "process"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "event", "time", "pipe", "stdio", "net"] }
+nix = { version = "0.31.3", features = ["signal", "process", "time"] }
+signal-hook = "0.4.4"
 
 [lints.rust]
 unsafe_code = "forbid"

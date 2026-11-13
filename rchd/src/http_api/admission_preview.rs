@@ -213,6 +213,7 @@ async fn observe(
     let history = Arc::clone(&ctx.history);
     let pool = ctx.pool.clone();
     let project = request.project.clone();
+    let lease_dir = ctx.client_lease_dir.clone();
     let (mut excluded, _permit) = tokio::task::spawn_blocking(move || {
         // Match actual admission: an active build consumes one project lane,
         // not necessarily the entire worker. Source fences below still apply
@@ -223,9 +224,9 @@ async fn observe(
             .filter(|(worker, count)| *count >= pool.project_lanes(worker) as usize)
             .map(|(worker, _)| worker)
             .collect();
-        excluded.extend(
-            history.source_fenced_workers(&project, crate::cancellation::client_lease_owns_source),
-        );
+        excluded.extend(history.source_fenced_workers(&project, |wrapper| {
+            crate::cancellation::client_lease_owns_source(&lease_dir, wrapper)
+        }));
         excluded.extend(history.live_checkout_fenced_workers(&project));
         excluded.extend(history.source_busy_fenced_workers(&project));
         (excluded, permit)
@@ -506,7 +507,8 @@ mod tests {
     ) -> crate::history::ActiveBuildState {
         let worker = ctx.pool.get(&WorkerId::new(worker_id)).await.unwrap();
         assert!(worker.reserve_slots(1).await);
-        ctx.history
+        let admission = ctx
+            .history
             .try_start_active_build_in_lanes(
                 project.into(),
                 worker_id.into(),
@@ -526,8 +528,11 @@ mod tests {
                 None,
                 ctx.pool.project_lanes(worker_id),
             )
-            .unwrap()
-            .expect("fixture must own a real project lane")
+            .unwrap();
+        let crate::history::ActiveBuildAdmission::Admitted(state) = admission else {
+            panic!("fixture must own a real project lane: {admission:?}");
+        };
+        *state
     }
 
     async fn finish_lane_owner(ctx: &DaemonContext, owner: &crate::history::ActiveBuildState) {

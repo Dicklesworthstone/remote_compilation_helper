@@ -2,23 +2,39 @@
 //! process group whose leader exits on TERM while its child ignores TERM.
 #![cfg(target_os = "linux")]
 
+use std::os::unix::process::CommandExt as _;
 use std::process::Command;
 
 fn run_case(body: &str) {
+    run_case_with_scale(body, None);
+}
+
+fn run_case_with_scale(body: &str, scale: Option<&str>) {
     for shell in ["sh", "bash"] {
-        let directory = tempfile::tempdir().expect("create fixture directory");
+        let directory = tempfile::Builder::new()
+            .prefix("remote-process-escalation-")
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("create fixture directory");
         std::fs::write(
             directory.path().join("protocol.sh"),
             rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
         )
         .expect("write embedded production protocol");
         let script = format!("{}\n{body}", rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT);
-        let output = Command::new(shell)
+        let mut command = Command::new(shell);
+        command
+            // A container's inherited PGID can be 1, which the production
+            // observer correctly refuses. Give this test its own valid group.
+            .process_group(0)
             .env_remove("RCH_TIMING_SCALE")
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
             .args(["-c", &script, "rch-process-test"])
-            .arg(directory.path())
-            .output()
-            .expect("run shell regression");
+            .arg(directory.path());
+        if let Some(scale) = scale {
+            command.env("RCH_TIMING_SCALE", scale);
+        }
+        let output = command.output().expect("run shell regression");
         assert!(
             output.status.success(),
             "{shell}: {:?}\nstdout: {}\nstderr: {}",
@@ -453,6 +469,11 @@ rch_group_state() {
     printf '%s\n' "$test_census_calls" > "$rch_test_dir/calls"
     # Bound this fixture even if a regression stops consulting the clock.
     [ "$test_census_calls" -le 1000 ] || return 9
+    # Explicitly inject a late successful observation to verify the consumer's
+    # deadline check, independently of the collector's own refusal below.
+    if [ "$test_late_empty" = 1 ] && [ "$test_census_calls" = "$test_settled_after" ]; then
+        return 0
+    fi
     # Model the production collector refusing output at its own deadline.
     [ "$test_clock" -lt "$rch_observation_deadline" ] || return 2
     [ "$test_census_calls" != "$test_settled_after" ] || return 0
@@ -460,25 +481,52 @@ rch_group_state() {
 }
 test_clock=100; test_signalled=0; test_census_calls=0
 test_census_ticks=120; test_pending_state=2; test_settled_after=3
-# Each real-fleet-shaped census consumes 1.2s of simulated monotonic time.
-# A separate two-second settlement cap would stop before the third pass.
-rch_remote_cancel /unused regression kill || exit 1
-[ "$(cat "$rch_test_dir/calls")" = 3 ] || exit 2
+test_late_empty=0
+# 005841f1 deliberately restored a 2s * scale retry-start window. A complete
+# census that STARTED in that window still gets the shared 30s * scale budget.
+# Each busy-worker census below consumes 1.2s, with a 100ms retry pause.
+case "${RCH_TIMING_SCALE:-1}" in
+    1)
+        test_first_status=44; test_first_calls=2; test_first_clock=480
+        test_full_deadline=3100; test_retry_calls=2; test_retry_clock=480
+        test_timely_empty_clock=470;;
+    2)
+        test_first_status=0; test_first_calls=3; test_first_clock=600
+        test_full_deadline=6100; test_retry_calls=4; test_retry_clock=740
+        test_timely_empty_clock=730;;
+    *) exit 99;;
+esac
+rch_remote_cancel /unused regression kill
+[ "$?" = "$test_first_status" ] || exit 1
+[ "$(cat "$rch_test_dir/calls")" = "$test_first_calls" ] || exit 2
 [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 3
-# Unknown never becomes completion. All slow passes consume the same
-# original 30s deadline; observations cannot restart or extend it.
+[ "$(cat "$rch_test_dir/clock")" = "$test_first_clock" ] || exit 19
+[ "$(cat "$rch_test_dir/deadline")" = "$test_full_deadline" ] || exit 20
+# Persistent unknown evidence stays unconfirmed at the retry-start cutoff.
+# Its final in-flight census may finish after that cutoff, but must retain
+# the original shared deadline instead of resetting it for each exchange.
 : > "$rch_test_dir/signals"
 test_settled_after=0
 rch_remote_cancel /unused regression kill
 [ "$?" = 44 ] || exit 4
-[ "$(cat "$rch_test_dir/calls")" -gt 3 ] || exit 5
+[ "$(cat "$rch_test_dir/calls")" = "$test_retry_calls" ] || exit 5
 [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 6
-[ "$(cat "$rch_test_dir/deadline")" = 3100 ] || exit 7
-test_finished=$(cat "$rch_test_dir/clock")
-[ "$test_finished" -ge 3100 ] && [ "$test_finished" -le 3110 ] || exit 8
-# An earlier enclosing cap wins even while slow observations are retried.
+[ "$(cat "$rch_test_dir/deadline")" = "$test_full_deadline" ] || exit 7
+[ "$(cat "$rch_test_dir/clock")" = "$test_retry_clock" ] || exit 8
+# A timely-started empty census can complete after the retry-start cutoff:
+# 470 > 420 at scale1 and 730 > 620 at scale2, within the shared deadline.
+: > "$rch_test_dir/signals"
+test_settled_after=$test_retry_calls
+rch_remote_cancel /unused regression kill || exit 21
+[ "$(cat "$rch_test_dir/calls")" = "$test_retry_calls" ] || exit 22
+[ "$(cat "$rch_test_dir/clock")" = "$test_timely_empty_clock" ] || exit 23
+[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 24
+# An earlier enclosing cap wins over an in-flight observation. At 1.8s per
+# census, the second post-KILL pass starts before either retry-start cutoff
+# but reaches the inherited deadline. Even an injected success is too late.
 : > "$rch_test_dir/signals"
 rch_observation_deadline=600
+test_census_ticks=180; test_settled_after=2; test_late_empty=1
 rch_remote_cancel /unused regression kill
 [ "$?" = 44 ] || exit 9
 [ "$rch_observation_deadline" = 600 ] || exit 10
@@ -486,12 +534,22 @@ rch_remote_cancel /unused regression kill
 test_finished=$(cat "$rch_test_dir/clock")
 [ "$test_finished" -ge 600 ] && [ "$test_finished" -le 610 ] || exit 12
 [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 13
-# Retain the known-live refusal when the deadline expires between censuses.
-: > "$rch_test_dir/signals"
-test_census_ticks=0; test_pending_state=1
-rch_remote_cancel /unused regression kill
-[ "$?" = 45 ] || exit 14
-[ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 15
+[ "$(cat "$rch_test_dir/calls")" = 2 ] || exit 25
+# 41540f0 distinguishes a known survivor from unavailable evidence when the
+# SHARED deadline expires between censuses. Keep that cap inside both retry-
+# start windows: ten zero-cost observations at ticks100..190, then expiry200.
+rch_observation_deadline=200
+test_census_ticks=0; test_settled_after=0; test_late_empty=0
+for test_pending_state in 1 2; do
+    : > "$rch_test_dir/signals"
+    rch_remote_cancel /unused regression kill
+    test_status=$?
+    case "$test_pending_state:$test_status" in 1:45|2:44) ;; *) exit 14;; esac
+    [ "$(cat "$rch_test_dir/signals")" = KILL ] || exit 15
+    [ "$(cat "$rch_test_dir/calls")" = 10 ] || exit 26
+    [ "$(cat "$rch_test_dir/deadline")" = 200 ] &&
+        [ "$(cat "$rch_test_dir/clock")" = 200 ] || exit 27
+done
 # An already expired enclosing cap permits neither a signal nor a retry.
 : > "$rch_test_dir/signals"
 rch_observation_deadline=100
@@ -499,11 +557,13 @@ rch_remote_cancel /unused regression kill
 [ "$?" = 44 ] || exit 16
 [ "$rch_observation_deadline" = 100 ] || exit 17
 [ ! -s "$rch_test_dir/signals" ] || exit 18
+[ "$(cat "$rch_test_dir/calls")" = 10 ] || exit 28
 "#;
 
 #[test]
 fn unavailable_census_retries_are_bounded_and_never_prove_completion() {
     run_case(CENSUS_RETRY_BUDGET);
+    run_case_with_scale(CENSUS_RETRY_BUDGET, Some("2"));
 }
 
 const SCOPE_BIND_OBSERVATION_RETRIES: &str = r#"
@@ -520,8 +580,14 @@ rch_policy_systemctl() {
     printf 'invocation\n' >> "$rch_test_dir/manager-reads"
     printf '1234567890abcdef1234567890abcdef\n'
 }
-rch_observation_clock() { rch_observation_now=100; }
-sleep() { :; }
+rch_observation_clock() {
+    rch_observation_now=$test_clock
+    printf '%s\n' "$test_clock" > "$rch_test_dir/bind-clock"
+}
+sleep() {
+    [ "$1" = 0.1 ] || return 1
+    test_clock=$((test_clock + test_pause_ticks))
+}
 # Only the independently observed scope state is injected. Binding syntax,
 # captured inode/UID/namespace fields, the retry loop and its budget are real.
 rch_scope_operation() {
@@ -535,22 +601,29 @@ rch_scope_operation() {
         transient) [ "$test_probe_calls" -ge 3 ] && return 0; return 2;;
         unavailable) return 2;;
         changed) return 3;;
+        late) test_clock=$rch_observation_deadline; return 0;;
         *) return 99;;
     esac
 }
 for test_mode in transient unavailable changed; do
     : > "$rch_test_dir/manager-reads"
     test_probe_calls=0; rch_scope_bound=0; test_expected_deadline=3100
+    test_clock=100; test_pause_ticks=10
     rch_scope_bind_created
     test_status=$?
     [ "$(cat "$rch_test_dir/manager-reads")" = invocation ] || exit 2
     case "$test_mode" in
         transient)
             [ "$test_status" = 0 ] && [ "$rch_scope_bound" = 1 ] &&
-                [ "$(cat "$rch_test_dir/probe-calls")" = 3 ] || exit 3;;
+                [ "$(cat "$rch_test_dir/probe-calls")" = 3 ] &&
+                [ "$(cat "$rch_test_dir/bind-clock")" = 120 ] || exit 3;;
         unavailable)
+            # 005841f1 replaced three attempts with a 30s elapsed budget.
+            # At 100ms per retry, calls at ticks100..3090 are allowed; no
+            # observation may begin at the shared deadline of tick3100.
             [ "$test_status" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
-                [ "$(cat "$rch_test_dir/probe-calls")" = 3 ] || exit 4;;
+                [ "$(cat "$rch_test_dir/probe-calls")" = 300 ] &&
+                [ "$(cat "$rch_test_dir/bind-clock")" = 3100 ] || exit 4;;
         changed)
             [ "$test_status" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
                 [ "$(cat "$rch_test_dir/probe-calls")" = 1 ] || exit 5;;
@@ -562,6 +635,25 @@ rch_observation_deadline=1200; test_expected_deadline=1200
 test_mode=transient; test_probe_calls=0; rch_scope_bound=0
 rch_scope_bind_created || exit 6
 [ "$rch_scope_bound" = 1 ] && [ "$rch_observation_deadline" = 1200 ] || exit 7
+# Persistent uncertainty also respects that inherited cap: 110 observations
+# at ticks100..1190, followed by refusal before a new observation at tick1200.
+test_mode=unavailable; test_probe_calls=0; rch_scope_bound=0
+rch_scope_bind_created
+[ "$?" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
+    [ "$(cat "$rch_test_dir/probe-calls")" = 110 ] &&
+    [ "$(cat "$rch_test_dir/bind-clock")" = 1200 ] || exit 8
+# Successful evidence that arrives at the deadline cannot open the gate.
+test_mode=late; test_probe_calls=0; rch_scope_bound=0
+rch_scope_bind_created
+[ "$?" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
+    [ "$(cat "$rch_test_dir/probe-calls")" = 1 ] &&
+    [ "$(cat "$rch_test_dir/bind-clock")" = 1200 ] || exit 9
+# A frozen clock remains a hard refusal, never a way to retry indefinitely.
+test_mode=unavailable; test_probe_calls=0; rch_scope_bound=0; test_pause_ticks=0
+rch_scope_bind_created
+[ "$?" = 1 ] && [ "$rch_scope_bound" = 0 ] &&
+    [ "$(cat "$rch_test_dir/probe-calls")" = 1 ] &&
+    [ "$(cat "$rch_test_dir/bind-clock")" = 100 ] || exit 10
 "#;
 
 #[test]

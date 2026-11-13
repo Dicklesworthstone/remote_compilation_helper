@@ -68,3 +68,38 @@ pub use log::{
     TerminalInfo, TestGuard, TestLogEntry, TestLogger, TestPhase, TestResult,
     init_global_test_logging,
 };
+
+/// Pin worker-side protocol tests to the explicitly selected or sibling build.
+///
+/// Cargo places test executables under either `deps` or the per-unit
+/// `build/<package>/<hash>/out` tree. The worker is uplifted into the profile
+/// directory by `cargo build -p rch-wkr` before cross-crate protocol tests;
+/// an installed worker or PATH fallback could hide regressions.
+#[track_caller]
+pub fn worker_binary() -> std::path::PathBuf {
+    let binary = std::env::var_os("RCH_WKR_BIN").map_or_else(
+        || {
+            let executable = std::env::current_exe().expect("locate current test executable");
+            let profile = executable
+                .ancestors()
+                .skip(1)
+                .take(5)
+                .find(|directory| {
+                    matches!(
+                        directory.file_name().and_then(|name| name.to_str()),
+                        Some("deps" | "build")
+                    )
+                })
+                .and_then(std::path::Path::parent)
+                .expect("Cargo profile directory; otherwise set RCH_WKR_BIN");
+            profile.join(format!("rch-wkr{}", std::env::consts::EXE_SUFFIX))
+        },
+        std::path::PathBuf::from,
+    );
+    assert!(
+        binary.is_file(),
+        "worker protocol tests require the current rch-wkr build at {}; run `cargo build -p rch-wkr` or set RCH_WKR_BIN to that build",
+        binary.display()
+    );
+    binary.canonicalize().expect("resolve worker test binary")
+}

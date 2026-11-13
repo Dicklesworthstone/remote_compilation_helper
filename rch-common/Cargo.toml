@@ -36,6 +36,7 @@ blake3 = { workspace = true }
 object = { workspace = true }
 flate2 = { workspace = true }
 shell-escape = "0.1.5"
+shell-words = "1.1.0"
 shellexpand = "3.1.1"
 dirs = { workspace = true }
 toml = { workspace = true }

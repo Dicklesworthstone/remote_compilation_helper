@@ -741,6 +741,19 @@ pub(crate) enum RegistryStoragePressure {
     RecoveryPending,
 }
 
+/// The daemon's collection scripts use POSIX process and descriptor snapshots.
+/// Git for Windows can provide those commands without exposing native Cargo
+/// processes, so successful snapshots there cannot authorize deletion. Keep
+/// this check on the config actually used to dispatch every mutating sweep,
+/// including an explicitly requested cleanup that skips scheduling policy.
+pub(crate) fn ensure_posix_gc_worker(config: &WorkerConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        rch_common::types::declared_os(&config.tags).as_deref() != Some("windows"),
+        "Windows collection is unavailable without native process/handle and durable ownership checks; use rch gc --dry-run for inventory"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct RegistryStoragePressureEvidence {
     reason: RegistryStoragePressure,
@@ -1007,8 +1020,9 @@ pub struct WorkerState {
     disk_capacity_observation: RwLock<Option<DiskCapacityObservation>>,
     /// Serialize daemon-side capability requests from health, operators and selection.
     capability_probe: tokio::sync::Mutex<()>,
-    /// Cached per-toolchain preflight verdicts.
-    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightEvidence>>,
+    /// Cached verdicts and the probes allowed to replace them. Capability
+    /// publication and reload revoke both completed and in-flight evidence.
+    toolchain_preflight: RwLock<ToolchainPreflightCache>,
     /// Latest daemon-side pressure policy assessment for this worker.
     pressure_assessment: RwLock<PressureAssessment>,
     /// Disk budget shared by all workers created by the same daemon pool.
@@ -1045,6 +1059,7 @@ pub(crate) struct CapabilityProbeContext {
     network_revision: u64,
     transport_generation: u64,
     current_transport_generation: Arc<AtomicU64>,
+    preflight_epoch: Arc<()>,
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -1180,7 +1195,7 @@ impl WorkerState {
             disk_capacity_generation: Arc::new(AtomicU64::new(0)),
             disk_capacity_observation: RwLock::new(None),
             capability_probe: tokio::sync::Mutex::new(()),
-            toolchain_preflight: RwLock::new(HashMap::new()),
+            toolchain_preflight: RwLock::new(ToolchainPreflightCache::default()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disk_slot_policy,
             unmeasured_capacity_hold_until: std::sync::Mutex::new(None),
@@ -1280,6 +1295,9 @@ impl WorkerState {
     /// not build admission or recovery from an open command/transport circuit.
     /// Callers still execute under a revocable background network permit.
     pub(crate) async fn background_disk_recovery_allowed(&self) -> bool {
+        if ensure_posix_gc_worker(&self.config.read().await).is_err() {
+            return false;
+        }
         let Some(network) = self.background_probe().await else {
             return false;
         };
@@ -1629,7 +1647,7 @@ impl WorkerState {
             *self.registry_storage_pressure.write().await = None;
             self.last_latency_ms.store(0, Ordering::Relaxed);
             self.cached_projects.write().await.clear();
-            self.toolchain_preflight.write().await.clear();
+            self.toolchain_preflight.write().await.invalidate();
             *self.capabilities.write().await = WorkerCapabilities::new();
             *self.disk_capacity_observation.write().await = None;
             *self.pressure_assessment.write().await = PressureAssessment::default();
@@ -1891,7 +1909,7 @@ impl WorkerState {
         let total_slots = self.slots_for(config.total_slots, &pressure);
         let preflight_provenance = match requirements.preflight_toolchain() {
             Some(toolchain_name) => {
-                let evidence = toolchain_preflight.as_ref()?.get(toolchain_name)?;
+                let evidence = toolchain_preflight.as_ref()?.verdicts.get(toolchain_name)?;
                 if !evidence.verdict.usable || !evidence.verdict.is_fresh(TOOLCHAIN_PREFLIGHT_TTL) {
                     return None;
                 }
@@ -2216,6 +2234,7 @@ impl WorkerState {
     pub(crate) async fn capability_probe_context(&self) -> CapabilityProbeContext {
         let config = self.config.read().await;
         let transport = self.transport();
+        let preflight_epoch = Arc::clone(&self.toolchain_preflight.read().await.epoch);
         CapabilityProbeContext {
             config: config.clone(),
             started_at: Instant::now(),
@@ -2223,13 +2242,16 @@ impl WorkerState {
             network_revision: *self.network_changes.borrow(),
             transport_generation: transport.disk_capacity_generation.load(Ordering::Acquire),
             current_transport_generation: Arc::clone(&transport.disk_capacity_generation),
+            preflight_epoch,
             deadline: None,
         }
     }
 
     /// Publish a probe only for the endpoint/generation that launched it. No
     /// config lock is held over SSH; this short read lock fences local publish
-    /// against retargeting while the three in-memory snapshots are updated.
+    /// against retargeting while the snapshots and preflight invalidation are
+    /// committed together. Inventory is a reason to recheck execution, never
+    /// a substitute for a successful concrete-toolchain execution probe.
     pub(crate) async fn publish_capabilities(
         &self,
         context: CapabilityProbeContext,
@@ -2242,15 +2264,17 @@ impl WorkerState {
         let publication = async {
             let config = self.config.read().await;
             let _publication = self.network_transition.lock().await;
-            // Match reservation's capability-before-pressure-and-disk order.
+            // Match reservation's capability -> preflight -> pressure -> disk order.
             // Acquire every destination before changing generation or any
             // cached snapshot: cancellation while queued keeps old evidence.
             let mut cached = self.capabilities.write().await;
+            let mut preflight = self.toolchain_preflight.write().await;
             let mut pressure = self.pressure_assessment.write().await;
             let mut disk = self.disk_capacity_observation.write().await;
             if *self.network_changes.borrow() != context.network_revision
                 || context.current_transport_generation.load(Ordering::Acquire)
                     != context.transport_generation
+                || !Arc::ptr_eq(&context.preflight_epoch, &preflight.epoch)
             {
                 return false;
             }
@@ -2293,6 +2317,7 @@ impl WorkerState {
             *disk = observation;
             *cached = capabilities;
             *pressure = next_pressure;
+            preflight.invalidate();
             true
         };
         match deadline {
@@ -2312,6 +2337,34 @@ impl WorkerState {
         self.disk_capacity_observation.read().await.clone()
     }
 
+    /// Re-evaluate concrete toolchains after a successful inventory reload.
+    /// Keep existing ownership, health and disk observations, but also fence
+    /// capability probes that started before this explicit refresh boundary.
+    pub(crate) async fn invalidate_toolchain_preflight(&self) {
+        let _config = self.config.read().await;
+        let _publication = self.network_transition.lock().await;
+        self.toolchain_preflight.write().await.invalidate();
+    }
+
+    /// Register the latest attempt for one toolchain before remote I/O.
+    /// Different toolchains can probe concurrently. For the same toolchain,
+    /// only the newest attempt may publish, regardless of completion order.
+    pub(crate) async fn begin_toolchain_preflight(
+        &self,
+        toolchain: &str,
+    ) -> ToolchainPreflightProbe {
+        let probe = ToolchainPreflightProbe {
+            toolchain: toolchain.to_owned(),
+            identity: Arc::new(()),
+        };
+        self.toolchain_preflight
+            .write()
+            .await
+            .probes
+            .insert(probe.toolchain.clone(), Arc::clone(&probe.identity));
+        probe
+    }
+
     /// Seed a current verdict in tests without running a remote probe.
     #[cfg(test)]
     pub async fn record_toolchain_preflight(
@@ -2320,25 +2373,40 @@ impl WorkerState {
         usable: bool,
         reason: Option<String>,
     ) {
+        self.record_toolchain_preflight_at(toolchain, usable, reason, current_unix_ms())
+            .await;
+    }
+
+    /// Seed expired or future-dated evidence without sleeping in regressions.
+    #[cfg(test)]
+    pub(crate) async fn record_toolchain_preflight_at(
+        &self,
+        toolchain: String,
+        usable: bool,
+        reason: Option<String>,
+        checked_at_unix_ms: i64,
+    ) {
         let mut cache = self.toolchain_preflight.write().await;
-        cache.insert(
+        cache.probes.remove(&toolchain);
+        cache.verdicts.insert(
             toolchain,
             ToolchainPreflightEvidence {
                 verdict: ToolchainPreflightStatus {
                     usable,
                     reason,
-                    checked_at_unix_ms: current_unix_ms(),
+                    checked_at_unix_ms,
                 },
                 provenance: self.network_revision_guard(),
             },
         );
     }
 
-    /// Publish a completed verdict only within its original network epochs and
-    /// budget. Waiting for the cache lock cannot renew revoked or late evidence.
+    /// Publish a completed verdict only for the latest attempt in its original
+    /// inventory/network epochs and budget. Waiting for the cache lock cannot
+    /// renew revoked, superseded or late evidence.
     pub(crate) async fn record_toolchain_preflight_before(
         &self,
-        toolchain: String,
+        probe: &ToolchainPreflightProbe,
         usable: bool,
         reason: Option<String>,
         provenance: &BackgroundProbe,
@@ -2352,11 +2420,18 @@ impl WorkerState {
         else {
             return false;
         };
-        if tokio::time::Instant::now() >= deadline || !provenance.is_current() {
+        if tokio::time::Instant::now() >= deadline
+            || !provenance.is_current()
+            || !cache
+                .probes
+                .get(&probe.toolchain)
+                .is_some_and(|current| Arc::ptr_eq(current, &probe.identity))
+        {
             return false;
         }
-        cache.insert(
-            toolchain,
+        cache.probes.remove(&probe.toolchain);
+        cache.verdicts.insert(
+            probe.toolchain.clone(),
             ToolchainPreflightEvidence {
                 verdict: ToolchainPreflightStatus {
                     usable,
@@ -2378,6 +2453,7 @@ impl WorkerState {
         self.toolchain_preflight
             .read()
             .await
+            .verdicts
             .get(toolchain)
             .filter(|evidence| evidence.provenance.is_current())
             .map(|evidence| evidence.verdict.clone())
@@ -2674,6 +2750,29 @@ impl WorkerState {
     }
 }
 
+/// Opaque attempt identity. Clearing the cache revokes every outstanding
+/// ticket, including a probe that finishes after a refresh or worker removal.
+pub(crate) struct ToolchainPreflightProbe {
+    toolchain: String,
+    identity: Arc<()>,
+}
+
+#[derive(Debug, Default)]
+struct ToolchainPreflightCache {
+    /// Capability probes retain this identity to reject pre-reload inventory.
+    epoch: Arc<()>,
+    probes: HashMap<String, Arc<()>>,
+    verdicts: HashMap<String, ToolchainPreflightEvidence>,
+}
+
+impl ToolchainPreflightCache {
+    fn invalidate(&mut self) {
+        self.epoch = Arc::new(());
+        self.probes.clear();
+        self.verdicts.clear();
+    }
+}
+
 /// A completed preflight retains the permission that admitted its remote I/O.
 /// Keep one entry per toolchain; revoked entries are replaced on the next probe.
 #[derive(Debug, Clone)]
@@ -2697,22 +2796,25 @@ impl ToolchainPreflightStatus {
     /// Whether this verdict is fresh enough to reuse for dispatch decisions.
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let age_ms = current_unix_ms().saturating_sub(self.checked_at_unix_ms);
-        age_ms <= duration_millis_i64(ttl)
+        age_ms >= 0 && age_ms <= duration_millis_i64(ttl)
     }
 
     /// Whether this verdict says anything about the toolchain itself.
     ///
-    /// Only `toolchain_preflight_command_failed` means the probe ran and the
-    /// toolchain is missing or broken. A connect failure or timeout (the probe
-    /// runs over SSH against possibly loaded workers) says nothing about the
-    /// toolchain, and caching it as "unusable" for the full TTL excluded a
-    /// healthy worker from every build for that toolchain for 10 minutes.
+    /// Only `toolchain_preflight_command_failed` with an ordinary command
+    /// failure means the probe ran and the toolchain is missing or broken.
+    /// A connect failure, SSH 255, timeout, or killed probe says nothing about
+    /// the toolchain. Caching those as "unusable" for the full TTL would exclude
+    /// a healthy worker from every build for that toolchain for 10 minutes.
     pub fn is_definitive(&self) -> bool {
         self.usable
             || self
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.starts_with("toolchain_preflight_command_failed"))
+                .and_then(|reason| reason.strip_prefix("toolchain_preflight_command_failed:"))
+                .and_then(|detail| detail.split_once(':'))
+                .and_then(|(code, _)| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code, 1..=123 | 126..=127))
     }
 
     /// How long to reuse this verdict: `definitive_ttl` for a real answer,
@@ -3285,8 +3387,14 @@ pub struct WorkerStateResponse {
 pub async fn get_workers_capabilities(
     ctx: &DaemonContext,
     refresh: bool,
+    worker_id: Option<&WorkerId>,
 ) -> WorkerCapabilitiesResponse {
-    let workers = ctx.pool.all_workers().await;
+    // A CLI probe refreshes only the daemon's current incarnation of that
+    // worker. Never accept capability facts collected by an outside caller.
+    let workers = match worker_id {
+        Some(id) => ctx.pool.get(id).await.into_iter().collect(),
+        None => ctx.pool.all_workers().await,
+    };
     let mut entries = Vec::with_capacity(workers.len());
     let mut refresh_results = if refresh {
         // Both probes are read-only and independent. Preserve the existing
@@ -3372,7 +3480,7 @@ fn source_topology_revalidation_command(fences: &[crate::history::SourceTopology
         "set -eu\nrch_source_topology_matches() (\nset -- check \"$1\" \"$2\"\n{}\n)\n",
         // rchd's own copy, so the published package builds; the hook's file
         // stays canonical and a test below fails when the two drift.
-        include_str!("source_namespace_paths.sh"),
+        rch_common::source_namespace_paths::shell_script(include_str!("source_namespace_paths.sh")),
     );
     for (index, fence) in fences.iter().enumerate() {
         let topology = &fence.mismatch.topology;
@@ -3958,7 +4066,8 @@ mod tests {
                 shell_escape::escape(command.as_str().into()).len() + "sh -c ".len()
                     <= SOURCE_TOPOLOGY_REVALIDATION_MAX_ARG_BYTES
             );
-            assert_eq!(command.matches("namespace_realpath() {").count(), 1);
+            assert_eq!(command.matches("rch_wkr_locate() {").count(), 1);
+            assert_eq!(command.matches("source-namespace-paths probe").count(), 1);
             assert_eq!(
                 command.matches("if rch_source_topology_matches ").count(),
                 range.len()
@@ -4050,6 +4159,7 @@ mod tests {
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(source_topology_revalidation_command(&fences))
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .output()
                 .unwrap();
             rch_common::CommandResult {
@@ -4732,6 +4842,19 @@ mod tests {
             );
             worker.release_slots(1).await;
             worker.set_capabilities(available).await;
+            if let Some(toolchain) = requirements.preflight_toolchain() {
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_none(),
+                    "{case}: restored inventory still requires new concrete-toolchain proof"
+                );
+                assert_eq!(worker.used_slots(), 3);
+                worker
+                    .record_toolchain_preflight(toolchain.to_owned(), true, None)
+                    .await;
+            }
             assert!(
                 worker
                     .reserve_slots_for_endpoint(1, &selected, &requirements)
@@ -4780,11 +4903,14 @@ mod tests {
             .await;
             match case {
                 "missing" => {
-                    let verdict = publication.remove(toolchain).unwrap();
-                    publication.insert("another-toolchain".into(), verdict);
+                    let verdict = publication.verdicts.remove(toolchain).unwrap();
+                    publication
+                        .verdicts
+                        .insert("another-toolchain".into(), verdict);
                 }
                 "expired" => {
                     publication
+                        .verdicts
                         .get_mut(toolchain)
                         .unwrap()
                         .verdict
@@ -4792,7 +4918,7 @@ mod tests {
                         .saturating_sub(duration_millis_i64(TOOLCHAIN_PREFLIGHT_TTL) + 1000);
                 }
                 "failed" | "transport-failed" => {
-                    let verdict = &mut publication.get_mut(toolchain).unwrap().verdict;
+                    let verdict = &mut publication.verdicts.get_mut(toolchain).unwrap().verdict;
                     verdict.usable = false;
                     verdict.reason = Some(if case == "failed" {
                         "toolchain_preflight_command_failed:1:wrapper refused".into()
@@ -4831,6 +4957,176 @@ mod tests {
             );
             assert_eq!(worker.used_slots(), 4);
         }
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_revokes_toolchain_preflight_before_new_slot_admission() {
+        for old_usable in [false, true] {
+            let worker = WorkerState::new(recovered_worker_config("refreshed-toolchain", 8));
+            let caps = WorkerCapabilities::mock_with_rust();
+            worker.set_capabilities(caps.clone()).await;
+            let mut request = execution_request(RequiredRuntime::Rust);
+            request.toolchain = Some(rch_common::ToolchainInfo::new(
+                "nightly",
+                Some("2026-11-11".into()),
+                "nightly-2026-11-11",
+            ));
+            let requirements = ExecutionRequirements::new(&request);
+            let toolchain = requirements.preflight_toolchain().unwrap();
+            worker
+                .record_toolchain_preflight(
+                    toolchain.into(),
+                    old_usable,
+                    (!old_usable)
+                        .then(|| "toolchain_preflight_command_failed:1:not installed".into()),
+                )
+                .await;
+            assert!(worker.reserve_slots(2).await);
+            let selected = worker.endpoint_snapshot().await;
+            let old_probe = worker.begin_toolchain_preflight(toolchain).await;
+            let permission = worker.background_probe().await.unwrap();
+
+            // Even an unchanged inventory is new evidence: it does not attest
+            // that rustup's named Cargo/rustc entry points can execute.
+            worker.set_capabilities(caps).await;
+            assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &requirements)
+                    .await
+                    .is_none(),
+                "inventory alone cannot authorize a concrete toolchain"
+            );
+            assert!(
+                !worker
+                    .record_toolchain_preflight_before(
+                        &old_probe,
+                        old_usable,
+                        None,
+                        &permission,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await,
+                "a pre-refresh completion cannot repopulate the cache"
+            );
+            assert_eq!(worker.used_slots(), 2, "existing ownership is retained");
+
+            let fresh = worker.begin_toolchain_preflight(toolchain).await;
+            assert!(
+                worker
+                    .record_toolchain_preflight_before(
+                        &fresh,
+                        true,
+                        None,
+                        &permission,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+            );
+            for _ in 0..3 {
+                assert!(
+                    worker
+                        .reserve_slots_for_endpoint(1, &selected, &requirements)
+                        .await
+                        .is_some(),
+                    "a fresh execution verdict must support repeated builds"
+                );
+                worker.release_slots(1).await;
+            }
+            assert_eq!(worker.used_slots(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_invalidation_fences_capability_probe_without_revoking_disk_or_slots() {
+        use crate::disk_pressure::DiskHeadroomAdmission;
+
+        let worker = WorkerState::new(recovered_worker_config("reload-toolchain", 8));
+        let caps = WorkerCapabilities {
+            build_disk_free_gb: Some(80.0),
+            build_disk_total_gb: Some(100.0),
+            ..WorkerCapabilities::mock_with_rust()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        worker
+            .record_toolchain_preflight("stable".into(), false, Some("old failure".into()))
+            .await;
+        assert!(worker.reserve_slots(2).await);
+        let disk = DiskHeadroomAdmission {
+            requested_gib: 64,
+            floor_gib: 0,
+            warm_policy: None,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        let stale_inventory = worker.capability_probe_context().await;
+        worker.invalidate_toolchain_preflight().await;
+        assert!(worker.toolchain_preflight_status("stable").await.is_none());
+        assert!(disk.check("reload-toolchain", 0).is_ok());
+        assert_eq!(worker.used_slots(), 2);
+        assert!(worker.background_network_allowed().await);
+        worker
+            .record_toolchain_preflight("stable".into(), true, None)
+            .await;
+
+        assert!(!worker.publish_capabilities(stale_inventory, caps).await);
+        assert!(
+            worker
+                .toolchain_preflight_status("stable")
+                .await
+                .unwrap()
+                .usable
+        );
+        assert!(disk.check("reload-toolchain", 0).is_ok());
+        assert_eq!(worker.used_slots(), 2);
+    }
+
+    #[tokio::test]
+    async fn replacement_worker_rejects_original_capability_and_toolchain_probe_tickets() {
+        let pool = WorkerPool::new();
+        let config = recovered_worker_config("replaced-toolchain", 8);
+        pool.add_worker(config.clone()).await;
+        let original = pool.get(&config.id).await.unwrap();
+        let inventory = original.capability_probe_context().await;
+        let attempt = original.begin_toolchain_preflight("stable").await;
+        let original_permission = original.background_probe().await.unwrap();
+        pool.remove_worker(&config.id).await;
+        pool.add_worker(config.clone()).await;
+        let replacement = pool.get(&config.id).await.unwrap();
+        replacement
+            .set_capabilities(WorkerCapabilities::mock_with_rust())
+            .await;
+        replacement
+            .record_toolchain_preflight("stable".into(), false, Some("new failure".into()))
+            .await;
+        let permission = replacement.background_probe().await.unwrap();
+        assert!(
+            !replacement
+                .publish_capabilities(inventory, WorkerCapabilities::mock_with_rust())
+                .await,
+            "identical coordinates do not make an old worker incarnation current"
+        );
+        for (worker, provenance) in [
+            (original.as_ref(), &original_permission),
+            (replacement.as_ref(), &permission),
+        ] {
+            assert!(
+                !worker
+                    .record_toolchain_preflight_before(
+                        &attempt,
+                        true,
+                        None,
+                        provenance,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+            );
+        }
+        let verdict = replacement
+            .toolchain_preflight_status("stable")
+            .await
+            .unwrap();
+        assert!(!verdict.usable);
+        assert_eq!(verdict.reason.as_deref(), Some("new failure"));
     }
 
     #[tokio::test]
@@ -4974,10 +5270,11 @@ mod tests {
                 assert!(worker.reserve_slots(1).await);
                 worker.release_slots(1).await;
                 let fresh = worker.background_probe().await.unwrap();
+                let attempt = worker.begin_toolchain_preflight(toolchain).await;
                 assert!(
                     worker
                         .record_toolchain_preflight_before(
-                            toolchain.to_owned(),
+                            &attempt,
                             true,
                             None,
                             &fresh,
@@ -4992,7 +5289,7 @@ mod tests {
                         .is_some()
                 );
                 assert_eq!(worker.used_slots(), 4);
-                assert_eq!(worker.toolchain_preflight.read().await.len(), 1);
+                assert_eq!(worker.toolchain_preflight.read().await.verdicts.len(), 1);
             }
         }
     }
@@ -7106,6 +7403,9 @@ mod tests {
                     ..Default::default()
                 };
                 worker.set_capabilities(capabilities(51.0)).await;
+                worker
+                    .record_toolchain_preflight("stable".into(), true, None)
+                    .await;
                 let old_budget = DiskHeadroomAdmission {
                     requested_gib: 64,
                     floor_gib: 0,
@@ -7130,6 +7430,11 @@ mod tests {
                 drop(disk_guard);
                 let accepted = publication.await;
                 assert_eq!(accepted, elapsed < allowance, "scale={scale}");
+                assert_eq!(
+                    worker.toolchain_preflight_status("stable").await.is_none(),
+                    accepted,
+                    "only an accepted publication may revoke execution evidence"
+                );
                 if accepted {
                     assert_eq!(
                         old_budget.check("disk-deadline", 0),
@@ -7172,6 +7477,10 @@ mod tests {
             ..Default::default()
         };
         worker.set_capabilities(capabilities(51.0)).await;
+        worker
+            .record_toolchain_preflight("stable".into(), false, Some("old failure".into()))
+            .await;
+        let old_preflight = worker.toolchain_preflight_status("stable").await.unwrap();
         let old_budget = DiskHeadroomAdmission {
             requested_gib: 64,
             floor_gib: 0,
@@ -7197,6 +7506,11 @@ mod tests {
             Err(DiskHeadroomRejection::Insufficient { .. })
         ));
         assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+        assert_eq!(
+            worker.toolchain_preflight_status("stable").await,
+            Some(old_preflight),
+            "cancellation cannot partially invalidate preflight evidence"
+        );
 
         let fresh_context = worker
             .capability_probe_context()
@@ -7891,6 +8205,22 @@ mod tests {
         assert!(status.is_fresh(Duration::from_millis(u64::MAX)));
     }
 
+    #[test]
+    fn toolchain_preflight_expired_or_future_success_cannot_authorize_execution() {
+        for checked_at_unix_ms in [
+            current_unix_ms() - duration_millis_i64(TOOLCHAIN_PREFLIGHT_TTL) - 1000,
+            current_unix_ms() + 60_000,
+            i64::MAX,
+        ] {
+            let status = ToolchainPreflightStatus {
+                usable: true,
+                reason: None,
+                checked_at_unix_ms,
+            };
+            assert!(!status.is_fresh(TOOLCHAIN_PREFLIGHT_TTL));
+        }
+    }
+
     /// Only a probe that ran and failed says the toolchain is broken; an
     /// unreachable or timed-out worker must not be excluded for the full TTL.
     #[test]
@@ -7911,9 +8241,33 @@ mod tests {
         assert!(broken.is_definitive());
         assert!(broken.is_reusable(long, short));
 
-        let unreachable = verdict(false, Some("toolchain_preflight_connect_failed:timed out"));
-        assert!(!unreachable.is_definitive());
-        assert!(!unreachable.is_reusable(long, short));
+        for reason in [
+            "toolchain_preflight_connect_failed:timed out",
+            "toolchain_preflight_transport_failed:255:Connection reset by peer",
+            "toolchain_preflight_inconclusive:137:Killed",
+            "toolchain_preflight_command_failed:255:Connection reset by peer",
+            "toolchain_preflight_command_failed:137:Killed",
+            "toolchain_preflight_command_failed:124:Timed out",
+            "toolchain_preflight_command_failed:125:Wrapper failed",
+            "toolchain_preflight_command_failed:-1:No exit status",
+            "toolchain_preflight_command_failed:0:Invalid failure",
+            "toolchain_preflight_command_failed:unavailable",
+            "toolchain_preflight_command_failed_extra:1:Invalid reason",
+        ] {
+            let unreachable = verdict(false, Some(reason));
+            assert!(!unreachable.is_definitive(), "{reason}");
+            assert!(!unreachable.is_reusable(long, short), "{reason}");
+        }
+
+        for reason in [
+            "toolchain_preflight_command_failed:101:Toolchain panicked",
+            "toolchain_preflight_command_failed:126:Cannot execute",
+            "toolchain_preflight_command_failed:127:Command not found",
+        ] {
+            let broken = verdict(false, Some(reason));
+            assert!(broken.is_definitive(), "{reason}");
+            assert!(broken.is_reusable(long, short), "{reason}");
+        }
 
         let healthy = verdict(true, None);
         assert!(healthy.is_definitive());
@@ -9027,6 +9381,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_recovery_never_uses_posix_collection_for_windows_workers() {
+        for (tag, supported) in [
+            (None, true),
+            (Some("os:linux"), true),
+            (Some("os:darwin"), true),
+            (Some("os:windows"), false),
+            (Some("os:WiNdOwS"), false),
+        ] {
+            let mut config = test_config("storage-platform");
+            config.tags = tag.into_iter().map(str::to_owned).collect();
+            let worker = WorkerState::new(config);
+            assert_eq!(
+                worker.background_disk_recovery_allowed().await,
+                supported,
+                "healthy worker: {tag:?}"
+            );
+            // Storage pressure may permit otherwise excluded POSIX workers,
+            // but it cannot make the MSYS process view authoritative.
+            let endpoint = worker.endpoint_snapshot().await;
+            let network = worker.background_probe().await.unwrap();
+            assert!(
+                worker
+                    .record_registry_storage_pressure(
+                        &endpoint,
+                        &network,
+                        Some(RegistryStoragePressure::NoSpace),
+                    )
+                    .await
+            );
+            worker.apply_health_status(WorkerStatus::Unreachable).await;
+            assert_eq!(
+                worker.background_disk_recovery_allowed().await,
+                supported,
+                "worker with confirmed pressure: {tag:?}"
+            );
+            assert!(worker.background_probe().await.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn storage_recovery_requires_current_typed_pressure_for_nonhealthy_workers() {
         let worker = WorkerState::new(test_config("registry-pressure"));
         assert!(worker.background_disk_recovery_allowed().await);
@@ -9659,12 +10053,13 @@ mod tests {
             .await;
         let original = worker.toolchain_preflight_status("stable").await.unwrap();
         let provenance = worker.network_revision_guard();
+        let attempt = worker.begin_toolchain_preflight("stable").await;
         for usable in [false, true] {
             for lateness in [Duration::ZERO, Duration::from_millis(1)] {
                 let guard = worker.toolchain_preflight.write().await;
                 let budget = Duration::from_secs(2);
                 let mut publication = Box::pin(worker.record_toolchain_preflight_before(
-                    "stable".into(),
+                    &attempt,
                     usable,
                     Some("late replacement".into()),
                     &provenance,
@@ -9687,7 +10082,7 @@ mod tests {
         assert!(
             worker
                 .record_toolchain_preflight_before(
-                    "stable".into(),
+                    &attempt,
                     true,
                     None,
                     &provenance,
@@ -9710,10 +10105,11 @@ mod tests {
             for usable in [false, true] {
                 let worker = WorkerState::new(test_config("queued-preflight"));
                 let provenance = worker.background_probe().await.unwrap();
+                let attempt = worker.begin_toolchain_preflight("stable").await;
                 let transition = worker.lock_network_publication(&provenance).await.unwrap();
                 let cache = worker.toolchain_preflight.write().await;
                 let mut publication = Box::pin(worker.record_toolchain_preflight_before(
-                    "stable".into(),
+                    &attempt,
                     usable,
                     (!usable).then(|| "toolchain_preflight_command_failed:1:old failure".into()),
                     &provenance,
@@ -9747,13 +10143,14 @@ mod tests {
                     "shared={shared_transport}, usable={usable}: queued evidence retains its original epoch"
                 );
                 drop(transition);
-                assert!(worker.toolchain_preflight.read().await.is_empty());
+                assert!(worker.toolchain_preflight.read().await.verdicts.is_empty());
 
                 let fresh = worker.background_probe().await.unwrap();
+                let attempt = worker.begin_toolchain_preflight("stable").await;
                 assert!(
                     worker
                         .record_toolchain_preflight_before(
-                            "stable".into(),
+                            &attempt,
                             !usable,
                             usable.then(|| {
                                 "toolchain_preflight_command_failed:1:fresh failure".into()

@@ -57,13 +57,14 @@ rch_observation_budget() {
 }
 
 # Monotonic hundredths. No recursive rch_control_capture in the Darwin clock;
-# its one stdlib process has no pipe holders and is independently bounded.
+# its native probe has no pipe holders and is independently bounded.
 rch_observation_clock() {
     if [ ! -r /proc/uptime ]; then
         [ "$(uname -s)" = Darwin ] || return 1
+        rch_wkr_locate || return 1
         rch_timing_budget 5
-        rch_observation_now=$(rch_group_timeout --signal=KILL "${rch_timing_scaled}s" python3 -I -S -c \
-            'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
+        rch_observation_now=$(rch_group_timeout --signal=KILL "${rch_timing_scaled}s" \
+            "$RCH_WKR" control-clock ticks) || return 1
         case "$rch_observation_now" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
         [ "${#rch_observation_now}" -le 15 ]
         return $?
@@ -112,7 +113,8 @@ rch_check_procfs_namespace() {
 # Native libproc birth time (microseconds), not rounded ps lstart seconds.
 # The worker binary is required on Darwin; missing/old helpers fail closed.
 rch_darwin_process() {
-    rch_darwin_helper=$(command -v rch-wkr) || return 1
+    rch_wkr_locate || return 1
+    rch_darwin_helper=$RCH_WKR
     rch_observation_budget
     rch_darwin_result=$(rch_control_capture "${rch_observation_seconds}s" "$rch_darwin_helper" process-identity "$1") || return 1
     set -- $rch_darwin_result
@@ -497,8 +499,8 @@ rch_remote_cancel() {
 rch_remote_cancel_loaded() (
     # Share 30 * scale seconds inside 45 * scale SSH; isolate authority.
     # A full build disk must not prevent observing that its writers stopped.
-    # Keep this preference local to cancellation/supervisor cleanup; workers
-    # without Python retain the existing bounded file-backed control path.
+    # Keep this preference local to cancellation/supervisor cleanup; a matching
+    # native helper is required before any observation can grant authority.
     rch_control_diskless=1
     # Witness helpers evaluate the protocol in fresh shells; their nested
     # Darwin identity observations must use the same storage-independent path.
@@ -714,8 +716,34 @@ rch_policy_read_file() {
     esac
 }
 
-# Kill helpers AND pipe holders in a private group, never the workload. Prefer
-# GNU (gnutimeout/gtimeout): uutils timeout kills only the direct child.
+# Duplicate only inside a subshell; the parent's descriptions and offsets stay
+# untouched. Probe stderr before suppressing diagnostics, so closed stays closed.
+# This must run before native process startup can sanitize closed stdio.
+rch_scope_launch_fd_present() (
+    case "$1" in
+        2) : 3>&2 2>/dev/null;;
+        0|1|[4-9]) ( : 3>&"$1" ) 2>/dev/null;;
+        *) exit 2;;
+    esac
+)
+
+# Native session ownership needs neither coreutils nor writable disk. Capture
+# closures before libstd opens absent standard descriptors.
+rch_native_group_timeout() {
+    rch_wkr_locate || {
+        printf '%s\n' 'RCH_SCOPED_LAUNCH_UNAVAILABLE: deploy a current rch-wkr' >&2
+        return 125
+    }
+    rch_control_closed_stdio=0
+    rch_scope_launch_fd_present 0 || rch_control_closed_stdio=$((rch_control_closed_stdio | 1))
+    rch_scope_launch_fd_present 1 || rch_control_closed_stdio=$((rch_control_closed_stdio | 2))
+    rch_scope_launch_fd_present 2 || rch_control_closed_stdio=$((rch_control_closed_stdio | 4))
+    "$RCH_WKR" scoped-launch timeout --closed-stdio "$rch_control_closed_stdio" "$@"
+}
+
+# Preserve the existing utility selection for ordinary file-backed controls.
+# Cancellation's memory collector uses native group ownership directly below:
+# a generic timeout may be uutils and terminate only its direct child.
 rch_group_timeout() {
     if command -v gnutimeout >/dev/null 2>&1; then
         gnutimeout "$@"
@@ -724,48 +752,7 @@ rch_group_timeout() {
     elif command -v timeout >/dev/null 2>&1; then
         timeout "$@"
     else
-        # The Darwin launcher already uses Python when setsid is unavailable.
-        # Do not require Homebrew coreutils merely to observe a native identity.
-        # Keep this monitor alive as its OWN session/group leader. On a deadline
-        # or interrupted observer, signal that group, never a reaped child PID
-        # and never the calling process group (which may contain the compiler).
-        command -v python3 >/dev/null 2>&1 || return 125
-        # Isolated mode alone still imports installed .pth/sitecustomize hooks.
-        # This monitor uses only stdlib: do not run unrelated startup code
-        # before its alarm is armed or let it corrupt control observations.
-        python3 -I -S -B -c '
-import os
-import signal
-import subprocess
-import sys
-
-if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in tuple(str(n) + "s" for n in range(1, 81)):
-    sys.exit(125)
-try:
-    os.setsid()
-except OSError:
-    sys.exit(125)
-if os.getpgrp() != os.getpid():
-    sys.exit(125)
-
-def stop_group(signum=None, frame=None):
-    try:
-        os.killpg(os.getpid(), signal.SIGKILL)
-    finally:
-        os._exit(125)
-
-for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
-    signal.signal(signum, stop_group)
-# Arm before spawning too: waiting for exec to complete is part of the probe.
-signal.alarm(int(sys.argv[2][:-1]))
-try:
-    child = subprocess.Popen(sys.argv[3:])
-except OSError:
-    sys.exit(125)
-status = child.wait()
-signal.alarm(0)
-sys.exit(status if status >= 0 else 128 - status)
-' "$@"
+        rch_native_group_timeout "$@"
     fi
 }
 
@@ -787,70 +774,45 @@ rch_control_budget() {
         rch_control_timeout=${rch_control_remaining}s
 }
 
-# The existing timeout owns the collector, command and inherited pipe holders
-# as one process group. Never create another session here. Buffer only bounded,
-# validated bytes in memory, so cancellation needs no space on the build disk.
+# The native timeout owns the collector, command and inherited pipe holders
+# as one process group. The collector never creates another session. Buffer
+# only bounded, validated bytes so cancellation needs no build-disk space.
 rch_control_capture_memory() {
+    rch_wkr_locate || {
+        printf '%s\n' 'RCH_CONTROL_CAPTURE_UNAVAILABLE: deploy a current rch-wkr' >&2
+        return 125
+    }
+    rch_control_budget || return 125
+    rch_control_status=0
     rch_control_output=$(
-        rch_group_timeout --signal=KILL "$rch_control_timeout" python3 -I -S -B -c '
-import signal
-import subprocess
-import sys
-
-limit = int(sys.argv[1])
-allowed = b"\t\n" + bytes(range(32, 127))
-output = bytearray()
-invalid = False
-interrupted = 0
-child = None
-def interrupt(signum, frame):
-    global interrupted
-    interrupted = interrupted or signum
-# Keep timeout alive if only its collector is interrupted. Exec resets these
-# handlers in the command; it retains its normal signal dispositions.
-for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-    signal.signal(signum, interrupt)
-if interrupted:
-    sys.exit(128 + interrupted)
-try:
-    # Same descriptors as the file-backed path, including a pinned scope on fd 8.
-    child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, close_fds=False,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    while True:
-        chunk = child.stdout.read(8192)
-        if not chunk:
-            break
-        if not invalid:
-            if len(output) + len(chunk) > limit or chunk.translate(None, allowed):
-                invalid = True
-                output.clear()
-            else:
-                output.extend(chunk)
-        # Even invalid output must drain to EOF before the collector exits.
-        # Otherwise timeout could exit while an inherited pipe holder lives.
-    status = child.wait()
-except OSError:
-    if child is None:
-        sys.exit(125)
-    # An unreadable pipe is not proof that its holders exited. Keep the owned
-    # timeout alive to stop the complete group instead of abandoning children.
-    while True:
-        signal.pause()
-if interrupted:
-    sys.exit(128 + interrupted)
-if invalid:
-    sys.exit(125)
-try:
-    stream = sys.stdout.buffer if status == 0 else sys.stderr.buffer
-    stream.write(output)
-    stream.flush()
-except OSError:
-    sys.exit(125)
-sys.exit(128 + interrupted if interrupted else status if status >= 0 else 128 - status)
-' "$rch_control_limit" "$@" </dev/null || exit $?
+        # Probe and observation share one timeout, including helper startup.
+        rch_native_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
+            # Prove this timed shell ran even if an incompatible worker exits
+            # successfully without implementing the requested timeout command.
+            printf "%s" "RCH_CONTROL_CAPTURE_STARTED_V1:" || exit 125
+            rch_native=$1
+            shift
+            rch_probe=$("$rch_native" control-capture probe </dev/null) || {
+                printf "%s\n" "RCH_CONTROL_CAPTURE_UNAVAILABLE: deploy a current rch-wkr" >&2
+                exit 125
+            }
+            [ "$rch_probe" = "rch-wkr control-capture v1" ] || {
+                printf "%s\n" "RCH_CONTROL_CAPTURE_UNAVAILABLE: incompatible rch-wkr" >&2
+                exit 125
+            }
+            exec "$rch_native" control-capture "$@"
+        ' rch-control-memory "$RCH_WKR" "$rch_control_limit" "$@" </dev/null || exit $?
         # Preserve every trailing newline across shell command substitution.
         printf "."
-    ) || return $?
+    ) || rch_control_status=$?
+    case "$rch_control_output" in
+        RCH_CONTROL_CAPTURE_STARTED_V1:*)
+            rch_control_output=${rch_control_output#RCH_CONTROL_CAPTURE_STARTED_V1:};;
+        *)
+            printf '%s\n' 'RCH_CONTROL_CAPTURE_UNAVAILABLE: incompatible rch-wkr timeout' >&2
+            return 125;;
+    esac
+    [ "$rch_control_status" -eq 0 ] || return "$rch_control_status"
     rch_control_output=${rch_control_output%.}
     rch_control_in_budget || return 125
     printf "%s" "$rch_control_output" || return 125
@@ -868,8 +830,8 @@ rch_control_capture() {
     case "${1:-}:${4:-}" in
         ps:*|/bin/sh:rch-group-census) rch_control_limit=1048576;;
     esac
-    if [ "${rch_control_diskless:-0}" = 1 ] && command -v python3 >/dev/null 2>&1; then
-        # Interpreter lookup/setup is also inside the remaining shared budget.
+    if [ "${rch_control_diskless:-0}" = 1 ]; then
+        # Native helper lookup/setup also consumes the shared budget.
         rch_control_budget || return 125
         rch_control_capture_memory "$@"
         return $?

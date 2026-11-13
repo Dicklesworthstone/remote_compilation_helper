@@ -2,8 +2,8 @@
 //!
 //! A worker's default capability roots can be healthy while this dispatcher's
 //! canonical root is missing or conflicts with its alias. Send the admission
-//! path program in check mode so diagnostics use the same physical-path rule,
-//! independently of the deployed worker binary. These observations never
+//! worker operation in check mode so diagnostics use the same physical-path
+//! rule and require its versioned capability. These observations never
 //! repair paths, acquire source ownership, or change placement fences.
 
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
@@ -145,7 +145,7 @@ fn build_check_command(topology: &SourceTopology) -> Result<String, String> {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     Ok(format!(
         "sh -c {} rch-source-topology check {} {} --report-json",
-        quote(PATHS),
+        quote(&rch_common::source_namespace_paths::shell_script(PATHS)),
         quote(&topology.canonical_root),
         quote(&topology.alias_root),
     ))
@@ -376,6 +376,7 @@ pub(crate) fn probe_local_for_test(
             "-c",
             &build_check_command(topology).expect("valid fixture topology"),
         ])
+        .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
         .current_dir(working_directory)
         .output()
         .expect("execute the production namespace check command");

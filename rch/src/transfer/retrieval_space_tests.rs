@@ -52,6 +52,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -84,6 +85,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
+        .env("RCH_WKR_BIN", native_control_worker_for_test())
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -100,6 +102,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
+        .env("RCH_WKR_BIN", native_control_worker_for_test())
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -117,6 +120,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
+        .env("RCH_WKR_BIN", native_control_worker_for_test())
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -135,6 +139,7 @@ async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializin
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
+        .env("RCH_WKR_BIN", native_control_worker_for_test())
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -1499,6 +1499,95 @@ pub(crate) fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Preserve env prefixes whose working directory or argv cannot be tied to
+/// the invocation directory used for sources, dependencies, and artifacts.
+/// Parse literal argv because mixed quoting such as `--chdir='some dir'` is
+/// valid even though the lightweight wrapper scanner leaves it unrecognized.
+fn env_prefix_changes_execution_context(input: &str) -> bool {
+    let Ok(words) = shell_words::split(input) else {
+        return true;
+    };
+    let literal = |word: &str| !word.contains(['$', '`', '*', '?', '[', '{', '}']);
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if !word.starts_with('-') {
+            let assignment = word
+                .split_once('=')
+                .is_some_and(|(key, _)| crate::ssh_utils::is_valid_env_key(key));
+            if !assignment && !literal(word) {
+                return true;
+            }
+            break;
+        }
+        // Expansion or globbing can introduce extra env options. Inspect only
+        // the prefix and its operands; compiler arguments retain their syntax.
+        if !literal(word) {
+            return true;
+        }
+        if word.starts_with("--") {
+            let option = word.split_once('=').map_or(word.as_str(), |(name, _)| name);
+            // GNU long options accept unambiguous abbreviations. Split-string
+            // can introduce further chdir options, so its argv also needs a
+            // context-aware parser before it can be delegated.
+            if ["--chdir", "--split-string"]
+                .iter()
+                .any(|candidate| candidate.starts_with(option))
+            {
+                return true;
+            }
+            if ["--unset", "--argv0"]
+                .iter()
+                .any(|candidate| candidate.starts_with(option))
+            {
+                if !word.contains('=') && !words.next().is_some_and(|value| literal(value)) {
+                    return true;
+                }
+                continue;
+            }
+            if [
+                "--ignore-environment",
+                "--debug",
+                "--null",
+                "--default-signal",
+                "--ignore-signal",
+                "--block-signal",
+                "--list-signal-handling",
+            ]
+            .iter()
+            .any(|candidate| candidate.starts_with(option))
+            {
+                continue;
+            }
+            // An unknown value-taking flag could hide a later chdir option
+            // behind an operand that happens to look like a compiler.
+            return true;
+        }
+
+        let mut short_options = word[1..].chars().peekable();
+        while let Some(option) = short_options.next() {
+            match option {
+                'i' | 'v' | '0' => {}
+                'C' | 'S' => return true,
+                'u' | 'a' => {
+                    // The remaining letters belong to the option's value:
+                    // `-uC` unsets C; it does not change directory.
+                    if short_options.peek().is_none()
+                        && !words.next().is_some_and(|value| literal(value))
+                    {
+                        return true;
+                    }
+                    break;
+                }
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
 /// Normalize a command by stripping common wrappers (sudo, time, env, etc.)
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     let mut result = cmd.trim();
@@ -1520,6 +1609,9 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
                 if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                     result = rest.trim_start();
                     changed = true;
+                    if wrapper == "env" && env_prefix_changes_execution_context(result) {
+                        return Cow::Borrowed(cmd);
+                    }
 
                     // Strip flags that might follow the wrapper (e.g., "time -v", "sudo -E").
                     // We heuristically strip any token starting with '-' until we find a non-flag.
@@ -6198,6 +6290,97 @@ mod tests_normalize_whitespace {
         assert!(!classify_command("time '-f%U' echo cargo build").is_compilation);
         assert!(!classify_command("time '-f%U cargo build").is_compilation);
         assert!(!classify_command("time '-f%U'echo cargo build").is_compilation);
+    }
+
+    #[test]
+    fn env_directory_changes_do_not_lose_their_execution_context() {
+        let _guard = test_guard!();
+        for cmd in [
+            "env -C sub cargo test",
+            "env -Csub cargo test",
+            "env --chdir sub cargo test",
+            "env --chdir=sub cargo test",
+            "env '--chdir=sub dir' cargo test",
+            "env --chdir='sub dir' cargo test",
+            "env '--chdir'=sub cargo test",
+            "env --ch''dir=sub cargo test",
+            "env --unset='RUSTFLAGS' --chdir=sub cargo test",
+            "env -iCsub cargo test",
+            "env -vCsub cargo test",
+            "env -ivC sub cargo test",
+            "env --ch=sub cargo test",
+            "env -S--chdir=sub cargo test",
+            "env --split-string='--chdir=sub' cargo test",
+            "env --un rustc -Csub rustc main.rs",
+            "env --env0-from rustc -Csub rustc main.rs",
+            "env -u $OPTIONS cargo test",
+            "env --unset=$OPTIONS cargo test",
+            "env -u '*' cargo test",
+            "env -u {NAME,--chdir=sub} cargo test",
+            "env ${OPTIONS:=-Csub} cargo test",
+            "RUST_BACKTRACE=1 /usr/bin/env --chdir=sub cargo test",
+            "timeout 60 env --chdir=sub cargo test",
+            "env --chdir=sub bun test",
+            "env --chdir=sub tsc --noEmit",
+        ] {
+            assert_eq!(normalize_command(cmd), cmd, "{cmd}");
+            let basic = classify_command(cmd);
+            assert!(
+                !basic.is_compilation,
+                "must preserve cwd-changing prefix: {cmd}"
+            );
+            let detailed = classify_command_detailed(cmd);
+            assert_eq!(detailed.classification, basic, "{cmd}");
+            assert_eq!(detailed.normalized, cmd, "{cmd}");
+        }
+        let malformed = "env --chdir='unterminated cargo test";
+        assert_eq!(normalize_command(malformed), malformed);
+    }
+
+    #[test]
+    fn env_context_check_stops_at_option_values_and_the_executable() {
+        let _guard = test_guard!();
+        for (cmd, normalized) in [
+            ("env -u C cargo test", "cargo test"),
+            ("env -uC cargo test", "cargo test"),
+            ("env -u -Csub cargo test", "cargo test"),
+            ("env --unset=--chdir cargo test", "cargo test"),
+            ("env --un --chdir cargo test", "cargo test"),
+            ("env --a -Csub cargo test", "cargo test"),
+            ("env -i RUSTFLAGS='-C opt-level=2' cargo test", "cargo test"),
+            ("env RUSTFLAGS=$FLAGS cargo test", "cargo test"),
+            ("env --ignore-environment cargo test", "cargo test"),
+            ("env --debug cargo test", "cargo test"),
+            (
+                "env -- cargo test -- --chdir=sub",
+                "cargo test -- --chdir=sub",
+            ),
+            ("env cargo test -- -Csub", "cargo test -- -Csub"),
+            ("env cargo test -- '$OPTIONS*'", "cargo test -- '$OPTIONS*'"),
+            ("env rustc -C opt-level=2 lib.rs", "rustc -C opt-level=2 lib.rs"),
+            ("env make -C sub", "make -C sub"),
+        ] {
+            assert_eq!(normalize_command(cmd), normalized, "{cmd}");
+            assert!(classify_command(cmd).is_compilation, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn env_context_refusal_reaches_wrapped_and_compound_classification() {
+        let _guard = test_guard!();
+        for cmd in [
+            "cd /repo && env --chdir=sub cargo test",
+            "sh -c 'env --chdir=sub cargo test'",
+            "env --chdir=sub cargo test | head",
+        ] {
+            let basic = classify_command(cmd);
+            assert!(!basic.is_compilation, "{cmd}");
+            assert_eq!(classify_command_detailed(cmd).classification, basic, "{cmd}");
+        }
+        let safe = classify_command("cd /repo/sub && cargo test");
+        assert!(safe.is_compilation);
+        assert_eq!(safe.command_prefix.as_deref(), Some("cd /repo/sub && "));
+        assert_eq!(safe.extracted_command.as_deref(), Some("cargo test"));
     }
 
     #[test]

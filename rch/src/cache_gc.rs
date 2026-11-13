@@ -403,6 +403,11 @@ fn inspect_or_collect(entry: &StagingGcEntry, base: &Path, registry: &str, apply
     let (gates, cleanup) = rch_common::stale_target_reap::gc_liveness_guard_fragments();
     let script = format!(
         r#"set -u
+{worker_locator}
+if ! rch_wkr_locate; then
+    printf 'RCH_STAGING_GC_V1 unavailable\n'
+    exit 0
+fi
 {source_guard}
 mode=$3
 if [ "$mode" = apply ]; then
@@ -427,7 +432,7 @@ if [ "$handles" = held ] || [ "$processes" = held ]; then
     verdict=in-use
 elif [ "$handles" != free ] || [ "$processes" != free ]; then
     verdict=unavailable
-elif verdict=$(python3 -I -S -c {program} "$1" "$2" "$3" "$4" "$5" "$__gc_candidate"); then
+elif verdict=$("$RCH_WKR" staging-gc --protocol v1 "$1" "$2" "$3" "$4" "$5" "$__gc_candidate"); then
     case "$verdict" in ready|removed|changed|recent|unavailable) ;; *) verdict=unavailable;; esac
 else
     verdict=unavailable
@@ -441,18 +446,24 @@ printf 'RCH_STAGING_GC_V1 %s\n' "$verdict"
 "#,
         source_guard =
             rch_common::stale_target_reap::source_claim_gc_guard_fragment_with_registry(registry),
-        program = shell_escape::escape(STAGING_TREE_OPERATION.into()),
+        worker_locator = rch_common::wkr_locate::WKR_LOCATE_SHELL,
     );
-    let output = match std::process::Command::new("sh")
+    let mut command = std::process::Command::new("sh");
+    command
         .args(["-c", &script, "rch-cache-clean"])
         .arg(&entry.path)
         .arg(base)
         .arg(if apply { "apply" } else { "preview" })
         .arg(witness)
         .arg(entry.min_age.as_nanos().to_string())
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
+        .stdin(std::process::Stdio::null());
+    // The worker integration suite compiles this exact dispatcher module and
+    // exercises its witness/claim protocol against the freshly built worker.
+    #[cfg(test)]
+    if let Some(worker) = option_env!("CARGO_BIN_EXE_rch-wkr") {
+        command.env("RCH_WKR_BIN", worker);
+    }
+    let output = match command.output() {
         Ok(output) if output.status.success() => output,
         _ => return "unavailable".into(),
     };
@@ -601,134 +612,6 @@ fn observe_tree(
         "staging collection requires POSIX directory identity",
     ))
 }
-
-// Only this owned helper mutates a staging candidate. Open descriptors keep
-// traversal beneath the observed base/project/tree even if a name is replaced;
-// every unlink/rmdir rechecks the named directory chain. Shared source custody
-// excludes cooperating writers throughout the operation. No file data is read.
-const STAGING_TREE_OPERATION: &str = r#"import hashlib, json, os, stat, struct, sys, time
-
-path, base, mode, encoded, minimum, claimed = sys.argv[1:]
-witness = json.loads(encoded)
-minimum = int(minimum)
-flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-held = []
-chain = []
-
-class Changed(Exception):
-    pass
-
-def identity(info):
-    return {'device': info.st_dev, 'inode': info.st_ino}
-
-def require(condition):
-    if not condition:
-        raise Changed()
-
-def fields(info):
-    mt, mn = divmod(info.st_mtime_ns, 1000000000)
-    ct, cn = divmod(info.st_ctime_ns, 1000000000)
-    return (':'.join(str(value) for value in (info.st_dev, info.st_ino, info.st_mode,
-        info.st_uid, info.st_gid, info.st_nlink, info.st_size, mt, mn, ct, cn)) + '\0').encode('ascii')
-
-def unchanged():
-    require(os.path.realpath(base) == witness['canonical_base'])
-    require(identity(os.stat(base)) == witness['base'])
-    for parent, name, expected in chain:
-        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        require(stat.S_ISDIR(current.st_mode) and identity(current) == expected)
-
-def open_directory(parent, name, expected):
-    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    require(stat.S_ISDIR(info.st_mode) and identity(info) == expected)
-    descriptor = os.open(name, flags, dir_fd=parent)
-    held.append(descriptor)
-    require(identity(os.fstat(descriptor)) == expected)
-    chain.append((parent, name, expected))
-    return descriptor
-
-def observe(descriptor, relative, digest):
-    info = os.fstat(descriptor)
-    digest.update(struct.pack('<Q', len(relative)))
-    digest.update(relative)
-    digest.update(fields(info))
-    newest = info.st_mtime_ns
-    before = fields(info)
-    for name in sorted(os.listdir(descriptor), key=os.fsencode):
-        current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        nested = relative + (b'/' if relative else b'') + os.fsencode(name)
-        if stat.S_ISDIR(current.st_mode):
-            child = os.open(name, flags, dir_fd=descriptor)
-            try:
-                require(identity(os.fstat(child)) == identity(current))
-                newest = max(newest, observe(child, nested, digest))
-                require(fields(os.stat(name, dir_fd=descriptor, follow_symlinks=False)) == fields(current))
-            finally:
-                os.close(child)
-        else:
-            digest.update(struct.pack('<Q', len(nested)))
-            digest.update(nested)
-            digest.update(fields(current))
-            newest = max(newest, current.st_mtime_ns)
-    require(fields(os.fstat(descriptor)) == before)
-    return newest
-
-def remove_contents(descriptor):
-    for name in os.listdir(descriptor):
-        unchanged()
-        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            child = open_directory(descriptor, name, identity(info))
-            try:
-                remove_contents(child)
-                unchanged()
-                os.rmdir(name, dir_fd=descriptor)
-            finally:
-                chain.pop()
-                held.pop()
-                os.close(child)
-        else:
-            os.unlink(name, dir_fd=descriptor)
-
-try:
-    relative = os.path.relpath(path, base).split('/')
-    require(len(relative) == 2 and all(part not in ('', '.', '..') for part in relative))
-    require(not relative[0].startswith('source-content-'))
-    # The registry claim and process snapshots name this physical candidate.
-    # A base alias changing away and back must not authorize a different tree.
-    require(claimed == os.path.join(witness['canonical_base'], *relative))
-    require(os.path.realpath(base) == witness['canonical_base'])
-    base_fd = os.open(witness['canonical_base'], flags)
-    held.append(base_fd)
-    require(identity(os.fstat(base_fd)) == witness['base'])
-    parent = open_directory(base_fd, relative[0], witness['parent'])
-    tree = open_directory(parent, relative[1], witness['tree'])
-    require(os.fstat(tree).st_uid == os.geteuid())
-    unchanged()
-    if mode == 'preview':
-        print('ready')
-    else:
-        require(mode == 'apply')
-        digest = hashlib.sha256(b'rch-staging-metadata-v1\0')
-        newest = observe(tree, b'', digest)
-        require(digest.hexdigest() == witness['metadata_digest'])
-        unchanged()
-        if time.time_ns() - newest < minimum:
-            print('recent')
-        else:
-            remove_contents(tree)
-            unchanged()
-            os.rmdir(relative[1], dir_fd=parent)
-            os.fsync(parent)
-            print('removed')
-except (Changed, FileNotFoundError, NotADirectoryError):
-    print('changed')
-except Exception:
-    print('unavailable')
-finally:
-    for descriptor in reversed(held):
-        os.close(descriptor)
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -925,10 +808,21 @@ mod tests {
         std::fs::create_dir(tree_dir.join("a")).unwrap();
         std::fs::write(tree_dir.join("a/child"), b"nested").unwrap();
         std::fs::write(tree_dir.join("a."), b"prefix sibling").unwrap();
+        use std::os::unix::ffi::OsStringExt as _;
+        std::fs::write(
+            tree_dir.join(std::ffi::OsString::from_vec(b"opaque-\xff".to_vec())),
+            b"non-UTF8 filename",
+        )
+        .unwrap();
         let outside = root.join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("retained"), b"outside the proposal").unwrap();
         std::os::unix::fs::symlink(&outside, tree_dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            tree_dir.join(std::ffi::OsString::from_vec(b"opaque-link-\xff".to_vec())),
+        )
+        .unwrap();
         let mut plan = proposed(&base);
         plan = inspect_staging_gc_plan_with_registry(plan, &base, registry.to_str().unwrap());
         assert_eq!(
@@ -985,6 +879,31 @@ mod tests {
             .unwrap();
         eprintln!("Retained cache-clean fixture: {}", path.display());
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn future_modified_input_is_retained_even_with_zero_minimum_age() {
+        let root = retained_fixture("staging-gc-future-");
+        let base = root.join("staging");
+        let registry = root.join("claims");
+        let tree = base.join("project/hash");
+        std::fs::create_dir_all(&tree).unwrap();
+        let input = tree.join("future");
+        std::fs::write(&input, b"not old enough").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(86_400))
+            .unwrap();
+        let plan = proposed(&base);
+        assert_eq!(plan.entries[0].action, GcAction::Prune);
+        assert_eq!(
+            inspect_or_collect(&plan.entries[0], &base, registry.to_str().unwrap(), true),
+            "recent"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), b"not old enough");
     }
 
     #[cfg(target_os = "linux")]
@@ -1156,16 +1075,23 @@ mod tests {
         // Model the exact boundary after a configured base alias changed to
         // another tree during source admission, then changed back. Every
         // witnessed inode is still valid, but the acquired claim is foreign.
-        let result = std::process::Command::new("python3")
-            .args(["-I", "-S", "-c", STAGING_TREE_OPERATION])
+        let script = format!(
+            "{}\nrch_wkr_locate || exit 73\nexec \"$RCH_WKR\" staging-gc --protocol v1 \"$@\"",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+        );
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", &script, "rch-staging-operation-test"])
             .arg(&tree)
             .arg(&base)
             .arg("apply")
             .arg(witness)
             .arg("0")
-            .arg(&other)
-            .output()
-            .unwrap();
+            .arg(&other);
+        if let Some(worker) = option_env!("CARGO_BIN_EXE_rch-wkr") {
+            command.env("RCH_WKR_BIN", worker);
+        }
+        let result = command.output().unwrap();
         assert!(result.status.success(), "{result:?}");
         assert_eq!(result.stdout, b"changed\n");
         for candidate in [&tree, &other] {

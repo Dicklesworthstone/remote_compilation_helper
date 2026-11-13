@@ -20,6 +20,10 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
+mod master_guardian;
+pub use master_guardian::run_ssh_master_guardian_if_requested;
+use master_guardian::{SshChild, SshControlDir};
+
 // Re-export platform-independent utilities for backwards compatibility
 pub use crate::ssh_utils::{
     CommandResult, EnvPrefix, build_env_prefix, is_retryable_transport_error,
@@ -126,6 +130,7 @@ struct SshProcessState {
     draining: bool,
     stopping: bool,
     outcome: Option<std::result::Result<ExitStatus, String>>,
+    diagnostic: String,
 }
 
 /// Run one command and wait for its entire descendant tree on Linux.
@@ -348,6 +353,9 @@ impl Drop for OwnedProcessGroup {
 /// returned as successful output. The local child and its process group remain
 /// owned until both pipes drain and the child is reaped. A pipe-holding descendant
 /// therefore expires the operation even if its leader already exited.
+/// A peer which closes its input early can still return a complete refusal:
+/// BrokenPipe preserves that non-success status and its bounded diagnostics.
+/// An incomplete upload can never authorize a successful response.
 ///
 /// SSH callers must configure a foreground transport before calling this helper.
 /// Local transport cleanup does not establish that a remote workload has stopped.
@@ -516,14 +524,20 @@ async fn capture_control_output_with_ownership(
             if let Some(input) = input {
                 let mut stdin = stdin
                     .ok_or_else(|| std::io::Error::other("control command stdin pipe missing"))?;
-                stdin.write_all(input).await?;
+                let written = stdin.write_all(input).await;
                 // Close stdin after the finite program, allowing the peer to
-                // finish parsing it while output collection continues.
+                // finish parsing it while output collection continues. Close
+                // it on refusal too; only BrokenPipe is deferred until status.
                 drop(stdin);
+                return match written {
+                    Ok(()) => Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(Some(error)),
+                    Err(error) => Err(error),
+                };
             }
-            Ok::<_, std::io::Error>(())
+            Ok::<_, std::io::Error>(None)
         };
-        let ((), stdout, stderr) = tokio::try_join!(
+        let (upload_error, stdout, stderr) = tokio::try_join!(
             upload,
             read_control_stream(stdout, "stdout", stdout_buffer),
             read_control_stream(stderr, "stderr", stderr_buffer),
@@ -532,6 +546,11 @@ async fn capture_control_output_with_ownership(
         // group members there. Locally forcing EOF must never turn partial
         // evidence into success; supervised callers verify their own receipt.
         let status = process.wait().await?;
+        if status.success()
+            && let Some(error) = upload_error
+        {
+            return Err(error);
+        }
         Ok(std::process::Output {
             status,
             stdout,
@@ -584,6 +603,51 @@ async fn read_control_stream(
         std::io::ErrorKind::InvalidData,
         format!("control command {stream} exceeds {limit}-byte limit"),
     ))
+}
+
+/// Retain a bounded diagnostic preview while draining the real stream to EOF.
+/// The caller owns the execution deadline. Reaching the preview limit must not
+/// close a command's pipe early or turn a partial response into complete output.
+async fn read_command_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<String> {
+    const MARKER: &str = "\n...[output truncated]...\n";
+    let prefix_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid SSH output limit")
+        })?;
+    // One extra byte distinguishes a complete, exactly-full response from an
+    // actual overflow. No later output is retained in memory.
+    let mut prefix = reader.take(prefix_limit);
+    let mut output = Vec::new();
+    prefix.read_to_end(&mut output).await?;
+    let truncated = output.len() > limit;
+    let mut remainder = prefix.into_inner();
+    let mut sink = tokio::io::sink();
+    tokio::io::copy(&mut remainder, &mut sink).await?;
+    output.truncate(limit);
+    if let Err(error) = std::str::from_utf8(&output) {
+        // A byte limit may cut a valid multibyte character. Only that trailing
+        // incomplete character may be discarded, and only on real overflow.
+        if !truncated || error.error_len().is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        output.truncate(error.valid_up_to());
+    }
+    if truncated {
+        let marker = &MARKER.as_bytes()[..MARKER.len().min(limit)];
+        let available = &output[..output.len().min(limit - marker.len())];
+        // The marker supplies a newline, so never append it to a cut control
+        // receipt. As with streaming OutputPreview, retain only whole lines.
+        let boundary = memchr::memrchr(b'\n', available).map_or(0, |index| index + 1);
+        output.truncate(boundary);
+        output.extend_from_slice(marker);
+    }
+    String::from_utf8(output)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// A bounded UTF-8 line reader whose pending bytes survive a cancelled read.
@@ -710,7 +774,7 @@ struct OwnedSshProcess {
 impl OwnedSshProcess {
     fn spawn(
         command: &mut tokio::process::Command,
-        control_dir: Option<Arc<tempfile::TempDir>>,
+        control_dir: Option<Arc<SshControlDir>>,
         idle_timeout: Option<Duration>,
     ) -> Result<Self> {
         Self::spawn_with_admission(command, control_dir, idle_timeout, None)
@@ -718,7 +782,7 @@ impl OwnedSshProcess {
 
     fn spawn_with_admission(
         command: &mut tokio::process::Command,
-        control_dir: Option<Arc<tempfile::TempDir>>,
+        control_dir: Option<Arc<SshControlDir>>,
         idle_timeout: Option<Duration>,
         admission: Option<PoolWorkerAdmission>,
     ) -> Result<Self> {
@@ -728,13 +792,14 @@ impl OwnedSshProcess {
                 .is_none_or(PoolWorkerAdmission::is_current),
             "SSH worker pool admission was revoked"
         );
-        let mut child = OwnedProcessGroup::spawn(command)?;
+        let mut child = SshChild::spawn(command, control_dir.as_ref())?;
         let (state, mut changes) = watch::channel(SshProcessState {
             active_commands: 0,
             idle_since: Instant::now(),
             draining: false,
             stopping: false,
             outcome: None,
+            diagnostic: String::new(),
         });
         let updates = state.clone();
         let supervisor = tokio::spawn(async move {
@@ -787,6 +852,7 @@ impl OwnedSshProcess {
             };
             updates.send_modify(|state| {
                 state.stopping = true;
+                state.diagnostic = child.diagnostic().to_owned();
                 state.outcome = Some(outcome.map_err(|error| error.to_string()));
             });
         });
@@ -889,7 +955,7 @@ struct OwnedSshSession {
     // exit` in Drop. Our foreground process supervisor performs that cleanup.
     session: Session,
     process: OwnedSshProcess,
-    _control_dir: Arc<tempfile::TempDir>,
+    _control_dir: Arc<SshControlDir>,
     can_disable_background: bool,
 }
 
@@ -905,7 +971,7 @@ pub struct OwnedSshTransport {
     socket: PathBuf,
     can_disable_background: bool,
     activity: SshProcessUse,
-    _control_dir: Arc<tempfile::TempDir>,
+    _control_dir: Arc<SshControlDir>,
     pool_admission: Option<PoolWorkerAdmission>,
 }
 
@@ -1265,24 +1331,6 @@ impl SshClient {
             Instant::now() < deadline,
             "SSH connection timed out before spawn"
         );
-        let directory = control_directory
-            .map(Path::to_path_buf)
-            .unwrap_or_else(ssh_control_directory);
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .context("Failed to protect SSH control directory")?;
-        }
-        let control_dir = Arc::new(
-            tempfile::Builder::new()
-                .prefix("rch-")
-                .tempdir_in(directory)
-                .context("Failed to create private SSH control directory")?,
-        );
-        let socket = control_dir.path().join("master");
-        let log = control_dir.path().join("log");
         let idle_timeout =
             match control_persist_mode(control_master, self.options.control_persist_idle) {
                 ControlPersistMode::IdleFor(seconds) => {
@@ -1305,6 +1353,30 @@ impl SshClient {
         // a global IgnoreUnknown override would break the user's own list.
         let can_disable_background =
             ssh_can_disable_background_before(ssh_program, deadline).await?;
+        ensure_ssh_deadline(Some(deadline))?;
+        // Probe before creating a per-connection directory: a stalled client
+        // capability check must not leave empty directories if the owner dies.
+        let directory = control_directory
+            .map(Path::to_path_buf)
+            .unwrap_or_else(ssh_control_directory);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .context("Failed to protect SSH control directory")?;
+        }
+        let control_dir = Arc::new(
+            SshControlDir::new(
+                tempfile::Builder::new()
+                    .prefix("rch-")
+                    .tempdir_in(directory)
+                    .context("Failed to create private SSH control directory")?,
+            )
+            .context("Failed to protect private SSH control directory")?,
+        );
+        let socket = control_dir.path().join("master");
+        let log = control_dir.path().join("log");
         let mut command = self.master_command(
             ssh_program,
             destination,
@@ -1559,41 +1631,16 @@ impl SshClient {
             let stderr_handle = child.stderr().take();
 
             let stdout_fut = async {
-                if let Some(out) = stdout_handle {
-                    let reader = BufReader::new(out);
-                    let mut take = reader.take(MAX_OUTPUT_SIZE);
-                    let mut buf = String::new();
-                    take.read_to_string(&mut buf).await?;
-                    // Drain the rest to prevent SIGPIPE or blocking
-                    let mut reader = take.into_inner();
-                    let mut sink = tokio::io::sink();
-                    tokio::io::copy(&mut reader, &mut sink).await?;
-                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
-                        buf.push_str("\n...[output truncated]...\n");
-                    }
-                    Ok::<String, anyhow::Error>(buf)
-                } else {
-                    Ok(String::new())
-                }
+                Ok::<_, anyhow::Error>(match stdout_handle {
+                    Some(out) => read_command_output(out, MAX_OUTPUT_SIZE as usize).await?,
+                    None => String::new(),
+                })
             };
-
             let stderr_fut = async {
-                if let Some(err) = stderr_handle {
-                    let reader = BufReader::new(err);
-                    let mut take = reader.take(MAX_OUTPUT_SIZE);
-                    let mut buf = String::new();
-                    take.read_to_string(&mut buf).await?;
-                    // Drain the rest to prevent SIGPIPE or blocking
-                    let mut reader = take.into_inner();
-                    let mut sink = tokio::io::sink();
-                    tokio::io::copy(&mut reader, &mut sink).await?;
-                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
-                        buf.push_str("\n...[output truncated]...\n");
-                    }
-                    Ok::<String, anyhow::Error>(buf)
-                } else {
-                    Ok(String::new())
-                }
+                Ok::<_, anyhow::Error>(match stderr_handle {
+                    Some(err) => read_command_output(err, MAX_OUTPUT_SIZE as usize).await?,
+                    None => String::new(),
+                })
             };
 
             let (stdout, stderr) = tokio::try_join!(stdout_fut, stderr_fut)?;
@@ -1889,7 +1936,12 @@ async fn wait_for_ssh_master(
         let outcome = process.state.borrow().outcome.clone();
         if let Some(outcome) = outcome {
             let status = outcome.map_err(anyhow::Error::msg)?;
-            let diagnostic = ssh_connect_diagnostic(log);
+            let retained = process.state.borrow().diagnostic.clone();
+            let diagnostic = if retained.is_empty() {
+                ssh_connect_diagnostic(log)
+            } else {
+                retained
+            };
             anyhow::bail!("SSH master exited before becoming ready ({status}): {diagnostic}");
         }
         anyhow::ensure!(
@@ -2151,7 +2203,6 @@ async fn system_ssh_execute_before(
     caller_deadline: Option<Instant>,
 ) -> Result<CommandResult> {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let start = std::time::Instant::now();
@@ -2211,20 +2262,16 @@ async fn system_ssh_execute_before(
         };
 
         let stdout_fut = async {
-            let mut buf = String::new();
-            if let Some(out) = stdout {
-                let mut handle = out.take(MAX_OUTPUT_SIZE);
-                handle.read_to_string(&mut buf).await?;
-            }
-            Ok::<String, anyhow::Error>(buf)
+            Ok::<_, anyhow::Error>(match stdout {
+                Some(out) => read_command_output(out, MAX_OUTPUT_SIZE as usize).await?,
+                None => String::new(),
+            })
         };
         let stderr_fut = async {
-            let mut buf = String::new();
-            if let Some(err) = stderr {
-                let mut handle = err.take(MAX_OUTPUT_SIZE);
-                handle.read_to_string(&mut buf).await?;
-            }
-            Ok::<String, anyhow::Error>(buf)
+            Ok::<_, anyhow::Error>(match stderr {
+                Some(err) => read_command_output(err, MAX_OUTPUT_SIZE as usize).await?,
+                None => String::new(),
+            })
         };
 
         let ((), stdout, stderr) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
@@ -3487,6 +3534,106 @@ while True: signal.pause()
             }
         }
     }
+    #[tokio::test]
+    async fn command_output_preserves_complete_bytes_and_reports_real_overflow() {
+        const MARKER: &str = "\n...[output truncated]...\n";
+        for text in [String::new(), "complete\n".to_string(), "x".repeat(64)] {
+            assert_eq!(
+                read_command_output(text.as_bytes(), 64).await.unwrap(),
+                text,
+                "a complete response, including the exact limit, is not truncated"
+            );
+        }
+        for text in [
+            format!("ok\n{}", "x".repeat(100)),
+            format!("ok\n{}", "€".repeat(25)),
+        ] {
+            let output = read_command_output(text.as_bytes(), 64).await.unwrap();
+            assert_eq!(output, format!("ok\n{MARKER}"));
+            assert!(output.len() <= 64);
+        }
+        let malformed = read_command_output(b"bad\xff\n".as_slice(), 64)
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.kind(), std::io::ErrorKind::InvalidData);
+        let mut malformed_overflow = b"bad\xff\n".to_vec();
+        malformed_overflow.extend_from_slice(&[b'x'; 100]);
+        assert_eq!(
+            read_command_output(malformed_overflow.as_slice(), 64)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+            "truncating a preview must not hide invalid captured UTF-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_output_requires_eof_after_preview_limit() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        writer.write_all(&[b'x'; 129]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), read_command_output(reader, 64),)
+                .await
+                .is_err(),
+            "a full preview is not EOF while a writer still owns its pipe"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn command_output_drains_real_stdout_and_stderr_before_waiting() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let finished = directory.join("finished");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"set -eu
+i=0
+while [ "$i" -lt 16384 ]; do
+    printf 'stdout payload 01234567890123456789012345678901234567890123456789\n'
+    printf 'stderr payload 01234567890123456789012345678901234567890123456789\n' >&2
+    i=$((i + 1))
+done
+printf 'complete\n' > "$1"
+exit 37
+"#,
+                "rch-output-fixture",
+            ])
+            .arg(&finished)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = OwnedProcessGroup::spawn(&mut command).unwrap();
+        let stdout = child.take_stdout().unwrap();
+        let stderr = child.take_stderr().unwrap();
+        let (stdout, stderr, status) = tokio::time::timeout(Duration::from_secs(10), async {
+            let (stdout, stderr) = tokio::try_join!(
+                read_command_output(stdout, 128),
+                read_command_output(stderr, 128),
+            )?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((stdout, stderr, status))
+        })
+        .await
+        .expect("both over-limit native pipes must drain without deadlock")
+        .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(37),
+            "preserve the command's actual exit"
+        );
+        assert_eq!(std::fs::read(&finished).unwrap(), b"complete\n");
+        for (output, prefix) in [(stdout, "stdout payload"), (stderr, "stderr payload")] {
+            assert!(output.starts_with(prefix));
+            assert!(output.ends_with("\n...[output truncated]...\n"));
+            assert!(output.len() <= 128);
+        }
+    }
+
     #[test]
     fn test_command_result_success() {
         let _guard = test_guard!();
@@ -5159,7 +5306,9 @@ exec sleep 30
         let socket = transport.socket.clone();
         client.disconnect().await.unwrap();
         assert!(transport.arguments().is_err());
-        assert!(socket.parent().unwrap().is_dir());
+        // A stale transport cannot retain the stopped master's private
+        // directory: the guardian retires it before disconnect completes.
+        assert!(!socket.parent().unwrap().exists());
         drop(transport);
         assert!(!socket.parent().unwrap().exists());
         fake.assert_reaped().await;
@@ -5328,8 +5477,18 @@ exec sleep 30
             let directory = fake.directory.path().to_owned();
             let connecting =
                 tokio::spawn(async move { client.connect_using(&program, Some(&directory)).await });
+            fake.wait_for_pid("capability-pids").await;
+            assert!(
+                std::fs::read_dir(fake.directory.path())
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("rch-")),
+                "a stalled capability probe must not create a private control directory"
+            );
             if cancelled {
-                fake.wait_for_pid("capability-pids").await;
                 connecting.abort();
                 assert!(connecting.await.unwrap_err().is_cancelled());
             } else {
@@ -5354,7 +5513,9 @@ exec sleep 30
 
     #[tokio::test]
     async fn foreground_options_preserve_user_ignore_unknown_configuration() {
-        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let directory = Arc::new(
+            SshControlDir::new(tempfile::Builder::new().prefix("rch-").tempdir().unwrap()).unwrap(),
+        );
         let config = directory.path().join("user-config");
         std::fs::write(
             &config,

@@ -2117,6 +2117,10 @@ fn reliability_metrics_requested(cli: &Cli) -> bool {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = rch_common::ssh::run_ssh_master_guardian_if_requested() {
+        std::process::exit(code);
+    }
     // Every agent Bash command runs this binary as a hook. Answer the common
     // pass-through before building the CLI or the runtime (bd-1nhd).
     if hook::try_fast_passthrough() {
@@ -2170,6 +2174,7 @@ async fn async_main() {
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
+        let exit_code = commands::jobs::automatic_recovery_exit_code(&error).unwrap_or(1);
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
         }
@@ -2228,7 +2233,7 @@ async fn async_main() {
         } else {
             let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }
 

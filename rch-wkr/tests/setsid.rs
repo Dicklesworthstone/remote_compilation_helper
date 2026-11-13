@@ -55,3 +55,66 @@ fn exec_failure_is_an_error_not_a_silent_success() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("/nonexistent/rch-test-command"));
 }
+
+#[test]
+fn closed_standard_descriptors_are_restored_after_native_startup() {
+    let owner = tempfile::Builder::new()
+        .prefix("rch-setsid-stdio-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    for mask in 0_u8..=7 {
+        let witness = owner.path().join(format!("descriptors-{mask}"));
+        let script = r#"
+state=0
+( : 3>&0 ) 2>/dev/null && state=$((state | 1))
+( : 3>&1 ) 2>/dev/null && state=$((state | 2))
+( : 3>&2 2>/dev/null ) && state=$((state | 4))
+printf '%s' "$state" > "$1"
+"#;
+        let status = Command::new(env!("CARGO_BIN_EXE_rch-wkr"))
+            .args(["setsid", "--closed-stdio", &mask.to_string(), "--"])
+            .args(["/bin/sh", "-c", script, "rch-fd-witness"])
+            .arg(&witness)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mask {mask}: {status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&witness).unwrap(),
+            (7 ^ mask).to_string(),
+            "native startup reopened a descriptor for mask {mask}"
+        );
+    }
+}
+
+#[test]
+fn darwin_shell_launch_preserves_literal_arguments_and_closed_input() {
+    let owner = tempfile::Builder::new()
+        .prefix("rch-darwin-exec-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let payload = owner.path().join("payload");
+    std::fs::write(
+        &payload,
+        b"if ( : 3>&0 ) 2>/dev/null; then exit 91; fi\nprintf '%s\\n' \"$@\"\n",
+    )
+    .unwrap();
+    // Only OS dispatch is doubled. The sh descriptors, worker executable,
+    // setsid syscall, and final exec all run on the actual test host.
+    let script = format!(
+        "{}\nuname() {{ printf Darwin; }}\nexec 0<&-\nrch_scope_launch_exec /bin/sh \"$1\" 'a b' '\"$()!;*'\n",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+    );
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script, "rch-native-launch"])
+        .arg(payload)
+        .env("RCH_WKR_BIN", env!("CARGO_BIN_EXE_rch-wkr"))
+        .env("RCH_TIMING_SCALE", "1")
+        .env("TOKIO_WORKER_THREADS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"a b\n\"$()!;*\n");
+    assert!(output.stderr.is_empty());
+}

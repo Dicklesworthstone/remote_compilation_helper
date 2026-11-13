@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 use crate::api::is_process_alive;
-use crate::api::{lease_blocks_restart, lease_owns_unretired_source};
+use crate::api::lease_owns_unretired_source;
 use crate::events::EventBus;
 use crate::workers::{OwnedRecoveryPermit, WorkerPool};
 use rch_common::WorkerConfig;
@@ -23,6 +23,9 @@ use rch_common::bypass_record::{AdminDisableStore, AdminNetworkPermit};
 use rch_common::job_identity::{
     DurableJobLease, default_job_lease_directory, local_terminal_settlement_candidate,
     source_recovery_resources_retired,
+};
+use rch_common::job_recovery::{
+    AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE, AUTOMATIC_RECOVERY_PENDING_EXIT_CODE,
 };
 use rch_common::process_identity::{OwnerPresence, owner_presence};
 use rch_common::ssh::{OwnedProcessGroup, ssh_can_disable_background};
@@ -37,13 +40,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 use tokio::task::{Id, JoinSet};
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-/// How often the lease directory is checked for recoverable leases.
-const RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Do not contend with a just-finished wrapper's journal. This is a scheduling
-/// grace only; activity-lock and durable worker receipts authorize settlement.
-const TERMINAL_CANCELLATION_GRACE_MS: u64 = 15 * 60 * 1000;
+/// A dead wrapper can fence every worker for its project even after its slots
+/// have been released. Inspect promptly; ownership evidence, not heartbeat age,
+/// authorizes a recovery attempt. Failed attempts keep their longer backoff.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound both starts per scan interval and total in-flight recovery clients.
 /// A worker gets at most one client, so a stalled worker cannot consume every
 /// lane or serialize independent workers behind its timeout.
@@ -121,7 +123,11 @@ async fn before_recovery_deadline<F: Future>(deadline: Instant, operation: F) ->
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryOutcome {
     Recovered,
-    /// Administrative disable, transport backoff, or an owned recovery flight.
+    /// The worker still owns an execution or its completion raced the probe.
+    /// Keep ownership and retry on the next scan, without failure backoff.
+    SettlementPending,
+    /// Administrative disable, transport backoff, an owned recovery flight,
+    /// or contention for the exact journal's exclusive ownership gate.
     /// Neither establishes lease completion nor counts as a failed recovery.
     Deferred,
 }
@@ -401,7 +407,7 @@ struct RecoveryCandidate {
     heartbeat_unix_ms: u64,
 }
 
-/// Only dead, stale source owners, pending daemon handoffs, or acknowledged
+/// Only dead source owners, pending daemon handoffs, or acknowledged
 /// cancellations lacking worker settlement enter the queue. Unreadable or
 /// noncanonical journals are not execution authority; the separate restart
 /// scan retains its fail-closed treatment of bad evidence.
@@ -425,20 +431,18 @@ fn recoverable_candidates(
         })
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
-            if terminal_cancellation_unsettled(lease) {
-                // lease_blocks_restart deliberately ignores terminal leases.
-                // Recovery must still exclude live or unverified wrappers.
-                return presence(lease) == OwnerPresence::Absent
-                    && lease.heartbeat_unix_ms > 0
-                    && (lease.heartbeat_unix_ms > now_unix_ms
-                        || now_unix_ms.saturating_sub(lease.heartbeat_unix_ms)
-                            >= TERMINAL_CANCELLATION_GRACE_MS);
-            }
-            !lease.terminal_acknowledged
-                && (lease_owns_unretired_source(lease)
-                    || retired_delivery(lease).is_some()
-                    || abandoned_without_recovery(lease, now_unix_ms))
-                && !lease_blocks_restart(lease, now_unix_ms, || presence(lease))
+            let unfinished = terminal_cancellation_unsettled(lease)
+                || (!lease.terminal_acknowledged
+                    && (lease_owns_unretired_source(lease)
+                        || retired_delivery(lease).is_some()
+                        || abandoned_without_recovery(lease, now_unix_ms)));
+            // A recent heartbeat cannot keep a provably dead owner alive.
+            // Reusing the restart barrier's fifteen-minute grace stranded
+            // execute/finalize leases after wrapper death or a build deadline
+            // (GH #134). Recovery still claims the journal's exclusive gate
+            // and confirms exact worker/daemon receipts before releasing any
+            // source fence; merely scheduling it changes no durable evidence.
+            unfinished && presence(lease) == OwnerPresence::Absent
         })
         .filter_map(|lease| {
             Some(RecoveryCandidate {
@@ -499,17 +503,26 @@ struct RecoveryQueue {
     running: HashMap<Id, RecoveryCandidate>,
     tasks: JoinSet<Result<RecoveryOutcome, String>>,
     backoff: Backoff,
+    last_started: HashMap<String, Instant>,
     starts_remaining: usize,
 }
 
 impl RecoveryQueue {
-    fn refresh(&mut self, candidates: Vec<RecoveryCandidate>) {
+    fn refresh(&mut self, mut candidates: Vec<RecoveryCandidate>) {
         let ids: Vec<String> = candidates
             .iter()
             .chain(self.running.values())
             .map(|candidate| candidate.wrapper_id.clone())
             .collect();
         self.backoff.retain(&ids);
+        let retained: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.last_started
+            .retain(|id, _| retained.contains(id.as_str()));
+        // Pending executions do not fail, so they have no retry backoff. Give
+        // unattempted and least-recently attempted leases the next turn rather
+        // than letting the oldest four consume every scan indefinitely.
+        // Stable sorting preserves journal age order for equal priorities.
+        candidates.sort_by_key(|candidate| self.last_started.get(&candidate.wrapper_id).copied());
         self.pending = candidates.into();
         self.starts_remaining = MAX_RECOVERIES_PER_CYCLE;
     }
@@ -554,6 +567,7 @@ impl RecoveryQueue {
                 .remove(next)
                 .expect("selected pending recovery");
             let task = self.tasks.spawn(run(candidate.clone()));
+            self.last_started.insert(candidate.wrapper_id.clone(), now);
             self.running.insert(task.id(), candidate);
             self.starts_remaining -= 1;
         }
@@ -577,9 +591,18 @@ impl RecoveryQueue {
                 .record_failure(&candidate.wrapper_id, Instant::now());
         } else if outcome == Ok(RecoveryOutcome::Recovered) {
             self.backoff.failures.remove(&candidate.wrapper_id);
+            self.last_started.remove(&candidate.wrapper_id);
         }
         Some((candidate, outcome))
     }
+}
+
+fn recovery_scan_interval() -> tokio::time::Interval {
+    // The first tick is immediate: a daemon restart must not introduce a new
+    // grace window for leases whose recorded owner is already gone.
+    let mut ticker = tokio::time::interval(RECOVERY_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
 }
 
 /// Start the recovery loop. `socket` is this daemon's socket; the child
@@ -599,9 +622,7 @@ pub(crate) fn start(
             }
         };
         let mut queue = RecoveryQueue::default();
-        let mut ticker =
-            tokio::time::interval_at(Instant::now() + RECOVERY_INTERVAL, RECOVERY_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = recovery_scan_interval();
         loop {
             tokio::select! {
                 completed = queue.next_completed(), if !queue.running.is_empty() => {
@@ -613,6 +634,9 @@ pub(crate) fn start(
                                 events.emit("lease_auto_recovered", &serde_json::json!({
                                     "wrapper_id": id,
                                 }));
+                            }
+                            Ok(RecoveryOutcome::SettlementPending) => {
+                                debug!(wrapper_id = %id, "Worker settlement pending; retaining lease ownership until the next scan");
                             }
                             Ok(RecoveryOutcome::Deferred) => {}
                             Err(error) => {
@@ -793,7 +817,7 @@ async fn recover_before(
             Err("automatic lease recovery exceeded its total deadline".into())
         }
         None => Ok(RecoveryOutcome::Deferred),
-        Some(result) => result.map(|()| RecoveryOutcome::Recovered),
+        Some(result) => result,
     }
 }
 
@@ -867,6 +891,7 @@ async fn recover_in(
         RecoveryWindow::new(rch_common::timing::configured())?,
     )
     .await
+    .map(|_| ())
 }
 
 async fn recover_in_with_policy(
@@ -877,7 +902,7 @@ async fn recover_in_with_policy(
     candidate: Option<&RecoveryCandidate>,
     policy: RecoveryClientPolicy,
     window: RecoveryWindow,
-) -> Result<(), String> {
+) -> Result<RecoveryOutcome, String> {
     window.remaining()?;
     let before = read_lease(lease_dir, wrapper_id)?;
     check_candidate(&before, wrapper_id, candidate)?;
@@ -924,9 +949,25 @@ async fn recover_in_with_policy(
         .map_err(|error| format!("cannot run {}: {error}", rch.display()))?;
     let (status, stderr) = collect_recovery_child(child, window.deadline).await?;
     window.remaining()?;
+    if automatic_ssh.is_some() && status.code() == Some(AUTOMATIC_RECOVERY_PENDING_EXIT_CODE) {
+        // This status never confirms completion, releases a reservation, or
+        // retires a source fence. Only the exact journal check below can do so.
+        return Ok(RecoveryOutcome::SettlementPending);
+    }
+    if automatic_ssh.is_some() && status.code() == Some(AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE) {
+        // Another handle owns the journal gate. Do not turn momentary local
+        // contention into ten minutes of failure backoff, or infer anything
+        // about the worker from an attempt that could not claim the journal.
+        debug!(
+            wrapper_id,
+            "Job journal is busy; deferring automatic recovery until the next scan"
+        );
+        return Ok(RecoveryOutcome::Deferred);
+    }
     if status.success() {
         let after = read_lease(lease_dir, wrapper_id)?;
-        return confirm_recovery_before(&before, &after, window);
+        return confirm_recovery_before(&before, &after, window)
+            .map(|()| RecoveryOutcome::Recovered);
     }
     Err(format!("{status}: {}", diagnostic_tail(&stderr)))
 }
@@ -1028,6 +1069,20 @@ mod tests {
 
     fn test_recovery_window() -> RecoveryWindow {
         RecoveryWindow::new(TimingScale::default()).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_scan_runs_immediately_and_skips_missed_ticks() {
+        let started = Instant::now();
+        let mut ticker = recovery_scan_interval();
+        assert_eq!(ticker.tick().await, started);
+        assert_eq!(Instant::now(), started, "startup must not delay recovery");
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(30));
+
+        // A stalled scan must not replay a burst of missed admission budgets.
+        tokio::time::advance(Duration::from_secs(95)).await;
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(60));
+        assert_eq!(ticker.tick().await, started + Duration::from_secs(150));
     }
 
     /// A fake `rch` for recovery: a hard link to one shim written once per
@@ -2352,10 +2407,12 @@ mod tests {
         }
 
         // A zero-status client without new settlement/acknowledgement evidence
-        // is a failed recovery. Repeated five-minute scans must back off, keep
-        // every durable reservation, and eventually inspect all nine wrappers.
+        // is a failed recovery. Scans over the same 45-minute retry window
+        // must back off, keep every durable reservation, and eventually
+        // inspect all nine wrappers even with the shorter polling interval.
         let mut queue = RecoveryQueue::default();
-        for _ in 0..9 {
+        let retry_window_end = Instant::now() + Duration::from_secs(45 * 60);
+        while Instant::now() < retry_window_end {
             queue.refresh(scan());
             queue.start_ready(Instant::now(), |job| {
                 let before = read_lease(directory.path(), &job.wrapper_id).unwrap();
@@ -2715,7 +2772,9 @@ mod tests {
                 queue.backoff.failures[&candidate.wrapper_id],
                 original_backoff
             );
-            tokio::time::advance(RECOVERY_INTERVAL).await;
+            // Preserve coverage of an hour-long outage independently of the
+            // shorter automatic recovery polling interval.
+            tokio::time::advance(Duration::from_secs(5 * 60)).await;
         }
         let (_, healthy_peer) =
             owned_recovery_fixture(directory.path(), &recovery_worker("healthy-peer"));
@@ -2847,7 +2906,7 @@ mod tests {
                     previous_backoff
                 );
                 if scan < 2 {
-                    tokio::time::advance(RECOVERY_INTERVAL).await;
+                    tokio::time::advance(Duration::from_secs(5 * 60)).await;
                 }
             }
 
@@ -3454,6 +3513,167 @@ mod tests {
         assert!(queue.running.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retryable_recovery_outcomes_wait_for_next_scan_without_failure_backoff() {
+        for retryable in [
+            RecoveryOutcome::SettlementPending,
+            RecoveryOutcome::Deferred,
+        ] {
+            let job = candidate("pending-recovery", "worker");
+            let mut queue = RecoveryQueue::default();
+            queue
+                .backoff
+                .record_failure(&job.wrapper_id, Instant::now());
+            let previous_failure = queue.backoff.failures[&job.wrapper_id];
+            tokio::time::advance(BACKOFF_BASE).await;
+
+            for _ in 0..3 {
+                queue.refresh(vec![job.clone()]);
+                queue.start_ready_if(
+                    Instant::now(),
+                    |_| true,
+                    move |_| async move { Ok(retryable) },
+                );
+                assert_eq!(queue.running.len(), 1);
+                assert_eq!(queue.next_completed().await.unwrap().1, Ok(retryable));
+                assert_eq!(queue.backoff.failures[&job.wrapper_id], previous_failure);
+                queue.start_ready_if(
+                    Instant::now(),
+                    |_| true,
+                    |_| async { panic!("deferred recovery must wait for another scan") },
+                );
+                assert!(queue.running.is_empty());
+                assert!(queue.pending.is_empty());
+                tokio::time::advance(RECOVERY_INTERVAL).await;
+            }
+
+            queue.refresh(vec![job.clone()]);
+            queue.start_ready(Instant::now(), |_| async { Err("transport failed".into()) });
+            assert!(queue.next_completed().await.unwrap().1.is_err());
+            assert_eq!(queue.backoff.failures[&job.wrapper_id].0, 2);
+            tokio::time::advance(RECOVERY_INTERVAL).await;
+            queue.refresh(vec![job]);
+            queue.start_ready(Instant::now(), |_| async {
+                panic!("a genuine failure must retain exponential backoff")
+            });
+            assert!(queue.running.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_recoveries_cannot_starve_unattempted_leases_on_the_same_worker() {
+        let candidates: Vec<_> = (0..2 * MAX_RECOVERIES_PER_CYCLE + 1)
+            .map(|index| candidate(&format!("job-{index}"), "same-worker"))
+            .collect();
+        let expected: Vec<_> = candidates
+            .iter()
+            .map(|job| job.wrapper_id.clone())
+            .collect();
+        for retryable in [
+            RecoveryOutcome::SettlementPending,
+            RecoveryOutcome::Deferred,
+        ] {
+            let mut queue = RecoveryQueue::default();
+            let mut attempted = Vec::new();
+            for _ in 0..3 {
+                queue.refresh(candidates.clone());
+                for _ in 0..MAX_RECOVERIES_PER_CYCLE {
+                    queue.start_ready_if(
+                        Instant::now(),
+                        |_| true,
+                        move |_| async move { Ok(retryable) },
+                    );
+                    assert_eq!(queue.running.len(), 1, "one recovery per worker");
+                    let (job, outcome) = queue.next_completed().await.unwrap();
+                    assert_eq!(outcome, Ok(retryable));
+                    attempted.push(job.wrapper_id);
+                }
+                queue.start_ready_if(
+                    Instant::now(),
+                    |_| true,
+                    |_| async { panic!("deferred recovery bypassed the per-scan budget") },
+                );
+                assert!(queue.running.is_empty());
+                assert!(queue.backoff.failures.is_empty());
+                tokio::time::advance(RECOVERY_INTERVAL).await;
+            }
+            assert_eq!(&attempted[..expected.len()], expected.as_slice());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_retryable_exits_retain_ownership_and_do_not_confirm_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = recovery_worker("pending-client");
+        let (owned, candidate) = owned_recovery_fixture(directory.path(), &endpoint);
+        let socket = directory.path().join("unused.sock");
+        for (exit_code, expected) in [
+            (
+                AUTOMATIC_RECOVERY_PENDING_EXIT_CODE,
+                RecoveryOutcome::SettlementPending,
+            ),
+            (
+                AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE,
+                RecoveryOutcome::Deferred,
+            ),
+        ] {
+            let child = fake_rch(directory.path(), &format!("exit {exit_code}\n"));
+            let outcome = recover_in_with_policy(
+                &child,
+                &socket,
+                directory.path(),
+                &candidate.wrapper_id,
+                Some(&candidate),
+                RecoveryClientPolicy::Network {
+                    can_disable_background: false,
+                },
+                test_recovery_window(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+                owned
+            );
+            assert!(verify_recovery_completion(&owned, &owned).is_err());
+            assert!(
+                recover_in(
+                    &child,
+                    &socket,
+                    directory.path(),
+                    &candidate.wrapper_id,
+                    Some(&candidate)
+                )
+                .await
+                .is_err(),
+                "retryable exit codes are reserved for the managed protocol"
+            );
+        }
+
+        let child = fake_rch(directory.path(), "echo 'job journal is busy' >&2\nexit 1\n");
+        assert!(
+            recover_in_with_policy(
+                &child,
+                &socket,
+                directory.path(),
+                &candidate.wrapper_id,
+                Some(&candidate),
+                RecoveryClientPolicy::Network {
+                    can_disable_background: false
+                },
+                test_recovery_window(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            read_lease(directory.path(), &candidate.wrapper_id).unwrap(),
+            owned
+        );
+    }
+
     #[tokio::test]
     async fn recovery_stderr_drains_beyond_capacity_and_keeps_only_the_tail() {
         use tokio::io::AsyncWriteExt as _;
@@ -3600,7 +3820,7 @@ mod tests {
     }
 
     #[test]
-    fn only_dead_stale_unacknowledged_source_owners_are_recoverable() {
+    fn only_provably_dead_unacknowledged_source_owners_are_recoverable() {
         let dir = tempfile::tempdir().unwrap();
         let now = 100 * 60 * 60 * 1000;
         let stale = now - 60 * 60 * 1000;
@@ -3629,7 +3849,13 @@ mod tests {
 
         let ids = recoverable_lease_ids(dir.path(), now, |pid| pid == live);
 
-        assert_eq!(ids, vec![leases[0].1.identity.local_wrapper_id.clone()]);
+        assert_eq!(
+            ids,
+            vec![
+                leases[0].1.identity.local_wrapper_id.clone(),
+                leases[2].1.identity.local_wrapper_id.clone(),
+            ]
+        );
     }
 
     #[test]
@@ -3654,12 +3880,133 @@ mod tests {
         )
         .unwrap();
 
-        for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
-            assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+        for heartbeat in [0, now - 60 * 60 * 1000, now, now + 60 * 60 * 1000] {
+            let mut lease = candidate.clone();
+            lease.heartbeat_unix_ms = heartbeat;
+            std::fs::write(
+                dir.path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(&lease).unwrap(),
+            )
+            .unwrap();
+            for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
+                assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+            }
+            let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
         }
-        let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn freshly_killed_execute_and_finalize_owners_are_queued_without_releasing_evidence() {
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+
+        let directory = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read -r gate"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let ProcessObservation::Present(birth) = observe_process(pid) else {
+            panic!("test wrapper must have a native process birth identity");
+        };
+        let mut journals = Vec::new();
+        let mut expected = Vec::new();
+        for phase in ["execute", "finalize"] {
+            let mut lease = lease(
+                now,
+                pid,
+                serde_json::json!({"source_roots":["/owned/source"],"retired":false}),
+            );
+            lease.phase = phase.into();
+            lease.process_birth = Some(birth.clone());
+            let path = directory
+                .path()
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            expected.push(lease.identity.local_wrapper_id);
+            journals.push((path, bytes));
+        }
+        let scan = || {
+            recoverable_candidates(directory.path(), now, |lease| {
+                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+            })
+        };
+        assert!(scan().is_empty(), "the live wrapper still owns both leases");
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        assert_eq!(owner_presence(pid, Some(&birth)), OwnerPresence::Absent);
+
+        expected.sort();
+        assert_eq!(
+            scan()
+                .into_iter()
+                .map(|candidate| candidate.wrapper_id)
+                .collect::<Vec<_>>(),
+            expected,
+            "a fresh heartbeat must not defer a provably dead execute/finalize owner"
+        );
+        for (path, bytes) in journals {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fresh_heartbeat_does_not_hide_recycled_wrapper_identity() {
+        use rch_common::process_identity::{ProcessStart, current_process_identity};
+
+        let directory = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let birth = current_process_identity().unwrap();
+        let mut previous_birth = birth.clone();
+        match &mut previous_birth.start {
+            ProcessStart::Linux { ticks } => *ticks = ticks.checked_add(1).unwrap(),
+            ProcessStart::Darwin { seconds, .. } => {
+                *seconds = seconds.checked_add(1).unwrap();
+            }
+        }
+        let mut expected = None;
+        for (identity, presence) in [
+            (Some(birth), OwnerPresence::Live),
+            (None, OwnerPresence::Unknown),
+            (Some(previous_birth), OwnerPresence::Absent),
+        ] {
+            let mut lease = lease(
+                now,
+                std::process::id(),
+                serde_json::json!({"source_roots":["/owned/source"],"retired":false}),
+            );
+            lease.process_birth = identity;
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(&lease).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()),
+                presence
+            );
+            if presence == OwnerPresence::Absent {
+                assert!(expected.is_none());
+                expected = Some(lease.identity.local_wrapper_id);
+            }
+        }
+        let candidates = recoverable_candidates(directory.path(), now, |lease| {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].wrapper_id, expected.unwrap());
     }
 
     #[test]
@@ -3761,6 +4108,7 @@ mod tests {
             interrupted.identity.local_wrapper_id.clone(),
         ];
         expected.sort();
+        expected.push(fresh.identity.local_wrapper_id.clone());
         for _restart in 0..2 {
             let candidates = recoverable_candidates(dir.path(), now, presence);
             assert_eq!(
@@ -4010,7 +4358,10 @@ mod tests {
         }
         assert_eq!(
             recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
-            std::slice::from_ref(&pending.identity.local_wrapper_id)
+            [
+                pending.identity.local_wrapper_id,
+                fresh.identity.local_wrapper_id,
+            ]
         );
     }
 

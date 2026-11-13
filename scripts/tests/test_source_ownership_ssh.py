@@ -35,11 +35,18 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
-HOLDER = (REPO / "rch/src/hook/source_lock_holder.sh").read_text()
+WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
+LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
+HOLDER = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+          + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n"
+          + (REPO / "rch/src/hook/source_lock_holder.sh").read_text())
 CONTROL = (REPO / "rch/src/hook/source_namespace_control.sh").read_text()
 SETTLEMENT = (REPO / "rch/src/hook/source_cancel_settlement.py").read_text()
 SSH_SOURCE = (REPO / "rch/src/hook/ssh.rs").read_text()
-WAITER = SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0]
+WAITER = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+          + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n"
+          + SSH_SOURCE.split('const SOURCE_AUTHORITY_RELEASE_WAITER: &str = r#"', 1)[1].split('"#;', 1)[0])
 PAIR_CUSTODY = SSH_SOURCE.split('const SOURCE_PAIR_CUSTODY: &str = r#"', 1)[1].split('"#;', 1)[0]
 # Decode Rust's existing literal, including escaped-newline continuation. The
 # shell check itself is not a fixture implementation of the ownership rules.
@@ -47,13 +54,14 @@ ACTIVITY_SOURCE = SSH_SOURCE.split('fn source_authority_activity_prefix_for_mode
 ACTIVITY_LITERAL = re.search(r'let check = ("(?:[^"\\]|\\[\s\S])*");', ACTIVITY_SOURCE).group(1)
 ACTIVITY_CHECK = json.loads(re.sub(r'\\\n[ \t]*', '', ACTIVITY_LITERAL))
 TRANSFER_SOURCE = (REPO / "rch/src/transfer.rs").read_text()
-RETENTION = TRANSFER_SOURCE.split("fn remote_tree_retention_program() -> &'static str {", 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 FINITE_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_finite_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 BOUNDED_ACTIVITY = TRANSFER_SOURCE.split('pub(crate) fn source_activity_bounded_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 ARTIFACT_HEADERS = TRANSFER_SOURCE.split('fn artifact_header_probe_script(', 1)[1].split('r#"', 1)[1].split('"#', 1)[0]
 HELPERS_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPERS_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
-TRANSACTION = HELPERS + "\n" + (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
+TRANSACTION = ('if [ "${RCH_WKR_BIN+x}" != x ]; then RCH_WKR_BIN=' + shlex.quote(WORKER)
+               + '; fi; export RCH_WKR_BIN;\n' + LOCATOR + "\n" + HELPERS + "\n"
+               + (REPO / "rch/src/hook/source_claim_registry.sh").read_text())
 SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
 SSH = shutil.which("ssh")
 KEYGEN = shutil.which("ssh-keygen")
@@ -331,17 +339,17 @@ class SourceOwnershipSshTests(unittest.TestCase):
     def fail_sync_after_pending_publication(self, pending):
         tools = self.root / "pending-publication-tools"
         tools.mkdir(mode=0o700)
-        adapter = tools / "python3"
+        adapter = tools / "rch-wkr"
         # Real file writes and atomic publication run. Fail only the next
         # production fsync adapter call after this exact pending file exists;
         # the record's content has already been written and file-synced.
         adapter.write_text(
-            '#!/bin/sh\ncase "${4-}" in *os.fsync*)\n'
+            '#!/bin/sh\nif [ "${1-}" = file-sync ] && [ "${2-}" = sync ]; then\n'
             "  if [ -e " + QUOTE(str(pending)) + " ]; then\n"
             "    printf 'injected post-pending publication sync failure\\n' >&2\n"
-            "    exit 91\n  fi\nesac\nexec " + QUOTE(sys.executable) + ' "$@"\n')
+            "    exit 91\n  fi\nfi\nexec " + QUOTE(WORKER) + ' "$@"\n')
         adapter.chmod(0o700)
-        return "env PATH=" + QUOTE(str(tools)) + ':"$PATH" '
+        return "env RCH_WKR_BIN=" + QUOTE(str(adapter)) + " PATH=" + QUOTE(str(tools)) + ':"$PATH" '
 
     def authority_records(self):
         return {str(path.relative_to(self.root)): (path.stat().st_ino, path.read_bytes())
@@ -381,7 +389,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
         return client
 
     def start_holder(self, idle=2, ready=True, acquire_command=None):
-        waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, "source",
+        waiter = shlex.join(["sh", "-c", WAITER, "rch-source-release", "source",
                              str(self.registry), self.token, self.digest, self.release])
         retirement = shlex.join([FLOCK, "-x", "--", str(self.activity_lock)]) + " " + self.invocation("release")
         terminal = ("set -eu; ready=$1; roots=$(cat <&4); exec 4<&-; "
@@ -490,12 +498,14 @@ class SourceOwnershipSshTests(unittest.TestCase):
             path = "executable-{:04d}-{}".format(number, "x" * 100)
             os.link(seed, self.source / path)
             paths.append(path)
-        payload = json.dumps([str(self.source), None, paths], separators=(",", ":")).encode().hex()
-        return ARTIFACT_HEADERS.replace("{payload}", payload), paths, contents
+        payload = json.dumps([str(self.source), None, paths], separators=(",", ":"))
+        command = ("RCH_WKR_BIN=" + QUOTE(WORKER) + "; export RCH_WKR_BIN;\n"
+                   + ARTIFACT_HEADERS.replace("{locate}", LOCATOR).replace("{payload}", payload))
+        return command, paths, contents
 
     def retention_command(self, identity=None, root=None, retained=None):
         return shlex.join([
-            sys.executable, "-I", "-c", RETENTION, "retain", str(root or self.source),
+            WORKER, "source-retain", "retain", str(root or self.source),
             str(retained or self.retained), identity or self.token, "0"])
 
     def retain_pair_tree(self, **arguments):
@@ -523,7 +533,7 @@ class SourceOwnershipSshTests(unittest.TestCase):
         token = token or self.token
         release = "RCH_SOURCE_PAIR_RELEASE:" + token
         ready_marker = "RCH_SOURCE_PAIR_READY:" + token
-        waiter = shlex.join([sys.executable, "-I", "-S", "-c", WAITER, mode,
+        waiter = shlex.join(["sh", "-c", WAITER, "rch-source-release", mode,
                              str(self.registry), token, str(self.source), release])
         after = ("\nprintf '%s\\n' " + QUOTE(ready_marker) + "\n" + waiter + "\n" +
                  self.pair_program("release", self.source, token) +

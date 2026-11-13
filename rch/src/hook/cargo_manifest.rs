@@ -137,12 +137,27 @@ pub(super) fn manifest_preflight_outcomes(
     package_roots: &[PathBuf],
     policy: &PathTopologyPolicy,
 ) -> anyhow::Result<Vec<(SyncClosurePlanEntry, SyncRootOutcome)>> {
+    let plan: Vec<_> = transfers.iter().map(|(entry, _)| entry.clone()).collect();
+    Ok(manifest_preflight_projection(&plan, package_roots, policy)?
+        .into_iter()
+        .map(|(index, entry)| (entry, transfers[index].1.clone()))
+        .collect())
+}
+
+/// Use the same package authorities before upload and after transfer. The
+/// index identifies the covering transfer, so local source selection never
+/// invents a successful sync outcome or uses a nested package's own filters.
+pub(super) fn manifest_preflight_projection(
+    transfers: &[SyncClosurePlanEntry],
+    package_roots: &[PathBuf],
+    policy: &PathTopologyPolicy,
+) -> anyhow::Result<Vec<(usize, SyncClosurePlanEntry)>> {
     anyhow::ensure!(
         !package_roots.is_empty(),
         "selected Cargo closure has no package roots"
     );
     let mut checks = BTreeMap::new();
-    for (entry, outcome) in transfers {
+    for (index, entry) in transfers.iter().enumerate() {
         // Only a primary *transfer basis* may lack a manifest. All dependency
         // and workspace-metadata entries keep their existing requirements,
         // even when their local manifest has disappeared since planning.
@@ -152,18 +167,19 @@ pub(super) fn manifest_preflight_outcomes(
         {
             checks.insert(
                 (entry.local_root.clone(), entry.mode),
-                (entry.clone(), outcome.clone()),
+                (index, entry.clone()),
             );
         }
     }
     for root in package_roots {
         let root = canonicalize_sync_root_for_plan(root, policy);
-        let (cover, outcome) = transfers
+        let (index, cover) = transfers
             .iter()
-            .filter(|(entry, _)| {
+            .enumerate()
+            .filter(|(_, entry)| {
                 entry.mode == SyncClosureMode::Full && root.starts_with(&entry.local_root)
             })
-            .max_by_key(|(entry, _)| entry.local_root.components().count())
+            .max_by_key(|(_, entry)| entry.local_root.components().count())
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Cargo package {} is not covered by a full source transfer",
@@ -177,10 +193,7 @@ pub(super) fn manifest_preflight_outcomes(
             .to_string_lossy()
             .into_owned();
         entry.local_root = root;
-        checks.insert(
-            (entry.local_root.clone(), entry.mode),
-            (entry, outcome.clone()),
-        );
+        checks.insert((entry.local_root.clone(), entry.mode), (index, entry));
     }
     Ok(checks.into_values().collect())
 }
@@ -456,5 +469,88 @@ mod tests {
             manifest_preflight_outcomes(&[(metadata, SyncRootOutcome::Synced)], &[nested], &policy)
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_selection_preflight_uses_covering_repository_filters() {
+        use super::super::super::dependency_closure::{
+            DependencyPreflightFailure, verify_selected_dependency_inputs,
+        };
+        use crate::transfer::TransferPipeline;
+        use rch_common::TransferConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("manifestless-repository");
+        let member = repo.join("crates/selected");
+        package(&member, "selected", "");
+        std::fs::create_dir_all(member.join("tests")).unwrap();
+        std::fs::write(member.join("tests/ignored.rs"), "#[test] fn fixture() {}\n").unwrap();
+        std::fs::write(
+            repo.join(".rchignore"),
+            "/crates/selected/tests/ignored.rs\n",
+        )
+        .unwrap();
+        // This nested policy is not the policy of the covering transfer.
+        std::fs::write(member.join(".rchignore"), "# nothing excluded here\n").unwrap();
+        let policy = PathTopologyPolicy::new(base.clone(), base);
+        let plan = vec![SyncClosurePlanEntry {
+            local_root: repo.clone(),
+            remote_root: "/worker/owned/repository".into(),
+            project_id: "selected".into(),
+            root_hash: "fixture".into(),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        }];
+        let projection = manifest_preflight_projection(&plan, &[member], &policy).unwrap();
+        assert_eq!(projection.len(), 1);
+        assert_eq!(projection[0].0, 0);
+        assert_eq!(
+            projection[0].1.remote_root,
+            "/worker/owned/repository/crates/selected"
+        );
+        let pipeline = TransferPipeline::new(
+            repo.clone(),
+            "selected".into(),
+            "fixture".into(),
+            TransferConfig::default(),
+        );
+        let failure = verify_selected_dependency_inputs(
+            &WorkerConfig::default(),
+            &plan[0],
+            &[&projection[0].1],
+            &pipeline,
+            None,
+        )
+        .await
+        .expect_err("collapsed package checks must use the repository transfer policy")
+        .downcast::<DependencyPreflightFailure>()
+        .unwrap();
+        let summary = failure.evidence_summary();
+        assert!(
+            summary.contains("crates/selected/tests/ignored.rs"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(repo.join(".rchignore").to_str().unwrap()),
+            "{summary}"
+        );
+        assert!(!summary.contains("repository/Cargo.toml"), "{summary}");
+
+        std::fs::write(
+            repo.join(".rchignore"),
+            "# source entrypoint is now selected\n",
+        )
+        .unwrap();
+        verify_selected_dependency_inputs(
+            &WorkerConfig::default(),
+            &plan[0],
+            &[&projection[0].1],
+            &pipeline,
+            None,
+        )
+        .await
+        .expect("a manifestless transfer basis must not acquire a root Cargo.toml obligation");
     }
 }

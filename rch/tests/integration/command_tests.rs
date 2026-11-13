@@ -136,18 +136,25 @@ mod source_topology_cli {
             std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(
                 base.join("paths.sh"),
-                include_str!("../../src/hook/source_namespace_paths.sh"),
+                rch_common::source_namespace_paths::shell_script(include_str!(
+                    "../../src/hook/source_namespace_paths.sh"
+                )),
             )
             .unwrap();
             std::fs::write(
                 base.join("admission.sh"),
-                include_str!("../../src/hook/source_claim_admission.sh"),
+                format!(
+                    "{}\n{}",
+                    rch_common::wkr_locate::WKR_LOCATE_SHELL,
+                    include_str!("../../src/hook/source_claim_admission.sh"),
+                ),
             )
             .unwrap();
             std::fs::write(
                 base.join("registry.sh"),
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
+                    rch_common::wkr_locate::WKR_LOCATE_SHELL,
                     rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
                     include_str!("../../src/hook/source_claim_registry.sh")
                 ),
@@ -311,6 +318,14 @@ mod source_topology_cli {
                 .env("RCH_STATE_HOME", base.join("state"))
                 .env("XDG_CACHE_HOME", base.join("cache"))
                 .env("RCH_TOPOLOGY_FIXTURE", base)
+                .env(
+                    "RCH_WKR_BIN",
+                    std::env::var_os("RCH_WKR_BIN")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            PathBuf::from(env!("CARGO_BIN_EXE_rch")).with_file_name("rch-wkr")
+                        }),
+                )
                 .env("RCH_DISABLE_CONFIG_CACHE", "1")
                 .env("RCH_NO_UPDATE_CHECK", "1")
                 .env("RCH_QUEUE_WHEN_BUSY", "0")
@@ -718,7 +733,7 @@ if 'RCH_NAMESPACE_SCOPE' not in payload:
     event('unexpected_control_command', 73)
     sys.exit('unexpected fixture SSH control command')
 paths = (base / 'paths.sh').read_text()
-assert 'RCH_SOURCE_TOPOLOGY_INCOMPATIBLE' in payload, 'missing namespace refusal protocol'
+assert 'source-namespace-paths probe' in payload, 'missing native namespace capability check'
 registry = root / 'registry'
 for name in ('', 'released', 'cancelled', 'quarantine'):
     (registry / name).mkdir(parents=True, exist_ok=True)

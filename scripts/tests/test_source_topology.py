@@ -20,6 +20,9 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
+WORKER = os.environ.get("RCH_WKR_BIN", str(REPO / "target/debug/rch-wkr"))
+LOCATOR = (REPO / "rch-common/src/wkr_locate.rs").read_text().split(
+    'pub const WKR_LOCATE_SHELL: &str = r#"', 1)[1].split('"#;', 1)[0]
 REGISTRY = Path(os.environ.get("RCH_TEST_SOURCE_TOPOLOGY_SCRIPT",
                               REPO / "rch/src/hook/source_claim_registry.sh"))
 RETRY = Path(os.environ.get("RCH_TEST_SOURCE_TOPOLOGY_RETRY",
@@ -54,8 +57,8 @@ class SourceTopologyTests(unittest.TestCase):
         self.canonical = self.base / "projects with spaces"
         self.alias = self.base / "dp"
         self.scope = [self.canonical, self.alias]
-        self.script = production_helpers() + "\n" + REGISTRY.read_text(encoding="utf-8")
-        self.env = {**os.environ, "LC_ALL": "C"}
+        self.script = LOCATOR + "\n" + production_helpers() + "\n" + REGISTRY.read_text(encoding="utf-8")
+        self.env = {**os.environ, "LC_ALL": "C", "RCH_WKR_BIN": WORKER}
 
     @staticmethod
     def root_bytes(roots):
@@ -110,18 +113,21 @@ class SourceTopologyTests(unittest.TestCase):
             tool = directory / name
             tool.write_text("#!/bin/sh\n" + body + "\n")
             tool.chmod(0o700)
-        return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+        env = {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+        if "rch-wkr" in tools:
+            env["RCH_WKR_BIN"] = str(directory / "rch-wkr")
+        return env
 
     def barrier_tools(self, program):
         # Topology barriers fsync the resolved root and its parent through the
-        # registry's `python3 -c` adapter, never the sync utility. `program`
+        # native worker adapter, never the sync utility. `program`
         # sees the barrier path as $1 and fails the barrier by exiting nonzero;
         # otherwise the real fsync runs. The utility itself always fails here.
         return self.fault_tools({
-            "python3": ('case "${4-}" in *os.fsync*)\n'
+            "rch-wkr": ('if [ "${1-}" = file-sync ] && [ "${2-}" = sync ]; then\n'
                         "  barrier() {\n" + program + "\n  }\n"
-                        '  barrier "$5" || exit\n'
-                        "esac\nexec " + shlex.quote(sys.executable) + ' "$@"'),
+                        '  barrier "$3" || exit\n'
+                        "fi\nexec " + shlex.quote(self.env["RCH_WKR_BIN"]) + ' "$@"'),
             "sync": "exit 97",
         })
 

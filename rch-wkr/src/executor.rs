@@ -100,6 +100,14 @@ fn strip_leading_env_assignments(command: &str) -> &str {
     }
 }
 
+#[cfg(test)]
+fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
+    prepared::Invocation::parse(command)
+        .filter(prepared::Invocation::is_relocatable)
+        .map(|invocation| invocation.runtime)
+        .unwrap_or_else(|| legacy_runtime_from_command(command))
+}
+
 /// Return true for script names that should have dependencies prepared before
 /// worker execution.
 fn is_test_or_typecheck_script(script: &str) -> bool {
@@ -127,10 +135,32 @@ fn next_package_manager_token<'a>(tokens: &mut impl Iterator<Item = &'a str>) ->
 /// detection is intentionally conservative — only commands that genuinely
 /// need `node_modules/` to be installed map to Bun/Node, so a misclassified
 /// Rust command never accidentally triggers `bun install`.
-fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
-    let after_env = strip_leading_env_assignments(command);
+fn runtime_for_head(command: &str) -> RequiredRuntime {
+    let Some((program, mut remaining)) = prepared::literal_word(command) else {
+        return RequiredRuntime::None;
+    };
+    let Some(program) = Path::new(&program).file_name().and_then(|name| name.to_str()) else {
+        return RequiredRuntime::None;
+    };
+    let mut arguments = Vec::new();
+    for _ in 0..256 {
+        let Some((word, tail)) = prepared::literal_word(remaining) else {
+            break;
+        };
+        arguments.push(word);
+        remaining = tail;
+    }
+    let tokens = std::iter::once(program).chain(arguments.iter().map(String::as_str));
+    runtime_for_words(tokens)
+}
 
-    let mut tokens = after_env.split_whitespace();
+/// Preserve existing preparation for opaque shell forms which cannot safely
+/// move inside the contextual selector. Their original shell is unchanged.
+fn legacy_runtime_from_command(command: &str) -> RequiredRuntime {
+    runtime_for_words(strip_leading_env_assignments(command).split_whitespace())
+}
+
+fn runtime_for_words<'a>(mut tokens: impl Iterator<Item = &'a str>) -> RequiredRuntime {
     match tokens.next() {
         Some("bun") => match tokens.next() {
             Some("test" | "typecheck") => return RequiredRuntime::Bun,
@@ -354,38 +384,85 @@ mod runtime_detection_tests {
     }
 
     #[test]
-    fn test_strip_leading_env_assignments_basic() {
-        assert_eq!(
-            strip_leading_env_assignments("RUST_LOG=debug cargo test"),
-            "cargo test"
-        );
-        assert_eq!(strip_leading_env_assignments("cargo test"), "cargo test");
+    fn literal_environment_prefixes_and_quoted_tools_select_preparation() {
+        for (command, expected) in [
+            ("CI='agent job' npm test", RequiredRuntime::Node),
+            ("env CI=1 bun test", RequiredRuntime::Bun),
+            (
+                "env -i PATH=/usr/bin:/bin npm run 'test:integration'",
+                RequiredRuntime::Node,
+            ),
+            (
+                "env -u NODE_OPTIONS --unset=NODE_PATH tsc --noEmit",
+                RequiredRuntime::Node,
+            ),
+            (
+                "env --chdir='nested project' pnpm typecheck",
+                RequiredRuntime::Node,
+            ),
+            (
+                "env -C nested env -C child bun typecheck",
+                RequiredRuntime::Bun,
+            ),
+            ("'/usr/local/bin/bun' 'test'", RequiredRuntime::Bun),
+            ("\"/usr/bin/tsc\" --noEmit", RequiredRuntime::Node),
+            (
+                "env -- 'CI=agent job' yarn run typecheck",
+                RequiredRuntime::Node,
+            ),
+        ] {
+            assert_eq!(detect_runtime_from_command(command), expected, "{command}");
+        }
     }
 
     #[test]
-    fn test_strip_leading_env_assignments_with_paths() {
-        assert_eq!(
-            strip_leading_env_assignments("LD_LIBRARY_PATH=/usr/lib bun test"),
-            "bun test"
-        );
-        assert_eq!(
-            strip_leading_env_assignments("PATH=/usr/bin:/bin bun test"),
-            "bun test"
-        );
+    fn opaque_prefixes_and_malformed_heads_are_not_relocated() {
+        for command in [
+            "'CI=agent job' npm test",
+            "CI=1; npm test",
+            "env -S 'npm test'",
+            "env -C",
+            "env --chdir= npm test",
+            "env -u npm test",
+            "cd nested && bun test",
+            "printf npm test",
+        ] {
+            assert!(prepared::Invocation::parse(command).is_none(), "{command}");
+        }
     }
 
     #[test]
-    fn test_strip_leading_env_assignments_does_not_strip_flags() {
-        // -x=1 is a flag, not an assignment, so it's NOT stripped.
-        assert_eq!(strip_leading_env_assignments("-x=1 cmd"), "-x=1 cmd");
+    fn opaque_existing_assignments_keep_the_original_preparation_path() {
+        for (command, expected) in [
+            ("CI=$CI npm test", RequiredRuntime::Node),
+            ("RUST_LOG=$RUST_LOG bun test", RequiredRuntime::Bun),
+            ("CI=1 npm test && printf done", RequiredRuntime::Node),
+            ("CI=1 npm test \"$FILTER\"", RequiredRuntime::Node),
+        ] {
+            assert!(
+                prepared::Invocation::parse(command)
+                    .filter(prepared::Invocation::is_relocatable)
+                    .is_none(),
+                "{command}"
+            );
+            assert_eq!(detect_runtime_from_command(command), expected, "{command}");
+        }
     }
 
     #[test]
-    fn test_strip_leading_env_assignments_multiple() {
-        assert_eq!(
-            strip_leading_env_assignments("FOO=1 BAR=2 BAZ=3 cmd arg"),
-            "cmd arg"
-        );
+    fn bare_runtime_detection_does_not_parse_unrelated_shell_tails() {
+        for command in [
+            "npm test\nprintf after".to_owned(),
+            "bun test \"$FILTER\" && printf after".to_owned(),
+            format!("npm test {}", "x".repeat(70_000)),
+        ] {
+            let expected = if command.starts_with("bun") {
+                RequiredRuntime::Bun
+            } else {
+                RequiredRuntime::Node
+            };
+            assert_eq!(detect_runtime_from_command(&command), expected);
+        }
     }
 
     #[test]
@@ -435,10 +512,45 @@ pub async fn execute_with_disk_budget(
     }
 
     // br-4998x: pre-execution hook for Bun/Node projects.
-    let runtime = detect_runtime_from_command(command);
+    let invocation = prepared::Invocation::parse(command)
+        .filter(prepared::Invocation::is_relocatable);
+    let runtime = invocation
+        .as_ref()
+        .map(|invocation| invocation.runtime)
+        .unwrap_or_else(|| legacy_runtime_from_command(command));
+    let prefixed = invocation.as_ref().filter(|invocation| {
+        invocation.is_prefixed() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
+    });
+    if disk_budget.is_some() && prefixed.is_some_and(|invocation| !invocation.preserves_disk_scope()) {
+        eprintln_best_effort(
+            "rch-wkr: environment prefix clears or overrides the admitted CARGO_TARGET_DIR/TMPDIR/TMP/TEMP paths; preserve those paths when using a disk budget; the command was not run",
+        );
+        return Err(CommandFailed {
+            exit_code: EXIT_PREPARE_FAILED,
+        }
+        .into());
+    }
+    let prefixed_roots = prefixed
+        .map(|invocation| -> Result<_> {
+            let project = invocation.working_directory(Path::new(workdir))?;
+            let preparation = crate::prepare::preparation_root(&project)?;
+            Ok((project, preparation))
+        })
+        .transpose()
+        .map_err(|error| {
+            eprintln_best_effort(&format!(
+                "rch-wkr: dependency invocation could not be prepared: {error:#}; the command was not run"
+            ));
+            CommandFailed {
+                exit_code: EXIT_PREPARE_FAILED,
+            }
+        })?;
     let mut dependency_layout = crate::prepare::DependencyLayout::NodeModules;
     let mut preparation_project = None;
-    if disk_budget.is_none() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+    if disk_budget.is_none()
+        && prefixed.is_none()
+        && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
+    {
         let project_root = Path::new(workdir);
         let log_dir = project_root.join(".rch_prepare_logs");
         match crate::prepare::prepare(project_root, runtime, &log_dir, None, None).await {
@@ -508,7 +620,9 @@ pub async fn execute_with_disk_budget(
             "conditional warm budgets require dispatcher-owned admission"
         );
         let root = std::fs::canonicalize(workdir)?;
-        let prepared_root = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+        let prepared_root = if let Some((_, preparation)) = &prefixed_roots {
+            preparation.clone()
+        } else if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
             crate::prepare::preparation_root(&root).map_err(|error| {
                 eprintln_best_effort(&format!(
                     "rch-wkr: workspace dependency preparation refused: {error:#}; the command was not run"
@@ -569,19 +683,18 @@ pub async fn execute_with_disk_budget(
             .collect::<Result<Vec<_>>>()?;
         let plan =
             serde_json::json!({"probe": probe_paths, "output": output_paths, "receipt": receipt});
-        let guarded_command = if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+        let guarded_command = if let (Some(invocation), Some((project, preparation))) =
+            (prefixed, prefixed_roots.as_ref())
+        {
+            invocation.prepared_command(&root, project, preparation)?
+        } else if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
             prepared::disk_guard_command(&root, &prepared_root, runtime, command)?
         } else {
             prepared::workload_command(crate::prepare::DependencyLayout::NodeModules, command)?
         };
-        let mut guarded = managed_command("python3");
+        let mut guarded = managed_command(crate::native_worker_executable()?);
         guarded
-            .args([
-                "-I",
-                "-S",
-                "-c",
-                rch_common::REMOTE_BUILD_DISK_MONITOR_SCRIPT,
-            ])
+            .arg("disk-supervise")
             .arg(budget.max_growth_bytes.to_string())
             .arg(budget.min_free_bytes.to_string())
             .arg(&marker)
@@ -596,6 +709,10 @@ pub async fn execute_with_disk_budget(
             .env("TEMP", &temporary);
         disk_receipt = Some((receipt, marker, budget));
         guarded
+    } else if let (Some(invocation), Some((project, preparation))) =
+        (prefixed, prefixed_roots.as_ref())
+    {
+        invocation.prepared_command(Path::new(workdir), project, preparation)?
     } else {
         prepared::workload_command(dependency_layout, command)?
     };
@@ -613,6 +730,7 @@ pub async fn execute_with_disk_budget(
     // The disk selector adds this path only after preparing a NodeModules
     // layout. PnP must keep the original PATH that selected its Yarn manager.
     if disk_budget.is_none()
+        && prefixed.is_none()
         && dependency_layout == crate::prepare::DependencyLayout::NodeModules
         && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
     {
@@ -775,6 +893,41 @@ pub async fn execute_with_disk_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn contextual_prefix_cannot_escape_an_admitted_disk_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 8 << 20,
+            min_free_bytes: 0,
+            warm_policy: None,
+        });
+        for command in [
+            "env -i npm test",
+            "env --ignore-environment npm test",
+            "env -u TMPDIR npm test",
+            "env --unset=CARGO_TARGET_DIR npm test",
+            "env -uTMP npm test",
+            "TEMP=/outside npm test",
+            "env TMPDIR=/outside npm test",
+            "env CARGO_TARGET_DIR=/outside npm test",
+        ] {
+            let error = execute_with_disk_budget(
+                directory.path().to_str().unwrap(),
+                command,
+                budget,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<CommandFailed>().unwrap().exit_code,
+                EXIT_PREPARE_FAILED,
+                "{command}: {error:#}"
+            );
+            assert!(!directory.path().join("target").exists());
+            assert!(!directory.path().join(".rch_prepare_logs").exists());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

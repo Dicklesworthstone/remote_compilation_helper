@@ -259,6 +259,38 @@ transport invalidates both successful and failed checks. After recovery, RCH
 checks the requested toolchain again before reserving slots; reconnecting alone
 cannot reuse a pre-outage success or keep a repaired toolchain excluded.
 
+### Installing or Repairing a Named Toolchain
+
+After installing the exact toolchain requested by a project, refresh the
+daemon's evidence before retrying the build:
+
+```bash
+rch workers probe worker1
+# Or refresh the entire fleet:
+rch workers capabilities --refresh
+```
+
+A successful capability publication invalidates that worker's cached
+toolchain verdicts, including both missing-toolchain refusals and earlier
+successes. The next build runs the concrete Cargo/rustc preflight again;
+listing a toolchain or its components alone does not authorize execution.
+Repeated builds may reuse the new definitive verdict for up to ten minutes,
+unless another refresh or lifecycle change invalidates it first.
+
+`workers probe` collects its direct report and asks the running daemon to
+refresh the same worker independently. JSON output reports that separate
+result in `daemon_refresh`: `live: true` means the daemon accepted fresh
+inventory. `live: false` means a matching daemon refresh was not confirmed;
+the accompanying message explains the failure or mismatch. A successful
+direct probe with an unavailable daemon is not an admission check.
+
+`rch daemon reload` also invalidates toolchain verdicts after a successful
+configuration reload, even when the workers file is unchanged. It preserves
+running build ownership and disk observations. A daemon restart is not needed
+to discard a repaired toolchain's cached refusal. Probes started before the
+refresh or reload cannot restore old verdicts, and a genuinely unavailable
+toolchain continues to fail its new preflight.
+
 For `worker Cargo execution check failed`, inspect the reported PATH or
 toolchain failure, update the dispatcher and worker binaries together, and
 repair the worker's Cargo/shim installation as needed. Re-run the capability

@@ -88,6 +88,7 @@ pub mod restart_admission;
 pub use restart_admission::{MaintenanceOwner, MaintenanceRecovery, RestartAdmissionResponse};
 pub mod rsync_flavor;
 pub mod schema_versions;
+pub mod source_namespace_paths;
 #[cfg(unix)]
 pub mod ssh;
 #[cfg(all(test, unix))]
@@ -104,9 +105,6 @@ pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;
-
-/// Standard-library-only worker guard shared by SSH and direct execution.
-pub const REMOTE_BUILD_DISK_MONITOR_SCRIPT: &str = include_str!("../build_disk_monitor.py");
 
 /// Paired loop-break markers for an RCH-managed Cargo child process.
 ///

@@ -117,11 +117,33 @@ Recovery also resumes settlement if source retirement reached the journal but
 the dispatcher stopped before recording the failed returned result. Persisted
 resource retirement does not bypass an outstanding cancellation obligation.
 Older preparation cancellations without this field also enter reconciliation.
-The daemon's existing recovery service considers eligible acknowledged
-cancellations normally after a 15-minute scheduling grace, retaining its
-per-worker concurrency limits and failure backoff. It excludes live or unverified owners.
-Elapsed time selects a recovery attempt; it never proves source ownership has
-ended.
+The daemon scans immediately after startup and every 30 seconds for unfinished
+execute/finalize leases, retired deliveries awaiting daemon acknowledgement, and
+eligible acknowledged cancellations. It requires the recorded process identity
+to be absent; live or unverified owners remain protected even when heartbeats
+are stale. The separate 15-minute restart barrier is not a recovery delay.
+Scheduling a recovery attempt never proves that worker ownership has ended.
+
+Recovery starts at most four clients per scan, with at most four in flight and
+one per worker. Pending executions take turns with other eligible leases. When
+the worker still reports execution activity, or completion appears between the
+receipt read and activity probe, recovery retains ownership and retries on a
+later scan. A journal gate held by another handle also defers automatic recovery
+until a later scan; brief local contention does not create a ten-minute failure
+delay. This observation proves nothing about the worker or the gate owner's
+process identity. Manual recovery continues to report the held journal as an
+explicit error. Neither kind of deferral clears an earlier genuine failure.
+Transport, protocol, journal validation, and reconciliation failures retain
+exponential backoff from ten minutes to six hours. These are attempt bounds,
+not completion promises: worker settlement, administrative disable, transport
+dormancy, and queued recovery can extend the wait.
+
+A cancellation response of `completed` describes daemon accounting and can
+still leave worker source ownership unresolved. Consequently, zero active builds
+and eight available slots do not by themselves prove the project can run.
+After automatic or manual recovery, verify the original lease's settlement and
+then admit a new build for the same project; successful inspection alone does
+not establish restored admission.
 
 #### Evidence required on the worker
 

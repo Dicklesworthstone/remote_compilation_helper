@@ -733,7 +733,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     if details.classification.is_compilation {
         if daemon_status.reachable {
-            match query_workers_capabilities(false).await {
+            match query_workers_capabilities(false, None).await {
                 Ok(response) => {
                     if required_runtime != RequiredRuntime::None {
                         let missing: Vec<String> = response

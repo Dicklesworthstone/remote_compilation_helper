@@ -7,7 +7,25 @@ rch_worker_prepare_project=$2
 rch_worker_prepare_root=$3
 rch_worker_prepare_runtime=$4
 rch_worker_prepare_original=$5
-shift 5
+rch_worker_prepare_head=$6
+rch_worker_prepare_od=$7
+rch_worker_prepare_shell=$8
+shift 8
+
+# The caller resolved literal env -C operations before reserving disk output
+# roots. Verify the prefix actually selected that directory before installing.
+rch_worker_prepare_actual=$(pwd -P && printf x) || exit 121
+rch_worker_prepare_actual=${rch_worker_prepare_actual%?}
+rch_worker_prepare_actual=${rch_worker_prepare_actual%?}
+if [ "$rch_worker_prepare_actual" != "$rch_worker_prepare_project" ]; then
+    printf 'rch-wkr: dependency invocation directory changed; the command was not run\n' >&2
+    exit 121
+fi
+# An outer env -i/-u may clear the inherited worker markers. Restore this
+# admitted child's paired loop break, including for nested Cargo scripts.
+RCH_CARGO_WRAPPER_BYPASS=1
+RCH_CARGO_WRAPPER_ORIGIN=rch
+export RCH_CARGO_WRAPPER_BYPASS RCH_CARGO_WRAPPER_ORIGIN
 
 # Preserve the exact newline, NUL bytes and terminal status in a bounded frame,
 # matching the dispatcher preparation protocol. Preparation never consumes the
@@ -19,13 +37,13 @@ rch_worker_prepare_output=$(
             --expected-preparation-root "$rch_worker_prepare_root" </dev/null
         rch_worker_prepare_status=$?
         printf 'RCH_PREPARE_STATUS:%s' "$rch_worker_prepare_status"
-    } | head -c 256 | od -An -v -tx1
+    } | "$rch_worker_prepare_head" -c 256 | "$rch_worker_prepare_od" -An -v -tx1
 ) || exit 121
 rch_worker_prepare_layout=unknown
 rch_worker_prepare_parents=0
 while [ "$rch_worker_prepare_parents" -le 64 ]; do
-    rch_worker_prepare_node=$(printf '%s\nRCH_PREPARE_STATUS:0' "RCH_PREPARED_NODE_MODULES:$rch_worker_prepare_parents" | od -An -v -tx1) || exit 121
-    rch_worker_prepare_pnp=$(printf '%s\nRCH_PREPARE_STATUS:0' "RCH_PREPARED_YARN_PNP:$rch_worker_prepare_parents" | od -An -v -tx1) || exit 121
+    rch_worker_prepare_node=$(printf '%s\nRCH_PREPARE_STATUS:0' "RCH_PREPARED_NODE_MODULES:$rch_worker_prepare_parents" | "$rch_worker_prepare_od" -An -v -tx1) || exit 121
+    rch_worker_prepare_pnp=$(printf '%s\nRCH_PREPARE_STATUS:0' "RCH_PREPARED_YARN_PNP:$rch_worker_prepare_parents" | "$rch_worker_prepare_od" -An -v -tx1) || exit 121
     case "$rch_worker_prepare_output" in
         "$rch_worker_prepare_node") rch_worker_prepare_layout=node_modules; break ;;
         "$rch_worker_prepare_pnp") rch_worker_prepare_layout=yarn_pnp; break ;;
@@ -64,7 +82,7 @@ case "$rch_worker_prepare_layout" in
             rch_worker_prepare_add_bin "$1"
         }
         rch_worker_prepare_ancestor_bins "$rch_worker_prepare_project" 0
-        exec sh -c "$rch_worker_prepare_original"
+        exec "$rch_worker_prepare_shell" -c "$rch_worker_prepare_original"
         ;;
     yarn_pnp)
         if [ "$rch_worker_prepare_runtime" != node ] || [ "$#" = 0 ]; then

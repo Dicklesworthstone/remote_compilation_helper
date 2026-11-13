@@ -26,6 +26,26 @@ use serde::{Deserialize, Serialize};
 use crate::incident::IncidentReasonCode;
 use crate::job_identity::{JobIdentity, JobLifecycleState};
 
+/// Internal exit status for daemon-managed recovery whose worker has not yet
+/// established completion or execution loss. This is neither a successful
+/// recovery nor a transport/validation failure. The daemon retries on its next
+/// scan while retaining the original journal and worker ownership.
+pub const AUTOMATIC_RECOVERY_PENDING_EXIT_CODE: i32 = 75;
+
+/// Internal exit status for daemon-managed recovery that could not acquire
+/// the job journal's exclusive gate because another handle still holds it.
+/// This defers the attempt until a later scan without adding failure backoff;
+/// it proves neither worker settlement nor absence of the journal's owner.
+pub const AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE: i32 = 76;
+
+/// The original execution has no durable completion, and recovery has not
+/// proved it gone. Age or wrapper death cannot authorize retirement or replay.
+/// Manual recovery reports this as an error; only the daemon-managed command
+/// translates this typed cause into [`AUTOMATIC_RECOVERY_PENDING_EXIT_CODE`].
+#[derive(Debug, thiserror::Error)]
+#[error("same-id remote execution has no durable completion yet; command was not replayed")]
+pub struct WorkerSettlementPending;
+
 /// Observable signals about a job and its local wrapper, used to decide whether
 /// the wrapper is stuck. Plain data so the classification is pure and total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
