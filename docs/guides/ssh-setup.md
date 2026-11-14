@@ -166,7 +166,9 @@ sessions to finish. The log reports `Requested drain of orphaned RCH SSH
 master`; this confirms the drain request, not that every session has exited.
 Each socket probe has a one-second deadline, and scanning continues in batches.
 Unverifiable or deliberately backgrounded connections are left alone, as are
-legacy log files and directory remnants. On macOS, ambiguous command display
+legacy log files and directory remnants. Linux recovery also requires a
+readable, verified system init executable for PID 1; application containers or
+restricted procfs views do not prove orphan ownership. On macOS, ambiguous command display
 paths (for example, a home directory containing spaces) are conservatively
 excluded from automatic recovery.
 

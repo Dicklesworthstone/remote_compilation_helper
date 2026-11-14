@@ -54,6 +54,7 @@ async fn inspect_platform(
     let ProcessObservation::Present(before) = observe_process(std::process::id()) else {
         return None;
     };
+    linux_init_parent(deadline).await?;
     let process = std::path::PathBuf::from(format!("/proc/{pid}"));
     let first = linux_snapshot(&process, pid, uid, deadline).await?;
     let executable = tokio::time::timeout_at(deadline, tokio::fs::read_link(process.join("exe")))
@@ -76,6 +77,49 @@ async fn inspect_platform(
         return None;
     };
     (Instant::now() < deadline && first == second && before == after).then_some(second)
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_init_parent(deadline: Instant) -> Option<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // PID 1 can be a live application inside a container, including another
+    // RCH owner. PPID 1 is orphan evidence only when the parent is a verified
+    // system init. Unknown or unreadable PID 1 executables are not authority
+    // to drain a connection, even when their UID differs from the child.
+    let status = read_bounded(Path::new("/proc/1/status"), deadline).await?;
+    let executable = tokio::time::timeout_at(deadline, tokio::fs::read_link("/proc/1/exe"))
+        .await
+        .ok()?
+        .ok()?;
+    let metadata = tokio::time::timeout_at(deadline, tokio::fs::metadata("/proc/1/exe"))
+        .await
+        .ok()?
+        .ok()?;
+    (known_linux_init(std::str::from_utf8(&status).ok()?, &executable)
+        && metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.mode() & 0o022 == 0
+        && Instant::now() < deadline)
+        .then_some(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn known_linux_init(status: &str, executable: &Path) -> bool {
+    status_number(status, "Pid:") == Some(1)
+        && status_number(status, "PPid:") == Some(0)
+        && status_has_uid(status, 0)
+        && matches!(
+            executable.to_str(),
+            Some(
+                "/usr/lib/systemd/systemd"
+                    | "/lib/systemd/systemd"
+                    | "/sbin/init"
+                    | "/usr/sbin/init"
+                    | "/sbin/openrc-init"
+                    | "/usr/sbin/openrc-init"
+            )
+        )
 }
 
 #[cfg(target_os = "linux")]
@@ -126,12 +170,7 @@ fn linux_records(
     {
         return None;
     }
-    let mut uid_records = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
-    let mut ids = uid_records.next()?.split_ascii_whitespace();
-    if uid_records.next().is_some()
-        || (0..4).any(|_| ids.next().and_then(decimal) != Some(u64::from(uid)))
-        || ids.next().is_some()
-    {
+    if !status_has_uid(status, uid) {
         return None;
     }
     Some(Identity {
@@ -139,6 +178,18 @@ fn linux_records(
         uid,
         birth: birth.clone(),
     })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn status_has_uid(status: &str, uid: u32) -> bool {
+    let mut records = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let Some(record) = records.next() else {
+        return false;
+    };
+    let mut ids = record.split_ascii_whitespace();
+    records.next().is_none()
+        && (0..4).all(|_| ids.next().and_then(decimal) == Some(u64::from(uid)))
+        && ids.next().is_none()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -581,6 +632,40 @@ mod tests {
             format!("42 (ssh ) unusual) {}", fields.join(" ")),
             format!("Pid:\t42\nPPid:\t{parent}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
         )
+    }
+
+    #[test]
+    fn linux_pid_one_must_be_a_known_system_init_not_a_live_application_owner() {
+        let status = "Name:\tsystemd\nPid:\t1\nPPid:\t0\nUid:\t0\t0\t0\t0\n";
+        for path in [
+            "/usr/lib/systemd/systemd",
+            "/lib/systemd/systemd",
+            "/sbin/init",
+            "/sbin/openrc-init",
+        ] {
+            assert!(known_linux_init(status, Path::new(path)), "{path}");
+        }
+        // Neither a forged comm name nor another UID identifies an adopting
+        // init; an RCH owner running as PID 1 must keep its live masters.
+        for path in [
+            "/usr/bin/rchd",
+            "/usr/bin/rch",
+            "/tmp/systemd",
+            "/usr/bin/tini",
+            "/usr/lib/systemd/systemd (deleted)",
+        ] {
+            assert!(!known_linux_init(status, Path::new(path)), "{path}");
+        }
+        let path = Path::new("/usr/lib/systemd/systemd");
+        for invalid in [
+            status.replace("Pid:\t1", "Pid:\t2"),
+            status.replace("PPid:\t0", "PPid:\t1"),
+            status.replace("Uid:\t0\t0\t0\t0", "Uid:\t1000\t1000\t1000\t1000"),
+            status.replace("Uid:\t0\t0\t0\t0", "Uid:\t0\t1000\t0\t0"),
+            format!("{status}Uid:\t0\t0\t0\t0\n"),
+        ] {
+            assert!(!known_linux_init(&invalid, path));
+        }
     }
 
     #[test]

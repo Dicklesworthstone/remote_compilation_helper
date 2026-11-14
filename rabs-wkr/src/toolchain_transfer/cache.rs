@@ -7,6 +7,9 @@
 //! Negotiated prefix recovery uses the same object names and capacity. A short
 //! object is only a hint until its independently copied hash is checked by the
 //! sender; old completed-file readers continue to treat short objects as misses.
+//! Replacement keeps the old object until its verified successor is ready. The
+//! single incoming file is temporary storage bounded by the same byte limit;
+//! a later writer removes interrupted staging without discarding retained bytes.
 
 use rabs_sandbox::toolchain_transfer::{
     MAX_TOOLCHAIN_CHUNK, ToolchainCheckpointError, ToolchainFile, ToolchainReceiver,
@@ -472,6 +475,111 @@ impl CacheWriter {
         Ok(true)
     }
 
+    fn reserve_replacement(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<bool> {
+        let Some(previous) = self.entries.get(name) else {
+            return self.reserve(bytes, true, stopped);
+        };
+        let previous_bytes = previous.bytes;
+        let used = previous.used;
+        // Reserve final growth without making the recovery object itself an
+        // eviction candidate. Copying, source verification, or cancellation may
+        // still fail; none of them is permission to discard the previous bytes.
+        self.evictable.remove(&(used, name.to_owned()));
+        let result = self.reserve(bytes.saturating_sub(previous_bytes), false, stopped);
+        if !self.protected.contains(name) {
+            self.evictable.insert((used, name.to_owned()));
+        }
+        result
+    }
+
+    fn publish_replacement(
+        &mut self,
+        name: &str,
+        file: &File,
+        bytes: u64,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.check(stopped)?;
+        let metadata = file.metadata()?;
+        if !private_file(&metadata, 1, false)
+            || metadata.len() != bytes
+            || !same_state(
+                &metadata,
+                &self.cache.open_child(INCOMING, false)?.metadata()?,
+            )
+        {
+            return Err(invalid(
+                "toolchain cache replacement changed before publication",
+            ));
+        }
+        let previous_bytes = if let Some(previous) = self.entries.get(name) {
+            if !same_state(
+                &previous.metadata,
+                &self.cache.open_child(name, false)?.metadata()?,
+            ) {
+                return Err(invalid("toolchain cache object changed before replacement"));
+            }
+            previous.bytes
+        } else {
+            match self.cache.open_child(name, false) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(invalid("untracked toolchain cache replacement destination")),
+            }
+            0
+        };
+        let total = self
+            .total
+            .checked_sub(previous_bytes)
+            .and_then(|total| total.checked_add(bytes))
+            .filter(|total| *total <= self.cache.max_bytes)
+            .ok_or_else(|| invalid("toolchain cache replacement exceeds its byte budget"))?;
+        if self.entries.len() + usize::from(!self.entries.contains_key(name)) > MAX_OBJECTS {
+            return Err(invalid(
+                "toolchain cache replacement exceeds its entry budget",
+            ));
+        }
+        // The owned writer excludes other cache writers. Replace the exact
+        // inventoried generation in one rename, after all fallible copying and
+        // verification, so a failed retry never unlinks its recovery prefix.
+        #[cfg(target_os = "linux")]
+        rustix::fs::renameat(
+            &self.cache.root.directory,
+            INCOMING,
+            &self.cache.root.directory,
+            name,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "toolchain file reuse requires Linux",
+        ));
+        let metadata = file.metadata()?;
+        if !same_state(&metadata, &self.cache.open_child(name, false)?.metadata()?) {
+            return Err(invalid("published toolchain cache replacement changed"));
+        }
+        let used = metadata.modified()?;
+        if let Some(previous) = self.entries.remove(name) {
+            self.evictable.remove(&(previous.used, name.to_owned()));
+        }
+        self.total = total;
+        self.entries.insert(
+            name.to_owned(),
+            Entry {
+                bytes,
+                used,
+                metadata,
+            },
+        );
+        self.protected.insert(name.to_owned());
+        Ok(())
+    }
+
     /// The retained bytes are hints, never a completed-file assertion. Publish
     /// the ordinary read-only object name with a held writable descriptor, then
     /// grow it only while this same nonblocking writer owns the cache lock.
@@ -498,10 +606,7 @@ impl CacheWriter {
         if self.protected.contains(&name) || offset > self.cache.max_bytes {
             return Ok(());
         }
-        if self.entries.contains_key(&name) {
-            self.remove(&name, stopped)?;
-        }
-        if !self.reserve(offset, true, stopped)? {
+        if !self.reserve_replacement(&name, offset, stopped)? {
             return Ok(());
         }
         let mut file = self.cache.open_child(INCOMING, true)?;
@@ -537,43 +642,7 @@ impl CacheWriter {
                 "toolchain prefix seed digest differs from selection",
             ));
         }
-        self.check(stopped)?;
-        let metadata = file.metadata()?;
-        if !private_file(&metadata, 1, false)
-            || metadata.len() != offset
-            || !same_state(
-                &metadata,
-                &self.cache.open_child(INCOMING, false)?.metadata()?,
-            )
-        {
-            return Err(invalid(
-                "toolchain prefix destination changed before publication",
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        rustix::fs::renameat(
-            &self.cache.root.directory,
-            INCOMING,
-            &self.cache.root.directory,
-            name.as_str(),
-        )?;
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "toolchain prefix reuse requires Linux",
-        ));
-        let metadata = file.metadata()?;
-        let used = metadata.modified()?;
-        self.total += offset;
-        self.entries.insert(
-            name.clone(),
-            Entry {
-                bytes: offset,
-                used,
-                metadata,
-            },
-        );
-        self.protected.insert(name);
+        self.publish_replacement(&name, &file, offset, stopped)?;
         self.active = Some(ActivePrefix {
             expected: expected.clone(),
             file,
@@ -700,27 +769,8 @@ impl CacheWriter {
         if self.protected.contains(&name) || expected.bytes > self.cache.max_bytes {
             return Ok(());
         }
-        if self.entries.contains_key(&name) {
-            // This name was reported missing, so it failed verified lookup.
-            // It may now be a useful short prefix. Reserve its growth before
-            // replacing it, so a complete object which cannot fit does not
-            // discard the bounded recovery bytes already retained.
-            let previous = self.entries[&name].bytes;
-            self.protect(&expected.sha256);
-            let fits = self
-                .reserve(expected.bytes.saturating_sub(previous), false, stopped)
-                .map_err(Destination)?;
-            self.protected.remove(&name);
-            self.evictable
-                .insert((self.entries[&name].used, name.clone()));
-            if !fits {
-                return Ok(());
-            }
-            // Replace only the inventoried ordinary object, never unknown state.
-            self.remove(&name, stopped).map_err(Destination)?;
-        }
         if !self
-            .reserve(expected.bytes, true, stopped)
+            .reserve_replacement(&name, expected.bytes, stopped)
             .map_err(Destination)?
         {
             return Ok(());
@@ -736,46 +786,8 @@ impl CacheWriter {
         let mut permissions = file.metadata().map_err(Destination)?.permissions();
         permissions.set_readonly(true);
         file.set_permissions(permissions).map_err(Destination)?;
-        let metadata = file.metadata().map_err(Destination)?;
-        self.check(stopped).map_err(Destination)?;
-        if !same_state(
-            &metadata,
-            &self
-                .cache
-                .open_child(INCOMING, false)
-                .map_err(Destination)?
-                .metadata()
-                .map_err(Destination)?,
-        ) {
-            return Err(Destination(invalid(
-                "toolchain checkpoint destination was replaced",
-            )));
-        }
-        #[cfg(target_os = "linux")]
-        rustix::fs::renameat(
-            &self.cache.root.directory,
-            INCOMING,
-            &self.cache.root.directory,
-            name.as_str(),
-        )
-        .map_err(|error| Destination(error.into()))?;
-        #[cfg(not(target_os = "linux"))]
-        return Err(Destination(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "toolchain file reuse requires Linux",
-        )));
-        let metadata = file.metadata().map_err(Destination)?;
-        let used = metadata.modified().map_err(Destination)?;
-        self.total += expected.bytes;
-        self.entries.insert(
-            name.clone(),
-            Entry {
-                bytes: expected.bytes,
-                used,
-                metadata,
-            },
-        );
-        self.protected.insert(name);
+        self.publish_replacement(&name, &file, expected.bytes, stopped)
+            .map_err(Destination)?;
         checkpoint(stopped).map_err(Destination)
     }
 }
@@ -914,7 +926,77 @@ impl Snapshots {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, fingerprint_toolchain};
+    use rabs_sandbox::toolchain_transfer::{ToolchainEntry, ToolchainEntryKind};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    fn private() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    fn expected(bytes: &[u8]) -> ToolchainFile {
+        ToolchainFile {
+            path: "compiler".to_owned(),
+            bytes: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        }
+    }
+
+    fn retain_prefix(cache: &ToolchainFileCache, expected: &ToolchainFile, bytes: &[u8]) {
+        let mut writer = cache.writer(&|| false).unwrap().unwrap();
+        writer
+            .begin_prefix(expected, None, 0, Sha256::digest([]).into(), &|| false)
+            .unwrap();
+        for (index, chunk) in bytes.chunks(MAX_TOOLCHAIN_CHUNK).enumerate() {
+            writer
+                .append_prefix(
+                    expected,
+                    (index * MAX_TOOLCHAIN_CHUNK) as u64,
+                    chunk,
+                    &|| false,
+                )
+                .unwrap();
+        }
+    }
+
+    fn received(bytes: &[u8]) -> (tempfile::TempDir, ToolchainReceiver) {
+        let owner = private();
+        let source = owner.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("compiler"), bytes).unwrap();
+        let identity =
+            fingerprint_toolchain(&source, &ToolchainLimits::default(), || false).unwrap();
+        let mut receiver = ToolchainReceiver::create(
+            &owner.path().join("received"),
+            identity,
+            ToolchainLimits::default(),
+        )
+        .unwrap();
+        receiver
+            .entry(ToolchainEntry {
+                path: "compiler".to_owned(),
+                kind: ToolchainEntryKind::File {
+                    bytes: bytes.len() as u64,
+                    executable: false,
+                },
+            })
+            .unwrap();
+        for (index, chunk) in bytes.chunks(MAX_TOOLCHAIN_CHUNK).enumerate() {
+            receiver
+                .write_chunk(
+                    "compiler",
+                    (index * MAX_TOOLCHAIN_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+        (owner, receiver)
+    }
 
     #[test]
     fn anonymous_snapshots_have_private_unlinked_descriptors() {
@@ -933,5 +1015,171 @@ mod tests {
             0,
             "privacy precedes copying any cached bytes"
         );
+    }
+
+    #[test]
+    fn interrupted_prefix_replacement_preserves_acknowledged_bytes_for_another_retry() {
+        let owner = private();
+        let bytes = vec![0x53; MAX_TOOLCHAIN_CHUNK * 3 + 19];
+        let expected = expected(&bytes);
+        let prefix = &bytes[..MAX_TOOLCHAIN_CHUNK + 11];
+        let cache = ToolchainFileCache::open(owner.path(), expected.bytes).unwrap();
+        retain_prefix(&cache, &expected, prefix);
+        let object = cache.root.path.join(object_name(&expected.sha256));
+        let before = fs::metadata(&object).unwrap();
+        let mut snapshots = Snapshots::new(cache.clone(), expected.bytes).unwrap();
+        let range = snapshots
+            .append(&expected, true, &|| false)
+            .unwrap()
+            .unwrap();
+        snapshots.seal(&|| false).unwrap();
+        let mut seed = snapshots.materialize(range, &|| false).unwrap();
+        let mut writer = cache.writer(&|| false).unwrap().unwrap();
+        // Stop after actual staging progress, independently of how many
+        // cancellation checkpoints the implementation performs.
+        let stopped = || {
+            fs::metadata(cache.root.path.join(INCOMING))
+                .is_ok_and(|metadata| metadata.len() >= MAX_TOOLCHAIN_CHUNK as u64)
+        };
+        let error = writer
+            .begin_prefix(
+                &expected,
+                Some(&mut seed),
+                range.bytes,
+                range.sha256,
+                &stopped,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(same_state(&before, &fs::metadata(&object).unwrap()));
+        assert_eq!(fs::read(&object).unwrap(), prefix);
+        assert_eq!(writer.total, prefix.len() as u64);
+        assert_eq!(writer.entries.len(), 1);
+        assert!(
+            fs::metadata(cache.root.path.join(INCOMING)).unwrap().len() <= cache.max_bytes,
+            "one interrupted staging file has its own fixed bound"
+        );
+        drop(writer);
+
+        let restarted = cache.writer(&|| false).unwrap().unwrap();
+        assert!(!cache.root.path.join(INCOMING).exists());
+        assert_eq!(restarted.total, prefix.len() as u64);
+        assert!(same_state(&before, &fs::metadata(&object).unwrap()));
+        let mut recovered = Snapshots::new(cache.clone(), expected.bytes).unwrap();
+        let retained = recovered
+            .append(&expected, true, &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.bytes, range.bytes);
+        assert_eq!(retained.sha256, range.sha256);
+    }
+
+    #[test]
+    fn failed_completed_checkpoint_never_discards_the_existing_recovery_prefix() {
+        for fault in 0..3 {
+            let owner = private();
+            let bytes = vec![0x39; MAX_TOOLCHAIN_CHUNK * 3 + 23];
+            let expected = expected(&bytes);
+            let prefix = &bytes[..MAX_TOOLCHAIN_CHUNK + 7];
+            let cache = ToolchainFileCache::open(owner.path(), expected.bytes).unwrap();
+            retain_prefix(&cache, &expected, prefix);
+            let object = cache.root.path.join(object_name(&expected.sha256));
+            let before = fs::metadata(&object).unwrap();
+            let (received_owner, mut receiver) = received(&bytes);
+            let mut writer = cache.writer(&|| false).unwrap().unwrap();
+            match fault {
+                0 => {}
+                1 => {
+                    let source = received_owner.path().join("received/compiler");
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&source, vec![0x27; bytes.len()]).unwrap();
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+                _ => {
+                    // A storage operation can fail before any copy as well.
+                    // The original retained object is not its cleanup target.
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(cache.root.path.join(INCOMING))
+                        .unwrap();
+                }
+            }
+            let result = writer.remember(&mut receiver, &expected, &|| {
+                fault == 0
+                    && fs::metadata(cache.root.path.join(INCOMING))
+                        .is_ok_and(|metadata| metadata.len() >= MAX_TOOLCHAIN_CHUNK as u64)
+            });
+            match (fault, result) {
+                (0, Err(ToolchainCheckpointError::Destination(error))) => {
+                    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                }
+                (1, Err(ToolchainCheckpointError::Source(_))) => {
+                    assert!(
+                        receiver.seal(|| false).is_err(),
+                        "source failure stays fatal"
+                    );
+                }
+                (2, Err(ToolchainCheckpointError::Destination(error))) => {
+                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                }
+                _ => panic!("checkpoint fault {fault} lost its failure classification"),
+            }
+            assert!(
+                same_state(&before, &fs::metadata(&object).unwrap()),
+                "fault {fault}"
+            );
+            assert_eq!(fs::read(&object).unwrap(), prefix, "fault {fault}");
+            assert_eq!(writer.total, prefix.len() as u64, "fault {fault}");
+            drop(writer);
+
+            let mut restarted = cache.writer(&|| false).unwrap().unwrap();
+            assert!(!cache.root.path.join(INCOMING).exists());
+            let (_fresh_owner, mut fresh) = received(&bytes);
+            restarted
+                .remember(&mut fresh, &expected, &|| false)
+                .unwrap();
+            assert_eq!(restarted.total, expected.bytes);
+            assert_eq!(restarted.entries.len(), 1);
+            assert_eq!(fs::read(&object).unwrap(), bytes);
+            assert!(!same_inode(&before, &fs::metadata(&object).unwrap()));
+            fresh.seal(|| false).unwrap().verify(|| false).unwrap();
+        }
+    }
+
+    #[test]
+    fn replacement_refuses_to_overwrite_a_changed_retained_generation() {
+        let owner = private();
+        let bytes = vec![0x42; MAX_TOOLCHAIN_CHUNK * 2 + 5];
+        let expected = expected(&bytes);
+        let cache = ToolchainFileCache::open(owner.path(), expected.bytes).unwrap();
+        retain_prefix(&cache, &expected, &bytes[..MAX_TOOLCHAIN_CHUNK]);
+        let object = cache.root.path.join(object_name(&expected.sha256));
+        let before = fs::metadata(&object).unwrap();
+        let (_received_owner, mut receiver) = received(&bytes);
+        let mut writer = cache.writer(&|| false).unwrap().unwrap();
+        let changed = std::cell::Cell::new(false);
+        let result = writer.remember(&mut receiver, &expected, &|| {
+            if !changed.get()
+                && fs::metadata(cache.root.path.join(INCOMING))
+                    .is_ok_and(|metadata| metadata.len() >= MAX_TOOLCHAIN_CHUNK as u64)
+            {
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&object, b"changed while staging").unwrap();
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+                changed.set(true);
+            }
+            false
+        });
+        assert!(changed.get());
+        assert!(matches!(
+            result,
+            Err(ToolchainCheckpointError::Destination(_))
+        ));
+        assert_eq!(fs::read(&object).unwrap(), b"changed while staging");
+        assert!(same_inode(&before, &fs::metadata(&object).unwrap()));
+        assert!(!writer.protected.contains(&object_name(&expected.sha256)));
+        receiver.seal(|| false).unwrap().verify(|| false).unwrap();
     }
 }

@@ -1261,12 +1261,21 @@ prefix. Loss of optional cache storage can discard progress; it cannot supply an
 unverified hit. Actual retained bytes are checked again after a worker restart;
 there is no trusted saved offset to replay.
 
+Replacing a retained prefix keeps the previous object until its replacement has
+been completely copied and verified. Cancellation or a failed checkpoint leaves
+those recovery bytes available to the next upload; the next cache writer removes
+the interrupted staging file. A changed retained generation is refused instead
+of being overwritten.
+
 Retained file objects are bounded and reclaimable. During an upload the worker
 also owns a hit snapshot bounded by the smaller of the declared SDK size and
 the configured file-cache budget, plus at most one materialized file for import
 into the independent receiver. Snapshot storage uses a bounded number of file
 descriptors, even for a complete installed SDK with tens of thousands of files.
-Allow disk space for these temporary copies as well as normal SDK staging.
+The single incoming replacement file is also temporary storage, bounded by the
+configured file-cache byte budget. Allow disk space for these temporary copies
+as well as normal SDK staging; the published objects keep their existing byte
+and entry limits.
 The cache directory cannot be exposed by a writable execution mount.
 
 File reuse preserves the original upload deadline and cancellation checks.
