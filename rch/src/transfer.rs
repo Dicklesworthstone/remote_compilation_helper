@@ -4351,6 +4351,13 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
         self
     }
 
+    /// Whether the original command selected a managed worker Cargo cache.
+    ///
+    /// Both launch isolation and the outer cache-base capture use this decision.
+    pub(crate) fn uses_managed_cargo_cache(&self) -> bool {
+        self.cargo_disk_cache.is_some()
+    }
+
     /// Force Layer 0 configuration-pack env pairs (bd-bqu38).
     ///
     /// These are resolved from the `[layer0]` config knobs by the caller and
@@ -6522,7 +6529,9 @@ mkdir -p {} && rm -f {} && {launch}",
         // `remote_build_jobs_fragment`. Windows workers run Git's sh without
         // nproc/meminfo/sysctl and are skipped.
         let build_jobs_fragment = self.remote_build_jobs_fragment();
-        let cargo_home_base = if command.contains("cargo") {
+        let cargo_home_base = if self.uses_managed_cargo_cache()
+            || (!self.cargo_disk_scope_captured && command.contains("cargo"))
+        {
             let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;
             let physical_base = if self.worker_platform.is_windows() {
                 String::new()
@@ -14495,7 +14504,11 @@ Number of files transferred: 42
         let requested = "env -- CARGO_HOME='/worker/explicit cache' cargo check";
         let pipeline = disk_budget_test_pipeline(Path::new("/tmp/cache-plan-test"), None, 20)
             .with_cargo_disk_cache(requested, &worker);
-        let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+        let isolated = crate::hook::add_cargo_isolation(
+            requested,
+            &worker,
+            pipeline.uses_managed_cargo_cache(),
+        );
         let command = pipeline.build_remote_command(&isolated, None);
         assert!(command.contains("\"name\":\"rch-cargo-cache-cache-worker\""));
         assert!(command.contains("\"additional_home\":\"/worker/explicit cache\""));
@@ -14514,6 +14527,16 @@ Number of files transferred: 42
             .build_remote_command("sh -c 'cd /tmp/cargo-source-guard && go test ./...'", None);
         assert!(guarded.contains("\"cargo_cache_required\":false"));
         assert!(guarded.contains("\"cargo_cache\":null"));
+        assert!(!guarded.contains("export RCH_CH_BASE"));
+        assert_eq!(
+            crate::hook::add_cargo_isolation(
+                &guarded,
+                &worker,
+                ordinary.uses_managed_cargo_cache(),
+            ),
+            guarded,
+            "wrapper paths cannot select an unaccounted cache"
+        );
     }
 
     #[test]
@@ -14540,7 +14563,11 @@ Number of files transferred: 42
                 .expect("supervised cache");
             assert!(cache.verified, "{requested}");
             assert_eq!(cache.additional_home.as_deref(), home, "{requested}");
-            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let isolated = crate::hook::add_cargo_isolation(
+                requested,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
             let command = pipeline.build_remote_command(&isolated, None);
             assert!(
                 command.contains("\"cargo_cache_required\":true"),
@@ -14570,7 +14597,11 @@ Number of files transferred: 42
                 !pipeline.cargo_disk_cache.as_ref().unwrap().verified,
                 "{requested}"
             );
-            let isolated = crate::hook::add_cargo_isolation(requested, &worker);
+            let isolated = crate::hook::add_cargo_isolation(
+                requested,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
             let command = pipeline.build_remote_command(&isolated, None);
             assert!(
                 command.contains("\"cargo_cache_required\":true"),
@@ -14597,7 +14628,11 @@ Number of files transferred: 42
             let worker = WorkerId::new("cache-scope-refusal");
             let pipeline = disk_budget_test_pipeline(&directory, None, 15)
                 .with_cargo_disk_cache(original, &worker);
-            let command = crate::hook::add_cargo_isolation(original, &worker);
+            let command = crate::hook::add_cargo_isolation(
+                original,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
             let output = run_external_timeout_fixture(
                 &directory,
                 &pipeline.build_remote_command(&command, None),
@@ -20438,6 +20473,7 @@ func main() {
                 let workload = crate::hook::add_cargo_isolation(
                     "printf 'cargo-home=%s\\ntmpdir=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"; printf 'cache-probe-stderr' >&2",
                     &worker,
+                    true,
                 );
                 let command = pipeline.build_remote_command(&workload, None);
                 let output = std::process::Command::new("sh")
@@ -20500,7 +20536,11 @@ func main() {
         let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
         assert!(cache.verified);
         assert_eq!(cache.additional_home.as_deref(), explicit_home.to_str());
-        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let workload = crate::hook::add_cargo_isolation(
+            &requested,
+            &worker,
+            pipeline.uses_managed_cargo_cache(),
+        );
         let command = pipeline.build_remote_command(&workload, None);
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
@@ -20562,7 +20602,11 @@ func main() {
         assert!(cache.verified);
         assert!(cache.additional_home.is_none());
         let expected_home = worker_base.canonicalize().unwrap().join(&cache.name);
-        let workload = crate::hook::add_cargo_isolation(&requested, &worker);
+        let workload = crate::hook::add_cargo_isolation(
+            &requested,
+            &worker,
+            pipeline.uses_managed_cargo_cache(),
+        );
         let command = pipeline.build_remote_command(&workload, None);
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
@@ -20580,6 +20624,94 @@ func main() {
             .collect::<Vec<_>>();
         assert_eq!(output.stdout, expected);
         assert_eq!(output.stderr, b"job-stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_non_cargo_job_preserves_home_across_generated_wrappers() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker_base = retained.join("worker volume");
+        let source = retained.join("cargo-source-guard");
+        let inherited_home = retained.join("inherited-home");
+        for directory in [&worker_base, &source, &inherited_home] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(
+            source.join("job.sh"),
+            "set -eu\nprintf '%s\\0' \"$CARGO_HOME\" \"${RCH_CH_BASE-unset}\"\nprintf 'job-stderr' >&2\nexit 42\n",
+        )
+        .unwrap();
+        let requested = "sh ./job.sh";
+        assert!(!requested.contains("cargo"));
+        let worker = WorkerId::new("cache-worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_env_allowlist(Vec::new())
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(requested, &worker);
+        assert!(!pipeline.uses_managed_cargo_cache());
+
+        let generated = format!(
+            "sh -c {}",
+            shell_words::quote(&format!(
+                "cd {} && {requested}",
+                shell_words::quote(source.to_str().unwrap())
+            ))
+        );
+        assert!(generated.contains("cargo"));
+        for delegated in [requested.to_owned(), generated] {
+            let workload = crate::hook::add_cargo_isolation(
+                &delegated,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
+            assert_eq!(workload, delegated);
+            let command = pipeline.build_remote_command(&workload, None);
+            assert!(!command.contains("export RCH_CH_BASE"));
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .current_dir(&retained)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &retained)
+                .env("TMPDIR", &worker_base)
+                .env("CARGO_HOME", &inherited_home)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(42), "{output:?}");
+            assert_eq!(
+                output.stdout,
+                format!("{}\0unset\0", inherited_home.display()).into_bytes()
+            );
+            assert_eq!(output.stderr, b"job-stderr");
+            assert!(!worker_base.join("rch-cargo-cache-cache-worker").exists());
+        }
+    }
+
+    #[test]
+    fn non_cargo_job_environment_removal_keeps_original_admission() {
+        let worker = WorkerId::new("cache-worker");
+        for requested in [
+            "env -i /bin/true",
+            "env -u CARGO_HOME sh ./job.sh",
+            "CARGO_HOME=relative sh ./job.sh",
+        ] {
+            assert!(!requested.contains("cargo"));
+            let pipeline = disk_budget_test_pipeline(Path::new("/tmp/job-plan"), None, 20)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(requested, &worker);
+            assert!(!pipeline.uses_managed_cargo_cache(), "{requested}");
+            let workload = crate::hook::add_cargo_isolation(
+                requested,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
+            assert_eq!(workload, requested);
+            let command = pipeline.build_remote_command(&workload, None);
+            assert!(command.contains("\"cargo_cache_required\":false"));
+            assert!(command.contains("\"cargo_cache\":null"));
+            assert!(!command.contains("export RCH_CH_BASE"));
+        }
     }
 
     #[cfg(unix)]
@@ -20631,7 +20763,7 @@ func main() {
         let retained = tempfile::tempdir().unwrap().keep();
         let pipeline = cargo_home_boundary_pipeline(&retained).with_build_id(Some(1));
         let workload =
-            crate::hook::add_cargo_isolation("cargo build", &WorkerId::new("cache-worker"));
+            crate::hook::add_cargo_isolation("cargo build", &WorkerId::new("cache-worker"), true);
         let command = pipeline.build_remote_command(&workload, None);
         let capture = command.find("export RCH_CH_BASE").unwrap();
         assert!(capture < command.find("touch ").unwrap());
@@ -20639,7 +20771,7 @@ func main() {
         assert!(capture < command.find("\"$@\" sh -c").unwrap());
         let plain = "printf plain";
         assert_eq!(
-            crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker")),
+            crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker"), false),
             plain
         );
         assert!(

@@ -9748,7 +9748,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
 
     // Test cargo build command gets isolation
     let cargo_command = "cargo build --release";
-    let isolated = add_cargo_isolation(cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(cargo_command, &worker_id, true);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(!isolated.starts_with("CARGO_HOME="));
@@ -9773,7 +9773,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
     assert!(!isolated.contains("rm "));
 
     // The same worker always maps to the same cache dir (that IS the reuse).
-    let again = add_cargo_isolation(cargo_command, &worker_id);
+    let again = add_cargo_isolation(cargo_command, &worker_id, true);
     assert_eq!(isolated, again);
 }
 
@@ -9832,7 +9832,7 @@ fn test_worker_cache_preparation_survives_cargo_isolation_and_config_guards() {
             .unwrap();
     let owned = source_fidelity::guard_owned_source_content_cargo_config(command, &[]).unwrap();
     for command in [command, &clean, &owned] {
-        let isolated = add_cargo_isolation(command, &WorkerId::new("routing-test"));
+        let isolated = add_cargo_isolation(command, &WorkerId::new("routing-test"), true);
         assert_eq!(isolated.matches("rch-rabs-worker").count(), 1);
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &isolated])
@@ -10255,7 +10255,7 @@ fn test_add_cargo_isolation_skips_non_cargo_commands() {
 
     // Test non-cargo command is unchanged
     let non_cargo_command = "echo hello world";
-    let isolated = add_cargo_isolation(non_cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(non_cargo_command, &worker_id, false);
 
     assert_eq!(isolated, non_cargo_command);
     assert!(!isolated.contains("CARGO_HOME"));
@@ -10269,7 +10269,7 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
     // Test complex cargo command with environment variables and arguments
     let complex_command =
         "cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo";
-    let isolated = add_cargo_isolation(complex_command, &worker_id);
+    let isolated = add_cargo_isolation(complex_command, &worker_id, true);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(
@@ -10290,7 +10290,7 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
 fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("timeout-worker");
-    let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id);
+    let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id, true);
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation-wrapper regression command above.
         .arg("-c")
         .arg(format!(
@@ -10324,6 +10324,7 @@ fn test_add_cargo_isolation_repairs_dangling_registry_link() {
     let isolated = add_cargo_isolation(
         "printf cargo >/dev/null; test -d \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/ok\"",
         &worker_id,
+        true,
     );
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation wrapper above.
         .arg("-c")

@@ -3017,6 +3017,7 @@ async fn execute_remote_compilation_inner(
     let isolated_command = add_cargo_isolation(
         alias_bound_command.as_deref().unwrap_or(guarded_command),
         &worker_config.id,
+        pipeline.uses_managed_cargo_cache(),
     );
 
     // Stream stdout/stderr to our stderr so the agent sees the output

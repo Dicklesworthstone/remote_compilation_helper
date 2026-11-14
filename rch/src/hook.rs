@@ -8035,10 +8035,13 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
     }
 }
 
-/// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
-pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
-    // Check if this is a cargo command that could benefit from isolation
-    if !command.contains("cargo") {
+/// Add per-worker CARGO_HOME isolation selected by the original command plan.
+///
+/// Shell wrappers can mention Cargo independently of the workload. The caller
+/// carries the captured decision through those wrappers instead of classifying
+/// the transformed command again.
+pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId, enabled: bool) -> String {
+    if !enabled {
         return command.to_string();
     }
 

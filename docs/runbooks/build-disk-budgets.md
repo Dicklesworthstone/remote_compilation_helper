@@ -248,6 +248,12 @@ physical directory identities are rechecked during scans and free-space
 sampling. Every resulting filesystem participates in reservation and floor
 checks.
 
+The same captured cache plan controls launch isolation and cache-base selection.
+Source paths and generated wrappers that happen to contain `cargo` cannot add
+a managed Cargo home after the original command selected no cache. Explicit job
+scripts retain their original admission and environment rules; RCH does not
+infer hidden Cargo invocations from script contents.
+
 Existing Cargo cache bytes receive no target-pool credit. They remain an
 unproven baseline, and an unfunded cache requires cold readmission before the
 workload starts. New cache allocations count even if target cleanup masks
