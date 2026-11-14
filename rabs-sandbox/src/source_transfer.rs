@@ -753,6 +753,26 @@ impl<const ARTIFACT: bool> FileReceiver<ARTIFACT> {
         &self.manifest
     }
 
+    /// Resume the same retained receiver at its first incomplete manifest
+    /// member. Completed and empty files precede the returned canonical index;
+    /// `(manifest.files().len(), 0)` means every declared byte has arrived.
+    ///
+    /// This is a transport cursor only. It does not revalidate accepted bytes,
+    /// authorize reopening staging from a pathname, or replace the final seal.
+    /// A failed filesystem write or digest check permanently refuses recovery.
+    pub fn resume_cursor(&self) -> io::Result<(usize, u64)> {
+        if self.poisoned {
+            return Err(invalid("source staging is poisoned"));
+        }
+        check_root(&self.root, &self.root_directory)?;
+        for (index, file) in self.files.values().enumerate() {
+            if file.received != file.expected.len {
+                return Ok((index, file.received));
+            }
+        }
+        Ok((self.manifest.files().len(), 0))
+    }
+
     /// Accept a contiguous new range or verify an exact retransmission. Only one
     /// chunk is allocated at a time; claimed sizes cannot allocate source-sized
     /// buffers. No write occurs for a wrong digest, path, offset or size.
@@ -1217,6 +1237,85 @@ mod tests {
             sha256: Sha256::digest(bytes).into(),
             executable: false,
         }
+    }
+
+    #[test]
+    fn resume_cursor_tracks_the_first_incomplete_member_and_preserves_full_sealing() {
+        fn exercise<const ARTIFACT: bool>() {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let bytes = b"complete bytes";
+            let manifest = FileManifest::<ARTIFACT>::new(vec![
+                entry("a-empty", b""),
+                entry("b-data", bytes),
+                entry("z-later", b"last"),
+            ])
+            .unwrap();
+            let mut receiver =
+                FileReceiver::create(&parent.path().join("received"), manifest).unwrap();
+            assert_eq!(receiver.resume_cursor().unwrap(), (1, 0));
+            receiver
+                .write_chunk("z-later", 0, b"last", Sha256::digest(b"last").into())
+                .unwrap();
+            assert_eq!(receiver.resume_cursor().unwrap(), (1, 0));
+            receiver
+                .write_chunk("b-data", 0, &bytes[..4], Sha256::digest(&bytes[..4]).into())
+                .unwrap();
+            assert_eq!(receiver.resume_cursor().unwrap(), (1, 4));
+            assert!(receiver.seal().is_err());
+            receiver
+                .write_chunk("b-data", 4, &bytes[4..], Sha256::digest(&bytes[4..]).into())
+                .unwrap();
+            assert_eq!(receiver.resume_cursor().unwrap(), (3, 0));
+            receiver.seal().unwrap();
+            assert_eq!(receiver.resume_cursor().unwrap(), (3, 0));
+        }
+        exercise::<false>();
+        exercise::<true>();
+    }
+
+    #[test]
+    fn resume_cursor_refuses_poisoned_or_replaced_receivers_and_never_proves_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let bytes = b"correct bytes";
+        let manifest = ArtifactManifest::new(vec![entry("data", bytes)]).unwrap();
+        let mut poisoned =
+            ArtifactReceiver::create(&parent.path().join("poisoned"), manifest.clone()).unwrap();
+        let wrong = b"changed bytes";
+        assert!(
+            poisoned
+                .write_chunk("data", 0, wrong, Sha256::digest(wrong).into())
+                .is_err()
+        );
+        assert!(poisoned.resume_cursor().is_err());
+
+        let replaced_path = parent.path().join("replaced");
+        let replaced = ArtifactReceiver::create(&replaced_path, manifest.clone()).unwrap();
+        fs::rename(&replaced_path, parent.path().join("original")).unwrap();
+        fs::create_dir(&replaced_path).unwrap();
+        fs::set_permissions(&replaced_path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(replaced.resume_cursor().is_err());
+
+        let root = parent.path().join("mutated");
+        let mut received = ArtifactReceiver::create(&root, manifest).unwrap();
+        received
+            .write_chunk("data", 0, &bytes[..4], Sha256::digest(&bytes[..4]).into())
+            .unwrap();
+        fs::write(root.join("data"), b"oops").unwrap();
+        // The cursor describes accepted transport bytes, not current byte trust.
+        assert_eq!(received.resume_cursor().unwrap(), (0, 4));
+        received
+            .write_chunk("data", 4, &bytes[4..], Sha256::digest(&bytes[4..]).into())
+            .unwrap();
+        assert!(received.seal().is_err());
+        assert!(received.resume_cursor().is_err());
     }
 
     #[test]

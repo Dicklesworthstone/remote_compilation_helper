@@ -58,28 +58,70 @@ fn validate_manifest(manifest: &ArtifactManifest) -> io::Result<()> {
 struct Parent {
     path: PathBuf,
     directory: File,
+    ancestors: Vec<(PathBuf, File)>,
 }
 
 impl Parent {
     fn open(path: &Path) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, openat};
         super::private_directory(path)?;
-        let before = fs::symlink_metadata(path)?;
-        let directory = File::open(path)?;
-        let opened = directory.metadata()?;
-        require(
-            before.dev() == opened.dev() && before.ino() == opened.ino(),
-            "remote target parent changed while opening",
-        )?;
+        let mut ancestors = Vec::new();
+        let mut current = PathBuf::from("/");
+        let mut directory = File::open(&current)?;
+        for component in path.components().skip(1) {
+            let child = File::from(openat(
+                &directory,
+                component.as_os_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            ancestors.push((current.clone(), directory));
+            current.push(component.as_os_str());
+            directory = child;
+        }
         let owner = Self {
             path: path.to_path_buf(),
             directory,
+            ancestors,
         };
         owner.verify()?;
         Ok(owner)
     }
 
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.clone(),
+            directory: self.directory.try_clone()?,
+            ancestors: self
+                .ancestors
+                .iter()
+                .map(|(path, directory)| Ok((path.clone(), directory.try_clone()?)))
+                .collect::<io::Result<_>>()?,
+        })
+    }
+
+    fn child(&self, path: PathBuf, directory: File) -> io::Result<Self> {
+        let mut ancestors = self.try_clone()?.ancestors;
+        ancestors.push((self.path.clone(), self.directory.try_clone()?));
+        let child = Self {
+            path,
+            directory,
+            ancestors,
+        };
+        child.verify()?;
+        Ok(child)
+    }
+
     fn verify(&self) -> io::Result<()> {
         super::private_directory(&self.path)?;
+        for (path, directory) in &self.ancestors {
+            let current = fs::symlink_metadata(path)?;
+            let held = directory.metadata()?;
+            require(
+                current.is_dir() && current.dev() == held.dev() && current.ino() == held.ino(),
+                "remote target parent ancestry was replaced",
+            )?;
+        }
         let current = fs::symlink_metadata(&self.path)?;
         let held = self.directory.metadata()?;
         require(
@@ -123,11 +165,8 @@ impl CaptureOwner {
             })?;
         let (directory, path) = created.keep().map_err(|error| error.error)?;
         let owner = Self {
-            parent: Parent {
-                path: parent.path.clone(),
-                directory: parent.directory.try_clone()?,
-            },
-            directory: Parent { path, directory },
+            parent: parent.try_clone()?,
+            directory: parent.child(path, directory)?,
         };
         owner.verify()?;
         Ok(owner)
@@ -192,6 +231,28 @@ fn verify_tree(
     checkpoint(stopped)?;
     validate_manifest(manifest)?;
     tree.verify(stopped)?;
+    verify_manifest_bytes(tree, manifest, stopped, sync)?;
+    if sync {
+        // Lexical order puts every child after its parent; sync children first.
+        let directories: Vec<_> = tree.directory_names().collect();
+        for name in directories.into_iter().rev() {
+            checkpoint(stopped)?;
+            tree.open_directory(name)?.sync_all()?;
+        }
+    }
+    tree.verify(stopped)?;
+    checkpoint(stopped)
+}
+
+/// Hash through the original inventory's retained root. Publication changes
+/// only the root's name and ctime, so an installed receipt can retain the exact
+/// same file/directory identities instead of reconstructing them from a path.
+fn verify_manifest_bytes(
+    tree: &TreeInventory,
+    manifest: &ArtifactManifest,
+    stopped: &impl Fn() -> bool,
+    sync: bool,
+) -> io::Result<()> {
     require(
         tree.names()
             .eq(manifest.files().iter().map(|file| file.path.as_str()))
@@ -228,16 +289,7 @@ fn verify_tree(
             file.sync_all()?;
         }
     }
-    if sync {
-        // Lexical order puts every child after its parent; sync children first.
-        let directories: Vec<_> = tree.directory_names().collect();
-        for name in directories.into_iter().rev() {
-            checkpoint(stopped)?;
-            tree.open_directory(name)?.sync_all()?;
-        }
-    }
-    tree.verify(stopped)?;
-    checkpoint(stopped)
+    Ok(())
 }
 
 /// Independent captured bytes, never writable links into the completed target.
@@ -376,6 +428,85 @@ impl CapturedTarget {
     pub(super) fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
         self.owner.verify()?;
         verify_tree(&self.tree, &self.manifest, stopped, false)
+    }
+}
+
+fn same_directory_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_dir()
+        && right.is_dir()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.nlink() == right.nlink()
+        && left.mode() == right.mode()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && (left.mtime(), left.mtime_nsec()) == (right.mtime(), right.mtime_nsec())
+}
+
+/// In-process custody of the exact tree installed by this receiver. It cannot
+/// be reconstructed from a destination path or an untrusted saved manifest.
+/// Retain it through terminal acknowledgment and any reconnect uncertainty.
+#[derive(Debug)]
+pub(super) struct InstalledTarget {
+    parent: Parent,
+    destination: PathBuf,
+    directory: File,
+    installed: fs::Metadata,
+    tree: TreeInventory,
+    manifest: ArtifactManifest,
+}
+
+impl InstalledTarget {
+    pub(super) fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+
+    fn verify_location(&self) -> io::Result<()> {
+        use rustix::fs::{Mode, OFlags, openat};
+        self.parent.verify()?;
+        let name = self
+            .destination
+            .file_name()
+            .ok_or_else(|| invalid("installed remote target name is absent"))?;
+        let named = File::from(openat(
+            &self.parent.directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        for current in [named.metadata()?, self.directory.metadata()?] {
+            require(
+                same_directory_state(&current, &self.installed)
+                    && (current.ctime(), current.ctime_nsec())
+                        == (self.installed.ctime(), self.installed.ctime_nsec()),
+                "installed remote target directory was replaced or changed",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_inventory(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        self.verify_location()?;
+        // The original root's pre-rename ctime and pathname are obsolete. Its
+        // children retain their exact sealed identities; the separate retained
+        // root descriptor and post-rename stamp cover root membership instead.
+        for name in self.tree.directory_names().filter(|name| !name.is_empty()) {
+            checkpoint(stopped)?;
+            self.tree.open_directory(name)?;
+        }
+        for name in self.tree.names() {
+            checkpoint(stopped)?;
+            self.tree.open_file(name)?;
+        }
+        self.verify_location()
+    }
+
+    pub(super) fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        checkpoint(stopped)?;
+        self.verify_inventory(stopped)?;
+        verify_manifest_bytes(&self.tree, &self.manifest, stopped, false)?;
+        self.verify_inventory(stopped)
     }
 }
 
@@ -537,6 +668,14 @@ impl ReceivedTarget {
         self.receiver.manifest()
     }
 
+    /// A cursor for this live receiver only; reconnect never adopts a partial
+    /// directory by its name. Full byte and namespace sealing remains mandatory.
+    pub(super) fn resume_cursor(&self) -> io::Result<(usize, u64)> {
+        require(!self.poisoned, "remote target receiver is failed")?;
+        self.parent.verify()?;
+        self.receiver.resume_cursor()
+    }
+
     /// Reuse complete old files as untrusted byte hints before receiving any
     /// network payload. Return the strictly ordered nonempty manifest indices
     /// still requiring download. Empty files already belong to the new receiver.
@@ -671,10 +810,10 @@ impl ReceivedTarget {
     /// A post-rename sync error can leave the destination installed; return that
     /// uncertainty without deleting it or authorizing execution to run again.
     pub(super) fn publish(
-        self,
+        mut self,
         destination: &Path,
         stopped: &impl Fn() -> bool,
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<InstalledTarget> {
         checkpoint(stopped)?;
         require(!self.poisoned, "remote target receiver is failed")?;
         require(
@@ -696,7 +835,7 @@ impl ReceivedTarget {
         // the retained descriptor, including if an ancestor was renamed after
         // the final cancellation checkpoint. Confirm the exact sealed source
         // before the atomic rename and the installed inode afterward.
-        let publication = (|| -> io::Result<()> {
+        let publication = (|| -> io::Result<(File, fs::Metadata)> {
             use rustix::fs::{Mode, OFlags, RenameFlags, openat, renameat_with};
             let source_name = self
                 .staging
@@ -717,7 +856,9 @@ impl ReceivedTarget {
             let source = open_named(source_name)?;
             let source_metadata = source.metadata()?;
             require(
-                source_metadata.dev() == expected.dev() && source_metadata.ino() == expected.ino(),
+                same_directory_state(&source_metadata, &expected)
+                    && (source_metadata.ctime(), source_metadata.ctime_nsec())
+                        == (expected.ctime(), expected.ctime_nsec()),
                 "remote target staging name no longer identifies the sealed tree",
             )?;
             renameat_with(
@@ -727,15 +868,17 @@ impl ReceivedTarget {
                 destination_name,
                 RenameFlags::NOREPLACE,
             )?;
-            let installed = open_named(destination_name)?.metadata()?;
+            let directory = open_named(destination_name)?;
+            let installed = directory.metadata()?;
             require(
-                installed.dev() == expected.dev() && installed.ino() == expected.ino(),
+                same_directory_state(&installed, &expected),
                 "remote target installation identity is uncertain",
             )?;
             self.parent.directory.sync_all()?;
-            self.parent.verify()
+            self.parent.verify()?;
+            Ok((directory, installed))
         })();
-        publication.map_err(|error| {
+        let (directory, installed) = publication.map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -745,7 +888,17 @@ impl ReceivedTarget {
                 ),
             )
         })?;
-        Ok(destination.to_path_buf())
+        Ok(InstalledTarget {
+            parent: self.parent,
+            destination: destination.to_path_buf(),
+            directory,
+            installed,
+            tree: self
+                .sealed
+                .take()
+                .expect("publication requires a sealed tree"),
+            manifest: self.receiver.manifest().clone(),
+        })
     }
 }
 
@@ -875,6 +1028,69 @@ mod tests {
         assert!(!destination.join("unrelated-link").exists());
         assert_eq!(fs::read(old.join("changed")).unwrap(), b"wrong bytes");
         assert_eq!(fs::read(old.join("partial")).unwrap(), b"part");
+    }
+
+    #[test]
+    fn installed_receipt_keeps_reused_bytes_independent_and_revalidates_the_new_tree() {
+        let old_parent = private();
+        let old = target(old_parent.path());
+        let retained = vec![0x4d; MAX_SOURCE_CHUNK + 19];
+        fs::write(old.join("a-reused"), &retained).unwrap();
+        let parent = private();
+        let fresh = b"new version";
+        let manifest = ArtifactManifest::new(vec![
+            file("a-reused", &retained, true),
+            file("z-fresh", fresh, false),
+        ])
+        .unwrap();
+        let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+        assert_eq!(received.reuse_from(&old, &|| false).unwrap(), vec![1]);
+        assert_eq!(received.resume_cursor().unwrap(), (1, 0));
+        received
+            .write_chunk(
+                "z-fresh",
+                0,
+                &fresh[..4],
+                Sha256::digest(&fresh[..4]).into(),
+            )
+            .unwrap();
+        assert_eq!(received.resume_cursor().unwrap(), (1, 4));
+        received
+            .write_chunk(
+                "z-fresh",
+                4,
+                &fresh[4..],
+                Sha256::digest(&fresh[4..]).into(),
+            )
+            .unwrap();
+        received.seal(&|| false).unwrap();
+        let destination = parent.path().join("completed");
+        let installed = received.publish(&destination, &|| false).unwrap();
+        assert_eq!(installed.manifest(), &manifest);
+        let prior = fs::metadata(old.join("a-reused")).unwrap();
+        let current = fs::metadata(destination.join("a-reused")).unwrap();
+        assert_ne!((prior.dev(), prior.ino()), (current.dev(), current.ino()));
+        assert_eq!(current.mode() & 0o7777, 0o555);
+
+        // The source of a verified import retains no installed write authority.
+        fs::write(old.join("a-reused"), b"changed old output").unwrap();
+        installed.verify(&|| false).unwrap();
+        assert_eq!(fs::read(destination.join("a-reused")).unwrap(), retained);
+
+        // Even an identical-byte replacement of the installed member loses
+        // the retained generation, so a resumed acknowledgment must refuse.
+        fs::rename(
+            destination.join("a-reused"),
+            parent.path().join("original-installed-member"),
+        )
+        .unwrap();
+        fs::write(destination.join("a-reused"), &retained).unwrap();
+        fs::set_permissions(
+            destination.join("a-reused"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        assert!(installed.verify(&|| false).is_err());
     }
 
     #[test]
@@ -1090,10 +1306,10 @@ mod tests {
         assert!(!destination.exists());
         received.seal(&|| false).unwrap();
         assert!(!destination.exists());
-        assert_eq!(
-            received.publish(&destination, &|| false).unwrap(),
-            destination
-        );
+        let installed = received.publish(&destination, &|| false).unwrap();
+        assert_eq!(installed.destination, destination);
+        assert_eq!(installed.manifest(), captured.manifest());
+        installed.verify(&|| false).unwrap();
         assert_eq!(fs::read(destination.join("nested/data")).unwrap(), bytes);
         assert_eq!(fs::read(destination.join("alias")).unwrap(), bytes);
         assert!(fs::read(destination.join("empty")).unwrap().is_empty());
@@ -1108,6 +1324,198 @@ mod tests {
             0o555,
         );
         assert!(original.exists());
+    }
+
+    #[test]
+    fn partial_artifact_cursor_retains_the_exact_receiver_across_delivery_sessions() {
+        let parent = private();
+        let bytes = vec![0x63; MAX_SOURCE_CHUNK * 2 + 23];
+        let manifest = ArtifactManifest::new(vec![
+            file("a-empty", b"", false),
+            file("bin/program", &bytes, true),
+            file("version", b"v1", false),
+        ])
+        .unwrap();
+        let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+        assert_eq!(received.manifest(), &manifest);
+        assert_eq!(received.resume_cursor().unwrap(), (1, 0));
+        received
+            .write_chunk(
+                "bin/program",
+                0,
+                &bytes[..MAX_SOURCE_CHUNK],
+                Sha256::digest(&bytes[..MAX_SOURCE_CHUNK]).into(),
+            )
+            .unwrap();
+        assert_eq!(
+            received.resume_cursor().unwrap(),
+            (1, MAX_SOURCE_CHUNK as u64)
+        );
+        let staging = received.staging.clone();
+        // A replacement transport keeps the same receiver and its hash state.
+        // No retained pathname is reopened as a new receiver or trusted result.
+        let (first, mut offset) = received.resume_cursor().unwrap();
+        assert_eq!(first, 1);
+        while offset < bytes.len() as u64 {
+            let end = (offset as usize + MAX_SOURCE_CHUNK).min(bytes.len());
+            let chunk = &bytes[offset as usize..end];
+            offset = received
+                .write_chunk("bin/program", offset, chunk, Sha256::digest(chunk).into())
+                .unwrap();
+        }
+        assert_eq!(received.resume_cursor().unwrap(), (2, 0));
+        received
+            .write_chunk("version", 0, b"v1", Sha256::digest(b"v1").into())
+            .unwrap();
+        assert_eq!(received.resume_cursor().unwrap(), (3, 0));
+        assert_eq!(received.staging, staging);
+        received.seal(&|| false).unwrap();
+        let installed = received
+            .publish(&parent.path().join("completed"), &|| false)
+            .unwrap();
+        installed.verify(&|| false).unwrap();
+        assert_eq!(
+            fs::read(parent.path().join("completed/bin/program")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn installed_receipt_survives_a_lost_acknowledgment_without_republication() {
+        let parent = private();
+        let bytes = b"complete installed artifact";
+        let manifest = ArtifactManifest::new(vec![file("data", bytes, false)]).unwrap();
+        let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+        received
+            .write_chunk("data", 0, bytes, Sha256::digest(bytes).into())
+            .unwrap();
+        received.seal(&|| false).unwrap();
+        let destination = parent.path().join("completed");
+        let installed = received.publish(&destination, &|| false).unwrap();
+        let identity = fs::metadata(&destination).unwrap();
+        installed.verify(&|| false).unwrap();
+        assert_eq!(
+            installed.verify(&|| true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        installed.verify(&|| false).unwrap();
+        assert_eq!(installed.manifest(), &manifest);
+        let current = fs::metadata(&destination).unwrap();
+        assert_eq!(
+            (identity.dev(), identity.ino()),
+            (current.dev(), current.ino())
+        );
+        assert_eq!(fs::read(destination.join("data")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn installed_receipt_refuses_byte_mode_member_and_namespace_replacement() {
+        for mutation in [
+            "bytes",
+            "mode",
+            "extra",
+            "empty-directory",
+            "missing",
+            "file-replacement",
+            "directory-replacement",
+            "root",
+            "parent",
+            "ancestor",
+        ] {
+            let outer = private();
+            let ancestor = outer.path().join("ancestor");
+            let parent = ancestor.join("parent");
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&parent)
+                .unwrap();
+            let bytes = b"complete installed artifact";
+            let manifest = ArtifactManifest::new(vec![file("nested/data", bytes, false)]).unwrap();
+            let mut received = ReceivedTarget::new(&parent, manifest).unwrap();
+            received
+                .write_chunk("nested/data", 0, bytes, Sha256::digest(bytes).into())
+                .unwrap();
+            received.seal(&|| false).unwrap();
+            let destination = parent.join("completed");
+            let installed = received.publish(&destination, &|| false).unwrap();
+            match mutation {
+                "bytes" => {
+                    fs::set_permissions(
+                        destination.join("nested/data"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    fs::write(
+                        destination.join("nested/data"),
+                        b"changed installed artifact",
+                    )
+                    .unwrap();
+                    fs::set_permissions(
+                        destination.join("nested/data"),
+                        fs::Permissions::from_mode(0o444),
+                    )
+                    .unwrap();
+                }
+                "mode" => fs::set_permissions(
+                    destination.join("nested/data"),
+                    fs::Permissions::from_mode(0o555),
+                )
+                .unwrap(),
+                "extra" => fs::write(destination.join("extra"), b"unexpected").unwrap(),
+                "empty-directory" => fs::create_dir(destination.join("extra")).unwrap(),
+                "missing" => {
+                    fs::rename(
+                        destination.join("nested/data"),
+                        parent.join("original-file"),
+                    )
+                    .unwrap();
+                }
+                "file-replacement" => {
+                    fs::rename(
+                        destination.join("nested/data"),
+                        parent.join("original-file"),
+                    )
+                    .unwrap();
+                    fs::write(destination.join("nested/data"), bytes).unwrap();
+                    fs::set_permissions(
+                        destination.join("nested/data"),
+                        fs::Permissions::from_mode(0o444),
+                    )
+                    .unwrap();
+                }
+                "directory-replacement" => {
+                    fs::rename(destination.join("nested"), parent.join("original-nested")).unwrap();
+                    fs::create_dir(destination.join("nested")).unwrap();
+                    fs::rename(
+                        parent.join("original-nested/data"),
+                        destination.join("nested/data"),
+                    )
+                    .unwrap();
+                }
+                "root" => {
+                    fs::rename(&destination, parent.join("original-installed")).unwrap();
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&destination)
+                        .unwrap();
+                }
+                "parent" => {
+                    fs::rename(&parent, ancestor.join("original-parent")).unwrap();
+                    fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+                }
+                "ancestor" => {
+                    let old = outer.path().join("original-ancestor");
+                    fs::rename(&ancestor, &old).unwrap();
+                    fs::DirBuilder::new().mode(0o700).create(&ancestor).unwrap();
+                    // The immediate parent and installed tree retain their
+                    // inodes. Only the previously retained ancestor changes.
+                    fs::rename(old.join("parent"), &parent).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(installed.verify(&|| false).is_err(), "{mutation}");
+        }
     }
 
     #[test]

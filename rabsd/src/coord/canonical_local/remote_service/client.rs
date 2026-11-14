@@ -1,6 +1,6 @@
 //! Local capture and verified result installation for a remote operation.
 
-use super::super::remote_artifacts::ReceivedTarget;
+use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, ArtifactPlan, CargoHome,
@@ -871,16 +871,17 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let delivery_deadline = Instant::now() + DELIVERY_BUDGET;
     let installed = if let Some(manifest) = target {
-        receive_target(
-            wire,
-            manifest,
-            &config.output_destination,
-            config.artifact_reuse_root.as_deref(),
-            stopped,
-            delivery_deadline,
+        Some(
+            receive_target(
+                wire,
+                manifest,
+                &config.output_destination,
+                config.artifact_reuse_root.as_deref(),
+                stopped,
+                delivery_deadline,
+            )
+            .await?,
         )
-        .await?;
-        Some(&config.output_destination)
     } else {
         wire.send(&Message::Close {}, stopped, delivery_deadline)
             .await?;
@@ -898,12 +899,17 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         completed == exit_code,
         "remote terminal exit status changed",
     )?;
+    if let Some(installed) = &installed {
+        installed
+            .verify(&|| stopped.load(Ordering::Acquire) || Instant::now() >= delivery_deadline)?;
+    }
     // This locally chosen path is reported only after the final coordinator
     // receipt. Diagnostic JSON from Cargo never authorizes installation.
     eprintln!(
         "{}",
         json!({"kind":"canonical-remote-completed", "exit_code":exit_code,
-        "target_root":installed, "coordinator":config.coordinator, "cargo_location":"coordinator"})
+        "target_root":installed.as_ref().map(|_| &config.output_destination),
+        "coordinator":config.coordinator, "cargo_location":"coordinator"})
     );
     Ok(exit_code)
 }
@@ -915,7 +921,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     artifact_reuse_root: Option<&Path>,
     stopped: &AtomicBool,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<InstalledTarget> {
     require_absent(destination)?;
     let native = receive_artifact_manifest(wire, declaration, stopped, deadline).await?;
     let manifest_sha256 = encode_hex(&native.digest());
@@ -1021,11 +1027,13 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
         committed == manifest_sha256,
         "coordinator authorized a different target manifest",
     )?;
-    target.publish(destination, &cancelled)?;
+    let installed = target.publish(destination, &cancelled)?;
+    installed.verify(&cancelled)?;
     // A lost response after this rename leaves an installed directory and an
     // uncertain command result. Never remove it or reexecute automatically.
     wire.send(&Message::Published { manifest_sha256 }, stopped, deadline)
-        .await
+        .await?;
+    Ok(installed)
 }
 
 async fn receive_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1490,6 +1498,131 @@ mod tests {
             executable: false,
         }));
         (ArtifactManifest::new(files).unwrap(), bytes)
+    }
+
+    fn delivery_config(destination: &Path) -> ClientProfile {
+        serde_json::from_value(json!({
+            "version": VERSION,
+            "coordinator": "fixture-coordinator",
+            "server_name": "fixture-coordinator",
+            "coordinator_pin": "11".repeat(32),
+            "tls": {"ca":"/fixture/ca", "certificate":"/fixture/certificate",
+                "private_key":"/fixture/key"},
+            "source_root":"/fixture/source", "toolchain_root":"/fixture/toolchain",
+            "staging_root":"/fixture/staging", "output_destination":destination,
+            "settings":{"command":"check", "manifest":"Cargo.toml", "jobs":1,
+                "timeout_seconds":30}
+        }))
+        .unwrap()
+    }
+
+    /// Delay the terminal record until the actual client has published. This
+    /// tests retained delivery custody, not a TLS or compiler execution path.
+    struct CompletionPeer {
+        inner: AdmissionStream,
+        destination: PathBuf,
+        alter_after_published: bool,
+        completed: bool,
+    }
+
+    impl AsyncRead for CompletionPeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let peer = self.get_mut();
+            if peer.inner.offset == peer.inner.input.len() && !peer.completed {
+                assert!(
+                    admission_messages(&peer.inner.output)
+                        .iter()
+                        .any(|message| message["kind"] == "published"),
+                    "the terminal peer waits for actual publication"
+                );
+                if peer.alter_after_published {
+                    let program = peer.destination.join("program");
+                    fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+                    fs::write(program, b"changed after the publication acknowledgment")?;
+                }
+                peer.inner
+                    .input
+                    .extend(serde_json::to_vec(&Message::Complete { exit_code: 0 }).unwrap());
+                peer.inner.input.push(b'\n');
+                peer.completed = true;
+            }
+            Pin::new(&mut peer.inner).poll_read(context, output)
+        }
+    }
+
+    impl AsyncWrite for CompletionPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(context, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    #[test]
+    fn terminal_completion_rechecks_the_exact_installed_target() {
+        let (manifest, bytes) = artifact_fixture();
+        for altered in [false, true] {
+            let directory = private();
+            let destination = directory.path().join("completed");
+            let config = delivery_config(&destination);
+            let mut messages = vec![Message::BuildFinished {
+                exit_code: 0,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                target: Some(ArtifactDeclaration::from_native(&manifest)),
+            }];
+            messages.extend(artifact_manifest_messages(&manifest));
+            for (index, bytes) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                messages.push(Message::ArtifactChunk {
+                    chunk: Chunk::new("program", (index * MAX_SOURCE_CHUNK) as u64, bytes).unwrap(),
+                });
+            }
+            messages.push(Message::WindowEnd { count: 2 });
+            messages.push(Message::ArtifactEnd {});
+            messages.push(Message::Commit {
+                manifest_sha256: encode_hex(&manifest.digest()),
+            });
+            let mut inner = AdmissionStream::new(&messages, false);
+            inner.quantum = 211;
+            let mut wire = Wire::new(CompletionPeer {
+                inner,
+                destination: destination.clone(),
+                alter_after_published: altered,
+                completed: false,
+            });
+            let result = native(receive_operation(
+                &mut wire,
+                &config,
+                &AtomicBool::new(false),
+            ));
+            if altered {
+                assert!(
+                    result.is_err(),
+                    "a terminal receipt cannot bless changed outputs"
+                );
+                assert_eq!(
+                    fs::read(destination.join("program")).unwrap(),
+                    b"changed after the publication acknowledgment"
+                );
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
