@@ -13,8 +13,8 @@ use rabs_sandbox::artifact_tree::{
     MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
 };
 use rabs_sandbox::source_transfer::{
-    ArtifactManifest, MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SourceFile,
-    SourceManifest,
+    ArtifactManifest, MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES,
+    MAX_SOURCE_PREFIX_HINT_BYTES, SourceFile, SourceManifest,
 };
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
@@ -30,7 +30,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v5";
+/// v6 adds bounded source-prefix offers to Ready. The first source chunk's
+/// existing offset selects a verified offer or a complete upload from zero.
+/// Older peers must refuse during Hello before either side admits input bytes.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v6";
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
 pub(super) const SOURCE_PAGE_FILES: usize = 64;
@@ -443,14 +446,26 @@ impl ArtifactPages {
     }
 }
 
+/// A retained prefix, indexed by the complete manifest's canonical path order.
+/// The sender independently checks its bytes before selecting this cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourcePrefixOffer {
+    pub(super) index: u16,
+    pub(super) offset: u64,
+    pub(super) sha256: String,
+}
+
 /// Missing input bytes, indexed by the complete manifest's canonical path order.
-/// This hint never grants source authority: the receiver must still seal the
+/// These hints never grant source authority: the receiver must still seal the
 /// entire declared tree, including every independently imported cache hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SourcePlan {
     pub(super) manifest_sha256: String,
     pub(super) missing_files: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) prefixes: Vec<SourcePrefixOffer>,
 }
 
 impl SourcePlan {
@@ -469,12 +484,28 @@ impl SourcePlan {
     }
 
     pub(super) fn new(manifest: &SourceManifest, missing_files: Vec<u16>) -> io::Result<Self> {
+        Self::with_prefixes(manifest, missing_files, Vec::new())
+    }
+
+    pub(super) fn with_prefixes(
+        manifest: &SourceManifest,
+        missing_files: Vec<u16>,
+        prefixes: Vec<SourcePrefixOffer>,
+    ) -> io::Result<Self> {
         let plan = Self {
             manifest_sha256: encode_hex(&manifest.digest()),
             missing_files,
+            prefixes,
         };
         plan.validate(manifest)?;
         Ok(plan)
+    }
+
+    pub(super) fn prefix_for(&self, index: usize) -> Option<&SourcePrefixOffer> {
+        self.prefixes
+            .binary_search_by_key(&index, |prefix| usize::from(prefix.index))
+            .ok()
+            .map(|position| &self.prefixes[position])
     }
 
     pub(super) fn validate(&self, manifest: &SourceManifest) -> io::Result<()> {
@@ -492,7 +523,34 @@ impl SourcePlan {
                         .is_some_and(|file| file.len != 0)
                 }),
             "source upload indexes must be a bounded ordered subset of nonempty files",
-        )
+        )?;
+        require(
+            self.prefixes.len() <= self.missing_files.len()
+                && self
+                    .prefixes
+                    .windows(2)
+                    .all(|pair| pair[0].index < pair[1].index),
+            "source prefixes must be a bounded ordered subset of missing files",
+        )?;
+        let mut encoded_bytes = 2_usize; // The array's opening and closing brackets.
+        for (position, prefix) in self.prefixes.iter().enumerate() {
+            require(
+                self.missing_files.binary_search(&prefix.index).is_ok()
+                    && manifest
+                        .files()
+                        .get(usize::from(prefix.index))
+                        .is_some_and(|file| prefix.offset != 0 && prefix.offset < file.len),
+                "source prefix must name an incomplete requested file",
+            )?;
+            digest(&prefix.sha256)?;
+            // Validate each small row before serializing it. A malformed digest
+            // or unbounded list cannot allocate another large JSON record here.
+            encoded_bytes = encoded_bytes
+                .checked_add(serde_json::to_vec(prefix)?.len() + usize::from(position != 0))
+                .filter(|bytes| *bytes <= MAX_SOURCE_PREFIX_HINT_BYTES)
+                .ok_or_else(|| invalid("source prefix offers exceed their metadata bound"))?;
+        }
+        Ok(())
     }
 }
 
@@ -945,6 +1003,9 @@ impl Window {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod prefix_tests;
 
 #[cfg(test)]
 mod tests {

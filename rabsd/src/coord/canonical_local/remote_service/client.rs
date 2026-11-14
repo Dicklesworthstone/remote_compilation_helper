@@ -5,8 +5,8 @@ use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, CargoHome, Chunk, Entry,
     IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan,
-    Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
-    controlled_future, decode_hex, digest, invalid, require,
+    SourcePrefixOffer, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire,
+    checkpoint, controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -31,6 +31,7 @@ use rabs_sandbox::source_transfer::{
 use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_INPUT_BUDGET, ToolchainEntryKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -401,6 +402,43 @@ async fn upload_message<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// A coordinator's offered cursor is only a byte hint. Hash the independent,
+/// already verified source checkpoint before selecting it, then leave the
+/// reader at the exact tail to send. A mismatch chooses a complete upload;
+/// cancellation, short reads and other local I/O errors remain terminal.
+fn source_prefix_offset(
+    reader: &mut (impl Read + Seek),
+    offered: Option<&SourcePrefixOffer>,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<u64> {
+    checkpoint(stopped, deadline)?;
+    reader.seek(SeekFrom::Start(0))?;
+    let Some(offered) = offered else {
+        return Ok(0);
+    };
+    let expected = digest(&offered.sha256)?;
+    let mut remaining = offered.offset;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
+    while remaining != 0 {
+        checkpoint(stopped, deadline)?;
+        let length = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..length])?;
+        hash.update(&buffer[..length]);
+        remaining -= length as u64;
+    }
+    checkpoint(stopped, deadline)?;
+    let offset = if <[u8; 32]>::from(hash.finalize()) == expected {
+        offered.offset
+    } else {
+        0
+    };
+    reader.seek(SeekFrom::Start(offset))?;
+    checkpoint(stopped, deadline)?;
+    Ok(offset)
+}
+
 async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     bundle: &mut PreparedLocalBundle,
@@ -439,8 +477,12 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 | SourceCheckpointError::Destination(error) => error,
             })?
             .into_file();
-        verified.seek(SeekFrom::Start(0))?;
-        let mut offset = 0;
+        let mut offset = source_prefix_offset(
+            &mut verified,
+            source_plan.prefix_for(index),
+            stopped,
+            deadline,
+        )?;
         // Held across awaits: an inline array would sit in the future, and
         // every move of the composed upload future copies it (bd-yxl32).
         let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
@@ -740,7 +782,12 @@ async fn receive_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 #[cfg(test)]
+mod prefix_tests;
+
+#[cfg(test)]
 mod tests {
+    mod source_prefix_upload;
+
     use super::super::ToolchainInput;
     use super::super::source_inputs::SourceInput;
     use super::super::wire;

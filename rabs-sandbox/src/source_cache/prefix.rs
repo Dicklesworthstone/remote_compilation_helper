@@ -55,6 +55,16 @@ impl SourcePrefixSnapshots {
         })
     }
 
+    /// Carry the frozen bytes into the owner's next bounded transfer phase.
+    /// The caller must grant this budget only once, after preparation completes;
+    /// individual frames and retries must not renew it. Cancellation remains
+    /// bound to the same shared flag, and the spool generation is unchanged.
+    #[must_use]
+    pub fn before(mut self, deadline: Instant) -> Self {
+        self.cache = self.cache.before(deadline);
+        self
+    }
+
     /// Cache errors are misses. Cancellation is still returned independently,
     /// and no partially copied range is ever offered to the sender.
     pub fn capture(&mut self, expected: &SourceFile) -> io::Result<Option<SourcePrefix>> {

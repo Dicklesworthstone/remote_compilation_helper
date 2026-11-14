@@ -1347,14 +1347,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v5_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v5", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v6_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v6", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
             ("canonical-compile-remote-v3", "build-one"),
             ("canonical-compile-remote-v4", "build-one"),
-            ("canonical-compile-remote-v5", "build-two"),
+            ("canonical-compile-remote-v5", "build-one"),
+            ("canonical-compile-remote-v6", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(

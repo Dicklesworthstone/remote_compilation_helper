@@ -2521,13 +2521,33 @@ still requires a complete fresh server-side seal before execution; imported byte
 and mutable execution files never share writable inodes. Source chunks outside
 the frozen missing-file plan are terminal protocol errors.
 
-Verified per-file checkpoints can seed later transfers even if an upload stops
-before the complete tree is sealed. They are byte-reuse hints, never execution
-or action-cache authority. Missing, evicted, corrupt or unavailable cache objects
-request ordinary upload before import begins. Once an import has started, a
-verification or cancellation failure cannot be converted into a cache miss in
-that receiver. Optional cache-write contention or storage failure can skip
-retention, but cannot hide invalid source bytes or authorize a partial tree.
+Completed files and bounded partial-file checkpoints can seed later transfers
+even if an upload stops before the complete tree is sealed. Ready may offer an
+incomplete file's index, byte offset and SHA-256, with at most 256 KiB of prefix
+metadata. Offers refer to one frozen private snapshot bounded by the declared
+source bytes and the existing cache budget. They are byte-reuse hints, never
+execution or action-cache authority.
+
+The client hashes the offered range from its independently verified local source
+checkpoint. A match sends only the missing tail; a mismatch starts the ordinary
+upload at zero. The first source chunk's offset selects exactly that frozen
+offer or zero. No extra round trip is added, and the existing four-frame upload
+window remains unchanged. The coordinator imports a selected prefix only once,
+checks the complete file and still requires the final complete-tree seal. This
+also applies to declared Cargo-home registry inputs. Wire version
+`canonical-compile-remote-v6` and the exact tool build identity must match before
+the service admits inputs; update the client and service together.
+
+The preparation budget bounds snapshot capture. Readiness grants the existing
+separate fixed input budget to both the receiver and its frozen snapshots;
+chunks, retries and prefix selection cannot renew it. Cancellation is checked
+between bounded copies. Missing, evicted or unavailable cache objects request
+ordinary upload. Once an import has started, a verification or cancellation
+failure cannot become a cache miss in that receiver. Optional cache-write
+contention or storage failure can skip retention, but cannot hide invalid source
+bytes or authorize a partial tree. Accepted partial bytes share the same object
+quota and byte budget as complete files, and failed replacement preserves the
+previous acknowledged checkpoint.
 
 The optional server `target_cache` object retains Cargo's private compilation
 state across remote operations and service restarts. It uses the existing
@@ -2761,8 +2781,8 @@ and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
 Install matching client and coordinator binaries: paged source and artifact
-manifests, source-file delta negotiation and SDK upload/reuse selection use wire
-version `canonical-compile-remote-v5`, while existing client and service JSON
+manifests, source-file and partial-prefix negotiation, and SDK upload/reuse
+selection use wire version `canonical-compile-remote-v6`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 
