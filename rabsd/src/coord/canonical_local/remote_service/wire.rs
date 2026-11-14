@@ -32,10 +32,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v7 adds explicit SDK file/prefix negotiation to UploadFiles. The ordinary
-/// upload and complete-image reuse paths keep their existing framing. Older
-/// peers refuse during Hello before either side admits input bytes.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v7";
+/// v8 adds a manifest-bound missing-file plan to artifact delivery. The client
+/// can import independently verified complete files before requesting payloads.
+/// Older peers must refuse during Hello before either side admits input bytes.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v8";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
@@ -446,6 +446,62 @@ impl ArtifactPages {
             "remote artifact manifest differs from its declared identity",
         )?;
         Ok(manifest)
+    }
+}
+
+/// Payload selection after the complete artifact manifest has been checked.
+/// Omitted members must already have independent byte custody at the client;
+/// the final full-tree seal and coordinator publication checks remain required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArtifactPlan {
+    pub(super) manifest_sha256: String,
+    pub(super) missing_files: Vec<u16>,
+}
+
+impl ArtifactPlan {
+    pub(super) fn all(manifest: &ArtifactManifest) -> io::Result<Self> {
+        let missing_files = manifest
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.len != 0)
+            .map(|(index, _)| {
+                u16::try_from(index)
+                    .map_err(|_| invalid("artifact delivery index exceeds its wire bound"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::new(manifest, missing_files)
+    }
+
+    pub(super) fn new(manifest: &ArtifactManifest, missing_files: Vec<u16>) -> io::Result<Self> {
+        Self::from_request(encode_hex(&manifest.digest()), missing_files, manifest)
+    }
+
+    pub(super) fn from_request(
+        manifest_sha256: String,
+        missing_files: Vec<u16>,
+        manifest: &ArtifactManifest,
+    ) -> io::Result<Self> {
+        require(
+            digest(&manifest_sha256)? == manifest.digest(),
+            "artifact delivery plan differs from the captured manifest",
+        )?;
+        require(
+            missing_files.len() <= MAX_ARTIFACT_FILES
+                && missing_files.len() <= manifest.files().len()
+                && missing_files.windows(2).all(|pair| pair[0] < pair[1])
+                && missing_files.iter().all(|index| {
+                    manifest
+                        .files()
+                        .get(usize::from(*index))
+                        .is_some_and(|file| file.len != 0)
+                }),
+            "artifact delivery indexes must be a bounded ordered subset of nonempty files",
+        )?;
+        Ok(Self {
+            manifest_sha256,
+            missing_files,
+        })
     }
 }
 
@@ -920,6 +976,7 @@ pub(super) enum Message {
     ArtifactManifestEnd {},
     ReceiveArtifacts {
         manifest_sha256: String,
+        missing_files: Vec<u16>,
     },
     ArtifactChunk {
         chunk: Chunk,
@@ -1172,6 +1229,119 @@ impl Window {
 
 #[cfg(test)]
 mod prefix_tests;
+
+#[cfg(test)]
+mod artifact_plan_tests {
+    use super::*;
+
+    fn manifest() -> ArtifactManifest {
+        ArtifactManifest::new(vec![
+            SourceFile {
+                path: "program".into(),
+                len: 3,
+                sha256: Sha256::digest(b"bin").into(),
+                executable: true,
+            },
+            SourceFile {
+                path: "empty".into(),
+                len: 0,
+                sha256: Sha256::digest([]).into(),
+                executable: false,
+            },
+            SourceFile {
+                path: "deps/lib.rmeta".into(),
+                len: 4,
+                sha256: Sha256::digest(b"meta").into(),
+                executable: false,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn artifact_plans_select_only_ordered_nonempty_manifest_members() {
+        let manifest = manifest();
+        let all = ArtifactPlan::all(&manifest).unwrap();
+        assert_eq!(all.missing_files, [0, 2]);
+        assert_eq!(all.manifest_sha256, encode_hex(&manifest.digest()));
+        for missing in [vec![], vec![0], vec![2], vec![0, 2]] {
+            assert_eq!(
+                ArtifactPlan::new(&manifest, missing.clone())
+                    .unwrap()
+                    .missing_files,
+                missing,
+            );
+        }
+        for missing in [
+            vec![0, 0],
+            vec![2, 0],
+            vec![1],
+            vec![3],
+            vec![u16::MAX],
+            vec![0; MAX_ARTIFACT_FILES + 1],
+        ] {
+            assert!(ArtifactPlan::new(&manifest, missing).is_err());
+        }
+    }
+
+    #[test]
+    fn artifact_plan_reuse_does_not_waive_complete_manifest_identity() {
+        let original = manifest();
+        let identity = encode_hex(&original.digest());
+        for missing in [vec![], vec![0], vec![0, 2]] {
+            for corrupt in ["00".repeat(32), "ff".repeat(31), "FF".repeat(32)] {
+                assert!(ArtifactPlan::from_request(corrupt, missing.clone(), &original).is_err());
+            }
+            // A reused file's bytes, path, length and mode remain part of the
+            // complete identity even when the request sends none of its bytes.
+            for changed in 0..4 {
+                let mut files = original.files().to_vec();
+                match changed {
+                    0 => files[2].sha256 = Sha256::digest(b"new").into(),
+                    1 => files[2].path = "another-program".into(),
+                    2 => files[2].executable = false,
+                    _ => files[2].len += 1,
+                }
+                let different = ArtifactManifest::new(files).unwrap();
+                assert!(
+                    ArtifactPlan::from_request(identity.clone(), missing.clone(), &different)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_artifact_plan_is_compact_even_for_large_manifest_paths() {
+        let manifest = ArtifactManifest::new(
+            (0..MAX_ARTIFACT_FILES)
+                .map(|index| SourceFile {
+                    path: format!("{index:05}/{}", "a".repeat(384)),
+                    len: 1,
+                    sha256: Sha256::digest(b"x").into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let plan = ArtifactPlan::all(&manifest).unwrap();
+        assert_eq!(plan.missing_files.len(), MAX_ARTIFACT_FILES);
+        assert_eq!(plan.missing_files.first(), Some(&0));
+        assert_eq!(
+            usize::from(*plan.missing_files.last().unwrap()),
+            MAX_ARTIFACT_FILES - 1,
+        );
+        // The wire carries indexes rather than repeating the paged paths.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "kind":"receive-artifacts",
+            "manifest_sha256":plan.manifest_sha256,
+            "missing_files":plan.missing_files,
+        }))
+        .unwrap();
+        assert!(bytes.len() < 100 * 1024);
+        assert!(bytes.len() < MAX_JSON_RECORD);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1897,6 +2067,39 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<Message>(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn artifact_delivery_wire_requires_explicit_bounded_file_indexes() {
+        let identity = "ab".repeat(32);
+        let valid = json!({
+            "kind":"receive-artifacts", "manifest_sha256":identity,
+            "missing_files":[0, 2],
+        });
+        assert!(matches!(
+            serde_json::from_value::<Message>(valid.clone()).unwrap(),
+            Message::ReceiveArtifacts { missing_files, .. } if missing_files == [0, 2]
+        ));
+        for index in [json!(-1), json!(65536), json!("0"), json!(0.5)] {
+            let mut value = valid.clone();
+            value["missing_files"] = json!([index]);
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for field in ["path", "root", "extra"] {
+            let mut value = valid.clone();
+            value[field] = json!("/not-a-path-capability");
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        assert!(
+            serde_json::from_value::<Message>(json!({
+                "kind":"receive-artifacts", "manifest_sha256":identity,
+            }))
+            .is_err()
+        );
+        let duplicate = format!(
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[],\"missing_files\":[0]}}"
+        );
+        assert!(serde_json::from_str::<Message>(&duplicate).is_err());
     }
 
     #[test]

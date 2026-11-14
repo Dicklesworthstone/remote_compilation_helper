@@ -12,7 +12,7 @@ use rabs_sandbox::source_transfer::{
     ArtifactManifest, ArtifactReceiver, MAX_SOURCE_CHUNK, SourceFile, create_staging_file,
 };
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -379,6 +379,108 @@ impl CapturedTarget {
     }
 }
 
+/// An untrusted old member becomes a byte hint only after a bounded, complete
+/// hash. Its name is always resolved beneath the retained private root, never
+/// through an old manifest or an unrelated directory enumeration.
+struct ReuseFile {
+    file: File,
+    observed: Metadata,
+}
+
+fn same_reuse_file(before: &Metadata, after: &Metadata) -> bool {
+    after.is_file()
+        && after.nlink() == 1
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mode() == after.mode()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn open_reuse_file(root: &Parent, path: &str) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    Ok(File::from(openat2(
+        &root.directory,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+    )?))
+}
+
+impl ReuseFile {
+    fn inspect(
+        root: &Parent,
+        expected: &SourceFile,
+        buffer: &mut [u8],
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<Self>> {
+        checkpoint(stopped)?;
+        root.verify()?;
+        let mut file = match open_reuse_file(root, &expected.path) {
+            Ok(file) => file,
+            Err(_) => {
+                // Missing, inaccessible and linked old members are all misses.
+                // The selected root itself must nevertheless remain unchanged.
+                root.verify()?;
+                checkpoint(stopped)?;
+                return Ok(None);
+            }
+        };
+        let observed = match file.metadata() {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.nlink() == 1
+                    && metadata.len() == expected.len =>
+            {
+                metadata
+            }
+            _ => return Ok(None),
+        };
+        let inspected = (|| {
+            let mut hash = Sha256::new();
+            let mut remaining = expected.len;
+            while remaining != 0 {
+                checkpoint(stopped)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            checkpoint(stopped)?;
+            Ok::<_, io::Error>(
+                file.read(&mut buffer[..1])? == 0
+                    && <[u8; 32]>::from(hash.finalize()) == expected.sha256
+                    && same_reuse_file(&observed, &file.metadata()?)
+                    && same_reuse_file(
+                        &observed,
+                        &open_reuse_file(root, &expected.path)?.metadata()?,
+                    ),
+            )
+        })();
+        root.verify()?;
+        match inspected {
+            Ok(true) => Ok(Some(Self { file, observed })),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(error),
+            // No receiver bytes were touched: stale, partial, corrupt or
+            // unavailable files may safely request ordinary network delivery.
+            Ok(false) | Err(_) => Ok(None),
+        }
+    }
+
+    fn verify(&self, root: &Parent, path: &str) -> io::Result<()> {
+        root.verify()?;
+        require(
+            same_reuse_file(&self.observed, &self.file.metadata()?)
+                && same_reuse_file(&self.observed, &open_reuse_file(root, path)?.metadata()?),
+            "artifact reuse member changed after selection",
+        )
+    }
+}
+
 /// A fresh client-owned staging tree. Failed and interrupted transfers retain
 /// their private staging paths; only an exact completed tree can be published.
 pub(super) struct ReceivedTarget {
@@ -387,6 +489,7 @@ pub(super) struct ReceivedTarget {
     receiver: ArtifactReceiver,
     sealed: Option<TreeInventory>,
     poisoned: bool,
+    input_started: bool,
 }
 
 impl ReceivedTarget {
@@ -426,7 +529,100 @@ impl ReceivedTarget {
             receiver,
             sealed: None,
             poisoned: false,
+            input_started: false,
         })
+    }
+
+    pub(super) fn manifest(&self) -> &ArtifactManifest {
+        self.receiver.manifest()
+    }
+
+    /// Reuse complete old files as untrusted byte hints before receiving any
+    /// network payload. Return the strictly ordered nonempty manifest indices
+    /// still requiring download. Empty files already belong to the new receiver.
+    ///
+    /// Only names in this newly verified manifest are inspected. Old modes and
+    /// unrelated files do not affect the new tree; each selected member is
+    /// copied or safely reflinked into an independent inode; the ordinary seal
+    /// chooses its mode and verifies the actual destination bytes.
+    /// A missing or unavailable old root/member, partial file, or hash mismatch
+    /// requests ordinary transfer. Once an import is chosen, mutation, I/O
+    /// failure or cancellation poisons this receiver rather than repairing it.
+    pub(super) fn reuse_from(
+        &mut self,
+        previous: &Path,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Vec<u16>> {
+        require(
+            !self.poisoned && self.sealed.is_none() && !self.input_started,
+            "artifact reuse must precede all other receiver input",
+        )?;
+        self.input_started = true;
+        // Fence external cancellation callbacks and partial imports alike.
+        self.poisoned = true;
+        let result = (|| {
+            checkpoint(stopped)?;
+            self.parent.verify()?;
+            require(
+                super::plain_absolute(previous)
+                    && !previous.starts_with(&self.staging)
+                    && !self.staging.starts_with(previous),
+                "artifact reuse root overlaps the new staging tree or is not an ordinary absolute path",
+            )?;
+            let root = match Parent::open(previous) {
+                Ok(root) => Some(root),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let mut missing = Vec::new();
+            let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
+            for index in 0..self.receiver.manifest().files().len() {
+                checkpoint(stopped)?;
+                // Clone one bounded path, not a second entire target manifest.
+                let expected = self.receiver.manifest().files()[index].clone();
+                if expected.len == 0 {
+                    continue;
+                }
+                let hint = match &root {
+                    Some(root) => ReuseFile::inspect(root, &expected, &mut buffer, stopped)?,
+                    None => None,
+                };
+                if let (Some(root), Some(mut hint)) = (&root, hint) {
+                    self.parent.verify()?;
+                    hint.verify(root, &expected.path)?;
+                    self.receiver.import_file_with_cloner(
+                        &expected.path,
+                        &mut hint.file,
+                        stopped,
+                        rabs_cas::materialization::try_verified_reflink,
+                    )?;
+                    hint.verify(root, &expected.path)?;
+                    self.parent.verify()?;
+                } else {
+                    missing.push(
+                        u16::try_from(index)
+                            .map_err(|_| invalid("artifact index exceeds its wire bound"))?,
+                    );
+                }
+            }
+            if let Some(root) = &root {
+                root.verify()?;
+            }
+            self.parent.verify()?;
+            checkpoint(stopped)?;
+            Ok(missing)
+        })();
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
     }
 
     pub(super) fn write_chunk(
@@ -440,6 +636,7 @@ impl ReceivedTarget {
             !self.poisoned && self.sealed.is_none(),
             "remote target receiver is failed or already sealed",
         )?;
+        self.input_started = true;
         self.parent.verify()?;
         self.receiver.write_chunk(path, offset, bytes, sha256)
     }
@@ -600,6 +797,273 @@ mod tests {
         }
         captured.verify(&|| false).unwrap();
         received
+    }
+
+    #[test]
+    fn artifact_reuse_copies_only_verified_complete_members_with_new_modes() {
+        let old_parent = private();
+        let old = target(old_parent.path());
+        fs::create_dir(old.join("nested")).unwrap();
+        let binary: Vec<_> = (0..MAX_SOURCE_CHUNK * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(old.join("nested/keep"), &binary).unwrap();
+        fs::set_permissions(old.join("nested/keep"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(old.join("program"), b"executable bytes").unwrap();
+        fs::set_permissions(old.join("program"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(old.join("changed"), b"wrong bytes").unwrap();
+        fs::write(old.join("partial"), b"part").unwrap();
+        fs::write(old.join("removed"), b"not in the new result").unwrap();
+        // Unrelated unsupported old members are not traversed or interpreted.
+        symlink("does-not-exist", old.join("unrelated-link")).unwrap();
+        let manifest = ArtifactManifest::new(vec![
+            file("changed", b"right bytes", false),
+            file("empty", b"", true),
+            file("missing", b"new file", false),
+            file("nested/keep", &binary, true),
+            file("partial", b"partial bytes", false),
+            file("program", b"executable bytes", false),
+        ])
+        .unwrap();
+        let parent = private();
+        let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+        let missing = received.reuse_from(&old, &|| false).unwrap();
+        assert_eq!(missing, vec![0, 2, 4]);
+        for index in missing {
+            let expected = &manifest.files()[usize::from(index)];
+            let bytes: &[u8] = match expected.path.as_str() {
+                "changed" => b"right bytes",
+                "missing" => b"new file",
+                "partial" => b"partial bytes",
+                _ => panic!("unexpected download"),
+            };
+            received
+                .write_chunk(&expected.path, 0, bytes, Sha256::digest(bytes).into())
+                .unwrap();
+        }
+        let staged = fs::metadata(received.staging.join("nested/keep")).unwrap();
+        let prior = fs::metadata(old.join("nested/keep")).unwrap();
+        assert_ne!((staged.dev(), staged.ino()), (prior.dev(), prior.ino()));
+        assert_eq!(staged.nlink(), 1);
+        // The prior tree retains no write alias into the new receiver.
+        fs::write(old.join("nested/keep"), b"changed after independent import").unwrap();
+        received.seal(&|| false).unwrap();
+        let destination = parent.path().join("completed");
+        received.publish(&destination, &|| false).unwrap();
+        assert_eq!(fs::read(destination.join("nested/keep")).unwrap(), binary);
+        assert_eq!(
+            fs::read(destination.join("changed")).unwrap(),
+            b"right bytes"
+        );
+        assert_eq!(
+            fs::read(destination.join("partial")).unwrap(),
+            b"partial bytes"
+        );
+        assert_eq!(fs::metadata(destination.join("empty")).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(destination.join("nested/keep"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o555,
+        );
+        assert_eq!(
+            fs::metadata(destination.join("program")).unwrap().mode() & 0o7777,
+            0o444,
+        );
+        assert!(!destination.join("removed").exists());
+        assert!(!destination.join("unrelated-link").exists());
+        assert_eq!(fs::read(old.join("changed")).unwrap(), b"wrong bytes");
+        assert_eq!(fs::read(old.join("partial")).unwrap(), b"part");
+    }
+
+    #[test]
+    fn artifact_reuse_never_reads_links_special_files_or_undeclared_names() {
+        let old_parent = private();
+        let old = target(old_parent.path());
+        let outside = private();
+        let bytes = b"complete prior artifact";
+        fs::write(outside.path().join("outside"), bytes).unwrap();
+        fs::hard_link(outside.path().join("outside"), old.join("hard")).unwrap();
+        symlink(outside.path().join("outside"), old.join("link")).unwrap();
+        symlink(outside.path(), old.join("nested")).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            old.join("pipe"),
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        fs::create_dir(old.join("directory")).unwrap();
+        let manifest = ArtifactManifest::new(vec![
+            file("directory", bytes, false),
+            file("hard", bytes, false),
+            file("link", bytes, false),
+            file("nested/outside", bytes, false),
+            file("pipe", bytes, false),
+        ])
+        .unwrap();
+        let parent = private();
+        let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+        assert_eq!(
+            received.reuse_from(&old, &|| false).unwrap(),
+            vec![0, 1, 2, 3, 4],
+        );
+        for expected in manifest.files() {
+            received
+                .write_chunk(&expected.path, 0, bytes, Sha256::digest(bytes).into())
+                .unwrap();
+        }
+        received.seal(&|| false).unwrap();
+        let destination = parent.path().join("completed");
+        received.publish(&destination, &|| false).unwrap();
+        for expected in manifest.files() {
+            let output = destination.join(&expected.path);
+            assert!(fs::symlink_metadata(&output).unwrap().is_file());
+            assert_eq!(fs::metadata(&output).unwrap().nlink(), 1);
+            assert_eq!(fs::read(output).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(outside.path().join("outside")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn artifact_reuse_missing_root_downloads_every_nonempty_member() {
+        let parent = private();
+        let old_parent = private();
+        let manifest = ArtifactManifest::new(vec![
+            file("data", b"bytes", false),
+            file("empty", b"", false),
+        ])
+        .unwrap();
+        let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
+        assert_eq!(
+            received
+                .reuse_from(&old_parent.path().join("gone"), &|| false)
+                .unwrap(),
+            vec![0],
+        );
+        received
+            .write_chunk("data", 0, b"bytes", Sha256::digest(b"bytes").into())
+            .unwrap();
+        received.seal(&|| false).unwrap();
+    }
+
+    #[test]
+    fn artifact_reuse_refuses_unsafe_roots_and_cannot_run_after_input() {
+        let old_parent = private();
+        let old = target(old_parent.path());
+        fs::write(old.join("data"), b"bytes").unwrap();
+        symlink(&old, old_parent.path().join("linked")).unwrap();
+        let public = old_parent.path().join("public");
+        fs::DirBuilder::new().mode(0o700).create(&public).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("data", b"bytes", false)]).unwrap();
+        for kind in ["linked", "public", "overlap", "relative"] {
+            let parent = private();
+            let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+            let previous = match kind {
+                "overlap" => parent.path().to_path_buf(),
+                "relative" => PathBuf::from("relative"),
+                _ => old_parent.path().join(kind),
+            };
+            assert!(received.reuse_from(&previous, &|| false).is_err(), "{kind}");
+            assert!(received.seal(&|| false).is_err(), "{kind}");
+        }
+        for network_first in [true, false] {
+            let parent = private();
+            let mut received = ReceivedTarget::new(parent.path(), manifest.clone()).unwrap();
+            if network_first {
+                received
+                    .write_chunk("data", 0, b"by", Sha256::digest(b"by").into())
+                    .unwrap();
+            } else {
+                assert!(received.reuse_from(&old, &|| false).unwrap().is_empty());
+            }
+            assert!(received.reuse_from(&old, &|| false).is_err());
+        }
+    }
+
+    #[test]
+    fn artifact_reuse_cancelled_during_inspection_never_installs_or_repairs() {
+        let old_parent = private();
+        let old = target(old_parent.path());
+        let bytes = vec![b'x'; MAX_SOURCE_CHUNK * 3 + 1];
+        fs::write(old.join("data"), &bytes).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("data", &bytes, false)]).unwrap();
+        let parent = private();
+        let mut received = ReceivedTarget::new(parent.path(), manifest).unwrap();
+        let seen = Cell::new(0);
+        let error = received
+            .reuse_from(&old, &|| {
+                seen.set(seen.get() + 1);
+                seen.get() == 5
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            fs::metadata(received.staging.join("data")).unwrap().len(),
+            0
+        );
+        assert!(received.seal(&|| false).is_err());
+        assert!(
+            received
+                .publish(&parent.path().join("completed"), &|| false)
+                .is_err(),
+        );
+        assert!(!parent.path().join("completed").exists());
+        assert_eq!(fs::read(old.join("data")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn artifact_reuse_changes_or_cancellation_during_import_poison_the_receiver() {
+        for change in ["bytes", "member", "source-root", "target-parent", "cancel"] {
+            let old_parent = private();
+            let old = target(old_parent.path());
+            let bytes = vec![b'x'; MAX_SOURCE_CHUNK * 2 + 17];
+            fs::write(old.join("data"), &bytes).unwrap();
+            let manifest = ArtifactManifest::new(vec![file("data", &bytes, false)]).unwrap();
+            let outer = private();
+            let parent = target(outer.path());
+            let mut received = ReceivedTarget::new(&parent, manifest).unwrap();
+            let staged_file = received.staging.join("data");
+            let changed = Cell::new(false);
+            let result = received.reuse_from(&old, &|| {
+                // Real copy progress identifies the post-selection boundary;
+                // hashing prior hints never writes to this new file.
+                if !changed.get()
+                    && fs::metadata(&staged_file).is_ok_and(|metadata| metadata.len() != 0)
+                {
+                    changed.set(true);
+                    match change {
+                        "bytes" => fs::write(old.join("data"), vec![b'y'; bytes.len()]).unwrap(),
+                        "member" => {
+                            fs::rename(old.join("data"), old.join("original-data")).unwrap();
+                            fs::write(old.join("data"), &bytes).unwrap();
+                        }
+                        "source-root" => {
+                            fs::rename(&old, old_parent.path().join("original-root")).unwrap();
+                            fs::DirBuilder::new().mode(0o700).create(&old).unwrap();
+                            fs::write(old.join("data"), &bytes).unwrap();
+                        }
+                        "target-parent" => {
+                            fs::rename(&parent, outer.path().join("original-parent")).unwrap();
+                            fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+                        }
+                        "cancel" => return true,
+                        _ => unreachable!(),
+                    }
+                }
+                false
+            });
+            assert!(changed.get(), "import never started: {change}");
+            assert!(result.is_err(), "{change}");
+            assert!(received.seal(&|| false).is_err(), "{change}");
+            let destination = parent.join("completed");
+            assert!(
+                received.publish(&destination, &|| false).is_err(),
+                "{change}"
+            );
+            assert!(!destination.exists(), "{change}");
+        }
     }
 
     #[test]

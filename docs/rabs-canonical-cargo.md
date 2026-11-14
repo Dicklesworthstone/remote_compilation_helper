@@ -2574,7 +2574,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v7` and the exact tool build identity must match before
+`canonical-compile-remote-v8` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2785,6 +2785,60 @@ does not clear an earlier result. The selected launcher profile remains availabl
 for inspection after failure or interruption; remote operations are not resumable.
 A failure does not trigger a local fallback or automatic resubmission.
 
+#### Reuse previously downloaded artifact bytes
+
+Repeated builds often return many unchanged dependency artifacts. To reuse
+those local bytes when downloading a new result, explicitly select a previous
+output directory:
+
+```sh
+RABS_REMOTE_ARTIFACT_REUSE_ROOT=/home/dev/rabs-remote-results/build-001 \
+  cargo rabs --rabs-canonical-remote ./remote-cargo.json -- build --workspace
+```
+
+The native client reads this variable directly; the Cargo launcher passes it
+through without adding it to `settings.env` or the compiled program's environment.
+For a direct `rabsd --canonical-compile-remote` invocation, the native client
+profile can instead contain `"artifact_reuse_root": "/home/dev/rabs-remote-results/build-001"`.
+That field is a native-client option; use the environment variable with the
+Cargo launcher. If both select different paths, preparation refuses. An empty
+variable also refuses instead of selecting an implicit default.
+
+The selected root must already exist, belong to the caller, and be private,
+with ordinary directory ancestors. It must be disjoint from captured source,
+toolchain, Cargo home, staging and the new output destination, and must not
+contain the client's private TLS key. A previous output can share the new
+output's parent. Existing outputs are never changed or merged into place.
+
+After receiving the complete new artifact manifest, the client examines only
+its declared file names in the selected root. A complete regular file with the
+expected length and SHA-256 is copied or reflinked into fresh private staging
+and verified again. Missing, partial, unreadable or mismatching files are
+downloaded normally. Symlinks and external hardlinks cannot supply reusable
+bytes. The new manifest supplies each file's executable mode. Unrelated old
+files are not copied, and no writable inode is shared with the previous result.
+Cancellation or a mutation during an accepted import terminates the receive
+operation; the client does not guess that a partial import succeeded.
+
+The client requests only the sorted manifest indexes still needing payloads.
+The service validates that request, retains the existing bounded transfer
+windows, and verifies its entire captured target and original producer authority
+before authorizing publication. The client still seals and hashes the complete
+new tree and waits for the coordinator's exact commit before atomic installation.
+An all-reused result goes through these same checks and acknowledgments.
+Reuse work shares the original delivery deadline; it cannot extend that budget.
+
+With reuse selected, stderr reports `canonical-remote-artifact-reuse` with
+`reused_files`, `reused_bytes`, `transfer_files` and `transfer_bytes` after local
+verification. These count the logical artifact bytes already imported and still
+required by the transfer plan; they exclude framing overhead and do not assert
+completed delivery or a measured build speedup.
+The same explicit mechanism accepts a retained `.rabs-target-staging-*` directory
+as hints for a deliberately submitted new operation, reusing its complete files.
+It does not reconnect to a lost operation, suppress a compiler invocation, resume
+partial files, or grant action-cache or Cargo freshness authority. Preserve and
+inspect any uncertain prior result before deciding to submit new work.
+
 #### Results, ownership and current limits
 
 The client preserves Cargo's numeric exit status and separate stdout/stderr
@@ -2820,8 +2874,9 @@ and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
 Install matching client and coordinator binaries: paged source and artifact
-manifests, source-file and partial-prefix negotiation, and SDK file/prefix and image reuse
-selection use wire version `canonical-compile-remote-v7`, while existing client and service JSON
+manifests, source-file and partial-prefix negotiation, SDK file/prefix and image
+reuse, and artifact missing-file selection use wire version
+`canonical-compile-remote-v8`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 

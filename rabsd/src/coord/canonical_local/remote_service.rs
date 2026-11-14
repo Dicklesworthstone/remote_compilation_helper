@@ -51,9 +51,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use toolchain_inputs::{RemoteToolchainFileCache, ToolchainFileInput};
 use wire::{
-    ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, Chunk, Manifest, Message, Output,
-    SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint,
-    digest, invalid, require,
+    ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, ArtifactPlan, Chunk, Manifest, Message,
+    Output, SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION, Window, Wire,
+    checkpoint, digest, invalid, require,
 };
 
 const SERVICE_VERSION: &str = "canonical-compile-remote-service-v1";
@@ -1140,65 +1140,7 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
             outcome.exit_code == 0,
             "failed compilation cannot publish a target",
         )?;
-        require(
-            matches!(
-                wire.receive(stopped, deadline).await?,
-                Message::ReceiveTarget {}
-            ),
-            "client did not accept the declared target",
-        )?;
-        send_artifact_manifest(wire, target.manifest(), stopped, deadline).await?;
-        let manifest_sha256 = encode_hex(&target.manifest().digest());
-        let Message::ReceiveArtifacts {
-            manifest_sha256: accepted,
-        } = wire.receive_until(stopped, deadline).await?
-        else {
-            return Err(invalid(
-                "client did not validate the complete artifact manifest",
-            ));
-        };
-        require(
-            accepted == manifest_sha256,
-            "client accepted a different artifact manifest",
-        )?;
-        let mut window = Window::default();
-        for file in target.manifest().files() {
-            let mut offset = 0;
-            while offset < file.len {
-                checkpoint(stopped, deadline)?;
-                let bytes = target.read_chunk(&file.path, offset, MAX_SOURCE_CHUNK, cancelled)?;
-                require(
-                    !bytes.is_empty(),
-                    "artifact source ended before its declared length",
-                )?;
-                wire.send(
-                    &Message::ArtifactChunk {
-                        chunk: Chunk::new(&file.path, offset, &bytes)?,
-                    },
-                    stopped,
-                    deadline,
-                )
-                .await?;
-                offset += bytes.len() as u64;
-                if window.record()? {
-                    send_window(wire, &mut window, stopped, deadline).await?;
-                }
-            }
-        }
-        send_window(wire, &mut window, stopped, deadline).await?;
-        wire.send(&Message::ArtifactEnd {}, stopped, deadline)
-            .await?;
-        let Message::Received {
-            manifest_sha256: received,
-        } = wire.receive_until(stopped, deadline).await?
-        else {
-            return Err(invalid("client did not seal the complete target"));
-        };
-        require(
-            received == manifest_sha256,
-            "client sealed a different target manifest",
-        )?;
-        target.verify(cancelled)?;
+        let manifest_sha256 = deliver_artifacts(wire, target, stopped, deadline, cancelled).await?;
         outcome.verify_before_delivery(cancelled)?;
         wire.send(
             &Message::Commit {
@@ -1236,6 +1178,80 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
     .await
 }
 
+/// Transfer only the requested payloads, but retain the complete captured
+/// target through its final byte check. Client reuse never supplies producer
+/// authority or waives the existing Commit/Published/Complete exchange.
+async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    target: &CapturedTarget,
+    stopped: &AtomicBool,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<String> {
+    require(
+        matches!(
+            wire.receive(stopped, deadline).await?,
+            Message::ReceiveTarget {}
+        ),
+        "client did not accept the declared target",
+    )?;
+    send_artifact_manifest(wire, target.manifest(), stopped, deadline).await?;
+    let Message::ReceiveArtifacts {
+        manifest_sha256,
+        missing_files,
+    } = wire.receive_until(stopped, deadline).await?
+    else {
+        return Err(invalid(
+            "client did not validate the complete artifact manifest",
+        ));
+    };
+    // Validate the entire request before reading or sending any payload. A
+    // malicious subset cannot create extra files, repeat bytes or select a
+    // path from another target generation.
+    let plan = ArtifactPlan::from_request(manifest_sha256, missing_files, target.manifest())?;
+    let mut window = Window::default();
+    for index in plan.missing_files {
+        let file = &target.manifest().files()[usize::from(index)];
+        let mut offset = 0;
+        while offset < file.len {
+            checkpoint(stopped, deadline)?;
+            let bytes = target.read_chunk(&file.path, offset, MAX_SOURCE_CHUNK, cancelled)?;
+            require(
+                !bytes.is_empty(),
+                "artifact source ended before its declared length",
+            )?;
+            wire.send(
+                &Message::ArtifactChunk {
+                    chunk: Chunk::new(&file.path, offset, &bytes)?,
+                },
+                stopped,
+                deadline,
+            )
+            .await?;
+            offset += bytes.len() as u64;
+            if window.record()? {
+                send_window(wire, &mut window, stopped, deadline).await?;
+            }
+        }
+    }
+    send_window(wire, &mut window, stopped, deadline).await?;
+    wire.send(&Message::ArtifactEnd {}, stopped, deadline)
+        .await?;
+    let Message::Received {
+        manifest_sha256: received,
+    } = wire.receive_until(stopped, deadline).await?
+    else {
+        return Err(invalid("client did not seal the complete target"));
+    };
+    require(
+        received == plan.manifest_sha256,
+        "client sealed a different target manifest",
+    )?;
+    // Include every locally reused member, not just the files read above.
+    target.verify(cancelled)?;
+    Ok(plan.manifest_sha256)
+}
+
 async fn send_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     manifest: &rabs_sandbox::source_transfer::ArtifactManifest,
@@ -1269,6 +1285,7 @@ mod tests {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     use rabs_sandbox::toolchain_dataset::ToolchainIdentity;
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use std::future::Future;
     use std::os::unix::fs::DirBuilderExt;
     use std::pin::{Pin, pin};
@@ -1494,8 +1511,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v7_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v7", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v8_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v8", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
@@ -1503,7 +1520,8 @@ mod tests {
             ("canonical-compile-remote-v4", "build-one"),
             ("canonical-compile-remote-v5", "build-one"),
             ("canonical-compile-remote-v6", "build-one"),
-            ("canonical-compile-remote-v7", "build-two"),
+            ("canonical-compile-remote-v7", "build-one"),
+            ("canonical-compile-remote-v8", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1741,6 +1759,270 @@ mod tests {
         assert!(
             sent.iter()
                 .all(|message| message["kind"] != "artifact-manifest-end")
+        );
+    }
+
+    fn artifact_delivery_fixture() -> (tempfile::TempDir, CapturedTarget, Vec<u8>) {
+        let owner = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let target = owner.path().join("target");
+        fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 4 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(target.join("a-reused"), b"old").unwrap();
+        fs::write(target.join("b-empty"), []).unwrap();
+        fs::write(target.join("c-needed"), &bytes).unwrap();
+        fs::write(target.join("d-reused"), b"ok").unwrap();
+        let captured = CapturedTarget::capture(&target, &|| false).unwrap();
+        (owner, captured, bytes)
+    }
+
+    fn artifact_delivery_input(
+        plan: ArtifactPlan,
+        windows: &[u64],
+        received: Option<&str>,
+    ) -> Vec<u8> {
+        let mut input = record(&Message::ReceiveTarget {});
+        input.extend(record(&Message::Window { count: 1 }));
+        input.extend(record(&Message::ReceiveArtifacts {
+            manifest_sha256: plan.manifest_sha256,
+            missing_files: plan.missing_files,
+        }));
+        for count in windows {
+            input.extend(record(&Message::Window { count: *count }));
+        }
+        if let Some(received) = received {
+            input.extend(record(&Message::Received {
+                manifest_sha256: received.to_owned(),
+            }));
+        }
+        input
+    }
+
+    #[test]
+    fn artifact_delivery_reuses_complete_files_without_changing_manifest_or_windows() {
+        // Real captured files and the production sender/manifest state machine;
+        // the fragmented peer is explicitly scripted, not TLS/Cargo proof.
+        let (_owner, captured, needed) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for (missing, windows) in [
+            (vec![0, 2, 3], vec![4, 7]),
+            (vec![2], vec![4, 5]),
+            (vec![], vec![]),
+        ] {
+            let plan = ArtifactPlan::new(captured.manifest(), missing.clone()).unwrap();
+            let peer = AdmissionPeer::new(artifact_delivery_input(plan, &windows, Some(&identity)));
+            let output = Arc::clone(&peer.output);
+            let received = ready(deliver_artifacts(
+                &mut Wire::new(peer),
+                &captured,
+                &AtomicBool::new(false),
+                Instant::now() + wire::IO_BUDGET,
+                &|| false,
+            ))
+            .unwrap();
+            assert_eq!(received, identity);
+            let mut pages =
+                wire::ArtifactPages::new(ArtifactDeclaration::from_native(captured.manifest()))
+                    .unwrap();
+            let mut delivered: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            let mut acknowledgments = Vec::new();
+            let sent = messages(&output);
+            for value in &sent {
+                match serde_json::from_value::<Message>(value.clone()).unwrap() {
+                    Message::ArtifactManifestPage { page } => pages.push(page).unwrap(),
+                    Message::ArtifactChunk { chunk } => {
+                        let (bytes, _) = chunk.verified_bytes().unwrap();
+                        let file = delivered.entry(chunk.path).or_default();
+                        assert_eq!(chunk.offset, file.len() as u64);
+                        file.extend(bytes);
+                    }
+                    Message::WindowEnd { count } => acknowledgments.push(count),
+                    Message::ArtifactManifestEnd {} | Message::ArtifactEnd {} => {}
+                    _ => panic!("artifact sender crossed into commit or execution authority"),
+                }
+            }
+            assert_eq!(pages.finish().unwrap(), *captured.manifest());
+            assert_eq!(
+                delivered.keys().map(String::as_str).collect::<Vec<_>>(),
+                missing
+                    .iter()
+                    .map(|index| captured.manifest().files()[usize::from(*index)]
+                        .path
+                        .as_str())
+                    .collect::<Vec<_>>(),
+            );
+            if missing.contains(&0) {
+                assert_eq!(delivered["a-reused"], b"old");
+            }
+            if missing.contains(&2) {
+                assert_eq!(delivered["c-needed"], needed);
+            }
+            if missing.contains(&3) {
+                assert_eq!(delivered["d-reused"], b"ok");
+            }
+            let expected_windows: Vec<_> = std::iter::once(1).chain(windows).collect();
+            assert_eq!(acknowledgments, expected_windows);
+            assert_eq!(sent.last().unwrap()["kind"], "artifact-end");
+        }
+    }
+
+    #[test]
+    fn artifact_delivery_refuses_invalid_plans_before_any_payload() {
+        let (_owner, captured, _) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        let mut invalid_plans: Vec<_> = [
+            vec![0, 0],
+            vec![2, 0],
+            vec![1],
+            vec![4],
+            vec![u16::MAX],
+            vec![0; rabs_sandbox::artifact_tree::MAX_ARTIFACT_FILES + 1],
+        ]
+        .into_iter()
+        .map(|missing_files| ArtifactPlan {
+            manifest_sha256: identity.clone(),
+            missing_files,
+        })
+        .collect();
+        invalid_plans.push(ArtifactPlan {
+            manifest_sha256: "00".repeat(32),
+            missing_files: vec![],
+        });
+        for plan in invalid_plans {
+            let peer = AdmissionPeer::new(artifact_delivery_input(plan, &[], Some(&identity)));
+            let output = Arc::clone(&peer.output);
+            assert!(
+                ready(deliver_artifacts(
+                    &mut Wire::new(peer),
+                    &captured,
+                    &AtomicBool::new(false),
+                    Instant::now() + wire::IO_BUDGET,
+                    &|| false,
+                ))
+                .is_err()
+            );
+            assert!(messages(&output).iter().all(|message| {
+                !matches!(
+                    message["kind"].as_str(),
+                    Some("artifact-chunk" | "artifact-end")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn artifact_reuse_still_requires_exact_window_and_full_receipt_acknowledgments() {
+        let (_owner, captured, _) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for (missing, windows, received, expected_chunks, ended) in [
+            (vec![2], vec![3], Some(identity.as_str()), 4, false),
+            (vec![2], vec![4], None, 5, false),
+            (vec![], vec![], None, 0, true),
+            (vec![], vec![], Some("different-manifest"), 0, true),
+        ] {
+            let plan = ArtifactPlan::new(captured.manifest(), missing).unwrap();
+            let peer = AdmissionPeer::new(artifact_delivery_input(plan, &windows, received));
+            let output = Arc::clone(&peer.output);
+            assert!(
+                ready(deliver_artifacts(
+                    &mut Wire::new(peer),
+                    &captured,
+                    &AtomicBool::new(false),
+                    Instant::now() + wire::IO_BUDGET,
+                    &|| false,
+                ))
+                .is_err()
+            );
+            let sent = messages(&output);
+            assert_eq!(
+                sent.iter()
+                    .filter(|message| message["kind"] == "artifact-chunk")
+                    .count(),
+                expected_chunks,
+            );
+            assert_eq!(
+                sent.iter().any(|message| message["kind"] == "artifact-end"),
+                ended,
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_reuse_revalidates_skipped_producer_files_and_original_deadline() {
+        let (owner, captured, _) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for cancel in [false, true] {
+            let peer = AdmissionPeer::new(artifact_delivery_input(
+                ArtifactPlan::new(captured.manifest(), vec![]).unwrap(),
+                &[],
+                Some(&identity),
+            ));
+            let output = Arc::clone(&peer.output);
+            let error = ready(deliver_artifacts(
+                &mut Wire::new(peer),
+                &captured,
+                &AtomicBool::new(cancel),
+                if cancel {
+                    Instant::now() + wire::IO_BUDGET
+                } else {
+                    Instant::now()
+                },
+                &|| false,
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancel {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                },
+            );
+            assert!(messages(&output).is_empty());
+        }
+        // The receiver can reuse every payload and acknowledge the complete
+        // manifest; corruption of an untransmitted producer file still refuses.
+        let capture = fs::read_dir(owner.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rabs-target-capture-")
+            })
+            .unwrap();
+        let corrupt = capture.join("files/a-reused");
+        let mut peer = AdmissionPeer::new(artifact_delivery_input(
+            ArtifactPlan::new(captured.manifest(), vec![]).unwrap(),
+            &[],
+            Some(&identity),
+        ));
+        peer.before_read = Some(Box::new(move || {
+            fs::set_permissions(&corrupt, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&corrupt, b"bad").unwrap();
+            fs::set_permissions(&corrupt, fs::Permissions::from_mode(0o444)).unwrap();
+        }));
+        let output = Arc::clone(&peer.output);
+        assert!(
+            ready(deliver_artifacts(
+                &mut Wire::new(peer),
+                &captured,
+                &AtomicBool::new(false),
+                Instant::now() + wire::IO_BUDGET,
+                &|| false,
+            ))
+            .is_err()
+        );
+        let sent = messages(&output);
+        assert_eq!(sent.last().unwrap()["kind"], "artifact-end");
+        assert!(
+            sent.iter()
+                .all(|message| message["kind"] != "artifact-chunk")
         );
     }
 

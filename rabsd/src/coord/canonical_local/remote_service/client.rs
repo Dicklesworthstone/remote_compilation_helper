@@ -3,11 +3,11 @@
 use super::super::remote_artifacts::ReceivedTarget;
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
-    ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, CargoHome, Chunk, Entry,
-    IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan,
-    SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition, ToolchainFilePage,
-    ToolchainPrefixOffer, ToolchainResume, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
-    controlled_future, decode_hex, digest, invalid, require,
+    ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, ArtifactPlan, CargoHome,
+    Chunk, Entry, IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage,
+    SourcePlan, SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition,
+    ToolchainFilePage, ToolchainPrefixOffer, ToolchainResume, VERSION, WIRE_VERSION, Window, Wire,
+    checkpoint, controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -60,10 +61,31 @@ struct ClientProfile {
     cargo_home_source: Option<PathBuf>,
     staging_root: PathBuf,
     output_destination: PathBuf,
+    /// Explicit, read-only byte hints from a previous output or failed delivery.
+    /// This path stays at the client and never enters build intent or identity.
+    artifact_reuse_root: Option<PathBuf>,
     settings: RemoteOperationSettings,
 }
 
 impl ClientProfile {
+    fn with_artifact_reuse_environment(mut self, value: Option<OsString>) -> io::Result<Self> {
+        if let Some(value) = value {
+            require(
+                !value.is_empty(),
+                "remote artifact reuse root must not be empty",
+            )?;
+            let root = PathBuf::from(value);
+            require(
+                self.artifact_reuse_root
+                    .as_ref()
+                    .is_none_or(|configured| *configured == root),
+                "profile and RABS_REMOTE_ARTIFACT_REUSE_ROOT select different directories",
+            )?;
+            self.artifact_reuse_root = Some(root);
+        }
+        Ok(self)
+    }
+
     fn validate(&self) -> io::Result<[u8; 32]> {
         require(
             self.version == VERSION,
@@ -111,6 +133,29 @@ impl ClientProfile {
                     "remote client source, compiler, Cargo home, staging and output roots must be disjoint",
                 )?;
             }
+        }
+        if let Some(reuse) = &self.artifact_reuse_root {
+            private_directory(reuse)?;
+            // Prior results commonly share the output parent. Only the new
+            // destination, rather than its whole parent, must be disjoint.
+            for root in [
+                &self.source_root,
+                &self.toolchain_root,
+                &self.staging_root,
+                &self.output_destination,
+            ]
+            .into_iter()
+            .chain(self.cargo_home_source.as_ref())
+            {
+                require(
+                    !overlap(reuse, root),
+                    "remote artifact reuse must be disjoint from captured inputs, staging and the new destination",
+                )?;
+            }
+            require(
+                !self.tls.private_key.starts_with(reuse),
+                "the edge authentication key must be outside artifact reuse hints",
+            )?;
         }
         self.tls.files()?;
         for root in [&self.source_root, &self.toolchain_root]
@@ -191,8 +236,9 @@ pub fn run_client_profile(
     build_identity: String,
 ) -> io::Result<i32> {
     let (_, bytes) = read_stable(path, PROFILE_BYTES)?;
-    let config: ClientProfile =
-        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let config = serde_json::from_slice::<ClientProfile>(&bytes)
+        .map_err(|error| invalid(error.to_string()))?
+        .with_artifact_reuse_environment(std::env::var_os("RABS_REMOTE_ARTIFACT_REUSE_ROOT"))?;
     let pin = config.validate()?;
     let tls = config.tls.files()?;
     tls.local_identity().map_err(io::Error::other)?;
@@ -829,6 +875,7 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
             wire,
             manifest,
             &config.output_destination,
+            config.artifact_reuse_root.as_deref(),
             stopped,
             delivery_deadline,
         )
@@ -865,6 +912,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     declaration: ArtifactDeclaration,
     destination: &Path,
+    artifact_reuse_root: Option<&Path>,
     stopped: &AtomicBool,
     deadline: Instant,
 ) -> io::Result<()> {
@@ -879,9 +927,37 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
         native,
         &cancelled,
     )?;
+    let plan = if let Some(root) = artifact_reuse_root {
+        let missing = target.reuse_from(root, &cancelled)?;
+        ArtifactPlan::new(target.manifest(), missing)?
+    } else {
+        ArtifactPlan::all(target.manifest())?
+    };
+    checkpoint(stopped, deadline)?;
+    if artifact_reuse_root.is_some() {
+        let transfer_bytes: u64 = plan
+            .missing_files
+            .iter()
+            .map(|index| target.manifest().files()[usize::from(*index)].len)
+            .sum();
+        let nonempty = target
+            .manifest()
+            .files()
+            .iter()
+            .filter(|file| file.len != 0)
+            .count();
+        eprintln!(
+            "{}",
+            json!({"kind":"canonical-remote-artifact-reuse",
+            "reused_files":nonempty - plan.missing_files.len(),
+            "reused_bytes":target.manifest().total_bytes() - transfer_bytes,
+            "transfer_files":plan.missing_files.len(), "transfer_bytes":transfer_bytes})
+        );
+    }
     wire.send(
         &Message::ReceiveArtifacts {
             manifest_sha256: manifest_sha256.clone(),
+            missing_files: plan.missing_files.clone(),
         },
         stopped,
         deadline,
@@ -892,6 +968,15 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
         match wire.receive_until(stopped, deadline).await? {
             Message::ArtifactChunk { chunk } => {
                 window.record()?;
+                let index = target
+                    .manifest()
+                    .files()
+                    .binary_search_by(|file| file.path.cmp(&chunk.path))
+                    .map_err(|_| invalid("remote artifact chunk names an undeclared file"))?;
+                require(
+                    plan.missing_files.binary_search(&(index as u16)).is_ok(),
+                    "remote artifact chunk names a file not requested for transfer",
+                )?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
                 target.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
             }
@@ -1014,6 +1099,105 @@ mod tests {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap()
+    }
+
+    fn artifact_reuse_profile(parent: &Path) -> ClientProfile {
+        for name in ["source", "toolchain", "staging", "outputs", "credentials"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(parent.join(name))
+                .unwrap();
+        }
+        serde_json::from_value(json!({
+            "version":VERSION,
+            "coordinator":"127.0.0.1:45300",
+            "server_name":"coordinator.invalid",
+            "coordinator_pin":"11".repeat(32),
+            "tls":{"ca":parent.join("credentials/ca.pem"),
+                "certificate":parent.join("credentials/edge.pem"),
+                "private_key":parent.join("credentials/edge.key")},
+            "source_root":parent.join("source"),
+            "toolchain_root":parent.join("toolchain"),
+            "staging_root":parent.join("staging"),
+            "output_destination":parent.join("outputs/new"),
+            "settings":{}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn artifact_reuse_environment_is_explicit_and_cannot_override_a_different_profile_root() {
+        let directory = private();
+        let profile = artifact_reuse_profile(directory.path());
+        assert!(profile.artifact_reuse_root.is_none());
+        assert!(profile.validate().is_ok());
+        let prior = directory.path().join("outputs/prior");
+        fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+        let profile = profile
+            .with_artifact_reuse_environment(Some(prior.clone().into_os_string()))
+            .unwrap();
+        assert_eq!(profile.artifact_reuse_root.as_ref(), Some(&prior));
+        assert!(
+            profile.validate().is_ok(),
+            "a prior sibling output is an allowed hint"
+        );
+        let profile = profile
+            .with_artifact_reuse_environment(Some(prior.into_os_string()))
+            .unwrap();
+        assert!(
+            profile
+                .with_artifact_reuse_environment(Some(
+                    directory.path().join("different").into_os_string()
+                ))
+                .is_err()
+        );
+
+        let directory = private();
+        let profile = artifact_reuse_profile(directory.path());
+        assert!(
+            profile
+                .with_artifact_reuse_environment(Some(OsString::new()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_reuse_profile_refuses_unsafe_roots_before_capture() {
+        let directory = private();
+        let mut profile = artifact_reuse_profile(directory.path());
+        let prior = directory.path().join("outputs/prior");
+        fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+        let linked = directory.path().join("linked");
+        symlink(&prior, &linked).unwrap();
+        let public = directory.path().join("public");
+        fs::DirBuilder::new().mode(0o700).create(&public).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+        for root in [
+            PathBuf::from("relative"),
+            directory.path().join("missing"),
+            profile.source_root.clone(),
+            profile.toolchain_root.clone(),
+            profile.staging_root.clone(),
+            directory.path().join("outputs"),
+            profile.output_destination.clone(),
+            directory.path().join("credentials"),
+            linked,
+            public,
+        ] {
+            profile.artifact_reuse_root = Some(root.clone());
+            assert!(
+                profile.validate().is_err(),
+                "unsafe hint root: {}",
+                root.display()
+            );
+        }
+        profile.artifact_reuse_root = Some(prior);
+        assert!(profile.validate().is_ok());
+        assert!(
+            !profile.output_destination.exists(),
+            "preflight never creates the output"
+        );
+        assert_eq!(fs::read_dir(&profile.staging_root).unwrap().count(), 0);
     }
 
     fn native<T>(future: impl Future<Output = T>) -> T {
@@ -1332,6 +1516,7 @@ mod tests {
             &mut wire,
             ArtifactDeclaration::from_native(&manifest),
             &destination,
+            None,
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(15),
         ))
@@ -1368,6 +1553,142 @@ mod tests {
                 sent[index]["manifest_sha256"],
                 encode_hex(&manifest.digest())
             );
+        }
+        assert_eq!(sent[3]["missing_files"], json!([320]));
+    }
+
+    #[test]
+    fn artifact_reuse_receives_only_changed_files_and_preserves_prior_bytes() {
+        let directory = private();
+        let prior = directory.path().join("prior");
+        fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+        fs::write(prior.join("a-cached"), b"same").unwrap();
+        fs::write(prior.join("b-changed"), b"old!").unwrap();
+        fs::write(prior.join("unrelated"), b"not an artifact in this result").unwrap();
+        let files = [
+            ("a-cached", b"same".as_slice()),
+            ("b-changed", b"new!".as_slice()),
+            ("c-empty", b"".as_slice()),
+        ];
+        let manifest = ArtifactManifest::new(
+            files
+                .iter()
+                .map(|(path, bytes)| SourceFile {
+                    path: (*path).into(),
+                    len: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    executable: *path == "a-cached",
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut messages = artifact_manifest_messages(&manifest);
+        messages.push(Message::ArtifactChunk {
+            chunk: Chunk::new("b-changed", 0, b"new!").unwrap(),
+        });
+        messages.push(Message::WindowEnd { count: 1 });
+        messages.push(Message::ArtifactEnd {});
+        messages.push(Message::Commit {
+            manifest_sha256: encode_hex(&manifest.digest()),
+        });
+        let mut stream = AdmissionStream::new(&messages, false);
+        stream.quantum = 19;
+        let output = Arc::clone(&stream.output);
+        let destination = directory.path().join("completed");
+        native(receive_target(
+            &mut Wire::new(stream),
+            ArtifactDeclaration::from_native(&manifest),
+            &destination,
+            Some(&prior),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(15),
+        ))
+        .unwrap();
+        for (name, bytes) in files {
+            assert_eq!(fs::read(destination.join(name)).unwrap(), bytes);
+        }
+        assert!(!destination.join("unrelated").exists());
+        assert_eq!(fs::read(prior.join("b-changed")).unwrap(), b"old!");
+        assert_ne!(
+            fs::metadata(prior.join("a-cached")).unwrap().ino(),
+            fs::metadata(destination.join("a-cached")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(destination.join("a-cached")).unwrap().mode() & 0o777,
+            0o555
+        );
+        fs::write(prior.join("a-cached"), b"edit").unwrap();
+        assert_eq!(fs::read(destination.join("a-cached")).unwrap(), b"same");
+        let sent = admission_messages(&output);
+        let plan = sent
+            .iter()
+            .find(|message| message["kind"] == "receive-artifacts")
+            .unwrap();
+        assert_eq!(plan["manifest_sha256"], encode_hex(&manifest.digest()));
+        assert_eq!(plan["missing_files"], json!([1]));
+        assert_eq!(sent.last().unwrap()["kind"], "published");
+    }
+
+    #[test]
+    fn artifact_reuse_all_hits_still_require_exact_commit_and_refuse_unrequested_payload() {
+        for case in [
+            "commit",
+            "wrong-commit",
+            "missing-commit",
+            "unrequested-payload",
+        ] {
+            let directory = private();
+            let prior = directory.path().join("prior");
+            fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+            fs::write(prior.join("program"), b"same").unwrap();
+            let manifest = ArtifactManifest::new(vec![SourceFile {
+                path: "program".into(),
+                len: 4,
+                sha256: Sha256::digest(b"same").into(),
+                executable: true,
+            }])
+            .unwrap();
+            let mut messages = artifact_manifest_messages(&manifest);
+            if case == "unrequested-payload" {
+                messages.push(Message::ArtifactChunk {
+                    chunk: Chunk::new("program", 0, b"same").unwrap(),
+                });
+            }
+            messages.push(Message::ArtifactEnd {});
+            if case != "missing-commit" {
+                messages.push(Message::Commit {
+                    manifest_sha256: if case == "wrong-commit" {
+                        "00".repeat(32)
+                    } else {
+                        encode_hex(&manifest.digest())
+                    },
+                });
+            }
+            let stream = AdmissionStream::new(&messages, false);
+            let output = Arc::clone(&stream.output);
+            let destination = directory.path().join("completed");
+            let result = native(receive_target(
+                &mut Wire::new(stream),
+                ArtifactDeclaration::from_native(&manifest),
+                &destination,
+                Some(&prior),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(15),
+            ));
+            assert_eq!(result.is_ok(), case == "commit", "{case}: {result:?}");
+            assert_eq!(destination.exists(), case == "commit", "{case}");
+            let sent = admission_messages(&output);
+            let plan = sent
+                .iter()
+                .find(|message| message["kind"] == "receive-artifacts")
+                .unwrap();
+            assert_eq!(plan["missing_files"], json!([]), "{case}");
+            assert_eq!(
+                sent.iter().any(|message| message["kind"] == "published"),
+                case == "commit",
+                "{case}"
+            );
+            assert_eq!(fs::read(prior.join("program")).unwrap(), b"same");
         }
     }
 
@@ -1410,6 +1731,7 @@ mod tests {
                 &mut wire,
                 ArtifactDeclaration::from_native(&manifest),
                 &destination,
+                None,
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(15),
             ));
@@ -1459,6 +1781,7 @@ mod tests {
                     &mut wire,
                     ArtifactDeclaration::from_native(&manifest),
                     &destination,
+                    None,
                     &AtomicBool::new(false),
                     Instant::now() + Duration::from_secs(15),
                 ))
