@@ -898,10 +898,23 @@ mod unix {
     }
 
     fn persist_receipt(path: &Path, receipts: &[(String, Option<Value>)]) -> Result<()> {
+        persist_receipt_with_directory_sync(path, receipts, File::sync_all)
+    }
+
+    fn persist_receipt_with_directory_sync(
+        path: &Path,
+        receipts: &[(String, Option<Value>)],
+        sync_directory: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<()> {
         let bytes = receipt_text(receipts)?;
         let parent = path
             .parent()
             .ok_or_else(|| Failure::unavailable("disk receipt has no parent"))?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(OFlags::DIRECTORY.bits() as i32)
+            .open(parent)?;
+        let identity = directory.metadata()?;
         let mut file = tempfile::Builder::new()
             .prefix(".disk-receipt-")
             .tempfile_in(parent)?;
@@ -910,6 +923,14 @@ mod unix {
         file.as_file().sync_all()?;
         file.persist(path)
             .map_err(|error| Failure::unavailable(error.to_string()))?;
+        // Syncing the staged file does not make the rename durable. Keep this
+        // barrier before complete diagnostics and the successful return to the
+        // guardian; its existing heartbeat fence also bounds stalled I/O here.
+        sync_directory(&directory)?;
+        let named = std::fs::metadata(parent)?;
+        if named.dev() != identity.dev() || named.ino() != identity.ino() {
+            return Err(Failure::unavailable("disk receipt parent changed"));
+        }
         Ok(())
     }
 
@@ -1245,6 +1266,90 @@ mod unix {
             )];
             assert!(persist_receipt(&receipt, &oversized).is_err());
             assert_eq!(std::fs::read(&receipt).unwrap(), b"previous receipt");
+        }
+
+        #[test]
+        fn receipt_publication_waits_for_directory_durability() {
+            let fixture = tempfile::tempdir().unwrap().keep();
+            let receipt = fixture.join("receipt");
+            std::fs::write(&receipt, b"previous receipt").unwrap();
+            let receipts = vec![(
+                "RCH_TEST_DISK_USAGE:".into(),
+                Some(json!({"complete": true, "exit_code": 17})),
+            )];
+            let expected = receipt_text(&receipts).unwrap();
+            let (entered, entry) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::sync_channel(1);
+            let (finished, completion) = mpsc::sync_channel(1);
+            let published = receipt.clone();
+            let publisher = thread::spawn(move || {
+                let result = persist_receipt_with_directory_sync(
+                    &published,
+                    &receipts,
+                    |directory| {
+                        let observed = (
+                            std::fs::read(&published)?,
+                            std::fs::metadata(&published)?.mode() & 0o777,
+                            directory.metadata()?.is_dir(),
+                        );
+                        entered.send(observed).unwrap();
+                        released
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(|_| io::Error::other("test directory barrier timed out"))?;
+                        directory.sync_all()
+                    },
+                );
+                finished.send(result).unwrap();
+            });
+            let observed = entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            let premature = completion.try_recv();
+            release.send(()).unwrap();
+            let result = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            publisher.join().unwrap();
+
+            assert!(
+                matches!(premature, Err(mpsc::TryRecvError::Empty)),
+                "publication returned before its directory barrier"
+            );
+            assert_eq!(observed.0, expected, "the barrier follows the final rename");
+            assert_eq!(observed.1, 0o600);
+            assert!(observed.2);
+            result.unwrap();
+            assert_eq!(std::fs::read(&receipt).unwrap(), expected);
+        }
+
+        #[test]
+        fn receipt_publication_refuses_failed_or_replaced_directory_barriers() {
+            let fixture = tempfile::tempdir().unwrap().keep();
+            let parent = fixture.join("attempt");
+            std::fs::create_dir(&parent).unwrap();
+            let receipt = parent.join("receipt");
+            let receipts = [(
+                "RCH_TEST_DISK_USAGE:".into(),
+                Some(json!({"complete": true, "exit_code": 0})),
+            )];
+            let expected = receipt_text(&receipts).unwrap();
+            let failed = persist_receipt_with_directory_sync(&receipt, &receipts, |_| {
+                Err(io::Error::other("injected directory sync failure"))
+            })
+            .unwrap_err();
+            assert!(failed.detail.contains("injected directory sync failure"));
+            assert_eq!(
+                std::fs::read(&receipt).unwrap(),
+                expected,
+                "visible renamed bytes alone cannot confirm durability"
+            );
+
+            let retained = fixture.join("retained-attempt");
+            let changed = persist_receipt_with_directory_sync(&receipt, &receipts, |directory| {
+                std::fs::rename(&parent, &retained)?;
+                std::fs::create_dir(&parent)?;
+                directory.sync_all()
+            })
+            .unwrap_err();
+            assert_eq!(changed.detail, "disk receipt parent changed");
+            assert!(!receipt.exists());
+            assert_eq!(std::fs::read(retained.join("receipt")).unwrap(), expected);
         }
 
         #[test]
