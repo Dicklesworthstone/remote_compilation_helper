@@ -2526,9 +2526,10 @@ SDK against the original dataset identity before admitting execution.
 An interrupted upload can therefore leave completed files and a bounded current
 prefix for a later request by the same authenticated client. Changed SDK images
 can reuse unchanged member bytes while still proving their own complete image.
-No network or Cargo operation is automatically retried. This is input-byte
-recovery before execution acceptance; it does not make an accepted operation
-resumable. The original fixed 35-minute input budget includes negotiation,
+An interrupted input upload is not automatically resubmitted. This cache provides
+input-byte recovery for a later deliberate request; accepted-operation recovery
+uses the separate live ownership mechanism described below. The original fixed
+35-minute input budget includes negotiation,
 snapshot import, network transfer and final verification, with cancellation
 checks between bounded copies.
 
@@ -2574,7 +2575,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v9` and the exact tool build identity must match before
+`canonical-compile-remote-v10` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2782,7 +2783,8 @@ resolved before the native client reads the retained profile.
 Alternatively, retain an explicit `output_destination` for a one-off operation;
 it must be absent, and it cannot be combined with `output_root`. The launcher
 does not clear an earlier result. The selected launcher profile remains available
-for inspection after failure or interruption; remote operations are not resumable.
+for inspection after failure or interruption. The surviving native client can
+reattach to its accepted operation within the running service, as described below.
 A failure does not trigger a local fallback or automatic resubmission.
 
 #### Reuse previously downloaded artifact bytes
@@ -2883,36 +2885,89 @@ private 0700 target root. Empty directories, timestamps and hardlink topology
 are not transported. These are detached build artifacts; this format does not
 grant reusable Cargo target-state or action-cache authority on the client.
 
-Client disconnection cancels and drains that operation. It removes only that
-operation's interest in a shared dependency execution; another client's retained
-subscription can continue. Losing the last subscriber cancels the shared
+Explicit cancellation, terminal local/protocol failure, recovery expiry, and
+service shutdown cancel and drain the original operation. Cancellation removes
+only that operation's interest in a shared dependency execution; another client's
+retained subscription can continue. Losing the last subscriber cancels the shared
 producer through the existing ownership path. Service shutdown stops admission
-and joins operations and shared executions before releasing coordinator
-authority. The service verifies the same installed build identity as the client
-and cannot downgrade a client's required release-authorization policy.
+and joins attached and detached operations and shared executions before releasing
+coordinator authority. The service verifies the same installed build identity as
+the client and cannot downgrade a client's required release-authorization policy.
 Install matching client and coordinator binaries: paged source and artifact
 manifests, source-file and partial-prefix negotiation, SDK file/prefix and image
-reuse, and artifact missing-file/prefix selection use wire version
-`canonical-compile-remote-v9`, while existing client and service JSON
+reuse, artifact missing-file/prefix selection and operation reattachment use wire
+version `canonical-compile-remote-v10`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 
-This remote protocol has no detached-job resume or automatic operation
-retry after admission. A transport failure after acceptance can leave execution
-or final delivery uncertain. An interruption after the local atomic rename can
-leave the requested output already installed even when the client reports an
-error. Preserve that result and inspect it; do not automatically submit another
-operation or fall back to a local compiler because an acknowledgment was lost.
-Failed receive staging is retained privately.
+#### Recover an interrupted accepted operation
+
+After input readiness, the client retains a random operation credential bound
+to its authenticated TLS key and the coordinator's current authority incarnation.
+The credential is issued before `InputsDone`, so a lost acceptance response can
+be reconciled without guessing whether execution began. The original input owner
+is the only path that can start Cargo. A resume request can take ownership of an
+existing operation or wait briefly for its original connection; it cannot upload
+inputs, reserve another build, select another coordinator, or start compilation.
+
+When an accepted connection encounters a transport error, the surviving client
+automatically reconnects to the same pinned coordinator for at most **60 seconds
+per outage**. The service retains the existing operation for at most 60 seconds
+while detached, within its original deadline. Execution and result delivery have
+fixed deadlines; reattachment does not renew them. Every retained operation keeps
+its admission permit, so active plus detached operations stay within `max_roots`.
+The service allows bounded connection headroom for reattachment while an old
+connection is still noticing a failure, without admitting extra builds.
+
+The client reports the last complete stdout/stderr record it successfully wrote.
+The server accepts only a previously acknowledged or actually offered complete
+record boundary. It resumes diagnostics there, without silently skipping bytes
+or printing an already exposed record again. A local output write failure is a
+terminal error, not a reason to replay partially printed diagnostics.
+
+During artifact transfer, the same private receiver stays alive across
+connections. After verifying the identical replayed manifest, the client sends
+its original missing-file/prefix selection and first incomplete file/byte cursor.
+Completed local imports and downloaded files stay in that receiver. A previously
+selected prefix is not imported again, and an accepted nonzero cursor takes
+precedence over an original prefix offer. Untouched files can still select their
+frozen prefix hints; reconnect never reads changed hints from the old tree. Every final
+tree still passes the complete manifest, byte, mode and namespace seal before
+the original coordinator authorizes publication.
+
+If the client has already atomically installed the output, it retains an
+`InstalledTarget` receipt with the original inventory, file and directory
+identities, and parent/ancestor descriptors. Reattachment verifies that exact
+tree and reconciles the original publication acknowledgment, without renaming or
+overwriting the destination again. The service accepts this path only after it
+authorized the original commit and rechecks its captured target and producer
+provenance before returning completion. The client verifies the installed tree
+again before reporting success. A final `Delivered` acknowledgment releases
+retained service custody; losing that acknowledgment does not invalidate a
+completion the client has already verified.
+
+Cancellation first uses a usable attachment and can also use a short, separately
+authenticated cancellation connection for the same token if the original wire
+has failed. It cannot become a new execution. If the coordinator is unreachable,
+the fixed detachment/execution deadlines provide the remaining cleanup bound.
+
+This recovery requires the **same surviving client process and the same running
+service incarnation**. Tokens and receiver/publication custody are not persisted
+for client or service restart, failover, detached-job lookup, or later CLI resume.
+Malformed protocol data, changed output, invalid credentials, cancellation and
+authority changes refuse recovery. A failure outside the retained window can
+still leave an installed output with an uncertain command result; preserve it
+for inspection instead of automatically submitting another operation. Failed
+receive staging remains private and retained.
 
 Cargo and each operation's rustc endpoint run at the coordinator. The client
 does not run an independent local Cargo driver against a distributed action
 coordinator. This route extends the existing shared dependency runtime across
 authenticated client hosts; complete M6 fleet scheduling, a measured multi-host
 build storm and its performance targets still require their own qualification.
-The Cargo frontend submits through this same native protocol. It does not add
-a detached-job resume mechanism or change the service's admission and artifact
-delivery limits.
+The Cargo frontend submits through this same native protocol and inherits its
+live reattachment behavior. It does not add restart recovery or change the
+service's admission and artifact delivery limits.
 
 ### Persistent reuse and command results
 

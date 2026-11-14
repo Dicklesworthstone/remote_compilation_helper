@@ -9,7 +9,9 @@ use super::super::remote_artifacts::ArtifactPrefix;
 use super::super::remote_operation::RemoteOperationSettings;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
+use rabs_protocol::durable_ids::BuildOperationId;
 use rabs_protocol::raw_bytes::encode_hex;
+use rabs_protocol::reconnect::{ResumableToken, SubscriberId};
 use rabs_sandbox::artifact_tree::{
     MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
 };
@@ -25,6 +27,7 @@ use rabs_sandbox::toolchain_transfer::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::pin;
@@ -33,10 +36,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v9 adds manifest-bound partial-file offers to artifact delivery. The sender
-/// verifies each offered prefix before selecting its offset in the first chunk.
-/// Older peers must refuse during Hello before either side admits input bytes.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v9";
+/// v10 adds peer-bound operation reattachment, diagnostic frontiers, artifact
+/// byte cursors and a terminal receipt. It preserves v9 verified prefix offers
+/// and complete-file reuse. Older peers refuse before admission.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v10";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
@@ -51,6 +54,9 @@ pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
 pub(super) const ADMISSION_POLL: Duration = Duration::from_millis(100);
+/// A disconnected operation retains its existing execution and input custody
+/// briefly, within the original execution/delivery deadline. No restart replay.
+pub(super) const RESUME_GRACE: Duration = Duration::from_secs(60);
 const CANCELLATION_POLL: Duration = Duration::from_millis(100);
 const READS_BEFORE_YIELD: usize = 32;
 
@@ -109,6 +115,63 @@ pub(super) fn digest(value: &str) -> io::Result<[u8; 32]> {
     decode_hex(value, 32)?
         .try_into()
         .map_err(|_| invalid("expected a SHA-256 digest"))
+}
+
+/// The wire carries no subscriber selector: one canonical command has exactly
+/// one diagnostic/publication owner. Debug output must never expose its secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OperationToken {
+    operation: String,
+    incarnation: String,
+    secret: String,
+}
+
+impl fmt::Debug for OperationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationToken")
+            .field("operation", &self.operation)
+            .field("incarnation", &self.incarnation)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl OperationToken {
+    pub(super) fn from_native(token: &ResumableToken) -> Self {
+        Self {
+            operation: encode_hex(&token.request.0.to_be_bytes()),
+            incarnation: encode_hex(&token.issued_by_incarnation.to_be_bytes()),
+            secret: encode_hex(&token.secret),
+        }
+    }
+
+    pub(super) fn native(&self) -> io::Result<ResumableToken> {
+        fn id(value: &str) -> io::Result<u128> {
+            let bytes: [u8; 16] = decode_hex(value, 16)?
+                .try_into()
+                .map_err(|_| invalid("remote operation token requires a 128-bit identity"))?;
+            let value = u128::from_be_bytes(bytes);
+            require(value != 0, "remote operation token has a zero identity")?;
+            Ok(value)
+        }
+        let secret = digest(&self.secret)?;
+        require(
+            secret != [0; 32],
+            "remote operation token has a zero secret",
+        )?;
+        Ok(ResumableToken {
+            request: BuildOperationId(id(&self.operation)?),
+            subscriber: SubscriberId(1),
+            issued_by_incarnation: id(&self.incarnation)?,
+            secret,
+        })
+    }
+
+    pub(super) fn validate(&self) -> io::Result<()> {
+        self.native().map(|_| ())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,7 +380,7 @@ impl SourcePages {
 /// V4 negotiates an output-specific, finite storage profile independently of
 /// source upload. The declaration is small even for a many-file Cargo target;
 /// no output paths are created until all bounded pages match this identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ArtifactDeclaration {
     pub(super) manifest_sha256: String,
@@ -520,6 +583,33 @@ impl ArtifactPlan {
             .binary_search_by_key(&index, |prefix| usize::from(prefix.index))
             .ok()
             .map(|position| &self.prefixes[position])
+    }
+
+    /// The original missing-file selection remains intact across attachments.
+    /// A live receiver can skip its completed prefix and resume one partial
+    /// member, but every result still requires a full manifest/byte seal.
+    pub(super) fn validate_cursor(
+        &self,
+        manifest: &ArtifactManifest,
+        file_index: u32,
+        offset: u64,
+    ) -> io::Result<()> {
+        let index = file_index as usize;
+        if index == manifest.files().len() {
+            return require(
+                offset == 0,
+                "completed artifact cursor has a nonzero offset",
+            );
+        }
+        require(
+            manifest
+                .files()
+                .get(index)
+                .is_some_and(|file| offset < file.len)
+                && u16::try_from(index)
+                    .is_ok_and(|index| self.missing_files.binary_search(&index).is_ok()),
+            "artifact resume cursor is outside the selected file payloads",
+        )
     }
 
     pub(super) fn from_request(
@@ -987,6 +1077,22 @@ pub(super) enum Message {
         toolchain_identity: Toolchain,
         cargo_home: Option<CargoHome>,
     },
+    Resume {
+        version: String,
+        build_identity: String,
+        require_release: bool,
+        token: OperationToken,
+        stdout_offset: u64,
+        stderr_offset: u64,
+    },
+    ResumePending {},
+    CancelOperation {
+        version: String,
+        build_identity: String,
+        require_release: bool,
+        token: OperationToken,
+    },
+    Cancelled {},
     SourceManifestPage {
         page: SourcePage,
     },
@@ -995,6 +1101,7 @@ pub(super) enum Message {
     Ready {
         toolchain: ToolchainDisposition,
         source: SourcePlan,
+        resume: OperationToken,
     },
     SourceChunk {
         chunk: Chunk,
@@ -1050,6 +1157,8 @@ pub(super) enum Message {
         manifest_sha256: String,
         missing_files: Vec<u16>,
         prefixes: Vec<ArtifactPrefixOffer>,
+        file_index: u32,
+        offset: u64,
     },
     ArtifactChunk {
         chunk: Chunk,
@@ -1067,6 +1176,7 @@ pub(super) enum Message {
     Complete {
         exit_code: i32,
     },
+    Delivered {},
     Close {},
     Cancel {},
     Failure {
@@ -1075,7 +1185,8 @@ pub(super) enum Message {
 }
 
 /// A fixed byte/frame deadline and a finite buffer belong to this connection.
-/// Partial records are never retried on another connection or another build.
+/// Partial records are never continued on another connection. A fresh wire can
+/// reattach to the same operation using its independently retained frontiers.
 pub(super) struct Wire<S> {
     stream: S,
     buffered: Vec<u8>,
@@ -1089,6 +1200,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             buffered: Vec::new(),
             failed: false,
         }
+    }
+
+    /// A local filesystem/output error, protocol refusal or cancellation must
+    /// never trigger network recovery, even if it uses the same error kind.
+    pub(super) fn can_resume_after(&self, error: &io::Error) -> bool {
+        self.failed
+            && matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::NotConnected
+            )
     }
 
     pub(super) async fn send(
@@ -1472,6 +1598,8 @@ mod artifact_plan_tests {
             manifest_sha256: plan.manifest_sha256,
             missing_files: plan.missing_files,
             prefixes: plan.prefixes,
+            file_index: 0,
+            offset: 0,
         })
         .unwrap();
         assert!(record.len() < MAX_JSON_RECORD);
@@ -1516,6 +1644,72 @@ mod artifact_plan_tests {
     }
 
     #[test]
+    fn artifact_resume_cursors_select_only_incomplete_payloads_or_the_complete_tree() {
+        let manifest = manifest();
+        let all = ArtifactPlan::all(&manifest).unwrap();
+        for (index, offset) in [(0, 0), (0, 3), (2, 0), (2, 2), (3, 0)] {
+            all.validate_cursor(&manifest, index, offset).unwrap();
+        }
+        for (index, offset) in [
+            (0, 4),
+            (0, u64::MAX),
+            (1, 0),
+            (2, 3),
+            (3, 1),
+            (4, 0),
+            (u32::MAX, 0),
+        ] {
+            assert!(
+                all.validate_cursor(&manifest, index, offset).is_err(),
+                "accepted cursor {index}:{offset}",
+            );
+        }
+
+        // Reused members cannot become payloads on reattachment. The original
+        // selected file may resume partway through, or have finished entirely.
+        let reused = ArtifactPlan::new(&manifest, vec![2]).unwrap();
+        assert!(reused.validate_cursor(&manifest, 0, 0).is_err());
+        reused.validate_cursor(&manifest, 2, 1).unwrap();
+        reused.validate_cursor(&manifest, 3, 0).unwrap();
+        let reused_all = ArtifactPlan::new(&manifest, vec![]).unwrap();
+        assert!(reused_all.validate_cursor(&manifest, 2, 0).is_err());
+        reused_all.validate_cursor(&manifest, 3, 0).unwrap();
+
+        // A tree of empty files still has one terminal cursor, not an
+        // arbitrary offset that could authorize an unlisted payload.
+        let empty = ArtifactManifest::new(vec![SourceFile {
+            path: "empty".into(),
+            len: 0,
+            sha256: Sha256::digest([]).into(),
+            executable: false,
+        }])
+        .unwrap();
+        let plan = ArtifactPlan::all(&empty).unwrap();
+        plan.validate_cursor(&empty, 1, 0).unwrap();
+        assert!(plan.validate_cursor(&empty, 0, 0).is_err());
+        assert!(plan.validate_cursor(&empty, 1, 1).is_err());
+        assert!(plan.validate_cursor(&empty, 2, 0).is_err());
+    }
+
+    #[test]
+    fn retained_artifact_cursor_is_independent_of_optional_original_prefix_offers() {
+        let manifest = manifest();
+        let offers = vec![prefix(0, 3), prefix(2, 1)];
+        let plan = ArtifactPlan::with_prefixes(&manifest, vec![0, 2], offers.clone()).unwrap();
+        // An untouched file still starts at zero until the sender chooses the
+        // hint. A rejected hint can leave fewer accepted bytes; a selected one
+        // can subsequently advance beyond its offered prefix on the same live
+        // receiver. None of these frontiers rewrites the immutable offer list.
+        for (index, offset) in [(0, 0), (0, 1), (0, 3), (2, 0), (2, 2), (3, 0)] {
+            plan.validate_cursor(&manifest, index, offset).unwrap();
+        }
+        assert_eq!(plan.prefixes, offers);
+        for (index, offset) in [(0, 4), (1, 0), (2, 3), (3, 1), (4, 0)] {
+            assert!(plan.validate_cursor(&manifest, index, offset).is_err());
+        }
+    }
+
+    #[test]
     fn maximum_artifact_plan_is_compact_even_for_large_manifest_paths() {
         let manifest = ArtifactManifest::new(
             (0..MAX_ARTIFACT_FILES)
@@ -1536,12 +1730,13 @@ mod artifact_plan_tests {
             MAX_ARTIFACT_FILES - 1,
         );
         // The wire carries indexes rather than repeating the paged paths.
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "kind":"receive-artifacts",
-            "manifest_sha256":plan.manifest_sha256,
-            "missing_files":plan.missing_files,
-            "prefixes":plan.prefixes,
-        }))
+        let bytes = serde_json::to_vec(&Message::ReceiveArtifacts {
+            manifest_sha256: plan.manifest_sha256,
+            missing_files: plan.missing_files,
+            prefixes: plan.prefixes,
+            file_index: 0,
+            offset: 0,
+        })
         .unwrap();
         assert!(bytes.len() < 100 * 1024);
         assert!(bytes.len() < MAX_JSON_RECORD);
@@ -1677,6 +1872,15 @@ mod tests {
         bytes
     }
 
+    fn operation_token() -> OperationToken {
+        OperationToken::from_native(&ResumableToken {
+            request: BuildOperationId(u128::MAX),
+            subscriber: SubscriberId(1),
+            issued_by_incarnation: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            secret: [0xab; 32],
+        })
+    }
+
     fn source_manifest() -> SourceManifest {
         SourceManifest::new(vec![
             SourceFile {
@@ -1702,11 +1906,135 @@ mod tests {
     }
 
     #[test]
+    fn operation_tokens_keep_native_identity_and_refuse_ambiguous_credentials() {
+        let token = operation_token();
+        let native = token.native().unwrap();
+        assert_eq!(native.request, BuildOperationId(u128::MAX));
+        assert_eq!(native.subscriber, SubscriberId(1));
+        assert_eq!(
+            native.issued_by_incarnation,
+            0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+        );
+        assert_eq!(native.secret, [0xab; 32]);
+        assert_eq!(OperationToken::from_native(&native), token);
+        let encoded = serde_json::to_vec(&token).unwrap();
+        let decoded: OperationToken = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.native().unwrap(), native);
+
+        for field in ["operation", "incarnation"] {
+            for invalid in [
+                String::new(),
+                "00".repeat(16),
+                "ff".repeat(15),
+                "ff".repeat(17),
+                "f".repeat(31),
+                "FF".repeat(16),
+                "gg".repeat(16),
+            ] {
+                let mut value = serde_json::to_value(&token).unwrap();
+                value[field] = json!(invalid);
+                let changed: OperationToken = serde_json::from_value(value).unwrap();
+                assert!(changed.validate().is_err(), "accepted {field}={invalid:?}");
+            }
+        }
+        for invalid in [
+            String::new(),
+            "00".repeat(32),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "a".repeat(63),
+            "AB".repeat(32),
+            "gg".repeat(32),
+        ] {
+            let mut changed = token.clone();
+            changed.secret = invalid;
+            assert!(changed.validate().is_err());
+        }
+        for field in ["subscriber", "peer", "root", "extra"] {
+            let mut value = serde_json::to_value(&token).unwrap();
+            value[field] = json!(1);
+            assert!(serde_json::from_value::<OperationToken>(value).is_err());
+        }
+        for field in ["operation", "incarnation", "secret"] {
+            let mut value = serde_json::to_value(&token).unwrap();
+            value[field] = json!(1);
+            assert!(serde_json::from_value::<OperationToken>(value).is_err());
+            let duplicate = format!(
+                "{{\"{field}\":\"00\",{}",
+                &String::from_utf8(encoded.clone()).unwrap()[1..],
+            );
+            assert!(serde_json::from_str::<OperationToken>(&duplicate).is_err());
+        }
+    }
+
+    #[test]
+    fn operation_token_and_recovery_message_debug_output_redact_the_bearer_secret() {
+        let token = operation_token();
+        let debug = format!("{token:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&token.secret));
+        assert!(debug.contains(&token.operation));
+        assert!(debug.contains(&token.incarnation));
+        for message in [
+            Message::Ready {
+                toolchain: ToolchainDisposition::Reuse,
+                source: SourcePlan::all(&source_manifest()).unwrap(),
+                resume: token.clone(),
+            },
+            Message::Resume {
+                version: WIRE_VERSION.into(),
+                build_identity: "service-build".into(),
+                require_release: false,
+                token: token.clone(),
+                stdout_offset: 17,
+                stderr_offset: 29,
+            },
+            Message::CancelOperation {
+                version: WIRE_VERSION.into(),
+                build_identity: "service-build".into(),
+                require_release: false,
+                token: token.clone(),
+            },
+        ] {
+            let debug = format!("{message:?}");
+            assert!(debug.contains("[redacted]"));
+            assert!(!debug.contains(&token.secret));
+            // The authenticated wire still carries the exact credential;
+            // redaction changes diagnostics, never authentication semantics.
+            let encoded = serde_json::to_string(&message).unwrap();
+            assert!(encoded.contains(&token.secret));
+            let decoded: Message = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn local_errors_never_authorize_reattachment_on_a_healthy_connection() {
+        let wire = Wire::new(MemoryStream::new(Vec::new(), 3));
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            // Filesystem/output errors can have the same kinds as a lost
+            // socket. Only an error from this actual wire can permit recovery.
+            assert!(!wire.can_resume_after(&io::Error::new(kind, "local failure")));
+        }
+    }
+
+    #[test]
     fn fragmented_and_coalesced_records_keep_the_exact_next_phase() {
         let mut bytes = record(&Message::Queued {});
         bytes.extend(record(&Message::Ready {
             toolchain: ToolchainDisposition::Reuse,
             source: SourcePlan::all(&source_manifest()).unwrap(),
+            resume: operation_token(),
         }));
         bytes.extend(record(&Message::Window { count: 4 }));
         bytes.extend(record(&Message::Complete { exit_code: 0 }));
@@ -1834,6 +2162,7 @@ mod tests {
                 };
                 setter.join().unwrap();
                 assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert!(!wire.can_resume_after(&error));
                 if writing {
                     assert_eq!(wire.stream.output, record(&Message::Poll {})[..5]);
                 } else {
@@ -1857,6 +2186,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(wire.can_resume_after(&error));
         });
     }
 
@@ -1909,6 +2239,7 @@ mod tests {
                             io::ErrorKind::TimedOut
                         }
                     );
+                    assert_eq!(wire.can_resume_after(&error), !cancelled);
                     let written = wire.stream.output.clone();
                     let reads = wire.stream.reads.load(Ordering::Relaxed);
                     if writing {
@@ -1924,6 +2255,7 @@ mod tests {
                     wire.stream.input = record(&Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
                         source: SourcePlan::all(&source_manifest()).unwrap(),
+                        resume: operation_token(),
                     });
                     wire.stream.offset = 0;
                     wire.stream.eof = true;
@@ -1959,14 +2291,17 @@ mod tests {
                 b"{invalid}\n".to_vec(),
                 Vec::new(),
             ] {
+                let is_transport_failure = first.is_empty();
                 let mut wire = Wire::new(MemoryStream::new(first, 3));
                 let stopped = AtomicBool::new(false);
                 let deadline = Instant::now() + Duration::from_secs(1);
-                assert!(wire.receive_until(&stopped, deadline).await.is_err());
+                let error = wire.receive_until(&stopped, deadline).await.unwrap_err();
+                assert_eq!(wire.can_resume_after(&error), is_transport_failure);
                 let reads = wire.stream.reads.load(Ordering::Relaxed);
                 wire.stream.input = record(&Message::Ready {
                     toolchain: ToolchainDisposition::Upload,
                     source: SourcePlan::all(&source_manifest()).unwrap(),
+                    resume: operation_token(),
                 });
                 wire.stream.offset = 0;
                 assert!(wire.receive_until(&stopped, deadline).await.is_err());
@@ -1999,8 +2334,12 @@ mod tests {
         let ready = serde_json::to_value(Message::Ready {
             toolchain: ToolchainDisposition::Reuse,
             source: SourcePlan::all(&source_manifest()).unwrap(),
+            resume: operation_token(),
         })
         .unwrap();
+        let mut missing_resume = ready.clone();
+        missing_resume.as_object_mut().unwrap().remove("resume");
+        assert!(serde_json::from_value::<Message>(missing_resume).is_err());
         for field in ["toolchain_root", "source_root", "peer", "extra"] {
             let mut value = ready.clone();
             value[field] = json!("/not-an-input-capability");
@@ -2016,6 +2355,8 @@ mod tests {
         // peers built before that change exchange the identical records.
         for (message, bytes) in [
             (Message::Queued {}, r#"{"kind":"queued"}"#),
+            (Message::ResumePending {}, r#"{"kind":"resume-pending"}"#),
+            (Message::Cancelled {}, r#"{"kind":"cancelled"}"#),
             (Message::InputsDone {}, r#"{"kind":"inputs-done"}"#),
             (Message::Accepted {}, r#"{"kind":"accepted"}"#),
             (
@@ -2037,6 +2378,7 @@ mod tests {
                 r#"{"kind":"artifact-manifest-end"}"#,
             ),
             (Message::ArtifactEnd {}, r#"{"kind":"artifact-end"}"#),
+            (Message::Delivered {}, r#"{"kind":"delivered"}"#),
             (Message::Close {}, r#"{"kind":"close"}"#),
             (Message::Cancel {}, r#"{"kind":"cancel"}"#),
         ] {
@@ -2052,26 +2394,37 @@ mod tests {
     fn ready_contract_carries_exact_upload_or_reuse_disposition() {
         let manifest = source_manifest();
         let plan = SourcePlan::all(&manifest).unwrap();
+        let token = operation_token();
         for (spelling, expected) in [
             ("upload", ToolchainDisposition::Upload),
             ("upload-files", ToolchainDisposition::UploadFiles),
             ("reuse", ToolchainDisposition::Reuse),
         ] {
             let bytes = serde_json::to_vec(&json!({
-                "kind": "ready", "toolchain": spelling, "source": plan
+                "kind": "ready", "toolchain": spelling, "source": plan, "resume": token
             }))
             .unwrap();
-            let Message::Ready { toolchain, source } =
-                serde_json::from_slice::<Message>(&bytes).unwrap()
+            let Message::Ready {
+                toolchain,
+                source,
+                resume,
+            } = serde_json::from_slice::<Message>(&bytes).unwrap()
             else {
                 panic!("expected explicit SDK and source admission");
             };
             assert_eq!(toolchain, expected);
             assert_eq!(source, plan);
             source.validate(&manifest).unwrap();
+            assert_eq!(resume, token);
+            resume.validate().unwrap();
             assert_eq!(
-                serde_json::to_value(Message::Ready { toolchain, source }).unwrap(),
-                json!({"kind": "ready", "toolchain": spelling, "source": plan})
+                serde_json::to_value(Message::Ready {
+                    toolchain,
+                    source,
+                    resume
+                })
+                .unwrap(),
+                json!({"kind": "ready", "toolchain": spelling, "source": plan, "resume": token})
             );
         }
     }
@@ -2281,14 +2634,42 @@ mod tests {
             "kind":"receive-artifacts", "manifest_sha256":identity,
             "missing_files":[0, 2],
             "prefixes":[],
+            "file_index":0, "offset":7,
         });
         assert!(matches!(
             serde_json::from_value::<Message>(valid.clone()).unwrap(),
-            Message::ReceiveArtifacts { missing_files, .. } if missing_files == [0, 2]
+            Message::ReceiveArtifacts { missing_files, file_index: 0, offset: 7, .. }
+                if missing_files == [0, 2]
         ));
         for index in [json!(-1), json!(65536), json!("0"), json!(0.5)] {
             let mut value = valid.clone();
             value["missing_files"] = json!([index]);
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for index in [
+            json!(-1),
+            json!(u64::from(u32::MAX) + 1),
+            json!("0"),
+            json!(0.5),
+        ] {
+            let mut value = valid.clone();
+            value["file_index"] = index;
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for offset in [json!(-1), json!("0"), json!(0.5)] {
+            let mut value = valid.clone();
+            value["offset"] = offset;
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for field in [
+            "manifest_sha256",
+            "missing_files",
+            "prefixes",
+            "file_index",
+            "offset",
+        ] {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Message>(value).is_err());
         }
         for field in ["path", "root", "extra"] {
@@ -2303,7 +2684,7 @@ mod tests {
             .is_err()
         );
         let duplicate = format!(
-            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[],\"missing_files\":[0],\"prefixes\":[]}}"
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[],\"missing_files\":[0],\"prefixes\":[],\"file_index\":0,\"offset\":0}}"
         );
         assert!(serde_json::from_str::<Message>(&duplicate).is_err());
     }
@@ -2315,6 +2696,7 @@ mod tests {
             "kind":"receive-artifacts", "manifest_sha256":identity,
             "missing_files":[0],
             "prefixes":[{"index":0,"offset":1,"sha256":identity}],
+            "file_index":0, "offset":0,
         });
         assert!(matches!(
             serde_json::from_value::<Message>(valid.clone()).unwrap(),
@@ -2349,11 +2731,11 @@ mod tests {
         absent.as_object_mut().unwrap().remove("prefixes");
         assert!(serde_json::from_value::<Message>(absent).is_err());
         let duplicate = format!(
-            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[],\"prefixes\":[]}}"
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[],\"prefixes\":[],\"file_index\":0,\"offset\":0}}"
         );
         assert!(serde_json::from_str::<Message>(&duplicate).is_err());
         let duplicate_offset = format!(
-            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[{{\"index\":0,\"offset\":1,\"offset\":2,\"sha256\":\"{identity}\"}}]}}"
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[{{\"index\":0,\"offset\":1,\"offset\":2,\"sha256\":\"{identity}\"}}],\"file_index\":0,\"offset\":0}}"
         );
         assert!(serde_json::from_str::<Message>(&duplicate_offset).is_err());
     }
@@ -2374,6 +2756,7 @@ mod tests {
         let bytes = serde_json::to_vec(&Message::Ready {
             toolchain: ToolchainDisposition::Reuse,
             source,
+            resume: operation_token(),
         })
         .unwrap();
         assert!(bytes.len() < 24 * 1024);

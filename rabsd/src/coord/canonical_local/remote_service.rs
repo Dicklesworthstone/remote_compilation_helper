@@ -6,6 +6,7 @@
 //! path-based Unix service is deliberately not used as a network protocol.
 
 mod client;
+mod operations;
 mod source_inputs;
 mod toolchain_inputs;
 mod wire;
@@ -26,6 +27,7 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
+use operations::{Attachment, Claim, DiagnosticFrontier, Registry};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
@@ -53,8 +55,8 @@ use std::time::{Duration, Instant};
 use toolchain_inputs::{RemoteToolchainFileCache, ToolchainFileInput};
 use wire::{
     ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, ArtifactPlan, Chunk, Manifest, Message,
-    Output, SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION, Window, Wire,
-    checkpoint, digest, invalid, require,
+    OperationToken, Output, SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION,
+    Window, Wire, checkpoint, digest, invalid, require,
 };
 
 const SERVICE_VERSION: &str = "canonical-compile-remote-service-v1";
@@ -216,7 +218,9 @@ impl ServiceProfile {
     }
 
     fn max_sessions(&self) -> usize {
-        self.max_roots + self.max_queued_roots
+        // A failed transport may not yet have observed EOF when its client
+        // reconnects. Headroom grants no extra operation or input permits.
+        2 * self.max_roots + self.max_queued_roots
     }
 }
 
@@ -283,6 +287,12 @@ impl Drop for Session {
 struct Sessions(Vec<Session>);
 
 impl Sessions {
+    fn cancel_all(&self) {
+        for session in &self.0 {
+            session.stopped.store(true, Ordering::Release);
+        }
+    }
+
     fn reap(&mut self) {
         let mut index = 0;
         while index < self.0.len() {
@@ -306,9 +316,7 @@ impl Drop for Sessions {
     fn drop(&mut self) {
         // Cancel every operation before joining any of them. A slow drain
         // cannot leave another client running after service shutdown begins.
-        for session in &self.0 {
-            session.stopped.store(true, Ordering::Release);
-        }
+        self.cancel_all();
     }
 }
 
@@ -344,6 +352,19 @@ pub fn run_service_profile(
         config.jobs_per_root,
     )?;
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
+    let operations = match runtime
+        .coord
+        .authority()
+        .ok_or_else(|| invalid("remote canonical coordinator has no active authority"))
+        .and_then(|authority| {
+            Registry::<RemoteBuild>::new(authority, config.max_roots, wire::RESUME_GRACE)
+        }) {
+        Ok(operations) => operations,
+        Err(error) => {
+            let _ = runtime.shutdown();
+            return Err(error);
+        }
+    };
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
@@ -367,6 +388,7 @@ pub fn run_service_profile(
     );
     let result = loop {
         sessions.reap();
+        operations.reap(Instant::now());
         if shutdown.is_shutting_down() {
             break Ok(());
         }
@@ -384,7 +406,8 @@ pub fn run_service_profile(
         };
         if sessions.0.len() >= config.max_sessions() {
             // No plaintext rejection on an authenticated-only endpoint. No
-            // admission took place, and clients never automatically retry.
+            // admission took place. Only an already issued operation token
+            // can reattach; a new command is never automatically replayed.
             drop(stream);
             continue;
         }
@@ -393,6 +416,7 @@ pub fn run_service_profile(
         let child_config = Arc::clone(&config);
         let child_runtime = Arc::clone(&runtime);
         let child_admissions = Arc::clone(&admissions);
+        let child_operations = Arc::clone(&operations);
         let child_caches = Arc::clone(&caches);
         let child_acceptor = Arc::clone(&acceptor);
         let child_pins = Arc::clone(&pins);
@@ -417,6 +441,7 @@ pub fn run_service_profile(
                         child_runtime,
                         &child_config,
                         &child_admissions,
+                        &child_operations,
                         &child_caches,
                         edge_pin,
                         &child_stop,
@@ -445,6 +470,11 @@ pub fn run_service_profile(
         });
     };
     drop(listener);
+    // Stop queued and pre-Ready sessions before releasing any retained permit.
+    // Detached owners may take time to join; no waiting caller should acquire
+    // a fresh input tree while that drain is in progress.
+    sessions.cancel_all();
+    operations.shutdown();
     drop(sessions);
     let drained = runtime.shutdown();
     result.and(drained)
@@ -612,16 +642,100 @@ fn require_wire_identity(version: &str, build_identity: &str, expected: &str) ->
     )
 }
 
+/// Execution and publication custody outlive a transport attachment. Field
+/// order drains the writer before releasing its input owner/admission permit.
+struct RemoteBuild {
+    operation: Option<remote_operation::RemoteOperationOwner>,
+    outcome: Option<RemoteOperationOutcome>,
+    target: Option<CapturedTarget>,
+    stdout: File,
+    stderr: File,
+    diagnostics: DiagnosticFrontier,
+    delivery_deadline: Option<Instant>,
+    commit_authorized: bool,
+    _owner: Arc<tempfile::TempDir>,
+    _admission: AdmittedOperation,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     runtime: Arc<SharedRuntime>,
     config: &ServiceProfile,
     admissions: &Arc<OperationAdmissions>,
+    operations: &Arc<Registry<RemoteBuild>>,
     caches: &InputCaches,
     edge_pin: [u8; 32],
     stopped: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let declaration_deadline = Instant::now() + wire::IO_BUDGET;
+    let first = wire.receive(stopped, declaration_deadline).await?;
+    if let Message::CancelOperation {
+        version,
+        build_identity,
+        require_release,
+        token,
+    } = first
+    {
+        require_wire_identity(&version, &build_identity, &runtime.build_identity)?;
+        require(
+            !require_release || runtime.release_mode == ReleaseAuthorizationMode::Required,
+            "remote service cannot downgrade required release authorization",
+        )?;
+        let authority = runtime
+            .coord
+            .authority()
+            .ok_or_else(|| invalid("remote canonical coordinator has no active authority"))?;
+        operations.cancel(&authority, edge_pin, &token.native()?)?;
+        return wire
+            .send(&Message::Cancelled {}, stopped, declaration_deadline)
+            .await;
+    }
+    if let Message::Resume {
+        version,
+        build_identity,
+        require_release,
+        token,
+        stdout_offset,
+        stderr_offset,
+    } = first
+    {
+        require_wire_identity(&version, &build_identity, &runtime.build_identity)?;
+        require(
+            !require_release || runtime.release_mode == ReleaseAuthorizationMode::Required,
+            "remote service cannot downgrade required release authorization",
+        )?;
+        require(
+            runtime.healthy(),
+            "remote canonical coordinator is unavailable",
+        )?;
+        let authority = runtime
+            .coord
+            .authority()
+            .ok_or_else(|| invalid("remote canonical coordinator has no active authority"))?;
+        return match operations.claim(
+            &authority,
+            edge_pin,
+            &token.native()?,
+            Arc::clone(stopped),
+            Instant::now(),
+        )? {
+            Claim::Pending => {
+                wire.send(&Message::ResumePending {}, stopped, declaration_deadline)
+                    .await
+            }
+            Claim::Attached(operation) => {
+                serve_attachment(
+                    wire,
+                    &runtime,
+                    operation,
+                    stopped,
+                    (stdout_offset, stderr_offset),
+                )
+                .await
+            }
+        };
+    }
     let Message::Hello {
         version,
         build_identity,
@@ -630,9 +744,9 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         source_manifest,
         toolchain_identity,
         cargo_home,
-    } = wire.receive(stopped, declaration_deadline).await?
+    } = first
     else {
-        return Err(invalid("remote operation must begin with hello"));
+        return Err(invalid("remote operation must begin with hello or resume"));
     };
     require_wire_identity(&version, &build_identity, &runtime.build_identity)?;
     require(
@@ -661,7 +775,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or_else(|| invalid("remote operation admission deadline overflow"))?;
     // Keep this permit through input custody, execution, final delivery and
     // every error/drop path. It is separate from the existing Cargo root token.
-    let _admission = acquire_operation(wire, admissions, stopped, queue_deadline, || {
+    let admission = acquire_operation(wire, admissions, stopped, queue_deadline, || {
         runtime.healthy()
     })
     .await?;
@@ -697,6 +811,14 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     // Both SDK handoff and verified source prefill use the original admission
     // deadline. Only completed readiness grants one fresh input-transfer budget.
     let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
+    // Issue the resume credential before the client can attempt InputsDone.
+    // Only this reservation's original input owner can activate execution.
+    let reservation = operations.reserve(
+        edge_pin,
+        Arc::clone(stopped),
+        input_deadline,
+        Instant::now(),
+    )?;
     let cancelled = || {
         stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= input_deadline
     };
@@ -705,6 +827,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         &Message::Ready {
             toolchain: disposition,
             source: source.plan().clone(),
+            resume: OperationToken::from_native(reservation.token()),
         },
         stopped,
         input_deadline,
@@ -736,10 +859,8 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     let stderr = output_file(owner.path(), "stderr")?;
     let execution_deadline =
         Instant::now() + Duration::from_secs(settings.timeout_seconds) + DELIVERY_BUDGET;
-    // Acceptance means execution may begin. An interruption from this point
-    // never selects a retry, another coordinator or local compilation.
-    wire.send(&Message::Accepted {}, stopped, input_deadline)
-        .await?;
+    // Execution belongs to the reservation before Accepted can be lost. The
+    // resume path above can only take this owner, never call start again.
     let operation = remote_operation::start(
         Arc::clone(&runtime),
         config.wrapper.clone(),
@@ -749,14 +870,63 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         *settings,
         stdout.try_clone()?,
         stderr.try_clone()?,
-        Arc::clone(stopped),
+        reservation.operation_stop(),
         OUTPUT_BYTES,
     )?;
-    let mut stdout_offset = 0;
-    let mut stderr_offset = 0;
-    let mut operation = Some(operation);
-    let mut outcome = None;
-    loop {
+    let operation = reservation.activate(
+        RemoteBuild {
+            operation: Some(operation),
+            outcome: None,
+            target: None,
+            stdout,
+            stderr,
+            diagnostics: DiagnosticFrontier::default(),
+            delivery_deadline: None,
+            commit_authorized: false,
+            _owner: owner,
+            _admission: admission,
+        },
+        execution_deadline,
+        Instant::now(),
+    )?;
+    serve_attachment(wire, &runtime, operation, stopped, (0, 0)).await
+}
+
+/// One transport may expose one complete diagnostic record at a time. Only
+/// transport failures explicitly detach; every other exit cancels and joins.
+async fn serve_attachment<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    runtime: &SharedRuntime,
+    mut operation: Attachment<RemoteBuild>,
+    stopped: &AtomicBool,
+    exposed: (u64, u64),
+) -> io::Result<()> {
+    let operation_stop = operation.operation_stop();
+    let result = serve_attached(wire, runtime, &mut operation, stopped, exposed).await;
+    if let Err(error) = &result
+        && wire.can_resume_after(error)
+        && !stopped.load(Ordering::Acquire)
+        && !operation_stop.load(Ordering::Acquire)
+        && runtime.healthy()
+        && Instant::now() < operation.deadline()
+    {
+        operation.detach(Instant::now())?;
+    }
+    result
+}
+
+async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    runtime: &SharedRuntime,
+    operation: &mut Attachment<RemoteBuild>,
+    stopped: &AtomicBool,
+    exposed: (u64, u64),
+) -> io::Result<()> {
+    operation.diagnostics.reattach(exposed)?;
+    let execution_deadline = operation.deadline();
+    wire.send(&Message::Accepted {}, stopped, execution_deadline)
+        .await?;
+    let (stdout_offset, stderr_offset) = loop {
         checkpoint(stopped, execution_deadline)?;
         require(
             runtime.healthy(),
@@ -769,20 +939,27 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             ),
             "expected an operation status poll",
         )?;
+        let (mut stdout_offset, mut stderr_offset) = operation.diagnostics.acknowledge_poll();
         if operation
+            .operation
             .as_ref()
             .is_some_and(remote_operation::RemoteOperationOwner::finished)
         {
-            outcome = Some(
+            operation.outcome = Some(
                 operation
+                    .operation
                     .take()
                     .expect("finished operation is owned")
                     .join()?,
             );
         }
-        let stdout_chunk = read_output(&stdout, &mut stdout_offset)?;
-        let stderr_chunk = read_output(&stderr, &mut stderr_offset)?;
-        if !stdout_chunk.bytes.is_empty() || !stderr_chunk.bytes.is_empty() || outcome.is_none() {
+        let stdout_chunk = read_output(&operation.stdout, &mut stdout_offset)?;
+        let stderr_chunk = read_output(&operation.stderr, &mut stderr_offset)?;
+        operation.diagnostics.offer(stdout_offset, stderr_offset)?;
+        if !stdout_chunk.bytes.is_empty()
+            || !stderr_chunk.bytes.is_empty()
+            || operation.outcome.is_none()
+        {
             wire.send(
                 &Message::Progress {
                     stdout: stdout_chunk,
@@ -794,18 +971,35 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
             continue;
         }
-        break;
-    }
-    let outcome = outcome.ok_or_else(|| invalid("remote operation completed without its owner"))?;
-    let delivery_deadline = Instant::now() + DELIVERY_BUDGET;
-    let cancelled = || {
-        stopped.load(Ordering::Acquire) || !runtime.healthy() || Instant::now() >= delivery_deadline
+        break (stdout_offset, stderr_offset);
     };
-    let target = outcome
-        .retained_target
-        .as_deref()
-        .map(|path| CapturedTarget::capture(path, &cancelled))
-        .transpose()?;
+    let delivery_deadline = operation
+        .delivery_deadline
+        .unwrap_or_else(|| (Instant::now() + DELIVERY_BUDGET).min(execution_deadline));
+    operation.shorten_deadline(delivery_deadline);
+    let operation_stop = operation.operation_stop();
+    let cancelled = || {
+        stopped.load(Ordering::Acquire)
+            || operation_stop.load(Ordering::Acquire)
+            || !runtime.healthy()
+            || Instant::now() >= delivery_deadline
+    };
+    if operation.delivery_deadline.is_none() {
+        let outcome = operation
+            .outcome
+            .as_ref()
+            .ok_or_else(|| invalid("remote operation completed without its owner"))?;
+        operation.target = outcome
+            .retained_target
+            .as_deref()
+            .map(|path| CapturedTarget::capture(path, &cancelled))
+            .transpose()?;
+        operation.delivery_deadline = Some(delivery_deadline);
+    }
+    let outcome = operation
+        .outcome
+        .as_ref()
+        .ok_or_else(|| invalid("remote operation completed without its owner"))?;
     outcome.verify_before_delivery(&cancelled)?;
     checkpoint(stopped, delivery_deadline)?;
     wire.send(
@@ -813,7 +1007,8 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
             exit_code: outcome.exit_code,
             stdout_bytes: stdout_offset,
             stderr_bytes: stderr_offset,
-            target: target
+            target: operation
+                .target
                 .as_ref()
                 .map(|target| ArtifactDeclaration::from_native(target.manifest())),
         },
@@ -821,15 +1016,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         delivery_deadline,
     )
     .await?;
-    deliver_result(
-        wire,
-        &outcome,
-        target.as_ref(),
-        stopped,
-        delivery_deadline,
-        &cancelled,
-    )
-    .await
+    deliver_result(wire, operation, stopped, delivery_deadline, &cancelled).await
 }
 
 /// One authenticated declaration owns a FIFO ticket, never an input tree or
@@ -1130,37 +1317,55 @@ async fn send_window<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
-    outcome: &RemoteOperationOutcome,
-    target: Option<&CapturedTarget>,
+    operation: &mut RemoteBuild,
     stopped: &AtomicBool,
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
 ) -> io::Result<()> {
-    if let Some(target) = target {
+    let outcome = operation
+        .outcome
+        .as_ref()
+        .ok_or_else(|| invalid("remote operation completed without its owner"))?;
+    if let Some(target) = &operation.target {
         require(
             outcome.exit_code == 0,
             "failed compilation cannot publish a target",
         )?;
-        let manifest_sha256 = deliver_artifacts(wire, target, stopped, deadline, cancelled).await?;
-        outcome.verify_before_delivery(cancelled)?;
-        wire.send(
-            &Message::Commit {
-                manifest_sha256: manifest_sha256.clone(),
-            },
+        let receipt = deliver_artifacts(
+            wire,
+            target,
             stopped,
             deadline,
+            cancelled,
+            operation.commit_authorized,
         )
         .await?;
-        let Message::Published {
-            manifest_sha256: published,
-        } = wire.receive_until(stopped, deadline).await?
-        else {
-            return Err(invalid("client did not acknowledge target installation"));
-        };
-        require(
-            published == manifest_sha256,
-            "client installed a different target manifest",
-        )?;
+        if let ArtifactDelivery::Sealed(manifest_sha256) = receipt {
+            outcome.verify_before_delivery(cancelled)?;
+            // Retain authorization before attempting the write. A surviving
+            // client may have installed the exact target even if the response
+            // or its acknowledgment never reached this connection.
+            operation.commit_authorized = true;
+            wire.send(
+                &Message::Commit {
+                    manifest_sha256: manifest_sha256.clone(),
+                },
+                stopped,
+                deadline,
+            )
+            .await?;
+            let Message::Published {
+                manifest_sha256: published,
+            } = wire.receive_until(stopped, deadline).await?
+            else {
+                return Err(invalid("client did not acknowledge target installation"));
+            };
+            require(
+                published == manifest_sha256,
+                "client installed a different target manifest",
+            )?;
+        }
+        target.verify(cancelled)?;
     } else {
         require(
             matches!(wire.receive(stopped, deadline).await?, Message::Close {}),
@@ -1176,7 +1381,22 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         stopped,
         deadline,
     )
-    .await
+    .await?;
+    // The client can recover a lost Complete while this owner still exists.
+    // A lost Delivered only retains bounded custody; it never reruns Cargo.
+    require(
+        matches!(
+            wire.receive(stopped, deadline).await?,
+            Message::Delivered {}
+        ),
+        "expected terminal delivery acknowledgment",
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArtifactDelivery {
+    Sealed(String),
+    Published,
 }
 
 /// Transfer only the requested payloads, but retain the complete captured
@@ -1188,12 +1408,19 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     stopped: &AtomicBool,
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
-) -> io::Result<String> {
+    commit_authorized: bool,
+) -> io::Result<ArtifactDelivery> {
+    let request = wire.receive(stopped, deadline).await?;
+    if let Message::Published { manifest_sha256 } = request {
+        require(
+            commit_authorized && digest(&manifest_sha256)? == target.manifest().digest(),
+            "installed artifact receipt lacks the original commit authorization",
+        )?;
+        target.verify(cancelled)?;
+        return Ok(ArtifactDelivery::Published);
+    }
     require(
-        matches!(
-            wire.receive(stopped, deadline).await?,
-            Message::ReceiveTarget {}
-        ),
+        matches!(request, Message::ReceiveTarget {}),
         "client did not accept the declared target",
     )?;
     send_artifact_manifest(wire, target.manifest(), stopped, deadline).await?;
@@ -1201,6 +1428,8 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
         manifest_sha256,
         missing_files,
         prefixes,
+        file_index,
+        offset,
     } = wire.receive_until(stopped, deadline).await?
     else {
         return Err(invalid(
@@ -1212,17 +1441,28 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     // path from another target generation.
     let plan =
         ArtifactPlan::from_request(manifest_sha256, missing_files, prefixes, target.manifest())?;
+    plan.validate_cursor(target.manifest(), file_index, offset)?;
     let mut window = Window::default();
     for &index in &plan.missing_files {
+        if u32::from(index) < file_index {
+            continue;
+        }
         let file = &target.manifest().files()[usize::from(index)];
-        let mut offset = artifact_prefix_offset(
-            target,
-            file,
-            plan.prefix_for(usize::from(index)),
-            stopped,
-            deadline,
-            cancelled,
-        )?;
+        // Accepted bytes belong to the retained live receiver. An original
+        // optional prefix offer must never rewind or jump over this cursor.
+        // Only an untouched file may select its frozen hint again.
+        let mut offset = if u32::from(index) == file_index && offset != 0 {
+            offset
+        } else {
+            artifact_prefix_offset(
+                target,
+                file,
+                plan.prefix_for(usize::from(index)),
+                stopped,
+                deadline,
+                cancelled,
+            )?
+        };
         while offset < file.len {
             checkpoint(stopped, deadline)?;
             let bytes = target.read_chunk(&file.path, offset, MAX_SOURCE_CHUNK, cancelled)?;
@@ -1259,7 +1499,7 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     )?;
     // Include every locally reused member, not just the files read above.
     target.verify(cancelled)?;
-    Ok(plan.manifest_sha256)
+    Ok(ArtifactDelivery::Sealed(plan.manifest_sha256))
 }
 
 /// An offer saves network bytes only when the producer independently confirms
@@ -1475,13 +1715,13 @@ mod tests {
         assert_eq!(profile.toolchain_cache_entries, 4);
         assert_eq!(profile.toolchain_file_cache_bytes, 0);
         assert!(profile.target_cache.is_none());
-        assert_eq!(profile.max_sessions(), 2);
+        assert_eq!(profile.max_sessions(), 4);
         profile.validate().unwrap();
         profile.max_roots = 32;
         profile.max_queued_roots = 128;
         profile.queue_timeout_seconds = 1800;
         profile.validate().unwrap();
-        assert_eq!(profile.max_sessions(), 160);
+        assert_eq!(profile.max_sessions(), 192);
         profile.max_queued_roots = 129;
         assert!(profile.validate().is_err());
         profile.max_queued_roots = 128;
@@ -1562,8 +1802,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v9_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v9", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v10_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v10", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
@@ -1573,7 +1813,8 @@ mod tests {
             ("canonical-compile-remote-v6", "build-one"),
             ("canonical-compile-remote-v7", "build-one"),
             ("canonical-compile-remote-v8", "build-one"),
-            ("canonical-compile-remote-v9", "build-two"),
+            ("canonical-compile-remote-v9", "build-one"),
+            ("canonical-compile-remote-v10", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1841,6 +2082,12 @@ mod tests {
         input.extend(record(&Message::Window { count: 1 }));
         input.extend(record(&Message::ReceiveArtifacts {
             manifest_sha256: plan.manifest_sha256,
+            // This fixture declares exactly four canonical members.
+            file_index: plan
+                .missing_files
+                .first()
+                .map_or(4, |index| u32::from(*index)),
+            offset: 0,
             missing_files: plan.missing_files,
             prefixes: plan.prefixes,
         }));
@@ -1875,9 +2122,10 @@ mod tests {
                 &AtomicBool::new(false),
                 Instant::now() + wire::IO_BUDGET,
                 &|| false,
+                false,
             ))
             .unwrap();
-            assert_eq!(received, identity);
+            assert_eq!(received, ArtifactDelivery::Sealed(identity.clone()));
             let mut pages =
                 wire::ArtifactPages::new(ArtifactDeclaration::from_native(captured.manifest()))
                     .unwrap();
@@ -1958,9 +2206,10 @@ mod tests {
                     &AtomicBool::new(false),
                     Instant::now() + wire::IO_BUDGET,
                     &|| false,
+                    false,
                 ))
                 .unwrap(),
-                identity,
+                ArtifactDelivery::Sealed(identity.clone()),
             );
             let selected = if matching { offered } else { 0 };
             let mut offset = selected;
@@ -2028,6 +2277,7 @@ mod tests {
             &AtomicBool::new(false),
             Instant::now() + wire::IO_BUDGET,
             &|| false,
+            false,
         ))
         .unwrap();
         let mut chunks = Vec::new();
@@ -2189,6 +2439,7 @@ mod tests {
                     &AtomicBool::new(false),
                     Instant::now() + wire::IO_BUDGET,
                     &|| false,
+                    false,
                 ))
                 .is_err()
             );
@@ -2198,6 +2449,130 @@ mod tests {
                     Some("artifact-chunk" | "artifact-end")
                 )
             }));
+        }
+    }
+
+    #[test]
+    fn artifact_delivery_resumes_a_partial_file_and_accepts_a_sealed_cursor() {
+        let (_owner, captured, needed) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        let start = MAX_SOURCE_CHUNK as u64 + 17;
+        for (file_index, offset, windows) in [(2, start, vec![3]), (4, 0, vec![])] {
+            let mut input = record(&Message::ReceiveTarget {});
+            input.extend(record(&Message::Window { count: 1 }));
+            input.extend(record(&Message::ReceiveArtifacts {
+                manifest_sha256: identity.clone(),
+                missing_files: vec![2],
+                // A prior rejected hint is larger than the accepted cursor.
+                // Reattachment must neither retry that hint nor rewind to 0.
+                prefixes: vec![wire::ArtifactPrefixOffer {
+                    index: 2,
+                    offset: (MAX_SOURCE_CHUNK * 2) as u64,
+                    sha256: "00".repeat(32),
+                }],
+                file_index,
+                offset,
+            }));
+            for count in windows {
+                input.extend(record(&Message::Window { count }));
+            }
+            input.extend(record(&Message::Received {
+                manifest_sha256: identity.clone(),
+            }));
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            assert_eq!(
+                ready(deliver_artifacts(
+                    &mut Wire::new(peer),
+                    &captured,
+                    &AtomicBool::new(false),
+                    Instant::now() + wire::IO_BUDGET,
+                    &|| false,
+                    false,
+                ))
+                .unwrap(),
+                ArtifactDelivery::Sealed(identity.clone())
+            );
+            let mut actual = Vec::new();
+            for value in messages(&output) {
+                if let Message::ArtifactChunk { chunk } = serde_json::from_value(value).unwrap() {
+                    assert_eq!(chunk.path, "c-needed");
+                    assert_eq!(chunk.offset, offset + actual.len() as u64);
+                    actual.extend(chunk.verified_bytes().unwrap().0);
+                }
+            }
+            if file_index == 2 {
+                assert_eq!(actual, needed[start as usize..]);
+            } else {
+                assert!(actual.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_resume_rejects_invalid_cursors_before_payload() {
+        let (_owner, captured, needed) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for (file_index, offset) in [(0, 0), (1, 0), (2, needed.len() as u64), (4, 1), (5, 0)] {
+            let mut input = record(&Message::ReceiveTarget {});
+            input.extend(record(&Message::Window { count: 1 }));
+            input.extend(record(&Message::ReceiveArtifacts {
+                manifest_sha256: identity.clone(),
+                missing_files: vec![2],
+                prefixes: vec![],
+                file_index,
+                offset,
+            }));
+            let peer = AdmissionPeer::new(input);
+            let output = Arc::clone(&peer.output);
+            assert!(
+                ready(deliver_artifacts(
+                    &mut Wire::new(peer),
+                    &captured,
+                    &AtomicBool::new(false),
+                    Instant::now() + wire::IO_BUDGET,
+                    &|| false,
+                    false,
+                ))
+                .is_err()
+            );
+            assert!(messages(&output).iter().all(|message| {
+                !matches!(
+                    message["kind"].as_str(),
+                    Some("artifact-chunk" | "artifact-end")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn installed_receipt_reconciliation_requires_the_original_commit_and_target() {
+        let (_owner, captured, _) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for (authorized, supplied, success) in [
+            (false, identity.clone(), false),
+            (true, "00".repeat(32), false),
+            (true, identity.clone(), true),
+        ] {
+            let peer = AdmissionPeer::new(record(&Message::Published {
+                manifest_sha256: supplied,
+            }));
+            let output = Arc::clone(&peer.output);
+            let result = ready(deliver_artifacts(
+                &mut Wire::new(peer),
+                &captured,
+                &AtomicBool::new(false),
+                Instant::now() + wire::IO_BUDGET,
+                &|| false,
+                authorized,
+            ));
+            if success {
+                assert_eq!(result.unwrap(), ArtifactDelivery::Published);
+            } else {
+                assert!(result.is_err());
+            }
+            // Reconciliation never resends artifacts or issues another Commit.
+            assert!(messages(&output).is_empty());
         }
     }
 
@@ -2221,6 +2596,7 @@ mod tests {
                     &AtomicBool::new(false),
                     Instant::now() + wire::IO_BUDGET,
                     &|| false,
+                    false,
                 ))
                 .is_err()
             );
@@ -2259,6 +2635,7 @@ mod tests {
                     Instant::now()
                 },
                 &|| false,
+                false,
             ))
             .unwrap_err();
             assert_eq!(
@@ -2302,6 +2679,7 @@ mod tests {
                 &AtomicBool::new(false),
                 Instant::now() + wire::IO_BUDGET,
                 &|| false,
+                false,
             ))
             .is_err()
         );

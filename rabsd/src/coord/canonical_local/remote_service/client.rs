@@ -4,11 +4,11 @@ use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, ArtifactPlan,
-    ArtifactPrefixOffer, CargoHome, Chunk, Entry, IO_BUDGET, Message, Output, SOURCE_PAGE_FILES,
-    SourceDeclaration, SourcePage, SourcePlan, SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain,
-    ToolchainDisposition, ToolchainFilePage, ToolchainPrefixOffer, ToolchainResume, VERSION,
-    WIRE_VERSION, Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid,
-    require,
+    ArtifactPrefixOffer, CargoHome, Chunk, Entry, IO_BUDGET, Message, OperationToken, Output,
+    RESUME_GRACE, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan, SourcePrefixOffer,
+    TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition, ToolchainFilePage, ToolchainPrefixOffer,
+    ToolchainResume, VERSION, WIRE_VERSION, Window, Wire, checkpoint, controlled_future,
+    decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -280,7 +281,7 @@ pub fn run_client_profile(
         .ok_or_else(|| invalid("remote canonical capture did not retain its compiler"))?;
     let hello = Message::Hello {
         version: WIRE_VERSION.into(),
-        build_identity,
+        build_identity: build_identity.clone(),
         require_release: release_mode == ReleaseAuthorizationMode::Required,
         settings: Box::new(config.settings.clone()),
         source_manifest: SourceDeclaration::from_native(bundle.source.manifest()),
@@ -311,7 +312,7 @@ pub fn run_client_profile(
         )
         .await?;
         let admission_deadline = Instant::now() + ADMISSION_BUDGET;
-        let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+        let (input_deadline, toolchain_disposition, source_plan, token) = await_input_admission(
             &mut wire,
             bundle.source.manifest(),
             stopped,
@@ -329,21 +330,27 @@ pub fn run_client_profile(
             input_deadline,
         )
         .await?;
-        wire.send(&Message::InputsDone {}, stopped, input_deadline)
-            .await?;
-        require(
-            matches!(
-                wire.receive_until(stopped, input_deadline).await?,
-                Message::Accepted {}
-            ),
-            "coordinator did not acknowledge operation admission",
-        )?;
-        eprintln!(
-            "{}",
-            json!({"kind":"canonical-remote-accepted", "coordinator":config.coordinator,
-            "cargo_location":"coordinator", "automatic_retry":false})
+        let mut client = ResumableClient::new(
+            &config,
+            stopped,
+            &build_identity,
+            release_mode == ReleaseAuthorizationMode::Required,
+            token,
+            input_deadline,
         );
-        receive_operation(&mut wire, &config, stopped).await
+        client
+            .complete(
+                wire,
+                || async {
+                    connect_coordinator_peer(&config.coordinator, &config.server_name, &tls, pin)
+                        .await
+                        .map(|peer| peer.stream)
+                        .map_err(io::Error::other)
+                },
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+            )
+            .await
     })
 }
 
@@ -383,14 +390,19 @@ async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
     stopped: &AtomicBool,
     coordinator: &str,
     admission_deadline: Instant,
-) -> io::Result<(Instant, ToolchainDisposition, SourcePlan)> {
+) -> io::Result<(Instant, ToolchainDisposition, SourcePlan, OperationToken)> {
     let mut reported_queue = false;
     loop {
         match wire.receive_until(stopped, admission_deadline).await? {
-            Message::Ready { toolchain, source } => {
+            Message::Ready {
+                toolchain,
+                source,
+                resume,
+            } => {
                 let input_deadline = Instant::now() + TOOLCHAIN_INPUT_BUDGET;
                 source.validate(source_manifest)?;
-                return Ok((input_deadline, toolchain, source));
+                resume.validate()?;
+                return Ok((input_deadline, toolchain, source, resume));
             }
             Message::Queued {} => {
                 if !reported_queue {
@@ -804,6 +816,285 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     checkpoint(stopped, deadline)
 }
 
+#[derive(Default)]
+struct TargetDelivery {
+    receiving: Option<ReceivedTarget>,
+    plan: Option<ArtifactPlan>,
+    installed: Option<InstalledTarget>,
+    started_files: BTreeSet<usize>,
+    resumed_files: u64,
+    resumed_bytes: u64,
+    transferred_bytes: u64,
+    reported_reuse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildCompletion {
+    exit_code: i32,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    target: Option<ArtifactDeclaration>,
+}
+
+/// The surviving client, rather than a disposable connection, owns every
+/// exposure frontier and receiver. No state here can be recovered by opening
+/// an existing output directory or by recapturing a changed source checkout.
+struct ClientDelivery {
+    operation_deadline: Instant,
+    delivery_deadline: Option<Instant>,
+    stdout_offset: u64,
+    stderr_offset: u64,
+    completion: Option<BuildCompletion>,
+    target: TargetDelivery,
+}
+
+impl ClientDelivery {
+    fn new(operation_deadline: Instant) -> Self {
+        Self {
+            operation_deadline,
+            delivery_deadline: None,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            completion: None,
+            target: TargetDelivery::default(),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        self.delivery_deadline.unwrap_or(self.operation_deadline)
+    }
+
+    fn completed(&mut self, completion: BuildCompletion) -> io::Result<()> {
+        require(
+            (0..=255).contains(&completion.exit_code)
+                && completion.stdout_bytes == self.stdout_offset
+                && completion.stderr_bytes == self.stderr_offset,
+            "remote completion has an invalid exit code or incomplete diagnostics",
+        )?;
+        require(
+            completion.exit_code == 0 || completion.target.is_none(),
+            "failed remote operation offered successful artifacts",
+        )?;
+        if let Some(previous) = &self.completion {
+            require(
+                previous == &completion,
+                "remote result identity changed while reconnecting",
+            )?;
+        } else {
+            self.completion = Some(completion);
+            self.delivery_deadline =
+                Some((Instant::now() + DELIVERY_BUDGET).min(self.operation_deadline));
+        }
+        Ok(())
+    }
+}
+
+struct ResumableClient<'a> {
+    config: &'a ClientProfile,
+    stopped: &'a AtomicBool,
+    build_identity: &'a str,
+    require_release: bool,
+    token: OperationToken,
+    input_deadline: Instant,
+    delivery: ClientDelivery,
+}
+
+impl<'a> ResumableClient<'a> {
+    fn new(
+        config: &'a ClientProfile,
+        stopped: &'a AtomicBool,
+        build_identity: &'a str,
+        require_release: bool,
+        token: OperationToken,
+        input_deadline: Instant,
+    ) -> Self {
+        Self {
+            config,
+            stopped,
+            build_identity,
+            require_release,
+            token,
+            input_deadline,
+            delivery: ClientDelivery::new(
+                Instant::now()
+                    + Duration::from_secs(config.settings.timeout_seconds)
+                    + DELIVERY_BUDGET,
+            ),
+        }
+    }
+
+    fn resume_request(&self) -> Message {
+        Message::Resume {
+            version: WIRE_VERSION.into(),
+            build_identity: self.build_identity.into(),
+            require_release: self.require_release,
+            token: self.token.clone(),
+            stdout_offset: self.delivery.stdout_offset,
+            stderr_offset: self.delivery.stderr_offset,
+        }
+    }
+
+    /// InputsDone is attempted exactly once. From this boundary onward even a
+    /// lost Accepted can only attach to the original coordinator-owned command.
+    /// The injected connector is the same pinned TLS path in production; tests
+    /// can exercise this complete state machine with explicit byte peers.
+    async fn complete<S, C, F, W, E>(
+        &mut self,
+        mut wire: Wire<S>,
+        mut connect: C,
+        stdout: &mut W,
+        stderr: &mut E,
+    ) -> io::Result<i32>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        C: FnMut() -> F,
+        F: Future<Output = io::Result<S>>,
+        W: Write,
+        E: Write,
+    {
+        self.token.validate()?;
+        let admitted = async {
+            let deadline = self.input_deadline.min(self.delivery.operation_deadline);
+            wire.send(&Message::InputsDone {}, self.stopped, deadline)
+                .await?;
+            require(
+                matches!(
+                    wire.receive_until(self.stopped, deadline).await?,
+                    Message::Accepted {}
+                ),
+                "coordinator did not acknowledge operation admission",
+            )
+        }
+        .await;
+        if let Err(error) = admitted {
+            if !wire.can_resume_after(&error) {
+                self.cancel_operation(&mut wire, &mut connect).await;
+                return Err(error);
+            }
+            wire = match self.reconnect(&mut connect).await {
+                Ok(wire) => wire,
+                Err(error) => {
+                    self.cancel_operation(&mut wire, &mut connect).await;
+                    return Err(error);
+                }
+            };
+        }
+        eprintln!(
+            "{}",
+            json!({"kind":"canonical-remote-accepted", "coordinator":self.config.coordinator,
+            "cargo_location":"coordinator", "automatic_retry":false,
+            "connection_recovery":true})
+        );
+        loop {
+            match receive_operation(
+                &mut wire,
+                self.config,
+                self.stopped,
+                &mut self.delivery,
+                stdout,
+                stderr,
+            )
+            .await
+            {
+                Ok(exit_code) => return Ok(exit_code),
+                Err(error) if wire.can_resume_after(&error) => {
+                    wire = match self.reconnect(&mut connect).await {
+                        Ok(wire) => wire,
+                        Err(error) => {
+                            self.cancel_operation(&mut wire, &mut connect).await;
+                            return Err(error);
+                        }
+                    };
+                }
+                Err(error) => {
+                    self.cancel_operation(&mut wire, &mut connect).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn reconnect<S, C, F>(&self, connect: &mut C) -> io::Result<Wire<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        C: FnMut() -> F,
+        F: Future<Output = io::Result<S>>,
+    {
+        let deadline = (Instant::now() + RESUME_GRACE).min(self.delivery.deadline());
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            checkpoint(self.stopped, deadline)?;
+            // Connection establishment may be unavailable during an outage.
+            // It still authenticates the original pin on every attempt; no
+            // application record is sent to an unauthenticated replacement.
+            if let Ok(stream) = controlled_future(self.stopped, deadline, connect()).await {
+                let mut wire = Wire::new(stream);
+                let response = async {
+                    wire.send(&self.resume_request(), self.stopped, deadline)
+                        .await?;
+                    wire.receive_until(self.stopped, deadline).await
+                }
+                .await;
+                match response {
+                    Ok(Message::Accepted {}) => return Ok(wire),
+                    Ok(Message::ResumePending {}) => {}
+                    Err(error) if wire.can_resume_after(&error) => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(invalid("coordinator did not attach the original operation"));
+                    }
+                }
+            }
+            controlled_future(self.stopped, deadline, async {
+                asupersync::time::sleep(runtime_transport_now(), backoff).await;
+                Ok(())
+            })
+            .await?;
+            backoff = (backoff * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    async fn cancel_operation<S, C, F>(&self, wire: &mut Wire<S>, connect: &mut C)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        C: FnMut() -> F,
+        F: Future<Output = io::Result<S>>,
+    {
+        // Cancellation may already have poisoned the active Wire. Keep one
+        // short independent cleanup bound, and use the same authenticated pin
+        // to cancel the original token without claiming or restarting it.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cleanup = AtomicBool::new(false);
+        if wire
+            .send(&Message::Cancel {}, &cleanup, deadline)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let Ok(stream) = controlled_future(&cleanup, deadline, connect()).await else {
+            return;
+        };
+        let mut wire = Wire::new(stream);
+        if wire
+            .send(
+                &Message::CancelOperation {
+                    version: WIRE_VERSION.into(),
+                    build_identity: self.build_identity.into(),
+                    require_release: self.require_release,
+                    token: self.token.clone(),
+                },
+                &cleanup,
+                deadline,
+            )
+            .await
+            .is_ok()
+        {
+            let _ = wire.receive_until(&cleanup, deadline).await;
+        }
+    }
+}
+
 fn write_output(output: Output, offset: &mut u64, writer: &mut impl Write) -> io::Result<bool> {
     require(
         output.offset == *offset,
@@ -824,25 +1115,49 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     config: &ClientProfile,
     stopped: &AtomicBool,
+    delivery: &mut ClientDelivery,
+    stdout_writer: &mut impl Write,
+    stderr_writer: &mut impl Write,
 ) -> io::Result<i32> {
-    let execution_deadline =
-        Instant::now() + Duration::from_secs(config.settings.timeout_seconds) + DELIVERY_BUDGET;
-    let mut stdout_offset = 0;
-    let mut stderr_offset = 0;
     let (exit_code, target) = loop {
-        wire.send(&Message::Poll {}, stopped, execution_deadline)
-            .await?;
-        match wire.receive_until(stopped, execution_deadline).await? {
+        let deadline = delivery.deadline();
+        wire.send(&Message::Poll {}, stopped, deadline).await?;
+        match wire.receive_until(stopped, deadline).await? {
             Message::Progress { stdout, stderr } => {
-                let first = write_output(stdout, &mut stdout_offset, &mut io::stdout().lock())?;
-                let second = write_output(stderr, &mut stderr_offset, &mut io::stderr().lock())?;
                 require(
-                    stdout_offset + stderr_offset <= OUTPUT_TOTAL_BYTES,
+                    delivery.completion.is_none(),
+                    "remote diagnostics resumed after the completed result",
+                )?;
+                // Validate the complete pair before any local exposure. Commit
+                // its frontiers together only after BOTH writes have finished.
+                let stdout_bytes = decode_hex(&stdout.bytes, MAX_SOURCE_CHUNK)?;
+                let stderr_bytes = decode_hex(&stderr.bytes, MAX_SOURCE_CHUNK)?;
+                require(
+                    stdout.offset == delivery.stdout_offset
+                        && stderr.offset == delivery.stderr_offset
+                        && delivery.stdout_offset
+                            + delivery.stderr_offset
+                            + stdout_bytes.len() as u64
+                            + stderr_bytes.len() as u64
+                            <= OUTPUT_TOTAL_BYTES,
                     "remote aggregate diagnostic output exceeds its bound",
                 )?;
+                let mut stdout_offset = delivery.stdout_offset;
+                let mut stderr_offset = delivery.stderr_offset;
+                let first = write_output(stdout, &mut stdout_offset, stdout_writer)?;
+                let second = write_output(stderr, &mut stderr_offset, stderr_writer)?;
+                delivery.stdout_offset = stdout_offset;
+                delivery.stderr_offset = stderr_offset;
                 if !first && !second {
-                    asupersync::time::sleep(runtime_transport_now(), Duration::from_millis(100))
+                    controlled_future(stopped, deadline, async {
+                        asupersync::time::sleep(
+                            runtime_transport_now(),
+                            Duration::from_millis(100),
+                        )
                         .await;
+                        Ok(())
+                    })
+                    .await?;
                 }
             }
             Message::BuildFinished {
@@ -851,16 +1166,12 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
                 stderr_bytes,
                 target,
             } => {
-                require(
-                    (0..=255).contains(&exit_code)
-                        && stdout_bytes == stdout_offset
-                        && stderr_bytes == stderr_offset,
-                    "remote completion has an invalid exit code or incomplete diagnostics",
-                )?;
-                require(
-                    exit_code == 0 || target.is_none(),
-                    "failed remote operation offered successful artifacts",
-                )?;
+                delivery.completed(BuildCompletion {
+                    exit_code,
+                    stdout_bytes,
+                    stderr_bytes,
+                    target: target.clone(),
+                })?;
                 break (exit_code, target);
             }
             _ => {
@@ -870,24 +1181,22 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
-    let delivery_deadline = Instant::now() + DELIVERY_BUDGET;
-    let installed = if let Some(manifest) = target {
-        Some(
-            receive_target(
-                wire,
-                manifest,
-                &config.output_destination,
-                config.artifact_reuse_root.as_deref(),
-                stopped,
-                delivery_deadline,
-            )
-            .await?,
+    let delivery_deadline = delivery.deadline();
+    if let Some(manifest) = target {
+        receive_target(
+            wire,
+            manifest,
+            &config.output_destination,
+            config.artifact_reuse_root.as_deref(),
+            stopped,
+            delivery_deadline,
+            &mut delivery.target,
         )
+        .await?;
     } else {
         wire.send(&Message::Close {}, stopped, delivery_deadline)
             .await?;
-        None
-    };
+    }
     let Message::Complete {
         exit_code: completed,
     } = wire.receive_until(stopped, delivery_deadline).await?
@@ -900,16 +1209,25 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         completed == exit_code,
         "remote terminal exit status changed",
     )?;
-    if let Some(installed) = &installed {
+    if let Some(installed) = &delivery.target.installed {
         installed
             .verify(&|| stopped.load(Ordering::Acquire) || Instant::now() >= delivery_deadline)?;
     }
+    // Complete is already authenticated and verified. A lost cleanup ACK must
+    // not turn a known completed command back into an uncertain execution.
+    let _ = wire
+        .send(
+            &Message::Delivered {},
+            stopped,
+            delivery_deadline.min(Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
     // This locally chosen path is reported only after the final coordinator
     // receipt. Diagnostic JSON from Cargo never authorizes installation.
     eprintln!(
         "{}",
         json!({"kind":"canonical-remote-completed", "exit_code":exit_code,
-        "target_root":installed.as_ref().map(|_| &config.output_destination),
+        "target_root":delivery.target.installed.as_ref().map(|_| &config.output_destination),
         "coordinator":config.coordinator, "cargo_location":"coordinator"})
     );
     Ok(exit_code)
@@ -922,45 +1240,85 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     artifact_reuse_root: Option<&Path>,
     stopped: &AtomicBool,
     deadline: Instant,
-) -> io::Result<InstalledTarget> {
+    delivery: &mut TargetDelivery,
+) -> io::Result<()> {
+    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
+    if let Some(installed) = &delivery.installed {
+        require(
+            ArtifactDeclaration::from_native(installed.manifest()) == declaration,
+            "resumed artifact declaration differs from the installed result",
+        )?;
+        installed.verify(&cancelled)?;
+        return wire
+            .send(
+                &Message::Published {
+                    manifest_sha256: encode_hex(&installed.manifest().digest()),
+                },
+                stopped,
+                deadline,
+            )
+            .await;
+    }
     require_absent(destination)?;
     let native = receive_artifact_manifest(wire, declaration, stopped, deadline).await?;
     let manifest_sha256 = encode_hex(&native.digest());
-    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
-    let mut target = ReceivedTarget::new_cancellable(
-        destination
-            .parent()
-            .ok_or_else(|| invalid("target parent missing"))?,
-        native,
-        &cancelled,
-    )?;
-    let plan = if let Some(root) = artifact_reuse_root {
-        let missing = target.reuse_from(root, &cancelled)?;
-        let prefixes = target
-            .prefix_hints()
-            .iter()
-            .map(ArtifactPrefixOffer::from_native)
-            .collect();
-        ArtifactPlan::with_prefixes(target.manifest(), missing, prefixes)?
+    if let Some(target) = &delivery.receiving {
+        require(
+            target.manifest() == &native,
+            "resumed artifact manifest differs from the retained receiver",
+        )?;
     } else {
-        ArtifactPlan::all(target.manifest())?
-    };
+        require(
+            delivery.plan.is_none(),
+            "artifact transfer plan lost its original receiver",
+        )?;
+        let mut target = ReceivedTarget::new_cancellable(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("target parent missing"))?,
+            native,
+            &cancelled,
+        )?;
+        let plan = if let Some(root) = artifact_reuse_root {
+            let missing = target.reuse_from(root, &cancelled)?;
+            let prefixes = target
+                .prefix_hints()
+                .iter()
+                .map(ArtifactPrefixOffer::from_native)
+                .collect();
+            ArtifactPlan::with_prefixes(target.manifest(), missing, prefixes)?
+        } else {
+            ArtifactPlan::all(target.manifest())?
+        };
+        delivery.receiving = Some(target);
+        delivery.plan = Some(plan);
+    }
+    let target = delivery
+        .receiving
+        .as_mut()
+        .ok_or_else(|| invalid("artifact receiver disappeared"))?;
+    let plan = delivery
+        .plan
+        .as_ref()
+        .ok_or_else(|| invalid("artifact transfer plan disappeared"))?;
+    let (file_index, offset) = target.resume_cursor()?;
+    let file_index = u32::try_from(file_index)
+        .map_err(|_| invalid("artifact resume cursor exceeds its index bound"))?;
+    plan.validate_cursor(target.manifest(), file_index, offset)?;
     checkpoint(stopped, deadline)?;
     wire.send(
         &Message::ReceiveArtifacts {
             manifest_sha256: manifest_sha256.clone(),
             missing_files: plan.missing_files.clone(),
             prefixes: plan.prefixes.clone(),
+            file_index,
+            offset,
         },
         stopped,
         deadline,
     )
     .await?;
     let mut window = Window::default();
-    let mut started_files = BTreeSet::new();
-    let mut resumed_files = 0_u64;
-    let mut resumed_bytes = 0_u64;
-    let mut transferred_bytes = 0_u64;
     loop {
         match wire.receive_until(stopped, deadline).await? {
             Message::ArtifactChunk { chunk } => {
@@ -975,19 +1333,21 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
                     "remote artifact chunk names a file not requested for transfer",
                 )?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
-                if started_files.insert(index) {
+                if delivery.started_files.insert(index) {
                     // The sender independently hashes each offered prefix. Its
                     // first payload selects that exact frozen range or zero;
                     // the ordinary receiver never skips uninstalled bytes.
+                    // Selection belongs to this retained receiver, so a later
+                    // connection never imports the same frozen prefix twice.
                     let imported =
                         target.select_first_chunk(index as u16, chunk.offset, &cancelled)?;
                     if imported != 0 {
-                        resumed_files += 1;
-                        resumed_bytes += imported;
+                        delivery.resumed_files += 1;
+                        delivery.resumed_bytes += imported;
                     }
                 }
                 target.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
-                transferred_bytes += bytes.len() as u64;
+                delivery.transferred_bytes += bytes.len() as u64;
             }
             Message::WindowEnd { count } => {
                 window.acknowledge(count)?;
@@ -1010,7 +1370,7 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     }
     target.seal(&cancelled)?;
     checkpoint(stopped, deadline)?;
-    if artifact_reuse_root.is_some() {
+    if artifact_reuse_root.is_some() && !delivery.reported_reuse {
         let requested_bytes: u64 = plan
             .missing_files
             .iter()
@@ -1028,9 +1388,10 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
             "reused_files":nonempty - plan.missing_files.len(),
             "reused_bytes":target.manifest().total_bytes() - requested_bytes,
             "offered_prefix_files":plan.prefixes.len(),
-            "resumed_files":resumed_files, "resumed_bytes":resumed_bytes,
-            "transfer_files":started_files.len(), "transfer_bytes":transferred_bytes})
+            "resumed_files":delivery.resumed_files, "resumed_bytes":delivery.resumed_bytes,
+            "transfer_files":delivery.started_files.len(), "transfer_bytes":delivery.transferred_bytes})
         );
+        delivery.reported_reuse = true;
     }
     wire.send(
         &Message::Received {
@@ -1052,13 +1413,20 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
         committed == manifest_sha256,
         "coordinator authorized a different target manifest",
     )?;
-    let installed = target.publish(destination, &cancelled)?;
-    installed.verify(&cancelled)?;
-    // A lost response after this rename leaves an installed directory and an
-    // uncertain command result. Never remove it or reexecute automatically.
+    let target = delivery
+        .receiving
+        .take()
+        .ok_or_else(|| invalid("sealed artifact receiver disappeared"))?;
+    delivery.installed = Some(target.publish(destination, &cancelled)?);
+    delivery
+        .installed
+        .as_ref()
+        .expect("successful publication retains its exact receipt")
+        .verify(&cancelled)?;
+    // Store the receipt before sending the acknowledgment. A transport error
+    // can resend this acknowledgment, but can never publish a second directory.
     wire.send(&Message::Published { manifest_sha256 }, stopped, deadline)
-        .await?;
-    Ok(installed)
+        .await
 }
 
 async fn receive_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1106,6 +1474,7 @@ mod prefix_tests;
 
 #[cfg(test)]
 mod tests {
+    mod operation_reconnect;
     mod source_prefix_upload;
     mod toolchain_file_upload;
 
@@ -1242,6 +1611,15 @@ mod tests {
         })
     }
 
+    fn operation_token() -> OperationToken {
+        OperationToken::from_native(&rabs_protocol::reconnect::ResumableToken {
+            request: rabs_protocol::durable_ids::BuildOperationId(17),
+            subscriber: rabs_protocol::reconnect::SubscriberId(1),
+            issued_by_incarnation: 23,
+            secret: [0x31; 32],
+        })
+    }
+
     /// Exercise the real wire and client state machine without opening a socket.
     /// This is a fragmented byte peer, not TLS or remote compiler qualification.
     struct AdmissionStream {
@@ -1370,6 +1748,7 @@ mod tests {
                 _ => Message::Ready {
                     toolchain: ToolchainDisposition::Reuse,
                     source: SourcePlan::all(&manifest).unwrap(),
+                    resume: operation_token(),
                 },
             };
             let mut peer = AdmissionStream::new(&[first, Message::Window { count: 7 }], false);
@@ -1448,6 +1827,7 @@ mod tests {
                         &Message::Ready {
                             toolchain: ToolchainDisposition::Reuse,
                             source: SourcePlan::all(&received)?,
+                            resume: operation_token(),
                         },
                         &stopped,
                         deadline,
@@ -1466,6 +1846,7 @@ mod tests {
                 let Message::Ready {
                     source,
                     toolchain: ToolchainDisposition::Reuse,
+                    ..
                 } = wire.receive(&stopped, deadline).await?
                 else {
                     return Err(invalid(
@@ -1633,6 +2014,9 @@ mod tests {
                 &mut wire,
                 &config,
                 &AtomicBool::new(false),
+                &mut ClientDelivery::new(Instant::now() + Duration::from_secs(15)),
+                &mut Vec::new(),
+                &mut Vec::new(),
             ));
             if altered {
                 assert!(
@@ -1677,6 +2061,7 @@ mod tests {
             None,
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(15),
+            &mut TargetDelivery::default(),
         ))
         .unwrap();
         assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
@@ -1760,6 +2145,7 @@ mod tests {
             Some(&prior),
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(15),
+            &mut TargetDelivery::default(),
         ))
         .unwrap();
         for (name, bytes) in files {
@@ -1832,6 +2218,7 @@ mod tests {
                 Some(&prior),
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(15),
+                &mut TargetDelivery::default(),
             ));
             assert_eq!(result.is_ok(), case == "commit", "{case}: {result:?}");
             assert_eq!(destination.exists(), case == "commit", "{case}");
@@ -1925,6 +2312,7 @@ mod tests {
                     Some(&prior),
                     &AtomicBool::new(false),
                     Instant::now() + IO_BUDGET,
+                    &mut TargetDelivery::default(),
                 ))
                 .unwrap();
                 assert_eq!(fs::read(destination.join("b-program")).unwrap(), bytes);
@@ -2020,6 +2408,7 @@ mod tests {
                 Some(&prior),
                 &AtomicBool::new(false),
                 Instant::now() + IO_BUDGET,
+                &mut TargetDelivery::default(),
             ));
             assert!(result.is_err(), "{case} unexpectedly published");
             assert!(
@@ -2073,14 +2462,19 @@ mod tests {
                         let mut wire = Wire::new(JsonAtpStream::new(stream));
                         let stopped = AtomicBool::new(false);
                         let deadline = Instant::now() + IO_BUDGET;
-                        let manifest_sha256 = super::super::deliver_artifacts(
-                            &mut wire,
-                            &captured,
-                            &stopped,
-                            deadline,
-                            &|| false,
-                        )
-                        .await?;
+                        let super::super::ArtifactDelivery::Sealed(manifest_sha256) =
+                            super::super::deliver_artifacts(
+                                &mut wire,
+                                &captured,
+                                &stopped,
+                                deadline,
+                                &|| false,
+                                false,
+                            )
+                            .await?
+                        else {
+                            return Err(invalid("initial artifact transfer skipped byte sealing"));
+                        };
                         wire.send(
                             &Message::Commit {
                                 manifest_sha256: manifest_sha256.clone(),
@@ -2108,6 +2502,7 @@ mod tests {
                         Some(&prior),
                         &AtomicBool::new(false),
                         Instant::now() + IO_BUDGET,
+                        &mut TargetDelivery::default(),
                     )
                     .await
                 });
@@ -2163,6 +2558,7 @@ mod tests {
                 None,
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(15),
+                &mut TargetDelivery::default(),
             ));
             assert!(result.is_err(), "{case}");
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0, "{case}");
@@ -2213,6 +2609,7 @@ mod tests {
                     None,
                     &AtomicBool::new(false),
                     Instant::now() + Duration::from_secs(15),
+                    &mut TargetDelivery::default(),
                 ))
                 .is_err(),
                 "{case}"
@@ -2312,6 +2709,7 @@ mod tests {
                     Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
                         source: SourcePlan::all(&manifest).unwrap(),
+                        resume: operation_token(),
                     },
                     Message::Accepted {},
                 ],
@@ -2323,7 +2721,7 @@ mod tests {
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
             let admission_deadline = started + Duration::from_secs(5);
-            let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+            let (input_deadline, toolchain_disposition, source_plan, _) = await_input_admission(
                 &mut wire,
                 &manifest,
                 &stopped,
@@ -2359,6 +2757,7 @@ mod tests {
                 &[Message::Ready {
                     toolchain: ToolchainDisposition::Reuse,
                     source: SourcePlan::all(&manifest).unwrap(),
+                    resume: operation_token(),
                 }],
                 false,
             );
@@ -2366,7 +2765,7 @@ mod tests {
             let mut wire = Wire::new(stream);
             let stopped = AtomicBool::new(false);
             let started = Instant::now();
-            let (input_deadline, toolchain_disposition, source_plan) = await_input_admission(
+            let (input_deadline, toolchain_disposition, source_plan, _) = await_input_admission(
                 &mut wire,
                 &manifest,
                 &stopped,
@@ -2540,6 +2939,7 @@ mod tests {
                         &[Message::Ready {
                             toolchain,
                             source: source.clone(),
+                            resume: operation_token(),
                         }],
                         false,
                     );
@@ -2710,6 +3110,7 @@ mod tests {
             let mut replies = vec![Message::Ready {
                 toolchain: disposition,
                 source,
+                resume: operation_token(),
             }];
             // Like the production receiver, acknowledge exact cumulative counts.
             let mut acknowledged = 0;
@@ -2743,7 +3144,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             native(async {
-                let (deadline, selected, source_plan) = await_input_admission(
+                let (deadline, selected, source_plan, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,
@@ -2913,7 +3314,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 let spools = watch_source_spools(&fixture.owner.path().join("scratch"));
                 native(async {
-                    let (deadline, selected, source_plan) = await_input_admission(
+                    let (deadline, selected, source_plan, _) = await_input_admission(
                         &mut wire,
                         &manifest,
                         &stopped,
@@ -3053,7 +3454,7 @@ mod tests {
             let stopped = AtomicBool::new(false);
             let scratch = fixture.owner.path().join("absent-scratch");
             native(async {
-                let (deadline, disposition, source_plan) = await_input_admission(
+                let (deadline, disposition, source_plan, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,
@@ -3117,7 +3518,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             let result = native(async {
-                let (deadline, disposition, source_plan) = await_input_admission(
+                let (deadline, disposition, source_plan, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,
@@ -3201,7 +3602,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             let result = native(async {
-                let (deadline, disposition, source_plan) = await_input_admission(
+                let (deadline, disposition, source_plan, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,
@@ -3241,6 +3642,7 @@ mod tests {
                     Some(Message::Ready {
                         toolchain: ToolchainDisposition::Upload,
                         source: source.clone(),
+                        resume: operation_token(),
                     }),
                     io::ErrorKind::InvalidData,
                 ),
@@ -3256,6 +3658,7 @@ mod tests {
             let mut replies = vec![Message::Ready {
                 toolchain: ToolchainDisposition::Reuse,
                 source,
+                resume: operation_token(),
             }];
             replies.extend(reply);
             let mut peer = AdmissionStream::new(&replies, false);
@@ -3264,7 +3667,7 @@ mod tests {
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             let result = native(async {
-                let (deadline, disposition, source_plan) = await_input_admission(
+                let (deadline, disposition, source_plan, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,

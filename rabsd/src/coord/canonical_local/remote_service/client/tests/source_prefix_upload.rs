@@ -51,6 +51,7 @@ fn prefix_peer(
     let mut replies = vec![Message::Ready {
         toolchain: disposition,
         source: plan,
+        resume: operation_token(),
     }];
     let mut cumulative = 0;
     while frames != 0 {
@@ -79,7 +80,7 @@ fn client_selects_only_matching_prefixes_and_seals_the_complete_source_and_sdk()
             let mut wire = Wire::new(peer);
             let stopped = AtomicBool::new(false);
             native(async {
-                let (deadline, selected, admitted) = await_input_admission(
+                let (deadline, selected, admitted, _) = await_input_admission(
                     &mut wire,
                     fixture.bundle.source.manifest(),
                     &stopped,
@@ -234,6 +235,7 @@ fn resumed_source_upload_refuses_a_wrong_window_ack_before_sending_more_tail_or_
             Message::Ready {
                 toolchain: ToolchainDisposition::Reuse,
                 source: plan,
+                resume: operation_token(),
             },
             Message::Window {
                 count: wire::WINDOW - 1,
@@ -246,7 +248,7 @@ fn resumed_source_upload_refuses_a_wrong_window_ack_before_sending_more_tail_or_
     let stopped = AtomicBool::new(false);
     let mut wire = Wire::new(peer);
     let error = native(async {
-        let (deadline, selected, source_plan) = await_input_admission(
+        let (deadline, selected, source_plan, _) = await_input_admission(
             &mut wire,
             fixture.bundle.source.manifest(),
             &stopped,
