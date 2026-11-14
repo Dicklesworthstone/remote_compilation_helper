@@ -31,7 +31,7 @@ use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_tran
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::source_cache::MAX_SOURCE_CACHE_BYTES;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceReceiver};
+use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceReceiver};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits};
 use rabs_sandbox::toolchain_file_cache::MAX_TOOLCHAIN_FILE_CACHE_BYTES;
 use rabs_sandbox::toolchain_transfer::{
@@ -39,6 +39,7 @@ use rabs_sandbox::toolchain_transfer::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use source_inputs::{RemoteSourceCache, SourceInput};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -1199,6 +1200,7 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     let Message::ReceiveArtifacts {
         manifest_sha256,
         missing_files,
+        prefixes,
     } = wire.receive_until(stopped, deadline).await?
     else {
         return Err(invalid(
@@ -1208,11 +1210,19 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     // Validate the entire request before reading or sending any payload. A
     // malicious subset cannot create extra files, repeat bytes or select a
     // path from another target generation.
-    let plan = ArtifactPlan::from_request(manifest_sha256, missing_files, target.manifest())?;
+    let plan =
+        ArtifactPlan::from_request(manifest_sha256, missing_files, prefixes, target.manifest())?;
     let mut window = Window::default();
-    for index in plan.missing_files {
+    for &index in &plan.missing_files {
         let file = &target.manifest().files()[usize::from(index)];
-        let mut offset = 0;
+        let mut offset = artifact_prefix_offset(
+            target,
+            file,
+            plan.prefix_for(usize::from(index)),
+            stopped,
+            deadline,
+            cancelled,
+        )?;
         while offset < file.len {
             checkpoint(stopped, deadline)?;
             let bytes = target.read_chunk(&file.path, offset, MAX_SOURCE_CHUNK, cancelled)?;
@@ -1250,6 +1260,47 @@ async fn deliver_artifacts<S: AsyncRead + AsyncWrite + Unpin>(
     // Include every locally reused member, not just the files read above.
     target.verify(cancelled)?;
     Ok(plan.manifest_sha256)
+}
+
+/// An offer saves network bytes only when the producer independently confirms
+/// the exact retained prefix. The first nonempty payload selects that offset;
+/// a mismatch simply sends the whole file. Nothing here grants result authority.
+fn artifact_prefix_offset(
+    target: &CapturedTarget,
+    file: &SourceFile,
+    offered: Option<&wire::ArtifactPrefixOffer>,
+    stopped: &AtomicBool,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<u64> {
+    checkpoint(stopped, deadline)?;
+    let Some(offered) = offered else {
+        return Ok(0);
+    };
+    require(
+        offered.offset != 0 && offered.offset < file.len,
+        "artifact prefix must leave a nonempty payload tail",
+    )?;
+    let expected = wire::digest(&offered.sha256)?;
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < offered.offset {
+        checkpoint(stopped, deadline)?;
+        let count = (offered.offset - offset).min(MAX_SOURCE_CHUNK as u64) as usize;
+        let bytes = target.read_chunk(&file.path, offset, count, cancelled)?;
+        require(
+            bytes.len() == count,
+            "artifact source ended before its offered prefix",
+        )?;
+        hash.update(&bytes);
+        offset += bytes.len() as u64;
+    }
+    checkpoint(stopped, deadline)?;
+    Ok(if <[u8; 32]>::from(hash.finalize()) == expected {
+        offered.offset
+    } else {
+        0
+    })
 }
 
 async fn send_artifact_manifest<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1511,8 +1562,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v8_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v8", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v9_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v9", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
@@ -1521,7 +1572,8 @@ mod tests {
             ("canonical-compile-remote-v5", "build-one"),
             ("canonical-compile-remote-v6", "build-one"),
             ("canonical-compile-remote-v7", "build-one"),
-            ("canonical-compile-remote-v8", "build-two"),
+            ("canonical-compile-remote-v8", "build-one"),
+            ("canonical-compile-remote-v9", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1790,6 +1842,7 @@ mod tests {
         input.extend(record(&Message::ReceiveArtifacts {
             manifest_sha256: plan.manifest_sha256,
             missing_files: plan.missing_files,
+            prefixes: plan.prefixes,
         }));
         for count in windows {
             input.extend(record(&Message::Window { count: *count }));
@@ -1871,6 +1924,213 @@ mod tests {
     }
 
     #[test]
+    fn artifact_delivery_confirms_prefixes_and_sends_only_the_selected_tail() {
+        let (_owner, captured, needed) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        for (offered, matching, windows) in [
+            (1, true, vec![4, 5]),
+            (MAX_SOURCE_CHUNK, true, vec![4]),
+            (MAX_SOURCE_CHUNK + 1, true, vec![4]),
+            (needed.len() - 1, true, vec![1]),
+            (MAX_SOURCE_CHUNK + 1, false, vec![4, 5]),
+        ] {
+            let hash = if matching {
+                Sha256::digest(&needed[..offered])
+            } else {
+                Sha256::digest(b"unrelated old bytes")
+            };
+            let plan = ArtifactPlan::with_prefixes(
+                captured.manifest(),
+                vec![2],
+                vec![wire::ArtifactPrefixOffer {
+                    index: 2,
+                    offset: offered as u64,
+                    sha256: encode_hex(&hash),
+                }],
+            )
+            .unwrap();
+            let peer = AdmissionPeer::new(artifact_delivery_input(plan, &windows, Some(&identity)));
+            let output = Arc::clone(&peer.output);
+            assert_eq!(
+                ready(deliver_artifacts(
+                    &mut Wire::new(peer),
+                    &captured,
+                    &AtomicBool::new(false),
+                    Instant::now() + wire::IO_BUDGET,
+                    &|| false,
+                ))
+                .unwrap(),
+                identity,
+            );
+            let selected = if matching { offered } else { 0 };
+            let mut offset = selected;
+            let mut tail = Vec::new();
+            let mut acknowledgments = Vec::new();
+            let mut pages =
+                wire::ArtifactPages::new(ArtifactDeclaration::from_native(captured.manifest()))
+                    .unwrap();
+            let sent = messages(&output);
+            for value in &sent {
+                match serde_json::from_value::<Message>(value.clone()).unwrap() {
+                    Message::ArtifactManifestPage { page } => pages.push(page).unwrap(),
+                    Message::ArtifactChunk { chunk } => {
+                        assert_eq!(chunk.path, "c-needed");
+                        assert_eq!(chunk.offset, offset as u64);
+                        let (bytes, _) = chunk.verified_bytes().unwrap();
+                        offset += bytes.len();
+                        tail.extend(bytes);
+                    }
+                    Message::WindowEnd { count } => acknowledgments.push(count),
+                    Message::ArtifactManifestEnd {} | Message::ArtifactEnd {} => {}
+                    _ => panic!("prefix selection crossed the result authority boundary"),
+                }
+            }
+            assert_eq!(pages.finish().unwrap(), *captured.manifest());
+            assert_eq!(offset, needed.len());
+            assert_eq!(tail, needed[selected..]);
+            assert!(!tail.is_empty());
+            assert_eq!(
+                acknowledgments,
+                std::iter::once(1).chain(windows).collect::<Vec<_>>(),
+            );
+            assert_eq!(sent.last().unwrap()["kind"], "artifact-end");
+        }
+    }
+
+    #[test]
+    fn artifact_prefixes_share_the_window_with_full_files_and_independent_misses() {
+        let (_owner, captured, needed) = artifact_delivery_fixture();
+        let identity = encode_hex(&captured.manifest().digest());
+        let offered = MAX_SOURCE_CHUNK + 3;
+        let plan = ArtifactPlan::with_prefixes(
+            captured.manifest(),
+            vec![0, 2, 3],
+            vec![
+                wire::ArtifactPrefixOffer {
+                    index: 0,
+                    offset: 1,
+                    sha256: encode_hex(&Sha256::digest(b"wrong prefix")),
+                },
+                wire::ArtifactPrefixOffer {
+                    index: 2,
+                    offset: offered as u64,
+                    sha256: encode_hex(&Sha256::digest(&needed[..offered])),
+                },
+            ],
+        )
+        .unwrap();
+        // One rejected prefix, four tail chunks and one ordinary whole file.
+        let peer = AdmissionPeer::new(artifact_delivery_input(plan, &[4, 6], Some(&identity)));
+        let output = Arc::clone(&peer.output);
+        ready(deliver_artifacts(
+            &mut Wire::new(peer),
+            &captured,
+            &AtomicBool::new(false),
+            Instant::now() + wire::IO_BUDGET,
+            &|| false,
+        ))
+        .unwrap();
+        let mut chunks = Vec::new();
+        let mut windows = Vec::new();
+        for value in messages(&output) {
+            match serde_json::from_value::<Message>(value).unwrap() {
+                Message::ArtifactChunk { chunk } => chunks.push(chunk),
+                Message::WindowEnd { count } => windows.push(count),
+                _ => {}
+            }
+        }
+        assert_eq!(windows, [1, 4, 6]);
+        assert_eq!(chunks.len(), 6);
+        assert_eq!(chunks[0].path, "a-reused");
+        assert_eq!(chunks[0].offset, 0);
+        assert_eq!(chunks[0].verified_bytes().unwrap().0, b"old");
+        let mut received = needed[..offered].to_vec();
+        for chunk in &chunks[1..5] {
+            assert_eq!(chunk.path, "c-needed");
+            assert_eq!(chunk.offset, received.len() as u64);
+            received.extend(chunk.verified_bytes().unwrap().0);
+        }
+        assert_eq!(received, needed);
+        assert_eq!(chunks[5].path, "d-reused");
+        assert_eq!(chunks[5].offset, 0);
+        assert_eq!(chunks[5].verified_bytes().unwrap().0, b"ok");
+    }
+
+    #[test]
+    fn artifact_prefix_inspection_observes_cancellation_deadline_and_capture_mutation() {
+        use std::cell::Cell;
+        let (owner, captured, needed) = artifact_delivery_fixture();
+        let file = &captured.manifest().files()[2];
+        let offered = wire::ArtifactPrefixOffer {
+            index: 2,
+            offset: (MAX_SOURCE_CHUNK * 2) as u64,
+            sha256: encode_hex(&Sha256::digest(&needed[..MAX_SOURCE_CHUNK * 2])),
+        };
+        let stopped = AtomicBool::new(false);
+        assert_eq!(
+            artifact_prefix_offset(
+                &captured,
+                file,
+                Some(&offered),
+                &stopped,
+                Instant::now(),
+                &|| false,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        let checkpoints = Cell::new(0);
+        let error = artifact_prefix_offset(
+            &captured,
+            file,
+            Some(&offered),
+            &stopped,
+            Instant::now() + wire::IO_BUDGET,
+            &|| {
+                checkpoints.set(checkpoints.get() + 1);
+                checkpoints.get() >= 3
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let capture = fs::read_dir(owner.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rabs-target-capture-")
+            })
+            .unwrap();
+        let changed = capture.join("files/c-needed");
+        let checkpoints = Cell::new(0);
+        assert!(
+            artifact_prefix_offset(
+                &captured,
+                file,
+                Some(&offered),
+                &stopped,
+                Instant::now() + wire::IO_BUDGET,
+                &|| {
+                    checkpoints.set(checkpoints.get() + 1);
+                    if checkpoints.get() == 2 {
+                        fs::set_permissions(&changed, fs::Permissions::from_mode(0o600)).unwrap();
+                        let writer = OpenOptions::new().write(true).open(&changed).unwrap();
+                        writer
+                            .write_all_at(b"changed", MAX_SOURCE_CHUNK as u64)
+                            .unwrap();
+                        fs::set_permissions(&changed, fs::Permissions::from_mode(0o444)).unwrap();
+                    }
+                    false
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn artifact_delivery_refuses_invalid_plans_before_any_payload() {
         let (_owner, captured, _) = artifact_delivery_fixture();
         let identity = encode_hex(&captured.manifest().digest());
@@ -1886,12 +2146,39 @@ mod tests {
         .map(|missing_files| ArtifactPlan {
             manifest_sha256: identity.clone(),
             missing_files,
+            prefixes: vec![],
         })
         .collect();
         invalid_plans.push(ArtifactPlan {
             manifest_sha256: "00".repeat(32),
             missing_files: vec![],
+            prefixes: vec![],
         });
+        let prefix = |index, offset| wire::ArtifactPrefixOffer {
+            index,
+            offset,
+            sha256: encode_hex(&Sha256::digest(b"untrusted prefix")),
+        };
+        for prefixes in [
+            vec![prefix(0, 1)],
+            vec![prefix(1, 1)],
+            vec![prefix(4, 1)],
+            vec![prefix(2, 0)],
+            vec![prefix(2, captured.manifest().files()[2].len)],
+            vec![prefix(2, u64::MAX)],
+            vec![prefix(2, 1), prefix(2, 2)],
+            vec![wire::ArtifactPrefixOffer {
+                index: 2,
+                offset: 1,
+                sha256: "FF".repeat(32),
+            }],
+        ] {
+            invalid_plans.push(ArtifactPlan {
+                manifest_sha256: identity.clone(),
+                missing_files: vec![2],
+                prefixes,
+            });
+        }
         for plan in invalid_plans {
             let peer = AdmissionPeer::new(artifact_delivery_input(plan, &[], Some(&identity)));
             let output = Arc::clone(&peer.output);

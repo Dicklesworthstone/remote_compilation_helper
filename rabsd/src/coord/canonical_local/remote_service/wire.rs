@@ -5,6 +5,7 @@
 //! coordinator authority, worker assignments or in-process subscriber handles.
 //! Diagnostic bytes are presentation, never filesystem or execution authority.
 
+use super::super::remote_artifacts::ArtifactPrefix;
 use super::super::remote_operation::RemoteOperationSettings;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
@@ -32,10 +33,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v8 adds a manifest-bound missing-file plan to artifact delivery. The client
-/// can import independently verified complete files before requesting payloads.
+/// v9 adds manifest-bound partial-file offers to artifact delivery. The sender
+/// verifies each offered prefix before selecting its offset in the first chunk.
 /// Older peers must refuse during Hello before either side admits input bytes.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v8";
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v9";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
@@ -43,6 +44,9 @@ pub(super) const SOURCE_PAGE_FILES: usize = 64;
 /// A maximum-length path still leaves this declaration far below one ATP
 /// record. Neither a large target nor its complete manifest becomes one frame.
 pub(super) const ARTIFACT_PAGE_FILES: usize = 64;
+/// Artifact and source offers have the same bounded index/offset/SHA shape and
+/// share the control-record budget, leaving room for the full missing-file list.
+pub(super) const MAX_ARTIFACT_PREFIX_HINT_BYTES: usize = MAX_SOURCE_PREFIX_HINT_BYTES;
 pub(super) const WINDOW: u64 = 4;
 pub(super) const IO_BUDGET: Duration = Duration::from_secs(15);
 pub(super) const ADMISSION_BUDGET: Duration = Duration::from_secs(30 * 60);
@@ -456,6 +460,27 @@ impl ArtifactPages {
 pub(super) struct ArtifactPlan {
     pub(super) manifest_sha256: String,
     pub(super) missing_files: Vec<u16>,
+    pub(super) prefixes: Vec<ArtifactPrefixOffer>,
+}
+
+/// Frozen receiver bytes, offered only as an optional transfer cursor. The
+/// captured producer must hash its own prefix before choosing this offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArtifactPrefixOffer {
+    pub(super) index: u16,
+    pub(super) offset: u64,
+    pub(super) sha256: String,
+}
+
+impl ArtifactPrefixOffer {
+    pub(super) fn from_native(prefix: &ArtifactPrefix) -> Self {
+        Self {
+            index: prefix.index,
+            offset: prefix.offset,
+            sha256: encode_hex(&prefix.sha256),
+        }
+    }
 }
 
 impl ArtifactPlan {
@@ -474,12 +499,33 @@ impl ArtifactPlan {
     }
 
     pub(super) fn new(manifest: &ArtifactManifest, missing_files: Vec<u16>) -> io::Result<Self> {
-        Self::from_request(encode_hex(&manifest.digest()), missing_files, manifest)
+        Self::with_prefixes(manifest, missing_files, Vec::new())
+    }
+
+    pub(super) fn with_prefixes(
+        manifest: &ArtifactManifest,
+        missing_files: Vec<u16>,
+        prefixes: Vec<ArtifactPrefixOffer>,
+    ) -> io::Result<Self> {
+        Self::from_request(
+            encode_hex(&manifest.digest()),
+            missing_files,
+            prefixes,
+            manifest,
+        )
+    }
+
+    pub(super) fn prefix_for(&self, index: usize) -> Option<&ArtifactPrefixOffer> {
+        self.prefixes
+            .binary_search_by_key(&index, |prefix| usize::from(prefix.index))
+            .ok()
+            .map(|position| &self.prefixes[position])
     }
 
     pub(super) fn from_request(
         manifest_sha256: String,
         missing_files: Vec<u16>,
+        prefixes: Vec<ArtifactPrefixOffer>,
         manifest: &ArtifactManifest,
     ) -> io::Result<Self> {
         require(
@@ -498,9 +544,35 @@ impl ArtifactPlan {
                 }),
             "artifact delivery indexes must be a bounded ordered subset of nonempty files",
         )?;
+        require(
+            prefixes.len() <= missing_files.len()
+                && prefixes
+                    .windows(2)
+                    .all(|pair| pair[0].index < pair[1].index),
+            "artifact prefixes must be a bounded ordered subset of missing files",
+        )?;
+        let mut encoded_bytes = 2_usize; // The array's opening and closing brackets.
+        for (position, prefix) in prefixes.iter().enumerate() {
+            require(
+                missing_files.binary_search(&prefix.index).is_ok()
+                    && manifest
+                        .files()
+                        .get(usize::from(prefix.index))
+                        .is_some_and(|file| prefix.offset != 0 && prefix.offset < file.len),
+                "artifact prefix must name an incomplete requested file",
+            )?;
+            digest(&prefix.sha256)?;
+            // Reject malformed rows before serializing them; the complete
+            // valid offer list occupies at most a fraction of one ATP record.
+            encoded_bytes = encoded_bytes
+                .checked_add(serde_json::to_vec(prefix)?.len() + usize::from(position != 0))
+                .filter(|bytes| *bytes <= MAX_ARTIFACT_PREFIX_HINT_BYTES)
+                .ok_or_else(|| invalid("artifact prefix offers exceed their metadata bound"))?;
+        }
         Ok(Self {
             manifest_sha256,
             missing_files,
+            prefixes,
         })
     }
 }
@@ -977,6 +1049,7 @@ pub(super) enum Message {
     ReceiveArtifacts {
         manifest_sha256: String,
         missing_files: Vec<u16>,
+        prefixes: Vec<ArtifactPrefixOffer>,
     },
     ArtifactChunk {
         chunk: Chunk,
@@ -1264,6 +1337,7 @@ mod artifact_plan_tests {
         let all = ArtifactPlan::all(&manifest).unwrap();
         assert_eq!(all.missing_files, [0, 2]);
         assert_eq!(all.manifest_sha256, encode_hex(&manifest.digest()));
+        assert!(all.prefixes.is_empty());
         for missing in [vec![], vec![0], vec![2], vec![0, 2]] {
             assert_eq!(
                 ArtifactPlan::new(&manifest, missing.clone())
@@ -1284,13 +1358,138 @@ mod artifact_plan_tests {
         }
     }
 
+    fn prefix(index: u16, offset: u64) -> ArtifactPrefixOffer {
+        ArtifactPrefixOffer {
+            index,
+            offset,
+            sha256: encode_hex(&Sha256::digest(b"retained prefix")),
+        }
+    }
+
+    #[test]
+    fn artifact_prefixes_are_optional_ordered_hints_for_requested_members() {
+        let manifest = manifest();
+        for offers in [vec![], vec![prefix(0, 1)], vec![prefix(0, 3), prefix(2, 2)]] {
+            let plan = ArtifactPlan::with_prefixes(&manifest, vec![0, 2], offers.clone()).unwrap();
+            assert_eq!(plan.prefixes, offers);
+            assert_eq!(
+                plan.prefix_for(0),
+                offers.first().filter(|offer| offer.index == 0)
+            );
+            assert_eq!(
+                plan.prefix_for(2),
+                offers.iter().find(|offer| offer.index == 2)
+            );
+            assert!(plan.prefix_for(1).is_none());
+            assert!(plan.prefix_for(usize::MAX).is_none());
+        }
+        let native = ArtifactPrefix {
+            index: 2,
+            offset: 2,
+            sha256: Sha256::digest(b"bi").into(),
+        };
+        assert_eq!(
+            ArtifactPrefixOffer::from_native(&native),
+            ArtifactPrefixOffer {
+                index: 2,
+                offset: 2,
+                sha256: encode_hex(&Sha256::digest(b"bi")),
+            },
+        );
+    }
+
+    #[test]
+    fn artifact_prefixes_refuse_unsafe_ranges_members_order_and_digests() {
+        let manifest = manifest();
+        for (missing, offers) in [
+            (vec![0, 2], vec![prefix(0, 0)]),
+            (vec![0, 2], vec![prefix(0, 4)]),
+            (vec![0, 2], vec![prefix(0, u64::MAX)]),
+            (vec![0, 2], vec![prefix(2, 3)]),
+            (vec![0, 2], vec![prefix(1, 1)]),
+            (vec![0, 2], vec![prefix(3, 1)]),
+            (vec![0, 2], vec![prefix(u16::MAX, 1)]),
+            (vec![2], vec![prefix(0, 1)]),
+            (vec![], vec![prefix(0, 1)]),
+            (vec![0, 2], vec![prefix(0, 1), prefix(0, 2)]),
+            (vec![0, 2], vec![prefix(2, 1), prefix(0, 1)]),
+            (vec![0, 2], vec![prefix(0, 1); MAX_ARTIFACT_FILES + 1]),
+        ] {
+            assert!(ArtifactPlan::with_prefixes(&manifest, missing, offers).is_err());
+        }
+        for sha256 in [
+            String::new(),
+            "FF".repeat(32),
+            "gg".repeat(32),
+            "ab".repeat(33),
+        ] {
+            let mut offered = prefix(0, 1);
+            offered.sha256 = sha256;
+            assert!(ArtifactPlan::with_prefixes(&manifest, vec![0], vec![offered]).is_err());
+        }
+        let plan = ArtifactPlan::with_prefixes(&manifest, vec![0], vec![prefix(0, 1)]).unwrap();
+        assert!(
+            ArtifactPlan::from_request(
+                "00".repeat(32),
+                plan.missing_files,
+                plan.prefixes,
+                &manifest,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_prefix_metadata_is_bounded_below_one_control_record() {
+        let manifest = ArtifactManifest::new(
+            (0..MAX_ARTIFACT_FILES)
+                .map(|index| SourceFile {
+                    path: format!("artifact-{index:05}"),
+                    len: 2,
+                    sha256: Sha256::digest(b"ab").into(),
+                    executable: false,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let missing = ArtifactPlan::all(&manifest).unwrap().missing_files;
+        let mut offers = Vec::new();
+        let mut bytes = 2;
+        let next = loop {
+            let offered = prefix(u16::try_from(offers.len()).unwrap(), 1);
+            let added =
+                serde_json::to_vec(&offered).unwrap().len() + usize::from(!offers.is_empty());
+            if bytes + added > MAX_ARTIFACT_PREFIX_HINT_BYTES {
+                break offered;
+            }
+            bytes += added;
+            offers.push(offered);
+        };
+        assert!(offers.len() < MAX_ARTIFACT_FILES);
+        assert_eq!(serde_json::to_vec(&offers).unwrap().len(), bytes);
+        let plan = ArtifactPlan::with_prefixes(&manifest, missing.clone(), offers.clone()).unwrap();
+        let record = serde_json::to_vec(&Message::ReceiveArtifacts {
+            manifest_sha256: plan.manifest_sha256,
+            missing_files: plan.missing_files,
+            prefixes: plan.prefixes,
+        })
+        .unwrap();
+        assert!(record.len() < MAX_JSON_RECORD);
+        offers.push(next);
+        let error = ArtifactPlan::with_prefixes(&manifest, missing, offers).unwrap_err();
+        assert!(error.to_string().contains("metadata bound"), "{error}");
+    }
+
     #[test]
     fn artifact_plan_reuse_does_not_waive_complete_manifest_identity() {
         let original = manifest();
         let identity = encode_hex(&original.digest());
         for missing in [vec![], vec![0], vec![0, 2]] {
             for corrupt in ["00".repeat(32), "ff".repeat(31), "FF".repeat(32)] {
-                assert!(ArtifactPlan::from_request(corrupt, missing.clone(), &original).is_err());
+                assert!(
+                    ArtifactPlan::from_request(corrupt, missing.clone(), vec![], &original)
+                        .is_err()
+                );
             }
             // A reused file's bytes, path, length and mode remain part of the
             // complete identity even when the request sends none of its bytes.
@@ -1304,8 +1503,13 @@ mod artifact_plan_tests {
                 }
                 let different = ArtifactManifest::new(files).unwrap();
                 assert!(
-                    ArtifactPlan::from_request(identity.clone(), missing.clone(), &different)
-                        .is_err()
+                    ArtifactPlan::from_request(
+                        identity.clone(),
+                        missing.clone(),
+                        vec![],
+                        &different,
+                    )
+                    .is_err()
                 );
             }
         }
@@ -1336,6 +1540,7 @@ mod artifact_plan_tests {
             "kind":"receive-artifacts",
             "manifest_sha256":plan.manifest_sha256,
             "missing_files":plan.missing_files,
+            "prefixes":plan.prefixes,
         }))
         .unwrap();
         assert!(bytes.len() < 100 * 1024);
@@ -2075,6 +2280,7 @@ mod tests {
         let valid = json!({
             "kind":"receive-artifacts", "manifest_sha256":identity,
             "missing_files":[0, 2],
+            "prefixes":[],
         });
         assert!(matches!(
             serde_json::from_value::<Message>(valid.clone()).unwrap(),
@@ -2097,9 +2303,59 @@ mod tests {
             .is_err()
         );
         let duplicate = format!(
-            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[],\"missing_files\":[0]}}"
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[],\"missing_files\":[0],\"prefixes\":[]}}"
         );
         assert!(serde_json::from_str::<Message>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn artifact_delivery_wire_requires_explicit_typed_prefix_offers() {
+        let identity = "ab".repeat(32);
+        let valid = json!({
+            "kind":"receive-artifacts", "manifest_sha256":identity,
+            "missing_files":[0],
+            "prefixes":[{"index":0,"offset":1,"sha256":identity}],
+        });
+        assert!(matches!(
+            serde_json::from_value::<Message>(valid.clone()).unwrap(),
+            Message::ReceiveArtifacts { prefixes, .. }
+                if prefixes.len() == 1 && prefixes[0].index == 0 && prefixes[0].offset == 1
+        ));
+        for field in ["index", "offset", "sha256"] {
+            let mut value = valid.clone();
+            value["prefixes"][0].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for (field, invalid) in [
+            ("index", json!(-1)),
+            ("index", json!(65536)),
+            ("index", json!("0")),
+            ("offset", json!(-1)),
+            ("offset", json!(0.5)),
+            ("offset", json!("1")),
+            ("sha256", json!(vec![0; 32])),
+            ("path", json!("/untrusted")),
+        ] {
+            let mut value = valid.clone();
+            value["prefixes"][0][field] = invalid;
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        for prefixes in [json!(null), json!({}), json!(1)] {
+            let mut value = valid.clone();
+            value["prefixes"] = prefixes;
+            assert!(serde_json::from_value::<Message>(value).is_err());
+        }
+        let mut absent = valid;
+        absent.as_object_mut().unwrap().remove("prefixes");
+        assert!(serde_json::from_value::<Message>(absent).is_err());
+        let duplicate = format!(
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[],\"prefixes\":[]}}"
+        );
+        assert!(serde_json::from_str::<Message>(&duplicate).is_err());
+        let duplicate_offset = format!(
+            "{{\"kind\":\"receive-artifacts\",\"manifest_sha256\":\"{identity}\",\"missing_files\":[0],\"prefixes\":[{{\"index\":0,\"offset\":1,\"offset\":2,\"sha256\":\"{identity}\"}}]}}"
+        );
+        assert!(serde_json::from_str::<Message>(&duplicate_offset).is_err());
     }
 
     #[test]

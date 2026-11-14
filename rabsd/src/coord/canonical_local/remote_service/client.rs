@@ -3,11 +3,12 @@
 use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
-    ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, ArtifactPlan, CargoHome,
-    Chunk, Entry, IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage,
-    SourcePlan, SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition,
-    ToolchainFilePage, ToolchainPrefixOffer, ToolchainResume, VERSION, WIRE_VERSION, Window, Wire,
-    checkpoint, controlled_future, decode_hex, digest, invalid, require,
+    ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, ArtifactPlan,
+    ArtifactPrefixOffer, CargoHome, Chunk, Entry, IO_BUDGET, Message, Output, SOURCE_PAGE_FILES,
+    SourceDeclaration, SourcePage, SourcePlan, SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain,
+    ToolchainDisposition, ToolchainFilePage, ToolchainPrefixOffer, ToolchainResume, VERSION,
+    WIRE_VERSION, Window, Wire, checkpoint, controlled_future, decode_hex, digest, invalid,
+    require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -935,41 +936,31 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     )?;
     let plan = if let Some(root) = artifact_reuse_root {
         let missing = target.reuse_from(root, &cancelled)?;
-        ArtifactPlan::new(target.manifest(), missing)?
+        let prefixes = target
+            .prefix_hints()
+            .iter()
+            .map(ArtifactPrefixOffer::from_native)
+            .collect();
+        ArtifactPlan::with_prefixes(target.manifest(), missing, prefixes)?
     } else {
         ArtifactPlan::all(target.manifest())?
     };
     checkpoint(stopped, deadline)?;
-    if artifact_reuse_root.is_some() {
-        let transfer_bytes: u64 = plan
-            .missing_files
-            .iter()
-            .map(|index| target.manifest().files()[usize::from(*index)].len)
-            .sum();
-        let nonempty = target
-            .manifest()
-            .files()
-            .iter()
-            .filter(|file| file.len != 0)
-            .count();
-        eprintln!(
-            "{}",
-            json!({"kind":"canonical-remote-artifact-reuse",
-            "reused_files":nonempty - plan.missing_files.len(),
-            "reused_bytes":target.manifest().total_bytes() - transfer_bytes,
-            "transfer_files":plan.missing_files.len(), "transfer_bytes":transfer_bytes})
-        );
-    }
     wire.send(
         &Message::ReceiveArtifacts {
             manifest_sha256: manifest_sha256.clone(),
             missing_files: plan.missing_files.clone(),
+            prefixes: plan.prefixes.clone(),
         },
         stopped,
         deadline,
     )
     .await?;
     let mut window = Window::default();
+    let mut started_files = BTreeSet::new();
+    let mut resumed_files = 0_u64;
+    let mut resumed_bytes = 0_u64;
+    let mut transferred_bytes = 0_u64;
     loop {
         match wire.receive_until(stopped, deadline).await? {
             Message::ArtifactChunk { chunk } => {
@@ -984,7 +975,19 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
                     "remote artifact chunk names a file not requested for transfer",
                 )?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
+                if started_files.insert(index) {
+                    // The sender independently hashes each offered prefix. Its
+                    // first payload selects that exact frozen range or zero;
+                    // the ordinary receiver never skips uninstalled bytes.
+                    let imported =
+                        target.select_first_chunk(index as u16, chunk.offset, &cancelled)?;
+                    if imported != 0 {
+                        resumed_files += 1;
+                        resumed_bytes += imported;
+                    }
+                }
                 target.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
+                transferred_bytes += bytes.len() as u64;
             }
             Message::WindowEnd { count } => {
                 window.acknowledge(count)?;
@@ -1007,6 +1010,28 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
     }
     target.seal(&cancelled)?;
     checkpoint(stopped, deadline)?;
+    if artifact_reuse_root.is_some() {
+        let requested_bytes: u64 = plan
+            .missing_files
+            .iter()
+            .map(|index| target.manifest().files()[usize::from(*index)].len)
+            .sum();
+        let nonempty = target
+            .manifest()
+            .files()
+            .iter()
+            .filter(|file| file.len != 0)
+            .count();
+        eprintln!(
+            "{}",
+            json!({"kind":"canonical-remote-artifact-reuse",
+            "reused_files":nonempty - plan.missing_files.len(),
+            "reused_bytes":target.manifest().total_bytes() - requested_bytes,
+            "offered_prefix_files":plan.prefixes.len(),
+            "resumed_files":resumed_files, "resumed_bytes":resumed_bytes,
+            "transfer_files":started_files.len(), "transfer_bytes":transferred_bytes})
+        );
+    }
     wire.send(
         &Message::Received {
             manifest_sha256: manifest_sha256.clone(),
@@ -1822,6 +1847,277 @@ mod tests {
                 "{case}"
             );
             assert_eq!(fs::read(prior.join("program")).unwrap(), b"same");
+        }
+    }
+
+    fn artifact_tail_messages(path: &str, offset: usize, bytes: &[u8]) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut window = Window::default();
+        for (index, chunk) in bytes[offset..].chunks(MAX_SOURCE_CHUNK).enumerate() {
+            messages.push(Message::ArtifactChunk {
+                chunk: Chunk::new(path, (offset + index * MAX_SOURCE_CHUNK) as u64, chunk).unwrap(),
+            });
+            if window.record().unwrap() {
+                let count = window.count();
+                messages.push(Message::WindowEnd { count });
+                window.acknowledge(count).unwrap();
+            }
+        }
+        if window.pending() {
+            messages.push(Message::WindowEnd {
+                count: window.count(),
+            });
+        }
+        messages
+    }
+
+    #[test]
+    fn artifact_prefix_selection_installs_exact_bytes_or_accepts_full_fallback() {
+        // Real receiver and filesystem with a deliberately scripted sender;
+        // sender-side hash selection is exercised separately and over ATP.
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 5 + 19)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        for retained in [1, MAX_SOURCE_CHUNK, MAX_SOURCE_CHUNK + 7, bytes.len() - 1] {
+            for matches in [true, false] {
+                let directory = private();
+                let prior = directory.path().join("prior");
+                fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+                fs::write(prior.join("a-cached"), b"same").unwrap();
+                let mut prefix = bytes[..retained].to_vec();
+                if !matches {
+                    prefix[0] ^= 0xff;
+                }
+                fs::write(prior.join("b-program"), &prefix).unwrap();
+                let manifest = ArtifactManifest::new(vec![
+                    SourceFile {
+                        path: "a-cached".into(),
+                        len: 4,
+                        sha256: Sha256::digest(b"same").into(),
+                        executable: false,
+                    },
+                    SourceFile {
+                        path: "b-program".into(),
+                        len: bytes.len() as u64,
+                        sha256: Sha256::digest(&bytes).into(),
+                        executable: true,
+                    },
+                ])
+                .unwrap();
+                let mut messages = artifact_manifest_messages(&manifest);
+                messages.extend(artifact_tail_messages(
+                    "b-program",
+                    if matches { retained } else { 0 },
+                    &bytes,
+                ));
+                messages.push(Message::ArtifactEnd {});
+                messages.push(Message::Commit {
+                    manifest_sha256: encode_hex(&manifest.digest()),
+                });
+                let mut stream = AdmissionStream::new(&messages, false);
+                stream.quantum = 211;
+                let output = Arc::clone(&stream.output);
+                let destination = directory.path().join("completed");
+                native(receive_target(
+                    &mut Wire::new(stream),
+                    ArtifactDeclaration::from_native(&manifest),
+                    &destination,
+                    Some(&prior),
+                    &AtomicBool::new(false),
+                    Instant::now() + IO_BUDGET,
+                ))
+                .unwrap();
+                assert_eq!(fs::read(destination.join("b-program")).unwrap(), bytes);
+                assert_eq!(fs::read(destination.join("a-cached")).unwrap(), b"same");
+                assert_eq!(fs::read(prior.join("b-program")).unwrap(), prefix);
+                assert_ne!(
+                    fs::metadata(prior.join("b-program")).unwrap().ino(),
+                    fs::metadata(destination.join("b-program")).unwrap().ino(),
+                );
+                assert_eq!(
+                    fs::metadata(destination.join("b-program")).unwrap().mode() & 0o777,
+                    0o555,
+                );
+                let sent = admission_messages(&output);
+                let plan = sent
+                    .iter()
+                    .find(|message| message["kind"] == "receive-artifacts")
+                    .unwrap();
+                assert_eq!(plan["missing_files"], json!([1]));
+                assert_eq!(
+                    plan["prefixes"],
+                    json!([{"index":1,"offset":retained,
+                        "sha256":encode_hex(&Sha256::digest(&prefix))}]),
+                );
+                assert_eq!(sent.last().unwrap()["kind"], "published");
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_selection_cannot_skip_bytes_windows_or_commit() {
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let retained = MAX_SOURCE_CHUNK;
+        for case in [
+            "wrong-offset",
+            "repeat-offset",
+            "corrupt-prefix",
+            "missing-tail",
+            "wrong-window",
+            "wrong-commit",
+            "missing-commit",
+        ] {
+            let directory = private();
+            let prior = directory.path().join("prior");
+            fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+            let mut prefix = bytes[..retained].to_vec();
+            if case == "corrupt-prefix" {
+                prefix[0] ^= 0xff;
+            }
+            fs::write(prior.join("program"), &prefix).unwrap();
+            let manifest = ArtifactManifest::new(vec![SourceFile {
+                path: "program".into(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(&bytes).into(),
+                executable: true,
+            }])
+            .unwrap();
+            let mut messages = artifact_manifest_messages(&manifest);
+            if case != "missing-tail" {
+                let offset = retained + usize::from(case == "wrong-offset");
+                messages.push(Message::ArtifactChunk {
+                    chunk: Chunk::new("program", offset as u64, &bytes[offset..]).unwrap(),
+                });
+                if case == "repeat-offset" {
+                    messages.push(Message::ArtifactChunk {
+                        chunk: Chunk::new("program", offset as u64, &bytes[offset..]).unwrap(),
+                    });
+                }
+                messages.push(Message::WindowEnd {
+                    count: if case == "wrong-window" { 2 } else { 1 },
+                });
+            }
+            messages.push(Message::ArtifactEnd {});
+            if case != "missing-commit" {
+                messages.push(Message::Commit {
+                    manifest_sha256: if case == "wrong-commit" {
+                        "00".repeat(32)
+                    } else {
+                        encode_hex(&manifest.digest())
+                    },
+                });
+            }
+            let mut stream = AdmissionStream::new(&messages, false);
+            stream.quantum = 211;
+            let output = Arc::clone(&stream.output);
+            let destination = directory.path().join("completed");
+            let result = native(receive_target(
+                &mut Wire::new(stream),
+                ArtifactDeclaration::from_native(&manifest),
+                &destination,
+                Some(&prior),
+                &AtomicBool::new(false),
+                Instant::now() + IO_BUDGET,
+            ));
+            assert!(result.is_err(), "{case} unexpectedly published");
+            assert!(
+                !destination.exists(),
+                "{case} installed an incomplete result"
+            );
+            assert_eq!(fs::read(prior.join("program")).unwrap(), prefix);
+            assert!(
+                admission_messages(&output)
+                    .iter()
+                    .all(|message| message["kind"] != "published"),
+                "{case} reported successful publication",
+            );
+        }
+    }
+
+    #[test]
+    fn native_atp_artifact_prefix_delivery_seals_and_publishes_the_complete_target() {
+        // Actual capture, sender, receiver and loopback ATP transport. The
+        // test supplies the final commit; it is not TLS or Cargo qualification.
+        for matching_prefix in [true, false] {
+            let producer = private();
+            let source = producer.path().join("target");
+            fs::DirBuilder::new().mode(0o700).create(&source).unwrap();
+            let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 6 + 13)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            fs::write(source.join("a-cached"), b"same").unwrap();
+            fs::write(source.join("b-program"), &bytes).unwrap();
+            fs::set_permissions(source.join("b-program"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let captured = super::super::CapturedTarget::capture(&source, &|| false).unwrap();
+            let declaration = ArtifactDeclaration::from_native(captured.manifest());
+            let receiver = private();
+            let prior = receiver.path().join("prior");
+            fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
+            fs::write(prior.join("a-cached"), b"same").unwrap();
+            let mut prefix = bytes[..MAX_SOURCE_CHUNK + 3].to_vec();
+            if !matching_prefix {
+                prefix[0] ^= 0xff;
+            }
+            fs::write(prior.join("b-program"), &prefix).unwrap();
+            let destination = receiver.path().join("completed");
+            std::thread::scope(|scope| {
+                let (addresses, address) = mpsc::sync_channel(1);
+                let server = scope.spawn(move || {
+                    native(async {
+                        let listener = TcpListener::bind("127.0.0.1:0").await?;
+                        addresses.send(listener.local_addr()?.to_string()).unwrap();
+                        let (stream, _) = listener.accept().await?;
+                        let mut wire = Wire::new(JsonAtpStream::new(stream));
+                        let stopped = AtomicBool::new(false);
+                        let deadline = Instant::now() + IO_BUDGET;
+                        let manifest_sha256 = super::super::deliver_artifacts(
+                            &mut wire,
+                            &captured,
+                            &stopped,
+                            deadline,
+                            &|| false,
+                        )
+                        .await?;
+                        wire.send(
+                            &Message::Commit {
+                                manifest_sha256: manifest_sha256.clone(),
+                            },
+                            &stopped,
+                            deadline,
+                        )
+                        .await?;
+                        let Message::Published {
+                            manifest_sha256: published,
+                        } = wire.receive(&stopped, deadline).await?
+                        else {
+                            return Err(invalid("client did not publish the verified result"));
+                        };
+                        require(published == manifest_sha256, "published manifest changed")
+                    })
+                });
+                let address = address.recv_timeout(Duration::from_secs(10)).unwrap();
+                let received = native(async {
+                    let stream = TcpStream::connect(address).await?;
+                    receive_target(
+                        &mut Wire::new(JsonAtpStream::new(stream)),
+                        declaration,
+                        &destination,
+                        Some(&prior),
+                        &AtomicBool::new(false),
+                        Instant::now() + IO_BUDGET,
+                    )
+                    .await
+                });
+                let sent = server.join().unwrap();
+                received.unwrap();
+                sent.unwrap();
+            });
+            assert_eq!(fs::read(destination.join("b-program")).unwrap(), bytes);
+            assert_eq!(fs::read(destination.join("a-cached")).unwrap(), b"same");
+            assert_eq!(fs::read(prior.join("b-program")).unwrap(), prefix);
         }
     }
 

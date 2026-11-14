@@ -9,7 +9,8 @@
 
 use rabs_sandbox::artifact_tree::{MAX_ARTIFACT_BYTES, TreeInventory, validate_artifact_names};
 use rabs_sandbox::source_transfer::{
-    ArtifactManifest, ArtifactReceiver, MAX_SOURCE_CHUNK, SourceFile, create_staging_file,
+    ArtifactManifest, ArtifactReceiver, MAX_SOURCE_CHUNK, MAX_SOURCE_PREFIX_HINT_BYTES, SourceFile,
+    create_staging_file,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, Metadata};
@@ -510,9 +511,9 @@ impl InstalledTarget {
     }
 }
 
-/// An untrusted old member becomes a byte hint only after a bounded, complete
-/// hash. Its name is always resolved beneath the retained private root, never
-/// through an old manifest or an unrelated directory enumeration.
+/// An untrusted old member is resolved beneath the retained private root, never
+/// through an old manifest or an unrelated directory enumeration. Complete
+/// imports and partial snapshots independently verify its bytes and generation.
 struct ReuseFile {
     file: File,
     observed: Metadata,
@@ -543,6 +544,30 @@ fn open_reuse_file(root: &Parent, path: &str) -> io::Result<File> {
 }
 
 impl ReuseFile {
+    fn partial(
+        root: &Parent,
+        expected: &SourceFile,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<Self>> {
+        checkpoint(stopped)?;
+        root.verify()?;
+        let opened = (|| {
+            let file = open_reuse_file(root, &expected.path)?;
+            let observed = file.metadata()?;
+            Ok::<_, io::Error>(
+                (observed.is_file()
+                    && observed.nlink() == 1
+                    && observed.len() != 0
+                    && observed.len() < expected.len)
+                    .then_some(Self { file, observed }),
+            )
+        })();
+        root.verify()?;
+        checkpoint(stopped)?;
+        // Partial hints are optional and have not supplied any receiver bytes.
+        Ok(opened.unwrap_or(None))
+    }
+
     fn inspect(
         root: &Parent,
         expected: &SourceFile,
@@ -612,6 +637,194 @@ impl ReuseFile {
     }
 }
 
+/// An immutable byte offer, indexed by the new complete manifest. The sender
+/// must independently verify this prefix before choosing its nonzero offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ArtifactPrefix {
+    pub(super) index: u16,
+    pub(super) offset: u64,
+    pub(super) sha256: [u8; 32],
+}
+
+// Each JSON offer (index, offset, 64 hexadecimal SHA-256 digits, punctuation
+// and a separating comma) fits in 128 bytes even at the integer type maxima.
+// The wire independently checks its actual serialized metadata budget.
+const MAX_ARTIFACT_PREFIXES: usize = (MAX_SOURCE_PREFIX_HINT_BYTES - 2) / 128;
+
+/// One anonymous descriptor holds every frozen prefix. It never becomes a
+/// named output, and its total bytes cannot exceed the new complete manifest.
+struct PrefixSpool {
+    file: File,
+    bytes: u64,
+    max_bytes: u64,
+    frozen: Option<Metadata>,
+}
+
+fn private_spool(metadata: &Metadata, bytes: u64) -> bool {
+    metadata.is_file()
+        && metadata.nlink() == 0
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.mode() & 0o077 == 0
+        && metadata.len() == bytes
+}
+
+fn same_spool(before: &Metadata, after: &Metadata) -> bool {
+    private_spool(after, before.len())
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.mode() == after.mode()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+impl PrefixSpool {
+    fn create(parent: &Parent, max_bytes: u64) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, openat};
+        parent.verify()?;
+        let file = File::from(openat(
+            &parent.directory,
+            ".",
+            OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        parent.verify()?;
+        require(
+            private_spool(&file.metadata()?, 0),
+            "artifact prefix spool is not private and anonymous",
+        )?;
+        Ok(Self {
+            file,
+            bytes: 0,
+            max_bytes,
+            frozen: None,
+        })
+    }
+
+    fn capture(
+        &mut self,
+        root: &Parent,
+        path: &str,
+        mut input: ReuseFile,
+        buffer: &mut [u8],
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<(u64, [u8; 32])>> {
+        checkpoint(stopped)?;
+        require(
+            self.frozen.is_none() && private_spool(&self.file.metadata()?, self.bytes),
+            "artifact prefix spool changed while collecting hints",
+        )?;
+        let length = input.observed.len();
+        if length > self.max_bytes.saturating_sub(self.bytes) {
+            return Ok(None);
+        }
+        self.file.seek(SeekFrom::Start(self.bytes))?;
+        let copied = (|| {
+            input.verify(root, path)?;
+            let mut remaining = length;
+            let mut hash = Sha256::new();
+            while remaining != 0 {
+                checkpoint(stopped)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                input.file.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                self.file.write_all(&buffer[..count])?;
+                remaining -= count as u64;
+            }
+            checkpoint(stopped)?;
+            require(
+                input.file.read(&mut buffer[..1])? == 0,
+                "artifact prefix gained bytes during snapshot",
+            )?;
+            input.verify(root, path)?;
+            Ok::<_, io::Error>(<[u8; 32]>::from(hash.finalize()))
+        })();
+        root.verify()?;
+        checkpoint(stopped)?;
+        let hash = match copied {
+            Ok(hash) => hash,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+            Err(_) => {
+                // No offer or receiver cursor exists for an incomplete copy.
+                // Preserve earlier snapshots and request this file from zero.
+                self.file.set_len(self.bytes)?;
+                self.file.seek(SeekFrom::Start(self.bytes))?;
+                return Ok(None);
+            }
+        };
+        let start = self.bytes;
+        self.bytes += length;
+        require(
+            private_spool(&self.file.metadata()?, self.bytes),
+            "artifact prefix snapshot exceeds its spool",
+        )?;
+        Ok(Some((start, hash)))
+    }
+
+    fn freeze(&mut self) -> io::Result<()> {
+        require(
+            self.frozen.is_none(),
+            "artifact prefix spool already frozen",
+        )?;
+        self.file
+            .set_permissions(fs::Permissions::from_mode(0o400))?;
+        let metadata = self.file.metadata()?;
+        require(
+            private_spool(&metadata, self.bytes) && self.bytes <= self.max_bytes,
+            "artifact prefix spool changed before freezing",
+        )?;
+        self.frozen = Some(metadata);
+        Ok(())
+    }
+
+    fn verify_frozen(&self) -> io::Result<()> {
+        let frozen = self
+            .frozen
+            .as_ref()
+            .ok_or_else(|| invalid("artifact prefix spool was not frozen"))?;
+        require(
+            same_spool(frozen, &self.file.metadata()?),
+            "artifact prefix spool changed after freezing",
+        )
+    }
+
+    fn read_chunk(
+        &mut self,
+        start: u64,
+        offset: u64,
+        bytes: &mut [u8],
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        checkpoint(stopped)?;
+        let frozen = self
+            .frozen
+            .as_ref()
+            .ok_or_else(|| invalid("artifact prefix spool was not frozen"))?;
+        let position = start
+            .checked_add(offset)
+            .filter(|position| {
+                position
+                    .checked_add(bytes.len() as u64)
+                    .is_some_and(|end| end <= self.bytes)
+            })
+            .ok_or_else(|| invalid("artifact prefix read exceeds its spool"))?;
+        require(
+            !bytes.is_empty()
+                && bytes.len() <= MAX_SOURCE_CHUNK
+                && same_spool(frozen, &self.file.metadata()?),
+            "artifact prefix spool changed before import",
+        )?;
+        self.file.seek(SeekFrom::Start(position))?;
+        self.file.read_exact(bytes)?;
+        checkpoint(stopped)?;
+        require(
+            same_spool(frozen, &self.file.metadata()?),
+            "artifact prefix spool changed during import",
+        )
+    }
+}
+
 /// A fresh client-owned staging tree. Failed and interrupted transfers retain
 /// their private staging paths; only an exact completed tree can be published.
 pub(super) struct ReceivedTarget {
@@ -621,6 +834,10 @@ pub(super) struct ReceivedTarget {
     sealed: Option<TreeInventory>,
     poisoned: bool,
     input_started: bool,
+    prefix_hints: Vec<ArtifactPrefix>,
+    prefix_starts: Vec<u64>,
+    prefix_spool: Option<PrefixSpool>,
+    first_chunks: Vec<bool>,
 }
 
 impl ReceivedTarget {
@@ -654,6 +871,7 @@ impl ReceivedTarget {
         let (receiver, staging) = staged.keep().map_err(|error| error.error)?;
         parent.verify()?;
         checkpoint(stopped)?;
+        let first_chunks = vec![false; receiver.manifest().files().len()];
         Ok(Self {
             parent,
             staging,
@@ -661,11 +879,19 @@ impl ReceivedTarget {
             sealed: None,
             poisoned: false,
             input_started: false,
+            prefix_hints: Vec::new(),
+            prefix_starts: Vec::new(),
+            prefix_spool: None,
+            first_chunks,
         })
     }
 
     pub(super) fn manifest(&self) -> &ArtifactManifest {
         self.receiver.manifest()
+    }
+
+    pub(super) fn prefix_hints(&self) -> &[ArtifactPrefix] {
+        &self.prefix_hints
     }
 
     /// A cursor for this live receiver only; reconnect never adopts a partial
@@ -684,8 +910,10 @@ impl ReceivedTarget {
     /// unrelated files do not affect the new tree; each selected member is
     /// copied or safely reflinked into an independent inode; the ordinary seal
     /// chooses its mode and verifies the actual destination bytes.
-    /// A missing or unavailable old root/member, partial file, or hash mismatch
-    /// requests ordinary transfer. Once an import is chosen, mutation, I/O
+    /// Partial files can offer immutable prefixes; they remain missing until
+    /// the sender independently selects an offered offset. A missing or
+    /// unavailable old root/member or hash mismatch requests ordinary transfer.
+    /// Once an import is chosen, mutation, I/O
     /// failure or cancellation poisons this receiver rather than repairing it.
     pub(super) fn reuse_from(
         &mut self,
@@ -722,6 +950,7 @@ impl ReceivedTarget {
             };
             let mut missing = Vec::new();
             let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
+            let mut spool_attempted = false;
             for index in 0..self.receiver.manifest().files().len() {
                 checkpoint(stopped)?;
                 // Clone one bounded path, not a second entire target manifest.
@@ -729,6 +958,8 @@ impl ReceivedTarget {
                 if expected.len == 0 {
                     continue;
                 }
+                let wire_index = u16::try_from(index)
+                    .map_err(|_| invalid("artifact index exceeds its wire bound"))?;
                 let hint = match &root {
                     Some(root) => ReuseFile::inspect(root, &expected, &mut buffer, stopped)?,
                     None => None,
@@ -744,19 +975,135 @@ impl ReceivedTarget {
                     )?;
                     hint.verify(root, &expected.path)?;
                     self.parent.verify()?;
+                    self.first_chunks[index] = true;
                 } else {
-                    missing.push(
-                        u16::try_from(index)
-                            .map_err(|_| invalid("artifact index exceeds its wire bound"))?,
-                    );
+                    missing.push(wire_index);
+                    if self.prefix_hints.len() < MAX_ARTIFACT_PREFIXES
+                        && let Some(root) = &root
+                        && let Some(partial) = ReuseFile::partial(root, &expected, stopped)?
+                    {
+                        if !spool_attempted {
+                            spool_attempted = true;
+                            // Anonymous files are optional filesystem support.
+                            // Failure to create one leaves normal downloads;
+                            // parent replacement and cancellation still refuse.
+                            self.prefix_spool = PrefixSpool::create(
+                                &self.parent,
+                                self.receiver.manifest().total_bytes(),
+                            )
+                            .ok();
+                            self.parent.verify()?;
+                            checkpoint(stopped)?;
+                        }
+                        let offset = partial.observed.len();
+                        if let Some(spool) = &mut self.prefix_spool
+                            && let Some((start, sha256)) = spool.capture(
+                                root,
+                                &expected.path,
+                                partial,
+                                &mut buffer,
+                                stopped,
+                            )?
+                        {
+                            self.prefix_starts.push(start);
+                            self.prefix_hints.push(ArtifactPrefix {
+                                index: wire_index,
+                                offset,
+                                sha256,
+                            });
+                        }
+                    }
                 }
             }
             if let Some(root) = &root {
                 root.verify()?;
             }
+            if let Some(spool) = &mut self.prefix_spool {
+                spool.freeze()?;
+            }
             self.parent.verify()?;
             checkpoint(stopped)?;
             Ok(missing)
+        })();
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+
+    /// The first network chunk selects exactly one offered prefix, or zero to
+    /// download the whole file. Only actual imported bytes advance the receiver
+    /// and contribute to the return value; an offer is never itself a cursor.
+    pub(super) fn select_first_chunk(
+        &mut self,
+        index: u16,
+        offset: u64,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<u64> {
+        require(
+            !self.poisoned && self.sealed.is_none(),
+            "artifact prefix receiver is failed or sealed",
+        )?;
+        self.poisoned = true;
+        self.input_started = true;
+        let result = (|| {
+            checkpoint(stopped)?;
+            self.parent.verify()?;
+            let expected = self
+                .receiver
+                .manifest()
+                .files()
+                .get(usize::from(index))
+                .ok_or_else(|| invalid("artifact prefix selects an undeclared file"))?
+                .clone();
+            require(
+                expected.len != 0 && !self.first_chunks[usize::from(index)],
+                "artifact prefix selection repeats input or names an empty file",
+            )?;
+            self.first_chunks[usize::from(index)] = true;
+            if offset == 0 {
+                return Ok(0);
+            }
+            let position = self
+                .prefix_hints
+                .binary_search_by_key(&index, |hint| hint.index)
+                .map_err(|_| invalid("artifact chunk selected an unoffered prefix"))?;
+            let hint = self.prefix_hints[position];
+            require(
+                offset == hint.offset && offset < expected.len,
+                "artifact chunk differs from the offered prefix offset",
+            )?;
+            let start = self.prefix_starts[position];
+            let spool = self
+                .prefix_spool
+                .as_mut()
+                .ok_or_else(|| invalid("artifact prefix has no frozen snapshot"))?;
+            let mut imported = 0;
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0_u8; MAX_SOURCE_CHUNK];
+            while imported < offset {
+                checkpoint(stopped)?;
+                self.parent.verify()?;
+                let count = (offset - imported).min(buffer.len() as u64) as usize;
+                let bytes = &mut buffer[..count];
+                spool.read_chunk(start, imported, bytes, stopped)?;
+                hash.update(&*bytes);
+                self.receiver.write_chunk(
+                    &expected.path,
+                    imported,
+                    bytes,
+                    Sha256::digest(&*bytes).into(),
+                )?;
+                imported += count as u64;
+            }
+            require(
+                imported == offset && <[u8; 32]>::from(hash.finalize()) == hint.sha256,
+                "artifact prefix snapshot differs from its offer",
+            )?;
+            checkpoint(stopped)?;
+            spool.verify_frozen()?;
+            self.parent.verify()?;
+            Ok(imported)
         })();
         if result.is_ok() {
             self.poisoned = false;
@@ -776,6 +1123,14 @@ impl ReceivedTarget {
             "remote target receiver is failed or already sealed",
         )?;
         self.input_started = true;
+        if let Ok(index) = self
+            .receiver
+            .manifest()
+            .files()
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+        {
+            self.first_chunks[index] = true;
+        }
         self.parent.verify()?;
         self.receiver.write_chunk(path, offset, bytes, sha256)
     }
@@ -1280,6 +1635,300 @@ mod tests {
             );
             assert!(!destination.exists(), "{change}");
         }
+    }
+
+    fn prefix_receiver(
+        expected: &[u8],
+        prior: &[u8],
+    ) -> (tempfile::TempDir, PathBuf, ReceivedTarget) {
+        let owner = private();
+        let previous = owner.path().join("previous");
+        let output = owner.path().join("output");
+        fs::DirBuilder::new().mode(0o700).create(&previous).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
+        fs::write(previous.join("data"), prior).unwrap();
+        let manifest = ArtifactManifest::new(vec![file("data", expected, true)]).unwrap();
+        let mut received = ReceivedTarget::new(&output, manifest).unwrap();
+        assert_eq!(received.reuse_from(&previous, &|| false).unwrap(), [0]);
+        (owner, previous, received)
+    }
+
+    #[test]
+    fn artifact_prefix_snapshots_advance_only_after_exact_selection_and_seal() {
+        for offset in [
+            1,
+            MAX_SOURCE_CHUNK - 1,
+            MAX_SOURCE_CHUNK,
+            MAX_SOURCE_CHUNK + 17,
+        ] {
+            let bytes: Vec<_> = (0..offset + MAX_SOURCE_CHUNK + 7)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let (_owner, previous, mut received) = prefix_receiver(&bytes, &bytes[..offset]);
+            assert_eq!(
+                received.prefix_hints(),
+                &[ArtifactPrefix {
+                    index: 0,
+                    offset: offset as u64,
+                    sha256: Sha256::digest(&bytes[..offset]).into(),
+                }],
+            );
+            let spool = received.prefix_spool.as_ref().unwrap();
+            assert!(spool.bytes <= received.manifest().total_bytes());
+            assert_eq!(spool.file.metadata().unwrap().nlink(), 0);
+            assert_eq!(spool.file.metadata().unwrap().mode() & 0o777, 0o400);
+            assert_eq!(
+                fs::metadata(received.staging.join("data")).unwrap().len(),
+                0
+            );
+            // Once frozen, old-path mutation cannot change the selected bytes.
+            fs::write(previous.join("data"), b"changed after snapshot").unwrap();
+            assert_eq!(
+                received
+                    .select_first_chunk(0, offset as u64, &|| false)
+                    .unwrap(),
+                offset as u64,
+            );
+            assert_eq!(
+                fs::read(received.staging.join("data")).unwrap(),
+                &bytes[..offset],
+            );
+            for (index, tail) in bytes[offset..].chunks(MAX_SOURCE_CHUNK).enumerate() {
+                received
+                    .write_chunk(
+                        "data",
+                        (offset + index * MAX_SOURCE_CHUNK) as u64,
+                        tail,
+                        Sha256::digest(tail).into(),
+                    )
+                    .unwrap();
+            }
+            received.seal(&|| false).unwrap();
+            let destination = received.parent.path.join("complete");
+            received.publish(&destination, &|| false).unwrap();
+            assert_eq!(fs::read(destination.join("data")).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(destination.join("data")).unwrap().mode() & 0o777,
+                0o555
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_zero_selection_downloads_normally_and_wrong_bytes_never_seal() {
+        let bytes = b"correct complete bytes";
+        for selected in [0, 5] {
+            let (_owner, _previous, mut received) = prefix_receiver(bytes, b"wrong");
+            assert_eq!(received.prefix_hints().len(), 1);
+            assert_eq!(
+                received.select_first_chunk(0, selected, &|| false).unwrap(),
+                selected,
+            );
+            assert_eq!(
+                fs::metadata(received.staging.join("data")).unwrap().len(),
+                selected,
+            );
+            let tail = &bytes[selected as usize..];
+            let appended =
+                received.write_chunk("data", selected, tail, Sha256::digest(tail).into());
+            // The ordinary receiver verifies the complete file as soon as its
+            // last chunk arrives, before the final whole-tree seal.
+            assert_eq!(appended.is_ok(), selected == 0);
+            assert_eq!(received.seal(&|| false).is_ok(), selected == 0);
+            let destination = received.parent.path.join("complete");
+            assert_eq!(
+                received.publish(&destination, &|| false).is_ok(),
+                selected == 0,
+            );
+            assert_eq!(destination.exists(), selected == 0);
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_spool_keeps_multiple_ranges_distinct_beside_complete_hits() {
+        let owner = private();
+        let previous = owner.path().join("previous");
+        let output = owner.path().join("output");
+        fs::DirBuilder::new().mode(0o700).create(&previous).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
+        let large = vec![b'z'; MAX_SOURCE_CHUNK + 19];
+        let files = [
+            ("a-complete", b"already complete".as_slice()),
+            ("b-partial", b"first prefix and tail".as_slice()),
+            ("c-empty", b"".as_slice()),
+            ("d-partial", large.as_slice()),
+            ("e-oversized", b"fresh".as_slice()),
+        ];
+        fs::write(previous.join("a-complete"), files[0].1).unwrap();
+        fs::write(previous.join("b-partial"), &files[1].1[..5]).unwrap();
+        fs::write(previous.join("d-partial"), &large[..MAX_SOURCE_CHUNK + 3]).unwrap();
+        fs::write(previous.join("e-oversized"), b"extra old bytes").unwrap();
+        let manifest = ArtifactManifest::new(
+            files
+                .iter()
+                .map(|(path, bytes)| file(path, bytes, false))
+                .collect(),
+        )
+        .unwrap();
+        let mut received = ReceivedTarget::new(&output, manifest).unwrap();
+        assert_eq!(
+            received.reuse_from(&previous, &|| false).unwrap(),
+            [1, 3, 4]
+        );
+        assert_eq!(received.prefix_starts, [0, 5]);
+        assert_eq!(
+            received
+                .prefix_hints()
+                .iter()
+                .map(|hint| hint.index)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        // Import the later spool range first; no shared seek cursor can select
+        // another member's bytes or make complete-file hits require payloads.
+        for (index, offset) in [(3_u16, (MAX_SOURCE_CHUNK + 3) as u64), (1, 5), (4, 0)] {
+            assert_eq!(
+                received
+                    .select_first_chunk(index, offset, &|| false)
+                    .unwrap(),
+                offset
+            );
+            let (path, bytes) = files[usize::from(index)];
+            let tail = &bytes[offset as usize..];
+            received
+                .write_chunk(path, offset, tail, Sha256::digest(tail).into())
+                .unwrap();
+        }
+        received.seal(&|| false).unwrap();
+        let destination = output.join("complete");
+        received.publish(&destination, &|| false).unwrap();
+        for (path, bytes) in files {
+            assert_eq!(fs::read(destination.join(path)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_invalid_repeated_or_late_selections_poison_the_receiver() {
+        let bytes = b"complete artifact";
+        for case in [
+            "unoffered",
+            "unknown",
+            "wrong-offset",
+            "full-length",
+            "repeat",
+            "late",
+        ] {
+            let prior: &[u8] = if case == "unoffered" { b"" } else { b"compl" };
+            let (_owner, _previous, mut received) = prefix_receiver(bytes, prior);
+            if case == "repeat" {
+                received.select_first_chunk(0, 0, &|| false).unwrap();
+            }
+            if case == "late" {
+                received
+                    .write_chunk("data", 0, b"c", Sha256::digest(b"c").into())
+                    .unwrap();
+            }
+            let (index, offset) = match case {
+                "unknown" => (1, 5),
+                "wrong-offset" => (0, 4),
+                "full-length" => (0, bytes.len() as u64),
+                _ => (0, 5),
+            };
+            assert!(
+                received
+                    .select_first_chunk(index, offset, &|| false)
+                    .is_err(),
+                "{case}"
+            );
+            assert!(received.seal(&|| false).is_err(), "{case}");
+            let destination = received.parent.path.join("complete");
+            assert!(received.publish(&destination, &|| false).is_err(), "{case}");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_spool_mutation_and_import_cancellation_are_terminal() {
+        use std::os::unix::fs::FileExt;
+        let bytes = vec![b'x'; MAX_SOURCE_CHUNK * 3 + 17];
+        let prefix = &bytes[..MAX_SOURCE_CHUNK * 2 + 3];
+        for case in ["before", "during", "cancel", "parent"] {
+            let (owner, _previous, mut received) = prefix_receiver(&bytes, prefix);
+            let spool = received
+                .prefix_spool
+                .as_ref()
+                .unwrap()
+                .file
+                .try_clone()
+                .unwrap();
+            let staged_file = received.staging.join("data");
+            let parent = received.parent.path.clone();
+            let changed = Cell::new(case == "before");
+            if case == "before" {
+                spool.write_at(b"changed", 0).unwrap();
+            }
+            let result = received.select_first_chunk(0, prefix.len() as u64, &|| {
+                if !changed.get()
+                    && fs::metadata(&staged_file).is_ok_and(|metadata| metadata.len() != 0)
+                {
+                    changed.set(true);
+                    match case {
+                        "during" => {
+                            spool.write_at(b"changed", 0).unwrap();
+                        }
+                        "parent" => {
+                            fs::rename(&parent, owner.path().join("original-output")).unwrap();
+                            fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+                        }
+                        "cancel" => return true,
+                        _ => unreachable!(),
+                    }
+                }
+                false
+            });
+            assert!(changed.get(), "import never reached mutation: {case}");
+            assert!(result.is_err(), "{case}");
+            assert!(received.seal(&|| false).is_err(), "{case}");
+            let destination = parent.join("complete");
+            assert!(received.publish(&destination, &|| false).is_err(), "{case}");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_hint_budget_falls_back_without_losing_missing_files() {
+        let owner = private();
+        let previous = owner.path().join("previous");
+        let output = owner.path().join("output");
+        fs::DirBuilder::new().mode(0o700).create(&previous).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
+        let count = MAX_ARTIFACT_PREFIXES + 3;
+        let mut files = Vec::new();
+        for index in 0..count {
+            let path = format!("data-{index:04}");
+            fs::write(previous.join(&path), b"a").unwrap();
+            files.push(file(&path, b"ab", false));
+        }
+        let manifest = ArtifactManifest::new(files).unwrap();
+        let mut received = ReceivedTarget::new(&output, manifest).unwrap();
+        let missing = received.reuse_from(&previous, &|| false).unwrap();
+        assert_eq!(missing.len(), count);
+        assert_eq!(received.prefix_hints().len(), MAX_ARTIFACT_PREFIXES);
+        assert!(2 + received.prefix_hints().len() * 128 <= MAX_SOURCE_PREFIX_HINT_BYTES);
+        assert_eq!(
+            received.prefix_spool.as_ref().unwrap().bytes,
+            MAX_ARTIFACT_PREFIXES as u64
+        );
+        let last = *missing.last().unwrap();
+        assert_eq!(received.select_first_chunk(last, 0, &|| false).unwrap(), 0);
+        let expected = received.manifest().files()[usize::from(last)].clone();
+        received
+            .write_chunk(&expected.path, 0, b"ab", Sha256::digest(b"ab").into())
+            .unwrap();
+        assert_eq!(
+            fs::read(received.staging.join(expected.path)).unwrap(),
+            b"ab"
+        );
     }
 
     #[test]

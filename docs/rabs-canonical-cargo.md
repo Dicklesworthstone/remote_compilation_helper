@@ -2574,7 +2574,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v8` and the exact tool build identity must match before
+`canonical-compile-remote-v9` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2813,12 +2813,27 @@ output's parent. Existing outputs are never changed or merged into place.
 After receiving the complete new artifact manifest, the client examines only
 its declared file names in the selected root. A complete regular file with the
 expected length and SHA-256 is copied or reflinked into fresh private staging
-and verified again. Missing, partial, unreadable or mismatching files are
+and verified again. Missing, unreadable or mismatching complete files are
 downloaded normally. Symlinks and external hardlinks cannot supply reusable
 bytes. The new manifest supplies each file's executable mode. Unrelated old
 files are not copied, and no writable inode is shared with the previous result.
 Cancellation or a mutation during an accepted import terminates the receive
 operation; the client does not guess that a partial import succeeded.
+
+For a shorter ordinary file, the client can freeze its current bytes into one
+private anonymous snapshot and offer the file's index, prefix length and SHA-256.
+The offers are bounded to 256 KiB of metadata, and snapshot bytes cannot exceed
+the complete new manifest's artifact-byte budget. An unavailable snapshot or a
+full offer budget leaves that file on the ordinary download path.
+
+The service hashes the same range from its independently captured artifact. A
+match sends only the remaining tail; a mismatch sends that file from offset zero.
+The first actual payload chunk selects one of those two choices, so no extra
+round trip is needed. The client imports a selected prefix from its frozen
+snapshot exactly once before appending the tail. It never advances a receive
+cursor without installing the actual bytes. An unexpected first offset, modified
+snapshot, interrupted import, or final file-hash mismatch refuses publication.
+Changes to the old file after capture cannot alter the frozen prefix.
 
 The client requests only the sorted manifest indexes still needing payloads.
 The service validates that request, retains the existing bounded transfer
@@ -2828,15 +2843,17 @@ new tree and waits for the coordinator's exact commit before atomic installation
 An all-reused result goes through these same checks and acknowledgments.
 Reuse work shares the original delivery deadline; it cannot extend that budget.
 
-With reuse selected, stderr reports `canonical-remote-artifact-reuse` with
-`reused_files`, `reused_bytes`, `transfer_files` and `transfer_bytes` after local
-verification. These count the logical artifact bytes already imported and still
-required by the transfer plan; they exclude framing overhead and do not assert
-completed delivery or a measured build speedup.
+With reuse selected, stderr reports `canonical-remote-artifact-reuse` after the
+complete local tree seal. `reused_files` and `reused_bytes` count complete files
+imported locally. `offered_prefix_files` counts prefix hints, while `resumed_files`
+and `resumed_bytes` count only prefixes the sender selected and the client
+actually imported. `transfer_files` and `transfer_bytes` count received artifact
+payloads. These counts exclude framing overhead and do not assert final commit
+authorization, completed delivery or a measured build speedup.
 The same explicit mechanism accepts a retained `.rabs-target-staging-*` directory
-as hints for a deliberately submitted new operation, reusing its complete files.
-It does not reconnect to a lost operation, suppress a compiler invocation, resume
-partial files, or grant action-cache or Cargo freshness authority. Preserve and
+as hints for a deliberately submitted new operation, reusing complete files and
+matching partial prefixes. It does not reconnect to a lost operation, suppress a
+compiler invocation, or grant action-cache or Cargo freshness authority. Preserve and
 inspect any uncertain prior result before deciding to submit new work.
 
 #### Results, ownership and current limits
@@ -2875,8 +2892,8 @@ authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
 Install matching client and coordinator binaries: paged source and artifact
 manifests, source-file and partial-prefix negotiation, SDK file/prefix and image
-reuse, and artifact missing-file selection use wire version
-`canonical-compile-remote-v8`, while existing client and service JSON
+reuse, and artifact missing-file/prefix selection use wire version
+`canonical-compile-remote-v9`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 
