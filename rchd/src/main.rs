@@ -1991,6 +1991,14 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    // The guardian prevents new orphaned SSH masters, but upgrading from an
+    // older daemon must also drain foreground connections whose owner died.
+    // This background scan never holds up admission or worker health probes.
+    #[cfg(unix)]
+    let ssh_orphan_recovery =
+        (!isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket))
+            .then(rch_common::ssh::start_ssh_orphan_recovery);
+
     // Main accept loop - platform-specific due to SIGHUP handling
     #[cfg(unix)]
     let shutdown_reason = {
@@ -2137,6 +2145,11 @@ async fn async_main() -> Result<()> {
     // after a signal or internal shutdown has committed process exit.
     context.admission_barrier.write().await.begin_shutdown();
     maintenance_recovery_handle.abort();
+    #[cfg(unix)]
+    if let Some(handle) = ssh_orphan_recovery {
+        handle.abort();
+        let _ = handle.await;
+    }
     info!(
         reason = shutdown_reason,
         deadline_secs = 30,

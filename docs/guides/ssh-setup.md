@@ -153,6 +153,23 @@ Host *
 
 This keeps a connection open for reuse (faster `rsync` and probes).
 
+RCH's own connections use private sockets under `~/.ssh/rch/rch-*/master`
+and an owned foreground SSH process. A guardian closes these connections if
+their owner exits unexpectedly. On Linux and macOS, the normal daemon also
+scans this directory at startup and once a minute for foreground RCH masters
+orphaned by older daemons. Isolated worker pools do not run this recovery.
+
+Recovery requires matching socket ownership, kernel peer credentials, process
+birth identity, parent PID 1, and RCH's exact foreground command. It sends
+OpenSSH's stop-listening request over the verified connection, allowing active
+sessions to finish. The log reports `Requested drain of orphaned RCH SSH
+master`; this confirms the drain request, not that every session has exited.
+Each socket probe has a one-second deadline, and scanning continues in batches.
+Unverifiable or deliberately backgrounded connections are left alone, as are
+legacy log files and directory remnants. On macOS, ambiguous command display
+paths (for example, a home directory containing spaces) are conservatively
+excluded from automatic recovery.
+
 ## 6. Troubleshooting
 
 ### Permission denied (publickey)

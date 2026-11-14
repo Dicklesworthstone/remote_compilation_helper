@@ -21,8 +21,10 @@ use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 mod master_guardian;
+mod orphan_recovery;
 pub use master_guardian::run_ssh_master_guardian_if_requested;
 use master_guardian::{SshChild, SshControlDir};
+pub use orphan_recovery::start_ssh_orphan_recovery;
 
 // Re-export platform-independent utilities for backwards compatibility
 pub use crate::ssh_utils::{
