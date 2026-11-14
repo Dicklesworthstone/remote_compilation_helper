@@ -7,6 +7,7 @@
 
 mod client;
 mod source_inputs;
+mod toolchain_inputs;
 mod wire;
 
 pub use client::run_client_profile;
@@ -32,6 +33,7 @@ use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::source_cache::MAX_SOURCE_CACHE_BYTES;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceReceiver};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits};
+use rabs_sandbox::toolchain_file_cache::MAX_TOOLCHAIN_FILE_CACHE_BYTES;
 use rabs_sandbox::toolchain_transfer::{
     TOOLCHAIN_INPUT_BUDGET, TOOLCHAIN_TRANSFER_VERSION, ToolchainReceiver,
 };
@@ -47,6 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use toolchain_inputs::{RemoteToolchainFileCache, ToolchainFileInput};
 use wire::{
     ARTIFACT_PAGE_FILES, ArtifactDeclaration, ArtifactPage, Chunk, Manifest, Message, Output,
     SourceDeclaration, SourcePages, ToolchainDisposition, WIRE_VERSION, Window, Wire, checkpoint,
@@ -109,6 +112,10 @@ struct ServiceProfile {
     toolchain_cache_bytes: u64,
     #[serde(default = "default_toolchain_cache_entries")]
     toolchain_cache_entries: usize,
+    /// Optional completed-file and prefix reuse under one shared peer-scoped
+    /// budget, separate from complete-image retention.
+    #[serde(default)]
+    toolchain_file_cache_bytes: u64,
     /// Restore only private target copies, partitioned by authenticated edge.
     #[serde(default)]
     target_cache: Option<TargetCacheConfig>,
@@ -151,6 +158,10 @@ impl ServiceProfile {
             self.toolchain_cache_bytes <= 64 * 1024 * 1024 * 1024
                 && (1..=32).contains(&self.toolchain_cache_entries),
             "remote toolchain cache must be at most 64 GiB and between 1 and 32 entries",
+        )?;
+        require(
+            self.toolchain_file_cache_bytes <= MAX_TOOLCHAIN_FILE_CACHE_BYTES,
+            "remote toolchain file cache must be at most 64 GiB",
         )?;
         if let Some(cache) = &self.target_cache {
             cache.validate()?;
@@ -211,6 +222,7 @@ impl ServiceProfile {
 /// Reuse budgets belong to the service, not to individual connections or peers.
 struct InputCaches {
     toolchains: RemoteToolchainCache,
+    toolchain_files: Option<RemoteToolchainFileCache>,
     sources: Option<RemoteSourceCache>,
 }
 
@@ -228,8 +240,17 @@ impl InputCaches {
                 config.source_cache_bytes,
             )?)
         };
+        let toolchain_files = if config.toolchain_file_cache_bytes == 0 {
+            None
+        } else {
+            Some(RemoteToolchainFileCache::new(
+                &config.input_root,
+                config.toolchain_file_cache_bytes,
+            )?)
+        };
         Ok(Self {
             toolchains,
+            toolchain_files,
             sources,
         })
     }
@@ -334,6 +355,7 @@ pub fn run_service_profile(
         "queue_timeout_seconds":config.queue_timeout_seconds,
         "source_cache_bytes":config.source_cache_bytes,
         "toolchain_cache_bytes":config.toolchain_cache_bytes,
+        "toolchain_file_cache_bytes":config.toolchain_file_cache_bytes,
         "toolchain_cache_entries":config.toolchain_cache_entries,
         "target_cache":config.target_cache.as_ref().map(|cache| json!({
             "runtime_epoch":cache.runtime_epoch,
@@ -485,6 +507,7 @@ enum ToolchainInput {
     Upload {
         receiver: Box<ToolchainReceiver>,
         owner: Arc<tempfile::TempDir>,
+        files: Option<Box<ToolchainFileInput>>,
     },
     Reuse(Arc<ReceivedToolchain>),
 }
@@ -492,6 +515,7 @@ enum ToolchainInput {
 impl ToolchainInput {
     fn disposition(&self) -> ToolchainDisposition {
         match self {
+            Self::Upload { files: Some(_), .. } => ToolchainDisposition::UploadFiles,
             Self::Upload { .. } => ToolchainDisposition::Upload,
             Self::Reuse(_) => ToolchainDisposition::Reuse,
         }
@@ -503,6 +527,7 @@ impl ToolchainInput {
 /// trees. The original admission deadline also bounds publisher handoff.
 struct ToolchainAdmission<'a> {
     cache: &'a RemoteToolchainCache,
+    file_cache: Option<&'a RemoteToolchainFileCache>,
     edge_pin: [u8; 32],
     identity: ToolchainIdentity,
     input_root: &'a Path,
@@ -543,12 +568,18 @@ impl<'a> ToolchainAdmission<'a> {
                         self.identity,
                         ToolchainLimits::default(),
                     )?;
+                    let files = self
+                        .file_cache
+                        .map(|cache| cache.for_peer(self.edge_pin, self.identity, &cancelled))
+                        .transpose()?
+                        .map(Box::new);
                     checkpoint(stopped, deadline)?;
                     require(healthy(), "remote coordinator stopped before SDK upload")?;
                     return Ok((
                         ToolchainInput::Upload {
                             receiver: Box::new(receiver),
                             owner,
+                            files,
                         },
                         Some(publisher),
                     ));
@@ -635,6 +666,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     .await?;
     let (toolchain, publisher) = ToolchainAdmission {
         cache: &caches.toolchains,
+        file_cache: caches.toolchain_files.as_ref(),
         edge_pin,
         identity,
         input_root: &config.input_root,
@@ -680,7 +712,9 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     let (source, toolchain) =
         receive_inputs(wire, source, toolchain, stopped, input_deadline).await?;
     let toolchain = match disposition {
-        ToolchainDisposition::Upload => caches.toolchains.adopt(edge_pin, toolchain, cancelled)?,
+        ToolchainDisposition::Upload | ToolchainDisposition::UploadFiles => {
+            caches.toolchains.adopt(edge_pin, toolchain, cancelled)?
+        }
         ToolchainDisposition::Reuse => toolchain,
     };
     if let Some(publisher) = publisher {
@@ -896,12 +930,81 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 let (bytes, sha256) = chunk.verified_bytes()?;
                 source.write_chunk(&chunk.path, chunk.offset, &bytes, sha256, cancelled)?;
             }
+            Message::ToolchainFilePage { page } => {
+                require(
+                    !window.pending(),
+                    "SDK file negotiation preceded source window acknowledgment",
+                )?;
+                let ToolchainInput::Upload {
+                    files: Some(files), ..
+                } = &mut toolchain
+                else {
+                    return Err(invalid("SDK file reuse was not admitted"));
+                };
+                if !source_finished {
+                    source.seal(cancelled)?;
+                    source_finished = true;
+                }
+                let plan = files.page(&page, &cancelled)?;
+                wire.send(
+                    &Message::ToolchainFilePlan { plan },
+                    stopped,
+                    input_deadline,
+                )
+                .await?;
+            }
+            Message::ToolchainFilesEnd {} => {
+                require(
+                    source_finished && !window.pending(),
+                    "SDK file inventory ended before its transfer phase",
+                )?;
+                let ToolchainInput::Upload {
+                    files: Some(files), ..
+                } = &mut toolchain
+                else {
+                    return Err(invalid("SDK file reuse was not admitted"));
+                };
+                let (files, bytes) = files.seal_manifest(&cancelled)?;
+                wire.send(
+                    &Message::ToolchainFilesReady { files, bytes },
+                    stopped,
+                    input_deadline,
+                )
+                .await?;
+            }
+            Message::ToolchainFilesDecline {} => {
+                require(
+                    !window.pending(),
+                    "SDK file decline preceded source window acknowledgment",
+                )?;
+                let ToolchainInput::Upload { files, .. } = &mut toolchain else {
+                    return Err(invalid("SDK file reuse was not admitted"));
+                };
+                require(
+                    files.as_ref().is_some_and(|files| files.can_decline()),
+                    "SDK file reuse can be declined only before its first page",
+                )?;
+                if !source_finished {
+                    source.seal(cancelled)?;
+                    source_finished = true;
+                }
+                files.take();
+                wire.send(&Message::ToolchainFilesDeclined {}, stopped, input_deadline)
+                    .await?;
+            }
             Message::ToolchainEntry { entry } => {
-                let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
+                let ToolchainInput::Upload {
+                    receiver, files, ..
+                } = &mut toolchain
+                else {
                     return Err(invalid(
                         "SDK entries are forbidden after toolchain reuse admission",
                     ));
                 };
+                require(
+                    files.is_none(),
+                    "negotiated SDK files require explicit prefix selections",
+                )?;
                 window.record()?;
                 if !source_finished {
                     source.seal(cancelled)?;
@@ -909,8 +1012,27 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 receiver.entry(entry.native())?;
             }
+            Message::ToolchainResumedEntry { entry, resume } => {
+                let ToolchainInput::Upload {
+                    receiver,
+                    files: Some(files),
+                    ..
+                } = &mut toolchain
+                else {
+                    return Err(invalid("SDK prefix selection was not admitted"));
+                };
+                require(
+                    source_finished,
+                    "SDK entries arrived before their file inventory",
+                )?;
+                window.record()?;
+                files.entry(receiver, entry.native(), resume, &cancelled)?;
+            }
             Message::ToolchainChunk { chunk } => {
-                let ToolchainInput::Upload { receiver, .. } = &mut toolchain else {
+                let ToolchainInput::Upload {
+                    receiver, files, ..
+                } = &mut toolchain
+                else {
                     return Err(invalid(
                         "SDK bytes are forbidden after toolchain reuse admission",
                     ));
@@ -918,7 +1040,18 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
                 require(source_finished, "toolchain bytes arrived before its entry")?;
                 window.record()?;
                 let (bytes, sha256) = chunk.verified_bytes()?;
-                receiver.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
+                if let Some(files) = files {
+                    files.write_chunk(
+                        receiver,
+                        &chunk.path,
+                        chunk.offset,
+                        &bytes,
+                        sha256,
+                        &cancelled,
+                    )?;
+                } else {
+                    receiver.write_chunk(&chunk.path, chunk.offset, &bytes, sha256)?;
+                }
             }
             Message::WindowEnd { count } => {
                 window.acknowledge(count)?;
@@ -948,11 +1081,17 @@ async fn receive_inputs<S: AsyncRead + AsyncWrite + Unpin>(
         ToolchainInput::Upload {
             mut receiver,
             owner,
-        } => Arc::new(ReceivedToolchain::new(
-            owner,
-            Arc::new(receiver.seal(cancelled)?),
-            cancelled,
-        )?),
+            mut files,
+        } => {
+            if let Some(files) = &mut files {
+                files.finish(&cancelled)?;
+            }
+            Arc::new(ReceivedToolchain::new(
+                owner,
+                Arc::new(receiver.seal(cancelled)?),
+                cancelled,
+            )?)
+        }
         ToolchainInput::Reuse(lease) => {
             // Recheck the exact owner pinned before Ready. Corruption or
             // cancellation cannot trigger a hidden upload or a different hit.
@@ -1266,6 +1405,7 @@ mod tests {
         assert_eq!(profile.source_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_entries, 4);
+        assert_eq!(profile.toolchain_file_cache_bytes, 0);
         assert!(profile.target_cache.is_none());
         assert_eq!(profile.max_sessions(), 2);
         profile.validate().unwrap();
@@ -1300,6 +1440,13 @@ mod tests {
         for bytes in [64 * 1024 * 1024 * 1024 + 1, u64::MAX] {
             profile.toolchain_cache_bytes = bytes;
             assert!(profile.validate().is_err(), "cache bytes {bytes}");
+        }
+        profile.toolchain_cache_bytes = 0;
+        profile.toolchain_file_cache_bytes = MAX_TOOLCHAIN_FILE_CACHE_BYTES;
+        profile.validate().unwrap();
+        for bytes in [MAX_TOOLCHAIN_FILE_CACHE_BYTES + 1, u64::MAX] {
+            profile.toolchain_file_cache_bytes = bytes;
+            assert!(profile.validate().is_err(), "SDK file cache bytes {bytes}");
         }
     }
 
@@ -1347,15 +1494,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v6_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v6", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v7_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v7", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
             ("canonical-compile-remote-v3", "build-one"),
             ("canonical-compile-remote-v4", "build-one"),
             ("canonical-compile-remote-v5", "build-one"),
-            ("canonical-compile-remote-v6", "build-two"),
+            ("canonical-compile-remote-v6", "build-one"),
+            ("canonical-compile-remote-v7", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
@@ -1645,6 +1793,7 @@ mod tests {
         let (input, _publisher) = ready(
             ToolchainAdmission {
                 cache,
+                file_cache: None,
                 edge_pin,
                 identity,
                 input_root,
@@ -1728,6 +1877,7 @@ mod tests {
             let (input, publisher) = ready(
                 ToolchainAdmission {
                     cache: &cache,
+                    file_cache: None,
                     edge_pin: pin,
                     identity,
                     input_root: inputs.path(),
@@ -1789,6 +1939,7 @@ mod tests {
             let (input, publisher) = ready(
                 ToolchainAdmission {
                     cache: &cache,
+                    file_cache: None,
                     edge_pin: pin,
                     identity,
                     input_root: inputs.path(),
@@ -1840,6 +1991,7 @@ mod tests {
                 ready(
                     ToolchainAdmission {
                         cache: &cache,
+                        file_cache: None,
                         edge_pin: pin,
                         identity,
                         input_root: inputs.path(),
@@ -1896,6 +2048,7 @@ mod tests {
             let error = ready(
                 ToolchainAdmission {
                     cache: &cache,
+                    file_cache: None,
                     edge_pin: pin,
                     identity,
                     input_root: inputs.path(),

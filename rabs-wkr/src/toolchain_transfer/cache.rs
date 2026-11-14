@@ -10,8 +10,10 @@ pub(super) use rabs_sandbox::toolchain_file_cache::{
 #[cfg(not(test))]
 pub use rabs_sandbox::toolchain_file_cache::{MAX_TOOLCHAIN_FILE_CACHE_BYTES, ToolchainFileCache};
 
+#[cfg(all(test, target_os = "linux"))]
+use rabs_sandbox::toolchain_dataset;
 #[cfg(test)]
-use rabs_sandbox::{toolchain_dataset, toolchain_transfer};
+use rabs_sandbox::toolchain_transfer;
 #[cfg(test)]
 #[path = "../../../rabs-sandbox/src/toolchain_file_cache.rs"]
 mod shared;

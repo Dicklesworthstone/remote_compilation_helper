@@ -19,7 +19,9 @@ use rabs_sandbox::source_transfer::{
 use rabs_sandbox::toolchain_dataset::{
     TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits,
 };
-use rabs_sandbox::toolchain_transfer::{ToolchainEntry, ToolchainEntryKind};
+use rabs_sandbox::toolchain_transfer::{
+    MAX_TOOLCHAIN_FILE_PAGE_BYTES, ToolchainEntry, ToolchainEntryKind, ToolchainFile,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::future::{Future, poll_fn};
@@ -30,10 +32,11 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v6 adds bounded source-prefix offers to Ready. The first source chunk's
-/// existing offset selects a verified offer or a complete upload from zero.
-/// Older peers must refuse during Hello before either side admits input bytes.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v6";
+/// v7 adds explicit SDK file/prefix negotiation to UploadFiles. The ordinary
+/// upload and complete-image reuse paths keep their existing framing. Older
+/// peers refuse during Hello before either side admits input bytes.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v7";
+pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
 pub(super) const SOURCE_PAGE_FILES: usize = 64;
@@ -590,6 +593,151 @@ impl Toolchain {
     }
 }
 
+/// A regular SDK member's byte identity. This inventory is only a transfer
+/// hint: the receiver still verifies directories, links and the complete SDK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolchainFileSpec {
+    path: String,
+    bytes: u64,
+    executable: bool,
+    sha256: String,
+}
+
+impl ToolchainFileSpec {
+    fn from_native(file: &ToolchainFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            bytes: file.bytes,
+            executable: file.executable,
+            sha256: encode_hex(&file.sha256),
+        }
+    }
+
+    fn native(&self) -> io::Result<ToolchainFile> {
+        require(
+            !self.path.is_empty()
+                && self.path.len() <= 4096
+                && !self.path.contains(['\\', ':'])
+                && !self.path.chars().any(char::is_control)
+                && self.path.split('/').count() <= 64
+                && self
+                    .path
+                    .split('/')
+                    .all(|part| part.len() <= 255 && !matches!(part, "" | "." | ".."))
+                && self.bytes <= ToolchainLimits::default().max_bytes,
+            "SDK file hints require bounded canonical relative paths and bytes",
+        )?;
+        Ok(ToolchainFile {
+            path: self.path.clone(),
+            bytes: self.bytes,
+            executable: self.executable,
+            sha256: digest(&self.sha256)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolchainFilePage {
+    pub(super) first: u32,
+    pub(super) files: Vec<ToolchainFileSpec>,
+}
+
+impl ToolchainFilePage {
+    pub(super) fn from_native(first: usize, files: &[ToolchainFile]) -> io::Result<Self> {
+        let page = Self {
+            first: u32::try_from(first).map_err(|_| invalid("SDK file index exceeds its bound"))?,
+            files: files.iter().map(ToolchainFileSpec::from_native).collect(),
+        };
+        page.native()?;
+        Ok(page)
+    }
+
+    pub(super) fn native(&self) -> io::Result<Vec<ToolchainFile>> {
+        require(
+            !self.files.is_empty()
+                && self.files.len() <= TOOLCHAIN_PAGE_FILES
+                && u64::from(self.first) + self.files.len() as u64
+                    <= ToolchainLimits::default().max_entries as u64,
+            "SDK file page exceeds its count or index bound",
+        )?;
+        let files = self
+            .files
+            .iter()
+            .map(ToolchainFileSpec::native)
+            .collect::<io::Result<Vec<_>>>()?;
+        require(
+            files.windows(2).all(|pair| pair[0].path < pair[1].path)
+                && serde_json::to_vec(self)?.len() <= MAX_TOOLCHAIN_FILE_PAGE_BYTES,
+            "SDK file page exceeds its metadata bound or canonical order",
+        )?;
+        Ok(files)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolchainPrefixOffer {
+    pub(super) index: u32,
+    pub(super) offset: u64,
+    pub(super) sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolchainFilePlan {
+    pub(super) first: u32,
+    pub(super) missing_files: Vec<u32>,
+    pub(super) prefixes: Vec<ToolchainPrefixOffer>,
+}
+
+impl ToolchainFilePlan {
+    pub(super) fn validate(&self, page: &ToolchainFilePage) -> io::Result<()> {
+        let files = page.native()?;
+        let file = |index: u32| {
+            index
+                .checked_sub(page.first)
+                .and_then(|index| files.get(index as usize))
+        };
+        require(
+            self.first == page.first
+                && self.missing_files.len() <= files.len()
+                && self.missing_files.windows(2).all(|pair| pair[0] < pair[1])
+                && self
+                    .missing_files
+                    .iter()
+                    .all(|index| file(*index).is_some_and(|file| file.bytes != 0)),
+            "SDK missing-file plan must be an ordered subset of this exact page",
+        )?;
+        require(
+            self.prefixes.len() <= self.missing_files.len()
+                && self
+                    .prefixes
+                    .windows(2)
+                    .all(|pair| pair[0].index < pair[1].index),
+            "SDK prefix plan must be an ordered subset of missing files",
+        )?;
+        for prefix in &self.prefixes {
+            require(
+                self.missing_files.binary_search(&prefix.index).is_ok()
+                    && file(prefix.index)
+                        .is_some_and(|file| prefix.offset != 0 && prefix.offset < file.bytes),
+                "SDK prefix must select an incomplete member of this exact page",
+            )?;
+            digest(&prefix.sha256)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolchainResume {
+    pub(super) offset: u64,
+    pub(super) sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CargoHome {
@@ -691,6 +839,7 @@ pub(super) struct Output {
 #[serde(rename_all = "kebab-case")]
 pub(super) enum ToolchainDisposition {
     Upload,
+    UploadFiles,
     Reuse,
 }
 
@@ -724,6 +873,23 @@ pub(super) enum Message {
     },
     ToolchainEntry {
         entry: Entry,
+    },
+    ToolchainFilePage {
+        page: ToolchainFilePage,
+    },
+    ToolchainFilePlan {
+        plan: ToolchainFilePlan,
+    },
+    ToolchainFilesEnd {},
+    ToolchainFilesReady {
+        files: u64,
+        bytes: u64,
+    },
+    ToolchainFilesDecline {},
+    ToolchainFilesDeclined {},
+    ToolchainResumedEntry {
+        entry: Entry,
+        resume: Option<ToolchainResume>,
     },
     ToolchainChunk {
         chunk: Chunk,
@@ -1477,6 +1643,18 @@ mod tests {
             (Message::Queued {}, r#"{"kind":"queued"}"#),
             (Message::InputsDone {}, r#"{"kind":"inputs-done"}"#),
             (Message::Accepted {}, r#"{"kind":"accepted"}"#),
+            (
+                Message::ToolchainFilesEnd {},
+                r#"{"kind":"toolchain-files-end"}"#,
+            ),
+            (
+                Message::ToolchainFilesDecline {},
+                r#"{"kind":"toolchain-files-decline"}"#,
+            ),
+            (
+                Message::ToolchainFilesDeclined {},
+                r#"{"kind":"toolchain-files-declined"}"#,
+            ),
             (Message::Poll {}, r#"{"kind":"poll"}"#),
             (Message::ReceiveTarget {}, r#"{"kind":"receive-target"}"#),
             (
@@ -1501,6 +1679,7 @@ mod tests {
         let plan = SourcePlan::all(&manifest).unwrap();
         for (spelling, expected) in [
             ("upload", ToolchainDisposition::Upload),
+            ("upload-files", ToolchainDisposition::UploadFiles),
             ("reuse", ToolchainDisposition::Reuse),
         ] {
             let bytes = serde_json::to_vec(&json!({
@@ -1520,6 +1699,132 @@ mod tests {
                 json!({"kind": "ready", "toolchain": spelling, "source": plan})
             );
         }
+    }
+
+    #[test]
+    fn sdk_file_pages_preserve_native_identities_and_reject_unbounded_names() {
+        let files = vec![
+            ToolchainFile {
+                path: "bin/rustc".into(),
+                bytes: 9,
+                executable: true,
+                sha256: Sha256::digest(b"compiler!").into(),
+            },
+            ToolchainFile {
+                path: "lib/empty".into(),
+                bytes: 0,
+                executable: false,
+                sha256: Sha256::digest([]).into(),
+            },
+        ];
+        let page = ToolchainFilePage::from_native(7, &files).unwrap();
+        assert_eq!(page.native().unwrap(), files);
+        let message = Message::ToolchainFilePage { page: page.clone() };
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let Message::ToolchainFilePage { page: decoded } =
+            serde_json::from_slice(&encoded).unwrap()
+        else {
+            panic!("SDK page roundtrip changed its phase")
+        };
+        assert_eq!(decoded.first, 7);
+        assert_eq!(decoded.native().unwrap(), files);
+        for path in [
+            "",
+            "../rustc",
+            "bin//rustc",
+            "/bin/rustc",
+            "bin/./rustc",
+            "C:/rustc",
+            "bin\\rustc",
+            "bin/rustc\n",
+        ] {
+            let mut changed = files.clone();
+            changed[0].path = path.into();
+            assert!(
+                ToolchainFilePage::from_native(0, &changed).is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(ToolchainFilePage::from_native(0, &[]).is_err());
+        assert!(ToolchainFilePage::from_native(u32::MAX as usize, &files).is_err());
+        let mut reversed = files.clone();
+        reversed.reverse();
+        assert!(ToolchainFilePage::from_native(0, &reversed).is_err());
+        let mut forged = serde_json::to_value(message).unwrap();
+        forged["page"]["files"][0]["sha256"] = json!("FF".repeat(32));
+        let Message::ToolchainFilePage { page: forged } = serde_json::from_value(forged).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(forged.native().is_err());
+    }
+
+    #[test]
+    fn sdk_file_plan_binds_its_page_and_exact_incomplete_ranges() {
+        let files = vec![
+            ToolchainFile {
+                path: "a".into(),
+                bytes: 10,
+                executable: false,
+                sha256: Sha256::digest(b"0123456789").into(),
+            },
+            ToolchainFile {
+                path: "b".into(),
+                bytes: 0,
+                executable: false,
+                sha256: Sha256::digest([]).into(),
+            },
+            ToolchainFile {
+                path: "c".into(),
+                bytes: 7,
+                executable: true,
+                sha256: Sha256::digest(b"compile").into(),
+            },
+        ];
+        let page = ToolchainFilePage::from_native(10, &files).unwrap();
+        let plan = ToolchainFilePlan {
+            first: 10,
+            missing_files: vec![10, 12],
+            prefixes: vec![ToolchainPrefixOffer {
+                index: 12,
+                offset: 3,
+                sha256: encode_hex(&Sha256::digest(b"com")),
+            }],
+        };
+        plan.validate(&page).unwrap();
+        ToolchainFilePlan {
+            first: 10,
+            missing_files: vec![],
+            prefixes: vec![],
+        }
+        .validate(&page)
+        .unwrap();
+        for missing in [
+            vec![9],
+            vec![13],
+            vec![11],
+            vec![12, 10],
+            vec![10, 10],
+            vec![10],
+        ] {
+            let mut changed = plan.clone();
+            changed.missing_files = missing;
+            assert!(changed.validate(&page).is_err());
+        }
+        for offset in [0, 7, u64::MAX] {
+            let mut changed = plan.clone();
+            changed.prefixes[0].offset = offset;
+            assert!(changed.validate(&page).is_err());
+        }
+        let mut changed = plan.clone();
+        changed.first = 0;
+        assert!(changed.validate(&page).is_err());
+        let mut changed = plan.clone();
+        changed.prefixes.push(changed.prefixes[0].clone());
+        assert!(changed.validate(&page).is_err());
+        let mut changed = plan;
+        changed.prefixes[0].sha256 = "00".repeat(31);
+        assert!(changed.validate(&page).is_err());
     }
 
     #[test]

@@ -5,8 +5,9 @@ use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
     ADMISSION_BUDGET, ADMISSION_POLL, ArtifactDeclaration, ArtifactPages, CargoHome, Chunk, Entry,
     IO_BUDGET, Message, Output, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan,
-    SourcePrefixOffer, Toolchain, ToolchainDisposition, VERSION, WIRE_VERSION, Window, Wire,
-    checkpoint, controlled_future, decode_hex, digest, invalid, require,
+    SourcePrefixOffer, TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition, ToolchainFilePage,
+    ToolchainPrefixOffer, ToolchainResume, VERSION, WIRE_VERSION, Window, Wire, checkpoint,
+    controlled_future, decode_hex, digest, invalid, require,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -28,10 +29,15 @@ use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::source_transfer::{
     ArtifactManifest, MAX_SOURCE_CHUNK, SourceCheckpointError, SourceManifest,
 };
-use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_INPUT_BUDGET, ToolchainEntryKind};
+use rabs_sandbox::toolchain_dataset::PreparedToolchain;
+use rabs_sandbox::toolchain_transfer::{
+    MAX_TOOLCHAIN_FILE_PAGE_BYTES, MAX_TOOLCHAIN_METADATA_BYTES, TOOLCHAIN_INPUT_BUDGET,
+    ToolchainEntryKind, ToolchainFile,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -439,6 +445,183 @@ fn source_prefix_offset(
     Ok(offset)
 }
 
+fn empty_toolchain_resume() -> ToolchainResume {
+    ToolchainResume {
+        offset: 0,
+        sha256: encode_hex(&Sha256::digest([])),
+    }
+}
+
+/// A prefix is only a hint until the independently captured SDK agrees. A
+/// mismatch sends the complete file; failed reads, mutation and cancellation
+/// cannot silently select an ordinary upload from a different generation.
+fn toolchain_prefix_resume(
+    toolchain: &PreparedToolchain,
+    file: &ToolchainFile,
+    offered: &ToolchainPrefixOffer,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<ToolchainResume> {
+    checkpoint(stopped, deadline)?;
+    require(
+        offered.offset != 0 && offered.offset < file.bytes,
+        "remote toolchain prefix is outside its declared file",
+    )?;
+    let expected = digest(&offered.sha256)?;
+    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
+    let mut offset = 0;
+    let mut hash = Sha256::new();
+    while offset < offered.offset {
+        checkpoint(stopped, deadline)?;
+        let maximum = (offered.offset - offset).min(MAX_SOURCE_CHUNK as u64) as usize;
+        let bytes = toolchain.read_chunk(&file.path, offset, maximum, cancelled)?;
+        require(
+            !bytes.is_empty() && bytes.len() <= maximum,
+            "captured toolchain prefix ended early or exceeded its range",
+        )?;
+        hash.update(&bytes);
+        offset += bytes.len() as u64;
+    }
+    checkpoint(stopped, deadline)?;
+    if <[u8; 32]>::from(hash.finalize()) == expected {
+        Ok(ToolchainResume {
+            offset,
+            sha256: offered.sha256.clone(),
+        })
+    } else {
+        Ok(empty_toolchain_resume())
+    }
+}
+
+/// File identities cost more metadata than the ordinary namespace inventory.
+/// Exceeding this optional bound preserves the existing cold transfer route.
+fn toolchain_file_manifest_fits(files: &[ToolchainFile]) -> bool {
+    files
+        .iter()
+        .try_fold(0_usize, |total, file| {
+            file.path
+                .len()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(256))
+                .and_then(|bytes| total.checked_add(bytes))
+                .filter(|total| *total <= MAX_TOOLCHAIN_METADATA_BYTES)
+        })
+        .is_some()
+}
+
+fn toolchain_file_page_end(files: &[ToolchainFile], first: usize) -> io::Result<usize> {
+    let mut next = first;
+    let mut bytes = 128_usize;
+    while next < files.len() && next - first < TOOLCHAIN_PAGE_FILES {
+        let charged = files[next]
+            .path
+            .len()
+            .checked_mul(2)
+            .and_then(|length| length.checked_add(256))
+            .and_then(|length| bytes.checked_add(length))
+            .ok_or_else(|| invalid("toolchain file page metadata overflow"))?;
+        if charged > MAX_TOOLCHAIN_FILE_PAGE_BYTES {
+            break;
+        }
+        bytes = charged;
+        next += 1;
+    }
+    require(next > first, "toolchain file cannot fit its bounded page")?;
+    Ok(next)
+}
+
+/// Negotiate only transfer offsets, never a new SDK identity. Complete file
+/// hits and independently checked prefixes still require every namespace
+/// entry and the receiver's final complete-dataset seal.
+async fn negotiate_toolchain_files<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    toolchain: &PreparedToolchain,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<Option<BTreeMap<String, ToolchainResume>>> {
+    checkpoint(stopped, deadline)?;
+    let cancelled = || stopped.load(Ordering::Acquire) || Instant::now() >= deadline;
+    toolchain.verify_retained_generation(cancelled)?;
+    let files = toolchain.files()?;
+    let identity = toolchain.identity();
+    let bytes = files.iter().try_fold(0_u64, |bytes, file| {
+        bytes
+            .checked_add(file.bytes)
+            .ok_or_else(|| invalid("toolchain file byte total overflow"))
+    })?;
+    require(
+        files.len() as u64 == identity.files && bytes == identity.bytes,
+        "toolchain file manifest differs from its retained dataset",
+    )?;
+    checkpoint(stopped, deadline)?;
+    if !toolchain_file_manifest_fits(&files) {
+        wire.send(&Message::ToolchainFilesDecline {}, stopped, deadline)
+            .await?;
+        require(
+            matches!(
+                wire.receive_until(stopped, deadline).await?,
+                Message::ToolchainFilesDeclined {}
+            ),
+            "coordinator did not acknowledge ordinary toolchain upload",
+        )?;
+        return Ok(None);
+    }
+    let mut resumes = BTreeMap::new();
+    let mut first = 0;
+    while first < files.len() {
+        checkpoint(stopped, deadline)?;
+        let next = toolchain_file_page_end(&files, first)?;
+        let message = Message::ToolchainFilePage {
+            page: ToolchainFilePage::from_native(first, &files[first..next])?,
+        };
+        wire.send(&message, stopped, deadline).await?;
+        let Message::ToolchainFilePlan { plan } = wire.receive_until(stopped, deadline).await?
+        else {
+            return Err(invalid("expected a toolchain file transfer plan"));
+        };
+        let Message::ToolchainFilePage { page } = &message else {
+            unreachable!("the sender retains its exact manifest page")
+        };
+        plan.validate(page)?;
+        let missing: BTreeSet<u32> = plan.missing_files.iter().copied().collect();
+        for (position, file) in files[first..next].iter().enumerate() {
+            checkpoint(stopped, deadline)?;
+            let index = (first + position) as u32;
+            let resume = if missing.contains(&index) {
+                match plan.prefixes.iter().find(|prefix| prefix.index == index) {
+                    Some(prefix) => {
+                        toolchain_prefix_resume(toolchain, file, prefix, stopped, deadline)?
+                    }
+                    None => empty_toolchain_resume(),
+                }
+            } else {
+                ToolchainResume {
+                    offset: file.bytes,
+                    sha256: encode_hex(&file.sha256),
+                }
+            };
+            require(
+                resumes.insert(file.path.clone(), resume).is_none(),
+                "toolchain file manifest repeats a retained path",
+            )?;
+        }
+        first = next;
+    }
+    wire.send(&Message::ToolchainFilesEnd {}, stopped, deadline)
+        .await?;
+    let Message::ToolchainFilesReady { files, bytes } =
+        wire.receive_until(stopped, deadline).await?
+    else {
+        return Err(invalid("coordinator did not seal the toolchain file plan"));
+    };
+    require(
+        files == identity.files && bytes == identity.bytes,
+        "coordinator accepted different toolchain file totals",
+    )?;
+    checkpoint(stopped, deadline)?;
+    Ok(Some(resumes))
+}
+
 async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     bundle: &mut PreparedLocalBundle,
@@ -507,25 +690,40 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
         .toolchain
         .as_ref()
         .ok_or_else(|| invalid("captured compiler owner disappeared"))?;
-    if toolchain_disposition == ToolchainDisposition::Upload {
+    let mut resumes = if toolchain_disposition == ToolchainDisposition::UploadFiles {
+        // File-plan replies must not overtake an outstanding source-window
+        // acknowledgment. The cumulative window continues through SDK payloads.
+        flush_window(wire, &mut window, stopped, deadline).await?;
+        negotiate_toolchain_files(wire, toolchain, stopped, deadline).await?
+    } else {
+        None
+    };
+    if toolchain_disposition != ToolchainDisposition::Reuse {
         for entry in toolchain.entries()? {
             checkpoint(stopped, deadline)?;
             let file = match &entry.kind {
                 ToolchainEntryKind::File { bytes, .. } => Some((entry.path.clone(), *bytes)),
                 _ => None,
             };
-            upload_message(
-                wire,
-                &mut window,
-                Message::ToolchainEntry {
-                    entry: Entry::from_native(entry),
-                },
-                stopped,
-                deadline,
-            )
-            .await?;
+            let resume = match (&mut resumes, &file) {
+                (Some(resumes), Some((path, _))) => Some(
+                    resumes
+                        .remove(path)
+                        .ok_or_else(|| invalid("toolchain entry was not in its file plan"))?,
+                ),
+                _ => None,
+            };
+            let offset = resume.as_ref().map_or(0, |resume| resume.offset);
+            let entry = Entry::from_native(entry);
+            let message = if resumes.is_some() {
+                Message::ToolchainResumedEntry { entry, resume }
+            } else {
+                Message::ToolchainEntry { entry }
+            };
+            upload_message(wire, &mut window, message, stopped, deadline).await?;
             if let Some((path, length)) = file {
-                let mut offset = 0;
+                require(offset <= length, "toolchain resume exceeds its file")?;
+                let mut offset = offset;
                 while offset < length {
                     checkpoint(stopped, deadline)?;
                     let bytes = toolchain.read_chunk(&path, offset, MAX_SOURCE_CHUNK, cancelled)?;
@@ -548,6 +746,10 @@ async fn upload_inputs<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+    require(
+        resumes.as_ref().is_none_or(BTreeMap::is_empty),
+        "toolchain file plan contains undeclared namespace entries",
+    )?;
     flush_window(wire, &mut window, stopped, deadline).await?;
     // A server cache hit does not waive custody of the SDK that this client
     // captured and declared. Mutation still refuses InputsDone and execution.
@@ -787,6 +989,7 @@ mod prefix_tests;
 #[cfg(test)]
 mod tests {
     mod source_prefix_upload;
+    mod toolchain_file_upload;
 
     use super::super::ToolchainInput;
     use super::super::source_inputs::SourceInput;
@@ -2424,6 +2627,7 @@ mod tests {
                         ToolchainInput::Upload {
                             receiver: Box::new(toolchain),
                             owner: sdk_destination,
+                            files: None,
                         },
                         &stopped,
                         deadline,
@@ -2564,6 +2768,7 @@ mod tests {
                             ToolchainInput::Upload {
                                 receiver: Box::new(toolchain),
                                 owner: sdk_destination,
+                                files: None,
                             },
                             &stopped,
                             deadline,

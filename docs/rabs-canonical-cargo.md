@@ -2417,6 +2417,7 @@ Save the complete service profile as `remote-service.json`:
   "source_cache_bytes": 536870912,
   "toolchain_cache_bytes": 8589934592,
   "toolchain_cache_entries": 4,
+  "toolchain_file_cache_bytes": 8589934592,
   "target_cache": {
     "runtime_epoch": "builder-image-2026.10",
     "max_bytes": 1073741824,
@@ -2502,6 +2503,44 @@ client still captures and validates its local SDK on each invocation. Reuse
 removes repeated SDK network transfer and reconstruction; it does not eliminate
 local capture or verification, and no end-to-end speedup is claimed here.
 
+`toolchain_file_cache_bytes` independently enables completed-file and partial-file
+SDK reuse. It defaults to 0 (disabled) and accepts at most 64 GiB. The example
+retains up to 8 GiB of SDK byte objects in addition to its complete-image cache.
+All authenticated clients share that one byte budget, object-count limit and
+nonblocking writer lock. Content names are partitioned by the TLS client key;
+one client cannot discover or reuse another client's retained file or prefix.
+These byte objects carry no SDK identity or execution authority. Like the
+complete-image cache, this optional storage lasts for the service process.
+
+Complete-image reuse takes precedence. On a cold SDK upload with file caching
+enabled, Ready selects `upload-files`. After the source window is acknowledged,
+the client declares regular SDK members in ordered pages of at most 64 files
+and 256 KiB. The service returns complete-file hits and bounded prefix offers
+from private snapshots. The client independently hashes each offered prefix
+from its retained SDK before choosing that offset; a mismatched prefix selects
+zero. Every directory, symlink and regular-file entry still travels, with an
+explicit file cursor, and the usual four-frame window carries missing bytes.
+The service verifies each imported range and seals the complete reconstructed
+SDK against the original dataset identity before admitting execution.
+
+An interrupted upload can therefore leave completed files and a bounded current
+prefix for a later request by the same authenticated client. Changed SDK images
+can reuse unchanged member bytes while still proving their own complete image.
+No network or Cargo operation is automatically retried. This is input-byte
+recovery before execution acceptance; it does not make an accepted operation
+resumable. The original fixed 35-minute input budget includes negotiation,
+snapshot import, network transfer and final verification, with cancellation
+checks between bounded copies.
+
+Cache contention, missing objects or optional checkpoint storage failures leave
+ordinary upload available. Once a range has been selected, a corrupt snapshot,
+unknown cursor, altered entry or invalid source cannot silently become a miss.
+A valid SDK whose extra file inventory would exceed the existing 64 MiB metadata
+limit explicitly declines optional file negotiation before its first page and
+uses the ordinary upload path. The final SDK limits and seal are unchanged.
+Temporary hit snapshots remain bounded by the smaller of the SDK size and cache
+capacity, separately from retained bytes and each operation's fresh input tree.
+
 The optional `source_cache_bytes` setting retains verified source-file bytes for
 later requests. It defaults to 0 (disabled), accepts at most 8 GiB, and uses one
 aggregate budget of at most 4096 objects across all enrolled clients. The example
@@ -2535,7 +2574,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v6` and the exact tool build identity must match before
+`canonical-compile-remote-v7` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2781,8 +2820,8 @@ and joins operations and shared executions before releasing coordinator
 authority. The service verifies the same installed build identity as the client
 and cannot downgrade a client's required release-authorization policy.
 Install matching client and coordinator binaries: paged source and artifact
-manifests, source-file and partial-prefix negotiation, and SDK upload/reuse
-selection use wire version `canonical-compile-remote-v6`, while existing client and service JSON
+manifests, source-file and partial-prefix negotiation, and SDK file/prefix and image reuse
+selection use wire version `canonical-compile-remote-v7`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 

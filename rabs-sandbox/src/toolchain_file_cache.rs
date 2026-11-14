@@ -953,7 +953,7 @@ impl Snapshots {
         Ok(file)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn corrupt_owned_snapshot_for_test(&mut self) {
         assert!(self.bytes > 0 && self.frozen.is_some());
         self.spool.rewind().unwrap();
