@@ -39,6 +39,18 @@ pub enum CompilationCommand {
     Bench,
 }
 
+/// Standard input for the current Cargo invocation and its executed targets.
+///
+/// `Closed` supplies EOF. `Inherit` preserves the caller's nonterminal input;
+/// services that do not forward stdin must refuse it. This is an execution
+/// policy, not captured input bytes or authority to cache a program's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompilationStdin {
+    Closed,
+    Inherit,
+}
+
 impl CompilationCommand {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -50,6 +62,25 @@ impl CompilationCommand {
             Self::Doc => "doc",
             Self::Run => "run",
             Self::Bench => "bench",
+        }
+    }
+
+    /// Resolve an optional input policy without changing an existing command's
+    /// behavior. Only `run` and executing `bench` inherit input by default.
+    /// Other commands and `bench --no-run` keep their closed input boundary.
+    pub fn stdin_policy(
+        self,
+        no_run: bool,
+        requested: Option<CompilationStdin>,
+    ) -> io::Result<CompilationStdin> {
+        let executes_with_input = self == Self::Run || (self == Self::Bench && !no_run);
+        match requested {
+            Some(CompilationStdin::Inherit) if !executes_with_input => Err(invalid(
+                "inherited stdin is supported only for run or executing bench",
+            )),
+            Some(policy) => Ok(policy),
+            None if executes_with_input => Ok(CompilationStdin::Inherit),
+            None => Ok(CompilationStdin::Closed),
         }
     }
 }
@@ -407,6 +438,59 @@ impl CompilationSelection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stdin_policy_preserves_command_defaults_and_allows_explicit_eof() {
+        for (command, no_run, default) in [
+            (CompilationCommand::Run, false, CompilationStdin::Inherit),
+            (CompilationCommand::Bench, false, CompilationStdin::Inherit),
+            (CompilationCommand::Bench, true, CompilationStdin::Closed),
+            (CompilationCommand::Test, false, CompilationStdin::Closed),
+            (CompilationCommand::Test, true, CompilationStdin::Closed),
+            (CompilationCommand::Check, false, CompilationStdin::Closed),
+            (CompilationCommand::Build, false, CompilationStdin::Closed),
+            (CompilationCommand::Clippy, false, CompilationStdin::Closed),
+            (CompilationCommand::Doc, false, CompilationStdin::Closed),
+        ] {
+            assert_eq!(command.stdin_policy(no_run, None).unwrap(), default);
+            assert_eq!(
+                command
+                    .stdin_policy(no_run, Some(CompilationStdin::Closed))
+                    .unwrap(),
+                CompilationStdin::Closed,
+            );
+            assert_eq!(
+                command
+                    .stdin_policy(no_run, Some(CompilationStdin::Inherit))
+                    .is_ok(),
+                default == CompilationStdin::Inherit,
+                "{command:?}, no_run={no_run}",
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_policy_wire_values_are_typed_and_reject_unsupported_inputs() {
+        for (name, policy) in [
+            ("closed", CompilationStdin::Closed),
+            ("inherit", CompilationStdin::Inherit),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<CompilationStdin>(json!(name)).unwrap(),
+                policy
+            );
+            assert_eq!(serde_json::to_value(policy).unwrap(), json!(name));
+        }
+        for value in [
+            json!("pipe"),
+            json!("/dev/null"),
+            json!("Closed"),
+            json!(true),
+            json!({}),
+        ] {
+            assert!(serde_json::from_value::<CompilationStdin>(value).is_err());
+        }
+    }
 
     #[test]
     fn empty_selection_preserves_cargos_default_member_and_target_selection() {

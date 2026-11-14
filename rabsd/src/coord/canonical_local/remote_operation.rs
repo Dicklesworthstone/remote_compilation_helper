@@ -7,9 +7,10 @@
 use super::remote_toolchains::ReceivedToolchain;
 use super::target_state::TargetCacheConfig;
 use super::{
-    CompilationCommand, CompilationSelection, OperationOutput, OperationProvenance, Profile,
-    SharedRuntime, SourceSelection, default_jobs, default_manifest, default_timeout, invalid,
-    overlap, private_directory, project_environment, require, run_operation,
+    CompilationCommand, CompilationSelection, CompilationStdin, OperationOutput,
+    OperationProvenance, Profile, SharedRuntime, SourceSelection, default_jobs, default_manifest,
+    default_timeout, invalid, overlap, private_directory, project_environment, require,
+    run_operation,
 };
 use crate::coord::{source_manifest, worker_delivery};
 use rabs_protocol::authority::CoordinatorAuthority;
@@ -37,6 +38,10 @@ fn complete_selection(selection: &SourceSelection) -> bool {
 pub(super) struct RemoteOperationSettings {
     #[serde(default)]
     pub(super) command: CompilationCommand,
+    /// Retained with the accepted operation for reconnect. This declares EOF
+    /// or inherited input; it does not describe or authenticate input bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) stdin: Option<CompilationStdin>,
     #[serde(default = "default_manifest")]
     pub(super) manifest: String,
     pub(super) vendor: Option<String>,
@@ -72,8 +77,8 @@ impl RemoteOperationSettings {
         let profile = self.profile();
         profile.validate_logical()?;
         require(
-            !profile.inherits_stdin(),
-            "remote canonical service does not accept commands with inherited stdin",
+            !profile.inherits_stdin()?,
+            "remote canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
         )?;
         require(
             serde_json::to_vec(self)?.len() <= 64 * 1024,
@@ -91,6 +96,7 @@ impl RemoteOperationSettings {
             wrapper: PathBuf::new(),
             service_socket: None,
             command: self.command,
+            stdin: self.stdin,
             manifest: self.manifest.clone(),
             vendor: self.vendor.clone(),
             cargo_home_source: None,
@@ -419,6 +425,7 @@ mod tests {
         selected.validate().unwrap();
         let encoded = serde_json::to_value(&selected).unwrap();
         assert!(encoded.get("source_selection").is_none());
+        assert!(encoded.get("stdin").is_none());
         assert!(encoded.get("source_root").is_none());
         settings(encoded).validate().unwrap();
         let request = selected
@@ -462,6 +469,10 @@ mod tests {
             json!({"vendor":"/host/vendor"}),
             json!({"command":"run"}),
             json!({"command":"bench"}),
+            json!({"command":"run", "stdin":"inherit"}),
+            json!({"command":"bench", "stdin":"inherit"}),
+            json!({"command":"check", "stdin":"inherit"}),
+            json!({"command":"bench", "stdin":"inherit", "selection":{"no_run":true}}),
             json!({"jobs":0}),
             json!({"timeout_seconds":7201}),
             json!({"env":{"RABS_DEPENDENCY_WORKERS_JSON":"[]"}}),
@@ -479,6 +490,53 @@ mod tests {
         settings(json!({"command":"bench", "selection":{"no_run":true}}))
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn remote_settings_admit_explicit_eof_run_and_bench_and_retain_the_policy() {
+        for (command, selection) in [
+            ("run", json!({"bin":["app"], "run_args":["--literal", ""]})),
+            (
+                "bench",
+                json!({"bench":["timing"], "test_args":["--literal", ""]}),
+            ),
+        ] {
+            let selected = settings(json!({
+                "command":command, "stdin":"closed", "selection":selection,
+                "env":{"CURRENT_INPUT":"value"}, "jobs":2, "timeout_seconds":90,
+            }));
+            selected.validate().unwrap();
+            let encoded = serde_json::to_value(&selected).unwrap();
+            assert_eq!(encoded["stdin"], "closed");
+            let restored = settings(encoded.clone());
+            restored.validate().unwrap();
+            assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+            assert_eq!(restored.profile().stdin, Some(CompilationStdin::Closed));
+            assert!(!restored.profile().inherits_stdin().unwrap());
+            restored.profile().validate_stdin(true).unwrap();
+            let request = restored
+                .source_specification(Path::new("/client/toolchain"), None)
+                .unwrap();
+            assert_eq!(request["args"][0], command);
+            assert_eq!(request["command_context"]["env"]["CURRENT_INPUT"], "value");
+            assert!(request.get("stdin").is_none());
+            // Replacing the retained policy cannot turn inherited input into
+            // EOF silently: the same service admission guard refuses it.
+            let mut inherited = encoded.clone();
+            inherited["stdin"] = json!("inherit");
+            assert!(settings(inherited).validate().is_err());
+            let mut omitted = encoded;
+            omitted.as_object_mut().unwrap().remove("stdin");
+            assert!(settings(omitted).validate().is_err());
+        }
+        for stdin in [json!("pipe"), json!(true), json!({"path":"/dev/null"})] {
+            assert!(
+                serde_json::from_value::<RemoteOperationSettings>(
+                    json!({"command":"run", "stdin":stdin})
+                )
+                .is_err()
+            );
+        }
     }
 
     fn fixture() -> RemoteOperationInputs {

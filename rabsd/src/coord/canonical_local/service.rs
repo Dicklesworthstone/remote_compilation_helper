@@ -175,8 +175,8 @@ fn validate_profile_route(profile: &Profile, socket: &Path) -> io::Result<()> {
         )?;
     }
     require(
-        !profile.inherits_stdin(),
-        "shared canonical service does not forward inherited stdin; use a standalone profile for run or executing bench",
+        !profile.inherits_stdin()?,
+        "shared canonical service does not forward inherited stdin; select stdin: closed for EOF or use a standalone profile",
     )
 }
 
@@ -977,6 +977,29 @@ pub fn run_client_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_service_run_and_bench_require_explicit_closed_stdin() {
+        let owner = crate::test_util::private_tempdir();
+        let socket = owner.path().join("service.sock");
+        for command in ["run", "bench"] {
+            let mut value = json!({
+                "version":super::super::PROFILE_VERSION, "command":command,
+                "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":owner.path(), "operation_root":"/operations",
+                "wrapper":"/bin/rabs-wrap", "service_socket":socket,
+            });
+            let profile: Profile = serde_json::from_value(value.clone()).unwrap();
+            assert!(validate_profile_route(&profile, &socket).is_err());
+            value["stdin"] = json!("inherit");
+            let profile: Profile = serde_json::from_value(value.clone()).unwrap();
+            assert!(validate_profile_route(&profile, &socket).is_err());
+            value["stdin"] = json!("closed");
+            let profile: Profile = serde_json::from_value(value).unwrap();
+            profile.validate_logical().unwrap();
+            validate_profile_route(&profile, &socket).unwrap();
+        }
+    }
 
     struct LiveFixture {
         operation: OperationOwner,

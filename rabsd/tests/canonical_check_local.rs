@@ -530,19 +530,26 @@ fn cli_refuses_executing_run_and_bench_terminal_input_before_touching_profile_ro
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let terminal = openpt(flags).unwrap();
     unlockpt(&terminal).unwrap();
-    for (number, command, selection, refused) in [
-        (0, "run", json!({"run_args":["--no-run"]}), true),
-        (1, "bench", json!({"test_args":["--no-run"]}), true),
-        (2, "bench", json!({"no_run":true}), false),
+    for (number, command, selection, stdin_policy, refused) in [
+        (0, "run", json!({"run_args":["--no-run"]}), None, true),
+        (1, "bench", json!({"test_args":["--no-run"]}), None, true),
+        (2, "bench", json!({"no_run":true}), None, false),
+        (3, "run", json!({}), Some("closed"), false),
+        (4, "bench", json!({}), Some("closed"), false),
+        (5, "run", json!({}), Some("inherit"), true),
+        (6, "bench", json!({}), Some("inherit"), true),
     ] {
         // None of these paths exists. A terminal refusal must happen before
         // source validation/capture, namespace probes, or operation allocation.
-        let profile = json!({"version":"canonical-compile-local-v1", "command":command,
+        let mut profile = json!({"version":"canonical-compile-local-v1", "command":command,
             "source_root":root.path().join("missing-source"),
             "toolchain_root":root.path().join("missing-toolchain"),
             "state_root":root.path().join("missing-state"),
             "operation_root":root.path().join("missing-operations"),
             "wrapper":root.path().join("missing-wrapper"), "selection":selection});
+        if let Some(stdin_policy) = stdin_policy {
+            profile["stdin"] = json!(stdin_policy);
+        }
         let stdin = fs::File::from(ioctl_tiocgptpeer(&terminal, flags).unwrap());
         assert!(stdin.is_terminal(), "the fixture must use an actual PTY");
         let (code, events, output) =
@@ -4112,6 +4119,121 @@ pub fn answer() -> u32 { canonical_dep::answer() }
             .is_none(),
         "documentation tests must not retain operation owners or deliver test outcomes"
     );
+}
+
+#[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes EOF-only run and custom bench standalone and through the persistent service"]
+fn canonical_closed_stdin_run_and_bench_execute_current_bodies_locally_and_in_service() {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("source-a");
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    write(
+        &source,
+        "Cargo.toml",
+        format!("{manifest}\n[[bench]]\nname='eof'\npath='benches/eof.rs'\nharness=false\n"),
+    );
+    let body = r#"use std::io::Read;
+fn main() {
+    assert_eq!(canonical_app::answer(), 42);
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    assert!(input.is_empty(), "closed input must supply EOF, not client bytes");
+    let path = "/__rabs/out/cargo/closed-stdin-executions";
+    let count: u32 = std::fs::read_to_string(path).ok().map(|value| value.parse().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(path, count.to_string()).unwrap();
+    println!("CURRENT_CLOSED_STDIN_EXECUTION={count}");
+    if std::env::args().any(|arg| arg == "--fail") { std::process::exit(7); }
+}
+"#;
+    write(&source, "src/main.rs", body);
+    write(&source, "benches/eof.rs", body);
+    profile["stdin"] = json!("closed");
+    profile["jobs"] = json!(1);
+    profile["target_cache"] =
+        json!({"runtime_epoch":"closed-stdin-native-v1", "max_bytes":268435456});
+    let socket = root.join("closed-stdin-service.sock");
+    let mut service = None;
+    let mut number = 3200;
+    for shared in [false, true] {
+        if shared {
+            let path = root.join("closed-stdin-service.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({
+                    "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+                    "socket":socket, "max_roots":1, "jobs_per_root":1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut command = shared_service_command(root);
+            command.arg("--canonical-compile-service").arg(path);
+            let mut child = SharedServiceChild::spawn(root, "closed-stdin-service", command);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                child.assert_running();
+                if socket.exists()
+                    && child
+                        .events()
+                        .iter()
+                        .any(|event| event["kind"] == "canonical-service-listening")
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{}", child.diagnostics());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            profile["service_socket"] = json!(socket);
+            service = Some(child);
+        }
+        for command in ["run", "bench"] {
+            profile["command"] = json!(command);
+            let mut previous = None;
+            for fail in [false, true] {
+                let arguments = if fail { json!(["--fail"]) } else { json!([]) };
+                profile["selection"] = if command == "run" {
+                    json!({"bin":["canonical_app"], "run_args":arguments})
+                } else {
+                    json!({"bench":["eof"], "test_args":arguments})
+                };
+                number += 1;
+                let (code, events, output) = run_with_input(
+                    root,
+                    number,
+                    &profile,
+                    &[],
+                    b"these client bytes must not reach the program\n",
+                );
+                assert_eq!(code == 0, !fail, "shared={shared}, {command}: {output}");
+                let count: u32 = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CURRENT_CLOSED_STDIN_EXECUTION="))
+                    .unwrap_or_else(|| panic!("the current body did not execute: {output}"))
+                    .parse()
+                    .unwrap();
+                if let Some(previous) = previous {
+                    assert_eq!(count, previous + 1, "{output}");
+                }
+                previous = Some(count);
+                let started = events
+                    .iter()
+                    .find(|event| event["kind"] == "canonical-compilation-started")
+                    .unwrap();
+                let result_cache = if command == "run" {
+                    "program_result_cache"
+                } else {
+                    "benchmark_result_cache"
+                };
+                assert_eq!(started[result_cache], false);
+                if fail {
+                    assert_eq!(started["private_target_state"], "restored");
+                }
+            }
+        }
+    }
+    service.unwrap().shutdown(Duration::from_secs(15)).unwrap();
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
 }
 
 #[test]

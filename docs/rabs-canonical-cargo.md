@@ -2087,6 +2087,50 @@ program/benchmark result caching disabled. `bench --no-run` delivers the complet
 compiled target tree through the same retained-artifact contract as Build and
 `test --no-run`.
 
+#### Run without input through a shared or remote service
+
+Native profiles can explicitly select `"stdin": "closed"`. Cargo and the
+requested program or benchmark receive EOF without reading the client's or
+daemon's input. This admits noninteractive Run and executing Bench commands
+through both persistent local and pinned-TLS remote canonical services.
+Omitting the field preserves the existing command-specific defaults: Run and
+executing Bench inherit nonterminal input in standalone mode and refuse service
+submission. An explicit `"stdin": "inherit"` also remains standalone-only.
+Other commands retain closed stdin and reject an explicit inherited policy.
+
+For a native local profile, add `"stdin": "closed"` beside `"command": "run"`
+and submit with `rabsd --canonical-compile-local PROFILE.json`. The same profile
+can name `service_socket` to use the persistent local coordinator.
+
+For a remote profile, replace its `settings` object with, for example:
+
+```json
+{
+  "command": "run",
+  "stdin": "closed",
+  "manifest": "app/Cargo.toml",
+  "selection": {
+    "bin": ["analyze"],
+    "run_args": ["--format=json"]
+  },
+  "jobs": 2,
+  "timeout_seconds": 1800
+}
+```
+
+Submit it with `rabsd --canonical-compile-remote PROFILE.json`. Executing Bench
+uses `"command": "bench"`, `"stdin": "closed"`, and the existing `bench`,
+`test_filter` and `test_args` selectors. Standard output, standard error,
+numeric exit status, cancellation, execution deadlines and accepted-operation
+recovery keep their ordinary service behavior. The program or benchmark runs
+once for each newly admitted operation; its outcome is not cached. Run and
+executing Bench return diagnostics and status without publishing an artifact
+destination. Planning still uses closed stdin independently of execution.
+
+Use these native `rabsd` entry points for the explicit stdin policy. The legacy
+`cargo rabs` launcher retains its existing profile whitelist and remote Run/Bench
+restriction. No stdin bytes are transferred or replayed by the remote protocol.
+
 ### Share a canonical coordinator across concurrent commands
 
 An optional persistent service keeps one coordinator authority, CAS and dependency
@@ -2305,11 +2349,11 @@ joins it during shutdown. Images are private to this service lifetime; restart
 captures them again.
 
 The service supports `check`, `build`, `clippy`, `doc`, `test`, `test --no-run` and
-`bench --no-run`. It has closed stdin. `run` and executing `bench` commands retain
-the direct profile path because their inherited input is not forwarded through
-this protocol. The restriction is checked again after command-line selection
-replaces a saved profile's command and options. Test bodies still run on each
-invocation and retain their actual failure status.
+`bench --no-run`. Native profiles also support `run` and executing `bench` with
+explicit `"stdin": "closed"`; the service never forwards inherited input.
+Profiles retaining inherited stdin refuse before capture. Test, program and
+benchmark bodies still run on each newly admitted operation and retain their
+actual failure status.
 
 Compiler stdout and stderr stream to the client while Cargo is running. Private
 bounded files separate process-pipe drainage from a slow socket consumer, and
@@ -2575,7 +2619,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v10` and the exact tool build identity must match before
+`canonical-compile-remote-v11` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2700,9 +2744,11 @@ environment contract as the canonical local profile. Defaults are `check`,
 grant. Omitting `selection` for Check retains its library-only default; an
 explicit empty selection uses Cargo's ordinary default members and targets.
 The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
-compilation with `"no_run": true`. Run and executing Bench require inherited
-stdin and are refused by this protocol, including when stdin is redirected.
-Test bodies still execute for each request and retain their actual exit status.
+compilation with `"no_run": true`. Native settings also admit Run and executing
+Bench with explicit `"stdin": "closed"`. Their default or explicit inherited
+stdin remains unsupported even when the client redirects its input: the service
+does not forward that stream. Test, program and benchmark bodies still execute
+for each newly admitted operation and retain their actual exit status.
 
 For a vendored source graph, omit `cargo_home_source` and `source_selection`,
 then add `"vendor": "vendor"` inside `settings`. For an entirely local graph,
@@ -2762,8 +2808,9 @@ cargo rabs --rabs-canonical-remote ./remote-cargo.json -- bench --no-run
 Check, Build, Clippy, Doc, Test and nonexecuting Bench use the canonical Cargo
 selection parser, including package, target, feature and profile choices.
 Clippy requires the captured Clippy tools; Doc and executing doctests require
-the captured rustdoc executable. Run and Bench without `--no-run` refuse before dispatch
-because the remote protocol does not forward stdin.
+the captured rustdoc executable. The legacy Cargo frontend still refuses Run and
+Bench without `--no-run` before dispatch. Use the native profile entry point with
+explicit closed stdin for those commands.
 
 The command line replaces any saved `settings.command` and
 `settings.selection`; other settings remain in effect. With no Cargo command,
@@ -2896,7 +2943,7 @@ the client and cannot downgrade a client's required release-authorization policy
 Install matching client and coordinator binaries: paged source and artifact
 manifests, source-file and partial-prefix negotiation, SDK file/prefix and image
 reuse, artifact missing-file/prefix selection and operation reattachment use wire
-version `canonical-compile-remote-v10`, while existing client and service JSON
+version `canonical-compile-remote-v11`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 

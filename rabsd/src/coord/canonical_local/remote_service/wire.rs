@@ -36,10 +36,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v10 adds peer-bound operation reattachment, diagnostic frontiers, artifact
-/// byte cursors and a terminal receipt. It preserves v9 verified prefix offers
-/// and complete-file reuse. Older peers refuse before admission.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v10";
+/// v11 admits explicitly closed stdin for noninteractive Run and Bench intent.
+/// Reattachment retains that original policy, diagnostic frontiers and artifact
+/// custody. Older peers refuse before admission.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v11";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.

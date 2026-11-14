@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::io;
 
 mod selection;
-pub use selection::{CompilationCommand, CompilationSelection};
+pub use selection::{CompilationCommand, CompilationSelection, CompilationStdin};
 
 const MAX_UNITS: usize = 16_384;
 const MAX_DEPENDENCIES: usize = 262_144;

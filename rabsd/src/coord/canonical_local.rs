@@ -46,7 +46,8 @@ use rabs_sandbox::canonical_namespace::{
     CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
 };
 use rabs_sandbox::cargo_check::{
-    CompilationCommand, CompilationSelection, run_build_selection, validate_compilation_unit_graph,
+    CompilationCommand, CompilationSelection, CompilationStdin, run_build_selection,
+    validate_compilation_unit_graph,
 };
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
@@ -105,6 +106,9 @@ struct Profile {
     service_socket: Option<PathBuf>,
     #[serde(default)]
     command: CompilationCommand,
+    /// Omission preserves command defaults. Explicit `closed` supplies EOF and
+    /// permits noninteractive run/bench execution through a shared service.
+    stdin: Option<CompilationStdin>,
     #[serde(default = "default_manifest")]
     manifest: String,
     vendor: Option<String>,
@@ -718,6 +722,7 @@ impl Profile {
             cache.validate()?;
         }
         self.compilation_args()?;
+        self.stdin_policy()?;
         self.command_environment()?;
         self.source_selection_version()?;
         require(
@@ -896,9 +901,12 @@ impl Profile {
             .is_some_and(|selection| selection.no_run)
     }
 
-    fn inherits_stdin(&self) -> bool {
-        self.command == CompilationCommand::Run
-            || (self.command == CompilationCommand::Bench && !self.no_run())
+    fn stdin_policy(&self) -> io::Result<CompilationStdin> {
+        self.command.stdin_policy(self.no_run(), self.stdin)
+    }
+
+    fn inherits_stdin(&self) -> io::Result<bool> {
+        Ok(self.stdin_policy()? == CompilationStdin::Inherit)
     }
 
     fn validate_stdin(&self, terminal: bool) -> io::Result<()> {
@@ -906,8 +914,8 @@ impl Profile {
         // controlling terminal could stop that group with SIGTTIN; supporting
         // interactive job control needs a separate, owned terminal/session.
         require(
-            !self.inherits_stdin() || !terminal,
-            "canonical run/bench requires nonterminal stdin: redirect input from a pipe, file, or /dev/null, or run a delivered build outside this noninteractive profile",
+            !self.inherits_stdin()? || !terminal,
+            "canonical run/bench requires nonterminal stdin when input is inherited: redirect from a pipe, file, or /dev/null, select stdin: closed for EOF, or run a delivered build outside this noninteractive profile",
         )
     }
 
@@ -1107,9 +1115,9 @@ pub fn run_profile_with_release(
     // Refuse unsupported terminal input before validating source roots,
     // acquiring state, probing namespaces, or capturing any source bytes.
     profile.validate_stdin(std::io::stdin().is_terminal())?;
-    if profile.service_socket.is_some() && profile.inherits_stdin() {
+    if profile.service_socket.is_some() && profile.inherits_stdin()? {
         return Err(invalid(
-            "canonical service does not accept commands with inherited stdin",
+            "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
         ));
     }
     profile.validate()?;
@@ -1143,8 +1151,8 @@ pub(super) fn run_shared_profile(
     let profile: Profile =
         serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
     require(
-        !profile.inherits_stdin(),
-        "canonical service does not accept commands with inherited stdin",
+        !profile.inherits_stdin()?,
+        "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
     )?;
     require(
         profile.service_socket.is_some()
@@ -1720,7 +1728,7 @@ fn run_operation(
     )?;
     let cargo_output = output.cargo_output(
         owner.path().join("compilation-drain"),
-        profile.inherits_stdin(),
+        profile.inherits_stdin()?,
     )?;
     let streamed = matches!(&cargo_output, CargoOutput::Stream { .. });
     let result = execute_controlled(
@@ -2897,7 +2905,7 @@ mod tests {
         assert_eq!(request["args"], json!(arguments));
         assert_eq!(request["command_context"]["env"]["RUSTDOC"], RUSTDOC);
         assert_eq!(request["command_context"]["env"]["RUSTC"], RUSTC);
-        assert!(!profile.inherits_stdin());
+        assert!(!profile.inherits_stdin().unwrap());
     }
 
     #[test]
@@ -3057,7 +3065,11 @@ mod tests {
                 "selection":{"no_run":no_run}
             }))
             .unwrap();
-            assert_eq!(profile.inherits_stdin(), inherits_stdin, "{command:?}");
+            assert_eq!(
+                profile.inherits_stdin().unwrap(),
+                inherits_stdin,
+                "{command:?}"
+            );
             assert!(profile.validate_stdin(false).is_ok(), "{command:?}");
             assert_eq!(
                 profile.validate_stdin(true).is_err(),
@@ -3065,6 +3077,79 @@ mod tests {
                 "{command:?}, no_run={no_run}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_closed_stdin_preserves_run_and_bench_intent_and_selects_eof() {
+        for command in [CompilationCommand::Run, CompilationCommand::Bench] {
+            let mut profile = application_environment_profile();
+            profile.command = command;
+            profile.selection = Some(CompilationSelection {
+                bin: if command == CompilationCommand::Run {
+                    vec!["app".into()]
+                } else {
+                    Vec::new()
+                },
+                run_args: if command == CompilationCommand::Run {
+                    vec!["--literal".into(), String::new()]
+                } else {
+                    Vec::new()
+                },
+                test_args: if command == CompilationCommand::Bench {
+                    vec!["--literal".into(), String::new()]
+                } else {
+                    Vec::new()
+                },
+                ..CompilationSelection::default()
+            });
+            let request = profile.source_specification().unwrap();
+            let selected = if command == CompilationCommand::Run {
+                Some(
+                    run_build_selection(profile.selection.as_ref().unwrap(), &Value::Null, None)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let plan = profile.graph_args(selected.as_ref()).unwrap();
+            assert!(profile.inherits_stdin().unwrap());
+            profile.stdin = Some(CompilationStdin::Closed);
+            profile.validate_logical().unwrap();
+            profile.validate_stdin(true).unwrap();
+            assert!(!profile.inherits_stdin().unwrap());
+            assert_eq!(profile.graph_args(selected.as_ref()).unwrap(), plan);
+            // The native profile carries runtime input policy. The existing
+            // compiler preparation request does not claim captured stdin or
+            // authority to reuse an executed program's result.
+            assert_eq!(profile.source_specification().unwrap(), request);
+            assert!(matches!(
+                OperationOutput::Inherit
+                    .cargo_output(PathBuf::new(), profile.inherits_stdin().unwrap())
+                    .unwrap(),
+                CargoOutput::Inherit {
+                    inherit_stdin: false
+                },
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_inherited_stdin_retains_terminal_and_command_refusals() {
+        let mut profile = application_environment_profile();
+        profile.stdin = Some(CompilationStdin::Inherit);
+        assert!(profile.validate_logical().is_err());
+        assert!(profile.validate_stdin(false).is_err());
+        for command in [CompilationCommand::Run, CompilationCommand::Bench] {
+            profile.command = command;
+            profile.validate_logical().unwrap();
+            profile.validate_stdin(false).unwrap();
+            assert!(profile.validate_stdin(true).is_err());
+        }
+        profile.selection = Some(CompilationSelection {
+            no_run: true,
+            ..CompilationSelection::default()
+        });
+        assert!(profile.validate_logical().is_err());
     }
 
     #[test]
@@ -3100,7 +3185,7 @@ mod tests {
             !profile.no_run(),
             "a literal program argument cannot change Cargo's execution mode"
         );
-        assert!(profile.inherits_stdin());
+        assert!(profile.inherits_stdin().unwrap());
         assert!(profile.validate_stdin(true).is_err());
         assert_eq!(profile.source_specification().unwrap()["args"], json!(args));
     }
@@ -3120,7 +3205,7 @@ mod tests {
         assert_eq!(&graph[..tail], &args[..tail]);
         assert_eq!(&graph[tail..], ["--unit-graph", "-Z", "unstable-options"]);
         assert!(!profile.no_run());
-        assert!(profile.inherits_stdin());
+        assert!(profile.inherits_stdin().unwrap());
         assert!(profile.validate_stdin(true).is_err());
         assert!(!args.iter().any(|arg| arg == "--release"));
         profile.selection = Some(CompilationSelection {
@@ -3129,7 +3214,7 @@ mod tests {
             ..CompilationSelection::default()
         });
         assert!(profile.no_run());
-        assert!(!profile.inherits_stdin());
+        assert!(!profile.inherits_stdin().unwrap());
         assert!(profile.validate_stdin(true).is_ok());
         assert!(
             profile

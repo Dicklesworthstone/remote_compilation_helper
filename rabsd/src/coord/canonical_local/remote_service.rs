@@ -1802,8 +1802,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v10_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v10", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v11_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v11", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
@@ -1814,7 +1814,8 @@ mod tests {
             ("canonical-compile-remote-v7", "build-one"),
             ("canonical-compile-remote-v8", "build-one"),
             ("canonical-compile-remote-v9", "build-one"),
-            ("canonical-compile-remote-v10", "build-two"),
+            ("canonical-compile-remote-v10", "build-one"),
+            ("canonical-compile-remote-v11", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(
