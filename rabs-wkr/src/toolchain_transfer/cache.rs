@@ -978,6 +978,12 @@ mod tests {
         .unwrap();
         receiver
             .entry(ToolchainEntry {
+                path: String::new(),
+                kind: ToolchainEntryKind::Directory,
+            })
+            .unwrap();
+        receiver
+            .entry(ToolchainEntry {
                 path: "compiler".to_owned(),
                 kind: ToolchainEntryKind::File {
                     bytes: bytes.len() as u64,

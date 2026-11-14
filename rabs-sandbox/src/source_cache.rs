@@ -8,6 +8,9 @@
 //! views from an authenticated peer key: those views share one inventory, writer
 //! and aggregate budget while never reading another peer's objects.
 
+mod prefix;
+pub use prefix::{SourcePrefix, SourcePrefixSnapshots};
+
 use crate::source_transfer::{
     MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SOURCE_PROJECTION_PREFIX, SourceCheckpointError,
     SourceFile, SourceManifest, SourceProjectionPool, SourceReceiver,
@@ -506,6 +509,7 @@ pub struct SourceCheckpoints {
     protected_bytes: u64,
     total: u64,
     visited: BTreeSet<String>,
+    active_prefix: Option<prefix::PrefixWriter>,
 }
 
 impl SourceCheckpoints {
@@ -553,6 +557,7 @@ impl SourceCheckpoints {
             .binary_search_by(|file| file.path.as_str().cmp(path))
             .map_err(|_| RememberError::Source(invalid("undeclared source checkpoint member")))?;
         let expected = files[index].clone();
+        self.finish_prefix(path)?;
         if !self.visited.insert(path.to_owned())
             || expected.len == 0
             || expected.len > self.cache.max_bytes
@@ -581,6 +586,7 @@ impl SourceCheckpoints {
             return Ok(());
         };
         let scratch = self.cache.root.join(INCOMING);
+        let previous = self.replacement_generation(&destination)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -606,37 +612,22 @@ impl SourceCheckpoints {
         let mut permissions = file.metadata()?.permissions();
         permissions.set_readonly(true);
         file.set_permissions(permissions)?;
-        drop(file);
         self.check_owner()?;
-        if self.entries.contains_key(&destination) {
-            self.remove(&destination)?;
+        if !self.reserve_replacement(&destination, expected.len)? {
+            // Another interleaved file may still own the remaining capacity.
+            // Retire only this exact private staging object so later completed
+            // files can checkpoint without tripping over our declined copy.
+            if !same_state(&file.metadata()?, &fs::symlink_metadata(&scratch)?) {
+                return Err(invalid("declined source checkpoint staging changed").into());
+            }
+            fs::remove_file(&scratch)?;
+            return Ok(());
         }
-        while self.entries.len() >= self.cache.max_files
-            || self
-                .total
-                .checked_add(expected.len)
-                .is_none_or(|sum| sum > self.cache.max_bytes)
-        {
-            let path = self
-                .evictable
-                .first()
-                .map(|(_, path)| path.clone())
-                .ok_or_else(|| invalid("source checkpoint eviction credit is inconsistent"))?;
-            self.remove(&path)?;
-        }
-        self.check_owner()?;
-        fs::rename(&scratch, &destination)?;
-        self.total += expected.len;
+        let metadata =
+            self.publish_replacement(&destination, &file, expected.len, previous.as_ref())?;
         self.protected_bytes = next_protected_bytes;
         self.protected.insert(destination.clone(), expected.len);
-        self.entries.insert(
-            destination.clone(),
-            Entry {
-                path: destination,
-                bytes: expected.len,
-                used: SystemTime::now(),
-            },
-        );
+        self.evictable.remove(&(metadata.modified()?, destination));
         Ok(())
     }
 }
@@ -1107,6 +1098,7 @@ impl SourceCache {
             protected_bytes,
             total,
             visited: BTreeSet::new(),
+            active_prefix: None,
         };
         checkpoint.check_owner()?;
         Ok(Some(checkpoint))
@@ -1254,6 +1246,17 @@ impl SourceCache {
             // crash debris and serializes capacity accounting across workers.
             // Verify the complete source before evicting useful cache objects.
             let scratch = self.root.join(INCOMING);
+            let previous = entries
+                .iter()
+                .find(|entry| entry.path == destination)
+                .map(|entry| -> io::Result<Metadata> {
+                    let metadata = fs::symlink_metadata(&destination)?;
+                    if !ordinary(&metadata) || metadata.len() != entry.bytes {
+                        return Err(invalid("source cache replacement inventory changed"));
+                    }
+                    Ok(metadata)
+                })
+                .transpose()?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -1266,7 +1269,10 @@ impl SourceCache {
             let mut permissions = file.metadata()?.permissions();
             permissions.set_readonly(true);
             file.set_permissions(permissions)?;
-            drop(file);
+            let staged = file.metadata()?;
+            if !same_state(&staged, &fs::symlink_metadata(&scratch)?) {
+                return Err(invalid("source cache staged replacement changed").into());
+            }
             // Establish that this object can fit WITHOUT sacrificing this
             // projection's useful bytes before removing any cache entry. If
             // it cannot, even unrelated LRU entries should remain untouched.
@@ -1276,7 +1282,8 @@ impl SourceCache {
                 let entry = entries
                     .remove(index)
                     .ok_or_else(|| invalid("source cache inventory changed"))?;
-                fs::remove_file(&entry.path)?;
+                // Keep the old inode named until the new independently
+                // verified object is ready for one atomic replacement.
                 total -= entry.bytes;
             }
             while entries.len() >= self.max_files
@@ -1296,6 +1303,24 @@ impl SourceCache {
                 total -= entry.bytes;
             }
             self.control.check()?;
+            match previous {
+                Some(previous) if !same_state(&previous, &fs::symlink_metadata(&destination)?) => {
+                    return Err(invalid("source cache object changed before replacement").into());
+                }
+                Some(_) => {}
+                None => match fs::symlink_metadata(&destination) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        return Err(invalid("source cache replacement destination appeared").into());
+                    }
+                },
+            }
+            if !same_state(&staged, &file.metadata()?)
+                || !same_state(&staged, &fs::symlink_metadata(&scratch)?)
+            {
+                return Err(invalid("source cache staged replacement changed").into());
+            }
             fs::rename(&scratch, &destination)?;
             total += expected.len;
             protected_bytes = next_protected_bytes;
@@ -2899,6 +2924,45 @@ mod tests {
             fs::metadata(cache.root.join(object_name(&expected.sha256)))
                 .unwrap()
                 .ino()
+        );
+    }
+
+    #[test]
+    fn complete_admission_preserves_old_prefix_if_staging_is_replaced() {
+        let parent = private();
+        let input = private();
+        let bytes = b"complete independently selected input";
+        let source = staged(input.path(), &[("input", bytes)]);
+        let cache = SourceCache::open_byte_only(parent.path(), 1024).unwrap();
+        cache.remember(&source).unwrap();
+        let file = &source.manifest().files()[0];
+        let previous = cache.object_path(&file.sha256);
+        fs::set_permissions(&previous, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&previous, &bytes[..8]).unwrap();
+        fs::set_permissions(&previous, fs::Permissions::from_mode(0o400)).unwrap();
+        let original = fs::metadata(&previous).unwrap();
+        let scratch = cache.root.join(INCOMING);
+        let result = cache.remember_files(
+            source.manifest(),
+            RememberSource::CapturedOutput,
+            |expected, output| {
+                copy_verified_ranges(
+                    expected,
+                    &cache.control,
+                    &mut |_, offset, count| Ok(range(bytes, offset, count)),
+                    output,
+                )?;
+                fs::rename(&scratch, parent.path().join("replaced-staging"))?;
+                fs::create_dir(&scratch)?;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(RememberError::Cache(_))));
+        assert!(same_state(&original, &fs::metadata(&previous).unwrap()));
+        assert_eq!(fs::read(&previous).unwrap(), &bytes[..8]);
+        assert!(
+            scratch.is_dir(),
+            "an unowned staging replacement must remain untouched"
         );
     }
 

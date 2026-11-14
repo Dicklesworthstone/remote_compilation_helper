@@ -1295,7 +1295,7 @@ impl WorkerState {
     /// not build admission or recovery from an open command/transport circuit.
     /// Callers still execute under a revocable background network permit.
     pub(crate) async fn background_disk_recovery_allowed(&self) -> bool {
-        if ensure_posix_gc_worker(&self.config.read().await).is_err() {
+        if ensure_posix_gc_worker(&*self.config.read().await).is_err() {
             return false;
         }
         let Some(network) = self.background_probe().await else {

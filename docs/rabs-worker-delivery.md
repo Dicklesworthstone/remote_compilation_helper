@@ -561,9 +561,42 @@ This reuse does not expand the eligible compiler action classes.
 Workers retain digest-verified source bytes across sessions and restarts.
 Objects live in `source-files-v1` below the worker's private journal directory.
 The default retained-input allowance is 512 MiB. Source files, generated inputs
-and Rust dependency archives share its byte cache. Every hit is fully hashed
-into a private snapshot before populating a fresh execution receiver; the final
-source seal remains required even when nothing needs uploading.
+and Rust dependency archives share its byte cache. Every completed-file hit is
+fully hashed into a private snapshot before populating a fresh execution
+receiver; the final source seal remains required even when nothing needs
+uploading.
+
+Interrupted source and dependency-file uploads can also retain contiguous
+prefixes within the same cache budget. A new coordinator requests
+`source-file-prefix-v1` in `source-begin`; a supporting worker echoes that version
+and offers bounded `{path, offset, sha256}` rows alongside `missing_files`.
+An older worker omits the echo, and the coordinator sends the ordinary complete
+files. Disabling source-cache storage or opting out of cached files prevents
+retaining and reusing these prefixes.
+
+The worker copies offered prefixes into one frozen private snapshot. The
+coordinator hashes the corresponding bytes in its own retained input before
+choosing an offset. Matching bytes let the first ordinary `source-chunk` start
+at that exact offset, even if it is not a chunk boundary; a disagreement selects
+zero and uploads the complete file. The first chunk carries the selected offset
+and hash. The worker imports only the matching owned snapshot, once, and then
+accepts the tail through the existing receiver. There is no additional round
+trip per file, and the bounded four-chunk pipeline remains unchanged.
+
+Prefix offers are limited to missing, nonempty files and at most 256 KiB of
+hint metadata. Hints that do not fit are omitted. Empty files require no chunks,
+and complete cached files retain their ordinary reuse path. A prefix digest
+does not authenticate the absent tail: the complete file digest and final
+source-manifest seal remain mandatory before execution.
+
+Accepted chunks can grow the optional cached prefix before acknowledgment.
+Capacity pressure stops growth while retaining the existing prefix. A failed
+or cancelled replacement preserves the previous cached generation until a
+fully copied replacement is ready; a later writer discards only interrupted
+staging. Each new upload measures the actual retained length and bytes again,
+so it does not trust a saved cursor after a crash. Cache corruption, a busy
+writer or unavailable storage can reduce reuse without changing the selected
+execution inputs or allowing an incomplete source tree to run.
 
 Workers also retain complete, read-only execution projections of package,
 workspace, generated and native trees within one process. Their keys bind the
@@ -605,8 +638,14 @@ their original deadline and cancellation owner, while execution preparation uses
 the current execution control.
 
 Retained capacity excludes request-private transfer staging and verification
-snapshots. Input objects must fit their byte-cache partition as well as the
-existing 512 MiB per-source limit. Projection reuse removes repeated execution
+snapshots. Complete input objects must fit their byte-cache partition as well
+as the existing 512 MiB per-source limit. A file that exceeds the byte-cache
+partition can still retain a bounded prefix within the source limit. Prefix
+snapshot storage is bounded by the smaller of the source size
+and the byte-cache partition and uses one file descriptor for all offers. At
+most one optional prefix writer and one bounded incoming replacement exist per
+cache writer. Allow temporary disk space for those snapshots and replacements.
+Projection reuse removes repeated execution
 tree copies and byte hashing; transport snapshot/import and the final receiver
 seal still run. Compilation, result publication and Cargo target-state policies
 retain their existing checks. This is input materialization reuse and grants no
@@ -1252,7 +1291,8 @@ entry acknowledgment must confirm that exact offset before it can release
 transfer credit. Prefix offers share the existing 256 KiB page-reply bound;
 optional hints that do not fit are omitted and those files start at zero.
 Older peers continue using completed-file reuse with its unchanged frames and
-upload partial files from zero. Source-file transfer is unchanged.
+upload partial files from zero. Source and dependency-file prefixes use the
+separate `source-file-prefix-v1` negotiation described above.
 
 Cache absence, corruption, writer contention or a full budget can produce misses
 without authorizing different compiler bytes. Prefix growth stops when the

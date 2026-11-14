@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 
 /// Version negotiated independently of output/artifact transfer.
 pub const SOURCE_TRANSFER: &str = "source-files-v1";
+/// Optional source-begin negotiation for sender-verified incomplete-file reuse.
+pub const SOURCE_PREFIX_REUSE_VERSION: &str = "source-file-prefix-v1";
+/// Optional hints never enlarge the ordinary source frame or manifest bounds.
+pub const MAX_SOURCE_PREFIX_HINT_BYTES: usize = 256 * 1024;
 /// Retained image parents. A leftover name must not be credited as free cache space.
 pub const SOURCE_PROJECTION_PREFIX: &str = "source-projections-";
 /// Bounded decoded bytes in one chunk, before hexadecimal wire expansion.

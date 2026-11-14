@@ -9,6 +9,7 @@
 //! never grants action-cache authority or skips the request's final source seal.
 
 mod cache;
+mod prefix;
 
 pub use cache::{DEFAULT_SOURCE_CACHE_BYTES, MAX_SOURCE_CACHE_BYTES, SourceCache};
 
@@ -185,6 +186,7 @@ pub struct SourceOwner {
     deadline: Instant,
     execution_owned: bool,
     allow_cached_files: bool,
+    prefix_reuse: Option<prefix::PrefixTransfer>,
     missing_files: Vec<String>,
     reused_bytes: u64,
     cache: Option<cache::SourceCache>,
@@ -1534,27 +1536,21 @@ impl SourceOwner {
         Ok(())
     }
 
-    fn checkpoint_completed_file(&mut self, path: &str, next: u64) -> Result<(), String> {
-        let Some(cache) = &self.cache else {
-            return Ok(());
-        };
-        let files = self.receiver.manifest().files();
-        let index = files
-            .binary_search_by(|file| file.path.as_str().cmp(path))
-            .map_err(|_| invalid("undeclared source checkpoint member"))?;
-        if next != files[index].len {
-            return Ok(());
+    fn start_cache_checkpoints(&mut self) -> Result<(), cache::RememberError> {
+        if !self.cache_checkpoints_started
+            && let Some(cache) = &self.cache
+        {
+            self.cache_checkpoints_started = true;
+            self.cache_checkpoints = cache.checkpoints(self.receiver.manifest())?;
         }
-        let result = (|| {
-            if !self.cache_checkpoints_started {
-                self.cache_checkpoints_started = true;
-                self.cache_checkpoints = cache.checkpoints(self.receiver.manifest())?;
-            }
-            if let Some(checkpoints) = &mut self.cache_checkpoints {
-                checkpoints.remember_file(&mut self.receiver, path)?;
-            }
-            Ok(())
-        })();
+        Ok(())
+    }
+
+    fn checkpoint_result(
+        &mut self,
+        result: Result<(), cache::RememberError>,
+        context: &str,
+    ) -> Result<(), String> {
         match result {
             Ok(()) => Ok(()),
             Err(cache::RememberError::Cache(error)) => {
@@ -1567,9 +1563,98 @@ impl SourceOwner {
             Err(cache::RememberError::Source(error)) => {
                 self.source_failed = true;
                 drop(self.cache_checkpoints.take());
-                Err(format!("completed source verification failed: {error}"))
+                Err(format!("{context} source verification failed: {error}"))
             }
         }
+    }
+
+    fn select_prefix(
+        &mut self,
+        frame: &Value,
+        path: &str,
+        offset: u64,
+        bytes: usize,
+        sha256: [u8; 32],
+    ) -> Result<(), String> {
+        let selection = match &mut self.prefix_reuse {
+            Some(prefix) => prefix.select(&mut self.receiver, frame, path, offset, bytes, sha256),
+            None if frame.get("resume").is_some() => {
+                Err(invalid("source prefix reuse was not negotiated"))
+            }
+            None => Ok(None),
+        };
+        let selected = match selection {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                // A partially imported frozen prefix must never become a
+                // usable input after the caller clears a cancellation flag.
+                self.source_failed = true;
+                return Err(error);
+            }
+        };
+        self.reused_bytes = self
+            .reused_bytes
+            .checked_add(selected.offset)
+            .filter(|bytes| *bytes <= self.receiver.manifest().total_bytes())
+            .ok_or_else(|| {
+                self.source_failed = true;
+                invalid("source prefix reuse exceeds the declared source bytes")
+            })?;
+        let result = (|| {
+            self.start_cache_checkpoints()?;
+            if let (Some(checkpoints), Some(prefix)) =
+                (&mut self.cache_checkpoints, &mut self.prefix_reuse)
+            {
+                checkpoints.begin_prefix(&self.receiver, path, selected, |offset, count| {
+                    prefix.read_chunk(path, offset, count)
+                })?;
+            }
+            Ok(())
+        })();
+        self.checkpoint_result(result, "prefix")
+    }
+
+    fn checkpoint_chunk(
+        &mut self,
+        path: &str,
+        offset: u64,
+        bytes: &[u8],
+        next: u64,
+    ) -> Result<(), String> {
+        if self.prefix_reuse.is_some() {
+            let result = self
+                .cache_checkpoints
+                .as_mut()
+                .map_or(Ok(()), |checkpoints| {
+                    checkpoints
+                        .append_prefix(path, offset, bytes)
+                        .map_err(cache::RememberError::Cache)
+                });
+            self.checkpoint_result(result, "prefix")?;
+        }
+        self.checkpoint_completed_file(path, next)
+    }
+
+    fn checkpoint_completed_file(&mut self, path: &str, next: u64) -> Result<(), String> {
+        if self.cache.is_none() {
+            return Ok(());
+        }
+        let files = self.receiver.manifest().files();
+        let index = files
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+            .map_err(|_| invalid("undeclared source checkpoint member"))?;
+        if next != files[index].len {
+            return Ok(());
+        }
+        let result = (|| {
+            self.start_cache_checkpoints()?;
+            if let Some(checkpoints) = &mut self.cache_checkpoints {
+                checkpoints.remember_file(&mut self.receiver, path)?;
+            }
+            Ok(())
+        })();
+        self.checkpoint_result(result, "completed")
     }
 
     fn within_budget(&self) -> Result<(), String> {
@@ -1638,6 +1723,14 @@ impl SourceOwner {
     /// Every readiness response uses the same post-I/O deadline frontier.
     /// Cached-file reuse and verification cannot renew the original budget.
     fn ready(&self) -> Result<Value, String> {
+        let mut reply = self.ready_base()?;
+        if let Some(prefix) = &self.prefix_reuse {
+            prefix.add_ready_fields(&mut reply)?;
+        }
+        Ok(reply)
+    }
+
+    fn ready_base(&self) -> Result<Value, String> {
         self.within_budget()?;
         let mut reply = json!({"kind":"source-ready", "request_id":self.request_id,
             "manifest_sha256":hex(&self.receiver.manifest().digest()),
@@ -1713,10 +1806,12 @@ impl SourceTransferState {
                     .as_bool()
                     .ok_or("allow_cached_files must be boolean")?,
             };
+            let allow_prefixes = prefix::selected(value, allow_cached_files)?;
             if let Some(owner) = &self.pending {
                 if owner.request_id != id
                     || owner.receiver.manifest() != &manifest
                     || owner.allow_cached_files != allow_cached_files
+                    || owner.prefix_reuse.is_some() != allow_prefixes
                     || owner.cargo_home != cargo_home
                 {
                     return Err(invalid("another source transfer owns this session"));
@@ -1749,6 +1844,8 @@ impl SourceTransferState {
             let mut receiver =
                 SourceReceiver::create(&directory.path().join("workspace"), manifest)
                     .map_err(|error| error.to_string())?;
+            let mut prefix_reuse = allow_prefixes
+                .then(|| prefix::PrefixTransfer::new(cache.clone(), receiver.manifest()));
             let mut missing_files = Vec::new();
             let mut reused_bytes = 0;
             for file in receiver.manifest().files().to_vec() {
@@ -1774,6 +1871,9 @@ impl SourceTransferState {
                         .map_err(|error| error.to_string())?;
                     reused_bytes += file.len;
                 } else {
+                    if let Some(prefix) = &mut prefix_reuse {
+                        prefix.capture(&file);
+                    }
                     missing_files.push(file.path);
                 }
             }
@@ -1784,13 +1884,14 @@ impl SourceTransferState {
             if Instant::now() >= deadline {
                 return Err(invalid("source upload deadline exceeded"));
             }
-            let owner = SourceOwner {
+            let mut owner = SourceOwner {
                 receiver,
                 _directory: directory,
                 request_id: id,
                 deadline,
                 execution_owned: false,
                 allow_cached_files,
+                prefix_reuse,
                 missing_files,
                 reused_bytes,
                 // Opt-out disables acquisition, while namespace protection
@@ -1805,6 +1906,10 @@ impl SourceTransferState {
                 cargo_home,
                 prepared_cargo_home: None,
             };
+            let base = owner.ready_base()?;
+            if let Some(prefix) = &mut owner.prefix_reuse {
+                prefix.seal(&base)?;
+            }
             let reply = owner.ready()?;
             check_cancelled(&cancelled)?;
             self.pending = Some(owner);
@@ -1837,9 +1942,13 @@ impl SourceTransferState {
                         .ok_or("source chunk lacks data")?,
                     MAX_SOURCE_CHUNK,
                 )?;
+                let chunk_sha256 = digest(&value["chunk_sha256"])?;
+                owner.select_prefix(value, path, offset, bytes.len(), chunk_sha256)?;
+                owner.within_budget()?;
+                check_cancelled(&cancelled)?;
                 let next = owner
                     .receiver
-                    .write_chunk(path, offset, &bytes, digest(&value["chunk_sha256"])?)
+                    .write_chunk(path, offset, &bytes, chunk_sha256)
                     .map_err(|error| error.to_string())?;
                 // Accepted filesystem writes do not make an expired transfer
                 // live again. Do not acknowledge progress after the deadline.
@@ -1848,7 +1957,7 @@ impl SourceTransferState {
                 // A completed member can survive a disconnect before the rest
                 // of the source tree arrives. Only verified independent bytes
                 // enter the cache; the receiver still needs its full final seal.
-                owner.checkpoint_completed_file(path, next)?;
+                owner.checkpoint_chunk(path, offset, &bytes, next)?;
                 owner.within_budget()?;
                 check_cancelled(&cancelled)?;
                 Ok(json!({"kind":"source-chunk-accepted", "request_id":id,
@@ -1996,7 +2105,11 @@ mod tests {
     #[test]
     fn crash_residue_fences_old_passive_and_new_cache_owners_without_destroying_reads() {
         use rabs_sandbox::source_transfer::SOURCE_PROJECTION_PREFIX;
-        let parent = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let passive = SourceCache::open(parent.path(), 1).unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -2056,7 +2169,11 @@ mod tests {
 
     #[test]
     fn source_cache_refuses_writable_runtime_aliases() {
-        let parent = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let cache = SourceCache::open(parent.path(), DEFAULT_SOURCE_CACHE_BYTES).unwrap();
         let runtime = tempfile::tempdir().unwrap();
         cache.validate_runtime_root(runtime.path()).unwrap();

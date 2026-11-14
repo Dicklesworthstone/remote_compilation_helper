@@ -24,7 +24,8 @@ use rabs_sandbox::generated_source::GeneratedSource;
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
+    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, MAX_SOURCE_PREFIX_HINT_BYTES, SOURCE_PREFIX_REUSE_VERSION,
+    SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
 use rabs_sandbox::toolchain_cache::RetainedToolchain;
 use rabs_sandbox::toolchain_dataset::{
@@ -108,6 +109,48 @@ impl PreparedLocalBundle {
 pub const MAX_SOURCE_ROOTS: usize = 64;
 // Outstanding chunks, not concurrent filesystem writers on the worker.
 const SOURCE_WINDOW: usize = 4;
+
+#[derive(Clone, Copy)]
+struct SourceResume {
+    offset: u64,
+    sha256: [u8; 32],
+}
+
+impl SourceResume {
+    fn empty() -> Self {
+        Self {
+            offset: 0,
+            sha256: Sha256::digest([]).into(),
+        }
+    }
+
+    /// A receiver's cache hint cannot select an offset until the retained
+    /// sender bytes independently verify that exact prefix. Check cancellation
+    /// during hashing just as during ordinary network transfer.
+    fn select<P: WorkerPeer + ?Sized>(
+        peer: &mut P,
+        bytes: &[u8],
+        offered: Option<&Self>,
+    ) -> io::Result<Self> {
+        if let Some(offered) = offered {
+            let length = usize::try_from(offered.offset)
+                .map_err(|_| invalid("source prefix offset exceeds retained address space"))?;
+            let prefix = bytes
+                .get(..length)
+                .ok_or_else(|| invalid("source prefix exceeds retained source bytes"))?;
+            let mut hash = Sha256::new();
+            for chunk in prefix.chunks(MAX_SOURCE_CHUNK) {
+                peer.checkpoint()?;
+                hash.update(chunk);
+            }
+            peer.checkpoint()?;
+            if <[u8; 32]>::from(hash.finalize()) == offered.sha256 {
+                return Ok(*offered);
+            }
+        }
+        Ok(Self::empty())
+    }
+}
 
 fn manifest_value(manifest: &SourceManifest) -> Value {
     json!({"manifest_sha256":hex(&manifest.digest()),
@@ -1069,7 +1112,8 @@ impl SourceUpload {
 
     fn begin_frame(&self, request: &Value) -> Value {
         let mut frame = json!({"kind":"source-begin", "request_id":request["request_id"],
-            "manifest":self.wire_manifest(), "allow_cached_files":true});
+            "manifest":self.wire_manifest(), "allow_cached_files":true,
+            "source_prefix_reuse":SOURCE_PREFIX_REUSE_VERSION});
         if let Some(home) = request.get("cargo_home") {
             frame["cargo_home"] = home.clone();
         }
@@ -1108,6 +1152,78 @@ impl SourceUpload {
             missing.insert(path.to_owned());
         }
         Ok(Some(missing))
+    }
+
+    /// Prefix reuse is an optional extension of the existing missing-file
+    /// exchange. Older workers omit the exact echo and receive ordinary chunks
+    /// without resume fields; unsolicited or malformed hints fail closed.
+    fn source_prefixes(
+        &self,
+        reply: &Value,
+        missing: Option<&BTreeSet<String>>,
+    ) -> io::Result<Option<BTreeMap<String, SourceResume>>> {
+        let Some(version) = reply.get("source_prefix_reuse") else {
+            require(
+                reply.get("prefixes").is_none(),
+                "source prefixes were not negotiated",
+            )?;
+            return Ok(None);
+        };
+        require(
+            version.as_str() == Some(SOURCE_PREFIX_REUSE_VERSION),
+            "unsupported source prefix reuse selection",
+        )?;
+        let missing = missing
+            .ok_or_else(|| invalid("source prefix reuse requires an explicit missing-file list"))?;
+        let rows = reply["prefixes"]
+            .as_array()
+            .filter(|rows| rows.len() <= missing.len())
+            .ok_or_else(|| invalid("source prefix list is absent or exceeds the missing set"))?;
+        let mut prefixes = BTreeMap::new();
+        let mut previous: Option<&str> = None;
+        let mut encoded_bytes = 2_usize; // JSON array brackets.
+        for row in rows {
+            require(
+                row.as_object().is_some_and(|object| {
+                    object.len() == 3
+                        && ["path", "offset", "sha256"]
+                            .iter()
+                            .all(|field| object.contains_key(*field))
+                }),
+                "source prefix has invalid fields",
+            )?;
+            let path = row["path"]
+                .as_str()
+                .ok_or_else(|| invalid("source prefix path is not a string"))?;
+            let index = self
+                .manifest
+                .files()
+                .binary_search_by(|file| file.path.as_str().cmp(path))
+                .map_err(|_| {
+                    invalid("source prefix names a file outside the approved projection")
+                })?;
+            let file = &self.manifest.files()[index];
+            require(
+                missing.contains(path) && previous.is_none_or(|last| last < path),
+                "source prefixes must be sorted, unique and missing on the worker",
+            )?;
+            let offset = row["offset"]
+                .as_u64()
+                .filter(|offset| *offset > 0 && *offset < file.len)
+                .ok_or_else(|| {
+                    invalid("source prefix must be a strict nonempty part of its file")
+                })?;
+            let sha256 = digest(&row["sha256"])?;
+            // Serialize only a structurally bounded row: manifest membership
+            // bounds its path, and the digest/offset have already been checked.
+            encoded_bytes = encoded_bytes
+                .checked_add(serde_json::to_vec(row)?.len() + usize::from(previous.is_some()))
+                .filter(|bytes| *bytes <= MAX_SOURCE_PREFIX_HINT_BYTES)
+                .ok_or_else(|| invalid("source prefix hints exceed their byte bound"))?;
+            previous = Some(path);
+            prefixes.insert(path.to_owned(), SourceResume { offset, sha256 });
+        }
+        Ok(Some(prefixes))
     }
 
     pub fn validate_request(&self, request: &Value) -> io::Result<()> {
@@ -1343,6 +1459,7 @@ impl SourceUpload {
             "worker did not accept the exact Cargo home replay selection",
         )?;
         let missing = self.missing_files(&reply)?;
+        let prefixes = self.source_prefixes(&reply, missing.as_ref())?;
         // Four bounded chunks fit below the worker's eight-frame / 2 MiB
         // deferred-source limit, including maximum encoded paths and hashes.
         // Keep the window full across files: one validated acknowledgment
@@ -1375,14 +1492,28 @@ impl SourceUpload {
                 continue;
             }
             let bytes = self.file_bytes(&file.path)?;
-            for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                let offset = (index as u64) * MAX_SOURCE_CHUNK as u64;
+            let resume = prefixes
+                .as_ref()
+                .map(|prefixes| SourceResume::select(peer, bytes, prefixes.get(&file.path)))
+                .transpose()?;
+            let start = resume.map_or(0, |resume| resume.offset);
+            let start_index = usize::try_from(start)
+                .map_err(|_| invalid("source resume offset exceeds retained address space"))?;
+            let tail = bytes
+                .get(start_index..)
+                .ok_or_else(|| invalid("source resume offset exceeds retained source bytes"))?;
+            for (index, chunk) in tail.chunks(MAX_SOURCE_CHUNK).enumerate() {
+                let offset = start + (index as u64) * MAX_SOURCE_CHUNK as u64;
                 let next = offset + chunk.len() as u64;
-                peer.send(
-                    &json!({"kind":"source-chunk", "request_id":id, "manifest_sha256":identity,
+                let mut frame = json!({"kind":"source-chunk", "request_id":id, "manifest_sha256":identity,
                     "path":file.path, "offset":offset, "data_hex":hex(chunk),
-                    "chunk_sha256":hex(&Sha256::digest(chunk))}),
-                )?;
+                    "chunk_sha256":hex(&Sha256::digest(chunk))});
+                if index == 0
+                    && let Some(resume) = resume
+                {
+                    frame["resume"] = json!({"offset":resume.offset, "sha256":hex(&resume.sha256)});
+                }
+                peer.send(&frame)?;
                 outstanding.push_back((file.path.as_str(), next));
                 if outstanding.len() == SOURCE_WINDOW {
                     acknowledge_one(peer, &mut outstanding)?;
@@ -1491,6 +1622,7 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
 #[cfg(all(test, unix))]
 mod tests {
     mod cargo_home_tests;
+    mod prefix_tests;
 
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
