@@ -1,4 +1,4 @@
-//! Local byte hints for an explicitly resumed, still-retained worker result.
+//! Local byte hints for a resumed, still-retained worker result.
 //!
 //! An abandoned directory is never promoted to a delivery and is never edited.
 //! Its ordinary files may supply prefixes in a NEW private staging directory.
@@ -21,9 +21,10 @@ use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-/// An operator-selected, read-only source of candidate prefixes. This is NOT a
-/// verified delivery, retained-result identity, or permission to execute work.
-#[derive(Debug)]
+/// A locally selected, read-only source of candidate prefixes. Explicit operator
+/// recovery or the still-owned live attempt selects it; worker JSON cannot.
+/// This is NOT a verified delivery, result identity, or permission to execute.
+#[derive(Debug, Clone)]
 pub struct ResumeSource {
     root: PathBuf,
     identity: Metadata,
@@ -156,7 +157,9 @@ impl ResumeSource {
         expected_length: u64,
         target: &mut File,
         hasher: &mut Sha256,
+        mut checkpoint: impl FnMut() -> io::Result<()>,
     ) -> io::Result<u64> {
+        checkpoint()?;
         require(
             matches!(group, "artifacts" | "diagnostics")
                 && safe_name(name)
@@ -172,6 +175,7 @@ impl ResumeSource {
         let mut directories = Vec::new();
         let mut components = std::iter::once(group).chain(name.split('/')).peekable();
         while let Some(component) = components.next() {
+            checkpoint()?;
             path.push(component);
             let before = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -203,12 +207,15 @@ impl ResumeSource {
             let mut remaining = before.len();
             let mut bytes = [0_u8; CHUNK_BYTES];
             while remaining != 0 {
+                checkpoint()?;
                 let count = remaining.min(CHUNK_BYTES as u64) as usize;
                 source.read_exact(&mut bytes[..count])?;
+                checkpoint()?;
                 target.write_all(&bytes[..count])?;
                 hasher.update(&bytes[..count]);
                 remaining -= count as u64;
             }
+            checkpoint()?;
             require(
                 source.read(&mut bytes[..1])? == 0
                     && same_file(&before, &source.metadata()?)
@@ -223,6 +230,7 @@ impl ResumeSource {
                 )?;
             }
             self.check_root()?;
+            checkpoint()?;
             return Ok(before.len());
         }
         Err(invalid("missing resume member"))
@@ -287,7 +295,14 @@ mod tests {
     ) -> io::Result<(u64, Vec<u8>, String)> {
         let output = tempfile::NamedTempFile::new_in(owner)?;
         let mut hash = Sha256::new();
-        let copied = source.copy_prefix(group, name, len, &mut output.reopen()?, &mut hash)?;
+        let copied = source.copy_prefix(
+            group,
+            name,
+            len,
+            &mut output.reopen()?,
+            &mut hash,
+            || Ok(()),
+        )?;
         let digest = hash
             .finalize()
             .iter()

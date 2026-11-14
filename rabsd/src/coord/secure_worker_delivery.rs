@@ -1715,6 +1715,7 @@ pub(crate) fn receive_standby_with_admission(
     request: &Value,
     destination: &Path,
     upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
     cancellation: OperationCancellation,
     on_admitted: Option<WorkerAdmissionHook>,
     continuation: Option<SealedResult>,
@@ -1741,7 +1742,7 @@ pub(crate) fn receive_standby_with_admission(
         destination,
         mode,
         upload,
-        None,
+        resume_source,
         cancellation,
         None,
         on_admitted,
@@ -1792,7 +1793,6 @@ fn receive_authenticated_inner(
         require(
             mode == DeliveryMode::Resume
                 && upload.is_none()
-                && resume_source.is_none()
                 && on_admitted.is_none()
                 && observer.is_none(),
             "live result continuation requires an isolated result-only transfer",

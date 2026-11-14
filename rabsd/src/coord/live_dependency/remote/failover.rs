@@ -15,7 +15,7 @@ use super::{
 };
 use crate::coord::action_actor::{AttemptPurpose, MAX_RETRIES_PER_GENERATION};
 use crate::coord::remote_dependency_transport::locality::{ProducedObject, WorkerProcess};
-use crate::coord::worker_delivery::{Delivery, DeliveryFailure, SealedResult};
+use crate::coord::worker_delivery::{Delivery, DeliveryFailure, ResumeSource, SealedResult};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io;
@@ -309,6 +309,15 @@ fn continue_delivery(
     verify_request(request)
         .and_then(|()| invocation.validation.verify(request))
         .map_err(&refused)?;
+    if failure.directory != original.path().join("delivery") {
+        return Err(refused(
+            "partial result differs from its original live delivery custody".into(),
+        ));
+    }
+    // Keep the old directory's owner alive until the complete replacement is
+    // verified. Its bytes remain untrusted hints, never result/publication proof.
+    let prefixes = ResumeSource::open(&failure.directory)
+        .map_err(|error| refused(format!("open original result prefixes: {error}")))?;
     let mut directory = recovery::ResultDirectory::new(&remote.state)
         .map_err(|error| refused(format!("create result continuation custody: {error}")))?;
     directory
@@ -320,7 +329,7 @@ fn continue_delivery(
         .map_err(|error| refused(format!("persist result continuation custody: {error}")))?;
     let destination = directory.path().join("delivery");
     let delivery = reservation
-        .continue_result(&wire, &destination, cancellation)
+        .continue_result(&wire, &destination, prefixes, cancellation)
         .map_err(|error| {
             refused(format!(
                 "result continuation failed: {}; retained continuation directory: {}",

@@ -20,8 +20,8 @@ use super::source_delivery::SourceUpload;
 #[cfg(test)]
 use super::worker_delivery::worker_transport_error;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, SealedResult, toolchain_transfer, transport_interrupted,
-    validate_request,
+    Delivery, DeliveryFailure, ResumeSource, SealedResult, toolchain_transfer,
+    transport_interrupted, validate_request,
 };
 use rabs_asupersync::worker_transport::TlsFiles;
 use rabs_protocol::worker_fence::WorkerSessionOffer;
@@ -111,7 +111,10 @@ enum ReservedOperation<'a> {
         upload: &'a SourceUpload,
         on_admitted: WorkerAdmissionHook,
     },
-    Continue(Box<SealedResult>),
+    Continue {
+        sealed: Box<SealedResult>,
+        prefixes: ResumeSource,
+    },
 }
 
 /// A connection-local placement hint. These generations are unrelated to
@@ -554,7 +557,7 @@ impl RemoteDependencyTransport {
         cancellation: OperationCancellation,
         operation: ReservedOperation<'_>,
     ) -> Result<Delivery, DeliveryFailure> {
-        let continuing = matches!(&operation, ReservedOperation::Continue(_));
+        let continuing = matches!(&operation, ReservedOperation::Continue { .. });
         let before_dispatch = |error| {
             let mut failure = failure(destination, error);
             // A connection failure on this path can never erase the original
@@ -563,7 +566,7 @@ impl RemoteDependencyTransport {
             failure
         };
         let mut connection_deadline = Instant::now() + CONNECT_BUDGET;
-        if let ReservedOperation::Continue(sealed) = &operation {
+        if let ReservedOperation::Continue { sealed, .. } = &operation {
             connection_deadline = connection_deadline.min(sealed.deadline());
         }
         if asupersync::cx::Cx::current().is_some() {
@@ -578,8 +581,11 @@ impl RemoteDependencyTransport {
             ReservedOperation::Execute { upload, .. } => {
                 preflight(request, upload, destination).map_err(&before_dispatch)?;
             }
-            ReservedOperation::Continue(sealed) => {
+            ReservedOperation::Continue { sealed, prefixes } => {
                 sealed.verify_request(request).map_err(&before_dispatch)?;
+                prefixes
+                    .validate_destination(destination)
+                    .map_err(&before_dispatch)?;
                 if !absolute_without_traversal(destination) {
                     return Err(before_dispatch(invalid(
                         "remote dependency destination must be absolute without traversal",
@@ -608,7 +614,9 @@ impl RemoteDependencyTransport {
                 upload: Box::new(upload.clone()),
                 on_admitted,
             },
-            ReservedOperation::Continue(sealed) => standby::Operation::Continue(sealed),
+            ReservedOperation::Continue { sealed, prefixes } => {
+                standby::Operation::Continue { sealed, prefixes }
+            }
         };
         listener.deliver(standby::Assignment {
             admission,
@@ -784,12 +792,14 @@ impl RemoteDependencyReservation {
 
     /// Reconnect once for the exact result already observed by this reservation.
     /// No upload, admission callback, lease renewal or compiler dispatch exists
-    /// on this path. The receiver rehashes every delivered byte; partial local
-    /// files remain private recovery custody and are not copied without bounds.
+    /// on this path. Partial local files stay in their original private custody;
+    /// the receiver copies bounded prefixes into the new directory and hashes
+    /// them with downloaded tails under the original transfer deadline.
     pub(crate) fn continue_result(
         &mut self,
         request: &Value,
         destination: &Path,
+        prefixes: ResumeSource,
         cancellation: OperationCancellation,
     ) -> Result<Delivery, DeliveryFailure> {
         let refuse = |reason: &str| DeliveryFailure {
@@ -816,7 +826,10 @@ impl RemoteDependencyReservation {
             request,
             destination,
             cancellation.clone(),
-            ReservedOperation::Continue(Box::new(sealed)),
+            ReservedOperation::Continue {
+                sealed: Box::new(sealed),
+                prefixes,
+            },
         );
         self.transport
             .observe_delivery(&outcome, cancellation.is_cancelled(), Instant::now());

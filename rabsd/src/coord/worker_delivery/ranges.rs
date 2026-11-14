@@ -56,6 +56,7 @@ impl<'a> Download<'a> {
                 item.len,
                 &mut file,
                 &mut hasher,
+                &mut checkpoint,
             )?,
             None => 0,
         };
@@ -208,6 +209,9 @@ fn download_many<'a>(
     mut cache: Option<CacheSession>,
     prefetch: Option<&MetadataPrefetch>,
 ) -> io::Result<()> {
+    // Retain the same local root identity without borrowing the transport while
+    // copying. Prefix reads obey its cancellation and original deadline too.
+    let source = peer.resume_source().cloned();
     let mut targets = targets.fuse();
     let mut active: VecDeque<Download<'a>> = VecDeque::with_capacity(RANGE_WINDOW);
     let mut outstanding = 0_usize;
@@ -217,12 +221,12 @@ fn download_many<'a>(
                 let Some((item, manifest_hash, path)) = targets.next() else {
                     break;
                 };
-                // The explicit resume source is borrowed only for its existing
-                // prefix semantics. Artifact cache copies get a separate mutable
-                // peer checkpoint, and are disabled whenever that source exists.
-                let source = peer.resume_source();
-                let file = if source.is_some() {
-                    Download::open(item, manifest_hash, &path, source, None, None, || Ok(()))?
+                // Explicit local prefixes retain their strict corruption
+                // refusal; no separate byte-cache hit may conceal a bad hint.
+                let file = if let Some(source) = &source {
+                    Download::open(item, manifest_hash, &path, Some(source), None, None, || {
+                        peer.checkpoint()
+                    })?
                 } else {
                     Download::open(
                         item,

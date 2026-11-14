@@ -667,3 +667,380 @@ fn byte_hint_wrappers_preserve_live_evidence_and_original_deadline() {
     );
     finish(peer, server);
 }
+
+// No socket or runtime is needed for these receiver regressions. The frames and
+// authentication facts are explicit protocol fixtures; all partial downloads,
+// prefix copies, complete hashes, receipts and failure retention are real files.
+mod prefix_resume {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::fs;
+
+    #[derive(Clone)]
+    struct Bytes {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        artifact: Vec<u8>,
+    }
+
+    impl Default for Bytes {
+        fn default() -> Self {
+            Self {
+                stdout: STDOUT.to_vec(),
+                stderr: STDERR.to_vec(),
+                artifact: (0..CHUNK_BYTES * 3 + 37)
+                    .map(|index| (index % 251) as u8)
+                    .collect(),
+            }
+        }
+    }
+
+    struct Peer {
+        replies: VecDeque<Value>,
+        sent: Vec<Value>,
+        result: Value,
+        bytes: Bytes,
+        negotiated: bool,
+        deadline: Instant,
+        continuation: Option<SealedResult>,
+        interrupt_artifact: bool,
+        broken: bool,
+        stop_after_copy: Option<(PathBuf, io::ErrorKind)>,
+        requested_bytes: usize,
+    }
+
+    impl Peer {
+        fn new(bytes: Bytes, resumed: bool) -> Self {
+            let mut session = Session::new(resumed, Ending::Complete);
+            session.result["stdout_bytes"] = json!(bytes.stdout.len());
+            session.result["stdout_sha256"] = json!(hash(&bytes.stdout));
+            session.result["stderr_bytes"] = json!(bytes.stderr.len());
+            session.result["stderr_sha256"] = json!(hash(&bytes.stderr));
+            session.result["artifact_manifest"] = artifact_manifest(&bytes.artifact, false);
+            Self {
+                replies: VecDeque::from([session.hello]),
+                sent: Vec::new(),
+                result: session.result,
+                bytes,
+                negotiated: false,
+                deadline: Instant::now() + Duration::from_secs(30),
+                continuation: None,
+                interrupt_artifact: false,
+                broken: false,
+                stop_after_copy: None,
+                requested_bytes: 0,
+            }
+        }
+
+        fn continued(bytes: Bytes, sealed: &SealedResult) -> Self {
+            let mut peer = Self::new(bytes, true);
+            peer.deadline = sealed.deadline();
+            peer.continuation = Some(sealed.clone());
+            peer
+        }
+
+        fn range(&mut self, frame: &Value) -> io::Result<Value> {
+            let artifact = frame["kind"] == "artifact-read";
+            let name = frame[if artifact { "name" } else { "stream" }]
+                .as_str()
+                .ok_or_else(|| io::Error::other("fixture range has no member"))?;
+            let bytes = match (artifact, name) {
+                (true, "a") => &self.bytes.artifact,
+                (false, "stdout") => &self.bytes.stdout,
+                (false, "stderr") => &self.bytes.stderr,
+                _ => return Err(io::Error::other("unexpected fixture member")),
+            };
+            let start = frame["offset"].as_u64().unwrap() as usize;
+            let maximum = frame["max_bytes"].as_u64().unwrap() as usize;
+            let end = start.saturating_add(maximum).min(bytes.len());
+            let data = bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::other("fixture range exceeds member"))?;
+            self.requested_bytes += data.len();
+            let mut chunk = json!({
+                "kind":if artifact { "artifact-chunk" } else { "output-chunk" },
+                "request_id":7, "offset":start, "next_offset":end,
+                "total_bytes":bytes.len(), "sha256":hash(bytes),
+                "chunk_sha256":hash(data), "eof":end == bytes.len(),
+                "data_hex":rabs_protocol::raw_bytes::encode_hex(data),
+            });
+            chunk[if artifact { "name" } else { "stream" }] = json!(name);
+            if artifact {
+                chunk["manifest_sha256"] =
+                    self.result["artifact_manifest"]["manifest_sha256"].clone();
+                chunk["executable"] = json!(false);
+            }
+            Ok(chunk)
+        }
+    }
+
+    impl WorkerPeer for Peer {
+        fn send(&mut self, frame: &Value) -> io::Result<()> {
+            self.checkpoint()?;
+            assert!(!self.broken, "failed transport must not send again");
+            self.sent.push(frame.clone());
+            match frame["kind"].as_str() {
+                Some("session-ok") => self.negotiated = true,
+                Some("canonical-exec" | "result-resume") => {
+                    self.replies.push_back(self.result.clone());
+                }
+                Some("output-read" | "artifact-read") => {
+                    let chunk = self.range(frame)?;
+                    self.replies.push_back(chunk);
+                }
+                Some("output-ack" | "artifact-ack") => {
+                    self.replies.push_back(json!({
+                        "kind":if frame["kind"] == "output-ack" {
+                            "output-acknowledged"
+                        } else {
+                            "artifact-acknowledged"
+                        },
+                        "request_id":7, "already_released":false,
+                    }));
+                }
+                _ => return Err(io::Error::other("unexpected fixture request")),
+            }
+            Ok(())
+        }
+
+        fn receive(&mut self) -> io::Result<Value> {
+            self.checkpoint()?;
+            assert!(!self.broken, "failed transport must not read again");
+            let frame = self
+                .replies
+                .pop_front()
+                .ok_or_else(|| io::Error::other("fixture has no reply"))?;
+            if self.interrupt_artifact
+                && frame["kind"] == "artifact-chunk"
+                && frame["offset"].as_u64().unwrap() >= CHUNK_BYTES as u64
+            {
+                self.broken = true;
+                return Err(worker_transport_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fixture disconnect after a verified artifact prefix",
+                )));
+            }
+            Ok(frame)
+        }
+
+        fn authentication(&self) -> Option<WorkerAuthentication> {
+            self.negotiated.then(|| authentication(23))
+        }
+
+        fn transfer_deadline(&self) -> Option<Instant> {
+            Some(self.deadline)
+        }
+
+        fn live_continuation(&self) -> Option<&SealedResult> {
+            self.continuation.as_ref()
+        }
+
+        fn checkpoint(&mut self) -> io::Result<()> {
+            if let Some((path, kind)) = &self.stop_after_copy
+                && fs::metadata(path).is_ok_and(|metadata| metadata.len() >= CHUNK_BYTES as u64)
+            {
+                return Err(io::Error::new(
+                    *kind,
+                    "stop after actual prefix copy progress",
+                ));
+            }
+            if Instant::now() >= self.deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "original deadline"));
+            }
+            Ok(())
+        }
+    }
+
+    fn interrupted(owner: &Path, bytes: &Bytes) -> (SealedResult, PathBuf) {
+        let directory = owner.join("original");
+        let mut peer = Peer::new(bytes.clone(), false);
+        peer.interrupt_artifact = true;
+        let failure = receive_operation(
+            &mut peer,
+            &request(),
+            "worker",
+            &directory,
+            DeliveryMode::Execute,
+        )
+        .unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.transport_interrupted);
+        assert_eq!(count(&peer.sent, "canonical-exec"), 1);
+        assert_eq!(count(&peer.sent, "result-resume"), 0);
+        assert_eq!(count(&peer.sent, "output-ack"), 0);
+        assert_eq!(count(&peer.sent, "artifact-ack"), 0);
+        assert_eq!(
+            fs::read(directory.join("diagnostics/stdout")).unwrap(),
+            bytes.stdout
+        );
+        assert_eq!(
+            fs::read(directory.join("diagnostics/stderr")).unwrap(),
+            bytes.stderr
+        );
+        assert_eq!(
+            fs::read(directory.join("artifacts/a")).unwrap(),
+            bytes.artifact[..CHUNK_BYTES],
+        );
+        assert!(!directory.join("delivery.json").exists());
+        (*failure.sealed_result.unwrap(), directory)
+    }
+
+    #[test]
+    fn live_continuation_reuses_partial_download_and_requests_only_the_missing_tail() {
+        let owner = tempfile::tempdir().unwrap();
+        let bytes = Bytes::default();
+        let (sealed, original) = interrupted(owner.path(), &bytes);
+        let source = ResumeSource::open(&original).unwrap();
+        let mut peer = Peer::continued(bytes.clone(), &sealed);
+        let destination = owner.path().join("continued");
+        let delivery = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source),
+            &request(),
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap();
+        sealed.verify_delivery(&delivery, &request()).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(count(&peer.sent, "canonical-exec"), 0);
+        assert_eq!(count(&peer.sent, "result-resume"), 1);
+        assert_eq!(count(&peer.sent, "output-read"), 0);
+        assert_eq!(peer.requested_bytes, bytes.artifact.len() - CHUNK_BYTES);
+        let offsets: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "artifact-read")
+            .map(|frame| frame["offset"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                CHUNK_BYTES as u64,
+                2 * CHUNK_BYTES as u64,
+                3 * CHUNK_BYTES as u64
+            ]
+        );
+        assert_eq!(
+            fs::read(destination.join("artifacts/a")).unwrap(),
+            bytes.artifact
+        );
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            bytes.stdout
+        );
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stderr")).unwrap(),
+            bytes.stderr
+        );
+        assert_eq!(
+            fs::read(original.join("artifacts/a")).unwrap(),
+            bytes.artifact[..CHUNK_BYTES]
+        );
+        assert!(!original.join("delivery.json").exists());
+    }
+
+    #[test]
+    fn live_continuation_stop_during_local_copy_retains_original_and_partial_new_bytes() {
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::TimedOut] {
+            let owner = tempfile::tempdir().unwrap();
+            let bytes = Bytes {
+                stdout: vec![0x37; CHUNK_BYTES * 3 + 11],
+                ..Bytes::default()
+            };
+            let (sealed, original) = interrupted(owner.path(), &bytes);
+            let source = ResumeSource::open(&original).unwrap();
+            let mut peer = Peer::continued(bytes.clone(), &sealed);
+            let destination = owner.path().join("continued");
+            let copied = destination.join("diagnostics/stdout");
+            peer.stop_after_copy = Some((copied.clone(), kind));
+            let failure = receive_operation(
+                &mut ResumePeer::new(&mut peer, &source),
+                &request(),
+                "worker",
+                &destination,
+                DeliveryMode::Resume,
+            )
+            .unwrap_err();
+            assert!(failure.execution_may_have_run);
+            assert!(!failure.transport_interrupted);
+            assert!(failure.sealed_result.is_none());
+            assert_eq!(fs::metadata(&copied).unwrap().len(), CHUNK_BYTES as u64);
+            assert_eq!(fs::read(copied).unwrap(), bytes.stdout[..CHUNK_BYTES]);
+            assert_eq!(
+                fs::read(original.join("diagnostics/stdout")).unwrap(),
+                bytes.stdout
+            );
+            assert_eq!(
+                fs::read(original.join("artifacts/a")).unwrap(),
+                bytes.artifact[..CHUNK_BYTES]
+            );
+            assert!(!destination.join("delivery.json").exists());
+            assert_eq!(count(&peer.sent, "canonical-exec"), 0);
+            assert_eq!(count(&peer.sent, "result-resume"), 1);
+            assert_eq!(count(&peer.sent, "output-read"), 0);
+            assert_eq!(count(&peer.sent, "artifact-read"), 0);
+            assert_eq!(count(&peer.sent, "output-ack"), 0);
+            assert_eq!(count(&peer.sent, "artifact-ack"), 0);
+        }
+    }
+
+    #[test]
+    fn live_continuation_corrupt_local_prefix_never_acks_or_reexecutes() {
+        let owner = tempfile::tempdir().unwrap();
+        let bytes = Bytes::default();
+        let (sealed, original) = interrupted(owner.path(), &bytes);
+        let corrupt = vec![0x91; CHUNK_BYTES];
+        fs::write(original.join("artifacts/a"), &corrupt).unwrap();
+        let source = ResumeSource::open(&original).unwrap();
+        let mut peer = Peer::continued(bytes, &sealed);
+        let destination = owner.path().join("continued");
+        let failure = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source),
+            &request(),
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap_err();
+        assert!(failure.detail.contains("complete file digest mismatch"));
+        assert!(failure.execution_may_have_run);
+        assert!(!failure.transport_interrupted);
+        assert!(failure.sealed_result.is_none());
+        assert_eq!(fs::read(original.join("artifacts/a")).unwrap(), corrupt);
+        assert!(!destination.join("delivery.json").exists());
+        assert_eq!(count(&peer.sent, "canonical-exec"), 0);
+        assert_eq!(count(&peer.sent, "result-resume"), 1);
+        assert_eq!(count(&peer.sent, "output-ack"), 0);
+        assert_eq!(count(&peer.sent, "artifact-ack"), 0);
+    }
+
+    #[test]
+    fn changed_sealed_result_refuses_before_copying_or_requesting_any_byte() {
+        let owner = tempfile::tempdir().unwrap();
+        let bytes = Bytes::default();
+        let (sealed, original) = interrupted(owner.path(), &bytes);
+        let source = ResumeSource::open(&original).unwrap();
+        let mut peer = Peer::continued(bytes, &sealed);
+        peer.result["retained_result_sha256"] = json!(hash(b"different sealed result"));
+        let destination = owner.path().join("continued");
+        let failure = receive_operation(
+            &mut ResumePeer::new(&mut peer, &source),
+            &request(),
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(!failure.transport_interrupted);
+        assert!(failure.sealed_result.is_none());
+        assert!(!destination.join("diagnostics/stdout").exists());
+        assert!(!destination.join("delivery.json").exists());
+        assert_eq!(peer.requested_bytes, 0);
+        assert_eq!(count(&peer.sent, "canonical-exec"), 0);
+        assert_eq!(count(&peer.sent, "result-resume"), 1);
+        assert_eq!(count(&peer.sent, "output-ack"), 0);
+        assert_eq!(count(&peer.sent, "artifact-ack"), 0);
+    }
+}

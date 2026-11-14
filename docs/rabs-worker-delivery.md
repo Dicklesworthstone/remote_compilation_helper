@@ -489,10 +489,16 @@ The new authenticated connection must identify the same pinned worker, boot
 generation and process incarnation, with the original request still at its
 durable high-water mark. The receiver compares the retained result digest,
 complete diagnostics, artifact names, modes and byte identities before any
-range request or release acknowledgment. It downloads and hashes the full result
-into a separate private directory. The original transfer deadline also bounds
-reconnection, authentication, download and acknowledgment; reconnecting does
-not extend it. A successful recovery reports
+range request or release acknowledgment. It reconstructs and hashes the full result
+into a separate private directory, copying already received diagnostic and
+artifact prefixes from the original private delivery and requesting only their
+missing tails. Complete local files avoid a network read after their full hash
+passes. Every copied prefix and downloaded tail participates in the same final
+file digest; corrupt local bytes refuse the continuation without acknowledging
+the worker or dispatching execution. Local copies check cancellation and the
+original deadline between bounded 64 KiB operations. The original transfer
+deadline also bounds reconnection, authentication, download and acknowledgment;
+reconnecting does not extend it. A successful recovery reports
 `rabsd-remote-dependency-result-continued` with the action, worker and request ID.
 
 Cancellation, a changed input generation, a restarted worker, protocol or

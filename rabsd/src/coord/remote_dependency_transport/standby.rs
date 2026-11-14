@@ -11,7 +11,7 @@ use crate::coord::secure_worker_delivery::{
 };
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{
-    Delivery, DeliveryFailure, SealedResult, worker_transport_error,
+    Delivery, DeliveryFailure, ResumeSource, SealedResult, worker_transport_error,
 };
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{Runtime, RuntimeBuilder};
@@ -221,7 +221,10 @@ pub(super) enum Operation {
         upload: Box<SourceUpload>,
         on_admitted: WorkerAdmissionHook,
     },
-    Continue(Box<SealedResult>),
+    Continue {
+        sealed: Box<SealedResult>,
+        prefixes: ResumeSource,
+    },
 }
 
 pub(super) struct Assignment {
@@ -236,7 +239,7 @@ pub(super) struct Assignment {
 impl Assignment {
     fn before_dispatch(&self, error: io::Error) -> DeliveryFailure {
         let mut failure = failure(&self.destination, error);
-        failure.execution_may_have_run = matches!(self.operation, Operation::Continue(_));
+        failure.execution_may_have_run = matches!(self.operation, Operation::Continue { .. });
         failure
     }
 
@@ -529,7 +532,7 @@ impl Listener {
 
     pub(super) fn deliver(&self, assignment: Assignment) -> Result<Delivery, DeliveryFailure> {
         let destination = assignment.destination.clone();
-        let continuing = matches!(assignment.operation, Operation::Continue(_));
+        let continuing = matches!(assignment.operation, Operation::Continue { .. });
         let (result, completed) = mpsc::sync_channel(1);
         self.mailbox
             .submit(Job { assignment, result })
@@ -785,12 +788,12 @@ fn deliver_assigned(
             })
         );
     }
-    let (upload, admitted, continuation) = match assignment.operation {
+    let (upload, admitted, continuation, prefixes) = match assignment.operation {
         Operation::Execute {
             upload,
             on_admitted,
-        } => (Some(upload), Some(on_admitted), None),
-        Operation::Continue(sealed) => (None, None, Some(*sealed)),
+        } => (Some(upload), Some(on_admitted), None, None),
+        Operation::Continue { sealed, prefixes } => (None, None, Some(*sealed), Some(prefixes)),
     };
     receive_standby_with_admission(
         runtime,
@@ -799,6 +802,7 @@ fn deliver_assigned(
         &assignment.request,
         &assignment.destination,
         upload.as_deref(),
+        prefixes.as_ref(),
         assignment.cancellation,
         admitted,
         continuation,
