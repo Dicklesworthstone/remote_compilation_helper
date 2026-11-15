@@ -27,7 +27,7 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
-use operations::{Attachment, Claim, DiagnosticFrontier, Registry};
+use operations::{Attachment, Claim, DiagnosticFrontier, Reaper, Registry};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
@@ -283,21 +283,32 @@ impl Drop for Session {
     }
 }
 
-#[derive(Default)]
-struct Sessions(Vec<Session>);
+struct Sessions {
+    connections: Vec<Session>,
+    // Fields drop in this order: all session-owned writers join before the
+    // final reaper join. Drop first signals both sets of owners together.
+    reaper: Reaper<RemoteBuild>,
+}
 
 impl Sessions {
+    fn new(operations: Arc<Registry<RemoteBuild>>) -> io::Result<Self> {
+        Ok(Self {
+            connections: Vec::new(),
+            reaper: Reaper::start(operations)?,
+        })
+    }
+
     fn cancel_all(&self) {
-        for session in &self.0 {
+        for session in &self.connections {
             session.stopped.store(true, Ordering::Release);
         }
     }
 
     fn reap(&mut self) {
         let mut index = 0;
-        while index < self.0.len() {
-            if self.0[index].finished() {
-                let mut session = self.0.swap_remove(index);
+        while index < self.connections.len() {
+            if self.connections[index].finished() {
+                let mut session = self.connections.swap_remove(index);
                 if let Some(thread) = session.thread.take() {
                     match thread.join() {
                         Ok(Ok(())) => {}
@@ -310,13 +321,24 @@ impl Sessions {
             }
         }
     }
+
+    fn signal_shutdown(&self) {
+        self.cancel_all();
+        self.reaper.signal_shutdown();
+    }
+
+    fn shutdown(mut self) -> io::Result<()> {
+        self.signal_shutdown();
+        self.connections.clear();
+        self.reaper.finish()
+    }
 }
 
 impl Drop for Sessions {
     fn drop(&mut self) {
-        // Cancel every operation before joining any of them. A slow drain
-        // cannot leave another client running after service shutdown begins.
-        self.cancel_all();
+        // Includes unwind: signal attached/pre-admission sessions and detached
+        // operations before any field destructor joins an operation writer.
+        self.signal_shutdown();
     }
 }
 
@@ -368,7 +390,13 @@ pub fn run_service_profile(
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
-    let mut sessions = Sessions::default();
+    let mut sessions = match Sessions::new(Arc::clone(&operations)) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            let _ = runtime.shutdown();
+            return Err(error);
+        }
+    };
     eprintln!(
         "{}",
         json!({"kind":"canonical-remote-service-listening", "version":SERVICE_VERSION,
@@ -388,7 +416,10 @@ pub fn run_service_profile(
     );
     let result = loop {
         sessions.reap();
-        operations.reap(Instant::now());
+        operations.signal_expired(Instant::now());
+        if let Err(error) = sessions.reaper.check() {
+            break Err(error);
+        }
         if shutdown.is_shutting_down() {
             break Ok(());
         }
@@ -404,7 +435,7 @@ pub fn run_service_profile(
             Ok(Err(error)) => break Err(error),
             Ok(Ok((stream, _))) => stream,
         };
-        if sessions.0.len() >= config.max_sessions() {
+        if sessions.connections.len() >= config.max_sessions() {
             // No plaintext rejection on an authenticated-only endpoint. No
             // admission took place. Only an already issued operation token
             // can reattach; a new command is never automatically replayed.
@@ -464,7 +495,7 @@ pub fn run_service_profile(
             Ok(thread) => thread,
             Err(error) => break Err(error),
         };
-        sessions.0.push(Session {
+        sessions.connections.push(Session {
             stopped,
             thread: Some(thread),
         });
@@ -473,11 +504,9 @@ pub fn run_service_profile(
     // Stop queued and pre-Ready sessions before releasing any retained permit.
     // Detached owners may take time to join; no waiting caller should acquire
     // a fresh input tree while that drain is in progress.
-    sessions.cancel_all();
-    operations.shutdown();
-    drop(sessions);
+    let session_drain = sessions.shutdown();
     let drained = runtime.shutdown();
-    result.and(drained)
+    result.and(session_drain).and(drained)
 }
 
 fn output_file(parent: &Path, name: &str) -> io::Result<File> {
@@ -1582,6 +1611,82 @@ mod tests {
     use std::pin::{Pin, pin};
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn expired_cleanup_holds_actual_admission_until_its_writer_joins() {
+        struct WriterDrain {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for WriterDrain {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test writer must be released");
+            }
+        }
+        struct OwnedOperation {
+            // Same ownership order as RemoteBuild: join the writer before
+            // releasing the real service admission, not a test counter.
+            _writer: WriterDrain,
+            _admission: AdmittedOperation,
+        }
+        struct ReleaseWriter(std::sync::mpsc::Sender<()>);
+        impl Drop for ReleaseWriter {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let admissions = OperationAdmissions::new(1, 1);
+        let admitted = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let authority = rabs_protocol::authority::CoordinatorAuthority {
+            cluster_id: rabs_protocol::authority::ClusterId("reaper-admission-test".into()),
+            credential_generation: 1,
+            term: 1,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
+        };
+        let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
+        let expired = Instant::now() - Duration::from_secs(2);
+        let reservation = operations
+            .reserve(
+                [1; 32],
+                Arc::new(AtomicBool::new(false)),
+                expired + Duration::from_secs(5),
+                expired,
+            )
+            .unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, receiver) = std::sync::mpsc::channel();
+        reservation
+            .activate(
+                OwnedOperation {
+                    _writer: WriterDrain {
+                        entered,
+                        release: receiver,
+                    },
+                    _admission: admitted,
+                },
+                expired + Duration::from_secs(60),
+                expired,
+            )
+            .unwrap()
+            .detach(expired)
+            .unwrap();
+        let mut reaper = Reaper::start(operations).unwrap();
+        let release = ReleaseWriter(release);
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let mut waiting = admissions.enqueue().unwrap();
+        assert!(waiting.try_start().unwrap().is_none());
+        assert!(admissions.enqueue().is_err());
+        drop(release);
+        reaper.finish().unwrap();
+        let next = waiting.try_start().unwrap().unwrap();
+        drop(next);
+        assert!(admissions.enqueue().unwrap().try_start().unwrap().is_some());
+    }
 
     /// An explicitly scripted transport, not a TLS/compiler substitute. Tests
     /// exercise the production queue's frame handling and permit ownership.

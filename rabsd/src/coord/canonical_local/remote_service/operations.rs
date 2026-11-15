@@ -13,8 +13,12 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const REAP_POLL: Duration = Duration::from_millis(100);
 
 fn refused() -> io::Error {
     io::Error::new(
@@ -59,6 +63,85 @@ pub(super) struct Registry<T> {
     grace: Duration,
     stopped: AtomicBool,
     entries: Mutex<BTreeMap<u128, Arc<Entry<T>>>>,
+}
+
+/// One service-owned thread drains expired detached operations. Payload drops
+/// can join Cargo and its descendants; they must not run on the listener that
+/// accepts cancellation and reconnect traffic. The registry and the payload's
+/// admission permit keep ownership bounded while this thread is draining.
+pub(super) struct Reaper<T> {
+    registry: Arc<Registry<T>>,
+    wake: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> Reaper<T> {
+    pub(super) fn start(registry: Arc<Registry<T>>) -> io::Result<Self> {
+        let (wake, receiver) = mpsc::channel();
+        let owner = Arc::clone(&registry);
+        let thread = thread::Builder::new()
+            .name("rabs-remote-operation-reaper".into())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(REAP_POLL) {
+                        Err(RecvTimeoutError::Timeout)
+                            if !owner.stopped.load(Ordering::Acquire) =>
+                        {
+                            owner.reap(Instant::now());
+                        }
+                        Ok(())
+                        | Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => break,
+                    }
+                }
+                owner.shutdown();
+            })?;
+        Ok(Self {
+            registry,
+            wake: Some(wake),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl<T> Reaper<T> {
+    pub(super) fn check(&self) -> io::Result<()> {
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(io::Error::other(
+                "remote operation cleanup thread stopped unexpectedly",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Signal every operation without joining it. The service calls this along
+    /// with session cancellation before either owner can block in its Drop.
+    pub(super) fn signal_shutdown(&self) {
+        self.registry.signal_shutdown();
+    }
+
+    pub(super) fn finish(&mut self) -> io::Result<()> {
+        self.signal_shutdown();
+        // Closing the channel wakes an idle reaper immediately. A reaper in a
+        // payload destructor is still joined, never detached on shutdown.
+        self.wake.take();
+        let result = self.thread.take().map_or(Ok(()), |thread| {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("remote operation cleanup thread panicked"))
+        });
+        // A panic may have left other detached owners in the registry. The
+        // listener is already shutting down; retain their ordinary drain path.
+        self.registry.shutdown();
+        result
+    }
+}
+
+impl<T> Drop for Reaper<T> {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            eprintln!("remote canonical cleanup: {error}");
+        }
+    }
 }
 
 pub(super) enum Claim<T> {
@@ -317,21 +400,50 @@ impl<T> Registry<T> {
 
     pub(super) fn reap(&self, now: Instant) {
         let entries = lock(&self.entries).values().cloned().collect::<Vec<_>>();
+        // One payload can wait for a slow Cargo drain. Signal all other expired
+        // writers first, rather than making their cancellation wait for it.
+        for entry in &entries {
+            Self::signal_entry(entry, Some(now));
+        }
         for entry in entries {
             self.retire_if_expired(&entry, Some(now));
         }
     }
 
-    pub(super) fn shutdown(&self) {
+    /// Listener-side cancellation remains responsive even when the reaper is
+    /// joining an earlier expired writer. This never drops a payload or joins.
+    pub(super) fn signal_expired(&self, now: Instant) {
+        let entries = lock(&self.entries).values().cloned().collect::<Vec<_>>();
+        for entry in entries {
+            Self::signal_entry(&entry, Some(now));
+        }
+    }
+
+    fn signal_entry(entry: &Arc<Entry<T>>, now: Option<Instant>) {
+        let state = lock(&entry.state);
+        // A reconnect may have cleared a detached grace deadline since the
+        // registry snapshot. Decide and signal under the same entry lock.
+        if now.is_some_and(|now| !state.expired(now)) {
+            return;
+        }
+        entry.stopped.store(true, Ordering::Release);
+        if let Some(connection) = &state.attached {
+            connection.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn signal_shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
         let entries = lock(&self.entries).values().cloned().collect::<Vec<_>>();
         // Signal every writer before any detached owner's destructor joins.
         for entry in &entries {
-            entry.stopped.store(true, Ordering::Release);
-            if let Some(connection) = &lock(&entry.state).attached {
-                connection.store(true, Ordering::Release);
-            }
+            Self::signal_entry(entry, None);
         }
+    }
+
+    pub(super) fn shutdown(&self) {
+        self.signal_shutdown();
+        let entries = lock(&self.entries).values().cloned().collect::<Vec<_>>();
         for entry in entries {
             self.retire(&entry);
         }
@@ -852,5 +964,190 @@ mod tests {
             .unwrap();
         registry.shutdown();
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    struct BlockingPayload {
+        entered: Sender<thread::ThreadId>,
+        release: mpsc::Receiver<()>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BlockingPayload {
+        fn drop(&mut self) {
+            self.entered.send(thread::current().id()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test cleanup must be released");
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Release blocking destructors before the reaper owner joins, including if
+    // an assertion unwinds. A failed test must not leave an unjoined helper.
+    struct ReleaseDrops(Vec<Sender<()>>);
+
+    impl Drop for ReleaseDrops {
+        fn drop(&mut self) {
+            for release in &self.0 {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    fn blocking_attachment(
+        registry: &Arc<Registry<BlockingPayload>>,
+        drops: &Arc<AtomicUsize>,
+        entered: &Sender<thread::ThreadId>,
+        now: Instant,
+    ) -> (Arc<AtomicBool>, Sender<()>, Attachment<BlockingPayload>) {
+        let reservation = registry
+            .reserve([1; 32], connection(), now + Duration::from_secs(5), now)
+            .unwrap();
+        let stopped = reservation.operation_stop();
+        let (release, receiver) = mpsc::channel();
+        let attached = reservation
+            .activate(
+                BlockingPayload {
+                    entered: entered.clone(),
+                    release: receiver,
+                    drops: Arc::clone(drops),
+                },
+                now + Duration::from_secs(120),
+                now,
+            )
+            .unwrap();
+        (stopped, release, attached)
+    }
+
+    #[test]
+    fn blocked_reaper_keeps_listener_expiry_signals_responsive() {
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(2);
+        let registry = Registry::new(authority(), 2, Duration::from_secs(1)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (entered, observed) = mpsc::channel();
+        let (first_stop, first_release, first) =
+            blocking_attachment(&registry, &drops, &entered, expired);
+        first.detach(expired).unwrap();
+        let (second_stop, second_release, second) =
+            blocking_attachment(&registry, &drops, &entered, now);
+        let second_connection = lock(&second.entry.state).attached.clone().unwrap();
+
+        let mut reaper = Reaper::start(Arc::clone(&registry)).unwrap();
+        let release = ReleaseDrops(vec![first_release, second_release]);
+        let cleanup_thread = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(cleanup_thread, thread::current().id());
+        assert!(first_stop.load(Ordering::Acquire));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(!second_stop.load(Ordering::Acquire));
+        assert!(!second_connection.load(Ordering::Acquire));
+
+        // This is the listener's production pass, while another real thread is
+        // blocked inside a payload destructor. It must not try to join it.
+        registry.signal_expired(now + Duration::from_secs(120));
+        assert!(second_stop.load(Ordering::Acquire));
+        assert!(second_connection.load(Ordering::Acquire));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        reaper.check().unwrap();
+
+        drop(release);
+        drop(second);
+        reaper.finish().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reaper_signals_every_expired_owner_before_first_blocking_drop() {
+        let expired = Instant::now() - Duration::from_secs(2);
+        let registry = Registry::new(authority(), 2, Duration::from_secs(1)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (entered, observed) = mpsc::channel();
+        let (first_stop, first_release, first) =
+            blocking_attachment(&registry, &drops, &entered, expired);
+        let (second_stop, second_release, second) =
+            blocking_attachment(&registry, &drops, &entered, expired);
+        first.detach(expired).unwrap();
+        second.detach(expired).unwrap();
+        let mut reaper = Reaper::start(Arc::clone(&registry)).unwrap();
+        let release = ReleaseDrops(vec![first_release, second_release]);
+
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // BTree token order is intentionally arbitrary. Whichever payload
+        // starts draining first, both other writers must already be cancelled.
+        assert!(first_stop.load(Ordering::Acquire));
+        assert!(second_stop.load(Ordering::Acquire));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(release);
+        reaper.finish().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reaper_drop_joins_owned_cleanup_during_unwind() {
+        let now = Instant::now();
+        let registry = Registry::new(authority(), 1, Duration::from_secs(60)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (entered, observed) = mpsc::channel();
+        let (stopped, release, attached) = blocking_attachment(&registry, &drops, &entered, now);
+        attached.detach(now).unwrap();
+        let releaser = thread::spawn(move || {
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(stopped.load(Ordering::Acquire));
+            release.send(()).unwrap();
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reaper = Reaper::start(Arc::clone(&registry)).unwrap();
+            panic!("injected listener unwind");
+        }));
+        releaser.join().unwrap();
+        assert!(outcome.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(lock(&registry.entries).is_empty());
+    }
+
+    #[test]
+    fn reaper_failure_is_reported_and_remaining_custody_is_drained() {
+        struct MayPanic {
+            panic: bool,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for MayPanic {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                assert!(!self.panic, "injected operation cleanup failure");
+            }
+        }
+
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(2);
+        let registry = Registry::new(authority(), 2, Duration::from_secs(1)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for (at, panic) in [(expired, true), (now, false)] {
+            let reservation = registry
+                .reserve([1; 32], connection(), at + Duration::from_secs(5), at)
+                .unwrap();
+            reservation
+                .activate(
+                    MayPanic {
+                        panic,
+                        drops: Arc::clone(&drops),
+                    },
+                    at + Duration::from_secs(120),
+                    at,
+                )
+                .unwrap()
+                .detach(at)
+                .unwrap();
+        }
+        let mut reaper = Reaper::start(Arc::clone(&registry)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reaper.check().is_ok() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(reaper.check().is_err());
+        assert!(reaper.finish().is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(lock(&registry.entries).is_empty());
+        assert!(registry.stopped.load(Ordering::Acquire));
     }
 }
