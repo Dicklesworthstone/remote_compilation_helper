@@ -1361,22 +1361,7 @@ impl SshClient {
         let directory = control_directory
             .map(Path::to_path_buf)
             .unwrap_or_else(ssh_control_directory);
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .context("Failed to protect SSH control directory")?;
-        }
-        let control_dir = Arc::new(
-            SshControlDir::new(
-                tempfile::Builder::new()
-                    .prefix("rch-")
-                    .tempdir_in(directory)
-                    .context("Failed to create private SSH control directory")?,
-            )
-            .context("Failed to protect private SSH control directory")?,
-        );
+        let control_dir = Arc::new(create_ssh_control_directory(&directory)?);
         let socket = control_dir.path().join("master");
         let log = control_dir.path().join("log");
         let mut command = self.master_command(
@@ -1850,6 +1835,89 @@ fn ssh_control_directory() -> PathBuf {
         let username = whoami::username().unwrap_or_else(|_| "unknown".to_owned());
         std::env::temp_dir().join(format!("rch-ssh-{username}"))
     }
+}
+
+/// OpenSSH first binds `<control path>.<16 random characters>`, then links it
+/// into place. Checking only the final master path misses names that fit Rust's
+/// socket API but fail inside OpenSSH. The six placeholder characters match
+/// rand_bytes(6) below; SocketAddr checks native path bytes, not characters.
+fn ssh_control_directory_fits(directory: &Path) -> bool {
+    std::os::unix::net::SocketAddr::from_pathname(
+        directory.join("rch-XXXXXX/master.XXXXXXXXXXXXXXXX"),
+    )
+    .is_ok()
+}
+
+fn create_ssh_control_directory(directory: &Path) -> Result<SshControlDir> {
+    if ssh_control_directory_fits(directory) {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .context("Failed to protect SSH control directory")?;
+        }
+        return create_private_ssh_control_directory(directory);
+    }
+
+    // HOME, XDG_RUNTIME_DIR and TMPDIR can all be longer than sockaddr_un,
+    // especially when RCH itself runs inside an owned remote workspace. Use
+    // the system's short temporary root, not another environment-derived path.
+    // macOS spells /tmp as a symlink to /private/tmp; resolve that system alias
+    // before validating the physical root. Never chmod a shared temporary root.
+    let short_root = std::fs::canonicalize("/tmp")
+        .context("Failed to resolve a short SSH control directory root")?;
+    debug!(
+        preferred = %directory.display(),
+        fallback = %short_root.display(),
+        "SSH control path exceeds the Unix socket limit; using a private short directory"
+    );
+    create_short_ssh_control_directory(&short_root)
+}
+
+fn create_short_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("Failed to inspect short SSH control root {root:?}"))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "Short SSH control root must be a physical directory: {root:?}"
+    );
+    anyhow::ensure!(
+        metadata.uid() == 0 || metadata.uid() == rustix::process::geteuid().as_raw(),
+        "Short SSH control root has an unexpected owner: {root:?}"
+    );
+    let mode = metadata.permissions().mode();
+    anyhow::ensure!(
+        mode & 0o022 == 0 || mode & 0o1000 != 0,
+        "Shared short SSH control root must have the sticky bit: {root:?}"
+    );
+    anyhow::ensure!(
+        ssh_control_directory_fits(root),
+        "Short SSH control root still exceeds the Unix socket limit: {root:?}"
+    );
+    // Exclusive random-directory creation cannot reuse an existing symlink or
+    // another connection's socket. The sticky shared parent prevents other
+    // users from replacing our entry; SshControlDir protects it before use and
+    // retains exactly the same guardian-owned lifetime and teardown protocol.
+    create_private_ssh_control_directory(root)
+}
+
+fn create_private_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    SshControlDir::new(
+        tempfile::Builder::new()
+            .prefix("rch-")
+            .rand_bytes(6)
+            // The shared fallback parent is searchable by other users. Set
+            // owner-only mode in mkdir itself, before any chmod or handoff.
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(root)
+            .context("Failed to create private SSH control directory")?,
+    )
+    .context("Failed to protect private SSH control directory")
 }
 
 /// Check whether a local SSH client accepts `ForkAfterAuthentication=no`.
@@ -4934,6 +5002,167 @@ mod ssh_connection_tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+
+    fn short_control_test_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("rch-c-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    fn assert_control_sockets_bind(directory: &SshControlDir) {
+        use std::os::unix::net::UnixListener;
+
+        assert_eq!(
+            std::fs::symlink_metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Exercise both names against the kernel: the temporary OpenSSH name
+        // needs 17 additional bytes even when the final socket itself fits.
+        let _temporary =
+            UnixListener::bind(directory.path().join("master.abcdefghijklmnop")).unwrap();
+        let _final_socket = UnixListener::bind(directory.path().join("master")).unwrap();
+    }
+
+    #[test]
+    fn ssh_control_directory_keeps_short_preferred_path_and_owned_cleanup() {
+        let root = short_control_test_root();
+        let preferred = root.path().join("control");
+        let first = create_ssh_control_directory(&preferred).unwrap();
+        let second = create_ssh_control_directory(&preferred).unwrap();
+        assert_eq!(first.path().parent(), Some(preferred.as_path()));
+        assert_eq!(second.path().parent(), Some(preferred.as_path()));
+        assert_ne!(first.path(), second.path());
+        assert_control_sockets_bind(&first);
+        assert_control_sockets_bind(&second);
+
+        let first_path = first.path().to_owned();
+        let second_path = second.path().to_owned();
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists(), "one connection must not remove another");
+        drop(second);
+        assert!(!second_path.exists());
+        assert!(preferred.is_dir(), "the shared parent is not connection-owned");
+    }
+
+    #[test]
+    fn ssh_control_directory_falls_back_for_long_home_runtime_and_temp_paths() {
+        let root = short_control_test_root();
+        let long = root.path().join("long-worker-workspace-".repeat(5));
+        let shared = std::fs::canonicalize("/tmp").unwrap();
+        let shared_mode = std::fs::metadata(&shared).unwrap().permissions().mode();
+        let unicode = root.path().join("é".repeat(35));
+        assert!(ssh_control_directory_fits(&root.path().join("e".repeat(35))));
+        assert!(
+            unicode.as_os_str().as_bytes().len()
+                > unicode.to_string_lossy().chars().count()
+        );
+        // These are the three branches of ssh_control_directory. Do not change
+        // process-global environment while other connection tests are running.
+        for preferred in [
+            long.join(".ssh/rch"),        // HOME
+            long.join("rch-ssh"),         // XDG_RUNTIME_DIR
+            long.join("rch-ssh-builder"), // TMPDIR
+            unicode,
+        ] {
+            assert!(!ssh_control_directory_fits(&preferred));
+            let directory = create_ssh_control_directory(&preferred).unwrap();
+            assert_eq!(directory.path().parent(), Some(shared.as_path()));
+            assert_control_sockets_bind(&directory);
+            assert!(!preferred.exists(), "a rejected long parent must not be created");
+        }
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode(),
+            shared_mode,
+            "falling back must never chmod the system temporary directory"
+        );
+    }
+
+    #[test]
+    fn ssh_control_directory_reserves_openssh_temporary_socket_suffix() {
+        use std::os::unix::net::{SocketAddr, UnixListener};
+
+        let root = short_control_test_root();
+        let mut component = "edge".to_owned();
+        let preferred = loop {
+            let candidate = root.path().join(&component);
+            let final_path = candidate.join("rch-XXXXXX/master");
+            assert!(SocketAddr::from_pathname(&final_path).is_ok());
+            if !ssh_control_directory_fits(&candidate) {
+                break candidate;
+            }
+            component.push('x');
+        };
+        let original_directory = preferred.join("rch-XXXXXX");
+        std::fs::create_dir_all(&original_directory).unwrap();
+        let _final_socket = UnixListener::bind(original_directory.join("master")).unwrap();
+        assert!(
+            UnixListener::bind(original_directory.join("master.abcdefghijklmnop")).is_err(),
+            "OpenSSH's initial bind must demonstrate the original failure"
+        );
+
+        let directory = create_ssh_control_directory(&preferred).unwrap();
+        assert_ne!(directory.path().parent(), Some(preferred.as_path()));
+        assert_control_sockets_bind(&directory);
+    }
+
+    #[test]
+    fn ssh_short_control_root_rejects_symlinks_and_non_directories() {
+        let root = short_control_test_root();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sentinel = target.join("sentinel");
+        std::fs::write(&sentinel, b"leave intact").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(create_short_ssh_control_directory(&alias).is_err());
+        assert!(create_short_ssh_control_directory(&sentinel).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"leave intact");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "a symlink refusal must not change its target's permissions"
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ssh_short_control_root_requires_sticky_shared_parent_without_chmod() {
+        let root = short_control_test_root();
+        for mode in [0o770, 0o777] {
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(create_short_ssh_control_directory(root.path()).is_err());
+            assert_eq!(
+                std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let directory = create_short_ssh_control_directory(root.path()).unwrap();
+        assert_control_sockets_bind(&directory);
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+    }
+
+    #[test]
+    fn ssh_short_control_root_refuses_an_overlong_physical_fallback() {
+        let root = short_control_test_root();
+        let long = root.path().join("x".repeat(100));
+        std::fs::create_dir(&long).unwrap();
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(create_short_ssh_control_directory(&long).is_err());
+        assert_eq!(std::fs::read_dir(&long).unwrap().count(), 0);
+    }
 
     struct FakeSsh {
         directory: tempfile::TempDir,
