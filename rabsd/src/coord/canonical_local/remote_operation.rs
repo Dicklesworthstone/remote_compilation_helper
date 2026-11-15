@@ -42,6 +42,10 @@ pub(super) struct RemoteOperationSettings {
     /// or inherited input; it does not describe or authenticate input bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) stdin: Option<CompilationStdin>,
+    /// A logical member of the captured workspace, never a coordinator path.
+    /// The retained operation supplies its exact private bytes to Cargo once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) stdin_file: Option<String>,
     #[serde(default = "default_manifest")]
     pub(super) manifest: String,
     pub(super) vendor: Option<String>,
@@ -78,7 +82,7 @@ impl RemoteOperationSettings {
         profile.validate_logical()?;
         require(
             !profile.inherits_stdin()?,
-            "remote canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
+            "remote canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
         )?;
         require(
             serde_json::to_vec(self)?.len() <= 64 * 1024,
@@ -97,6 +101,7 @@ impl RemoteOperationSettings {
             service_socket: None,
             command: self.command,
             stdin: self.stdin,
+            stdin_file: self.stdin_file.clone(),
             manifest: self.manifest.clone(),
             vendor: self.vendor.clone(),
             cargo_home_source: None,
@@ -426,6 +431,7 @@ mod tests {
         let encoded = serde_json::to_value(&selected).unwrap();
         assert!(encoded.get("source_selection").is_none());
         assert!(encoded.get("stdin").is_none());
+        assert!(encoded.get("stdin_file").is_none());
         assert!(encoded.get("source_root").is_none());
         settings(encoded).validate().unwrap();
         let request = selected
@@ -537,6 +543,57 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn remote_settings_retain_captured_stdin_and_reject_ambient_input_controls() {
+        for command in ["run", "bench"] {
+            let selected = settings(json!({
+                "command":command, "stdin_file":"inputs/request.bin",
+                "manifest":"member/Cargo.toml", "jobs":2,
+            }));
+            selected.validate().unwrap();
+            let encoded = serde_json::to_value(&selected).unwrap();
+            assert!(encoded.get("stdin").is_none());
+            assert_eq!(encoded["stdin_file"], "inputs/request.bin");
+            let restored = settings(encoded.clone());
+            restored.validate().unwrap();
+            assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+            assert_eq!(
+                restored.profile().stdin_file.as_deref(),
+                Some("inputs/request.bin")
+            );
+            assert!(!restored.profile().inherits_stdin().unwrap());
+            restored.profile().validate_stdin(true).unwrap();
+            let request = restored
+                .source_specification(Path::new("/client/toolchain"), None)
+                .unwrap();
+            assert_eq!(request["args"][0], command);
+            assert!(request.get("stdin_file").is_none());
+            for policy in ["closed", "inherit"] {
+                let mut ambiguous = encoded.clone();
+                ambiguous["stdin"] = json!(policy);
+                assert!(settings(ambiguous).validate().is_err());
+            }
+            for path in ["/private/secret", "../secret", "inputs/../secret", ""] {
+                let mut ambient = encoded.clone();
+                ambient["stdin_file"] = json!(path);
+                assert!(settings(ambient).validate().is_err(), "{path:?}");
+            }
+        }
+        for command in ["check", "build", "test", "clippy", "doc"] {
+            assert!(
+                settings(json!({"command":command, "stdin_file":"inputs/request.bin"}))
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(
+            settings(json!({"command":"bench", "stdin_file":"inputs/request.bin",
+                "selection":{"no_run":true}}))
+            .validate()
+            .is_err()
+        );
     }
 
     fn fixture() -> RemoteOperationInputs {

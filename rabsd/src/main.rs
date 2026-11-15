@@ -465,7 +465,8 @@ fn main() {
                  Test selection accepts doc, no_run, no_fail_fast, test_filter and literal test_args after --.\n\
                  Tests/doctests execute on every request; doctests use captured rustdoc and failures retain Cargo's status.\n\
                  Run selects one binary/example with literal run_args; Bench supports no_run, no_fail_fast, test_filter and test_args.\n\
-                 Run/Bench bodies execute every time and require nonterminal stdin: use a pipe, file or /dev/null.\n\
+                 Run/Bench bodies execute every time; select stdin=closed for EOF or stdin_file for a captured source-relative file.\n\
+                 Omitted stdin inherits nonterminal input in standalone mode: use a pipe, file or /dev/null.\n\
                  Linux namespaces and nightly Cargo unit-graph planning are required.\n\
                  Test, Clippy, Run, Bench and selected build-script/proc-macro graphs require isolated workers for dependency cache authority.\n\
                  Without a worker those units compile normally; source/HOME are read-only and networking is isolated.\n\
@@ -475,7 +476,7 @@ fn main() {
                  service version canonical-compile-service-v1 requires state_root, socket, max_roots and jobs_per_root.\n\
                  Set service_socket in a canonical local profile to attach to that running service.\n\
                  Independent builds share one coordinator and worker pool, with private targets and scoped cancellation.\n\
-                 Busy or unavailable services fail without local fallback. Run and executing Bench require standalone profiles.\n\
+                 Busy or unavailable services fail without local fallback. Run/Bench require explicit closed or captured-file stdin.\n\
                  REMOTE CANONICAL SERVICE: rabsd --canonical-compile-remote-service <service.json>\n\
                  service version canonical-compile-remote-service-v1 requires listen, state_root, input_root, operation_root,\n\
                  wrapper, tls (ca/certificate/private_key), allowed_edge_pins, max_roots and jobs_per_root.\n\
@@ -486,8 +487,8 @@ fn main() {
                  Dedicated pinned mutual TLS and matching build identities are required; release policy cannot be downgraded.\n\
                  State/input/operation roots and the client output parent must be private; output_destination must be new.\n\
                  Returned outputs are limited to 512 MiB and 4096 files. Unsupported trees refuse without partial installation.\n\
-                 Check is the default; Run and executing Bench require stdin forwarding and are refused.\n\
-                 Disconnect cancels that operation; there is no operation resume or automatic retry after admission.\n\
+                 Check is the default; Run/Bench accept settings.stdin=closed or settings.stdin_file, never inherited client input.\n\
+                 Accepted operations reconnect within fixed deadlines while the same client and service survive; execution is never retried.\n\
                  See docs/rabs-canonical-cargo.md for complete profiles, dependency-worker setup and output semantics.\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\

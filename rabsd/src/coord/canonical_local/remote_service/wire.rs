@@ -36,10 +36,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v11 admits explicitly closed stdin for noninteractive Run and Bench intent.
-/// Reattachment retains that original policy, diagnostic frontiers and artifact
-/// custody. Older peers refuse before admission.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v11";
+/// v12 admits source-relative captured stdin for noninteractive Run and Bench.
+/// Reattachment retains the original input custody, diagnostic frontiers and
+/// artifact custody. Older peers refuse before admission.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v12";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.

@@ -2129,7 +2129,55 @@ destination. Planning still uses closed stdin independently of execution.
 
 Use these native `rabsd` entry points for the explicit stdin policy. The legacy
 `cargo rabs` launcher retains its existing profile whitelist and remote Run/Bench
-restriction. No stdin bytes are transferred or replayed by the remote protocol.
+restriction. No live stdin stream is forwarded by the remote protocol.
+
+#### Run with a captured input file
+
+Native local, shared and remote profiles can instead select
+`"stdin_file": "inputs/request.bin"` for Run or executing Bench. The name is
+relative to the approved `source_root`, independently of the selected manifest's
+directory. For a remote profile, put it in `settings`:
+
+```json
+{
+  "command": "run",
+  "stdin_file": "inputs/request.bin",
+  "manifest": "app/Cargo.toml",
+  "selection": {"bin": ["analyze"]},
+  "jobs": 2,
+  "timeout_seconds": 1800
+}
+```
+
+Use `rabsd --canonical-compile-local PROFILE.json` or
+`rabsd --canonical-compile-remote PROFILE.json`; a local profile may also name
+`service_socket`. Omit `stdin` when selecting `stdin_file`: combining the two
+is an error. Check, Build, Clippy, Doc, Test and `bench --no-run` do not accept
+this field. Their existing EOF behavior is unchanged.
+
+The selected file must already belong to the captured compiler-visible
+workspace. Absolute paths, traversal, symlinks, missing files and isolated
+Cargo-home transport members cannot become input. Existing source capture
+exclusions, file counts and the 512 MiB aggregate source limit still apply;
+`stdin_file` cannot request an extra client or coordinator pathname. The bytes
+travel through the ordinary verified source upload, including its existing
+whole-file and prefix reuse.
+
+After source sealing, the operation copies this exact member into private
+descriptor custody, verifies its checksum, and gives Cargo one read-only regular
+file at offset zero. Cargo decides which descendants inherit it, as with an
+ordinary redirected Cargo invocation. Planning receives EOF and never consumes
+the file. File bytes, identity and ownership are checked again before spawn and
+after the process group drains. Client or service stdin is not read. Empty files
+produce EOF, binary data is preserved, and a new admitted command starts from
+offset zero even when its compiled targets are fresh.
+
+The original operation retains this input across a connection interruption;
+reattachment cannot reopen a host pathname, rewind the running command or execute
+it again. Run and Bench outcomes remain uncached. The native Cargo/namespace
+fixture `canonical_captured_stdin_run_and_bench_execute_current_bytes_locally_and_in_service`
+checks current file contents, client-input isolation and repeated execution on
+a capable host; its presence does not establish native or fleet qualification.
 
 ### Share a canonical coordinator across concurrent commands
 
@@ -2619,7 +2667,7 @@ offer or zero. No extra round trip is added, and the existing four-frame upload
 window remains unchanged. The coordinator imports a selected prefix only once,
 checks the complete file and still requires the final complete-tree seal. This
 also applies to declared Cargo-home registry inputs. Wire version
-`canonical-compile-remote-v11` and the exact tool build identity must match before
+`canonical-compile-remote-v12` and the exact tool build identity must match before
 the service admits inputs; update the client and service together.
 
 The preparation budget bounds snapshot capture. Readiness grants the existing
@@ -2745,7 +2793,7 @@ grant. Omitting `selection` for Check retains its library-only default; an
 explicit empty selection uses Cargo's ordinary default members and targets.
 The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
 compilation with `"no_run": true`. Native settings also admit Run and executing
-Bench with explicit `"stdin": "closed"`. Their default or explicit inherited
+Bench with explicit `"stdin": "closed"` or a captured `"stdin_file"`. Their default or explicit inherited
 stdin remains unsupported even when the client redirects its input: the service
 does not forward that stream. Test, program and benchmark bodies still execute
 for each newly admitted operation and retain their actual exit status.
@@ -2949,7 +2997,7 @@ the client and cannot downgrade a client's required release-authorization policy
 Install matching client and coordinator binaries: paged source and artifact
 manifests, source-file and partial-prefix negotiation, SDK file/prefix and image
 reuse, artifact missing-file/prefix selection and operation reattachment use wire
-version `canonical-compile-remote-v11`, while existing client and service JSON
+version `canonical-compile-remote-v12`, while existing client and service JSON
 profile versions remain unchanged. Older wire versions refuse before upload or
 execution.
 

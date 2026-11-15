@@ -176,7 +176,7 @@ fn validate_profile_route(profile: &Profile, socket: &Path) -> io::Result<()> {
     }
     require(
         !profile.inherits_stdin()?,
-        "shared canonical service does not forward inherited stdin; select stdin: closed for EOF or use a standalone profile",
+        "shared canonical service does not forward inherited stdin; select stdin: closed for EOF, stdin_file for captured input, or use a standalone profile",
     )
 }
 
@@ -998,6 +998,28 @@ mod tests {
             let profile: Profile = serde_json::from_value(value).unwrap();
             profile.validate_logical().unwrap();
             validate_profile_route(&profile, &socket).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_service_accepts_captured_stdin_without_forwarding_client_input() {
+        let owner = crate::test_util::private_tempdir();
+        let socket = owner.path().join("service.sock");
+        for command in ["run", "bench"] {
+            let mut value = json!({
+                "version":super::super::PROFILE_VERSION, "command":command,
+                "source_root":"/source", "toolchain_root":"/toolchain",
+                "state_root":owner.path(), "operation_root":"/operations",
+                "wrapper":"/bin/rabs-wrap", "service_socket":socket,
+                "stdin_file":"inputs/request.bin",
+            });
+            let profile: Profile = serde_json::from_value(value.clone()).unwrap();
+            profile.validate_logical().unwrap();
+            validate_profile_route(&profile, &socket).unwrap();
+            assert!(!profile.inherits_stdin().unwrap());
+            value["stdin"] = json!("closed");
+            let profile: Profile = serde_json::from_value(value).unwrap();
+            assert!(validate_profile_route(&profile, &socket).is_err());
         }
     }
 

@@ -52,7 +52,10 @@ use rabs_sandbox::cargo_check::{
 use rabs_sandbox::cargo_home::CargoHomeProjection;
 use rabs_sandbox::cargo_target::state::{PrivateTreeSnapshot, SourceTimestamps};
 use rabs_sandbox::process_context::CommandContext;
-use rabs_sandbox::source_transfer::{MAX_SOURCE_BYTES, SourceManifest, SourceReceiver};
+use rabs_sandbox::source_transfer::{
+    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, SourceCheckpointError, SourceFile, SourceManifest,
+    SourceReceiver,
+};
 use rabs_sandbox::toolchain_cache::{CAPACITY as TOOLCHAIN_CAPACITY, ToolchainPool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -60,7 +63,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +114,10 @@ struct Profile {
     /// Omission preserves command defaults. Explicit `closed` supplies EOF and
     /// permits noninteractive run/bench execution through a shared service.
     stdin: Option<CompilationStdin>,
+    /// Source-root-relative input for run or executing bench. The exact member
+    /// is copied from the sealed source into private, read-only descriptor
+    /// custody before Cargo starts. Mutually exclusive with `stdin`.
+    stdin_file: Option<String>,
     #[serde(default = "default_manifest")]
     manifest: String,
     vendor: Option<String>,
@@ -609,6 +618,13 @@ enum OperationOutput {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileStdin<'a> {
+    Closed,
+    Inherit,
+    Captured(&'a str),
+}
+
 impl OperationOutput {
     fn captured(stdout: File, stderr: File, maximum: u64) -> io::Result<Self> {
         let first = stdout.metadata()?;
@@ -901,12 +917,30 @@ impl Profile {
             .is_some_and(|selection| selection.no_run)
     }
 
-    fn stdin_policy(&self) -> io::Result<CompilationStdin> {
-        self.command.stdin_policy(self.no_run(), self.stdin)
+    fn stdin_policy(&self) -> io::Result<ProfileStdin<'_>> {
+        if let Some(path) = &self.stdin_file {
+            require(self.stdin.is_none(), "choose stdin or stdin_file, not both")?;
+            require(
+                self.command == CompilationCommand::Run
+                    || (self.command == CompilationCommand::Bench && !self.no_run()),
+                "captured stdin_file is supported only for run or executing bench",
+            )?;
+            require(
+                relative_member(path),
+                "stdin_file must be an ordinary source-root-relative file",
+            )?;
+            return Ok(ProfileStdin::Captured(path));
+        }
+        Ok(
+            match self.command.stdin_policy(self.no_run(), self.stdin)? {
+                CompilationStdin::Closed => ProfileStdin::Closed,
+                CompilationStdin::Inherit => ProfileStdin::Inherit,
+            },
+        )
     }
 
     fn inherits_stdin(&self) -> io::Result<bool> {
-        Ok(self.stdin_policy()? == CompilationStdin::Inherit)
+        Ok(matches!(self.stdin_policy()?, ProfileStdin::Inherit))
     }
 
     fn validate_stdin(&self, terminal: bool) -> io::Result<()> {
@@ -915,7 +949,7 @@ impl Profile {
         // interactive job control needs a separate, owned terminal/session.
         require(
             !self.inherits_stdin()? || !terminal,
-            "canonical run/bench requires nonterminal stdin when input is inherited: redirect from a pipe, file, or /dev/null, select stdin: closed for EOF, or run a delivered build outside this noninteractive profile",
+            "canonical run/bench requires nonterminal stdin when input is inherited: redirect from a pipe, file, or /dev/null, select stdin: closed for EOF or stdin_file for captured input, or run a delivered build outside this noninteractive profile",
         )
     }
 
@@ -1042,6 +1076,7 @@ fn resolve_run_selection(
             directory: owner.join("run-metadata-drain"),
             maximum: MAX_GRAPH_BYTES,
         },
+        None,
         timeout,
         stopped,
         shared,
@@ -1073,6 +1108,7 @@ fn resolve_run_selection(
                 directory: owner.join("run-package-drain"),
                 maximum: MAX_GRAPH_BYTES,
             },
+            None,
             timeout,
             stopped,
             shared,
@@ -1117,7 +1153,7 @@ pub fn run_profile_with_release(
     profile.validate_stdin(std::io::stdin().is_terminal())?;
     if profile.service_socket.is_some() && profile.inherits_stdin()? {
         return Err(invalid(
-            "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
+            "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
         ));
     }
     profile.validate()?;
@@ -1152,7 +1188,7 @@ pub(super) fn run_shared_profile(
         serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
     require(
         !profile.inherits_stdin()?,
-        "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF",
+        "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
     )?;
     require(
         profile.service_socket.is_some()
@@ -1265,7 +1301,7 @@ fn run_operation(
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&profile.operation_root)?,
     );
-    let (source, captured_toolchain, request, input_owner, received_toolchain) =
+    let (mut source, captured_toolchain, request, input_owner, received_toolchain) =
         match prepared_inputs {
             Some(inputs) => {
                 inputs.verify_for_profile(&profile, &cancelled)?;
@@ -1338,6 +1374,18 @@ fn run_operation(
         .and_then(|home| home.projected_workspace())
         .unwrap_or(source_root)
         .to_path_buf();
+    let captured_stdin = match profile.stdin_policy()? {
+        ProfileStdin::Captured(path) => Some(CapturedStdin::capture(
+            &mut source,
+            path,
+            cargo_projection
+                .as_ref()
+                .and_then(CargoHomeProjection::workspace_manifest),
+            owner.path(),
+            &cancelled,
+        )?),
+        ProfileStdin::Closed | ProfileStdin::Inherit => None,
+    };
     let workspace_manifest = cargo_projection
         .as_ref()
         .and_then(CargoHomeProjection::workspace_manifest)
@@ -1471,6 +1519,7 @@ fn run_operation(
             directory: owner.path().join("unit-graph-drain"),
             maximum: MAX_GRAPH_BYTES,
         },
+        None,
         timeout,
         &stopped,
         shared.as_deref(),
@@ -1737,6 +1786,7 @@ fn run_operation(
         profile.program(),
         &compilation_args,
         cargo_output,
+        captured_stdin,
         timeout,
         &stopped,
         shared.as_deref(),
@@ -2059,6 +2109,186 @@ fn capture_wrapper(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// One already transferred source member, independently copied into the
+/// operation's private control directory. Only a read-only descriptor crosses
+/// into Cargo; neither this pathname nor a writable alias is mounted there.
+/// Planning never receives this descriptor and execution can take it only once.
+#[derive(Debug)]
+struct CapturedStdin {
+    root: File,
+    root_path: PathBuf,
+    file: File,
+    generation: FileSig,
+    expected: SourceFile,
+    handed_off: bool,
+}
+
+impl CapturedStdin {
+    fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
+        if stopped() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "captured standard input cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_root(root: &File, path: &Path) -> io::Result<()> {
+        private_directory(path)?;
+        let held = root.metadata()?;
+        let named = fs::symlink_metadata(path)?;
+        require(
+            held.is_dir()
+                && held.uid() == rustix::process::geteuid().as_raw()
+                && held.mode() & 0o077 == 0
+                && (held.dev(), held.ino()) == (named.dev(), named.ino()),
+            "captured stdin directory was replaced",
+        )
+    }
+
+    fn open_member(root: &File, create: bool) -> io::Result<File> {
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | if create {
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL
+            } else {
+                OFlags::RDONLY
+            };
+        let mode = if create {
+            Mode::RUSR | Mode::WUSR
+        } else {
+            Mode::empty()
+        };
+        #[cfg(target_os = "linux")]
+        let descriptor = rustix::fs::openat2(
+            root,
+            "stdin",
+            flags,
+            mode,
+            rustix::fs::ResolveFlags::BENEATH
+                | rustix::fs::ResolveFlags::NO_SYMLINKS
+                | rustix::fs::ResolveFlags::NO_MAGICLINKS
+                | rustix::fs::ResolveFlags::NO_XDEV,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let descriptor = rustix::fs::openat(root, "stdin", flags, mode)?;
+        Ok(File::from(descriptor))
+    }
+
+    fn capture(
+        source: &mut SourceReceiver,
+        path: &str,
+        workspace: Option<&SourceManifest>,
+        parent: &Path,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        Self::checkpoint(stopped)?;
+        require(
+            source.sealed_root().is_some() && relative_member(path),
+            "captured stdin requires a sealed source and an ordinary relative member",
+        )?;
+        let workspace = workspace.unwrap_or_else(|| source.manifest());
+        let expected = workspace
+            .files()
+            .iter()
+            .find(|file| file.path == path)
+            .cloned()
+            .ok_or_else(|| invalid("stdin_file is not a captured workspace file"))?;
+        private_directory(parent)?;
+        let root = File::from(rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        Self::verify_root(&root, parent)?;
+        let destination = Self::open_member(&root, true)?;
+        let copied =
+            source
+                .checkpoint_file(path, destination, stopped)
+                .map_err(|error| match error {
+                    SourceCheckpointError::Source(error)
+                    | SourceCheckpointError::Destination(error) => error,
+                })?;
+        require(
+            copied.expected() == &expected,
+            "captured stdin differs from its workspace input declaration",
+        )?;
+        let written = copied.into_file();
+        written.set_permissions(fs::Permissions::from_mode(0o400))?;
+        let generation = FileSig::of(&written.metadata()?);
+        let file = Self::open_member(&root, false)?;
+        require(
+            FileSig::of(&file.metadata()?) == generation,
+            "captured stdin changed while opening its read-only descriptor",
+        )?;
+        drop(written);
+        let input = Self {
+            root,
+            root_path: parent.to_path_buf(),
+            file,
+            generation,
+            expected,
+            handed_off: false,
+        };
+        input.verify(stopped)?;
+        Ok(input)
+    }
+
+    fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        Self::checkpoint(stopped)?;
+        Self::verify_root(&self.root, &self.root_path)?;
+        let check_file = |file: &File| -> io::Result<()> {
+            let metadata = file.metadata()?;
+            require(
+                metadata.is_file()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o777 == 0o400
+                    && metadata.dev() == self.root.metadata()?.dev()
+                    && FileSig::of(&metadata) == self.generation,
+                "captured stdin file identity, bytes or ownership changed",
+            )
+        };
+        check_file(&self.file)?;
+        check_file(&Self::open_member(&self.root, false)?)?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; MAX_SOURCE_CHUNK];
+        let mut offset = 0;
+        while offset < self.expected.len {
+            Self::checkpoint(stopped)?;
+            let count = (self.expected.len - offset).min(bytes.len() as u64) as usize;
+            self.file.read_exact_at(&mut bytes[..count], offset)?;
+            hash.update(&bytes[..count]);
+            offset += count as u64;
+        }
+        require(
+            self.file.read_at(&mut bytes[..1], offset)? == 0
+                && <[u8; 32]>::from(hash.finalize()) == self.expected.sha256,
+            "captured stdin bytes differ from the sealed source",
+        )?;
+        check_file(&self.file)?;
+        check_file(&Self::open_member(&self.root, false)?)?;
+        Self::verify_root(&self.root, &self.root_path)?;
+        Self::checkpoint(stopped)
+    }
+
+    fn take_stdio(&mut self, stopped: &impl Fn() -> bool) -> io::Result<Stdio> {
+        require(
+            !self.handed_off,
+            "captured stdin was already handed to Cargo",
+        )?;
+        self.verify(stopped)?;
+        let file = self.file.try_clone()?;
+        self.handed_off = true;
+        Ok(Stdio::from(file))
+    }
+}
+
 enum CargoOutput {
     Capture {
         directory: PathBuf,
@@ -2081,11 +2311,16 @@ fn execute_controlled(
     program: &str,
     args: &[String],
     output: CargoOutput,
+    mut captured_stdin: Option<CapturedStdin>,
     timeout: Duration,
     stopped: &AtomicBool,
     shared: Option<&SharedRuntime>,
     destination: &mut OperationOutput,
 ) -> io::Result<DrainedOutput> {
+    require(
+        !matches!(&output, CargoOutput::Capture { .. }) || captured_stdin.is_none(),
+        "Cargo planning cannot consume captured stdin",
+    )?;
     let launch = build_canonical_argv(spec, support, program, args)
         .map_err(|error| invalid(error.to_string()))?;
     let mut command = command_for(&launch);
@@ -2144,6 +2379,11 @@ fn execute_controlled(
             io::ErrorKind::Interrupted,
             "canonical Cargo cancelled before spawn",
         ));
+    }
+    if let Some(input) = &mut captured_stdin {
+        command.stdin(input.take_stdio(&|| {
+            stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy())
+        })?);
     }
     let process = ManagedProcessGroup::spawn_command(command, Attribution::default())?;
     let group = process.pgid();
@@ -2209,6 +2449,11 @@ fn execute_controlled(
                 "canonical Cargo command was cancelled"
             },
         ));
+    }
+    if let Some(input) = &captured_stdin {
+        input.verify(&|| {
+            stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy())
+        })?;
     }
     Ok(output)
 }
@@ -3131,6 +3376,246 @@ mod tests {
                 },
             ));
         }
+    }
+
+    #[test]
+    fn captured_stdin_profiles_preserve_command_selection_and_compilation_identity() {
+        for command in [CompilationCommand::Run, CompilationCommand::Bench] {
+            let mut profile = application_environment_profile();
+            profile.command = command;
+            profile.selection = Some(CompilationSelection {
+                bin: if command == CompilationCommand::Run {
+                    vec!["app".into()]
+                } else {
+                    Vec::new()
+                },
+                ..CompilationSelection::default()
+            });
+            let original = profile.source_specification().unwrap();
+            profile.stdin_file = Some("inputs/binary.dat".into());
+            profile.validate_logical().unwrap();
+            profile.validate_stdin(true).unwrap();
+            assert_eq!(
+                profile.stdin_policy().unwrap(),
+                ProfileStdin::Captured("inputs/binary.dat")
+            );
+            assert!(!profile.inherits_stdin().unwrap());
+            // Runtime input does not become a compiler argument, configuration
+            // field or program-result cache authority. Its bytes are already
+            // members of this operation's independently captured source.
+            assert_eq!(profile.source_specification().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn captured_stdin_profiles_reject_ambiguous_policies_and_nonexecution_commands() {
+        let mut profile = application_environment_profile();
+        profile.stdin_file = Some("inputs/binary.dat".into());
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Test,
+            CompilationCommand::Clippy,
+            CompilationCommand::Doc,
+        ] {
+            profile.command = command;
+            assert!(profile.validate_logical().is_err(), "{command:?}");
+        }
+        profile.command = CompilationCommand::Bench;
+        profile.selection = Some(CompilationSelection {
+            no_run: true,
+            ..CompilationSelection::default()
+        });
+        assert!(profile.validate_logical().is_err());
+        profile.selection = None;
+        for policy in [CompilationStdin::Closed, CompilationStdin::Inherit] {
+            profile.stdin = Some(policy);
+            assert!(profile.validate_logical().is_err(), "{policy:?}");
+        }
+        profile.stdin = None;
+        for path in [
+            "",
+            "/dev/stdin",
+            "../private",
+            "inputs/../private",
+            "inputs//data",
+            "inputs/./data",
+            "inputs\\data",
+            "inputs/data\n",
+        ] {
+            profile.stdin_file = Some(path.into());
+            assert!(profile.validate_logical().is_err(), "{path:?}");
+        }
+        profile.stdin_file = Some("x".repeat(1025));
+        assert!(profile.validate_logical().is_err());
+    }
+
+    fn captured_stdin_fixture(bytes: &[u8]) -> (tempfile::TempDir, SourceReceiver, PathBuf) {
+        let owner = crate::test_util::private_tempdir();
+        let expected = SourceFile {
+            path: "inputs/binary.dat".into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        };
+        let mut source = SourceReceiver::create(
+            &owner.path().join("source"),
+            SourceManifest::new(vec![expected]).unwrap(),
+        )
+        .unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            source
+                .write_chunk(
+                    "inputs/binary.dat",
+                    (index * MAX_SOURCE_CHUNK) as u64,
+                    chunk,
+                    Sha256::digest(chunk).into(),
+                )
+                .unwrap();
+        }
+        source.seal().unwrap();
+        let control = owner.path().join("control");
+        create_private(&control).unwrap();
+        (owner, source, control)
+    }
+
+    #[test]
+    fn captured_stdin_runs_once_from_independent_verified_read_only_bytes() {
+        for bytes in [
+            Vec::new(),
+            b"binary\0input\xff\n".to_vec(),
+            vec![73; MAX_SOURCE_CHUNK + 17],
+        ] {
+            let (_owner, mut source, control) = captured_stdin_fixture(&bytes);
+            let mut input =
+                CapturedStdin::capture(&mut source, "inputs/binary.dat", None, &control, &|| false)
+                    .unwrap();
+            assert_eq!(
+                input.expected.sha256,
+                <[u8; 32]>::from(Sha256::digest(&bytes))
+            );
+            assert!(input.file.write_at(b"forbidden", 0).is_err());
+            // Later changes to the original snapshot cannot redirect the
+            // descriptor into newly opened input. Overall source provenance
+            // remains the operation owner's separate completion obligation.
+            let original = source.sealed_root().unwrap().join("inputs/binary.dat");
+            let permissions = fs::metadata(&original).unwrap().permissions();
+            fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&original, b"changed").unwrap();
+            fs::set_permissions(&original, permissions).unwrap();
+            let output = std::process::Command::new("/bin/cat")
+                .stdin(input.take_stdio(&|| false).unwrap())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, bytes);
+            assert!(output.stderr.is_empty());
+            input.verify(&|| false).unwrap();
+            assert!(input.take_stdio(&|| false).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_stdin_requires_a_current_member_of_the_compiler_visible_workspace() {
+        let (_owner, mut source, control) = captured_stdin_fixture(b"captured");
+        assert!(CapturedStdin::capture(&mut source, "missing", None, &control, &|| false).is_err());
+        // An isolated Cargo-home member may exist in the transport tree while
+        // intentionally being absent from its compiler-visible workspace.
+        let workspace = SourceManifest::new(vec![SourceFile {
+            path: "Cargo.toml".into(),
+            len: 0,
+            sha256: Sha256::digest([]).into(),
+            executable: false,
+        }])
+        .unwrap();
+        assert!(
+            CapturedStdin::capture(
+                &mut source,
+                "inputs/binary.dat",
+                Some(&workspace),
+                &control,
+                &|| false,
+            )
+            .is_err()
+        );
+        assert!(!control.join("stdin").exists());
+        let original = source.sealed_root().unwrap().join("inputs/binary.dat");
+        let permissions = fs::metadata(&original).unwrap().permissions();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&original, b"mutated!").unwrap();
+        fs::set_permissions(&original, permissions).unwrap();
+        assert!(
+            CapturedStdin::capture(&mut source, "inputs/binary.dat", None, &control, &|| false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn captured_stdin_rejects_replaced_files_roots_aliases_and_modified_bytes() {
+        for mutation in ["replace", "root", "alias", "bytes", "symlink"] {
+            let (owner, mut source, control) = captured_stdin_fixture(b"captured");
+            let mut input =
+                CapturedStdin::capture(&mut source, "inputs/binary.dat", None, &control, &|| false)
+                    .unwrap();
+            let path = control.join("stdin");
+            match mutation {
+                "replace" => {
+                    fs::rename(&path, control.join("saved-input")).unwrap();
+                    fs::write(&path, b"captured").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "root" => {
+                    fs::rename(&control, owner.path().join("saved-control")).unwrap();
+                    create_private(&control).unwrap();
+                }
+                "alias" => fs::hard_link(&path, control.join("alias")).unwrap(),
+                "bytes" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, b"modified").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "symlink" => {
+                    fs::rename(&path, control.join("saved-input")).unwrap();
+                    std::os::unix::fs::symlink("saved-input", &path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(input.verify(&|| false).is_err(), "{mutation}");
+            assert!(input.take_stdio(&|| false).is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn captured_stdin_observes_cancellation_during_copy_verification_and_handoff() {
+        let (owner, mut source, control) = captured_stdin_fixture(&vec![91; 8 * MAX_SOURCE_CHUNK]);
+        let checks = std::cell::Cell::new(0);
+        let stopped = || {
+            let count = checks.get() + 1;
+            checks.set(count);
+            count >= 7
+        };
+        let error =
+            CapturedStdin::capture(&mut source, "inputs/binary.dat", None, &control, &stopped)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(checks.get() >= 7);
+        // Cancelled copying cannot poison intact captured source or hand a
+        // partial prefix to Cargo. A new operation can take a fresh full copy.
+        let retry = owner.path().join("retry");
+        create_private(&retry).unwrap();
+        let mut input =
+            CapturedStdin::capture(&mut source, "inputs/binary.dat", None, &retry, &|| false)
+                .unwrap();
+        assert_eq!(
+            input.verify(&|| true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            input.take_stdio(&|| true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!input.handed_off);
+        input.verify(&|| false).unwrap();
     }
 
     #[test]

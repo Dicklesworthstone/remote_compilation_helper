@@ -4237,6 +4237,135 @@ fn main() {
 }
 
 #[test]
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes captured-file run and custom bench standalone and through the persistent service"]
+fn canonical_captured_stdin_run_and_bench_execute_current_bytes_locally_and_in_service() {
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let source = root.join("source-a");
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    write(
+        &source,
+        "Cargo.toml",
+        format!(
+            "{manifest}\n[[bench]]\nname='captured'\npath='benches/captured.rs'\nharness=false\n"
+        ),
+    );
+    let body = r#"use std::io::Read;
+fn main() {
+    assert_eq!(canonical_app::answer(), 42);
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let expected = std::fs::read("/__rabs/workspace/inputs/request.bin").unwrap();
+    assert_eq!(input, expected, "stdin must contain the current captured file");
+    let path = "/__rabs/out/cargo/captured-stdin-executions";
+    let count: u32 = std::fs::read_to_string(path).ok().map(|value| value.parse().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(path, count.to_string()).unwrap();
+    println!("CURRENT_CAPTURED_STDIN_EXECUTION={count}");
+    println!("CAPTURED_STDIN_BYTES={}", input.len());
+    if std::env::args().any(|arg| arg == "--fail") { std::process::exit(7); }
+}
+"#;
+    write(&source, "src/main.rs", body);
+    write(&source, "benches/captured.rs", body);
+    write(&source, "inputs/request.bin", b"captured\0input\xff\n");
+    profile["stdin_file"] = json!("inputs/request.bin");
+    profile["jobs"] = json!(1);
+    profile["target_cache"] =
+        json!({"runtime_epoch":"captured-stdin-native-v1", "max_bytes":268435456});
+    let socket = root.join("captured-stdin-service.sock");
+    let mut service = None;
+    let mut number = 3400;
+    for shared in [false, true] {
+        if shared {
+            let path = root.join("captured-stdin-service.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({
+                    "version":"canonical-compile-service-v1", "state_root":root.join("state"),
+                    "socket":socket, "max_roots":1, "jobs_per_root":1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut command = shared_service_command(root);
+            command.arg("--canonical-compile-service").arg(path);
+            let mut child = SharedServiceChild::spawn(root, "captured-stdin-service", command);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                child.assert_running();
+                if socket.exists()
+                    && child
+                        .events()
+                        .iter()
+                        .any(|event| event["kind"] == "canonical-service-listening")
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{}", child.diagnostics());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            profile["service_socket"] = json!(socket);
+            service = Some(child);
+        }
+        for command in ["run", "bench"] {
+            profile["command"] = json!(command);
+            write(&source, "inputs/request.bin", b"captured\0input\xff\n");
+            let mut previous = None;
+            for (attempt, fail) in [false, true, false].into_iter().enumerate() {
+                if attempt == 2 {
+                    write(&source, "inputs/request.bin", b"changed current bytes\n");
+                }
+                let arguments = if fail { json!(["--fail"]) } else { json!([]) };
+                profile["selection"] = if command == "run" {
+                    json!({"bin":["canonical_app"], "run_args":arguments})
+                } else {
+                    json!({"bench":["captured"], "test_args":arguments})
+                };
+                number += 1;
+                let (code, events, output) = run_with_input(
+                    root,
+                    number,
+                    &profile,
+                    &[],
+                    b"ambient client input must not be consumed\n",
+                );
+                assert_eq!(code == 0, !fail, "shared={shared}, {command}: {output}");
+                let count: u32 = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CURRENT_CAPTURED_STDIN_EXECUTION="))
+                    .unwrap_or_else(|| panic!("the current body did not execute: {output}"))
+                    .parse()
+                    .unwrap();
+                if attempt == 1 {
+                    assert_eq!(count, previous.unwrap() + 1, "{output}");
+                }
+                previous = Some(count);
+                assert!(
+                    output.contains(&format!(
+                        "CAPTURED_STDIN_BYTES={}",
+                        fs::metadata(source.join("inputs/request.bin"))
+                            .unwrap()
+                            .len()
+                    )),
+                    "{output}"
+                );
+                let started = events
+                    .iter()
+                    .find(|event| event["kind"] == "canonical-compilation-started")
+                    .unwrap();
+                assert_eq!(started["program_result_cache"], false);
+                assert_eq!(started["benchmark_result_cache"], false);
+                if attempt == 1 {
+                    assert_eq!(started["private_target_state"], "restored");
+                }
+            }
+        }
+    }
+    service.unwrap().shutdown(Duration::from_secs(15)).unwrap();
+    assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+}
+
+#[test]
 #[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes current programs with inherited input and private Cargo freshness"]
 fn canonical_cargo_run_preserves_default_target_input_arguments_and_every_current_exit() {
     let (owner, mut profile) = native_fixture();
