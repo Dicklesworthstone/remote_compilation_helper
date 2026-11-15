@@ -28,7 +28,7 @@ fn selected(path: &str, bytes: &[u8]) -> PreparedDependencyFile {
     }
 }
 
-fn command(root: &Path, project: &Path, mode: &str) -> Command {
+fn worker_command(root: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rch-wkr"));
     command
         .env_clear()
@@ -41,13 +41,144 @@ fn command(root: &Path, project: &Path, mode: &str) -> Command {
         .env("TOKIO_WORKER_THREADS", "2")
         .env("RCH_PREPARE_INSTALL_TIMEOUT_SECS", "3")
         .env("RCH_TEST_INSTALL_COUNT", root.join("installer-count"))
-        .args(["prepare-proof", "--mode", mode, "--project"])
-        .arg(project)
-        .args(["--runtime", "node"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+fn command(root: &Path, project: &Path, mode: &str) -> Command {
+    let mut command = worker_command(root);
+    command
+        .args(["prepare-proof", "--mode", mode, "--project"])
+        .arg(project)
+        .args(["--runtime", "node"]);
+    command
+}
+
+/// A deterministic manager fixture, not real npm. It forks a lifecycle-style
+/// reader before creating dependencies, and the test workload reads stdin too.
+/// Running the actual worker proves which process receives the caller's pipe.
+fn stdin_fixture(root: &Path) -> std::path::PathBuf {
+    let project = root.join("project");
+    for name in ["project", "home", "bin"] {
+        fs::create_dir(root.join(name)).unwrap();
+    }
+    fs::write(
+        project.join("package.json"),
+        b"{\"name\":\"stdin-fixture\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("package-lock.json"),
+        b"{\"lockfileVersion\":3}\n",
+    )
+    .unwrap();
+    let manager = root.join("bin/npm");
+    fs::write(
+        &manager,
+        br#"#!/bin/sh
+set -eu
+case "$1" in
+    --prefix)
+        [ "$#" = 3 ] && [ "$2" = "$PWD" ] && [ "$3" = ci ]
+        sh -c 'cat > "$RCH_TEST_INSTALL_STDIN"'
+        mkdir -p node_modules
+        printf 'prepared\n' > node_modules/dependency.js
+        printf 'install\n' >> "$RCH_TEST_INSTALL_COUNT"
+        ;;
+    test)
+        [ -f node_modules/dependency.js ]
+        printf 'started\n' > "$RCH_TEST_WORKLOAD_STARTED"
+        cat > "$RCH_TEST_WORKLOAD_STDIN"
+        printf 'workload complete\n'
+        ;;
+    *) exit 73 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+    project
+}
+
+fn stdin_execution(root: &Path, project: &Path) -> Command {
+    let mut command = worker_command(root);
+    command
+        .env("RCH_TEST_INSTALL_STDIN", root.join("installer-stdin"))
+        .env("RCH_TEST_WORKLOAD_STDIN", root.join("workload-stdin"))
+        .env("RCH_TEST_WORKLOAD_STARTED", root.join("workload-started"))
+        .args(["execute", "--workdir"])
+        .arg(project)
+        .args(["--command", "npm test"])
+        .stdin(Stdio::piped());
+    command
+}
+
+#[test]
+fn dependency_install_preserves_workload_stdin_on_cold_and_cached_execution() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let project = stdin_fixture(root);
+    for first_byte in [0_u8, 17] {
+        let input: Vec<u8> = (0..=255)
+            .cycle()
+            .skip(usize::from(first_byte))
+            .take(8192)
+            .collect();
+        let mut child = stdin_execution(root, &project).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"workload complete\n");
+        assert_eq!(fs::read(root.join("installer-stdin")).unwrap(), b"");
+        assert_eq!(fs::read(root.join("workload-stdin")).unwrap(), input);
+        assert_eq!(
+            fs::read(root.join("installer-count")).unwrap(),
+            b"install\n"
+        );
+    }
+}
+
+#[test]
+fn dependency_install_does_not_wait_for_workload_stdin_to_close() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let project = stdin_fixture(root);
+    let mut child = stdin_execution(root, &project).spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let started_without_input = loop {
+        if root.join("workload-started").exists() {
+            break true;
+        }
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // Always close the caller's pipe and reap the worker before asserting, so
+    // the regression's old blocking installer cannot escape the test's owner.
+    let write = input.write_all(b"input after preparation\0\xff\n");
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        started_without_input,
+        "preparation waited on the workload's open input pipe: {}: {}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    write.unwrap();
+    assert!(result.status.success(), "{:?}", result);
+    assert_eq!(fs::read(root.join("installer-stdin")).unwrap(), b"");
+    assert_eq!(
+        fs::read(root.join("workload-stdin")).unwrap(),
+        b"input after preparation\0\xff\n"
+    );
 }
 
 fn install(

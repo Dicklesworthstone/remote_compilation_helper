@@ -834,6 +834,10 @@ async fn prepare_node_like(
     }
     let mut child = installer
         .current_dir(project_root)
+        // Preparation is non-interactive. Its manager and lifecycle children
+        // must not consume the stdin reserved for the eventual workload, or
+        // wait for that workload's caller to close an otherwise idle pipe.
+        .stdin(std::process::Stdio::null())
         .stderr(log_file)
         .kill_on_drop(true)
         .spawn()
