@@ -87,7 +87,7 @@ pub struct NormalizedRustcInvocation {
     pub features: Vec<String>,
     /// Lint flags in original order (order decides precedence).
     pub lints: Vec<LintFlag>,
-    /// `--cap-lints`.
+    /// The first `--cap-lints` value, matching rustc's repeatable option.
     pub cap_lints: Option<String>,
     /// `--extern name[=path]` in original order.
     pub externs: Vec<(String, Option<String>)>,
@@ -117,6 +117,10 @@ pub enum ParseError {
     StdinWithoutDigest,
     /// Two positional source arguments.
     MultipleSources(String, String),
+    /// A recognized option is missing its required operand.
+    MissingValue(&'static str),
+    /// A rustc singleton option appeared more than once.
+    DuplicateOption(&'static str),
 }
 
 /// Whether a path names a plausible rustc binary (chain decode only —
@@ -161,6 +165,19 @@ fn name_value(s: &str) -> (String, Option<String>) {
         Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
         None => (s.to_owned(), None),
     }
+}
+
+/// Set an option that rustc rejects when repeated, including equal values.
+fn set_singleton(
+    slot: &mut Option<String>,
+    option: &'static str,
+    value: String,
+) -> Result<(), ParseError> {
+    if slot.is_some() {
+        return Err(ParseError::DuplicateOption(option));
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 /// Parse a raw wrapper-chain argv into the normalized model.
@@ -211,10 +228,15 @@ pub fn parse(
             || a.starts_with("--diagnostic-width=")
         {
             let recorded = if matches!(a, "--color" | "--diagnostic-width") {
-                match rest.next() {
-                    Some(value) => format!("{a}={value}"),
-                    None => arg,
-                }
+                let flag = if a == "--color" {
+                    "--color"
+                } else {
+                    "--diagnostic-width"
+                };
+                // Older keys retained only the option name. A malformed
+                // request must never reach those historical successful entries.
+                let value = rest.next().ok_or(ParseError::MissingValue(flag))?;
+                format!("{flag}={value}")
             } else {
                 arg
             };
@@ -222,19 +244,22 @@ pub fn parse(
             continue;
         }
         if let Some(v) = take_value(a, "--crate-name", &mut rest) {
-            inv.crate_name = Some(v);
+            set_singleton(&mut inv.crate_name, "--crate-name", v)?;
         } else if let Some(v) = take_value(a, "--crate-type", &mut rest) {
             inv.crate_types.extend(v.split(',').map(str::to_owned));
         } else if let Some(v) = take_value(a, "--edition", &mut rest) {
-            inv.edition = Some(v);
+            set_singleton(&mut inv.edition, "--edition", v)?;
         } else if let Some(v) = take_value(a, "--target", &mut rest) {
-            inv.target = Some(v);
+            set_singleton(&mut inv.target, "--target", v)?;
         } else if let Some(v) = take_value(a, "--emit", &mut rest) {
             inv.emit.extend(v.split(',').map(str::to_owned));
         } else if let Some(v) = take_value(a, "--out-dir", &mut rest) {
-            inv.out_dir = Some(v);
+            set_singleton(&mut inv.out_dir, "--out-dir", v)?;
         } else if let Some(v) = take_value(a, "--cap-lints", &mut rest) {
-            inv.cap_lints = Some(v);
+            // rustc reads the FIRST cap, even when a later value is invalid.
+            if inv.cap_lints.is_none() {
+                inv.cap_lints = Some(v);
+            }
         } else if let Some(v) = take_value(a, "--cfg", &mut rest) {
             // `feature="name"` cfgs are the feature set; others are cfgs.
             if let Some(f) = v
@@ -349,8 +374,19 @@ impl NormalizedRustcInvocation {
         for l in &self.lints {
             enc.str(l.level).str(&l.name);
         }
-        enc.opt_str(self.cap_lints.as_deref())
-            .pair_seq(&self.externs)
+        // Tag 1 belonged to the old last-value normalization. Its successful
+        // entries can contain diagnostics from a different effective lint cap.
+        // Tag 2 fences those entries in every cache lane using this encoding;
+        // absent caps keep their existing representation.
+        match self.cap_lints.as_deref() {
+            Some(level) => {
+                enc.u64(2).str(level);
+            }
+            None => {
+                enc.u64(0);
+            }
+        }
+        enc.pair_seq(&self.externs)
             .str_seq(&self.lib_search)
             .str_seq(&self.native_libs)
             .opt_str(self.out_dir.as_deref())
@@ -635,13 +671,14 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_presentation_operands_remain_distinct_from_values() {
+    fn missing_presentation_operands_cannot_reach_legacy_replay_keys() {
         for flag in ["--color", "--diagnostic-width"] {
-            let missing = parse(&args(&["rustc", "m.rs", flag]), None).unwrap();
+            assert_eq!(
+                parse(&args(&["rustc", "m.rs", flag]), None),
+                Err(ParseError::MissingValue(flag))
+            );
             let empty = parse(&args(&["rustc", "m.rs", flag, ""]), None).unwrap();
-            assert_eq!(missing.excluded_presentation, [flag]);
             assert_eq!(empty.excluded_presentation, [format!("{flag}=")]);
-            assert_ne!(missing.excluded_presentation, empty.excluded_presentation);
         }
     }
 
@@ -659,6 +696,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    #[test]
+    fn duplicate_singletons_cannot_collapse_into_successful_invocations() {
+        for (flag, first, other) in [
+            ("--crate-name", "first", "last"),
+            ("--edition", "2018", "2021"),
+            ("--target", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
+            ("--out-dir", "/first", "/last"),
+        ] {
+            for last in [first, other] {
+                for first_attached in [false, true] {
+                    for last_attached in [false, true] {
+                        let mut argv = args(&["rustc", "m.rs"]);
+                        for (value, attached) in [(first, first_attached), (last, last_attached)] {
+                            if attached {
+                                argv.push(format!("{flag}={value}"));
+                            } else {
+                                argv.extend([flag.to_owned(), value.to_owned()]);
+                            }
+                        }
+                        assert_eq!(parse(&argv, None), Err(ParseError::DuplicateOption(flag)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeatable_caps_use_rustcs_first_value_without_rejecting_later_values() {
+        for (first, last) in [
+            ("invalid", "allow"),
+            ("allow", "invalid"),
+            ("warn", "allow"),
+            ("allow", "warn"),
+            ("deny", "allow"),
+            ("allow", "deny"),
+        ] {
+            let repeated = parse(
+                &args(&[
+                    "rustc",
+                    "m.rs",
+                    "--cap-lints",
+                    first,
+                    &format!("--cap-lints={last}"),
+                ]),
+                None,
+            )
+            .unwrap();
+            let single = parse(&args(&["rustc", "m.rs", "--cap-lints", first]), None).unwrap();
+            assert_eq!(repeated.cap_lints.as_deref(), Some(first));
+            assert_eq!(repeated.canonical_bytes(), single.canonical_bytes());
+        }
+    }
+
+    #[test]
+    fn lint_cap_identity_cannot_reuse_legacy_last_value_entries() {
+        let invocation = NormalizedRustcInvocation {
+            cap_lints: Some("allow".into()),
+            ..NormalizedRustcInvocation::default()
+        };
+        // The pre-fix encoding of this exact otherwise-empty invocation:
+        // eleven empty fields, the old optional-string cap, five empty fields.
+        let mut legacy = CanonicalEncoder::new();
+        for _ in 0..11 {
+            legacy.u64(0);
+        }
+        legacy.u64(1).str("allow");
+        for _ in 0..5 {
+            legacy.u64(0);
+        }
+        assert_ne!(invocation.canonical_bytes(), legacy.finish());
+        assert_eq!(
+            NormalizedRustcInvocation::default().canonical_bytes(),
+            vec![0; 17 * 8],
+            "invocations without lint caps retain their encoding"
+        );
+    }
+
+    #[test]
+    fn legal_repeatable_crate_types_and_emit_options_stay_ordered() {
+        let invocation = parse(
+            &args(&[
+                "rustc",
+                "m.rs",
+                "--crate-type=lib",
+                "--crate-type",
+                "rlib",
+                "--emit=metadata",
+                "--emit",
+                "dep-info",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(invocation.crate_types, ["lib", "rlib"]);
+        assert_eq!(invocation.emit, ["metadata", "dep-info"]);
     }
 
     #[test]

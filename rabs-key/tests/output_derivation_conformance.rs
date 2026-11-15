@@ -549,3 +549,124 @@ fn real_rustc_diagnostic_widths_have_distinct_live_replay_keys() {
         "attached and separate widths preserve exact output and reuse"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn compiler_option_errors_and_first_lint_cap_never_become_false_cache_hits() {
+    use rabs_key::invocation::ParseError;
+    use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest, plan_dependency_action};
+
+    let owner = tempfile::tempdir().unwrap();
+    let cargo_home = owner.path().join("cargo-home");
+    let package = cargo_home.join("registry/src/index.example-0123456789abcdef/options-1.0.0");
+    let out = owner.path().join("out");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    let source = package.join("src/lib.rs");
+    std::fs::write(&source, "pub fn f() { let unused_variable = 1; }\n").unwrap();
+    let host = host_triple();
+    let env = vec![
+        ("CARGO_HOME".into(), cargo_home.display().to_string()),
+        ("CARGO_MANIFEST_DIR".into(), package.display().to_string()),
+        ("CARGO_PKG_NAME".into(), "options".into()),
+    ];
+    let base = vec![
+        "rustc".to_owned(),
+        "--crate-name=options".into(),
+        "--crate-type=lib".into(),
+        "--edition=2021".into(),
+        format!("--target={host}"),
+        "--emit=dep-info,metadata".into(),
+        "--error-format=json".into(),
+        "-Dunused_variables".into(),
+        "--out-dir".into(),
+        out.display().to_string(),
+        source.display().to_string(),
+    ];
+    let plan = |argv: &[String]| {
+        plan_dependency_action(
+            LiveRustcRequest {
+                argv,
+                cwd: package.to_str().unwrap(),
+                env: &env,
+            },
+            &host,
+        )
+    };
+    let run = |argv: &[String]| Command::new("rustc").args(&argv[1..]).output().unwrap();
+    let mut valid = base.clone();
+    valid.push("--cap-lints=allow".into());
+    assert!(plan(&valid).is_ok());
+    let output = run(&valid);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    for (flag, value) in [
+        ("--crate-name", "options"),
+        ("--edition", "2021"),
+        ("--target", host.as_str()),
+        ("--out-dir", out.to_str().unwrap()),
+    ] {
+        let mut duplicate = valid.clone();
+        duplicate.extend([flag.to_owned(), value.to_owned()]);
+        assert_eq!(
+            parse(&duplicate, None),
+            Err(ParseError::DuplicateOption(flag))
+        );
+        assert!(matches!(plan(&duplicate), Err(LiveRefusal::Unparseable(_))));
+        let output = run(&duplicate);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("given more than once"));
+    }
+    for flag in ["--color", "--diagnostic-width"] {
+        let mut missing = valid.clone();
+        missing.push(flag.into());
+        assert_eq!(parse(&missing, None), Err(ParseError::MissingValue(flag)));
+        assert!(matches!(plan(&missing), Err(LiveRefusal::Unparseable(_))));
+        let output = run(&missing);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "Argument to option '{}' missing",
+                flag.trim_start_matches("--")
+            )),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (first, last, succeeds, diagnostic) in [
+        ("invalid", "allow", false, "unknown lint level"),
+        ("allow", "invalid", true, ""),
+        ("warn", "allow", true, "unused variable"),
+        ("allow", "warn", true, ""),
+        ("deny", "allow", false, "unused variable"),
+        ("allow", "deny", true, ""),
+    ] {
+        let mut repeated = base.clone();
+        repeated.extend([
+            format!("--cap-lints={first}"),
+            "--cap-lints".into(),
+            last.into(),
+        ]);
+        assert_eq!(
+            parse(&repeated, None).unwrap().cap_lints.as_deref(),
+            Some(first)
+        );
+        assert_eq!(plan(&repeated).is_ok(), first == "allow");
+        let output = run(&repeated);
+        assert_eq!(output.status.success(), succeeds, "{first}, {last}");
+        if diagnostic.is_empty() {
+            assert!(output.stderr.is_empty(), "{first}, {last}");
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
