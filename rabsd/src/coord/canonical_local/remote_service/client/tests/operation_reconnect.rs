@@ -599,6 +599,374 @@ fn stdout_first_write_observes_the_verified_installed_target() {
     assert!(client.delivery.stdout_spool.is_none());
 }
 
+fn cargo_artifact_record() -> Value {
+    json!({
+        "reason":"compiler-artifact",
+        "package_id":"path+file:///__rabs/workspace#fixture@0.1.0",
+        "manifest_path":"/__rabs/workspace/Cargo.toml",
+        "target":{"src_path":"/__rabs/workspace/src/main.rs", "kind":["bin"]},
+        "profile":{"test":false}, "fresh":false,
+        "filenames":["/__rabs/out/cargo/program"],
+        "executable":"/__rabs/out/cargo/program"
+    })
+}
+
+fn cargo_error_record() -> Value {
+    json!({
+        "reason":"compiler-message",
+        "package_id":"path+file:///__rabs/workspace#fixture@0.1.0",
+        "manifest_path":"/__rabs/workspace/Cargo.toml",
+        "target":{"src_path":"/__rabs/workspace/src/main.rs", "kind":["bin"]},
+        "message":{
+            "message":"keep /__rabs/workspace/literal", "level":"error", "children":[],
+            "spans":[{"file_name":"/__rabs/workspace/src/main.rs", "line_start":3, "column_start":1,
+                "text":[{"text":"let literal = \"/__rabs/workspace/source\";"}]}],
+            "rendered":"error: keep /__rabs/workspace/literal\n --> /__rabs/workspace/src/main.rs:3:1\n3 | let literal = \"/__rabs/workspace/source\";\n"
+        }
+    })
+}
+
+fn cargo_json_line(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[test]
+fn subscriber_artifact_first_write_names_the_actual_verified_file() {
+    struct ReturnedArtifact<'a> {
+        expected_path: &'a Path,
+        expected_bytes: &'a [u8],
+        bytes: Vec<u8>,
+        checked: bool,
+    }
+    impl Write for ReturnedArtifact<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.checked {
+                let record: Value = serde_json::from_slice(bytes).unwrap();
+                let named = Path::new(record["executable"].as_str().unwrap());
+                assert_eq!(named, self.expected_path);
+                assert_eq!(
+                    fs::read(named).unwrap(),
+                    self.expected_bytes,
+                    "the first returned Cargo artifact path must already open the verified bytes"
+                );
+                self.checked = true;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let directory = private();
+    let destination = directory.path().join("completed");
+    let mut config = delivery_config(&destination);
+    config.stdout_presentation = StdoutPresentation::CargoJsonSubscriber;
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let (manifest, bytes) = artifact_fixture();
+    let mut retained = cargo_json_line(&cargo_artifact_record());
+    retained.extend(cargo_json_line(
+        &json!({"reason":"build-finished", "success":true}),
+    ));
+    let runtime =
+        b"\xff\0{\"reason\":\"compiler-artifact\",\"executable\":\"/__rabs/out/cargo/fake\"}";
+    retained.extend_from_slice(runtime);
+    let mut messages = vec![
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, &retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 0,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: Some(ArtifactDeclaration::from_native(&manifest)),
+        },
+    ];
+    messages.extend(artifact_manifest_messages(&manifest));
+    for (index, part) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+        messages.push(Message::ArtifactChunk {
+            chunk: Chunk::new("program", (index * MAX_SOURCE_CHUNK) as u64, part).unwrap(),
+        });
+    }
+    messages.extend([
+        Message::WindowEnd { count: 2 },
+        Message::ArtifactEnd {},
+        Message::Commit {
+            manifest_sha256: encode_hex(&manifest.digest()),
+        },
+        Message::Complete { exit_code: 0 },
+    ]);
+    let expected_path = destination.join("program");
+    let mut output = ReturnedArtifact {
+        expected_path: &expected_path,
+        expected_bytes: &bytes,
+        bytes: Vec::new(),
+        checked: false,
+    };
+    let mut stderr = Vec::new();
+    assert_eq!(
+        native(client.complete(
+            Wire::new(RecoveryPeer::new(&messages)),
+            || std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                "presentation must not reconnect"
+            ))),
+            &mut output,
+            &mut stderr,
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(output.checked);
+    assert!(output.bytes.ends_with(runtime));
+    assert!(stderr.is_empty());
+    assert_eq!(client.delivery.stdout_offset, retained.len() as u64);
+    assert!(client.delivery.stdout_spool.is_none());
+}
+
+#[test]
+fn source_error_presentation_survives_reconnect_with_raw_wire_frontiers() {
+    let directory = private();
+    let destination = directory.path().join("completed");
+    let mut config = delivery_config(&destination);
+    config.stdout_presentation = StdoutPresentation::CargoJsonSourcePaths;
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let mut retained = cargo_json_line(&cargo_artifact_record());
+    retained.extend(cargo_json_line(&cargo_error_record()));
+    retained.extend(cargo_json_line(
+        &json!({"reason":"build-finished", "success":false}),
+    ));
+    let split = 31;
+    let initial = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, &retained[..split]),
+            stderr: diagnostic(0, b"live\n"),
+        },
+    ]);
+    let resumed = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(split as u64, &retained[split..]),
+            stderr: diagnostic(5, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 101,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 5,
+            target: None,
+        },
+        Message::Complete { exit_code: 101 },
+    ]);
+    let commands = resumed.output();
+    let mut peers = VecDeque::from([resumed]);
+    let mut output = ObservedOutput::default();
+    let visible = Arc::clone(&output.bytes);
+    let mut stderr = Vec::new();
+    assert_eq!(
+        native(client.complete(
+            Wire::new(initial),
+            || {
+                assert!(visible.lock().unwrap().is_empty());
+                std::future::ready(Ok(peers.pop_front().expect("one reconnect")))
+            },
+            &mut output,
+            &mut stderr
+        ))
+        .unwrap(),
+        101
+    );
+    assert_resume(&commands, split as u64, 5);
+    assert_eq!(stderr, b"live\n");
+    let output = visible.lock().unwrap();
+    let records: Vec<Value> = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[0]["executable"],
+        cargo_artifact_record()["executable"]
+    );
+    assert_eq!(records[0]["manifest_path"], "/fixture/source/Cargo.toml");
+    assert_eq!(
+        records[1]["message"]["spans"][0]["file_name"],
+        "/fixture/source/src/main.rs"
+    );
+    assert_eq!(
+        records[1]["message"]["message"],
+        cargo_error_record()["message"]["message"]
+    );
+    assert_eq!(client.delivery.stdout_offset, retained.len() as u64);
+    assert_ne!(
+        output.len(),
+        retained.len(),
+        "wire offsets must not become presentation offsets"
+    );
+    assert!(!destination.exists());
+    assert!(client.delivery.stdout_published);
+}
+
+#[test]
+fn incomplete_presentation_discards_its_private_prefix_and_replays_raw_once() {
+    let directory = private();
+    let destination = directory.path().join("completed");
+    let mut config = delivery_config(&destination);
+    config.stdout_presentation = StdoutPresentation::CargoJsonSubscriber;
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let mut retained = cargo_json_line(&cargo_error_record());
+    retained.extend(cargo_json_line(&cargo_artifact_record()));
+    let peer = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, &retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 101,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: None,
+        },
+        Message::Complete { exit_code: 101 },
+    ]);
+    let commands = peer.output();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    assert_eq!(
+        native(client.complete(
+            Wire::new(peer),
+            || {
+                std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                    "a presentation bypass must not reconnect",
+                )))
+            },
+            &mut stdout,
+            &mut stderr
+        ))
+        .unwrap(),
+        101
+    );
+    assert_eq!(
+        stdout, retained,
+        "no translated private prefix may escape before a late bypass"
+    );
+    let status: Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(status["kind"], "canonical-remote-presentation-bypassed");
+    assert_eq!(status["reason"], "output-path-not-installed");
+    assert_eq!(status["using"], "raw");
+    assert_eq!(
+        client.delivery.stderr_offset, 0,
+        "local presentation status is not remote output"
+    );
+    assert_eq!(
+        kinds(&commands)
+            .iter()
+            .filter(|kind| *kind == "delivered")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cumulative_presentation_limit_discards_private_translation_before_raw_replay() {
+    let directory = private();
+    let mut config = delivery_config(&directory.path().join("completed"));
+    config.stdout_presentation = StdoutPresentation::CargoJsonSourcePaths;
+    let stopped = AtomicBool::new(false);
+    let first = cargo_json_line(&cargo_error_record());
+    let limit = first.len() as u64;
+    let mut retained = first;
+    retained.extend_from_slice(&[b'x'; 128]);
+    retained.push(b'\n');
+    let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+    delivery
+        .retain_stdout(&config.staging_root, &retained)
+        .unwrap();
+    delivery.stdout_offset = retained.len() as u64;
+    delivery
+        .completed(BuildCompletion {
+            exit_code: 101,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: None,
+        })
+        .unwrap();
+    let mut stderr = Vec::new();
+    let selected = delivery
+        .prepare_stdout_presentation(&config, &stopped, &mut stderr, limit)
+        .unwrap();
+    assert!(
+        selected.is_none(),
+        "the complete presentation exceeds the injected byte budget"
+    );
+    assert!(!delivery.stdout_published);
+    let status: Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(status["reason"], "translated-cargo-output-limit");
+    assert_eq!(status["using"], "raw");
+    let mut stdout = Vec::new();
+    delivery
+        .publish_stdout(&stopped, &mut stdout, selected.as_ref())
+        .unwrap();
+    assert_eq!(
+        stdout, retained,
+        "no earlier translated record may escape or be duplicated"
+    );
+    assert_eq!(delivery.stdout_offset, retained.len() as u64);
+    assert_eq!(delivery.stderr_offset, 0);
+    assert!(delivery.stdout_published);
+    assert!(delivery.stdout_spool.is_none());
+}
+
+#[test]
+fn unavailable_presentation_status_sink_is_a_local_failure_without_stdout_or_retry() {
+    let directory = private();
+    let mut config = delivery_config(&directory.path().join("completed"));
+    config.stdout_presentation = StdoutPresentation::CargoJsonSubscriber;
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let retained = cargo_json_line(&cargo_artifact_record());
+    let peer = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, &retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 101,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: None,
+        },
+        Message::Complete { exit_code: 101 },
+    ]);
+    let commands = peer.output();
+    let mut stdout = Vec::new();
+    let mut connections = 0;
+    let result = native(client.complete(
+        Wire::new(peer),
+        || {
+            connections += 1;
+            std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                "local status failure must not reconnect",
+            )))
+        },
+        &mut stdout,
+        &mut FailedOutput,
+    ));
+    assert!(result.is_err());
+    assert!(stdout.is_empty());
+    assert_eq!(connections, 0);
+    assert!(!kinds(&commands).iter().any(|kind| kind == "delivered"));
+}
+
 #[test]
 fn retained_stdout_bound_is_checked_before_creating_a_spool() {
     let directory = private();
@@ -660,7 +1028,7 @@ fn local_stdout_failure_after_complete_never_reconnects_or_replays() {
     assert!(
         client
             .delivery
-            .publish_stdout(&stopped, &mut replay)
+            .publish_stdout(&stopped, &mut replay, None)
             .is_err()
     );
     assert!(replay.is_empty());

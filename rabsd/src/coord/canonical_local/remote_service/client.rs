@@ -19,6 +19,9 @@ use super::{
 use crate::coord::source_delivery::control::PreparationControl;
 use crate::coord::source_delivery::{PreparedLocalBundle, prepare_local_bundle_controlled};
 use crate::coord::worker_delivery::MAX_LOCAL_CANONICAL_REQUEST_BYTES;
+use crate::edge::diagnostic_rewrite::{
+    CargoJsonPresentation, CargoPresentationOutcome, MappingEntry, SubscriberMapping,
+};
 use crate::edge::live_facts::read_stable;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::runtime::RuntimeBuilder;
@@ -53,6 +56,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+// Presentation can expand paths, but cannot turn a bounded remote transcript
+// into an arbitrarily larger local output stream. Raw fallback keeps the
+// existing independent wire bound and byte-exact semantics.
+const PRESENTATION_OUTPUT_BYTES: u64 = 4 * OUTPUT_TOTAL_BYTES;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientProfile {
@@ -69,10 +77,73 @@ struct ClientProfile {
     /// Explicit, read-only byte hints from a previous output or failed delivery.
     /// This path stays at the client and never enters build intent or identity.
     artifact_reuse_root: Option<PathBuf>,
+    /// Subscriber-only presentation; never sent in the remote build request.
+    #[serde(default)]
+    stdout_presentation: StdoutPresentation,
     settings: RemoteOperationSettings,
 }
 
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+enum StdoutPresentation {
+    #[default]
+    #[serde(rename = "raw")]
+    Raw,
+    #[serde(rename = "cargo-json-subscriber-v1")]
+    CargoJsonSubscriber,
+    #[serde(rename = "cargo-json-source-paths-v1")]
+    CargoJsonSourcePaths,
+}
+
+impl StdoutPresentation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::CargoJsonSubscriber => "cargo-json-subscriber-v1",
+            Self::CargoJsonSourcePaths => "cargo-json-source-paths-v1",
+        }
+    }
+}
+
 impl ClientProfile {
+    fn cargo_presentation(
+        &self,
+        installed_files: Option<BTreeSet<String>>,
+    ) -> io::Result<CargoJsonPresentation> {
+        let mut roots = vec![
+            ("/__rabs/workspace", self.source_root.as_path()),
+            ("/__rabs/toolchain", self.toolchain_root.as_path()),
+        ];
+        if let Some(root) = self.cargo_home_source.as_deref() {
+            roots.push(("/__rabs/cargo-home", root));
+        }
+        if installed_files.is_some() {
+            roots.push(("/__rabs/out/cargo", self.output_destination.as_path()));
+        }
+        let entries = roots
+            .into_iter()
+            .map(|(canonical, root)| {
+                Ok(MappingEntry {
+                    canonical: canonical.into(),
+                    worktree: root
+                        .to_str()
+                        .ok_or_else(|| {
+                            invalid("subscriber presentation requires UTF-8 root paths")
+                        })?
+                        .into(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mapping = SubscriberMapping::new(entries)
+            .map_err(|_| invalid("invalid subscriber presentation mapping"))?;
+        Ok(
+            if self.stdout_presentation == StdoutPresentation::CargoJsonSourcePaths {
+                CargoJsonPresentation::source_paths(mapping)
+            } else {
+                CargoJsonPresentation::new(mapping, installed_files)
+            },
+        )
+    }
+
     fn with_artifact_reuse_environment(mut self, value: Option<OsString>) -> io::Result<Self> {
         if let Some(value) = value {
             require(
@@ -926,10 +997,92 @@ impl ClientDelivery {
         spool.flush()
     }
 
+    /// Validate the entire private stream before exposing a translated prefix.
+    /// A presentation refusal keeps the original compiler status and transcript;
+    /// it is never a reason to execute again or invent a missing local artifact.
+    fn prepare_stdout_presentation(
+        &mut self,
+        config: &ClientProfile,
+        stopped: &AtomicBool,
+        stderr: &mut impl Write,
+        maximum_output_bytes: u64,
+    ) -> io::Result<Option<CargoJsonPresentation>> {
+        if config.stdout_presentation == StdoutPresentation::Raw {
+            return Ok(None);
+        }
+        require(
+            self.completion.is_some() && !self.stdout_published,
+            "remote stdout presentation is incomplete or was already published",
+        )?;
+        let deadline = self.deadline();
+        checkpoint(stopped, deadline)?;
+        let files = (config.stdout_presentation == StdoutPresentation::CargoJsonSubscriber)
+            .then(|| {
+                self.target.installed.as_ref().map(|installed| {
+                    installed
+                        .manifest()
+                        .files()
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect()
+                })
+            })
+            .flatten();
+        let presentation = config.cargo_presentation(files)?;
+        let outcome = if let Some(spool) = &mut self.stdout_spool {
+            require(
+                spool.metadata()?.len() == self.stdout_offset,
+                "retained remote stdout changed before presentation validation",
+            )?;
+            spool.rewind()?;
+            let mut input = spool.take(self.stdout_offset);
+            let outcome =
+                presentation.copy(&mut input, &mut io::sink(), maximum_output_bytes, || {
+                    checkpoint(stopped, deadline)
+                })?;
+            if outcome == CargoPresentationOutcome::Complete {
+                require(
+                    input.limit() == 0,
+                    "retained remote stdout was truncated during validation",
+                )?;
+            }
+            outcome
+        } else {
+            require(
+                self.stdout_offset == 0,
+                "retained remote stdout is missing at validation",
+            )?;
+            CargoPresentationOutcome::Complete
+        };
+        match outcome {
+            CargoPresentationOutcome::Complete => Ok(Some(presentation)),
+            CargoPresentationOutcome::Bypass(reason) => {
+                checkpoint(stopped, deadline)?;
+                serde_json::to_writer(
+                    &mut *stderr,
+                    &json!({
+                        "kind":"canonical-remote-presentation-bypassed",
+                        "requested":config.stdout_presentation.name(),
+                        "using":"raw",
+                        "reason":reason.reason(),
+                    }),
+                )?;
+                stderr.write_all(b"\n")?;
+                stderr.flush()?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Call only after the authenticated terminal receipt and installed-target
     /// verification. Consume custody before the first local write: a failed
     /// output sink must never cause either replay or remote execution retry.
-    fn publish_stdout(&mut self, stopped: &AtomicBool, writer: &mut impl Write) -> io::Result<()> {
+    fn publish_stdout(
+        &mut self,
+        stopped: &AtomicBool,
+        writer: &mut impl Write,
+        presentation: Option<&CargoJsonPresentation>,
+    ) -> io::Result<()> {
         require(
             self.completion.is_some() && !self.stdout_published,
             "remote stdout publication is incomplete or was already attempted",
@@ -943,14 +1096,26 @@ impl ClientDelivery {
                 "retained remote stdout changed before publication",
             )?;
             spool.rewind()?;
-            let mut remaining = self.stdout_offset;
-            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
-            while remaining != 0 {
-                checkpoint(stopped, deadline)?;
-                let count = remaining.min(buffer.len() as u64) as usize;
-                spool.read_exact(&mut buffer[..count])?;
-                writer.write_all(&buffer[..count])?;
-                remaining -= count as u64;
+            if let Some(presentation) = presentation {
+                let mut input = spool.take(self.stdout_offset);
+                let outcome =
+                    presentation.copy(&mut input, writer, PRESENTATION_OUTPUT_BYTES, || {
+                        checkpoint(stopped, deadline)
+                    })?;
+                require(
+                    outcome == CargoPresentationOutcome::Complete && input.limit() == 0,
+                    "validated remote stdout presentation changed before publication",
+                )?;
+            } else {
+                let mut remaining = self.stdout_offset;
+                let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+                while remaining != 0 {
+                    checkpoint(stopped, deadline)?;
+                    let count = remaining.min(buffer.len() as u64) as usize;
+                    spool.read_exact(&mut buffer[..count])?;
+                    writer.write_all(&buffer[..count])?;
+                    remaining -= count as u64;
+                }
             }
         } else {
             require(
@@ -1309,13 +1474,19 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         completed == exit_code,
         "remote terminal exit status changed",
     )?;
+    let presentation = delivery.prepare_stdout_presentation(
+        config,
+        stopped,
+        stderr_writer,
+        PRESENTATION_OUTPUT_BYTES,
+    )?;
     if let Some(installed) = &delivery.target.installed {
         installed
             .verify(&|| stopped.load(Ordering::Acquire) || Instant::now() >= delivery_deadline)?;
     }
     // Replay before the optional network cleanup: local output failures must
     // remain distinguishable from a failed transport and must not reconnect.
-    delivery.publish_stdout(stopped, stdout_writer)?;
+    delivery.publish_stdout(stopped, stdout_writer, presentation.as_ref())?;
     // Complete is already authenticated and verified. A lost cleanup ACK must
     // not turn a known completed command back into an uncertain execution.
     let _ = wire
@@ -1637,6 +1808,7 @@ mod tests {
         let directory = private();
         let profile = artifact_reuse_profile(directory.path());
         assert!(profile.artifact_reuse_root.is_none());
+        assert_eq!(profile.stdout_presentation, StdoutPresentation::Raw);
         assert!(profile.validate().is_ok());
         let prior = directory.path().join("outputs/prior");
         fs::DirBuilder::new().mode(0o700).create(&prior).unwrap();
@@ -1666,6 +1838,42 @@ mod tests {
                 .with_artifact_reuse_environment(Some(OsString::new()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn subscriber_presentation_is_explicit_and_does_not_enter_remote_build_settings() {
+        let directory = private();
+        let mut profile = artifact_reuse_profile(directory.path());
+        let settings = serde_json::to_value(&profile.settings).unwrap();
+        for (name, expected) in [
+            ("raw", StdoutPresentation::Raw),
+            (
+                "cargo-json-subscriber-v1",
+                StdoutPresentation::CargoJsonSubscriber,
+            ),
+            (
+                "cargo-json-source-paths-v1",
+                StdoutPresentation::CargoJsonSourcePaths,
+            ),
+        ] {
+            let mode: StdoutPresentation = serde_json::from_value(json!(name)).unwrap();
+            assert_eq!(mode, expected);
+            assert_eq!(mode.name(), name);
+            profile.stdout_presentation = mode;
+            assert!(profile.validate().is_ok());
+            assert_eq!(serde_json::to_value(&profile.settings).unwrap(), settings);
+        }
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!("subscriber"),
+            json!({"mode":"raw"}),
+        ] {
+            assert!(serde_json::from_value::<StdoutPresentation>(invalid).is_err());
+        }
+        let mut remote_settings = settings;
+        remote_settings["stdout_presentation"] = json!("cargo-json-source-paths-v1");
+        assert!(serde_json::from_value::<RemoteOperationSettings>(remote_settings).is_err());
     }
 
     #[test]

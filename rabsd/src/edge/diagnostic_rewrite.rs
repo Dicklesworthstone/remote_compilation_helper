@@ -30,6 +30,10 @@
 
 use sha2::{Digest, Sha256};
 
+mod cargo_json;
+
+pub use cargo_json::{CargoJsonPresentation, CargoPresentationBypass, CargoPresentationOutcome};
+
 /// The canonical visible namespace marker (rabs-sandbox layout root).
 const CANONICAL_MARKER: &str = "/__rabs";
 
@@ -92,7 +96,14 @@ impl SubscriberMapping {
             if entry.canonical.is_empty() || entry.worktree.is_empty() {
                 return Err(MappingError::EmptyEntry);
             }
-            if !entry.canonical.starts_with(CANONICAL_MARKER) {
+            if !canonical_path(&entry.canonical)
+                || entry.canonical.ends_with('/')
+                || entry
+                    .canonical
+                    .split('/')
+                    .any(|part| matches!(part, "." | ".."))
+                || entry.canonical.contains("//")
+            {
                 return Err(MappingError::NonCanonicalSource {
                     canonical: entry.canonical.clone(),
                 });
@@ -102,13 +113,42 @@ impl SubscriberMapping {
         Ok(Self { entries })
     }
 
-    /// Rewrite every canonical prefix occurrence inside one string.
-    fn rewrite_str(&self, value: &str) -> String {
-        let mut out = value.to_string();
-        for entry in &self.entries {
-            out = out.replace(&entry.canonical, &entry.worktree);
+    /// Rewrite original path tokens once. A subscriber's own path can contain
+    /// `/__rabs`; it must never become input to a later mapping or an apparent
+    /// untranslated canonical path. Prefixes end at a path component boundary.
+    fn rewrite_str(&self, value: &str) -> (String, bool) {
+        let mut out = String::with_capacity(value.len());
+        let mut copied = 0;
+        let mut complete = true;
+        for (index, _) in value.match_indices(CANONICAL_MARKER) {
+            if index < copied
+                || value[..index].chars().next_back().is_some_and(|previous| {
+                    previous.is_alphanumeric() || matches!(previous, '/' | '_' | '-' | '.')
+                })
+            {
+                continue;
+            }
+            let tail = &value[index..];
+            if !tail[CANONICAL_MARKER.len()..]
+                .chars()
+                .next()
+                .is_none_or(path_token_boundary)
+            {
+                continue;
+            }
+            let Some(entry) = self.entries.iter().find(|entry| {
+                tail.strip_prefix(&entry.canonical)
+                    .is_some_and(|rest| rest.chars().next().is_none_or(path_token_boundary))
+            }) else {
+                complete = false;
+                continue;
+            };
+            out.push_str(&value[copied..index]);
+            out.push_str(&entry.worktree);
+            copied = index + entry.canonical.len();
         }
-        out
+        out.push_str(&value[copied..]);
+        (out, complete)
     }
 
     /// The redacted receipt for provenance (no raw worktree paths).
@@ -126,6 +166,19 @@ impl SubscriberMapping {
                 .collect(),
         }
     }
+}
+
+fn canonical_path(path: &str) -> bool {
+    path == CANONICAL_MARKER
+        || path
+            .strip_prefix(CANONICAL_MARKER)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_token_boundary(character: char) -> bool {
+    character == '/'
+        || character.is_whitespace()
+        || matches!(character, ':' | '\'' | '"' | ')' | ']' | '}' | ',' | ';')
 }
 
 /// Outcome of translating one payload for one subscriber.
@@ -147,42 +200,29 @@ pub enum TranslationOutcome {
     NotJson,
 }
 
-fn collect_untranslated(value: &serde_json::Value, found: &mut Vec<String>) {
+fn rewrite_value(
+    mapping: &SubscriberMapping,
+    value: &mut serde_json::Value,
+    untranslated: &mut Vec<String>,
+) {
     match value {
         serde_json::Value::String(text) => {
             if text.contains(CANONICAL_MARKER) {
-                found.push(text.clone());
+                let (rewritten, complete) = mapping.rewrite_str(text);
+                if !complete {
+                    untranslated.push(text.clone());
+                }
+                *text = rewritten;
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_untranslated(item, found);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values() {
-                collect_untranslated(item, found);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_value(mapping: &SubscriberMapping, value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => {
-            if text.contains(CANONICAL_MARKER) {
-                *text = mapping.rewrite_str(text);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                rewrite_value(mapping, item);
+                rewrite_value(mapping, item, untranslated);
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                rewrite_value(mapping, item);
+                rewrite_value(mapping, item, untranslated);
             }
         }
         _ => {}
@@ -207,9 +247,8 @@ pub fn translate_structured_event(
     if value.get("artifact").is_some() && value.get("reason").is_none() {
         return TranslationOutcome::ReplayedVerbatim(event_json.to_string());
     }
-    rewrite_value(mapping, &mut value);
     let mut untranslated = Vec::new();
-    collect_untranslated(&value, &mut untranslated);
+    rewrite_value(mapping, &mut value, &mut untranslated);
     if untranslated.is_empty() {
         TranslationOutcome::Translated(value.to_string())
     } else {
@@ -221,10 +260,10 @@ pub fn translate_structured_event(
 /// output): plain prefix rewriting with the same completeness rule.
 #[must_use]
 pub fn translate_rendered(mapping: &SubscriberMapping, text: &str) -> TranslationOutcome {
-    let rewritten = mapping.rewrite_str(text);
-    if rewritten.contains(CANONICAL_MARKER) {
+    let (rewritten, complete) = mapping.rewrite_str(text);
+    if !complete {
         TranslationOutcome::Bypass {
-            untranslated: rewritten
+            untranslated: text
                 .lines()
                 .filter(|line| line.contains(CANONICAL_MARKER))
                 .map(str::to_string)
@@ -463,6 +502,62 @@ mod tests {
             panic!()
         };
         assert_eq!(out, "path /home/alice/proj/target/debug/fx");
+    }
+
+    #[test]
+    fn mapping_requires_real_namespace_and_component_boundaries() {
+        for canonical in [
+            "/__rabs-else/workspace",
+            "/__rabs/workspace/../out",
+            "/__rabs//workspace",
+            "/__rabs/workspace/",
+        ] {
+            assert!(
+                SubscriberMapping::new(vec![MappingEntry {
+                    canonical: canonical.into(),
+                    worktree: "/home/alice/proj".into(),
+                }])
+                .is_err(),
+                "{canonical}"
+            );
+        }
+        let mapping = mapping_for("/home/alice/proj");
+        assert!(matches!(
+            translate_rendered(&mapping, "path /__rabs/workspace-extra/src/lib.rs"),
+            TranslationOutcome::Bypass { .. }
+        ));
+        assert_eq!(
+            translate_rendered(&mapping, "path /__rabs-workspace/src/lib.rs"),
+            TranslationOutcome::Translated("path /__rabs-workspace/src/lib.rs".into())
+        );
+    }
+
+    #[test]
+    fn inserted_subscriber_paths_are_not_rewritten_or_treated_as_missing() {
+        let mapping = SubscriberMapping::new(vec![
+            MappingEntry {
+                canonical: "/__rabs/workspace".into(),
+                worktree: "/home/alice/__rabs/out/fixture".into(),
+            },
+            MappingEntry {
+                canonical: "/__rabs/out/fixture".into(),
+                worktree: "/different-output".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            translate_rendered(&mapping, "path /__rabs/workspace/src/lib.rs"),
+            TranslationOutcome::Translated("path /home/alice/__rabs/out/fixture/src/lib.rs".into())
+        );
+        let TranslationOutcome::Translated(output) =
+            translate_structured_event(&mapping, DIAGNOSTIC)
+        else {
+            panic!(
+                "a canonical-looking component in the subscriber path is not missing mapping evidence"
+            );
+        };
+        assert!(output.contains("/home/alice/__rabs/out/fixture/src/lib.rs"));
+        assert!(!output.contains("/different-output"));
     }
 
     #[test]

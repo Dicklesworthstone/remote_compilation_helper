@@ -3013,18 +3013,73 @@ inspect any uncertain prior result before deciding to submit new work.
 #### Results, ownership and current limits
 
 The client preserves Cargo's numeric exit status and separate stdout/stderr
-streams. It retains stdout in a bounded private file while receiving progress.
+streams. By default, stdout remains byte-exact. The client retains it in a
+bounded private file while receiving progress.
 Stdout is replayed once only after the authenticated terminal completion agrees
 with Cargo's exit status and any returned target has been installed and verified.
 This keeps Cargo's artifact announcements behind verified delivery. Stderr remains
 live. An incomplete or invalid delivery does not expose retained stdout; a completed
-failed command still replays its original bytes and preserves its nonzero exit.
+failed command still publishes its diagnostics and preserves its nonzero exit.
 A successful Build or Doc, or Test/Bench with `no_run`, transfers the
 completed ordinary-file target tree and installs it at `output_destination`.
 Successful Check, Clippy and executing Test return their status and diagnostics
 without materializing that destination. The destination field remains required
 for every profile, and an existing destination refuses instead of being merged
 or overwritten. Choose a fresh destination for each intentional new operation.
+
+#### Subscriber paths in remote Cargo JSON
+
+The native remote client and `rabs-cargo --remote` accept an optional top-level
+`stdout_presentation` field in the client profile. It is independent of
+`settings`; it never enters the remote request, compilation identity or cache
+key. Omitting it selects `"raw"`.
+
+| Value | Published stdout |
+| --- | --- |
+| `raw` | Original Cargo and program bytes. |
+| `cargo-json-source-paths-v1` | Translate recognized source and diagnostic paths to this client's source, toolchain and optional Cargo-home roots. Preserve artifact filenames, executable paths and complete build-script output records. This variant also works for failed commands and commands that do not install a target tree. |
+| `cargo-json-subscriber-v1` | Translate recognized source paths and returned artifact paths. Every translated output file must belong to the verified installed manifest; output directories must be represented by installed descendants. A missing output mapping refuses the translated presentation. |
+
+For example, add this field beside `source_root` in a native remote profile:
+
+```json
+"stdout_presentation": "cargo-json-source-paths-v1"
+```
+
+Source paths map from `/__rabs/workspace`, `/__rabs/toolchain`, and
+`/__rabs/cargo-home` to the corresponding explicit client roots. Full subscriber
+presentation also maps `/__rabs/out/cargo` to `output_destination`, subject to
+verified manifest membership. Cargo's `package_id` remains its original identity.
+Diagnostic messages, source snippets, labels, suggestions, build-script values,
+and unknown records retain their meaning. Rendered diagnostic location headers
+change only when their original path, line and column match structured spans.
+Rustc's internal artifact notifications retain their original bytes.
+
+The client validates the entire retained stream privately before publishing any
+translated prefix, then verifies installed output custody again. An unsupported
+record, unmapped path, unavailable output, ambiguous rendered location or exceeded
+presentation bound selects the original **whole stream** instead. Stderr then
+reports `canonical-remote-presentation-bypassed` with `requested`, `using: "raw"`,
+and a content-free `reason`. It does not expose source text or client paths in
+that status record, alter the compiler's exit status, or submit another execution.
+Transport reattachment still uses raw byte offsets from the retained transcript.
+
+JSON records are limited to 1 MiB before translation and 4 MiB after translation;
+total presented bytes are limited to four times the existing retained-output
+budget. Plain output streams in bounded chunks. After Cargo's valid
+`build-finished` record, all remaining program bytes stay byte-exact, including
+JSON-looking or binary output. Cancellation and the existing delivery deadline
+remain active during validation and publication.
+
+Relative rustc span paths remain unchanged: their base can be a workspace root
+different from the selected manifest's directory, so the client does not guess
+an absolute location. Source links identify the original captured roots; they
+do not assert that the live checkout still contains the captured bytes. Select
+the source-path variant when dependency artifacts are not returned; the full
+subscriber variant must fall back to raw output if any requested artifact is
+absent from the installed tree.
+
+#### Delivery bounds and ownership
 
 Source input remains limited to **512 MiB and 4096 regular files**. Source and
 artifact manifests transfer in bounded pages, so a complete declaration may
