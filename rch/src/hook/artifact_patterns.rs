@@ -306,24 +306,23 @@ pub(super) fn get_custom_target_artifact_patterns(
         return Vec::new();
     }
     match kind {
-        Some(CompilationKind::CargoTest)
-        | Some(CompilationKind::CargoCheck)
+        Some(CompilationKind::CargoCheck)
         | Some(CompilationKind::CargoClippy)
         // Nix builds and jobs never write into a cargo target dir and return
         // no artifacts.
         | Some(CompilationKind::NixBuild)
         | Some(CompilationKind::Job) => Vec::new(),
-        Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
-            // Test/bench artifacts are already a narrow allowlist; just rebase them
-            // onto the target-dir root (the sync root IS the remote target dir).
+        Some(CompilationKind::CargoTest)
+        | Some(CompilationKind::CargoNextest)
+        | Some(CompilationKind::CargoBench) => {
+            // Cargo target forwarding is active even with the default local
+            // target/. Keep its report allowlist, but rebase ONLY target-root
+            // reports. Project-root junit/tarpaulin/cobertura files belong to
+            // the project phase; looking for them here can return stale files
+            // from a reused target tree into the wrong local directory.
             get_artifact_patterns(kind, command)
                 .into_iter()
-                .map(|pattern| {
-                    pattern
-                        .strip_prefix("target/")
-                        .unwrap_or(pattern.as_str())
-                        .to_string()
-                })
+                .filter_map(|pattern| pattern.strip_prefix("target/").map(str::to_owned))
                 .collect()
         }
         // Zig cross-build in a custom CARGO_TARGET_DIR: outputs live at

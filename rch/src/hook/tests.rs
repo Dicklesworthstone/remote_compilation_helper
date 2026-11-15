@@ -3119,7 +3119,10 @@ async fn clean_overlay_nested_pins_invalidate_warm_archives_and_cargo_artifacts(
                     ])
                     .env_clear()
                     .env("PATH", "")
-                    .env("RCH_WKR_BIN", crate::transfer::native_control_worker_for_test())
+                    .env(
+                        "RCH_WKR_BIN",
+                        crate::transfer::native_control_worker_for_test(),
+                    )
                     .output()
                     .unwrap();
                 assert!(output.status.success(), "{output:?}");
@@ -14870,14 +14873,133 @@ fn test_cargo_package_verification_rejects_known_empty_archive_sync() {
 }
 
 #[test]
-fn test_custom_target_artifact_patterns_for_cargo_test_are_skipped() {
+fn test_report_artifact_patterns_preserve_default_and_custom_root_ownership() {
     let _guard = test_guard!();
-    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest), None);
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let target_reports = [
+        "coverage/report.json",
+        "llvm-cov-target/report.profraw",
+        "nextest/default/junit.xml",
+        "criterion/example/new/estimates.json",
+    ];
+    let project_reports = [
+        "junit.xml",
+        "test-results.xml",
+        "cobertura.xml",
+        "tarpaulin-report.html",
+        "tarpaulin-report.json",
+    ];
+    let build_cache = [
+        "debug/application",
+        "debug/deps/libapplication.rlib",
+        "debug/incremental/cache.bin",
+        "debug/.fingerprint/application/lib.json",
+        "release/build/dependency/out/generated.rs",
+    ];
+    for (kind, command) in [
+        (CompilationKind::CargoTest, "cargo test"),
+        (CompilationKind::CargoNextest, "cargo nextest run"),
+        (CompilationKind::CargoBench, "cargo bench"),
+    ] {
+        for explicit in [false, true] {
+            let custom = directory.path().join("custom target");
+            // Ordinary Cargo commands resolve a target phase even without
+            // CARGO_TARGET_DIR. That previously removed these reports from
+            // the project phase while CargoTest's target phase stayed empty.
+            let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+                Some(kind),
+                &project,
+                &reporter,
+                |name| {
+                    (explicit && name == "CARGO_TARGET_DIR")
+                        .then(|| custom.to_string_lossy().into_owned())
+                },
+                None,
+            );
+            let target = resolved
+                .as_ref()
+                .expect("Cargo always resolves a target root");
+            assert_eq!(
+                target,
+                &if explicit {
+                    custom
+                } else {
+                    project.join("target")
+                }
+            );
+            std::fs::create_dir_all(target).unwrap();
 
-    assert!(
-        patterns.is_empty(),
-        "cargo test output is streamed; do not sync a custom target dir after tests"
-    );
+            let stage = directory.path().join(format!("stage-{kind:?}-{explicit}"));
+            let target_stage = stage.join("target");
+            let target_paths: Vec<_> = target_reports
+                .iter()
+                .chain(project_reports.iter())
+                .chain(build_cache.iter())
+                .map(PathBuf::from)
+                .collect();
+            for relative in &target_paths {
+                let path = target_stage.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"staged target report or retained worker residue\n")
+                    .unwrap();
+            }
+            let target_pipeline = TransferPipeline::new(
+                target.clone(),
+                "test-reports".into(),
+                "test-report-target-fixture".into(),
+                TransferConfig::default(),
+            );
+            let target_patterns = get_custom_target_artifact_patterns(Some(kind), Some(command));
+            let (admitted, rejected) = target_pipeline
+                .partition_staged_artifact_paths(&target_paths, &target_patterns)
+                .unwrap();
+            assert_eq!(
+                admitted,
+                target_reports.map(PathBuf::from),
+                "{command}, explicit={explicit}: preserve the declared target reports"
+            );
+            for relative in project_reports.iter().chain(build_cache.iter()) {
+                assert!(
+                    rejected.contains(&PathBuf::from(relative)),
+                    "{command}: target retrieval must reject {relative}"
+                );
+            }
+
+            // The same project-root report names remain valid in their own
+            // phase. Stale project/target reports cannot replace the reports
+            // produced in the isolated worker target tree.
+            let project_paths: Vec<_> = project_reports
+                .iter()
+                .map(PathBuf::from)
+                .chain(
+                    target_reports
+                        .iter()
+                        .map(|path| Path::new("target").join(path)),
+                )
+                .collect();
+            for relative in &project_paths {
+                let path = stage.join("project").join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"staged project report or old target residue\n").unwrap();
+            }
+            let project_pipeline = TransferPipeline::new(
+                project.clone(),
+                "test-reports".into(),
+                "test-report-project-fixture".into(),
+                TransferConfig::default(),
+            );
+            let project_patterns =
+                get_project_artifact_patterns(Some(kind), Some(command), resolved.is_some());
+            let (admitted, rejected) = project_pipeline
+                .partition_staged_artifact_paths(&project_paths, &project_patterns)
+                .unwrap();
+            assert_eq!(admitted, project_reports.map(PathBuf::from));
+            assert_eq!(rejected.len(), target_reports.len());
+        }
+    }
 }
 
 #[test]
