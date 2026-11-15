@@ -3619,6 +3619,40 @@ mod tests {
     }
 
     #[test]
+    fn separate_presentation_values_cannot_alias_live_transcript_keys() {
+        for (flag, first, second) in [
+            ("--color", "always", "never"),
+            ("--diagnostic-width", "30", "160"),
+        ] {
+            let first_plan = plan_for(OUT_A, &[flag, first], &[]).unwrap();
+            let second_plan = plan_for(OUT_A, &[flag, second], &[]).unwrap();
+            assert_eq!(
+                first_plan.invocation.canonical_bytes(),
+                second_plan.invocation.canonical_bytes(),
+                "presentation does not change semantic invocation bytes"
+            );
+            assert_ne!(
+                key(&first_plan),
+                key(&second_plan),
+                "different {flag} operands must not replay the same transcript"
+            );
+            for (value, plan) in [(first, first_plan), (second, second_plan)] {
+                let attached = format!("{flag}={value}");
+                assert_eq!(
+                    key(&plan),
+                    key(&plan_for(OUT_B, &[&attached], &[]).unwrap()),
+                    "equivalent operand spelling and output placement preserve reuse"
+                );
+            }
+            assert_ne!(
+                key(&plan_for(OUT_A, &[flag, first, flag, second], &[]).unwrap()),
+                key(&plan_for(OUT_A, &[flag, second, flag, first], &[]).unwrap()),
+                "the presentation record must preserve repeated-option order"
+            );
+        }
+    }
+
+    #[test]
     fn compiler_environment_is_preserved_and_custom_values_change_keys() {
         let plan = plan_for(OUT_A, &[], &[]).unwrap();
         let mut expected = env(&[]);

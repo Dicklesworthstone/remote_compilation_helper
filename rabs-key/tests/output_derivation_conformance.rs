@@ -407,3 +407,145 @@ fn save_temps_really_adds_files_that_dependency_serving_must_not_omit() {
     let invocation = parse(&argv, None).unwrap();
     assert!(derive_dependency_output_declarations(&invocation, &host_triple()).is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_rustc_diagnostic_widths_have_distinct_live_replay_keys() {
+    use std::path::Path;
+
+    use rabs_key::live_dependency::{
+        LiveRustcRequest, ToolchainFacts, canonicalize_compiler_transcript, live_dependency_key,
+        plan_dependency_action,
+    };
+    use rabs_key::typed_digest::compute;
+    use rabs_protocol::input_evidence::{
+        ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+    };
+    use rabs_protocol::raw_bytes::RawBytes;
+    use rabs_protocol::result_identity::ObjectId;
+
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("probe real rustc sysroot");
+    assert!(sysroot.status.success());
+    let rustc = Path::new(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+    let version = Command::new(&rustc).arg("-vV").output().unwrap();
+    assert!(version.status.success());
+    // The fixture's fixed identities isolate the presentation component;
+    // the actual compiler/version and source stay identical in all runs.
+    let digest = |tag: u8| compute("rabs.test-object.v1", &[tag]);
+    let facts = ToolchainFacts {
+        compiler_binary_digest: digest(1),
+        verbose_version: String::from_utf8(version.stdout).unwrap(),
+        sysroot_root_digest: digest(2),
+        runtime_libraries: vec![digest(3)],
+    };
+    let host = facts.host_triple().unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let cargo_home = temporary.path().join("cargo-home");
+    let package = cargo_home.join("registry/src/index.example-0123456789abcdef/width-1.0.0");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='width'\nversion='1.0.0'\n",
+    )
+    .unwrap();
+    let source = package.join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "pub fn render() { let a_long_variable_name_that_is_deliberately_unused_to_exercise_the_compiler_diagnostic_width_contract = 1; }\n",
+    )
+    .unwrap();
+    let environment = vec![
+        ("CARGO_HOME".into(), cargo_home.display().to_string()),
+        ("CARGO_MANIFEST_DIR".into(), package.display().to_string()),
+        ("CARGO_PKG_NAME".into(), "width".into()),
+    ];
+    let mut runs = Vec::new();
+    for (index, width, attached) in [(0, "30", false), (1, "160", false), (2, "30", true)] {
+        let out = temporary.path().join(format!("out-{index}"));
+        std::fs::create_dir(&out).unwrap();
+        let mut arguments = vec![
+            rustc.display().to_string(),
+            "--crate-name=width".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            "--error-format=json".into(),
+            "--force-warn=unused_variables".into(),
+            "--cap-lints=allow".into(),
+            "--out-dir".into(),
+            out.display().to_string(),
+            source.display().to_string(),
+        ];
+        if attached {
+            arguments.push(format!("--diagnostic-width={width}"));
+        } else {
+            arguments.extend(["--diagnostic-width".into(), width.into()]);
+        }
+        let plan = plan_dependency_action(
+            LiveRustcRequest {
+                argv: &arguments,
+                cwd: package.to_str().unwrap(),
+                env: &environment,
+            },
+            host,
+        )
+        .unwrap();
+        let output = Command::new(&rustc)
+            .args(&arguments[1..])
+            .env_clear()
+            .envs(plan.execution_env.iter().cloned())
+            .current_dir(&package)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let transcript = canonicalize_compiler_transcript(&output.stderr, &plan).unwrap();
+        assert!(
+            transcript
+                .windows(b"unused variable".len())
+                .any(|bytes| bytes == b"unused variable")
+        );
+        let input = |relative: &str, tag: u8| PositiveInput {
+            virtual_path: RawBytes::new(plan.input_virtual_path(relative).into_bytes()),
+            object: ObjectId(digest(tag)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        };
+        let inputs = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: vec![input("Cargo.toml", 10), input("src/lib.rs", 11)],
+            ..ActionInputManifest::default()
+        };
+        let key = live_dependency_key(&plan, &facts, &[], &[], None, &inputs)
+            .unwrap()
+            .action_key;
+        runs.push((
+            key,
+            transcript,
+            std::fs::read(out.join("libwidth.rmeta")).unwrap(),
+        ));
+    }
+    assert_ne!(
+        runs[0].1, runs[1].1,
+        "real rustc renders different diagnostic widths"
+    );
+    assert_eq!(
+        runs[0].2, runs[1].2,
+        "only presentation changed, not metadata"
+    );
+    assert_ne!(
+        runs[0].0, runs[1].0,
+        "different real transcripts must have different replay keys"
+    );
+    assert_eq!(
+        runs[0], runs[2],
+        "attached and separate widths preserve exact output and reuse"
+    );
+}

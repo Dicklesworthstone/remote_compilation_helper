@@ -99,8 +99,10 @@ pub struct NormalizedRustcInvocation {
     pub out_dir: Option<String>,
     /// Everything unrecognized, in original order (sound-by-inclusion).
     pub passthrough: Vec<String>,
-    /// Known-volatile presentation flags that were dropped (`--color`,
-    /// `--diagnostic-width`) — diagnostic record of the exclusion.
+    /// Known-volatile presentation flags excluded from semantic bytes
+    /// (`--color`, `--diagnostic-width`), with their complete values and order
+    /// retained for exact transcript variants. Separate operands normalize to
+    /// `--flag=value`, just like attached operands.
     pub excluded_presentation: Vec<String>,
 }
 
@@ -200,19 +202,23 @@ pub fn parse(
     let mut rest = argv[compiler_pos + 1..].iter().cloned().peekable();
     while let Some(arg) = rest.next() {
         let a = arg.as_str();
-        // Known-volatile presentation flags: the ONLY dropped surface.
-        if a == "--color" || a.starts_with("--color=") {
-            if a == "--color" {
-                rest.next();
-            }
-            inv.excluded_presentation.push(arg);
-            continue;
-        }
-        if a == "--diagnostic-width" || a.starts_with("--diagnostic-width=") {
-            if a == "--diagnostic-width" {
-                rest.next();
-            }
-            inv.excluded_presentation.push(arg);
+        // Presentation is excluded only from semantic artifact identity.
+        // Live serving also binds this record to the exact transcript: losing
+        // a separate operand would alias different diagnostic widths/colors.
+        if a == "--color"
+            || a.starts_with("--color=")
+            || a == "--diagnostic-width"
+            || a.starts_with("--diagnostic-width=")
+        {
+            let recorded = if matches!(a, "--color" | "--diagnostic-width") {
+                match rest.next() {
+                    Some(value) => format!("{a}={value}"),
+                    None => arg,
+                }
+            } else {
+                arg
+            };
+            inv.excluded_presentation.push(recorded);
             continue;
         }
         if let Some(v) = take_value(a, "--crate-name", &mut rest) {
@@ -470,7 +476,7 @@ mod tests {
         // Presentation flags dropped AND recorded.
         assert_eq!(
             inv.excluded_presentation,
-            ["--color", "--diagnostic-width=142"]
+            ["--color=always", "--diagnostic-width=142"]
         );
         assert!(inv.passthrough.is_empty(), "{:?}", inv.passthrough);
     }
@@ -566,6 +572,77 @@ mod tests {
         extra.push("feature=\"alloc\"".into());
         let changed = parse(&extra, None).unwrap();
         assert_ne!(with.canonical_bytes(), changed.canonical_bytes());
+    }
+
+    #[test]
+    fn presentation_record_preserves_separate_values_and_repeated_option_order() {
+        let separate = parse(
+            &args(&[
+                "rustc",
+                "--color",
+                "always",
+                "--diagnostic-width",
+                "80",
+                "--color",
+                "never",
+                "--diagnostic-width",
+                "140",
+                "m.rs",
+            ]),
+            None,
+        )
+        .unwrap();
+        let attached = parse(
+            &args(&[
+                "rustc",
+                "--color=always",
+                "--diagnostic-width=80",
+                "--color=never",
+                "--diagnostic-width=140",
+                "m.rs",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            separate.excluded_presentation,
+            [
+                "--color=always",
+                "--diagnostic-width=80",
+                "--color=never",
+                "--diagnostic-width=140",
+            ]
+        );
+        assert_eq!(separate, attached);
+        let reversed = parse(
+            &args(&[
+                "rustc",
+                "--color=never",
+                "--diagnostic-width=140",
+                "--color=always",
+                "--diagnostic-width=80",
+                "m.rs",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            separate.excluded_presentation,
+            reversed.excluded_presentation
+        );
+        assert_eq!(separate.canonical_bytes(), reversed.canonical_bytes());
+        assert_eq!(separate.source, Some(SourceInput::Path("m.rs".into())));
+    }
+
+    #[test]
+    fn incomplete_presentation_operands_remain_distinct_from_values() {
+        for flag in ["--color", "--diagnostic-width"] {
+            let missing = parse(&args(&["rustc", "m.rs", flag]), None).unwrap();
+            let empty = parse(&args(&["rustc", "m.rs", flag, ""]), None).unwrap();
+            assert_eq!(missing.excluded_presentation, [flag]);
+            assert_eq!(empty.excluded_presentation, [format!("{flag}=")]);
+            assert_ne!(missing.excluded_presentation, empty.excluded_presentation);
+        }
     }
 
     #[test]
