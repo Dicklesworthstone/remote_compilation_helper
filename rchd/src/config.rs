@@ -626,6 +626,17 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
     let config: WorkersConfig = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse workers config from {:?}", config_path))?;
 
+    validate_worker_tool_probes(&config, &config_path)?;
+
+    info!("Loaded {} worker definitions", config.workers.len());
+    Ok(config)
+}
+
+/// Startup and hot reload must accept the same named-tool declarations.
+pub(crate) fn validate_worker_tool_probes(
+    config: &WorkersConfig,
+    config_path: &Path,
+) -> Result<()> {
     // Tool probe declarations are validated HERE, at load, not at probe time: a
     // name that cannot survive the `RCH_FACT tool=<name>` wire format would come
     // back parsed as a different name, so the worker would advertise a
@@ -642,8 +653,7 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
         }
     }
 
-    info!("Loaded {} worker definitions", config.workers.len());
-    Ok(config)
+    Ok(())
 }
 
 /// Load enabled workers as WorkerConfig instances.

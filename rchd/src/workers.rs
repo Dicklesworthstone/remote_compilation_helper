@@ -1621,12 +1621,14 @@ impl WorkerState {
     }
 
     /// Update configuration, returning whether health/recovery monitors need
-    /// to wake for a new endpoint or a resumed inventory drain. Resuming the
-    /// same endpoint preserves its existing transport recovery deadline.
+    /// to wake for a new endpoint, changed tool declarations, or a resumed
+    /// inventory drain. Resuming the same endpoint preserves its existing
+    /// transport recovery deadline.
     pub async fn update_config(&self, new_config: WorkerConfig) -> bool {
         let mut config = self.config.write().await;
         let _transition = self.network_transition.lock().await;
         let endpoint_changed = !same_endpoint(&config, &new_config);
+        let tools_changed = config.tools != new_config.tools;
         self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         if endpoint_changed {
             self.require_connection_probe();
@@ -1655,6 +1657,43 @@ impl WorkerState {
                 .write()
                 .await
                 .observe_health(EligibilityState::Unreachable);
+        } else if tools_changed {
+            // A successful old argv cannot qualify its replacement merely
+            // because the operator kept the same tool name. Keep evidence only
+            // when every declaration for that name is unchanged; comparing all
+            // entries also handles inventories containing duplicate names.
+            // The config guard prevents admission during this invalidation,
+            // and the generation bump above fences probes already in flight.
+            let unchanged = |name: &String| {
+                let before = config.tools.iter().filter(|tool| tool.name == *name);
+                let mut after = new_config
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.name == *name)
+                    .peekable();
+                after.peek().is_some() && before.eq(after)
+            };
+            let mut capabilities = self.capabilities.write().await;
+            capabilities.tools_present.retain(unchanged);
+            capabilities.tools_absent.retain(unchanged);
+            capabilities.tools_pending.retain(unchanged);
+            for tool in &new_config.tools {
+                if !unchanged(&tool.name) && !capabilities.tools_pending.contains(&tool.name) {
+                    capabilities.tools_pending.push(tool.name.clone());
+                }
+            }
+            drop(capabilities);
+
+            // A healthy idle worker can refresh the new declarations now.
+            // A running health check already owns its next capability refresh;
+            // an offline worker must keep its bounded recovery cadence.
+            let transport = self.transport();
+            if let Ok(_probe) = transport.probe.try_lock() {
+                let mut state = transport.state.lock().await;
+                if self.connection_is_ready() && !state.down {
+                    state.next_probe = None;
+                }
+            }
         }
         *config = new_config;
 
@@ -1681,7 +1720,7 @@ impl WorkerState {
             self.set_pooled_connections_enabled(self.background_network_allowed().await)
                 .await;
         }
-        endpoint_changed || resume_inventory_drain
+        endpoint_changed || tools_changed || resume_inventory_drain
     }
 
     /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
@@ -10290,6 +10329,91 @@ mod tests {
             assert!(state.capabilities().await.rustc_version.is_none());
             state.release_slots(2).await;
             assert_eq!(state.used_slots(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_tool_reload_wakes_idle_health_and_preserves_other_probe_deadlines() {
+        let heartbeat = Duration::from_secs(600);
+        let circuit = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_cooldown_secs: 900,
+            ..Default::default()
+        };
+        for connected in [true, false] {
+            for busy in [false, true] {
+                let pool = WorkerPool::new().with_connection_monitoring();
+                let mut config = test_config("tool-change");
+                config.tools = vec![rch_common::types::WorkerToolProbe {
+                    name: "clang".into(),
+                    command: vec!["clang".into(), "--version".into()],
+                }];
+                pool.add_worker(config.clone()).await;
+                let worker = pool.get(&config.id).await.unwrap();
+                worker
+                    .record_transport_result(true, heartbeat, &circuit)
+                    .await;
+                assert!(worker.reserve_slots(1).await);
+                let permit = worker
+                    .health_probe_permit(heartbeat, &circuit)
+                    .await
+                    .unwrap();
+                worker
+                    .record_transport_result(connected, heartbeat, &circuit)
+                    .await;
+                let in_flight = busy.then_some(permit);
+                let transport = worker.transport();
+                let before = transport.state.lock().await.next_probe.unwrap().remaining();
+                let network = worker.network_revision_guard();
+                let mut changes = pool.subscribe_endpoint_changes();
+
+                config.tools[0].command[0] = "/opt/new/bin/clang".into();
+                pool.add_worker(config.clone()).await;
+                assert!(changes.has_changed().unwrap());
+                changes.changed().await.unwrap();
+                assert_eq!(worker.used_slots(), 1);
+                assert_eq!(worker.transport_is_down().await, !connected);
+                assert!(
+                    network.is_current(),
+                    "tool edits must not cancel active I/O"
+                );
+                assert_eq!(
+                    transport
+                        .state
+                        .lock()
+                        .await
+                        .next_probe
+                        .map_or(Duration::ZERO, TransportProbeDeadline::remaining),
+                    if connected && !busy {
+                        Duration::ZERO
+                    } else {
+                        before
+                    },
+                    "connected={connected}, busy={busy}",
+                );
+                if busy || !connected {
+                    assert!(
+                        worker
+                            .health_probe_permit(heartbeat, &circuit)
+                            .await
+                            .is_none()
+                    );
+                } else {
+                    assert!(
+                        worker
+                            .health_probe_permit(heartbeat, &circuit)
+                            .await
+                            .is_some()
+                    );
+                }
+                pool.add_worker(config.clone()).await;
+                assert!(
+                    !changes.has_changed().unwrap(),
+                    "unchanged tools need no wake"
+                );
+                drop(in_flight);
+                worker.release_slots(1).await;
+            }
         }
     }
 

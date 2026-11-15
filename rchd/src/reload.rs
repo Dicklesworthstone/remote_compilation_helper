@@ -158,6 +158,7 @@ fn worker_config_changed(old: &WorkerConfig, new: &WorkerConfig) -> bool {
         || old.total_slots != new.total_slots
         || old.priority != new.priority
         || old.tags != new.tags
+        || old.tools != new.tools
 }
 
 /// Validate a new workers configuration.
@@ -323,9 +324,11 @@ fn load_workers_reload_snapshot(config_path: Option<&Path>) -> Result<WorkersCon
             path.display()
         )
     })?;
-    Ok(WorkersConfig {
+    let config = WorkersConfig {
         workers: snapshot.workers,
-    })
+    };
+    config::validate_worker_tool_probes(&config, &path)?;
+    Ok(config)
 }
 
 /// Reload workers configuration from disk and apply changes.
@@ -851,6 +854,195 @@ enabled = true
             .await
             .unwrap();
         assert!(!result.has_changes());
+    }
+
+    #[tokio::test]
+    async fn named_tool_reload_requires_evidence_for_the_current_declaration() {
+        use crate::admission::ExecutionRequirements;
+        use rch_common::{RequiredRuntime, SelectionRequest, WorkerCapabilities};
+
+        let _guard = test_guard!();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("workers.toml");
+        let inventory = |tools: &str| {
+            format!(
+                "[[workers]]\nid = \"tool-reload\"\nhost = \"worker.example\"\ntotal_slots = 8\ntools = [{tools}]\n"
+            )
+        };
+        std::fs::write(
+            &path,
+            inventory(
+                r#"
+                { name = "clang", command = ["clang", "--version"] },
+                { name = "cmake", command = ["cmake", "--version"] },
+                { name = "ninja", command = ["ninja", "--version"] },
+                { name = "missing", command = ["missing", "--version"] },
+                { name = "unready", command = ["unready", "--version"] }
+                "#,
+            ),
+        )
+        .unwrap();
+        let pool = WorkerPool::new();
+        reload_workers(&pool, Some(&path), true).await.unwrap();
+        let worker = pool.get(&WorkerId::new("tool-reload")).await.unwrap();
+        let mut original = WorkerCapabilities::mock_with_rust();
+        original.tools_present = vec!["clang".into(), "cmake".into(), "ninja".into()];
+        original.tools_absent = vec!["missing".into()];
+        original.tools_pending = vec!["unready".into()];
+        original.node_version = Some("v26.7.0".into());
+        original.build_disk_free_gb = Some(1000.0);
+        original.build_disk_total_gb = Some(2000.0);
+        worker.set_capabilities(original.clone()).await;
+        assert!(worker.reserve_slots(2).await);
+        let selected = worker.endpoint_snapshot().await;
+        let before_reload = worker.capability_probe_context().await;
+        let mut request = SelectionRequest {
+            project: "named-tool-reload".into(),
+            command: None,
+            command_priority: rch_common::CommandPriority::Normal,
+            estimated_cores: 1,
+            disk_headroom_gib: 0,
+            disk_observation_version: 0,
+            preferred_workers: Vec::new(),
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            job_mode: true,
+            required_tools: vec!["clang".into()],
+            source_topology: None,
+            hook_pid: None,
+        };
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(1, &selected, &ExecutionRequirements::new(&request))
+                .await
+                .is_some()
+        );
+        worker.release_slots(1).await;
+
+        // Change only tools: replace clang's argv, remove cmake, and add lld.
+        // Existing runtime, unchanged tools, and active ownership stay usable.
+        std::fs::write(
+            &path,
+            inventory(
+                r#"
+                { name = "clang", command = ["/opt/new/bin/clang", "--version"] },
+                { name = "lld", command = ["ld.lld", "--version"] },
+                { name = "ninja", command = ["ninja", "--version"] },
+                { name = "missing", command = ["missing", "--version"] },
+                { name = "unready", command = ["unready", "--version"] }
+                "#,
+            ),
+        )
+        .unwrap();
+        let result = reload_workers(&pool, Some(&path), true).await.unwrap();
+        assert_eq!(result.updated, 1);
+        assert_eq!(
+            worker.config.read().await.tools[0].command[0],
+            "/opt/new/bin/clang"
+        );
+        let pending = worker.capabilities().await;
+        assert_eq!(pending.tools_present, vec!["ninja"]);
+        assert_eq!(pending.tools_absent, vec!["missing"]);
+        assert_eq!(pending.tools_pending, vec!["unready", "clang", "lld"]);
+        assert_eq!(pending.rustc_version, original.rustc_version);
+        assert_eq!(pending.node_version, original.node_version);
+        assert_eq!(pending.build_disk_free_gb, original.build_disk_free_gb);
+        assert_eq!(worker.used_slots(), 2);
+
+        // A probe started before reload must not restore the obsolete proof.
+        assert!(!worker.publish_capabilities(before_reload, original).await);
+        for (tool, expected) in [
+            ("clang", false),
+            ("cmake", false),
+            ("lld", false),
+            ("ninja", true),
+            ("missing", false),
+            ("unready", false),
+            ("node@26.7.0", true),
+            ("node@22.0.0", false),
+        ] {
+            request.required_tools = vec![tool.into()];
+            let admitted = worker
+                .reserve_slots_for_endpoint(1, &selected, &ExecutionRequirements::new(&request))
+                .await
+                .is_some();
+            assert_eq!(admitted, expected, "admission for {tool} after reload");
+            if admitted {
+                worker.release_slots(1).await;
+            }
+            assert_eq!(worker.used_slots(), 2);
+        }
+
+        let mut refreshed = pending;
+        refreshed
+            .tools_present
+            .extend(["clang".into(), "lld".into()]);
+        refreshed.tools_pending = vec!["unready".into()];
+        let current = worker.capability_probe_context().await;
+        assert!(worker.publish_capabilities(current, refreshed).await);
+        for tool in ["clang", "lld", "ninja"] {
+            request.required_tools = vec![tool.into()];
+            assert!(
+                worker
+                    .reserve_slots_for_endpoint(1, &selected, &ExecutionRequirements::new(&request))
+                    .await
+                    .is_some(),
+                "fresh evidence admits {tool}"
+            );
+            worker.release_slots(1).await;
+        }
+        worker.release_slots(2).await;
+        assert_eq!(worker.used_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn named_tool_reload_rejects_invalid_declarations_before_changing_the_fleet() {
+        let _guard = test_guard!();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("workers.toml");
+        let valid = r#"
+[[workers]]
+id = "tool-reload"
+host = "worker.example"
+total_slots = 8
+tools = [{ name = "clang", command = ["clang", "--version"] }]
+"#;
+        std::fs::write(&path, valid).unwrap();
+        let pool = WorkerPool::new();
+        reload_workers(&pool, Some(&path), true).await.unwrap();
+        let worker = pool.get(&WorkerId::new("tool-reload")).await.unwrap();
+        let mut capabilities = rch_common::WorkerCapabilities::mock_with_rust();
+        capabilities.tools_present = vec!["clang".into()];
+        worker.set_capabilities(capabilities.clone()).await;
+        assert!(worker.reserve_slots(2).await);
+
+        // Tool declarations are schema validation at both startup and reload,
+        // even when optional inventory warnings are disabled.
+        for validate in [true, false] {
+            for bad in [
+                r#"{ name = "cl ang", command = ["true"] }"#,
+                r#"{ name = "clang=1", command = ["true"] }"#,
+                r#"{ name = "", command = ["true"] }"#,
+                r#"{ name = "clang", command = [] }"#,
+            ] {
+                std::fs::write(
+                    &path,
+                    format!(
+                        "[[workers]]\nid = \"tool-reload\"\nhost = \"replacement.example\"\ntools = [{bad}]\n"
+                    ),
+                )
+                .unwrap();
+                let error = reload_workers(&pool, Some(&path), validate)
+                    .await
+                    .expect_err("an invalid probe must retain the previous inventory");
+                assert!(format!("{error:#}").contains("unusable tool probe"));
+                assert_eq!(worker.config.read().await.host, "worker.example");
+                assert_eq!(worker.capabilities().await.tools_present, vec!["clang"]);
+                assert_eq!(worker.used_slots(), 2);
+            }
+        }
+        worker.release_slots(2).await;
     }
 
     #[tokio::test]
