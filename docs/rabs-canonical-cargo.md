@@ -51,6 +51,63 @@ clients share its existing worker pool and action ownership. Each client receive
 its own verified output tree. The native `rabsd --canonical-compile-remote`
 entrypoint remains available for explicit one-off profiles.
 
+## Native canonical Cargo entry point
+
+`rabs-cargo` is the Rust command-line entry point for the local canonical driver
+and the shared remote coordinator. It accepts the native
+`canonical-compile-local-v1` and `canonical-compile-remote-v1` profiles described
+below. It exposes `build`, `check`, `clippy`, `doc`, `test`, `run`, and `bench`,
+including executing `run`/`bench` with explicitly closed or captured file input.
+
+Build it from the same checkout as the native driver:
+
+```sh
+cargo build --locked --profile wrapper-release -p rabs-cli --bin rabs-cargo
+
+target/wrapper-release/rabs-cargo --remote REMOTE.json \
+  --rabsd /absolute/path/to/rabsd --stdin closed -- run --bin application
+
+target/wrapper-release/rabs-cargo --remote REMOTE.json \
+  --rabsd /absolute/path/to/rabsd --stdin-file fixtures/request.json \
+  -- run --bin application -- --mode batch
+
+target/wrapper-release/rabs-cargo --local LOCAL.json \
+  --rabsd /absolute/path/to/rabsd -- check --workspace --all-targets
+```
+
+Use `--local PROFILE` or `--remote PROFILE` exactly once. Cargo selectors follow
+the optional `--` separator. With an explicit Cargo command, its selectors
+replace the saved command and selection; with no Cargo command, the native
+profile's command and selection remain in effect. Arguments after Cargo's own
+`--` remain program or test arguments and are validated by the shared canonical
+command contract.
+
+`--stdin closed` selects EOF. `--stdin-file RELATIVE` selects an ordinary input
+file within the approved `source_root`; the native driver captures it with the
+source and delivers the captured bytes to the executing program. A stdin
+override replaces either saved stdin policy. Remote operations and local
+service submissions require explicit closed or captured file input for `run`
+and executing `bench`. `--stdin inherit` is available only for direct local
+execution, subject to the driver's noninteractive-input rules.
+
+The profile must provide an explicit physical `toolchain_root`. Rustup discovery
+and leading `+toolchain` selectors belong to the existing `cargo rabs` launcher
+and are not accepted by `rabs-cargo`. The existing backend still performs source,
+toolchain, environment, namespace, authentication, and output validation.
+
+The command resolves `rabsd` beside its own physical executable, or uses an
+explicit `--rabsd PATH` or `CARGO_RABS_DAEMON` setting. It retains a private
+operation profile before handing off once to that driver. Cargo's exit status
+and process signals pass through the handoff; an execution failure does not
+start a local fallback or another build. Remote profiles may use a private
+`output_root` to allocate a fresh, absent output destination for each invocation.
+An explicit existing `output_destination` is refused.
+
+This executable can also be installed independently with
+`cargo install --locked --path rabs-cli --bin rabs-cargo`; select the matching
+driver explicitly when it is installed elsewhere. This source-build command
+does not establish that a published release bundle contains the executable.
+
 ## Profile and prerequisites
 
 Linux is required on the preparing host and worker. Install matching `cargo-rabs`

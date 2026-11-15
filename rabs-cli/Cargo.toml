@@ -6,15 +6,19 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Native operator commands for retained RABS results"
+description = "Native canonical Cargo and retained-result operator commands"
 publish = false
 
 [[bin]]
 name = "rabs-recover"
 path = "src/main.rs"
 
-# Operator-only dependency cone. Recovery delegates authenticated transport to
-# rabsd; it must not pull a daemon, runtime, or compiler wrapper into this CLI.
+[[bin]]
+name = "rabs-cargo"
+path = "src/cargo_main.rs"
+
+# Operator-only dependency cone. Selection uses shared sandbox validators;
+# execution and authenticated transport remain in the separate native driver.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
 serde = { workspace = true }
@@ -22,7 +26,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+rabs-sandbox = { path = "../rabs-sandbox" }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
+tempfile = "3.25.0"
 
 [dev-dependencies]
 tempfile = "3.25.0"

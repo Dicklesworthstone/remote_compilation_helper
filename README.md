@@ -416,6 +416,19 @@ profiles support Rustup toolchain selection and a separate output root. See
 [remote Cargo profiles and command support](docs/rabs-canonical-cargo.md#submit-through-cargo-with-a-reusable-remote-profile)
 for setup, supported commands and the current qualification limits.
 
+The native Rust `rabs-cargo` entry point accepts local and shared-coordinator
+profiles, including `run` and executing `bench` with closed or captured file
+input. For example:
+
+```bash
+rabs-cargo --remote PROFILE.json --rabsd /absolute/path/to/rabsd \
+  --stdin-file fixtures/request.json -- run --bin application -- --mode batch
+```
+
+It uses an explicit captured toolchain, retains one private operation profile,
+and hands off once to the native driver. See the [native command's build and
+usage instructions](docs/rabs-canonical-cargo.md#native-canonical-cargo-entry-point).
+
 ### Named Cargo JSON for installer consumers
 
 An installer selecting explicit binary targets can request caller-visible

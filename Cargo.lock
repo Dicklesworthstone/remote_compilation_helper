@@ -5125,6 +5125,7 @@ name = "rabs-cli"
 version = "2.1.36"
 dependencies = [
  "rabs-protocol",
+ "rabs-sandbox",
  "rustix",
  "serde",
  "serde_json",

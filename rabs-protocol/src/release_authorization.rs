@@ -286,6 +286,7 @@ where
             | "rabs-cargo-root"
             | "rabs-delivery-cas"
             | "rabs-recover"
+            | "rabs-cargo"
     ) {
         return None;
     }
@@ -683,6 +684,10 @@ mod tests {
             .expect("native retained-result recovery must identify its compiled source");
         assert!(retained.contains("\"tool\":\"rabs-recover\""));
         assert!(build_info_for_args("rabs-recover", ["--rabs-build-info", "/operation"]).is_none());
+        let cargo = build_info_for_args("rabs-cargo", ["--rabs-build-info"])
+            .expect("native canonical Cargo entry point must identify its compiled source");
+        assert!(cargo.contains("\"tool\":\"rabs-cargo\""));
+        assert!(build_info_for_args("rabs-cargo", ["--rabs-build-info", "run"]).is_none());
         for args in [
             vec![],
             vec!["--version"],
