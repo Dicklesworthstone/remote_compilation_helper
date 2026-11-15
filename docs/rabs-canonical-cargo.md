@@ -57,7 +57,7 @@ entrypoint remains available for explicit one-off profiles.
 and the shared remote coordinator. It accepts the native
 `canonical-compile-local-v1` and `canonical-compile-remote-v1` profiles described
 below. It exposes `build`, `check`, `clippy`, `doc`, `test`, `run`, and `bench`,
-including executing `run`/`bench` with explicitly closed or captured file input.
+including executing `run`/`test`/`bench` with explicitly closed or captured file input.
 
 Build it from the same checkout as the native driver:
 
@@ -84,11 +84,12 @@ command contract.
 
 `--stdin closed` selects EOF. `--stdin-file RELATIVE` selects an ordinary input
 file within the approved `source_root`; the native driver captures it with the
-source and delivers the captured bytes to the executing program. A stdin
-override replaces either saved stdin policy. Remote operations and local
+source and delivers the captured bytes to the executing program or test harness.
+A stdin override replaces either saved stdin policy. Remote operations and local
 service submissions require explicit closed or captured file input for `run`
-and executing `bench`. `--stdin inherit` is available only for direct local
-execution, subject to the driver's noninteractive-input rules.
+and executing `bench`; `test` defaults to EOF and also accepts captured input.
+`--stdin inherit` is available for direct local `run`, executing `test`, and
+executing `bench`, subject to the driver's noninteractive-input rules.
 
 The profile must provide an explicit physical `toolchain_root`. Rustup discovery
 and leading `+toolchain` selectors belong to the existing `cargo rabs` launcher
@@ -2130,8 +2131,10 @@ capture or coordinator startup because the managed Cargo process group does not
 own terminal foreground control. Redirect input, use `</dev/null`, or deliver a
 binary with `build` and run it outside this profile when it needs an interactive
 terminal. `bench --no-run` does not consume stdin or require this redirection.
-Existing Check, Build, Clippy, Doc and Test commands retain closed stdin. The source
-workspace and HOME remain read-only, temporary and target directories are
+Check, Build, Clippy and Doc retain closed stdin. Test also defaults to closed
+stdin, but an executing Test can explicitly inherit nonterminal input or use a
+captured file as described below. The source workspace and HOME remain read-only,
+temporary and target directories are
 private and writable, and external networking remains unavailable.
 
 Optional private target reuse can restore compiled artifacts across changes to
@@ -2152,8 +2155,9 @@ daemon's input. This admits noninteractive Run and executing Bench commands
 through both persistent local and pinned-TLS remote canonical services.
 Omitting the field preserves the existing command-specific defaults: Run and
 executing Bench inherit nonterminal input in standalone mode and refuse service
-submission. An explicit `"stdin": "inherit"` also remains standalone-only.
-Other commands retain closed stdin and reject an explicit inherited policy.
+submission. An explicit `"stdin": "inherit"` also remains standalone-only and
+is available for executing Test as well. Test defaults to EOF; compilation-only
+commands, including `test --no-run` and `bench --no-run`, reject inherited input.
 
 For a native local profile, add `"stdin": "closed"` beside `"command": "run"`
 and submit with `rabsd --canonical-compile-local PROFILE.json`. The same profile
@@ -2191,7 +2195,7 @@ restriction. No live stdin stream is forwarded by the remote protocol.
 #### Run with a captured input file
 
 Native local, shared and remote profiles can instead select
-`"stdin_file": "inputs/request.bin"` for Run or executing Bench. The name is
+`"stdin_file": "inputs/request.bin"` for Run, executing Test, or executing Bench. The name is
 relative to the approved `source_root`, independently of the selected manifest's
 directory. For a remote profile, put it in `settings`:
 
@@ -2209,8 +2213,26 @@ directory. For a remote profile, put it in `settings`:
 Use `rabsd --canonical-compile-local PROFILE.json` or
 `rabsd --canonical-compile-remote PROFILE.json`; a local profile may also name
 `service_socket`. Omit `stdin` when selecting `stdin_file`: combining the two
-is an error. Check, Build, Clippy, Doc, Test and `bench --no-run` do not accept
-this field. Their existing EOF behavior is unchanged.
+is an error. Check, Build, Clippy, Doc, `test --no-run` and `bench --no-run` do not
+accept this field. Their existing EOF behavior is unchanged.
+
+For a test harness that reads standard input, select `"command": "test"` and,
+for example, `"selection": {"test": ["parser"], "test_args": ["--nocapture"]}`.
+Captured input is supported for both ordinary libtest and `harness = false`
+targets; select arguments that the chosen harness supports. The native frontend
+exposes this directly:
+
+```sh
+rabs-cargo --remote REMOTE.json --stdin-file fixtures/request.bin \
+  -- test --test parser -- --nocapture
+rabs-cargo --local LOCAL.json --stdin inherit \
+  -- test --test parser -- --nocapture < fixtures/request.bin
+```
+
+Input is shared with Cargo descendants using Cargo's ordinary descriptor
+inheritance; it is not duplicated independently for every selected harness.
+A literal `--no-run` after the harness separator remains a harness argument and
+does not turn an executing selection into compilation-only work.
 
 The selected file must already belong to the captured compiler-visible
 workspace. Absolute paths, traversal, symlinks, missing files and isolated
@@ -2231,8 +2253,8 @@ offset zero even when its compiled targets are fresh.
 
 The original operation retains this input across a connection interruption;
 reattachment cannot reopen a host pathname, rewind the running command or execute
-it again. Run and Bench outcomes remain uncached. The native Cargo/namespace
-fixture `canonical_captured_stdin_run_and_bench_execute_current_bytes_locally_and_in_service`
+it again. Test, Run and Bench outcomes remain uncached. The native Cargo/namespace
+fixture `canonical_captured_stdin_run_test_and_bench_execute_current_bytes_locally_and_in_service`
 checks current file contents, client-input isolation and repeated execution on
 a capable host; its presence does not establish native or fleet qualification.
 
@@ -2455,7 +2477,9 @@ captures them again.
 
 The service supports `check`, `build`, `clippy`, `doc`, `test`, `test --no-run` and
 `bench --no-run`. Native profiles also support `run` and executing `bench` with
-explicit `"stdin": "closed"`; the service never forwards inherited input.
+explicit `"stdin": "closed"` or a captured `"stdin_file"`. Executing `test` can
+also select captured input while retaining EOF by default. The service never
+forwards inherited input.
 Profiles retaining inherited stdin refuse before capture. Test, program and
 benchmark bodies still run on each newly admitted operation and retain their
 actual failure status.
@@ -2850,7 +2874,8 @@ grant. Omitting `selection` for Check retains its library-only default; an
 explicit empty selection uses Cargo's ordinary default members and targets.
 The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
 compilation with `"no_run": true`. Native settings also admit Run and executing
-Bench with explicit `"stdin": "closed"` or a captured `"stdin_file"`. Their default or explicit inherited
+Bench with explicit `"stdin": "closed"` or a captured `"stdin_file"`; executing
+Test also accepts captured input and otherwise defaults to EOF. Any inherited
 stdin remains unsupported even when the client redirects its input: the service
 does not forward that stream. Test, program and benchmark bodies still execute
 for each newly admitted operation and retain their actual exit status.

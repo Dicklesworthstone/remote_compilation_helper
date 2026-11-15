@@ -67,19 +67,21 @@ impl CompilationCommand {
 
     /// Resolve an optional input policy without changing an existing command's
     /// behavior. Only `run` and executing `bench` inherit input by default.
-    /// Other commands and `bench --no-run` keep their closed input boundary.
+    /// Executing `test` may explicitly inherit input while retaining EOF by
+    /// default. Nonexecuting commands and `--no-run` keep closed input.
     pub fn stdin_policy(
         self,
         no_run: bool,
         requested: Option<CompilationStdin>,
     ) -> io::Result<CompilationStdin> {
-        let executes_with_input = self == Self::Run || (self == Self::Bench && !no_run);
+        let executes_with_input =
+            self == Self::Run || (matches!(self, Self::Test | Self::Bench) && !no_run);
         match requested {
             Some(CompilationStdin::Inherit) if !executes_with_input => Err(invalid(
-                "inherited stdin is supported only for run or executing bench",
+                "inherited stdin is supported only for run, test or bench execution",
             )),
             Some(policy) => Ok(policy),
-            None if executes_with_input => Ok(CompilationStdin::Inherit),
+            None if executes_with_input && self != Self::Test => Ok(CompilationStdin::Inherit),
             None => Ok(CompilationStdin::Closed),
         }
     }
@@ -441,16 +443,18 @@ mod tests {
 
     #[test]
     fn stdin_policy_preserves_command_defaults_and_allows_explicit_eof() {
-        for (command, no_run, default) in [
-            (CompilationCommand::Run, false, CompilationStdin::Inherit),
-            (CompilationCommand::Bench, false, CompilationStdin::Inherit),
-            (CompilationCommand::Bench, true, CompilationStdin::Closed),
-            (CompilationCommand::Test, false, CompilationStdin::Closed),
-            (CompilationCommand::Test, true, CompilationStdin::Closed),
-            (CompilationCommand::Check, false, CompilationStdin::Closed),
-            (CompilationCommand::Build, false, CompilationStdin::Closed),
-            (CompilationCommand::Clippy, false, CompilationStdin::Closed),
-            (CompilationCommand::Doc, false, CompilationStdin::Closed),
+        use CompilationStdin::{Closed, Inherit};
+
+        for (command, no_run, default, permits_inherit) in [
+            (CompilationCommand::Run, false, Inherit, true),
+            (CompilationCommand::Bench, false, Inherit, true),
+            (CompilationCommand::Bench, true, Closed, false),
+            (CompilationCommand::Test, false, Closed, true),
+            (CompilationCommand::Test, true, Closed, false),
+            (CompilationCommand::Check, false, Closed, false),
+            (CompilationCommand::Build, false, Closed, false),
+            (CompilationCommand::Clippy, false, Closed, false),
+            (CompilationCommand::Doc, false, Closed, false),
         ] {
             assert_eq!(command.stdin_policy(no_run, None).unwrap(), default);
             assert_eq!(
@@ -463,7 +467,7 @@ mod tests {
                 command
                     .stdin_policy(no_run, Some(CompilationStdin::Inherit))
                     .is_ok(),
-                default == CompilationStdin::Inherit,
+                permits_inherit,
                 "{command:?}, no_run={no_run}",
             );
         }

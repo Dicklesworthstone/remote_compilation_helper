@@ -36,9 +36,9 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v12 admits source-relative captured stdin for noninteractive Run and Bench.
+/// v12 adds source-relative captured stdin for noninteractive execution.
 /// Reattachment retains the original input custody, diagnostic frontiers and
-/// artifact custody. Older peers refuse before admission.
+/// artifact custody. Peers predating v12 refuse before admission.
 pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v12";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging

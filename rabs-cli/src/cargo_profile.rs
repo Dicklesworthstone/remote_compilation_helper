@@ -281,8 +281,9 @@ fn logical(
         require(requested.is_none(), "choose stdin or stdin_file, not both")?;
         require(
             command == CompilationCommand::Run
-                || (command == CompilationCommand::Bench && !selection.no_run),
-            "captured stdin_file requires run or executing bench",
+                || (matches!(command, CompilationCommand::Test | CompilationCommand::Bench)
+                    && !selection.no_run),
+            "captured stdin_file requires run, test or bench execution",
         )?;
         require(
             value.as_str().is_some_and(relative_member),
@@ -294,11 +295,11 @@ fn logical(
     };
     require(
         !inherited || !service,
-        "service run/bench requires explicit closed stdin or a captured stdin_file",
+        "service run/test/bench requires explicit closed stdin or a captured stdin_file",
     )?;
     require(
         !inherited || !io::stdin().is_terminal(),
-        "inherited run/bench stdin must be a pipe, file or /dev/null",
+        "inherited run/test/bench stdin must be a pipe, file or /dev/null",
     )?;
     for (field, maximum) in [("jobs", 4096), ("timeout_seconds", 7200)] {
         if let Some(value) = profile.get(field) {

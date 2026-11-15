@@ -522,7 +522,7 @@ fn cli_rejects_profile_environment_that_replaces_driver_control() {
 }
 
 #[test]
-fn cli_refuses_executing_run_and_bench_terminal_input_before_touching_profile_roots() {
+fn cli_refuses_inherited_terminal_input_before_touching_profile_roots() {
     use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
 
     let root = tempfile::tempdir().unwrap();
@@ -538,6 +538,9 @@ fn cli_refuses_executing_run_and_bench_terminal_input_before_touching_profile_ro
         (4, "bench", json!({}), Some("closed"), false),
         (5, "run", json!({}), Some("inherit"), true),
         (6, "bench", json!({}), Some("inherit"), true),
+        (7, "test", json!({}), None, false),
+        (8, "test", json!({"test_args":["--no-run"]}), Some("inherit"), true),
+        (9, "test", json!({}), Some("closed"), false),
     ] {
         // None of these paths exists. A terminal refusal must happen before
         // source validation/capture, namespace probes, or operation allocation.
@@ -556,7 +559,7 @@ fn cli_refuses_executing_run_and_bench_terminal_input_before_touching_profile_ro
             run_with_stdin(root.path(), number, &profile, &[], Stdio::from(stdin));
         assert_eq!(code, if refused { 2 } else { 1 }, "{output}");
         assert_eq!(
-            output.contains("canonical run/bench requires nonterminal stdin"),
+            output.contains("canonical run/test/bench requires nonterminal stdin"),
             refused,
             "{output}"
         );
@@ -4237,8 +4240,8 @@ fn main() {
 }
 
 #[test]
-#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes captured-file run and custom bench standalone and through the persistent service"]
-fn canonical_captured_stdin_run_and_bench_execute_current_bytes_locally_and_in_service() {
+#[ignore = "requires real bubblewrap namespaces, native toolchain and RABS_CANONICAL_TEST_WRAPPER; executes captured-file run and custom test/bench standalone and through the persistent service"]
+fn canonical_captured_stdin_run_test_and_bench_execute_current_bytes_locally_and_in_service() {
     let (owner, mut profile) = native_fixture();
     let root = owner.path();
     let source = root.join("source-a");
@@ -4247,7 +4250,7 @@ fn canonical_captured_stdin_run_and_bench_execute_current_bytes_locally_and_in_s
         &source,
         "Cargo.toml",
         format!(
-            "{manifest}\n[[bench]]\nname='captured'\npath='benches/captured.rs'\nharness=false\n"
+            "{manifest}\n[[test]]\nname='captured'\npath='tests/captured.rs'\nharness=false\n\n[[bench]]\nname='captured'\npath='benches/captured.rs'\nharness=false\n"
         ),
     );
     let body = r#"use std::io::Read;
@@ -4267,6 +4270,7 @@ fn main() {
 "#;
     write(&source, "src/main.rs", body);
     write(&source, "benches/captured.rs", body);
+    write(&source, "tests/captured.rs", body);
     write(&source, "inputs/request.bin", b"captured\0input\xff\n");
     profile["stdin_file"] = json!("inputs/request.bin");
     profile["jobs"] = json!(1);
@@ -4307,7 +4311,7 @@ fn main() {
             profile["service_socket"] = json!(socket);
             service = Some(child);
         }
-        for command in ["run", "bench"] {
+        for command in ["run", "test", "bench"] {
             profile["command"] = json!(command);
             write(&source, "inputs/request.bin", b"captured\0input\xff\n");
             let mut previous = None;
@@ -4316,10 +4320,10 @@ fn main() {
                     write(&source, "inputs/request.bin", b"changed current bytes\n");
                 }
                 let arguments = if fail { json!(["--fail"]) } else { json!([]) };
-                profile["selection"] = if command == "run" {
-                    json!({"bin":["canonical_app"], "run_args":arguments})
-                } else {
-                    json!({"bench":["captured"], "test_args":arguments})
+                profile["selection"] = match command {
+                    "run" => json!({"bin":["canonical_app"], "run_args":arguments}),
+                    "test" => json!({"test":["captured"], "test_args":arguments}),
+                    _ => json!({"bench":["captured"], "test_args":arguments}),
                 };
                 number += 1;
                 let (code, events, output) = run_with_input(
@@ -4353,6 +4357,7 @@ fn main() {
                     .iter()
                     .find(|event| event["kind"] == "canonical-compilation-started")
                     .unwrap();
+                assert_eq!(started["test_result_cache"], false);
                 assert_eq!(started["program_result_cache"], false);
                 assert_eq!(started["benchmark_result_cache"], false);
                 if attempt == 1 {

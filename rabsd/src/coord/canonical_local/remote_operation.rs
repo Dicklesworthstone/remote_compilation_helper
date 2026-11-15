@@ -477,8 +477,10 @@ mod tests {
             json!({"command":"bench"}),
             json!({"command":"run", "stdin":"inherit"}),
             json!({"command":"bench", "stdin":"inherit"}),
+            json!({"command":"test", "stdin":"inherit"}),
             json!({"command":"check", "stdin":"inherit"}),
             json!({"command":"bench", "stdin":"inherit", "selection":{"no_run":true}}),
+            json!({"command":"test", "stdin":"inherit", "selection":{"no_run":true}}),
             json!({"jobs":0}),
             json!({"timeout_seconds":7201}),
             json!({"env":{"RABS_DEPENDENCY_WORKERS_JSON":"[]"}}),
@@ -494,6 +496,10 @@ mod tests {
             .is_err()
         );
         settings(json!({"command":"bench", "selection":{"no_run":true}}))
+            .validate()
+            .unwrap();
+        settings(json!({"command":"test"})).validate().unwrap();
+        settings(json!({"command":"test", "selection":{"no_run":true}}))
             .validate()
             .unwrap();
     }
@@ -547,7 +553,7 @@ mod tests {
 
     #[test]
     fn remote_settings_retain_captured_stdin_and_reject_ambient_input_controls() {
-        for command in ["run", "bench"] {
+        for command in ["run", "test", "bench"] {
             let selected = settings(json!({
                 "command":command, "stdin_file":"inputs/request.bin",
                 "manifest":"member/Cargo.toml", "jobs":2,
@@ -581,19 +587,22 @@ mod tests {
                 assert!(settings(ambient).validate().is_err(), "{path:?}");
             }
         }
-        for command in ["check", "build", "test", "clippy", "doc"] {
+        for command in ["check", "build", "clippy", "doc"] {
             assert!(
                 settings(json!({"command":command, "stdin_file":"inputs/request.bin"}))
                     .validate()
                     .is_err()
             );
         }
-        assert!(
-            settings(json!({"command":"bench", "stdin_file":"inputs/request.bin",
-                "selection":{"no_run":true}}))
-            .validate()
-            .is_err()
-        );
+        for command in ["test", "bench"] {
+            assert!(
+                settings(json!({"command":command, "stdin_file":"inputs/request.bin",
+                    "selection":{"no_run":true}}))
+                .validate()
+                .is_err(),
+                "{command} --no-run",
+            );
+        }
     }
 
     fn fixture() -> RemoteOperationInputs {

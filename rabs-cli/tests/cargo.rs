@@ -386,30 +386,45 @@ fn explicit_commands_replace_saved_selection_and_preserve_literal_runtime_tails(
 }
 
 #[test]
-fn direct_local_run_inherits_exact_nonterminal_input_and_process_identity() {
-    let fixture = Fixture::new();
-    let input = b"\0literal stdin\xff\n";
-    let mut child = fixture
-        .command(false)
-        .args(["run", "--bin", "app", "--", "", "--remote", "α\nβ"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.stdin.take().unwrap().write_all(input).unwrap();
-    let report = fixture.handed_off(child.wait_with_output().unwrap());
-    assert_eq!(report["pid"], pid);
-    assert_eq!(report["stdin"], json!(input));
-    assert_eq!(
-        report["profile"]["selection"]["run_args"],
-        json!(["", "--remote", "α\nβ"])
-    );
+fn direct_local_execution_inherits_exact_nonterminal_input_and_process_identity() {
+    for (arguments, tail, expected_tail) in [
+        (
+            vec!["run", "--bin", "app", "--", "", "--remote", "α\nβ"],
+            "run_args",
+            json!(["", "--remote", "α\nβ"]),
+        ),
+        (
+            vec![
+                "--stdin", "inherit", "test", "--test", "reader", "--", "", "--remote", "α β",
+            ],
+            "test_args",
+            json!(["", "--remote", "α β"]),
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let input = b"\0literal stdin\xff\n";
+        let mut child = fixture
+            .command(false)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let report = fixture.handed_off(child.wait_with_output().unwrap());
+        assert_eq!(report["pid"], pid);
+        assert_eq!(report["stdin"], json!(input));
+        assert_eq!(report["profile"]["selection"][tail], expected_tail);
+        if tail == "test_args" {
+            assert_eq!(report["profile"]["stdin"], "inherit");
+        }
+    }
 }
 
 #[test]
-fn remote_run_and_bench_accept_only_explicit_input_and_retain_presentation_locally() {
+fn remote_execution_retains_explicit_input_and_local_presentation() {
     for (command, input_flag, input, saved_field, saved_input) in [
         ("run", "--stdin", "closed", "stdin_file", "inputs/old.bin"),
         (
@@ -422,6 +437,14 @@ fn remote_run_and_bench_accept_only_explicit_input_and_retain_presentation_local
         ("bench", "--stdin", "closed", "stdin_file", "inputs/old.bin"),
         (
             "bench",
+            "--stdin-file",
+            "inputs/request.bin",
+            "stdin",
+            "inherit",
+        ),
+        ("test", "--stdin", "closed", "stdin_file", "inputs/old.bin"),
+        (
+            "test",
             "--stdin-file",
             "inputs/request.bin",
             "stdin",
@@ -463,49 +486,55 @@ fn remote_run_and_bench_accept_only_explicit_input_and_retain_presentation_local
 #[test]
 fn service_and_remote_execution_refuse_implicit_or_inherited_stdin_before_handoff() {
     for remote in [false, true] {
-        for command in ["run", "bench"] {
-            for explicit in [false, true] {
-                let fixture = Fixture::new();
-                if !remote {
-                    rewrite_json(&fixture.local, |profile| {
-                        profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
-                    });
-                }
-                let mut process = fixture.command(remote);
-                if explicit {
-                    process.args(["--stdin", "inherit"]);
-                }
-                process.arg(command);
-                assert!(
-                    fixture
-                        .refused(process.output().unwrap())
-                        .contains("requires explicit closed stdin")
-                );
+        for (command, explicit) in [
+            ("run", false),
+            ("run", true),
+            ("bench", false),
+            ("bench", true),
+            ("test", true),
+        ] {
+            let fixture = Fixture::new();
+            if !remote {
+                rewrite_json(&fixture.local, |profile| {
+                    profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
+                });
             }
+            let mut process = fixture.command(remote);
+            if explicit {
+                process.args(["--stdin", "inherit"]);
+            }
+            process.arg(command);
+            assert!(
+                fixture
+                    .refused(process.output().unwrap())
+                    .contains("requires explicit closed stdin")
+            );
         }
     }
 }
 
 #[test]
 fn local_service_closed_and_captured_input_and_remote_nonexecuting_bench_are_reachable() {
-    for input in [
-        ["--stdin", "closed"],
-        ["--stdin-file", "inputs/request.bin"],
-    ] {
-        let fixture = Fixture::new();
-        rewrite_json(&fixture.local, |profile| {
-            profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
-        });
-        let report = fixture.handed_off(
-            fixture
-                .command(false)
-                .args(input)
-                .arg("run")
-                .output()
-                .unwrap(),
-        );
-        assert_eq!(report["profile"]["command"], "run");
-        assert!(report["profile"].get("service_socket").is_some());
+    for command in ["run", "test", "bench"] {
+        for input in [
+            ["--stdin", "closed"],
+            ["--stdin-file", "inputs/request.bin"],
+        ] {
+            let fixture = Fixture::new();
+            rewrite_json(&fixture.local, |profile| {
+                profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
+            });
+            let report = fixture.handed_off(
+                fixture
+                    .command(false)
+                    .args(input)
+                    .arg(command)
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(report["profile"]["command"], command);
+            assert!(report["profile"].get("service_socket").is_some());
+        }
     }
     let fixture = Fixture::new();
     let report = fixture.handed_off(
@@ -516,6 +545,75 @@ fn local_service_closed_and_captured_input_and_remote_nonexecuting_bench_are_rea
             .unwrap(),
     );
     assert_eq!(report["profile"]["settings"]["selection"]["no_run"], true);
+}
+
+#[test]
+fn test_input_preserves_closed_defaults_and_distinguishes_cargo_no_run_from_a_harness_tail() {
+    for (remote, shared) in [(false, false), (false, true), (true, false)] {
+        for no_run in [false, true] {
+            let fixture = Fixture::new();
+            if shared {
+                rewrite_json(&fixture.local, |profile| {
+                    profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
+                });
+            }
+            let mut command = fixture.command(remote);
+            command.arg("test");
+            if no_run {
+                command.arg("--no-run");
+            }
+            let report = fixture.handed_off(command.output().unwrap());
+            let logical = if remote {
+                &report["profile"]["settings"]
+            } else {
+                &report["profile"]
+            };
+            assert_eq!(logical["command"], "test");
+            assert_eq!(logical["selection"]["no_run"], no_run);
+            assert!(logical.get("stdin").is_none());
+            assert!(logical.get("stdin_file").is_none());
+        }
+        for input in [
+            ["--stdin", "inherit"],
+            ["--stdin-file", "inputs/request.bin"],
+        ] {
+            let fixture = Fixture::new();
+            if shared {
+                rewrite_json(&fixture.local, |profile| {
+                    profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
+                });
+            }
+            fixture.refused(
+                fixture
+                    .command(remote)
+                    .args(input)
+                    .args(["test", "--no-run"])
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let fixture = Fixture::new();
+        if shared {
+            rewrite_json(&fixture.local, |profile| {
+                profile["service_socket"] = json!(fixture.root.join("canonical.sock"))
+            });
+        }
+        let report = fixture.handed_off(
+            fixture
+                .command(remote)
+                .args(["--stdin-file", "inputs/request.bin", "test", "--", "--no-run"])
+                .output()
+                .unwrap(),
+        );
+        let logical = if remote {
+            &report["profile"]["settings"]
+        } else {
+            &report["profile"]
+        };
+        assert_eq!(logical["stdin_file"], "inputs/request.bin");
+        assert_eq!(logical["selection"]["no_run"], false);
+        assert_eq!(logical["selection"]["test_args"], json!(["--no-run"]));
+    }
 }
 
 #[test]

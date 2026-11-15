@@ -19,8 +19,8 @@ Options:
   --local PROFILE        Local canonical driver, optionally using its service_socket
   --remote PROFILE       Captured inputs and verified results over pinned TLS
   --rabsd EXECUTABLE     Explicit native driver (otherwise CARGO_RABS_DAEMON or sibling rabsd)
-  --stdin closed|inherit  Supply EOF, or inherit nonterminal input for direct local run/bench
-  --stdin-file RELATIVE  Capture one source-root-relative input file for run/bench
+  --stdin closed|inherit  Supply EOF, or inherit nonterminal input for direct local run/test/bench
+  --stdin-file RELATIVE  Capture one source-root-relative input file for run/test/bench execution
   -h, --help             Print help without starting any operation
   --version              Print version
 
@@ -34,7 +34,8 @@ replaces both, including an empty selection for ordinary Cargo defaults.
 Profiles require an explicit toolchain_root. Remote profiles may use output_root
 for a fresh output destination per invocation, or one absent output_destination.
 Run and executing bench through a service require explicit closed stdin or a
-captured stdin_file. Runtime outcomes are never cached. Linux is required for
+captured stdin_file. Test defaults to EOF and can explicitly select input when
+executing its targets. Runtime outcomes are never cached. Linux is required for
 operations; no local fallback or execution retry is performed.
 ";
 

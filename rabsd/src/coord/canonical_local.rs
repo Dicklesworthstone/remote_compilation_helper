@@ -114,7 +114,7 @@ struct Profile {
     /// Omission preserves command defaults. Explicit `closed` supplies EOF and
     /// permits noninteractive run/bench execution through a shared service.
     stdin: Option<CompilationStdin>,
-    /// Source-root-relative input for run or executing bench. The exact member
+    /// Source-root-relative input for run, test or bench execution. The exact member
     /// is copied from the sealed source into private, read-only descriptor
     /// custody before Cargo starts. Mutually exclusive with `stdin`.
     stdin_file: Option<String>,
@@ -922,8 +922,11 @@ impl Profile {
             require(self.stdin.is_none(), "choose stdin or stdin_file, not both")?;
             require(
                 self.command == CompilationCommand::Run
-                    || (self.command == CompilationCommand::Bench && !self.no_run()),
-                "captured stdin_file is supported only for run or executing bench",
+                    || (matches!(
+                        self.command,
+                        CompilationCommand::Test | CompilationCommand::Bench
+                    ) && !self.no_run()),
+                "captured stdin_file is supported only for run, test or bench execution",
             )?;
             require(
                 relative_member(path),
@@ -949,7 +952,7 @@ impl Profile {
         // interactive job control needs a separate, owned terminal/session.
         require(
             !self.inherits_stdin()? || !terminal,
-            "canonical run/bench requires nonterminal stdin when input is inherited: redirect from a pipe, file, or /dev/null, select stdin: closed for EOF or stdin_file for captured input, or run a delivered build outside this noninteractive profile",
+            "canonical run/test/bench requires nonterminal stdin when input is inherited: redirect from a pipe, file, or /dev/null, select stdin: closed for EOF or stdin_file for captured input, or run a delivered build outside this noninteractive profile",
         )
     }
 
@@ -2344,9 +2347,9 @@ fn execute_controlled(
             (DrainLimits::new(directory), maximum, Some(files))
         }
         CargoOutput::Inherit { inherit_stdin } => {
-            // Only the explicit noninteractive run/bench executor consumes
-            // caller input. Planning probes and earlier compilation/test
-            // commands keep their original EOF behavior.
+            // Only a noninteractive run/test/bench execution with inherited
+            // input consumes caller stdin. Planning probes, other commands
+            // and tests without an explicit input policy retain EOF.
             command.stdin(if inherit_stdin {
                 Stdio::inherit()
             } else {
@@ -3292,7 +3295,7 @@ mod tests {
     }
 
     #[test]
-    fn only_current_run_and_bench_execution_inherit_nonterminal_stdin() {
+    fn command_defaults_keep_test_stdin_closed_and_run_and_bench_inherited() {
         for (command, no_run, inherits_stdin) in [
             (CompilationCommand::Run, false, true),
             (CompilationCommand::Bench, false, true),
@@ -3380,7 +3383,11 @@ mod tests {
 
     #[test]
     fn captured_stdin_profiles_preserve_command_selection_and_compilation_identity() {
-        for command in [CompilationCommand::Run, CompilationCommand::Bench] {
+        for command in [
+            CompilationCommand::Run,
+            CompilationCommand::Test,
+            CompilationCommand::Bench,
+        ] {
             let mut profile = application_environment_profile();
             profile.command = command;
             profile.selection = Some(CompilationSelection {
@@ -3414,19 +3421,20 @@ mod tests {
         for command in [
             CompilationCommand::Check,
             CompilationCommand::Build,
-            CompilationCommand::Test,
             CompilationCommand::Clippy,
             CompilationCommand::Doc,
         ] {
             profile.command = command;
             assert!(profile.validate_logical().is_err(), "{command:?}");
         }
-        profile.command = CompilationCommand::Bench;
         profile.selection = Some(CompilationSelection {
             no_run: true,
             ..CompilationSelection::default()
         });
-        assert!(profile.validate_logical().is_err());
+        for command in [CompilationCommand::Test, CompilationCommand::Bench] {
+            profile.command = command;
+            assert!(profile.validate_logical().is_err(), "{command:?}");
+        }
         profile.selection = None;
         for policy in [CompilationStdin::Closed, CompilationStdin::Inherit] {
             profile.stdin = Some(policy);
@@ -3448,6 +3456,37 @@ mod tests {
         }
         profile.stdin_file = Some("x".repeat(1025));
         assert!(profile.validate_logical().is_err());
+    }
+
+    #[test]
+    fn stdin_execution_policy_distinguishes_cargo_no_run_from_harness_arguments() {
+        for command in [CompilationCommand::Test, CompilationCommand::Bench] {
+            for captured in [false, true] {
+                let mut profile = application_environment_profile();
+                profile.command = command;
+                profile.selection = Some(CompilationSelection {
+                    test_args: vec!["--no-run".into()],
+                    ..CompilationSelection::default()
+                });
+                if captured {
+                    profile.stdin_file = Some("inputs/binary.dat".into());
+                } else {
+                    profile.stdin = Some(CompilationStdin::Inherit);
+                }
+                // A literal argument after `--` belongs to the executed
+                // harness. Only Cargo's typed no_run selection disables it.
+                profile.validate_logical().unwrap();
+                assert!(!profile.no_run());
+                assert!(
+                    profile
+                        .compilation_args()
+                        .unwrap()
+                        .ends_with(&["--".into(), "--no-run".into()])
+                );
+                profile.selection.as_mut().unwrap().no_run = true;
+                assert!(profile.validate_logical().is_err());
+            }
+        }
     }
 
     fn captured_stdin_fixture(bytes: &[u8]) -> (tempfile::TempDir, SourceReceiver, PathBuf) {
@@ -3512,6 +3551,126 @@ mod tests {
             assert!(output.stderr.is_empty());
             input.verify(&|| false).unwrap();
             assert!(input.take_stdio(&|| false).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_stdin_reaches_real_cargo_test_harnesses_on_every_execution() {
+        // This exercises host Cargo, actual libtest/custom-harness children,
+        // and production input custody. Namespace/service execution has its
+        // separate controlled-host integration fixture.
+        let bytes = b"test\0captured input\xff\n";
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| {
+            let sibling = Path::new(env!("CARGO")).with_file_name("rustc");
+            if sibling.is_file() {
+                sibling.into_os_string()
+            } else {
+                "rustc".into()
+            }
+        });
+        for harness in [true, false] {
+            let (owner, mut source, control) = captured_stdin_fixture(bytes);
+            let project = owner.path().join("project");
+            fs::create_dir(&project).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='captured-test-input'\nversion='0.1.0'\nedition='2021'\n\
+                     [workspace]\n[[test]]\nname='reader'\npath='reader.rs'\nharness={harness}\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                project.join("Cargo.lock"),
+                "version = 4\n[[package]]\nname = \"captured-test-input\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            fs::write(project.join("expected.bin"), bytes).unwrap();
+            let reader = r#"use std::io::Read;
+fn consume_current_input() {
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    assert_eq!(input.as_slice(), &include_bytes!("expected.bin")[..]);
+    let path = std::env::var_os("EXECUTION_COUNTER").unwrap();
+    let count: u32 = std::fs::read_to_string(&path).ok().map(|value| value.parse().unwrap()).unwrap_or(0) + 1;
+    std::fs::write(path, count.to_string()).unwrap();
+    println!("CURRENT_CAPTURED_TEST_INPUT={count}:{}", input.len());
+    assert_eq!(std::env::var("FAIL_CURRENT_TEST").unwrap(), "false", "current failure must be preserved");
+}
+"#;
+            let entrypoint = if harness {
+                "#[test]\nfn reads_current_input() { consume_current_input(); }\n"
+            } else {
+                "fn main() { consume_current_input(); }\n"
+            };
+            fs::write(project.join("reader.rs"), format!("{reader}{entrypoint}")).unwrap();
+            let mut profile = application_environment_profile();
+            profile.command = CompilationCommand::Test;
+            profile.stdin_file = Some("inputs/binary.dat".into());
+            profile.selection = Some(CompilationSelection {
+                test: vec!["reader".into()],
+                test_args: vec!["--nocapture".into()],
+                ..CompilationSelection::default()
+            });
+            profile.validate_logical().unwrap();
+            let ProfileStdin::Captured(path) = profile.stdin_policy().unwrap() else {
+                panic!("executing tests must retain their captured input policy");
+            };
+            let selection = profile.selection.as_ref().unwrap();
+            for (attempt, fail) in [false, true, false].into_iter().enumerate() {
+                let execution = control.join(attempt.to_string());
+                create_private(&execution).unwrap();
+                let mut input =
+                    CapturedStdin::capture(&mut source, path, None, &execution, &|| false).unwrap();
+                let mut command = std::process::Command::new(env!("CARGO"));
+                command
+                    .current_dir(&project)
+                    .args(selection.cargo_arguments(profile.command).unwrap())
+                    .args(["--offline", "--locked", "--jobs", "1", "--target-dir"])
+                    .arg(project.join("target"))
+                    .args(selection.runtime_arguments(profile.command).unwrap())
+                    .env("CARGO_HOME", project.join("cargo-home"))
+                    .env("RUSTC", &compiler)
+                    .env("RUSTC_WRAPPER", "")
+                    .env("RUSTC_WORKSPACE_WRAPPER", "")
+                    .env("EXECUTION_COUNTER", project.join("executions"))
+                    .env("FAIL_CURRENT_TEST", fail.to_string())
+                    .stdin(input.take_stdio(&|| false).unwrap())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let mut timed_out = false;
+                let output = ManagedProcessGroup::spawn_command(command, Attribution::default())
+                    .unwrap()
+                    .wait_with_bounded_drain_budget(
+                        &DrainLimits::new(execution.join("output")),
+                        1024 * 1024,
+                        || {
+                            timed_out |= Instant::now() >= deadline;
+                            timed_out
+                        },
+                    )
+                    .unwrap();
+                let stdout = io::read_to_string(output.stdout.reader().unwrap()).unwrap();
+                let stderr = io::read_to_string(output.stderr.reader().unwrap()).unwrap();
+                assert!(!timed_out, "{stdout}\n{stderr}");
+                assert_eq!(output.residual_group_members, 0);
+                assert_eq!(
+                    output.status.code(),
+                    Some(if fail { 101 } else { 0 }),
+                    "harness={harness}, attempt={attempt}: {stdout}\n{stderr}",
+                );
+                assert!(
+                    stdout.contains(&format!(
+                        "CURRENT_CAPTURED_TEST_INPUT={}:{}",
+                        attempt + 1,
+                        bytes.len(),
+                    )),
+                    "{stdout}\n{stderr}",
+                );
+                input.verify(&|| false).unwrap();
+                assert!(input.take_stdio(&|| false).is_err());
+            }
         }
     }
 
@@ -3624,7 +3783,11 @@ mod tests {
         profile.stdin = Some(CompilationStdin::Inherit);
         assert!(profile.validate_logical().is_err());
         assert!(profile.validate_stdin(false).is_err());
-        for command in [CompilationCommand::Run, CompilationCommand::Bench] {
+        for command in [
+            CompilationCommand::Run,
+            CompilationCommand::Test,
+            CompilationCommand::Bench,
+        ] {
             profile.command = command;
             profile.validate_logical().unwrap();
             profile.validate_stdin(false).unwrap();
@@ -3634,7 +3797,10 @@ mod tests {
             no_run: true,
             ..CompilationSelection::default()
         });
-        assert!(profile.validate_logical().is_err());
+        for command in [CompilationCommand::Test, CompilationCommand::Bench] {
+            profile.command = command;
+            assert!(profile.validate_logical().is_err(), "{command:?}");
+        }
     }
 
     #[test]

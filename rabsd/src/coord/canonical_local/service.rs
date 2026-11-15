@@ -979,10 +979,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_service_run_and_bench_require_explicit_closed_stdin() {
+    fn shared_service_preserves_closed_test_defaults_and_refuses_inherited_stdin() {
         let owner = crate::test_util::private_tempdir();
         let socket = owner.path().join("service.sock");
-        for command in ["run", "bench"] {
+        for command in ["run", "test", "bench"] {
             let mut value = json!({
                 "version":super::super::PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
@@ -990,7 +990,11 @@ mod tests {
                 "wrapper":"/bin/rabs-wrap", "service_socket":socket,
             });
             let profile: Profile = serde_json::from_value(value.clone()).unwrap();
-            assert!(validate_profile_route(&profile, &socket).is_err());
+            assert_eq!(
+                validate_profile_route(&profile, &socket).is_ok(),
+                command == "test",
+                "{command}",
+            );
             value["stdin"] = json!("inherit");
             let profile: Profile = serde_json::from_value(value.clone()).unwrap();
             assert!(validate_profile_route(&profile, &socket).is_err());
@@ -1005,7 +1009,7 @@ mod tests {
     fn shared_service_accepts_captured_stdin_without_forwarding_client_input() {
         let owner = crate::test_util::private_tempdir();
         let socket = owner.path().join("service.sock");
-        for command in ["run", "bench"] {
+        for command in ["run", "test", "bench"] {
             let mut value = json!({
                 "version":super::super::PROFILE_VERSION, "command":command,
                 "source_root":"/source", "toolchain_root":"/toolchain",
