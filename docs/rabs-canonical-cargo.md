@@ -3029,6 +3029,13 @@ or printing an already exposed record again. A local spool or output write failu
 is a terminal error, not a reason to reconnect or replay partially printed
 diagnostics.
 
+The native remote client writes to caller pipes and sockets using bounded
+nonblocking output. Cancellation or the current operation/delivery deadline can
+stop blocked live stderr or final verified stdout publication and cancel the
+original operation without replaying output. Regular-file writes still depend
+on filesystem and kernel latency; this does not make every filesystem call
+interruptible or introduce an interactive terminal/PTY protocol.
+
 During artifact transfer, the same private receiver stays alive across
 connections. After verifying the identical replayed manifest, the client sends
 its original missing-file/prefix selection and first incomplete file/byte cursor.

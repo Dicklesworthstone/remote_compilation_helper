@@ -1,5 +1,7 @@
 //! Local capture and verified result installation for a remote operation.
 
+mod output;
+
 use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
@@ -21,6 +23,7 @@ use crate::edge::live_facts::read_stable;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
+use output::{ControlledOutput, OutputDeadline};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{
     MAX_JSON_RECORD, connect_coordinator_peer, runtime_transport_now,
@@ -338,6 +341,19 @@ pub fn run_client_profile(
             token,
             input_deadline,
         );
+        // Open the caller's exact output descriptions before InputsDone can
+        // start Cargo. Pipe/socket backpressure must still observe the same
+        // cancellation flag and operation/delivery deadlines as the network.
+        let mut stdout = ControlledOutput::with_deadline(
+            &io::stdout(),
+            stopped,
+            client.delivery.output_deadline.clone(),
+        )?;
+        let mut stderr = ControlledOutput::with_deadline(
+            &io::stderr(),
+            stopped,
+            client.delivery.output_deadline.clone(),
+        )?;
         client
             .complete(
                 wire,
@@ -347,11 +363,21 @@ pub fn run_client_profile(
                         .map(|peer| peer.stream)
                         .map_err(io::Error::other)
                 },
-                &mut io::stdout().lock(),
-                &mut io::stderr().lock(),
+                &mut stdout,
+                &mut stderr,
             )
             .await
     })
+}
+
+/// Administrative notices cannot strand the client behind stderr either.
+/// They do not acknowledge transcript bytes or establish a result, and remain
+/// best effort if the caller cannot consume them within one ordinary poll.
+fn report_status(message: Value, stopped: &AtomicBool, deadline: Instant) {
+    let deadline = deadline.min(Instant::now() + ADMISSION_POLL);
+    if let Ok(mut stderr) = ControlledOutput::new(&io::stderr(), stopped, deadline) {
+        let _ = writeln!(stderr, "{message}");
+    }
 }
 
 /// The entire declaration uses one deadline and the same bounded window as
@@ -406,10 +432,11 @@ async fn await_input_admission<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Message::Queued {} => {
                 if !reported_queue {
-                    eprintln!(
-                        "{}",
+                    report_status(
                         json!({"kind":"canonical-remote-queued", "coordinator":coordinator,
-                            "cargo_location":"coordinator", "automatic_retry":false})
+                            "cargo_location":"coordinator", "automatic_retry":false}),
+                        stopped,
+                        admission_deadline,
                     );
                     reported_queue = true;
                 }
@@ -842,6 +869,9 @@ struct BuildCompletion {
 struct ClientDelivery {
     operation_deadline: Instant,
     delivery_deadline: Option<Instant>,
+    // The same deadline controls a sink already blocked while stdout is
+    // published after verified delivery. Completion may shorten it once.
+    output_deadline: OutputDeadline,
     stdout_offset: u64,
     stderr_offset: u64,
     stdout_spool: Option<fs::File>,
@@ -855,6 +885,7 @@ impl ClientDelivery {
         Self {
             operation_deadline,
             delivery_deadline: None,
+            output_deadline: OutputDeadline::new(operation_deadline),
             stdout_offset: 0,
             stderr_offset: 0,
             stdout_spool: None,
@@ -874,8 +905,7 @@ impl ClientDelivery {
     fn retain_stdout(&mut self, staging_root: &Path, bytes: &[u8]) -> io::Result<()> {
         require(
             !self.stdout_published
-                && (bytes.len() as u64)
-                    <= OUTPUT_TOTAL_BYTES.saturating_sub(self.stdout_offset),
+                && (bytes.len() as u64) <= OUTPUT_TOTAL_BYTES.saturating_sub(self.stdout_offset),
             "retained remote stdout exceeds its bound or was already published",
         )?;
         if bytes.is_empty() {
@@ -899,11 +929,7 @@ impl ClientDelivery {
     /// Call only after the authenticated terminal receipt and installed-target
     /// verification. Consume custody before the first local write: a failed
     /// output sink must never cause either replay or remote execution retry.
-    fn publish_stdout(
-        &mut self,
-        stopped: &AtomicBool,
-        writer: &mut impl Write,
-    ) -> io::Result<()> {
+    fn publish_stdout(&mut self, stopped: &AtomicBool, writer: &mut impl Write) -> io::Result<()> {
         require(
             self.completion.is_some() && !self.stdout_published,
             "remote stdout publication is incomplete or was already attempted",
@@ -956,6 +982,7 @@ impl ClientDelivery {
             self.completion = Some(completion);
             self.delivery_deadline =
                 Some((Instant::now() + DELIVERY_BUDGET).min(self.operation_deadline));
+            self.output_deadline.limit(self.deadline());
         }
         Ok(())
     }
@@ -1051,11 +1078,12 @@ impl<'a> ResumableClient<'a> {
                 }
             };
         }
-        eprintln!(
-            "{}",
+        report_status(
             json!({"kind":"canonical-remote-accepted", "coordinator":self.config.coordinator,
             "cargo_location":"coordinator", "automatic_retry":false,
-            "connection_recovery":true})
+            "connection_recovery":true}),
+            self.stopped,
+            self.delivery.deadline(),
         );
         loop {
             match receive_operation(
@@ -1299,11 +1327,12 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         .await;
     // This locally chosen path is reported only after the final coordinator
     // receipt. Diagnostic JSON from Cargo never authorizes installation.
-    eprintln!(
-        "{}",
+    report_status(
         json!({"kind":"canonical-remote-completed", "exit_code":exit_code,
         "target_root":delivery.target.installed.as_ref().map(|_| &config.output_destination),
-        "coordinator":config.coordinator, "cargo_location":"coordinator"})
+        "coordinator":config.coordinator, "cargo_location":"coordinator"}),
+        stopped,
+        delivery_deadline,
     );
     Ok(exit_code)
 }
@@ -1457,14 +1486,15 @@ async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
             .iter()
             .filter(|file| file.len != 0)
             .count();
-        eprintln!(
-            "{}",
+        report_status(
             json!({"kind":"canonical-remote-artifact-reuse",
             "reused_files":nonempty - plan.missing_files.len(),
             "reused_bytes":target.manifest().total_bytes() - requested_bytes,
             "offered_prefix_files":plan.prefixes.len(),
             "resumed_files":delivery.resumed_files, "resumed_bytes":delivery.resumed_bytes,
-            "transfer_files":delivery.started_files.len(), "transfer_bytes":delivery.transferred_bytes})
+            "transfer_files":delivery.started_files.len(), "transfer_bytes":delivery.transferred_bytes}),
+            stopped,
+            deadline,
         );
         delivery.reported_reuse = true;
     }
@@ -2056,7 +2086,8 @@ mod tests {
     #[test]
     fn terminal_completion_rechecks_the_exact_installed_target() {
         let (manifest, bytes) = artifact_fixture();
-        let diagnostic = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/rabs/target/program\"]}\n";
+        let diagnostic =
+            b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/rabs/target/program\"]}\n";
         for altered in [false, true] {
             let directory = private();
             let destination = directory.path().join("completed");
@@ -2108,7 +2139,10 @@ mod tests {
                 &mut Vec::new(),
             ));
             if altered {
-                assert!(stdout.is_empty(), "changed artifacts cannot release Cargo stdout");
+                assert!(
+                    stdout.is_empty(),
+                    "changed artifacts cannot release Cargo stdout"
+                );
                 assert!(
                     result.is_err(),
                     "a terminal receipt cannot bless changed outputs"

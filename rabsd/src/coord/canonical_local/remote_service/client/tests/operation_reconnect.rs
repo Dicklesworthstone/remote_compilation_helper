@@ -227,7 +227,10 @@ fn reconnect_retains_raw_stdout_privately_and_publishes_it_once() {
         .unwrap(),
         0
     );
-    assert_eq!(visible.lock().unwrap().as_slice(), b"first-out\x00\xff-next\n");
+    assert_eq!(
+        visible.lock().unwrap().as_slice(),
+        b"first-out\x00\xff-next\n"
+    );
     assert_eq!(stderr, b"first-err");
     assert_resume(&resumed_output, first_stdout.len() as u64, 9);
     assert_eq!(
@@ -294,6 +297,107 @@ fn local_stderr_failure_cancels_without_publishing_retained_stdout() {
 }
 
 #[test]
+fn blocked_real_output_cancels_the_original_operation_without_reconnect() {
+    struct BlockedOutput<'a> {
+        inner: ControlledOutput<'a>,
+        started: std::sync::mpsc::Sender<()>,
+    }
+    impl Write for BlockedOutput<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.inner.write(bytes)
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if !bytes.is_empty() {
+                self.started.send(()).unwrap();
+            }
+            self.inner.write_all(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    // Stderr is live; stdout can block only after its verified terminal
+    // receipt. Neither kind of local backpressure may retry the remote work.
+    for block_stdout in [false, true] {
+        let directory = private();
+        let config = delivery_config(&directory.path().join("completed"));
+        let stopped = AtomicBool::new(false);
+        let mut client = client(&config, &stopped);
+        let initial = RecoveryPeer::new(&[
+            Message::Accepted {},
+            Message::Progress {
+                stdout: diagnostic(0, b"retained"),
+                stderr: diagnostic(0, if block_stdout { b"" } else { b"blocked" }),
+            },
+            Message::BuildFinished {
+                exit_code: 0,
+                stdout_bytes: 8,
+                stderr_bytes: if block_stdout { 0 } else { 7 },
+                target: None,
+            },
+            Message::Complete { exit_code: 0 },
+        ]);
+        let commands = initial.output();
+        let (_reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK).unwrap();
+        loop {
+            match rustix::io::write(&writer, &[0; 4096]) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                result => panic!("unexpected real pipe fill result: {result:?}"),
+            }
+        }
+        let (started, observed) = std::sync::mpsc::channel();
+        let mut blocked = BlockedOutput {
+            inner: ControlledOutput::with_deadline(
+                &writer,
+                &stopped,
+                client.delivery.output_deadline.clone(),
+            )
+            .unwrap(),
+            started,
+        };
+        let mut connects = 0;
+        let error = std::thread::scope(|scope| {
+            let stopped = &stopped;
+            scope.spawn(move || {
+                observed.recv_timeout(Duration::from_secs(3)).unwrap();
+                stopped.store(true, Ordering::Release);
+            });
+            let connect = || {
+                connects += 1;
+                std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                    "blocked local output must not reconnect",
+                )))
+            };
+            if block_stdout {
+                native(client.complete(Wire::new(initial), connect, &mut blocked, &mut Vec::new()))
+            } else {
+                native(client.complete(Wire::new(initial), connect, &mut Vec::new(), &mut blocked))
+            }
+            .unwrap_err()
+        });
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(connects, 0);
+        assert_eq!(client.delivery.stdout_published, block_stdout);
+        assert_eq!(
+            (client.delivery.stdout_offset, client.delivery.stderr_offset),
+            if block_stdout { (8, 0) } else { (0, 0) }
+        );
+        assert_eq!(
+            kinds(&commands),
+            if block_stdout {
+                vec!["inputs-done", "poll", "poll", "close", "cancel"]
+            } else {
+                vec!["inputs-done", "poll", "cancel"]
+            }
+        );
+    }
+}
+
+#[test]
 fn terminal_receipt_controls_stdout_including_failed_build_diagnostics() {
     let retained = b"failed compiler output\x00\xff\n";
     for terminal_exit in [None, Some(0), Some(7)] {
@@ -339,7 +443,13 @@ fn terminal_receipt_controls_stdout_including_failed_build_diagnostics() {
             assert!(stdout.is_empty());
             assert!(!delivery.stdout_published);
             assert_eq!(
-                delivery.stdout_spool.as_ref().unwrap().metadata().unwrap().len(),
+                delivery
+                    .stdout_spool
+                    .as_ref()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .len(),
                 retained.len() as u64
             );
         }
@@ -391,7 +501,13 @@ fn interrupted_target_delivery_keeps_cargo_stdout_private() {
     assert!(!delivery.stdout_published);
     assert_eq!(delivery.stdout_offset, retained.len() as u64);
     assert_eq!(
-        delivery.stdout_spool.as_ref().unwrap().metadata().unwrap().len(),
+        delivery
+            .stdout_spool
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len(),
         retained.len() as u64
     );
 }
@@ -1135,8 +1251,10 @@ fn result_identity_and_original_delivery_deadline_cannot_change_on_reattachment(
     };
     delivery.completed(result.clone()).unwrap();
     assert_eq!(delivery.deadline(), original);
+    assert_eq!(delivery.output_deadline.get(), original);
     delivery.completed(result).unwrap();
     assert_eq!(delivery.deadline(), original);
+    assert_eq!(delivery.output_deadline.get(), original);
     assert!(
         delivery
             .completed(BuildCompletion {
@@ -1148,6 +1266,28 @@ fn result_identity_and_original_delivery_deadline_cannot_change_on_reattachment(
             .is_err()
     );
     assert_eq!(delivery.deadline(), original);
+    assert_eq!(delivery.output_deadline.get(), original);
+}
+
+#[test]
+fn completed_build_shortens_the_deadline_held_by_caller_output() {
+    let original = Instant::now() + DELIVERY_BUDGET * 2;
+    let mut delivery = ClientDelivery::new(original);
+    let output = delivery.output_deadline.clone();
+    let result = BuildCompletion {
+        exit_code: 0,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        target: None,
+    };
+    delivery.completed(result.clone()).unwrap();
+    let deadline = delivery.deadline();
+    assert!(deadline < original);
+    assert_eq!(output.get(), deadline);
+    // Reattachment cannot move either the network or blocked sink's bound.
+    delivery.completed(result).unwrap();
+    assert_eq!(delivery.deadline(), deadline);
+    assert_eq!(output.get(), deadline);
 }
 
 #[test]
