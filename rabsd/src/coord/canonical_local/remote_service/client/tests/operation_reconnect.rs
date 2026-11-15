@@ -159,20 +159,38 @@ fn lost_input_acknowledgment_only_resumes_the_original_token() {
     }
 }
 
+#[derive(Default)]
+struct ObservedOutput {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for ObservedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
-fn reconnect_retains_only_fully_exposed_diagnostic_pairs() {
+fn reconnect_retains_raw_stdout_privately_and_publishes_it_once() {
     let directory = private();
     let config = delivery_config(&directory.path().join("completed"));
     let stopped = AtomicBool::new(false);
     let mut client = client(&config, &stopped);
+    let first_stdout = b"first-out\x00\xff";
+    let next_stdout = b"-next\n";
     let mut initial = RecoveryPeer::new(&[
         Message::Accepted {},
         Message::Progress {
-            stdout: diagnostic(0, b"first-out"),
+            stdout: diagnostic(0, first_stdout),
             stderr: diagnostic(0, b"first-err"),
         },
     ]);
-    // A partial next record is never exposed or continued on another stream.
+    // A partial next record is never retained or continued on another stream.
     initial
         .inner
         .input
@@ -180,12 +198,12 @@ fn reconnect_retains_only_fully_exposed_diagnostic_pairs() {
     let resumed = RecoveryPeer::new(&[
         Message::Accepted {},
         Message::Progress {
-            stdout: diagnostic(9, b"-next"),
+            stdout: diagnostic(first_stdout.len() as u64, next_stdout),
             stderr: diagnostic(9, b""),
         },
         Message::BuildFinished {
             exit_code: 0,
-            stdout_bytes: 14,
+            stdout_bytes: (first_stdout.len() + next_stdout.len()) as u64,
             stderr_bytes: 9,
             target: None,
         },
@@ -193,25 +211,32 @@ fn reconnect_retains_only_fully_exposed_diagnostic_pairs() {
     ]);
     let resumed_output = resumed.output();
     let mut peers = VecDeque::from([resumed]);
-    let mut stdout = Vec::new();
+    let mut stdout = ObservedOutput::default();
+    let visible = Arc::clone(&stdout.bytes);
     let mut stderr = Vec::new();
     assert_eq!(
         native(client.complete(
             Wire::new(initial),
-            || std::future::ready(Ok(peers.pop_front().expect("unexpected reconnect"))),
+            || {
+                assert!(visible.lock().unwrap().is_empty());
+                std::future::ready(Ok(peers.pop_front().expect("unexpected reconnect")))
+            },
             &mut stdout,
             &mut stderr,
         ))
         .unwrap(),
         0
     );
-    assert_eq!(stdout, b"first-out-next");
+    assert_eq!(visible.lock().unwrap().as_slice(), b"first-out\x00\xff-next\n");
     assert_eq!(stderr, b"first-err");
-    assert_resume(&resumed_output, 9, 9);
+    assert_resume(&resumed_output, first_stdout.len() as u64, 9);
     assert_eq!(
         (client.delivery.stdout_offset, client.delivery.stderr_offset),
-        (14, 9)
+        ((first_stdout.len() + next_stdout.len()) as u64, 9)
     );
+    assert!(client.delivery.stdout_published);
+    assert!(client.delivery.stdout_spool.is_none());
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 struct FailedOutput;
@@ -230,7 +255,7 @@ impl Write for FailedOutput {
 }
 
 #[test]
-fn local_diagnostic_failure_cancels_without_replaying_an_exposed_half_pair() {
+fn local_stderr_failure_cancels_without_publishing_retained_stdout() {
     let directory = private();
     let config = delivery_config(&directory.path().join("completed"));
     let stopped = AtomicBool::new(false);
@@ -238,7 +263,7 @@ fn local_diagnostic_failure_cancels_without_replaying_an_exposed_half_pair() {
     let initial = RecoveryPeer::new(&[
         Message::Accepted {},
         Message::Progress {
-            stdout: diagnostic(0, b"visible"),
+            stdout: diagnostic(0, b"retained"),
             stderr: diagnostic(0, b"failed"),
         },
     ]);
@@ -258,12 +283,312 @@ fn local_diagnostic_failure_cancels_without_replaying_an_exposed_half_pair() {
     ))
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-    assert_eq!(stdout, b"visible");
+    assert!(stdout.is_empty());
+    assert!(!client.delivery.stdout_published);
     assert_eq!(
         (client.delivery.stdout_offset, client.delivery.stderr_offset),
         (0, 0)
     );
     assert_eq!(connects, 0);
+    assert_eq!(kinds(&output), ["inputs-done", "poll", "cancel"]);
+}
+
+#[test]
+fn terminal_receipt_controls_stdout_including_failed_build_diagnostics() {
+    let retained = b"failed compiler output\x00\xff\n";
+    for terminal_exit in [None, Some(0), Some(7)] {
+        let directory = private();
+        let config = delivery_config(&directory.path().join("completed"));
+        let stopped = AtomicBool::new(false);
+        let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+        let mut messages = vec![
+            Message::Progress {
+                stdout: diagnostic(0, retained),
+                stderr: diagnostic(0, b"live diagnostic"),
+            },
+            Message::BuildFinished {
+                exit_code: 7,
+                stdout_bytes: retained.len() as u64,
+                stderr_bytes: 15,
+                target: None,
+            },
+        ];
+        if let Some(exit_code) = terminal_exit {
+            messages.push(Message::Complete { exit_code });
+        }
+        let mut wire = Wire::new(RecoveryPeer::new(&messages));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = native(receive_operation(
+            &mut wire,
+            &config,
+            &stopped,
+            &mut delivery,
+            &mut stdout,
+            &mut stderr,
+        ));
+        assert_eq!(stderr, b"live diagnostic");
+        assert_eq!(delivery.stdout_offset, retained.len() as u64);
+        if terminal_exit == Some(7) {
+            assert_eq!(result.unwrap(), 7);
+            assert_eq!(stdout, retained);
+            assert!(delivery.stdout_published);
+            assert!(delivery.stdout_spool.is_none());
+        } else {
+            assert!(result.is_err());
+            assert!(stdout.is_empty());
+            assert!(!delivery.stdout_published);
+            assert_eq!(
+                delivery.stdout_spool.as_ref().unwrap().metadata().unwrap().len(),
+                retained.len() as u64
+            );
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn interrupted_target_delivery_keeps_cargo_stdout_private() {
+    let directory = private();
+    let destination = directory.path().join("completed");
+    let config = delivery_config(&destination);
+    let stopped = AtomicBool::new(false);
+    let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+    let (manifest, bytes) = artifact_fixture();
+    let retained = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/rabs/target/program\"]}\n";
+    let mut messages = vec![
+        Message::Progress {
+            stdout: diagnostic(0, retained),
+            stderr: diagnostic(0, b"live diagnostic"),
+        },
+        Message::BuildFinished {
+            exit_code: 0,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 15,
+            target: Some(ArtifactDeclaration::from_native(&manifest)),
+        },
+    ];
+    messages.extend(artifact_manifest_messages(&manifest));
+    messages.push(Message::ArtifactChunk {
+        chunk: Chunk::new("program", 0, &bytes[..MAX_SOURCE_CHUNK]).unwrap(),
+    });
+    let mut wire = Wire::new(RecoveryPeer::new(&messages));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = native(receive_operation(
+        &mut wire,
+        &config,
+        &stopped,
+        &mut delivery,
+        &mut stdout,
+        &mut stderr,
+    ))
+    .unwrap_err();
+    assert!(wire.can_resume_after(&error));
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, b"live diagnostic");
+    assert!(!destination.exists());
+    assert!(!delivery.stdout_published);
+    assert_eq!(delivery.stdout_offset, retained.len() as u64);
+    assert_eq!(
+        delivery.stdout_spool.as_ref().unwrap().metadata().unwrap().len(),
+        retained.len() as u64
+    );
+}
+
+#[test]
+fn stdout_first_write_observes_the_verified_installed_target() {
+    struct ArtifactReadyOutput<'a> {
+        destination: &'a Path,
+        expected: &'a [u8],
+        bytes: Vec<u8>,
+        checked: bool,
+    }
+
+    impl Write for ArtifactReadyOutput<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.checked {
+                assert_eq!(
+                    fs::read(self.destination.join("program")).unwrap(),
+                    self.expected,
+                    "Cargo stdout cannot announce an unavailable artifact"
+                );
+                self.checked = true;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let directory = private();
+    let destination = directory.path().join("completed");
+    let config = delivery_config(&destination);
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let (manifest, bytes) = artifact_fixture();
+    let retained = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/rabs/target/program\"]}\n";
+    let mut messages = vec![
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 0,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: Some(ArtifactDeclaration::from_native(&manifest)),
+        },
+    ];
+    messages.extend(artifact_manifest_messages(&manifest));
+    for (index, part) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+        messages.push(Message::ArtifactChunk {
+            chunk: Chunk::new("program", (index * MAX_SOURCE_CHUNK) as u64, part).unwrap(),
+        });
+    }
+    messages.push(Message::WindowEnd { count: 2 });
+    messages.push(Message::ArtifactEnd {});
+    messages.push(Message::Commit {
+        manifest_sha256: encode_hex(&manifest.digest()),
+    });
+    messages.push(Message::Complete { exit_code: 0 });
+    let mut stdout = ArtifactReadyOutput {
+        destination: &destination,
+        expected: &bytes,
+        bytes: Vec::new(),
+        checked: false,
+    };
+    assert_eq!(
+        native(client.complete(
+            Wire::new(RecoveryPeer::new(&messages)),
+            || {
+                std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                    "successful delivery must not reconnect",
+                )))
+            },
+            &mut stdout,
+            &mut Vec::new(),
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(stdout.checked);
+    assert_eq!(stdout.bytes, retained);
+    assert!(client.delivery.target.installed.is_some());
+    assert!(client.delivery.stdout_published);
+    assert!(client.delivery.stdout_spool.is_none());
+}
+
+#[test]
+fn retained_stdout_bound_is_checked_before_creating_a_spool() {
+    let directory = private();
+    let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+    delivery.stdout_offset = OUTPUT_TOTAL_BYTES - 1;
+    let error = delivery.retain_stdout(directory.path(), b"xx").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(delivery.stdout_offset, OUTPUT_TOTAL_BYTES - 1);
+    assert!(delivery.stdout_spool.is_none());
+    assert!(!delivery.stdout_published);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn local_stdout_failure_after_complete_never_reconnects_or_replays() {
+    let directory = private();
+    let config = delivery_config(&directory.path().join("completed"));
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let retained = b"completed stdout\x00\xff\n";
+    let initial = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 0,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: None,
+        },
+        Message::Complete { exit_code: 0 },
+    ]);
+    let output = initial.output();
+    let mut connects = 0;
+    let error = native(client.complete(
+        Wire::new(initial),
+        || {
+            connects += 1;
+            std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                "must not reconnect",
+            )))
+        },
+        &mut FailedOutput,
+        &mut Vec::new(),
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(connects, 0);
+    assert!(client.delivery.stdout_published);
+    assert!(client.delivery.stdout_spool.is_none());
+    assert_eq!(client.delivery.stdout_offset, retained.len() as u64);
+    assert_eq!(
+        kinds(&output),
+        ["inputs-done", "poll", "poll", "close", "cancel"]
+    );
+    let mut replay = Vec::new();
+    assert!(
+        client
+            .delivery
+            .publish_stdout(&stopped, &mut replay)
+            .is_err()
+    );
+    assert!(replay.is_empty());
+}
+
+#[test]
+fn local_stdout_spool_failure_never_becomes_transport_recovery() {
+    let directory = private();
+    let mut config = delivery_config(&directory.path().join("completed"));
+    config.staging_root = directory.path().join("missing-staging");
+    let stopped = AtomicBool::new(false);
+    let mut client = client(&config, &stopped);
+    let initial = RecoveryPeer::new(&[
+        Message::Accepted {},
+        Message::Progress {
+            stdout: diagnostic(0, b"retained"),
+            stderr: diagnostic(0, b"not exposed"),
+        },
+    ]);
+    let output = initial.output();
+    let mut connects = 0;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let error = native(client.complete(
+        Wire::new(initial),
+        || {
+            connects += 1;
+            std::future::ready(Err::<RecoveryPeer, _>(io::Error::other(
+                "must not reconnect",
+            )))
+        },
+        &mut stdout,
+        &mut stderr,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(connects, 0);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        (client.delivery.stdout_offset, client.delivery.stderr_offset),
+        (0, 0)
+    );
+    assert!(!client.delivery.stdout_published);
     assert_eq!(kinds(&output), ["inputs-done", "poll", "cancel"]);
 }
 
@@ -757,14 +1082,25 @@ fn lost_delivered_ack_does_not_repeat_an_already_verified_completion() {
     let config = delivery_config(&directory.path().join("completed"));
     let stopped = AtomicBool::new(false);
     let mut client = client(&config, &stopped);
+    let retained = b"completed output";
     let mut initial = RecoveryPeer::new(&[
         Message::Accepted {},
-        finished(0, None),
+        Message::Progress {
+            stdout: diagnostic(0, retained),
+            stderr: diagnostic(0, b""),
+        },
+        Message::BuildFinished {
+            exit_code: 0,
+            stdout_bytes: retained.len() as u64,
+            stderr_bytes: 0,
+            target: None,
+        },
         Message::Complete { exit_code: 0 },
     ]);
     initial.fail_write = Some("delivered");
     let output = initial.output();
     let mut connects = 0;
+    let mut stdout = Vec::new();
     assert_eq!(
         native(client.complete(
             Wire::new(initial),
@@ -774,14 +1110,17 @@ fn lost_delivered_ack_does_not_repeat_an_already_verified_completion() {
                     "must not reconnect",
                 )))
             },
-            &mut Vec::new(),
+            &mut stdout,
             &mut Vec::new(),
         ))
         .unwrap(),
         0
     );
+    assert_eq!(stdout, retained);
+    assert!(client.delivery.stdout_published);
+    assert!(client.delivery.stdout_spool.is_none());
     assert_eq!(connects, 0);
-    assert_eq!(kinds(&output), ["inputs-done", "poll", "close"]);
+    assert_eq!(kinds(&output), ["inputs-done", "poll", "poll", "close"]);
 }
 
 #[test]

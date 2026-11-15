@@ -2908,7 +2908,13 @@ inspect any uncertain prior result before deciding to submit new work.
 #### Results, ownership and current limits
 
 The client preserves Cargo's numeric exit status and separate stdout/stderr
-streams. A successful Build or Doc, or Test/Bench with `no_run`, transfers the
+streams. It retains stdout in a bounded private file while receiving progress.
+Stdout is replayed once only after the authenticated terminal completion agrees
+with Cargo's exit status and any returned target has been installed and verified.
+This keeps Cargo's artifact announcements behind verified delivery. Stderr remains
+live. An incomplete or invalid delivery does not expose retained stdout; a completed
+failed command still replays its original bytes and preserves its nonzero exit.
+A successful Build or Doc, or Test/Bench with `no_run`, transfers the
 completed ordinary-file target tree and installs it at `output_destination`.
 Successful Check, Clippy and executing Test return their status and diagnostics
 without materializing that destination. The destination field remains required
@@ -2966,11 +2972,14 @@ its admission permit, so active plus detached operations stay within `max_roots`
 The service allows bounded connection headroom for reattachment while an old
 connection is still noticing a failure, without admitting extra builds.
 
-The client reports the last complete stdout/stderr record it successfully wrote.
+The client reports the last complete record it successfully retained for stdout
+and wrote for stderr. The same private stdout file survives transport reattachment;
+wire offsets count the original received bytes, independently of later replay.
 The server accepts only a previously acknowledged or actually offered complete
 record boundary. It resumes diagnostics there, without silently skipping bytes
-or printing an already exposed record again. A local output write failure is a
-terminal error, not a reason to replay partially printed diagnostics.
+or printing an already exposed record again. A local spool or output write failure
+is a terminal error, not a reason to reconnect or replay partially printed
+diagnostics.
 
 During artifact transfer, the same private receiver stays alive across
 connections. After verifying the identical replayed manifest, the client sends

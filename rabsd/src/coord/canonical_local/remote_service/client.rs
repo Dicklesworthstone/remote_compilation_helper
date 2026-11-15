@@ -837,13 +837,15 @@ struct BuildCompletion {
 }
 
 /// The surviving client, rather than a disposable connection, owns every
-/// exposure frontier and receiver. No state here can be recovered by opening
-/// an existing output directory or by recapturing a changed source checkout.
+/// retained diagnostic frontier and receiver. No state here can be recovered
+/// by opening an output directory or recapturing a changed source checkout.
 struct ClientDelivery {
     operation_deadline: Instant,
     delivery_deadline: Option<Instant>,
     stdout_offset: u64,
     stderr_offset: u64,
+    stdout_spool: Option<fs::File>,
+    stdout_published: bool,
     completion: Option<BuildCompletion>,
     target: TargetDelivery,
 }
@@ -855,6 +857,8 @@ impl ClientDelivery {
             delivery_deadline: None,
             stdout_offset: 0,
             stderr_offset: 0,
+            stdout_spool: None,
+            stdout_published: false,
             completion: None,
             target: TargetDelivery::default(),
         }
@@ -862,6 +866,74 @@ impl ClientDelivery {
 
     fn deadline(&self) -> Instant {
         self.delivery_deadline.unwrap_or(self.operation_deadline)
+    }
+
+    /// Cargo stdout can name artifacts that are not installed yet. Retain its
+    /// raw bytes in one private anonymous file owned by the surviving client;
+    /// neither reconnect nor artifact delivery may expose this stream early.
+    fn retain_stdout(&mut self, staging_root: &Path, bytes: &[u8]) -> io::Result<()> {
+        require(
+            !self.stdout_published
+                && (bytes.len() as u64)
+                    <= OUTPUT_TOTAL_BYTES.saturating_sub(self.stdout_offset),
+            "retained remote stdout exceeds its bound or was already published",
+        )?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.stdout_spool.is_none() {
+            self.stdout_spool = Some(tempfile::tempfile_in(staging_root)?);
+        }
+        let spool = self
+            .stdout_spool
+            .as_mut()
+            .ok_or_else(|| invalid("remote stdout spool is unavailable"))?;
+        require(
+            spool.metadata()?.len() == self.stdout_offset,
+            "retained remote stdout changed before append",
+        )?;
+        spool.write_all(bytes)?;
+        spool.flush()
+    }
+
+    /// Call only after the authenticated terminal receipt and installed-target
+    /// verification. Consume custody before the first local write: a failed
+    /// output sink must never cause either replay or remote execution retry.
+    fn publish_stdout(
+        &mut self,
+        stopped: &AtomicBool,
+        writer: &mut impl Write,
+    ) -> io::Result<()> {
+        require(
+            self.completion.is_some() && !self.stdout_published,
+            "remote stdout publication is incomplete or was already attempted",
+        )?;
+        self.stdout_published = true;
+        let deadline = self.deadline();
+        checkpoint(stopped, deadline)?;
+        if let Some(mut spool) = self.stdout_spool.take() {
+            require(
+                spool.metadata()?.len() == self.stdout_offset,
+                "retained remote stdout changed before publication",
+            )?;
+            spool.rewind()?;
+            let mut remaining = self.stdout_offset;
+            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+            while remaining != 0 {
+                checkpoint(stopped, deadline)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                spool.read_exact(&mut buffer[..count])?;
+                writer.write_all(&buffer[..count])?;
+                remaining -= count as u64;
+            }
+        } else {
+            require(
+                self.stdout_offset == 0,
+                "retained remote stdout is missing at publication",
+            )?;
+        }
+        checkpoint(stopped, deadline)?;
+        writer.flush()
     }
 
     fn completed(&mut self, completion: BuildCompletion) -> io::Result<()> {
@@ -1128,8 +1200,9 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
                     delivery.completion.is_none(),
                     "remote diagnostics resumed after the completed result",
                 )?;
-                // Validate the complete pair before any local exposure. Commit
-                // its frontiers together only after BOTH writes have finished.
+                // Validate the complete pair before retaining stdout or exposing
+                // stderr. Commit raw wire frontiers only after both writes finish;
+                // stdout remains private until verified terminal completion.
                 let stdout_bytes = decode_hex(&stdout.bytes, MAX_SOURCE_CHUNK)?;
                 let stderr_bytes = decode_hex(&stderr.bytes, MAX_SOURCE_CHUNK)?;
                 require(
@@ -1142,13 +1215,12 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
                             <= OUTPUT_TOTAL_BYTES,
                     "remote aggregate diagnostic output exceeds its bound",
                 )?;
-                let mut stdout_offset = delivery.stdout_offset;
                 let mut stderr_offset = delivery.stderr_offset;
-                let first = write_output(stdout, &mut stdout_offset, stdout_writer)?;
+                delivery.retain_stdout(&config.staging_root, &stdout_bytes)?;
                 let second = write_output(stderr, &mut stderr_offset, stderr_writer)?;
-                delivery.stdout_offset = stdout_offset;
+                delivery.stdout_offset += stdout_bytes.len() as u64;
                 delivery.stderr_offset = stderr_offset;
-                if !first && !second {
+                if stdout_bytes.is_empty() && !second {
                     controlled_future(stopped, deadline, async {
                         asupersync::time::sleep(
                             runtime_transport_now(),
@@ -1213,6 +1285,9 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         installed
             .verify(&|| stopped.load(Ordering::Acquire) || Instant::now() >= delivery_deadline)?;
     }
+    // Replay before the optional network cleanup: local output failures must
+    // remain distinguishable from a failed transport and must not reconnect.
+    delivery.publish_stdout(stopped, stdout_writer)?;
     // Complete is already authenticated and verified. A lost cleanup ACK must
     // not turn a known completed command back into an uncertain execution.
     let _ = wire
@@ -1915,7 +1990,7 @@ mod tests {
             "tls": {"ca":"/fixture/ca", "certificate":"/fixture/certificate",
                 "private_key":"/fixture/key"},
             "source_root":"/fixture/source", "toolchain_root":"/fixture/toolchain",
-            "staging_root":"/fixture/staging", "output_destination":destination,
+            "staging_root":destination.parent().unwrap(), "output_destination":destination,
             "settings":{"command":"check", "manifest":"Cargo.toml", "jobs":1,
                 "timeout_seconds":30}
         }))
@@ -1981,16 +2056,29 @@ mod tests {
     #[test]
     fn terminal_completion_rechecks_the_exact_installed_target() {
         let (manifest, bytes) = artifact_fixture();
+        let diagnostic = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/rabs/target/program\"]}\n";
         for altered in [false, true] {
             let directory = private();
             let destination = directory.path().join("completed");
             let config = delivery_config(&destination);
-            let mut messages = vec![Message::BuildFinished {
-                exit_code: 0,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                target: Some(ArtifactDeclaration::from_native(&manifest)),
-            }];
+            let mut messages = vec![
+                Message::Progress {
+                    stdout: Output {
+                        offset: 0,
+                        bytes: encode_hex(diagnostic),
+                    },
+                    stderr: Output {
+                        offset: 0,
+                        bytes: String::new(),
+                    },
+                },
+                Message::BuildFinished {
+                    exit_code: 0,
+                    stdout_bytes: diagnostic.len() as u64,
+                    stderr_bytes: 0,
+                    target: Some(ArtifactDeclaration::from_native(&manifest)),
+                },
+            ];
             messages.extend(artifact_manifest_messages(&manifest));
             for (index, bytes) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
                 messages.push(Message::ArtifactChunk {
@@ -2010,15 +2098,17 @@ mod tests {
                 alter_after_published: altered,
                 completed: false,
             });
+            let mut stdout = Vec::new();
             let result = native(receive_operation(
                 &mut wire,
                 &config,
                 &AtomicBool::new(false),
                 &mut ClientDelivery::new(Instant::now() + Duration::from_secs(15)),
-                &mut Vec::new(),
+                &mut stdout,
                 &mut Vec::new(),
             ));
             if altered {
+                assert!(stdout.is_empty(), "changed artifacts cannot release Cargo stdout");
                 assert!(
                     result.is_err(),
                     "a terminal receipt cannot bless changed outputs"
@@ -2029,6 +2119,7 @@ mod tests {
                 );
             } else {
                 assert_eq!(result.unwrap(), 0);
+                assert_eq!(stdout, diagnostic);
                 assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
             }
         }
