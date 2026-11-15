@@ -1,4 +1,4 @@
-//! Recover foreground RCH ControlMasters left behind by pre-guardian daemons.
+//! Recover foreground RCH ControlMasters after an owner or guardian is lost.
 //!
 //! A pathname or a reported PID is not authority to kill a process. Recovery
 //! binds an owned directory/socket to the kernel's peer credentials, a stable
@@ -44,8 +44,13 @@ pub fn start_ssh_orphan_recovery() -> JoinHandle<()> {
 
 async fn recover_loop(path: PathBuf) {
     loop {
-        if let Err(error) = recover_pass(&path).await {
-            debug!(%error, "SSH orphan recovery pass could not finish");
+        match super::ssh_effective_control_directory(&path) {
+            Ok(path) => {
+                if let Err(error) = recover_pass(&path).await {
+                    debug!(%error, "SSH orphan recovery pass could not finish");
+                }
+            }
+            Err(error) => debug!(%error, "SSH orphan recovery directory unavailable"),
         }
         sleep(SCAN_INTERVAL).await;
     }
@@ -420,6 +425,49 @@ mod tests {
         symlink(&child, temp.path().join("rch-def456")).unwrap();
         assert!(Candidate::open(&root, OsString::from("rch-def456")).is_err());
         assert!(temp.path().join("rch-def456").is_symlink());
+    }
+
+    #[test]
+    fn recovery_discovers_short_fallback_inside_the_same_private_base() {
+        let temp = tempfile::Builder::new()
+            .prefix("rch-r-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let preferred = temp.path().join("long-worker-workspace-".repeat(5));
+        let path = super::super::ssh_effective_control_directory(&preferred).unwrap();
+        let control = super::super::create_ssh_control_directory(&preferred).unwrap();
+        assert_eq!(control.path().parent(), Some(path.as_path()));
+        assert!(!preferred.exists());
+        let socket = control.path().join("master");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // The normal private-directory opener and candidate checks must work
+        // unchanged. Recovery never opens or enumerates the shared /tmp root.
+        let root = Directory::open(&path).unwrap();
+        let candidate =
+            Candidate::open(&root, control.path().file_name().unwrap().to_os_string()).unwrap();
+        candidate.revalidate().unwrap();
+        assert_eq!(candidate.socket, socket);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_a_missing_private_root_uncreated() {
+        let temp = tempfile::Builder::new()
+            .prefix("rch-r-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let missing = temp.path().join("missing");
+        let path = super::super::ssh_effective_control_directory(&missing).unwrap();
+        assert_eq!(path, missing);
+        recover_pass(&path).await.unwrap();
+        assert!(!missing.exists());
     }
 
     #[tokio::test]

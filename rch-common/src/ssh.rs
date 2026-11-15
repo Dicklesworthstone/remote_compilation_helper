@@ -1849,7 +1849,8 @@ fn ssh_control_directory_fits(directory: &Path) -> bool {
 }
 
 fn create_ssh_control_directory(directory: &Path) -> Result<SshControlDir> {
-    if ssh_control_directory_fits(directory) {
+    let effective = ssh_effective_control_directory(directory)?;
+    if effective == directory {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
         {
@@ -1860,6 +1861,17 @@ fn create_ssh_control_directory(directory: &Path) -> Result<SshControlDir> {
         return create_private_ssh_control_directory(directory);
     }
 
+    create_short_ssh_control_directory(&effective)
+}
+
+// Recovery uses the same selection without creating directories. A stable,
+// private per-user base keeps short sockets discoverable after guardian loss
+// without requiring recovery to enumerate or trust a shared temporary root.
+fn ssh_effective_control_directory(directory: &Path) -> Result<PathBuf> {
+    if ssh_control_directory_fits(directory) {
+        return Ok(directory.to_path_buf());
+    }
+
     // HOME, XDG_RUNTIME_DIR and TMPDIR can all be longer than sockaddr_un,
     // especially when RCH itself runs inside an owned remote workspace. Use
     // the system's short temporary root, not another environment-derived path.
@@ -1867,15 +1879,16 @@ fn create_ssh_control_directory(directory: &Path) -> Result<SshControlDir> {
     // before validating the physical root. Never chmod a shared temporary root.
     let short_root = std::fs::canonicalize("/tmp")
         .context("Failed to resolve a short SSH control directory root")?;
+    let short_directory = short_ssh_control_base(&short_root)?;
     debug!(
         preferred = %directory.display(),
-        fallback = %short_root.display(),
+        fallback = %short_directory.display(),
         "SSH control path exceeds the Unix socket limit; using a private short directory"
     );
-    create_short_ssh_control_directory(&short_root)
+    Ok(short_directory)
 }
 
-fn create_short_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
+fn short_ssh_control_base(root: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = std::fs::symlink_metadata(root)
@@ -1893,15 +1906,40 @@ fn create_short_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
         mode & 0o022 == 0 || mode & 0o1000 != 0,
         "Shared short SSH control root must have the sticky bit: {root:?}"
     );
+    let directory = root.join(format!("rch-ssh-{}", rustix::process::geteuid().as_raw()));
     anyhow::ensure!(
-        ssh_control_directory_fits(root),
-        "Short SSH control root still exceeds the Unix socket limit: {root:?}"
+        ssh_control_directory_fits(&directory),
+        "Short SSH control base still exceeds the Unix socket limit: {directory:?}"
+    );
+    Ok(directory)
+}
+
+fn create_short_ssh_control_directory(directory: &Path) -> Result<SshControlDir> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to create short SSH control base {directory:?}"));
+        }
+    }
+    // Never chmod or follow a pre-existing path in the shared parent. Its
+    // owner-only mode must have been established atomically by its creator.
+    let metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("Failed to inspect short SSH control base {directory:?}"))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.permissions().mode() & 0o7777 == 0o700,
+        "Short SSH control base must be a private owned directory: {directory:?}"
     );
     // Exclusive random-directory creation cannot reuse an existing symlink or
     // another connection's socket. The sticky shared parent prevents other
-    // users from replacing our entry; SshControlDir protects it before use and
-    // retains exactly the same guardian-owned lifetime and teardown protocol.
-    create_private_ssh_control_directory(root)
+    // users from replacing our private base. Only the random child is handed
+    // to SshControlDir, retaining the guardian's existing cleanup boundary.
+    create_private_ssh_control_directory(directory)
 }
 
 fn create_private_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
@@ -1911,8 +1949,8 @@ fn create_private_ssh_control_directory(root: &Path) -> Result<SshControlDir> {
         tempfile::Builder::new()
             .prefix("rch-")
             .rand_bytes(6)
-            // The shared fallback parent is searchable by other users. Set
-            // owner-only mode in mkdir itself, before any chmod or handoff.
+            // Establish owner-only mode in mkdir itself, before any chmod
+            // or handoff to the guardian.
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(root)
             .context("Failed to create private SSH control directory")?,
@@ -5045,10 +5083,16 @@ mod ssh_connection_tests {
         let second_path = second.path().to_owned();
         drop(first);
         assert!(!first_path.exists());
-        assert!(second_path.exists(), "one connection must not remove another");
+        assert!(
+            second_path.exists(),
+            "one connection must not remove another"
+        );
         drop(second);
         assert!(!second_path.exists());
-        assert!(preferred.is_dir(), "the shared parent is not connection-owned");
+        assert!(
+            preferred.is_dir(),
+            "the shared parent is not connection-owned"
+        );
     }
 
     #[test]
@@ -5056,13 +5100,13 @@ mod ssh_connection_tests {
         let root = short_control_test_root();
         let long = root.path().join("long-worker-workspace-".repeat(5));
         let shared = std::fs::canonicalize("/tmp").unwrap();
+        let private_base = short_ssh_control_base(&shared).unwrap();
         let shared_mode = std::fs::metadata(&shared).unwrap().permissions().mode();
         let unicode = root.path().join("é".repeat(35));
-        assert!(ssh_control_directory_fits(&root.path().join("e".repeat(35))));
-        assert!(
-            unicode.as_os_str().as_bytes().len()
-                > unicode.to_string_lossy().chars().count()
-        );
+        assert!(ssh_control_directory_fits(
+            &root.path().join("e".repeat(35))
+        ));
+        assert!(unicode.as_os_str().as_bytes().len() > unicode.to_string_lossy().chars().count());
         // These are the three branches of ssh_control_directory. Do not change
         // process-global environment while other connection tests are running.
         for preferred in [
@@ -5073,9 +5117,16 @@ mod ssh_connection_tests {
         ] {
             assert!(!ssh_control_directory_fits(&preferred));
             let directory = create_ssh_control_directory(&preferred).unwrap();
-            assert_eq!(directory.path().parent(), Some(shared.as_path()));
+            assert_eq!(directory.path().parent(), Some(private_base.as_path()));
+            assert_eq!(
+                ssh_effective_control_directory(&preferred).unwrap(),
+                private_base
+            );
             assert_control_sockets_bind(&directory);
-            assert!(!preferred.exists(), "a rejected long parent must not be created");
+            assert!(
+                !preferred.exists(),
+                "a rejected long parent must not be created"
+            );
         }
         assert_eq!(
             std::fs::metadata(&shared).unwrap().permissions().mode(),
@@ -5122,8 +5173,8 @@ mod ssh_connection_tests {
         std::fs::write(&sentinel, b"leave intact").unwrap();
         let alias = root.path().join("alias");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
-        assert!(create_short_ssh_control_directory(&alias).is_err());
-        assert!(create_short_ssh_control_directory(&sentinel).is_err());
+        assert!(short_ssh_control_base(&alias).is_err());
+        assert!(short_ssh_control_base(&sentinel).is_err());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"leave intact");
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
@@ -5138,7 +5189,7 @@ mod ssh_connection_tests {
         let root = short_control_test_root();
         for mode in [0o770, 0o777] {
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(create_short_ssh_control_directory(root.path()).is_err());
+            assert!(short_ssh_control_base(root.path()).is_err());
             assert_eq!(
                 std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777,
                 mode
@@ -5146,8 +5197,18 @@ mod ssh_connection_tests {
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         }
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
-        let directory = create_short_ssh_control_directory(root.path()).unwrap();
+        let private_base = short_ssh_control_base(root.path()).unwrap();
+        let directory = create_short_ssh_control_directory(&private_base).unwrap();
         assert_control_sockets_bind(&directory);
+        assert_eq!(directory.path().parent(), Some(private_base.as_path()));
+        assert_eq!(
+            std::fs::metadata(&private_base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
         assert_eq!(
             std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777,
             0o1777
@@ -5160,8 +5221,73 @@ mod ssh_connection_tests {
         let long = root.path().join("x".repeat(100));
         std::fs::create_dir(&long).unwrap();
         std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(create_short_ssh_control_directory(&long).is_err());
+        assert!(short_ssh_control_base(&long).is_err());
         assert_eq!(std::fs::read_dir(&long).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ssh_short_control_base_is_reused_but_not_owned_by_a_connection() {
+        let root = short_control_test_root();
+        let private_base = short_ssh_control_base(root.path()).unwrap();
+        assert!(
+            !private_base.exists(),
+            "resolving the base must not create it"
+        );
+        let first = create_short_ssh_control_directory(&private_base).unwrap();
+        let second = create_short_ssh_control_directory(&private_base).unwrap();
+        assert_eq!(first.path().parent(), Some(private_base.as_path()));
+        assert_eq!(second.path().parent(), Some(private_base.as_path()));
+        assert_ne!(first.path(), second.path());
+        assert_control_sockets_bind(&first);
+        assert_control_sockets_bind(&second);
+        let sentinel = private_base.join("keep");
+        std::fs::write(&sentinel, b"unrelated connection state").unwrap();
+        let second_path = second.path().to_path_buf();
+        drop(first);
+        assert!(second_path.is_dir());
+        drop(second);
+        assert!(!second_path.exists());
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"unrelated connection state"
+        );
+        assert_eq!(
+            std::fs::metadata(&private_base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn ssh_short_control_base_refuses_existing_unsafe_paths_without_chmod() {
+        let root = short_control_test_root();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = target.join("keep");
+        std::fs::write(&sentinel, b"leave intact").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(create_short_ssh_control_directory(&alias).is_err());
+        assert!(create_short_ssh_control_directory(&sentinel).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"leave intact");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+
+        for mode in [0o755, 0o770, 0o777, 0o1777] {
+            let directory = root.path().join(format!("mode-{mode:o}"));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(create_short_ssh_control_directory(&directory).is_err());
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "a pre-existing fallback base must never be repaired with chmod"
+            );
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        }
     }
 
     struct FakeSsh {
