@@ -416,6 +416,35 @@ async fn confirm_source_namespace_preflight_release(
     })
 }
 
+/// A typed pre-execution refusal proves that this attempt never launched its
+/// command, but its release can race a daemon cancellation. Confirm the terminal
+/// receipt before recording either disposition or permitting a local run.
+async fn confirm_pre_execution_release(
+    writer: &DurableLeaseWriter,
+    release_acknowledged: bool,
+    socket_path: &str,
+) -> anyhow::Result<SourceNamespacePreflightCompletion> {
+    let result = async {
+        anyhow::ensure!(
+            release_acknowledged,
+            "pre-execution reservation release is unconfirmed"
+        );
+        let observed = writer.snapshot();
+        // This is the same pre-execution refusal/cancellation receipt used by
+        // namespace preflight. An ACK alone does not establish which won.
+        let completion =
+            daemon_ipc::query_source_namespace_preflight_completion(socket_path, &observed).await?;
+        writer.acknowledge_observed_completion(&observed, completion.exit_code())?;
+        Ok(completion)
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| {
+        error
+            .context("pre-execution terminal receipt could not be reconciled")
+            .context(crate::transfer::RemoteExecutionUnconfirmed)
+    })
+}
+
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
     if requires_recovery_before_release(error)
         || (is_ssh_command_timeout_error(error) && !error.is::<SourceNamespacePreflightFailure>())
@@ -2763,10 +2792,10 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next).map(|()| true)
     }
 
-    /// The daemon answered this attempt's selection without a worker or build
-    /// id (queue timeout, no admissible worker, restart barrier still closed).
-    /// Every such reply is sent after the daemon dropped any queued row for
-    /// this wrapper, so no remote build can start for it. Record that before
+    /// Selection either failed before dispatch or answered without a worker or
+    /// build id (queue timeout, no admissible worker, restart barrier closed).
+    /// A pre-dispatch failure cannot own a queued row; definitive refusals are
+    /// sent after the daemon dropped that row. Record this no-start proof before
     /// the local run or refusal: a nonterminal lease of a live wrapper blocks
     /// daemon restart for the whole local fallback, and stays `queued` in
     /// `rch jobs` forever once the wrapper exits. No exit code is recorded,
@@ -2791,7 +2820,7 @@ impl DurableLeaseWriter {
 
     /// Settle a pre-admission lease whose owner process is gone after the 24h
     /// daemon-absence window (`bd-7e3bt`). Unlike `confirm_failed_before_admission`,
-    /// which requires an immediate daemon refusal on the live path, this requires
+    /// which requires immediate no-start proof on the live path, this requires
     /// `daemon_absence_is_conclusive` and also settles abandoned `selection_pending`
     /// or `selection_unconfirmed` journals.
     pub(crate) fn settle_abandoned_pre_admission(&self, now_unix_ms: u64) -> anyhow::Result<()> {
@@ -5381,6 +5410,14 @@ pub async fn run_exec(
                 None
             };
 
+            if retry.is_none() {
+                // Every selection failure passed the unconfirmed-outcome gate
+                // above, so no admission request was dispatched. Retire
+                // this wrapper before the terminal policy can run locally or
+                // exit: process::exit does not run lease cleanup.
+                durable_lease.confirm_failed_before_admission()?;
+            }
+
             match decide_recovery_action(retry.is_some(), strict_remote) {
                 // Daemon came back after autostart + retry — proceed remotely.
                 // ProceedRemote implies `retry` is Some; fail open defensively
@@ -5490,7 +5527,11 @@ pub async fn run_exec(
         .await
         {
             Ok(response) => response,
-            Err(error) => return Err(selection_error_for_recovery(error, &durable_lease)?),
+            Err(error) => {
+                let error = selection_error_for_recovery(error, &durable_lease)?;
+                durable_lease.confirm_failed_before_admission()?;
+                return Err(error);
+            }
         };
     }
 
@@ -5549,9 +5590,7 @@ pub async fn run_exec(
             if job && !require_remote {
                 reason = format!("job admission exhausted: {reason}");
             }
-            if let Err(error) = durable_lease.confirm_failed_before_admission() {
-                debug!("Durable lease left open after selection refusal: {error:#}");
-            }
+            durable_lease.confirm_failed_before_admission()?;
             exit_with_gated_local_fallback(
                 &command,
                 &reporter,
@@ -6252,6 +6291,45 @@ pub async fn run_exec(
             Err(e) => {
                 if classify_remote_pipeline_failure(&e)
                     == RemotePipelineFailurePolicy::AllowLocalFallback
+                    && (e.is::<DependencyPreflightFailure>()
+                        || matches!(
+                            e.downcast_ref::<TransferError>(),
+                            Some(TransferError::TransferSkipped { .. })
+                        ))
+                {
+                    let completion = confirm_pre_execution_release(
+                        &durable_lease,
+                        release_acknowledged,
+                        &config.general.socket_path,
+                    )
+                    .await
+                    .with_context(|| format!("pre-execution refusal: {e:#}"))?;
+                    if completion == SourceNamespacePreflightCompletion::Cancelled {
+                        reporter.summary("[RCH] cancelled before remote execution");
+                        emit_exec_envelope(&ExecResultEnvelope {
+                            api_version: "1.0",
+                            command: &remote_command,
+                            outcome: "completed",
+                            location: "remote",
+                            fallback_reason: None,
+                            worker_id: Some(worker.id.as_str()),
+                            remote_exit_code: Some(130),
+                            duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                            timing: exec_timing.as_ref(),
+                            result_dirs: exec_dir_stats.as_deref(),
+                            error_code: None,
+                            admission: durable_lease.machine_admission_reference(
+                                &wrapper_id,
+                                remote_build_id,
+                                &worker.id,
+                            )?,
+                        });
+                        std::process::exit(130);
+                    }
+                }
+
+                if classify_remote_pipeline_failure(&e)
+                    == RemotePipelineFailurePolicy::AllowLocalFallback
                     && let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>()
                 {
                     // Project-specific: retrying a different worker cannot help.
@@ -6273,18 +6351,6 @@ pub async fn run_exec(
                     ));
                     let fallback_reason =
                         format!("dependency preflight failed: {evidence_summary}");
-                    if release_acknowledged
-                        && let Err(error) = durable_lease
-                            // This typed planner refusal precedes execution and
-                            // uses the same failure outcome sent with release.
-                            .record_exit(EXIT_BUILD_ERROR)
-                            .and_then(|_| durable_lease.acknowledge_terminal())
-                    {
-                        warn!(
-                            "Failed to persist acknowledged durable lease terminal state: {}",
-                            error
-                        );
-                    }
                     exit_with_gated_local_fallback(
                         &command,
                         &reporter,
@@ -6301,13 +6367,6 @@ pub async fn run_exec(
                     && let Some(skip_err) = e.downcast_ref::<TransferError>()
                     && let TransferError::TransferSkipped { reason } = skip_err
                 {
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
-                    {
-                        warn!(
-                            "Failed to persist acknowledged durable lease terminal state: {}",
-                            error
-                        );
-                    }
                     exit_with_gated_local_fallback(
                         &command,
                         &reporter,

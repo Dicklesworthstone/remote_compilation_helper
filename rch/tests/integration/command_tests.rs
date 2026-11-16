@@ -2913,7 +2913,7 @@ fn test_robot_triage_json_outputs_quick_ref() {
     crate::test_log!("TEST PASS: test_robot_triage_json_outputs_quick_ref");
 }
 
-/// What one isolated `rch --json exec -- cargo check` run did (#114).
+/// What one isolated `rch --json exec` run did (#114).
 #[cfg(unix)]
 struct FallbackGateRun {
     status: std::process::ExitStatus,
@@ -2921,6 +2921,179 @@ struct FallbackGateRun {
     stderr: String,
     local_cargo_ran: bool,
     incidents: Vec<serde_json::Value>,
+    job_leases: Vec<rch_common::job_identity::DurableJobLease>,
+    lease_at_local_start: Option<rch_common::job_identity::DurableJobLease>,
+    daemon_requests: Vec<String>,
+    ssh_ran: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum FallbackDaemonFixture {
+    Missing,
+    NotSocket,
+    Stale,
+    RestartDisappears,
+    UnconfirmedSelection,
+    TransferSkipped { completion_exit: Option<i32> },
+}
+
+#[cfg(unix)]
+struct FallbackDaemonServer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+#[cfg(unix)]
+impl FallbackDaemonServer {
+    fn start(socket: &std::path::Path, fixture: FallbackDaemonFixture) -> Option<Self> {
+        use serde_json::json;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        if matches!(fixture, FallbackDaemonFixture::Missing) {
+            return None;
+        }
+        if matches!(fixture, FallbackDaemonFixture::NotSocket) {
+            std::fs::write(socket, "not a daemon socket").unwrap();
+            return None;
+        }
+        let listener = UnixListener::bind(socket).unwrap();
+        if matches!(fixture, FallbackDaemonFixture::Stale) {
+            // Leave the socket inode behind to exercise the connect failure.
+            drop(listener);
+            return None;
+        }
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        Some(Self {
+            stop,
+            thread: Some(std::thread::spawn(move || {
+                let mut listener = Some(listener);
+                let mut requests = Vec::new();
+                while !server_stop.load(Ordering::Acquire) {
+                    let Some(active) = listener.as_ref() else {
+                        break;
+                    };
+                    let (stream, _) = match active.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept fallback fixture connection: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    if request.is_empty() {
+                        continue;
+                    }
+                    requests.push(request.trim_end().to_owned());
+                    let route = request.trim_end();
+                    let body = if route == "GET /restart-admission" {
+                        if matches!(fixture, FallbackDaemonFixture::RestartDisappears)
+                            && requests.len() == 3
+                        {
+                            // Stop accepting before replying that the barrier
+                            // is open, so the subsequent selection cannot race
+                            // this fixture's shutdown.
+                            drop(listener.take());
+                        }
+                        json!({"admission_closed": false})
+                    } else if route.starts_with("GET /select-worker?") {
+                        match fixture {
+                            FallbackDaemonFixture::RestartDisappears => json!({
+                                "worker": null,
+                                "reason": {"selection_error": "restart_admission_barrier_active"},
+                            }),
+                            FallbackDaemonFixture::UnconfirmedSelection => json!({}),
+                            FallbackDaemonFixture::TransferSkipped { .. } => json!({
+                                "worker": {
+                                    "id": "preflight-worker",
+                                    "host": "not-contacted.invalid",
+                                    "user": "fixture",
+                                    "identity_file": "/unused/identity",
+                                    "slots_available": 4,
+                                    "speed_score": 90.0,
+                                },
+                                "reason": "success",
+                                "build_id": 42,
+                            }),
+                            _ => panic!("unexpected live fixture {fixture:?}"),
+                        }
+                    } else if route.starts_with("POST /release-worker?") {
+                        json!({"status": "ok"})
+                    } else if let Some(query) = route.strip_prefix("GET /builds/42?") {
+                        let wrapper = query.strip_prefix("local_wrapper_id=").unwrap();
+                        let wrapper = urlencoding::decode(wrapper).unwrap();
+                        let FallbackDaemonFixture::TransferSkipped { completion_exit } = fixture
+                        else {
+                            panic!("unexpected completion query for {fixture:?}");
+                        };
+                        match completion_exit {
+                            Some(exit_code) => json!({
+                                "status": "completed",
+                                "local_wrapper_id": wrapper,
+                                "record": {
+                                    "id": 42,
+                                    "worker_id": "preflight-worker",
+                                    "exit_code": exit_code,
+                                    "cancellation": (exit_code == 130).then(|| json!({
+                                        "operation_id": "cancel-42",
+                                        "origin": "user",
+                                        "reason_code": "user_cancelled",
+                                        "escalation_stage": "term",
+                                        "escalation_count": 0,
+                                        "remote_kill_attempted": false,
+                                        "cleanup_ok": true,
+                                        "history_cancelled": true,
+                                        "final_state": "completed",
+                                    })),
+                                },
+                            }),
+                            None => json!({"status": "running", "local_wrapper_id": wrapper}),
+                        }
+                    } else {
+                        panic!("unexpected fallback fixture request: {route}");
+                    };
+                    let body = body.to_string();
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+                requests
+            })),
+        })
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FallbackDaemonServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2947,8 +3120,8 @@ impl FallbackGateRun {
 /// Isolation: the environment is cleared, and config, config cache, state,
 /// incident ledger, HOME and the daemon socket all live in a temp dir. The
 /// socket does not exist and hook autostart is off, so the run can never
-/// reach the operator's config or daemon. PATH holds only `sh` and a fake
-/// `cargo` that records that it ran on this machine.
+/// reach the operator's config or daemon. PATH holds `sh` and fake `cargo`,
+/// `make`, and `ssh` executables that record attempted local or remote work.
 ///
 /// With `resolved_toolchain` the client resolves a Rust toolchain, so the
 /// run reaches the daemon socket and takes the daemon-unavailable exit.
@@ -2980,9 +3153,32 @@ fn run_isolated_exec(
     require_remote: bool,
     exec_args: &[&str],
 ) -> FallbackGateRun {
+    run_isolated_exec_with_socket(
+        general_extra,
+        allow_local_fallback,
+        resolved_toolchain,
+        require_remote,
+        exec_args,
+        FallbackDaemonFixture::Missing,
+    )
+}
+
+#[cfg(unix)]
+fn run_isolated_exec_with_socket(
+    general_extra: &str,
+    allow_local_fallback: bool,
+    resolved_toolchain: bool,
+    require_remote: bool,
+    exec_args: &[&str],
+    daemon_fixture: FallbackDaemonFixture,
+) -> FallbackGateRun {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    // Unix socket paths must stay short even when TMPDIR is a synced checkout.
+    let temp = tempfile::Builder::new()
+        .prefix("rch-fallback-")
+        .tempdir_in("/tmp")
+        .unwrap();
     // The configured root must match the cwd rch observes, including when the
     // temp dir sits behind a symlink (macOS /var -> /private/var).
     let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -3012,17 +3208,36 @@ fn run_isolated_exec(
         .unwrap();
     }
     let sentinel = root.join("local-cargo-ran");
+    let local_lease = root.join("lease-at-local-start.json");
     let cargo = bin.join("cargo");
     std::fs::write(
         &cargo,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
-            sentinel.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n\
+             for lease in \"$RCH_STATE_HOME\"/job-leases/*.json; do\n\
+                 [ -f \"$lease\" ] || continue\n\
+                 while IFS= read -r line || [ -n \"$line\" ]; do\n\
+                     printf '%s\\n' \"$line\"\n\
+                 done < \"$lease\"\n\
+             done > '{}'\n",
+            sentinel.display(),
+            local_lease.display(),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&cargo, bin.join("make")).unwrap();
     std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+    let ssh_sentinel = root.join("ssh-ran");
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!("#!/bin/sh\n: > '{}'\nexit 99\n", ssh_sentinel.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = root.join("absent-daemon.sock");
+    let daemon = FallbackDaemonServer::start(&socket, daemon_fixture);
     std::fs::write(
         config_dir.join("config.toml"),
         format!(
@@ -3030,7 +3245,7 @@ fn run_isolated_exec(
              [self_healing]\nhook_starts_daemon = false\n\n\
              [compilation]\nallow_local_fallback = {allow_local_fallback}\n\n\
              [path_topology]\ncanonical_root = \"{projects}\"\nalias_root = \"{alias}\"\n",
-            socket = root.join("absent-daemon.sock").display(),
+            socket = socket.display(),
             projects = projects.display(),
             alias = root.join("alias").display(),
         ),
@@ -3058,17 +3273,237 @@ fn run_isolated_exec(
         command.env("RCH_REQUIRE_REMOTE", "1");
     }
     let output = command.output().expect("run rch exec");
+    let daemon_requests = daemon.map(FallbackDaemonServer::finish).unwrap_or_default();
     let incidents = std::fs::read_to_string(state_dir.join("incidents.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|line| serde_json::from_str(line).expect("incident ledger line is JSON"))
         .collect();
+    let job_leases = match std::fs::read_dir(state_dir.join("job-leases")) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .map(|path| {
+                serde_json::from_slice(&std::fs::read(path).unwrap())
+                    .expect("durable job lease is valid")
+            })
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read job leases: {error}"),
+    };
+    let lease_at_local_start = std::fs::read_to_string(local_lease)
+        .ok()
+        .filter(|contents| !contents.trim().is_empty())
+        .map(|contents| serde_json::from_str(&contents).expect("local-start lease is valid"));
     FallbackGateRun {
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         local_cargo_ran: sentinel.exists(),
         incidents,
+        job_leases,
+        lease_at_local_start,
+        daemon_requests,
+        ssh_ran: ssh_sentinel.exists(),
+    }
+}
+
+#[cfg(unix)]
+fn assert_unavailable_daemon_retires_unadmitted_lease(fixture: FallbackDaemonFixture) {
+    use rch_common::job_identity::JobLifecycleState;
+
+    init_test_logging();
+    for (allow_local_fallback, require_remote, expected_exit) in [
+        (true, false, 0),
+        (false, false, 1),
+        (true, true, 103),
+        (false, true, 103),
+    ] {
+        let run = run_isolated_exec_with_socket(
+            "",
+            allow_local_fallback,
+            true,
+            require_remote,
+            &["--", "cargo", "check"],
+            fixture,
+        );
+        let context = format!(
+            "fixture={fixture:?}, allow_local_fallback={allow_local_fallback}, \
+                 require_remote={require_remote}: stderr={}",
+            run.stderr
+        );
+        assert_eq!(run.status.code(), Some(expected_exit), "{context}");
+        assert_eq!(run.local_cargo_ran, expected_exit == 0, "{context}");
+        assert_eq!(run.job_leases.len(), 1, "{context}");
+        let lease = &run.job_leases[0];
+        assert_eq!(
+            lease.state,
+            JobLifecycleState::FailedBeforeAdmission,
+            "{context}"
+        );
+        assert!(lease.terminal_acknowledged, "{context}");
+        assert_eq!(lease.phase, "failed_before_admission", "{context}");
+        assert!(lease.identity.remote_build_id.is_none(), "{context}");
+        assert!(
+            lease.worker_id.is_none() && lease.recovery.is_none(),
+            "{context}"
+        );
+        assert!(
+            lease.exit_code.is_none(),
+            "no remote command ran; {context}"
+        );
+        if expected_exit == 0 {
+            assert_eq!(
+                run.lease_at_local_start.as_ref(),
+                Some(lease),
+                "the lease must retire before local execution starts; {context}"
+            );
+        } else {
+            assert!(run.lease_at_local_start.is_none(), "{context}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_missing_daemon_retires_unadmitted_lease() {
+    assert_unavailable_daemon_retires_unadmitted_lease(FallbackDaemonFixture::Missing);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_non_socket_daemon_path_retires_unadmitted_lease() {
+    assert_unavailable_daemon_retires_unadmitted_lease(FallbackDaemonFixture::NotSocket);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_stale_daemon_retires_unadmitted_lease() {
+    assert_unavailable_daemon_retires_unadmitted_lease(FallbackDaemonFixture::Stale);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_restart_requery_failure_retires_unadmitted_lease() {
+    let run = run_isolated_exec_with_socket(
+        "",
+        true,
+        true,
+        false,
+        &["--", "cargo", "check"],
+        FallbackDaemonFixture::RestartDisappears,
+    );
+    assert!(!run.status.success(), "{}", run.stderr);
+    assert!(!run.local_cargo_ran && !run.ssh_ran, "{}", run.stderr);
+    assert_eq!(run.daemon_requests.len(), 3, "{:?}", run.daemon_requests);
+    assert_eq!(run.job_leases.len(), 1, "{}", run.stderr);
+    let lease = &run.job_leases[0];
+    assert!(lease.terminal_acknowledged, "{lease:?}");
+    assert_eq!(lease.phase, "failed_before_admission");
+    assert!(lease.identity.remote_build_id.is_none() && lease.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_uncertain_selection_retains_lease_without_local_execution() {
+    for require_remote in [false, true] {
+        let run = run_isolated_exec_with_socket(
+            "",
+            true,
+            true,
+            require_remote,
+            &["--", "cargo", "check"],
+            FallbackDaemonFixture::UnconfirmedSelection,
+        );
+        assert!(!run.status.success(), "{}", run.stderr);
+        assert!(!run.local_cargo_ran && !run.ssh_ran, "{}", run.stderr);
+        assert_eq!(run.daemon_requests.len(), 2, "{:?}", run.daemon_requests);
+        assert_eq!(run.job_leases.len(), 1, "{}", run.stderr);
+        let lease = &run.job_leases[0];
+        assert!(!lease.terminal_acknowledged, "{lease:?}");
+        assert_eq!(lease.phase, "selection_unconfirmed");
+        assert!(lease.identity.remote_build_id.is_none() && lease.exit_code.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_transfer_skip_confirms_release_before_local_fallback() {
+    for (allow_local_fallback, require_remote, expected_exit) in [
+        (true, false, 0),
+        (false, false, 1),
+        (true, true, 103),
+        (false, true, 103),
+    ] {
+        // An older daemon can select a worker without supplying the committed
+        // slot count. The native scheduler guard refuses before SSH or source
+        // preparation; the reservation's terminal refusal must then be durable
+        // before the original command can run locally.
+        let run = run_isolated_exec_with_socket(
+            "",
+            allow_local_fallback,
+            true,
+            require_remote,
+            &["--", "make"],
+            FallbackDaemonFixture::TransferSkipped {
+                completion_exit: Some(1),
+            },
+        );
+        assert_eq!(run.status.code(), Some(expected_exit), "{}", run.stderr);
+        assert_eq!(run.local_cargo_ran, expected_exit == 0, "{}", run.stderr);
+        assert!(
+            !run.ssh_ran,
+            "prelaunch refusal contacted SSH: {}",
+            run.stderr
+        );
+        assert_eq!(run.daemon_requests.len(), 4, "{:?}", run.daemon_requests);
+        assert!(run.daemon_requests[2].starts_with("POST /release-worker?"));
+        assert!(run.daemon_requests[3].starts_with("GET /builds/42?"));
+        assert_eq!(run.job_leases.len(), 1, "{}", run.stderr);
+        let lease = &run.job_leases[0];
+        assert!(lease.terminal_acknowledged, "{lease:?}");
+        assert_eq!(lease.phase, "finished");
+        assert_eq!(lease.identity.remote_build_id, Some(42));
+        assert_eq!(lease.worker_id.as_deref(), Some("preflight-worker"));
+        assert_eq!(lease.exit_code, Some(1), "the daemon's prelaunch refusal");
+        if expected_exit == 0 {
+            assert_eq!(run.lease_at_local_start.as_ref(), Some(lease));
+            assert!(run.envelope()["remote_exit_code"].is_null());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_transfer_skip_preserves_cancellation_and_unconfirmed_completion() {
+    for completion_exit in [Some(130), None] {
+        let run = run_isolated_exec_with_socket(
+            "",
+            true,
+            true,
+            false,
+            &["--", "make"],
+            FallbackDaemonFixture::TransferSkipped { completion_exit },
+        );
+        assert!(!run.status.success(), "{}", run.stderr);
+        assert!(!run.local_cargo_ran && !run.ssh_ran, "{}", run.stderr);
+        assert_eq!(run.daemon_requests.len(), 4, "{:?}", run.daemon_requests);
+        assert_eq!(run.job_leases.len(), 1, "{}", run.stderr);
+        let lease = &run.job_leases[0];
+        assert_eq!(lease.identity.remote_build_id, Some(42));
+        assert_eq!(lease.worker_id.as_deref(), Some("preflight-worker"));
+        if let Some(exit_code) = completion_exit {
+            assert_eq!(run.status.code(), Some(exit_code), "{}", run.stderr);
+            assert!(lease.terminal_acknowledged, "{lease:?}");
+            assert_eq!(lease.exit_code, Some(exit_code));
+            assert_eq!(run.envelope()["remote_exit_code"], exit_code);
+        } else {
+            assert!(!lease.terminal_acknowledged, "{lease:?}");
+            assert!(lease.exit_code.is_none(), "{lease:?}");
+        }
     }
 }
 
