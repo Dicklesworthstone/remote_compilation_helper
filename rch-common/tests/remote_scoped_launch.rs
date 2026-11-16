@@ -280,8 +280,8 @@ mod native_result_recovery {
 
     use rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT as PROTOCOL;
 
-    // These tests launch and drain real process groups. Only one supervisor
-    // observation is faulted, after the real leader publishes its result.
+    // These tests launch and drain real process groups. They fault one
+    // observation or kill the group after the real leader publishes its result.
     // The child receives the unchanged production protocol and no test hooks.
     fn alias(source: &str, name: &str, replacement: &str) -> String {
         let declaration = format!("{name}() ");
@@ -303,7 +303,8 @@ rch_policy_select_file() { rch_policy_file=; }
 rch_fixture_fault() {
     [ "$RCH_RESULT_TEST_MODE" != control ] || return 1
     [ ! -e "$RCH_RESULT_TEST_ROOT/injected" ] || return 1
-    if [ "$RCH_RESULT_TEST_MODE" = before-admission ]; then
+    rch_fixture_mode=${RCH_RESULT_TEST_MODE#exited-}
+    if [ "$rch_fixture_mode" = before-admission ]; then
         [ "${__sl_admitted:-0}" = 0 ] && [ -n "${__sl_child_start:-}" ] || return 1
         rch_fixture_attempt=0
         while [ ! -f "$__sl_record" ]; do
@@ -316,7 +317,7 @@ rch_fixture_fault() {
     else
         [ "${__sl_admitted:-0}" = 1 ] || return 1
         rch_fixture_ready="$__sl_control/result"
-        [ "$RCH_RESULT_TEST_MODE" != missing ] || rch_fixture_ready="$RCH_RESULT_TEST_ROOT/started"
+        [ "$rch_fixture_mode" != missing ] || rch_fixture_ready="$RCH_RESULT_TEST_ROOT/started"
         rch_fixture_attempt=0
         while [ ! -f "$rch_fixture_ready" ]; do
             rch_fixture_attempt=$((rch_fixture_attempt + 1))
@@ -325,7 +326,7 @@ rch_fixture_fault() {
         done
     fi
     : > "$RCH_RESULT_TEST_ROOT/injected" || exit 98
-    case "$RCH_RESULT_TEST_MODE" in
+    case "$rch_fixture_mode" in
         wrong-build)
             printf 'RCH_SCOPED_RESULT_V1:4243:%s:%s:0\n' \
                 "$__sl_child" "$__sl_child_start" > "$__sl_control/result";;
@@ -342,12 +343,37 @@ rch_fixture_fault() {
     return 0
 }
 rch_scope_launch_clock() {
-    if [ "$RCH_RESULT_TEST_MODE" != process ] && rch_fixture_fault; then return 1; fi
+    case "$RCH_RESULT_TEST_MODE" in
+        process|exited|exited-*) ;;
+        *) if rch_fixture_fault; then return 1; fi;;
+    esac
     rch_fixture_clock
 }
 rch_scope_launch_process() {
     if [ "$1" = "${__sl_child:-}" ] && [ "$RCH_RESULT_TEST_MODE" = process ] &&
         rch_fixture_fault; then return 2; fi
+    case "$RCH_RESULT_TEST_MODE" in
+        exited|exited-*)
+            if [ "$1" = "${__sl_child:-}" ] && rch_fixture_fault; then
+                # Stop the real group after result publication (or the started
+                # marker for the missing-result control). Recheck the fixture's
+                # leader identity before signalling; observe actual death.
+                rch_fixture_process "$__sl_child" &&
+                    [ "$rch_launch_group" = "$__sl_child" ] &&
+                    [ "$rch_launch_birth" = "$__sl_child_start" ] || exit 98
+                kill -KILL -"$__sl_child" || exit 98
+                rch_fixture_attempt=0
+                while :; do
+                    rch_fixture_process "$__sl_child"
+                    rch_fixture_liveness=$?
+                    [ "$rch_fixture_liveness" != 1 ] || return 1
+                    [ "$rch_fixture_liveness" = 0 ] || exit 98
+                    rch_fixture_attempt=$((rch_fixture_attempt + 1))
+                    [ "$rch_fixture_attempt" -lt 500 ] || exit 98
+                    sleep 0.01 || exit 98
+                done
+            fi;;
+    esac
     rch_fixture_process "$@"
 }
 rch_remote_cancel_loaded() {
@@ -355,7 +381,7 @@ rch_remote_cancel_loaded() {
     rch_fixture_cleanup=$?
     # Simulate unavailable final evidence only after actually draining the
     # owned group, so even the negative control leaves no live fixture work.
-    if [ "$RCH_RESULT_TEST_MODE:$rch_fixture_cleanup" = cleanup:0 ]; then return 44; fi
+    if [ "${RCH_RESULT_TEST_MODE#exited-}:$rch_fixture_cleanup" = cleanup:0 ]; then return 44; fi
     return "$rch_fixture_cleanup"
 }
 exec 3>&2
@@ -363,7 +389,7 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
     /bin/sh -c '
         printf "PAYLOAD_START\n"
         : > "$RCH_RESULT_TEST_ROOT/started"
-        if [ "$RCH_RESULT_TEST_MODE" = missing ]; then sleep 30; fi
+        if [ "${RCH_RESULT_TEST_MODE#exited-}" = missing ]; then sleep 30; fi
         printf "PAYLOAD_DONE\n"
         exit "$RCH_RESULT_TEST_STATUS"
     '
@@ -430,6 +456,80 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
     }
 
     #[test]
+    fn finished_payload_keeps_its_status_after_its_leader_exits() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for status in [0, 37, 101] {
+                let (directory, output) = run(shell, "exited", status);
+                assert_eq!(output.status.code(), Some(status), "{output:?}");
+                assert_eq!(output.stdout, b"PAYLOAD_START\nPAYLOAD_DONE\n");
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(!error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
+                assert!(!error.contains("RCH_RESULT_TEST_DEADLINE"));
+                let result = std::fs::read_to_string(
+                    directory.path().join("receipt.supervisor.v1/result"),
+                )
+                .unwrap();
+                assert!(result.starts_with("RCH_SCOPED_RESULT_V1:4242:"));
+                assert!(result.ends_with(&format!(":{status}\n")));
+            }
+        }
+    }
+
+    #[test]
+    fn exited_leader_cannot_authorize_an_invalid_payload_result() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in [
+                "exited-missing",
+                "exited-wrong-build",
+                "exited-wrong-birth",
+                "exited-malformed",
+                "exited-mode",
+                "exited-hardlink",
+            ] {
+                let (directory, output) = run(shell, mode, 0);
+                assert_eq!(output.status.code(), Some(137), "{mode}: {output:?}");
+                assert_eq!(
+                    output.stdout,
+                    if mode == "exited-missing" {
+                        b"PAYLOAD_START\n".as_slice()
+                    } else {
+                        b"PAYLOAD_START\nPAYLOAD_DONE\n".as_slice()
+                    },
+                    "{mode}: {output:?}",
+                );
+                assert!(
+                    !String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"),
+                    "{mode}: {output:?}",
+                );
+                if mode == "exited-missing" {
+                    assert!(
+                        !directory
+                            .path()
+                            .join("receipt.supervisor.v1/result")
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exited_leader_result_still_requires_cleanup_and_an_intact_record() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in ["exited-record", "exited-cleanup"] {
+                let (directory, output) = run(shell, mode, 0);
+                assert_eq!(output.status.code(), Some(255), "{mode}: {output:?}");
+                assert_eq!(output.stdout, b"PAYLOAD_START\nPAYLOAD_DONE\n");
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
+                assert!(error.contains("reason=exited,admitted=1"));
+                assert!(directory.path().join("receipt.supervisor.v1/result").is_file());
+            }
+        }
+    }
+
+    #[test]
     fn result_recovery_keeps_admission_identity_and_cleanup_requirements() {
         for shell in ["/bin/sh", "/bin/bash"] {
             for mode in [
@@ -470,7 +570,12 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
     #[test]
     fn deadline_and_cancellation_still_override_a_finished_payload() {
         for shell in ["/bin/sh", "/bin/bash"] {
-            for (mode, expected) in [("deadline", 137), ("cancelled", 143)] {
+            for (mode, expected) in [
+                ("deadline", 137),
+                ("cancelled", 143),
+                ("exited-deadline", 137),
+                ("exited-cancelled", 143),
+            ] {
                 let (_, output) = run(shell, mode, 0);
                 assert_eq!(output.status.code(), Some(expected), "{mode}: {output:?}");
                 assert_eq!(output.stdout, b"PAYLOAD_START\nPAYLOAD_DONE\n");
@@ -478,7 +583,7 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
                 assert!(!error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
                 assert_eq!(
                     error.contains("RCH_RESULT_TEST_DEADLINE"),
-                    mode == "deadline"
+                    matches!(mode, "deadline" | "exited-deadline")
                 );
             }
         }

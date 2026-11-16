@@ -525,7 +525,12 @@ RCH_SCOPED_COMPLETION_DETAIL:reason=$__sl_reason,admitted=$__sl_admitted,cleanup
 RCH_SCOPED_COMPLETION_DETAIL:reason=unknown,admitted=$__sl_admitted,cleanup=0,record=0"
             return 255;;
         exited)
-            if [ "$__sl_admitted" = 1 ]; then return "$__sl_wait"; fi;;
+            if [ "$__sl_admitted" = 1 ]; then
+                # The leader can exit after atomically publishing its result.
+                # Cleanup and record validation above still gate completion.
+                if rch_scope_launch_read_result; then return "$__sl_status"; fi
+                return "$__sl_wait"
+            fi;;
     esac
     rch_scope_launch_message "$__sl_marker" setup
     return 125
