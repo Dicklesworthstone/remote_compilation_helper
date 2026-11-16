@@ -166,8 +166,10 @@ fn remote_cancellation_required(record: &CancellationRecord) -> bool {
 /// remote source or a process record. Every real Unix execution route persists
 /// a nonempty source-recovery intent before transfer or launch; Windows does
 /// not, and heartbeats alone are best effort. Bind the original Unix endpoint
-/// and the existing, unclaimed client journal to this exact native process and
-/// build. Missing, replaced, malformed, or source-owning evidence is not proof.
+/// and the existing client journal to this exact native process and wrapper.
+/// Admission may still be awaiting the client's durable acknowledgement;
+/// otherwise the journal must name this exact build and worker. Missing,
+/// mismatched, malformed, or source-owning evidence is not proof.
 fn provably_unlaunched_before_sync(
     build: &crate::history::ActiveBuildState,
     lease_dir: &std::path::Path,
@@ -215,14 +217,31 @@ fn provably_unlaunched_before_sync(
     let Ok(lease) = serde_json::from_slice::<DurableJobLease>(&bytes) else {
         return false;
     };
+    // The daemon persists admission before the client can acknowledge its
+    // build/worker pair. A wrapper that dies in that handoff still has its
+    // pre-admission journal. Retries publish these no-id states only after
+    // the previous reservation and source ownership have been released.
+    let admission_matches = match (lease.identity.remote_build_id, lease.worker_id.as_deref()) {
+        (Some(build_id), Some(worker_id)) => {
+            build_id == build.id
+                && worker_id == build.worker_id.as_str()
+                && lease.state == JobLifecycleState::Running
+                && lease.phase == "sync_up"
+        }
+        (None, None) => {
+            lease.state == JobLifecycleState::Queued
+                && matches!(
+                    lease.phase.as_str(),
+                    "admission" | "selection_pending" | "selection_unconfirmed"
+                )
+        }
+        _ => false,
+    };
     lease.schema_version == 1
         && lease.identity.local_wrapper_id == wrapper
-        && lease.identity.remote_build_id == Some(build.id)
-        && lease.worker_id.as_deref() == Some(build.worker_id.as_str())
         && lease.wrapper_pid == build.hook_pid
         && lease.owner_identity().as_ref() == Some(&identity)
-        && lease.state == JobLifecycleState::Running
-        && lease.phase == "sync_up"
+        && admission_matches
         && !lease.terminal_acknowledged
         && lease.exit_code.is_none()
         && lease.recovery.is_none()
@@ -2655,7 +2674,16 @@ wait
         use rch_common::job_identity::{DurableJobLease, JobIdentity};
 
         for reason in [CancelReason::User, CancelReason::StuckDetector] {
-            for force in [false, true] {
+            for (phase, force) in [
+                ("sync_up", false),
+                ("sync_up", true),
+                ("admission", false),
+                ("admission", true),
+                ("selection_pending", false),
+                ("selection_pending", true),
+                ("selection_unconfirmed", false),
+                ("selection_unconfirmed", true),
+            ] {
                 let pool = WorkerPool::new();
                 let config = rch_common::WorkerConfig {
                     id: WorkerId::new("pre-sync-worker"),
@@ -2697,25 +2725,42 @@ wait
                     )
                     .unwrap()
                     .unwrap();
-                lease.admit(active.id, config.id.to_string(), 1);
+                if phase == "sync_up" {
+                    lease.admit(active.id, config.id.to_string(), 1);
+                } else {
+                    // The server committed admission, but the client died
+                    // before writing the selected build/worker to its journal.
+                    lease.phase = phase.to_string();
+                }
                 lease.process_birth = active
                     .hook_process_identity
                     .as_deref()
                     .and_then(rch_common::process_identity::ProcessIdentity::from_record);
-                let heartbeat = history.record_build_heartbeat(rch_common::BuildHeartbeatRequest {
-                    build_id: active.id,
-                    worker_id: config.id.clone(),
-                    hook_pid: Some(wrapper.id()),
-                    local_wrapper_id: Some(identity.local_wrapper_id.clone()),
-                    remote_pgid_file: None,
-                    phase: rch_common::BuildHeartbeatPhase::SyncUp,
-                    detail: Some("source_validation".into()),
-                    progress_counter: None,
-                    progress_percent: None,
-                });
+                let heartbeat_accepted = if phase == "sync_up" {
+                    history
+                        .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                            build_id: active.id,
+                            worker_id: config.id.clone(),
+                            hook_pid: Some(wrapper.id()),
+                            local_wrapper_id: Some(identity.local_wrapper_id.clone()),
+                            remote_pgid_file: None,
+                            phase: rch_common::BuildHeartbeatPhase::SyncUp,
+                            detail: Some("source_validation".into()),
+                            progress_counter: None,
+                            progress_percent: None,
+                        })
+                        .is_some()
+                } else {
+                    true
+                };
                 wrapper.kill().unwrap();
                 wrapper.wait().unwrap();
-                assert!(heartbeat.is_some(), "the first heartbeat was accepted");
+                assert!(heartbeat_accepted, "the requested heartbeat was accepted");
+                assert_eq!(
+                    history.active_build(active.id).unwrap().heartbeat_count,
+                    if phase == "sync_up" { 1 } else { 0 },
+                    "unacknowledged admission must be tested before its first heartbeat"
+                );
                 assert!(
                     lease.process_birth.is_some(),
                     "native wrapper birth recorded"
@@ -2740,6 +2785,10 @@ wait
                     "wrapper",
                     "build",
                     "worker",
+                    "partial build",
+                    "partial worker",
+                    "state",
+                    "restart wait",
                     "pid",
                     "birth",
                     "schema",
@@ -2756,6 +2805,22 @@ wait
                         }
                         "build" => replaced.identity.remote_build_id = Some(active.id + 1),
                         "worker" => replaced.worker_id = Some("other-worker".into()),
+                        "partial build" => {
+                            replaced.identity.remote_build_id = Some(active.id);
+                            replaced.worker_id = None;
+                        }
+                        "partial worker" => {
+                            replaced.identity.remote_build_id = None;
+                            replaced.worker_id = Some(config.id.to_string());
+                        }
+                        "state" => {
+                            replaced.state = if phase == "sync_up" {
+                                rch_common::job_identity::JobLifecycleState::Queued
+                            } else {
+                                rch_common::job_identity::JobLifecycleState::Running
+                            };
+                        }
+                        "restart wait" => replaced.phase = "restart_admission_wait".into(),
                         "pid" => replaced.wrapper_pid = std::process::id(),
                         "birth" => {
                             replaced.process_birth.as_mut().unwrap().boot_id =
@@ -2788,7 +2853,7 @@ wait
                 }
                 std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
                 let response = owner.cancel_build(&ctx, active.id, reason, force).await;
-                assert_eq!(response.status, "cancelled", "{response:?}");
+                assert_eq!(response.status, "cancelled", "{phase}: {response:?}");
                 assert_eq!(response.slots_released, 2);
                 assert_eq!(worker.used_slots(), 1, "unrelated capacity stays reserved");
                 assert!(history.active_build(active.id).is_none());
