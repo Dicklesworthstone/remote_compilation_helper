@@ -155,7 +155,7 @@ const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
 
 /// The conservative silence bound for a build that never reported starting
 /// its remote command. Exact pre-sync Unix ownership can be retired sooner;
-/// legacy, Windows, and already-recorded process ownership keep this policy.
+/// unverified, Windows, and already-recorded process ownership keep this policy.
 const ABANDONED_BEFORE_REMOTE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 fn remote_cancellation_required(record: &CancellationRecord) -> bool {

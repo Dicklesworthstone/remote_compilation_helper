@@ -904,6 +904,40 @@ async fn clean_overlay_subdirectory_discovers_only_selected_ancestor_toolchains(
             .rustup_toolchain(),
         parse_channel_string("beta").unwrap().rustup_toolchain()
     );
+    // Execution and previews share precedence: an explicit command selector
+    // wins over the clean base; without one, only the selected tree counts.
+    for (command, expected) in [
+        ("cargo check", "beta"),
+        ("cargo +1.80.0 check", "1.80.0"),
+        (
+            "env RUSTUP_TOOLCHAIN=nightly-2026-08-25 cargo check",
+            "nightly-2026-08-25",
+        ),
+    ] {
+        assert_eq!(
+            resolve_command_toolchain(command, RequiredRuntime::Rust, Some(&root), Some(&spec))
+                .await
+                .unwrap()
+                .unwrap()
+                .rustup_toolchain(),
+            expected,
+            "{command}"
+        );
+    }
+    for (command, runtime) in [
+        ("env -u RUSTUP_TOOLCHAIN cargo check", RequiredRuntime::Rust),
+        ("cargo +--help check", RequiredRuntime::Rust),
+        ("sh -c 'cargo +nightly check'", RequiredRuntime::None),
+        ("go build ./...", RequiredRuntime::Go),
+    ] {
+        assert!(
+            resolve_command_toolchain(command, runtime, Some(&root), Some(&spec))
+                .await
+                .unwrap()
+                .is_none(),
+            "{command} must not borrow the project's Rust toolchain"
+        );
+    }
     // A directory overlay selects its toolchain files too, including the
     // legacy filename whose precedence is the same as rustup's own search.
     std::fs::write(
@@ -18627,13 +18661,20 @@ fn rustup_toolchain_from_command_tokens_parses_env_prefix_and_selector() {
 }
 
 #[test]
-fn rust_and_zig_jobs_require_toolchains_without_reinterpreting_opaque_jobs() {
+fn direct_jobs_require_runtimes_without_reinterpreting_opaque_jobs() {
     for (command, expected) in [
         ("cargo build", RequiredRuntime::Rust),
         ("cargo +nightly clippy", RequiredRuntime::Rust),
         ("cargo zigbuild", RequiredRuntime::Zig),
         ("cargo +nightly zigbuild", RequiredRuntime::Zig),
+        (
+            "env 'LABEL=two words' RUSTUP_TOOLCHAIN=1.81.0 cargo check",
+            RequiredRuntime::Rust,
+        ),
         ("rustc main.rs", RequiredRuntime::Rust),
+        ("bun test", RequiredRuntime::Bun),
+        ("npx tsc --noEmit", RequiredRuntime::Node),
+        ("nix build .#app", RequiredRuntime::Nix),
         ("bash ./build.sh", RequiredRuntime::None),
         ("python3 build.py", RequiredRuntime::None),
         (

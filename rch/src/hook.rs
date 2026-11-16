@@ -889,7 +889,7 @@ fn hook_mode_panic_fail_open_enabled() -> bool {
 /// `sh -c` is a no-op. Some callers pass `rch exec -- "<whole shell command>"`
 /// as a single argv entry; split that shell command once before re-quoting so
 /// `sh -c` sees `env VAR=... cargo ...` instead of one quoted command name.
-fn join_exec_command(command_parts: &[String]) -> String {
+pub(crate) fn join_exec_command(command_parts: &[String]) -> String {
     let mut normalized_parts = normalize_exec_command_parts(command_parts);
     // `shell_words::join` quotes `FOO=1` as a whole word, and a quoted
     // assignment is no longer an assignment: `'FOO=1' cargo test` runs a
@@ -970,10 +970,34 @@ fn env_flag_enabled(value: &str) -> bool {
 /// The rustup toolchain explicitly requested inside a delegated command: an
 /// env-style `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind
 /// `env`) or a higher-priority `cargo +<name>` selector (issues #63, #133).
+#[cfg(test)]
 fn rustup_toolchain_from_command_tokens(
     tokens: &[String],
 ) -> Result<Option<String>, rch_common::UnresolvedCommandToolchain> {
     rch_common::rustup_toolchain_from_command(&join_exec_command(tokens))
+}
+
+/// Keep execution and admission previews on the same Rustup identity. An
+/// explicit command pin outranks the selected source tree, which in turn
+/// outranks the ambient worktree. An opaque command is not evidence that the
+/// ambient toolchain will run, and non-Rust jobs need no Rust preflight.
+pub(crate) async fn resolve_command_toolchain(
+    command: &str,
+    required_runtime: RequiredRuntime,
+    project_root: Option<&Path>,
+    clean_overlay: Option<&CleanOverlaySpec>,
+) -> anyhow::Result<Option<ToolchainInfo>> {
+    if !required_runtime.needs_rust_toolchain() {
+        return Ok(None);
+    }
+    match rch_common::rustup_toolchain_from_command(command) {
+        Ok(Some(name)) => Ok(parse_channel_string(&name).ok()),
+        Ok(None) => match clean_overlay {
+            Some(spec) => detect_clean_overlay_toolchain(&spec.repository_root, spec).await,
+            None => Ok(project_root.and_then(|root| detect_toolchain(root).ok())),
+        },
+        Err(_) => Ok(None),
+    }
 }
 
 /// rchd's select-worker refusal while a restart holds admission closed.
@@ -5208,28 +5232,13 @@ pub async fn run_exec(
     } else {
         required_runtime_for_kind(classification.kind)
     };
-    let needs_rust_toolchain = required_runtime.needs_rust_toolchain();
-    let toolchain = if needs_rust_toolchain {
-        match rustup_toolchain_from_command_tokens(&command_parts) {
-            // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
-            // command outranks the ambient project toolchain (rustup's own
-            // precedence), so preflight and the component gate must check the
-            // toolchain the remote cargo will actually use (issue #63).
-            Ok(Some(name)) => parse_channel_string(&name).ok(),
-            Ok(None) => {
-                if let Some(spec) = clean_overlay_spec.as_ref() {
-                    detect_clean_overlay_toolchain(&spec.repository_root, spec).await?
-                } else {
-                    project_root
-                        .as_ref()
-                        .and_then(|root| detect_toolchain(root).ok())
-                }
-            }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let toolchain = resolve_command_toolchain(
+        &command,
+        required_runtime,
+        project_root.as_deref(),
+        clean_overlay_spec.as_ref(),
+    )
+    .await?;
     let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
         classification.kind,
         project_root.as_deref().unwrap_or_else(|| Path::new(".")),
@@ -7975,19 +7984,14 @@ fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<St
     }
 }
 
-/// Only directly classified Rust jobs inherit Cargo/toolchain admission.
+/// Directly classified jobs retain their runtime capability requirements.
 /// Opaque jobs retain their explicit-tool requirements and original command.
-fn required_runtime_for_job(command: &str) -> RequiredRuntime {
+pub(crate) fn required_runtime_for_job(command: &str) -> RequiredRuntime {
     let classification = classify_command(command);
     if classification.command_prefix.is_some() {
         return RequiredRuntime::None;
     }
-    let runtime = required_runtime_for_kind(classification.kind);
-    if runtime.needs_rust_toolchain() {
-        runtime
-    } else {
-        RequiredRuntime::None
-    }
+    required_runtime_for_kind(classification.kind)
 }
 
 /// Map a classification kind to required runtime.

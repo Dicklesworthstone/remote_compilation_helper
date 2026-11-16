@@ -7,14 +7,14 @@ mod load;
 
 use crate::hook::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers, query_admission_preview, query_daemon_dry_run, required_runtime_for_kind,
+    preferred_workers, query_admission_preview, query_daemon_dry_run, required_runtime_for_job,
+    required_runtime_for_kind, resolve_command_toolchain,
 };
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
     SelfTestResultRecordFromApi, SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi,
     WorkerStatusFromApi, extract_json_body,
 };
-use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::{StatusIndicator, Theme};
@@ -673,10 +673,15 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 .ok()
         });
         let project = extract_project_name_with_policy(&topology_policy);
-        let toolchain = project_root
-            .as_ref()
-            .or(normalized_project_root.as_ref())
-            .and_then(|root| detect_toolchain(root).ok());
+        let toolchain = resolve_command_toolchain(
+            command,
+            required_runtime,
+            project_root
+                .as_deref()
+                .or(normalized_project_root.as_deref()),
+            None,
+        )
+        .await?;
         let preferred_workers = preferred_workers(); // env + project .rch/config.toml [routing]
 
         // A dry run: a real selection opens a durable build, and releasing it
@@ -1469,10 +1474,20 @@ pub async fn admit(
                     .map(|normalized| normalized.canonical_path().to_path_buf())
                     .ok()
             });
-            let toolchain = project_root
-                .as_ref()
-                .or(normalized_project_root.as_ref())
-                .and_then(|root| detect_toolchain(root).ok());
+            let required_runtime = if job {
+                required_runtime_for_job(command)
+            } else {
+                required_runtime_for_kind(kind)
+            };
+            let toolchain = resolve_command_toolchain(
+                command,
+                required_runtime,
+                project_root
+                    .as_deref()
+                    .or(normalized_project_root.as_deref()),
+                None,
+            )
+            .await?;
             let request = rch_common::admission_preview::PreviewRequest {
                 protocol_version: rch_common::admission_preview::PROTOCOL_VERSION,
                 project,
@@ -1481,7 +1496,7 @@ pub async fn admit(
                 disk_headroom_gib: config.compilation.disk_headroom_gib,
                 preferred_workers: preferred_workers(),
                 toolchain,
-                required_runtime: required_runtime_for_kind(kind),
+                required_runtime,
                 job_mode: job,
                 required_tools: pf.required.needs_tools.clone(),
                 source_topology: Some(

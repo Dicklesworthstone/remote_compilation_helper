@@ -2,6 +2,271 @@ use std::process::Command;
 
 use super::common::{assert_contains, init_test_logging};
 
+/// Exercise the real CLI and Unix-socket requests against a refusing protocol
+/// fixture. No worker is admitted and the compiler sentinel never builds.
+#[cfg(unix)]
+#[test]
+fn execution_diagnose_and_admit_use_the_same_command_toolchain() {
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct Server {
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    // Keep the socket short even under a managed worker's long TMPDIR.
+    let root = tempfile::Builder::new()
+        .prefix("rch-pin-")
+        .disable_cleanup(true)
+        .tempdir_in("/tmp")
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    for path in ["home", "bin", "config", "state", "projects/app/src"] {
+        std::fs::create_dir_all(base.join(path)).unwrap();
+    }
+    let project = base.join("projects/app");
+    symlink(base.join("projects"), base.join("alias")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"pinprobe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        project.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.85.0\"\n",
+    )
+    .unwrap();
+    let socket = base.join("d.sock");
+    std::fs::write(
+        base.join("config/config.toml"),
+        format!(
+            "[general]\nsocket_path = {:?}\nforce_remote = true\n\
+             [self_healing]\nhook_starts_daemon = false\n\
+             [compilation]\nallow_local_fallback = false\nlocal_slots = 0\n\
+             [path_topology]\ncanonical_root = {:?}\nalias_root = {:?}\n",
+            socket.to_str().unwrap(),
+            base.join("projects").to_str().unwrap(),
+            base.join("alias").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(base.join("config/workers.toml"), "workers = []\n").unwrap();
+    for (name, script) in [
+        (
+            "cargo",
+            "#!/bin/sh\ncase \"${1-}\" in --version|-V) echo 'cargo 1.85.0'; exit 0;; metadata) exit 101;; esac\nprintf 'unexpected build\\n' > \"$HOME/build-ran\"\nexit 99\n",
+        ),
+        (
+            "rustup",
+            "#!/bin/sh\nif [ \"$*\" = show ]; then printf 'active toolchain\\n----------------\\nname: 1.85.0-x86_64-unknown-linux-gnu\\nactive because: overridden by rust-toolchain.toml\\n'; exit 0; fi\nexit 1\n",
+        ),
+        (
+            "rustc",
+            "#!/bin/sh\nprintf 'rustc 1.85.0 (fixture 2025-02-20)\\n'\n",
+        ),
+    ] {
+        let path = base.join("bin").join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let observed = Arc::clone(&requests);
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let _server = Server {
+        stop,
+        thread: Some(thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept fixture connection: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() {
+                    continue;
+                }
+                let route = line.trim_end();
+                if let Some((path, query)) = route.split_once('?') {
+                    let parameters: BTreeMap<_, _> = query
+                        .split('&')
+                        .map(|pair| {
+                            let (key, value) = pair.split_once('=').unwrap();
+                            (key, urlencoding::decode(value).unwrap().into_owned())
+                        })
+                        .collect();
+                    let request = if path == "GET /admission-preview" {
+                        serde_json::from_str::<Value>(&parameters["request"]).unwrap()
+                    } else if path == "GET /select-worker" {
+                        json!({
+                            "toolchain": parameters.get("toolchain").map(|value| serde_json::from_str::<Value>(value).unwrap()),
+                        })
+                    } else {
+                        Value::Null
+                    };
+                    if !request.is_null() {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push((path.into(), request["toolchain"].clone()));
+                    }
+                }
+                let (status, body) = if route == "GET /health" {
+                    (
+                        "200 OK",
+                        "{\"status\":\"healthy\",\"version\":\"fixture\",\"uptime_seconds\":1}",
+                    )
+                } else {
+                    (
+                        "503 Unavailable",
+                        "{\"error\":\"fixture refuses every admission\"}",
+                    )
+                };
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        })),
+    };
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["cargo", "+1.80.0", "check"], "1.80.0"),
+        (
+            &[
+                "env",
+                "RUSTUP_TOOLCHAIN=beta",
+                "cargo",
+                "+nightly-2026-08-25",
+                "clippy",
+            ],
+            "nightly-2026-08-25",
+        ),
+        (
+            &[
+                "env",
+                "LABEL=two words",
+                "RUSTUP_TOOLCHAIN=1.81.0",
+                "cargo",
+                "check",
+            ],
+            "1.81.0",
+        ),
+        (&["cargo", "check"], "1.85.0"),
+    ];
+    for (case, (arguments, expected)) in cases.iter().enumerate() {
+        for (mode, subcommand) in [
+            &["exec"][..],
+            &["diagnose"],
+            &["admit"],
+            &["exec", "--job"],
+            &["admit", "--job"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            requests.lock().unwrap().clear();
+            let stdout = base.join(format!("{case}-{mode}.stdout"));
+            let stderr = base.join(format!("{case}-{mode}.stderr"));
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rch"))
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", base.join("bin").display()),
+                )
+                .env("HOME", base.join("home"))
+                .env("RCH_CONFIG_DIR", base.join("config"))
+                .env("RCH_STATE_HOME", base.join("state"))
+                .env("XDG_STATE_HOME", base.join("state"))
+                .env("XDG_CACHE_HOME", base.join("state"))
+                .env("RCH_SOCKET_PATH", &socket)
+                .env("RCH_REQUIRE_REMOTE", "1")
+                .env("RCH_NO_UPDATE_CHECK", "1")
+                .env("RCH_NO_SELF_HEALING", "1")
+                .current_dir(&project)
+                .args(["--no-self-healing", "--json", "--format=json"])
+                .args(subcommand)
+                .arg("--")
+                .args(*arguments)
+                .stdout(std::fs::File::create_new(&stdout).unwrap())
+                .stderr(std::fs::File::create_new(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if Instant::now() >= until {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("CLI request timed out: {subcommand:?} {arguments:?}");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let observed = requests.lock().unwrap();
+            assert!(
+                !observed.is_empty(),
+                "no admission request for {subcommand:?} {arguments:?}: stdout={} stderr={}",
+                std::fs::read_to_string(&stdout).unwrap(),
+                std::fs::read_to_string(&stderr).unwrap(),
+            );
+            for (route, toolchain) in observed.iter() {
+                assert_eq!(
+                    route,
+                    if subcommand[0] == "admit" {
+                        "GET /admission-preview"
+                    } else {
+                        "GET /select-worker"
+                    },
+                );
+                let toolchain: rch_common::ToolchainInfo =
+                    serde_json::from_value(toolchain.clone()).unwrap();
+                assert_eq!(
+                    toolchain.rustup_toolchain(),
+                    *expected,
+                    "{subcommand:?} {arguments:?}",
+                );
+            }
+            assert!(
+                !base.join("home/build-ran").exists(),
+                "local compiler executed"
+            );
+        }
+    }
+}
+
 /// Actual CLI exits and IPC, with explicitly local SSH transport fixtures.
 /// Each worker has real, separate paths and executes the compiled namespace
 /// registry, path validator and admission retry script. This is not a live SSH

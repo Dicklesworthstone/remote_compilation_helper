@@ -4313,7 +4313,7 @@ async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> 
 }
 
 async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContext) -> Result<()> {
-    let joined = command.join(" ");
+    let joined = hook::join_exec_command(&command);
     commands::diagnose(&joined, dry_run, ctx).await?;
     Ok(())
 }
@@ -4324,7 +4324,7 @@ async fn handle_admit(
     command: Vec<String>,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let joined = command.join(" ");
+    let joined = hook::join_exec_command(&command);
     commands::admit(&joined, job, require_tool, ctx).await
 }
 
