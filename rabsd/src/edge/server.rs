@@ -274,13 +274,45 @@ pub struct EdgeServerConfig {
 /// quotes a path or an OS error with backslashes or newlines stays one
 /// parseable line instead of silently dropping out of the decision trail.
 pub(crate) fn log_line(kind: &str, fields: &[(&str, &str)]) {
-    write_log_line(std::io::stderr().lock(), &render_log_line(kind, fields))
-        .expect("write RABS diagnostic to stderr");
+    report_log_line(&render_log_line(kind, fields));
 }
 
 fn log_json_line(value: &serde_json::Value) {
-    write_log_line(std::io::stderr().lock(), &value.to_string())
-        .expect("write RABS diagnostic to stderr");
+    report_log_line(&value.to_string());
+}
+
+#[cfg(target_os = "linux")]
+static DIAGNOSTIC_OUTPUT: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "linux")]
+pub(crate) fn write_bounded_log_line(
+    output: &impl std::os::fd::AsFd,
+    line: &str,
+) -> std::io::Result<()> {
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let output = crate::controlled_output::ControlledOutput::new(
+        output,
+        &stopped,
+        std::time::Instant::now() + Duration::from_millis(100),
+    )?;
+    write_log_line(output, line)
+}
+
+/// On Linux, a stopped pipe/socket log consumer cannot retain an admission,
+/// endpoint lease or runtime worker. Serialize without waiting on stdio or
+/// another notice; the normal framed record is best effort within one budget.
+pub(crate) fn report_log_line(line: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(_writer) = DIAGNOSTIC_OUTPUT.try_lock() else {
+            return;
+        };
+        let _ = write_bounded_log_line(&std::io::stderr(), line);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = write_log_line(std::io::stderr().lock(), line);
+    }
 }
 
 pub(crate) fn write_log_line(mut output: impl std::io::Write, line: &str) -> std::io::Result<()> {
@@ -1800,6 +1832,9 @@ mod edge_liveness_tests {
         // these records after a foreign writer's incomplete line.
         let legacy = collect(|output, line| writeln!(output, "{line}"));
         assert!(legacy.is_empty());
+        #[cfg(target_os = "linux")]
+        let current = collect(|output, line| write_bounded_log_line(output, line));
+        #[cfg(not(target_os = "linux"))]
         let current = collect(|output, line| write_log_line(output, line));
         assert_eq!(current.len(), RECORDS);
         for (sequence, event) in current.iter().enumerate() {

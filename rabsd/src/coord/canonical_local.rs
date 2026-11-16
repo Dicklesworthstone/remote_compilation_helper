@@ -27,6 +27,7 @@ use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::{CanonicalPaths, CommittedOutputExportError};
 use super::live_dependency::remote::{RemoteDependencies, SharedRemoteExecutions};
 use super::source_delivery::control::{PreparationControl, PreparationRootGuard};
+use crate::controlled_output::ControlledOutput;
 use crate::edge::live_facts::{FileSig, read_stable};
 use crate::edge::server::{
     CanonicalActivity, EdgeServerConfig, canonical_edge_work, canonical_edge_work_shared,
@@ -63,6 +64,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{
     DirBuilderExt, FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
@@ -84,6 +86,20 @@ const TARGET: &str = "/__rabs/out/cargo";
 const WRAPPER: &str = "/__rabs/home/control/rabs-wrap";
 const SOCKET: &str = "/__rabs/home/control/rustc.sock";
 const MAX_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Report a final canonical CLI error without re-entering a blocked caller
+/// sink after the operation has already drained. The caller keeps its error
+/// exit code whether or not stderr accepts this best-effort diagnostic.
+pub fn report_cli_error(message: std::fmt::Arguments<'_>) {
+    let stopped = AtomicBool::new(false);
+    if let Ok(mut stderr) = ControlledOutput::new(
+        &io::stderr(),
+        &stopped,
+        Instant::now() + Duration::from_millis(100),
+    ) {
+        let _ = writeln!(stderr, "{message}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
 enum SourceSelection {
@@ -607,8 +623,11 @@ impl Drop for RootAdmission {
 
 /// Compiler output and driver events belong to one caller. The service path
 /// never inherits the daemon's stdio, and its files have one aggregate bound.
-enum OperationOutput {
-    Inherit,
+enum OperationOutput<'a> {
+    Inherit {
+        stdout: ControlledOutput<'a>,
+        stderr: ControlledOutput<'a>,
+    },
     Captured {
         stdout: File,
         stderr: File,
@@ -625,7 +644,22 @@ enum ProfileStdin<'a> {
     Captured(&'a str),
 }
 
-impl OperationOutput {
+impl<'a> OperationOutput<'a> {
+    fn inherited(
+        stdout: &impl AsFd,
+        stderr: &impl AsFd,
+        stopped: &'a AtomicBool,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        // Capture the caller's descriptors before any source preparation or
+        // execution. Only driver diagnostics use these bounded writers; Cargo
+        // still inherits its original streams under process-group supervision.
+        Ok(Self::Inherit {
+            stdout: ControlledOutput::new(stdout, stopped, deadline)?,
+            stderr: ControlledOutput::new(stderr, stopped, deadline)?,
+        })
+    }
+
     fn captured(stdout: File, stderr: File, maximum: u64) -> io::Result<Self> {
         let first = stdout.metadata()?;
         let second = stderr.metadata()?;
@@ -670,7 +704,7 @@ impl OperationOutput {
     fn line(&mut self, line: &str) -> io::Result<()> {
         self.reserve((line.len() as u64).saturating_add(1))?;
         match self {
-            Self::Inherit => writeln!(io::stderr().lock(), "{line}"),
+            Self::Inherit { stderr, .. } => writeln!(stderr, "{line}"),
             Self::Captured { stderr, .. } => writeln!(stderr, "{line}"),
         }
     }
@@ -692,7 +726,12 @@ impl OperationOutput {
             .ok_or_else(|| invalid("canonical diagnostic length overflow"))?;
         self.reserve(bytes)?;
         match self {
-            Self::Inherit => replay(output),
+            Self::Inherit { stdout, stderr } => {
+                io::copy(&mut output.stdout.reader()?, stdout)?;
+                io::copy(&mut output.stderr.reader()?, stderr)?;
+                stdout.flush()?;
+                stderr.flush()
+            }
             Self::Captured { stdout, stderr, .. } => {
                 io::copy(&mut output.stdout.reader()?, stdout)?;
                 io::copy(&mut output.stderr.reader()?, stderr)?;
@@ -704,7 +743,7 @@ impl OperationOutput {
 
     fn cargo_output(&self, directory: PathBuf, inherit_stdin: bool) -> io::Result<CargoOutput> {
         Ok(match self {
-            Self::Inherit => CargoOutput::Inherit { inherit_stdin },
+            Self::Inherit { .. } => CargoOutput::Inherit { inherit_stdin },
             Self::Captured {
                 stdout,
                 stderr,
@@ -721,6 +760,17 @@ impl OperationOutput {
 }
 
 impl Profile {
+    fn client_deadline(&self) -> io::Result<Instant> {
+        // Admission may wait for one operation budget, followed by bounded
+        // Cargo planning and execution. Capture and final drain keep the same
+        // finite allowance as the local service protocol.
+        let budget =
+            Duration::from_secs(self.timeout_seconds.saturating_mul(4).saturating_add(600));
+        Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| invalid("canonical client deadline overflow"))
+    }
+
     fn validate_logical(&self) -> io::Result<()> {
         require(
             self.version == PROFILE_VERSION,
@@ -1055,7 +1105,7 @@ fn resolve_run_selection(
     timeout: Duration,
     stopped: &AtomicBool,
     shared: Option<&SharedRuntime>,
-    destination: &mut OperationOutput,
+    destination: &mut OperationOutput<'_>,
 ) -> io::Result<CompilationSelection> {
     let selection = profile.selection.clone().unwrap_or_default();
     if !selection.bin.is_empty() || !selection.example.is_empty() {
@@ -1210,13 +1260,19 @@ pub fn run_profile_with_release(
         return service::run_client_profile(path, release_mode, build_identity);
     }
     let cancellation = OperationCancellation::start()?;
+    let output = OperationOutput::inherited(
+        &io::stdout(),
+        &io::stderr(),
+        &cancellation.stopped,
+        profile.client_deadline()?,
+    )?;
     run_operation(
         profile,
         release_mode,
         build_identity,
         None,
         Arc::clone(&cancellation.stopped),
-        OperationOutput::Inherit,
+        output,
         None,
     )
     .map(|outcome| outcome.exit_code)
@@ -1287,7 +1343,7 @@ fn run_operation(
     build_identity: String,
     shared: Option<Arc<SharedRuntime>>,
     stopped: Arc<AtomicBool>,
-    mut output: OperationOutput,
+    mut output: OperationOutput<'_>,
     prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
 ) -> io::Result<OperationOutcome> {
     let remote_operation = prepared_inputs.is_some();
@@ -2365,7 +2421,7 @@ fn execute_controlled(
     timeout: Duration,
     stopped: &AtomicBool,
     shared: Option<&SharedRuntime>,
-    destination: &mut OperationOutput,
+    destination: &mut OperationOutput<'_>,
 ) -> io::Result<DrainedOutput> {
     require(
         !matches!(&output, CargoOutput::Capture { .. }) || captured_stdin.is_none(),
@@ -2506,12 +2562,6 @@ fn execute_controlled(
         })?;
     }
     Ok(output)
-}
-
-fn replay(output: &DrainedOutput) -> io::Result<()> {
-    io::copy(&mut output.stdout.reader()?, &mut io::stdout().lock())?;
-    io::copy(&mut output.stderr.reader()?, &mut io::stderr().lock())?;
-    Ok(())
 }
 
 fn coordinator_work(coord: Arc<CoordLive>) -> SubsystemWork {
@@ -3417,10 +3467,19 @@ mod tests {
             // compiler preparation request does not claim captured stdin or
             // authority to reuse an executed program's result.
             assert_eq!(profile.source_specification().unwrap(), request);
+            let stopped = AtomicBool::new(false);
+            let stdout = tempfile::tempfile().unwrap();
+            let stderr = tempfile::tempfile().unwrap();
             assert!(matches!(
-                OperationOutput::Inherit
-                    .cargo_output(PathBuf::new(), profile.inherits_stdin().unwrap())
-                    .unwrap(),
+                OperationOutput::inherited(
+                    &stdout,
+                    &stderr,
+                    &stopped,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+                .cargo_output(PathBuf::new(), profile.inherits_stdin().unwrap())
+                .unwrap(),
                 CargoOutput::Inherit {
                     inherit_stdin: false
                 },
@@ -4391,6 +4450,245 @@ fn consume_current_input() {
             before
         );
         assert_eq!(fs::metadata(owner.path().join("stdout")).unwrap().len(), 0);
+    }
+
+    fn captured_driver_diagnostics(owner: &Path) -> DrainedOutput {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'stdout\\000\\377'; printf 'stderr\\000\\376' >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let process = ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap();
+        let output = process
+            .wait_with_bounded_drain_budget(
+                &DrainLimits {
+                    resident_bound: 2,
+                    spill_dir: owner.join("diagnostics"),
+                },
+                1024,
+                || false,
+            )
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.residual_group_members, 0);
+        assert!(output.stdout.spilled_bytes() > 0);
+        assert!(output.stderr.spilled_bytes() > 0);
+        output
+    }
+
+    fn full_diagnostic_pipe() -> (std::os::fd::OwnedFd, File) {
+        let (reader, writer) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+        )
+        .unwrap();
+        let bytes = [0x5a; 4096];
+        loop {
+            match rustix::io::write(&writer, &bytes) {
+                Ok(count) => assert!(count > 0),
+                Err(rustix::io::Errno::AGAIN) => break,
+                result => panic!("unexpected caller-pipe fill: {result:?}"),
+            }
+        }
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        rustix::fs::fcntl_setfl(&writer, flags & !rustix::fs::OFlags::NONBLOCK).unwrap();
+        (reader, File::from(writer))
+    }
+
+    #[test]
+    fn inherited_diagnostic_replay_keeps_spilled_bytes_and_original_file_offsets() {
+        let owner = crate::test_util::private_tempdir();
+        let captured = captured_driver_diagnostics(owner.path());
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        stdout.write_all(b"before-").unwrap();
+        stderr.write_all(b"prior-").unwrap();
+        let stopped = AtomicBool::new(false);
+        let mut output = OperationOutput::inherited(
+            &stdout,
+            &stderr,
+            &stopped,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        output.replay(&captured).unwrap();
+        stdout.write_all(b"-after").unwrap();
+        stderr.write_all(b"-after").unwrap();
+        let mut bytes = vec![0; stdout.metadata().unwrap().len() as usize];
+        stdout.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, b"before-stdout\0\xff-after");
+        bytes.resize(stderr.metadata().unwrap().len() as usize, 0);
+        stderr.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, b"prior-stderr\0\xfe-after");
+    }
+
+    #[test]
+    fn inherited_diagnostic_backpressure_releases_state_after_cancellation_or_deadline() {
+        for replay in [false, true] {
+            for cancel in [false, true] {
+                let owner = crate::test_util::private_tempdir();
+                let captured = captured_driver_diagnostics(owner.path());
+                let state = StateOwner::acquire(owner.path()).unwrap();
+                let (_reader, writer) = full_diagnostic_pipe();
+                let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+                let stdout = if replay {
+                    writer.try_clone().unwrap()
+                } else {
+                    tempfile::tempfile().unwrap()
+                };
+                let stderr = if replay {
+                    tempfile::tempfile().unwrap()
+                } else {
+                    writer.try_clone().unwrap()
+                };
+                let stopped = Arc::new(AtomicBool::new(false));
+                let child_stopped = Arc::clone(&stopped);
+                let (ready, started) = std::sync::mpsc::channel();
+                let (finished, result) = std::sync::mpsc::channel();
+                let child = std::thread::spawn(move || {
+                    let _state = state;
+                    let deadline = Instant::now()
+                        + if cancel {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::from_millis(500)
+                        };
+                    let mut output =
+                        OperationOutput::inherited(&stdout, &stderr, &child_stopped, deadline)
+                            .unwrap();
+                    ready.send(()).unwrap();
+                    let outcome = if replay {
+                        output.replay(&captured)
+                    } else {
+                        output.event(json!({"kind":"canonical-driver-diagnostic"}))
+                    };
+                    finished.send(outcome).unwrap();
+                });
+                started.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(StateOwner::acquire(owner.path()).is_err());
+                assert!(matches!(
+                    result.recv_timeout(Duration::from_millis(75)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                ));
+                if cancel {
+                    stopped.store(true, Ordering::Release);
+                }
+                assert_eq!(
+                    result
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("driver output must not strand the operation owner")
+                        .unwrap_err()
+                        .kind(),
+                    if cancel {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::TimedOut
+                    },
+                );
+                child.join().unwrap();
+                StateOwner::acquire(owner.path()).unwrap();
+                assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_diagnostic_signal_child() {
+        let Some(root) = std::env::var_os("RABS_DIAGNOSTIC_SIGNAL_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let _state = StateOwner::acquire(&root).unwrap();
+        let cancellation = OperationCancellation::start().unwrap();
+        let (_reader, writer) = full_diagnostic_pipe();
+        let mut output = OperationOutput::inherited(
+            &writer,
+            &writer,
+            &cancellation.stopped,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        fs::write(root.join("signal-ready"), b"signal listeners installed").unwrap();
+        assert_eq!(
+            output
+                .event(json!({"kind":"blocked-native-diagnostic"}))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+        fs::write(root.join("signal-observed"), b"cancelled").unwrap();
+    }
+
+    #[test]
+    fn inherited_diagnostic_output_observes_real_sigterm() {
+        // Signals are process-global. Exercise the production bridge in a
+        // dedicated instance of this test binary, never the parallel runner.
+        struct ChildOwner(std::process::Child);
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let root = crate::test_util::private_tempdir();
+        let log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.path().join("child.log"))
+            .unwrap();
+        let mut child = ChildOwner(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "coord::canonical_local::tests::inherited_diagnostic_signal_child",
+                    "--nocapture",
+                ])
+                .env("RABS_DIAGNOSTIC_SIGNAL_TEST_ROOT", root.path())
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !root.path().join("signal-ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "signal child failed to become ready: {}",
+                fs::read_to_string(root.path().join("child.log")).unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(StateOwner::acquire(root.path()).is_err());
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SIGTERM did not release the blocked diagnostic writer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "signal child failed: {}",
+            fs::read_to_string(root.path().join("child.log")).unwrap(),
+        );
+        assert_eq!(
+            fs::read(root.path().join("signal-observed")).unwrap(),
+            b"cancelled"
+        );
+        StateOwner::acquire(root.path()).unwrap();
     }
 
     #[test]

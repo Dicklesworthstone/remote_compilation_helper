@@ -8,10 +8,12 @@
 mod wire;
 
 use super::{
-    Profile, SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory,
+    OperationCancellation, Profile, SharedRuntime, ordinary_directory, overlap, plain_absolute,
+    private_directory,
 };
+use crate::controlled_output::ControlledOutput;
 use crate::edge::live_facts::read_stable;
-use crate::edge::server::write_log_line;
+use crate::edge::server::report_log_line;
 use asupersync::signal::ShutdownController;
 use rabs_protocol::canonical_service::{
     Header, Kind, MAX_CHUNK_BYTES, MAX_FAILURE_BYTES, MAX_PROFILE_BYTES, ResponseState,
@@ -36,6 +38,12 @@ const REQUEST_VERSION: &str = "canonical-compile-service-request-v1";
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 const DELIVERY_BUDGET: Duration = Duration::from_secs(120);
 const CARGO_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Administrative logging is best effort. A stopped log consumer must not
+/// block admission, session retirement, or the service's shutdown loop.
+fn report_status(value: Value) {
+    report_log_line(&value.to_string());
+}
 
 fn invalid(detail: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail.into())
@@ -229,9 +237,8 @@ impl Drop for ListenerOwner {
     fn drop(&mut self) {
         self.listener.take();
         if let Err(error) = self.lease.retire_bound() {
-            let _ = write_log_line(
-                io::stderr().lock(),
-                &json!({"kind":"canonical-service-endpoint-retirement-refused","reason":error.to_string()}).to_string(),
+            report_status(
+                json!({"kind":"canonical-service-endpoint-retirement-refused","reason":error.to_string()}),
             );
         }
     }
@@ -327,11 +334,7 @@ impl OperationAdmissions {
                 return Ok(admitted);
             }
             if !reported {
-                let _ = write_log_line(
-                    io::stderr().lock(),
-                    &json!({"kind":"canonical-service-queued", "ticket":waiting.ticket})
-                        .to_string(),
-                );
+                report_status(json!({"kind":"canonical-service-queued", "ticket":waiting.ticket}));
                 reported = true;
             }
             // No capture, Cargo process or root token exists while waiting.
@@ -453,10 +456,8 @@ impl Session {
                 .join()
                 .unwrap_or_else(|_| Err(io::Error::other("canonical service session panicked")));
             if let Err(error) = outcome {
-                let _ = write_log_line(
-                    io::stderr().lock(),
-                    &json!({"kind":"canonical-service-session-error","reason":error.to_string()})
-                        .to_string(),
+                report_status(
+                    json!({"kind":"canonical-service-session-error","reason":error.to_string()}),
                 );
             }
         }
@@ -785,18 +786,14 @@ pub fn run_service_profile(
     let mut sessions = Sessions::default();
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
     let mut sequence = 0_u64;
-    let _ = write_log_line(
-        io::stderr().lock(),
-        &json!({
-            "kind":"canonical-service-listening", "version":SERVICE_VERSION,
-            "socket":config.socket, "max_roots":config.max_roots,
-            "max_queued_roots":config.max_queued_roots,
-            "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
-            "required_release":release_mode == ReleaseAuthorizationMode::Required,
-            "workspace_cache":false
-        })
-        .to_string(),
-    );
+    report_status(json!({
+        "kind":"canonical-service-listening", "version":SERVICE_VERSION,
+        "socket":config.socket, "max_roots":config.max_roots,
+        "max_queued_roots":config.max_queued_roots,
+        "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
+        "required_release":release_mode == ReleaseAuthorizationMode::Required,
+        "workspace_cache":false
+    }));
     let result = loop {
         sessions.reap();
         if shutdown.is_shutting_down() {
@@ -897,8 +894,15 @@ pub fn run_client_profile(
         )
     };
     let identity = socket_identity(socket).map_err(endpoint_error)?;
-    let stopped = AtomicBool::new(false);
-    let mut stream = wire::connect(socket, Instant::now() + HANDSHAKE_BUDGET, &stopped)
+    let cancellation = OperationCancellation::start()?;
+    let stopped = &cancellation.stopped;
+    let deadline = profile.client_deadline()?;
+    // Validate and retain the caller's sinks before submitting a request that
+    // can start Cargo. Backpressure uses the same stop flag and fixed deadline
+    // as socket I/O, without altering the shell's descriptor flags.
+    let mut stdout = ControlledOutput::new(&io::stdout(), stopped, deadline)?;
+    let mut stderr = ControlledOutput::new(&io::stderr(), stopped, deadline)?;
+    let mut stream = wire::connect(socket, Instant::now() + HANDSHAKE_BUDGET, stopped)
         .map_err(endpoint_error)?;
     require(
         socket_identity(socket).map_err(endpoint_error)? == identity,
@@ -909,43 +913,49 @@ pub fn run_client_profile(
         "require_release":release_mode == ReleaseAuthorizationMode::Required,
         "profile":serde_json::from_slice::<Value>(&bytes)?
     });
-    let mut early_refusal = wire::submit(
+    let early_refusal = wire::submit(
         &mut stream,
         &serde_json::to_vec(&request)?,
         Instant::now() + HANDSHAKE_BUDGET,
-        &stopped,
+        stopped,
     )?;
-    // Admission can wait for one operation budget before capture starts.
-    // Planning can then run two bounded Cargo queries before compilation.
-    // Capture and publication drain have an additional finite client allowance.
-    let budget = Duration::from_secs(
-        profile
-            .timeout_seconds
-            .saturating_mul(4)
-            .saturating_add(600),
-    );
-    let deadline = Instant::now()
-        .checked_add(budget)
-        .ok_or_else(|| invalid("canonical service deadline overflow"))?;
+    receive_result(
+        stream,
+        early_refusal,
+        deadline,
+        stopped,
+        &mut stdout,
+        &mut stderr,
+    )
+}
+
+/// Own the connection through presentation so any failed/cancelled sink closes
+/// it immediately. The service then cancels and joins only this operation.
+fn receive_result(
+    mut stream: UnixStream,
+    mut early_refusal: Option<(Header, Vec<u8>)>,
+    deadline: Instant,
+    stopped: &AtomicBool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> io::Result<i32> {
     let mut state = ResponseState::default();
     let mut result = None;
     while !state.is_finished() {
         let (header, payload) = match early_refusal.take() {
             Some(frame) => frame,
-            None => wire::receive(&mut stream, deadline, &stopped)?,
+            None => wire::receive(&mut stream, deadline, stopped)?,
         };
         state.observe(header, &payload).map_err(io::Error::other)?;
         match header.kind() {
             Kind::Accepted => {}
             Kind::Stdout => {
-                let mut output = io::stdout().lock();
-                output.write_all(&payload)?;
-                output.flush()?;
+                stdout.write_all(&payload)?;
+                stdout.flush()?;
             }
             Kind::Stderr => {
-                let mut output = io::stderr().lock();
-                output.write_all(&payload)?;
-                output.flush()?;
+                stderr.write_all(&payload)?;
+                stderr.flush()?;
             }
             Kind::Completed => {
                 let bytes: [u8; 4] = payload
@@ -962,7 +972,11 @@ pub fn run_client_profile(
             Kind::Profile => return Err(invalid("service sent a client profile")),
         }
     }
-    if let Err(error) = wire::expect_eof(&mut stream, Instant::now() + HANDSHAKE_BUDGET, &stopped) {
+    if let Err(error) = wire::expect_eof(
+        &mut stream,
+        deadline.min(Instant::now() + HANDSHAKE_BUDGET),
+        stopped,
+    ) {
         // Closing an unread request after an early refusal can reset AF_UNIX.
         // Keep that failure's reason; a successful result still requires EOF.
         return Err(match result {
@@ -1210,6 +1224,189 @@ mod tests {
             fs::read(root.path().join("stdout")).unwrap(),
             b"already visible"
         );
+    }
+
+    #[test]
+    fn service_client_preserves_native_exit_and_both_binary_streams() {
+        let root = crate::test_util::private_tempdir();
+        let LiveFixture {
+            operation,
+            output,
+            release,
+            stopped: _,
+            finished,
+        } = live_fixture(root.path(), b"compiler\0\xff".to_vec());
+        let (client, mut server) = UnixStream::pair().unwrap();
+        wire::configure(&client).unwrap();
+        wire::configure(&server).unwrap();
+        let relay = std::thread::spawn(move || {
+            wire::send(
+                &mut server,
+                Kind::Accepted,
+                &[],
+                Instant::now() + Duration::from_secs(5),
+                &AtomicBool::new(false),
+            )?;
+            relay_operation(&mut server, operation, output, || true)
+        });
+        release.send(()).unwrap();
+        let stopped = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stdout = tempfile::tempfile().unwrap();
+        let stderr = tempfile::tempfile().unwrap();
+        let code = receive_result(
+            client,
+            None,
+            deadline,
+            &stopped,
+            &mut ControlledOutput::new(&stdout, &stopped, deadline).unwrap(),
+            &mut ControlledOutput::new(&stderr, &stopped, deadline).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(code, 7);
+        relay.join().unwrap().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        let mut bytes = vec![0; stdout.metadata().unwrap().len() as usize];
+        stdout.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, b"compiler\0\xfftail");
+        bytes.resize(stderr.metadata().unwrap().len() as usize, 0);
+        stderr.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, b"warning\0\xffend");
+    }
+
+    fn full_caller_pipe() -> (std::os::fd::OwnedFd, File) {
+        let (reader, writer) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+        )
+        .unwrap();
+        let bytes = [0x5a; 4096];
+        loop {
+            match rustix::io::write(&writer, &bytes) {
+                Ok(count) => assert!(count > 0),
+                Err(rustix::io::Errno::AGAIN) => break,
+                result => panic!("unexpected caller-pipe fill: {result:?}"),
+            }
+        }
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        rustix::fs::fcntl_setfl(&writer, flags & !rustix::fs::OFlags::NONBLOCK).unwrap();
+        (reader, File::from(writer))
+    }
+
+    #[test]
+    fn service_client_backpressure_cancels_and_joins_operation_before_releasing_admission() {
+        for block_stdout in [false, true] {
+            for cancel in [false, true] {
+                let root = crate::test_util::private_tempdir();
+                let LiveFixture {
+                    operation,
+                    output,
+                    release: _release,
+                    stopped: operation_stopped,
+                    finished: operation_finished,
+                } = live_fixture(root.path(), b"visible prefix".to_vec());
+                let admissions = OperationAdmissions::new(1, 1);
+                let admitted = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+                let mut successor = admissions.enqueue().unwrap();
+                let (client, mut server) = UnixStream::pair().unwrap();
+                wire::configure(&client).unwrap();
+                wire::configure(&server).unwrap();
+                let relay = std::thread::spawn(move || {
+                    let _admitted = admitted;
+                    wire::send(
+                        &mut server,
+                        Kind::Accepted,
+                        &[],
+                        Instant::now() + Duration::from_secs(5),
+                        &AtomicBool::new(false),
+                    )?;
+                    relay_operation(&mut server, operation, output, || true)
+                });
+                let (_reader, writer) = full_caller_pipe();
+                let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+                let stdout = if block_stdout {
+                    writer.try_clone().unwrap()
+                } else {
+                    tempfile::tempfile().unwrap()
+                };
+                let stderr = if block_stdout {
+                    tempfile::tempfile().unwrap()
+                } else {
+                    writer.try_clone().unwrap()
+                };
+                let stopped = Arc::new(AtomicBool::new(false));
+                let client_stopped = Arc::clone(&stopped);
+                let (ready, started) = std::sync::mpsc::channel();
+                let (finished, result) = std::sync::mpsc::channel();
+                let caller = std::thread::spawn(move || {
+                    let deadline = Instant::now()
+                        + if cancel {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::from_millis(500)
+                        };
+                    let mut stdout =
+                        ControlledOutput::new(&stdout, &client_stopped, deadline).unwrap();
+                    let mut stderr =
+                        ControlledOutput::new(&stderr, &client_stopped, deadline).unwrap();
+                    ready.send(()).unwrap();
+                    let outcome = receive_result(
+                        client,
+                        None,
+                        deadline,
+                        &client_stopped,
+                        &mut stdout,
+                        &mut stderr,
+                    );
+                    finished.send(outcome).unwrap();
+                });
+                started.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(successor.try_start().unwrap().is_none());
+                assert!(matches!(
+                    result.recv_timeout(Duration::from_millis(75)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                ));
+                if cancel {
+                    stopped.store(true, Ordering::Release);
+                }
+                assert_eq!(
+                    result
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the local service client must retire a blocked caller sink")
+                        .unwrap_err()
+                        .kind(),
+                    if cancel {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::TimedOut
+                    },
+                );
+                caller.join().unwrap();
+                assert!(relay.join().unwrap().is_err());
+                assert!(operation_stopped.load(Ordering::Acquire));
+                assert!(operation_finished.load(Ordering::Acquire));
+                assert_eq!(admissions.state.lock().unwrap().active, 0);
+                drop(successor.try_start().unwrap().unwrap());
+                assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+            }
+        }
+    }
+
+    #[test]
+    fn best_effort_service_notices_cannot_wait_forever_on_a_full_log_pipe() {
+        let (_reader, writer) = full_caller_pipe();
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            crate::edge::server::write_bounded_log_line(
+                &writer,
+                &json!({"kind":"canonical-service-queued","ticket":1}).to_string(),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
     }
 
     #[test]

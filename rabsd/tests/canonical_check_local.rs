@@ -62,6 +62,103 @@ fn canonical_daemon_selection_is_explicit_and_refuses_unusable_paths() {
     }
 }
 
+#[test]
+fn canonical_cli_errors_keep_their_exit_codes_when_stderr_is_blocked() {
+    // Real CLI entry points, no namespace or worker fixture. Exercise
+    // the final error reporter after profile/config/usage failures. A full
+    // caller pipe must not turn any of those terminal errors into a hang.
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(&config, "[rabs]\n").unwrap();
+    let missing = root.path().join("missing-profile.json");
+    let binary = daemon_binary();
+    for mode in [
+        "--canonical-compile-local",
+        "--canonical-compile-service",
+        "--canonical-compile-remote",
+        "--canonical-compile-remote-service",
+    ] {
+        for failure in ["profile", "config", "usage"] {
+            let mut command = Command::new(&binary);
+            command
+                .arg(mode)
+                .env("RABS_CONFIG", &config)
+                .env("RABS_RELEASE_AUTHORIZATION", "advisory")
+                .env("RABS_LIVE_DEPENDENCY", "false")
+                .env("RABS_PREPARED_CONCURRENCY", "1")
+                .env(
+                    "RABS_BUILD_ID",
+                    if failure == "config" {
+                        ""
+                    } else {
+                        "diagnostic-test"
+                    },
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if failure != "usage" {
+                command.arg(&missing);
+            }
+            let (_reader, writer) = rustix::pipe::pipe_with(
+                rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+            )
+            .unwrap();
+            let bytes = [0x5a; 4096];
+            loop {
+                match rustix::io::write(&writer, &bytes) {
+                    Ok(count) => assert!(count > 0),
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    result => panic!("unexpected caller-pipe fill: {result:?}"),
+                }
+            }
+            let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+            rustix::fs::fcntl_setfl(&writer, flags & !rustix::fs::OFlags::NONBLOCK).unwrap();
+            command.stderr(Stdio::from(writer));
+            let process =
+                ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap();
+            let start = Instant::now();
+            let mut timed_out = false;
+            let output = process
+                .wait_with_bounded_drain_budget(
+                    &DrainLimits::new(root.path().join("unused-drain")),
+                    0,
+                    || {
+                        timed_out |= start.elapsed() >= Duration::from_secs(5);
+                        timed_out
+                    },
+                )
+                .unwrap();
+            assert!(
+                !timed_out,
+                "{mode} {failure}: final error blocked on stderr"
+            );
+            assert_eq!(output.residual_group_members, 0);
+            assert_eq!(
+                output.status.code(),
+                Some(if failure == "profile" { 1 } else { 2 }),
+                "{mode} {failure}: the original CLI error code must survive",
+            );
+        }
+    }
+    let output = Command::new(binary)
+        .args(["--canonical-compile-local"])
+        .arg(&missing)
+        .env("RABS_CONFIG", config)
+        .env("RABS_RELEASE_AUTHORIZATION", "advisory")
+        .env("RABS_LIVE_DEPENDENCY", "false")
+        .env("RABS_PREPARED_CONCURRENCY", "1")
+        .env("RABS_BUILD_ID", "diagnostic-test")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .starts_with("rabsd canonical compilation: "),
+        "an available stderr still receives the ordinary error message",
+    );
+}
+
 fn write(root: &Path, relative: &str, bytes: impl AsRef<[u8]>) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -539,7 +636,13 @@ fn cli_refuses_inherited_terminal_input_before_touching_profile_roots() {
         (5, "run", json!({}), Some("inherit"), true),
         (6, "bench", json!({}), Some("inherit"), true),
         (7, "test", json!({}), None, false),
-        (8, "test", json!({"test_args":["--no-run"]}), Some("inherit"), true),
+        (
+            8,
+            "test",
+            json!({"test_args":["--no-run"]}),
+            Some("inherit"),
+            true,
+        ),
         (9, "test", json!({}), Some("closed"), false),
     ] {
         // None of these paths exists. A terminal refusal must happen before

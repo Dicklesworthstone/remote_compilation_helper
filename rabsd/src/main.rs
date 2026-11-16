@@ -228,6 +228,13 @@ fn log_line(kind: &str, fields: &[(&str, &str)]) {
     eprintln!("{line}");
 }
 
+fn report_canonical_error(message: std::fmt::Arguments<'_>) {
+    #[cfg(target_os = "linux")]
+    rabsd::coord::canonical_local::report_cli_error(message);
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("{message}");
+}
+
 /// Gather installation facts and run the doctor. Exit code: 0 ok/warn
 /// (fail-open — a warn must never fail a CI gate that only cares whether
 /// RABS is catastrophically misconfigured), 1 on any Fail check.
@@ -541,7 +548,7 @@ fn main() {
             remote_mode @ ("--canonical-compile-remote-service" | "--canonical-compile-remote"),
         ) => {
             if args.len() != 2 {
-                eprintln!("usage: rabsd {remote_mode} <profile.json>");
+                report_canonical_error(format_args!("usage: rabsd {remote_mode} <profile.json>"));
                 std::process::exit(2);
             }
             #[cfg(target_os = "linux")]
@@ -549,7 +556,7 @@ fn main() {
                 let config = match load_config() {
                     Ok(config) => config,
                     Err(error) => {
-                        eprintln!("rabsd: {error}");
+                        report_canonical_error(format_args!("rabsd: {error}"));
                         std::process::exit(2);
                     }
                 };
@@ -571,7 +578,7 @@ fn main() {
                 let code = match result {
                     Ok(code) => code,
                     Err(error) => {
-                        eprintln!("rabsd {remote_mode}: {error}");
+                        report_canonical_error(format_args!("rabsd {remote_mode}: {error}"));
                         if error.kind() == std::io::ErrorKind::InvalidInput {
                             2
                         } else {
@@ -583,13 +590,15 @@ fn main() {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                eprintln!("rabsd {remote_mode} requires Linux support");
+                report_canonical_error(format_args!("rabsd {remote_mode} requires Linux support"));
                 std::process::exit(2);
             }
         }
         Some("--canonical-compile-service") => {
             if args.len() != 2 {
-                eprintln!("usage: rabsd --canonical-compile-service <service.json>");
+                report_canonical_error(format_args!(
+                    "usage: rabsd --canonical-compile-service <service.json>"
+                ));
                 std::process::exit(2);
             }
             #[cfg(target_os = "linux")]
@@ -597,7 +606,7 @@ fn main() {
                 let config = match load_config() {
                     Ok(config) => config,
                     Err(error) => {
-                        eprintln!("rabsd: {error}");
+                        report_canonical_error(format_args!("rabsd: {error}"));
                         std::process::exit(2);
                     }
                 };
@@ -609,7 +618,7 @@ fn main() {
                 let code = match result {
                     Ok(()) => 0,
                     Err(error) => {
-                        eprintln!("rabsd canonical service: {error}");
+                        report_canonical_error(format_args!("rabsd canonical service: {error}"));
                         if error.kind() == std::io::ErrorKind::InvalidInput {
                             2
                         } else {
@@ -621,13 +630,17 @@ fn main() {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                eprintln!("rabsd canonical service requires Linux namespace support");
+                report_canonical_error(format_args!(
+                    "rabsd canonical service requires Linux namespace support"
+                ));
                 std::process::exit(2);
             }
         }
         Some("--canonical-compile-local") => {
             if args.len() != 2 {
-                eprintln!("usage: rabsd --canonical-compile-local <profile.json>");
+                report_canonical_error(format_args!(
+                    "usage: rabsd --canonical-compile-local <profile.json>"
+                ));
                 std::process::exit(2);
             }
             #[cfg(target_os = "linux")]
@@ -635,7 +648,7 @@ fn main() {
                 let config = match load_config() {
                     Ok(config) => config,
                     Err(error) => {
-                        eprintln!("rabsd: {error}");
+                        report_canonical_error(format_args!("rabsd: {error}"));
                         std::process::exit(2);
                     }
                 };
@@ -647,7 +660,9 @@ fn main() {
                 let code = match result {
                     Ok(code) => code,
                     Err(error) => {
-                        eprintln!("rabsd canonical compilation: {error}");
+                        report_canonical_error(format_args!(
+                            "rabsd canonical compilation: {error}"
+                        ));
                         if error.kind() == std::io::ErrorKind::InvalidInput {
                             2
                         } else {
@@ -659,7 +674,9 @@ fn main() {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                eprintln!("rabsd canonical check requires Linux namespace support");
+                report_canonical_error(format_args!(
+                    "rabsd canonical check requires Linux namespace support"
+                ));
                 std::process::exit(2);
             }
         }

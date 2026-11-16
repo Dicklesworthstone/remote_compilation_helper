@@ -14,6 +14,11 @@
 //!   scheduling decisions, and committed action-result pointers (I5/I10);
 //! - workers (`rabs-wkr`) prepare and offer results but never commit.
 
+// Local/remote callers and daemon notices share the same bounded Linux sink.
+// Keep the implementation and its native I/O regressions in their source file.
+#[cfg(target_os = "linux")]
+#[path = "coord/canonical_local/remote_service/client/output.rs"]
+pub(crate) mod controlled_output;
 pub mod coord;
 pub mod doctor;
 pub mod edge;

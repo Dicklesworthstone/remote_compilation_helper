@@ -1,7 +1,5 @@
 //! Local capture and verified result installation for a remote operation.
 
-mod output;
-
 use super::super::OperationCancellation;
 use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
@@ -17,6 +15,7 @@ use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
     plain_absolute, private_directory,
 };
+use crate::controlled_output::{ControlledOutput, OutputDeadline};
 use crate::coord::source_delivery::control::PreparationControl;
 use crate::coord::source_delivery::{PreparedLocalBundle, prepare_local_bundle_controlled};
 use crate::coord::worker_delivery::MAX_LOCAL_CANONICAL_REQUEST_BYTES;
@@ -26,7 +25,6 @@ use crate::edge::diagnostic_rewrite::{
 use crate::edge::live_facts::read_stable;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::runtime::RuntimeBuilder;
-use output::{ControlledOutput, OutputDeadline};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{
     MAX_JSON_RECORD, connect_coordinator_peer, runtime_transport_now,

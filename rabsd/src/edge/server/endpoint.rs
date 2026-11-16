@@ -7,7 +7,7 @@
 
 use asupersync::net::unix::{UnixListener, UnixStream};
 use rabs_sandbox::socket_endpoint::EndpointLease;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,9 +31,9 @@ impl Drop for EndpointOwner {
                 &[("socket", &path), ("reason", &error.to_string())],
             ),
         };
-        // Teardown still releases ownership when stderr is closed. Do not
-        // let an eprintln! I/O panic interrupt an already-unwinding owner.
-        let _ = writeln!(io::stderr().lock(), "{line}");
+        // Teardown releases ownership even when stderr is closed or its
+        // consumer stopped reading. A notice cannot strand this lease.
+        super::report_log_line(&line);
         // EndpointLease explicitly unlocks only after the retirement attempt.
     }
 }

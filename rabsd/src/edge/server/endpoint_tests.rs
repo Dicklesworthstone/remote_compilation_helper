@@ -15,6 +15,109 @@ fn identity(path: &Path) -> (u64, u64, i64, i64) {
     (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_stderr_retirement_child() {
+    use std::io::Read;
+
+    let Some(root) = std::env::var_os("RABS_EDGE_LOG_LOCK_TEST_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    // Even before binding, this production owner fences every other daemon
+    // from taking the endpoint. Its Drop must release the actual native lock.
+    let owner = EndpointOwner(EndpointLease::acquire(&root.join("edge.sock")).unwrap());
+    fs::write(root.join("ready"), b"endpoint lease held").unwrap();
+    std::io::stdin().read_exact(&mut [0_u8]).unwrap();
+    drop(owner);
+    fs::write(root.join("retired"), b"endpoint owner dropped").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_stderr_cannot_strand_the_native_endpoint_lease() {
+    use std::io::Write;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    struct ChildOwner(Child);
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let root = crate::test_util::private_tempdir();
+    let path = root.path().join("edge.sock");
+    let (_reader, writer) = rustix::pipe::pipe_with(
+        rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+    )
+    .unwrap();
+    let bytes = [0x5a; 4096];
+    loop {
+        match rustix::io::write(&writer, &bytes) {
+            Ok(count) => assert!(count > 0),
+            Err(rustix::io::Errno::AGAIN) => break,
+            result => panic!("unexpected caller-pipe fill: {result:?}"),
+        }
+    }
+    let flags = rustix::fs::fcntl_getfl(&writer).unwrap() & !rustix::fs::OFlags::NONBLOCK;
+    rustix::fs::fcntl_setfl(&writer, flags).unwrap();
+    let writer = fs::File::from(writer);
+    let log = fs::File::create(root.path().join("child.log")).unwrap();
+    // Exercise actual production Drop with an inherited full stderr, not a
+    // substituted retirement function or a process-global fd redirection.
+    let mut child = ChildOwner(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "edge::server::endpoint::tests::blocked_stderr_retirement_child",
+                "--nocapture",
+            ])
+            .env("RABS_EDGE_LOG_LOCK_TEST_ROOT", root.path())
+            .stdin(Stdio::piped())
+            .stdout(log)
+            .stderr(writer.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.path().join("ready").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "endpoint child did not acquire its lease: {}",
+            fs::read_to_string(root.path().join("child.log")).unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(EndpointLease::acquire(&path).is_err());
+    child.0.stdin.take().unwrap().write_all(b"retire").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the endpoint owner stranded its lease behind a blocked stderr",
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "endpoint child failed: {}",
+        fs::read_to_string(root.path().join("child.log")).unwrap(),
+    );
+    assert_eq!(
+        fs::read(root.path().join("retired")).unwrap(),
+        b"endpoint owner dropped",
+    );
+    EndpointLease::acquire(&path).unwrap();
+    assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+}
+
 #[test]
 fn bound_listener_is_private_and_retirement_is_generation_owned() {
     let root = crate::test_util::private_tempdir();
